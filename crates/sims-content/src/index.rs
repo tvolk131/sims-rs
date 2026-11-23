@@ -280,16 +280,23 @@ impl Index {
         map
     }
 
+    /// The mount number a neighborhood's `Characters` directory takes when it is
+    /// added ([`Index::add_characters`]): right after the user objects. Every resource
+    /// of a mount below it comes before every `Characters` resource in load order.
+    #[must_use]
+    pub fn characters_mount(&self) -> usize {
+        self.mounts
+            .iter()
+            .position(|m| m.path == Install::USER_OBJECTS)
+            .map_or(self.mounts.len(), |n| n + 1)
+    }
+
     /// Adds a neighborhood's `Characters` directory as a mount named
     /// `Characters`. The original scans the neighborhood's people after the
     /// user objects and before Downloads (0x43c609), so the mount and its
     /// resources go there, not at the end.
     pub fn add_characters(&mut self, path: &Path) -> Result<()> {
-        let number = self
-            .mounts
-            .iter()
-            .position(|m| m.path == Install::USER_OBJECTS)
-            .map_or(self.mounts.len(), |n| n + 1);
+        let number = self.characters_mount();
         self.mounts.insert(
             number,
             Mount {
@@ -319,11 +326,7 @@ impl Index {
     /// case-folded ordering, Windows-1252 key encoding, and file-table hash
     /// order as [`Index::add_characters`].
     pub fn add_character_files(&mut self, files: &BTreeMap<String, Vec<u8>>) -> Result<()> {
-        let number = self
-            .mounts
-            .iter()
-            .position(|m| m.path == Install::USER_OBJECTS)
-            .map_or(self.mounts.len(), |n| n + 1);
+        let number = self.characters_mount();
         self.mounts.insert(
             number,
             Mount {

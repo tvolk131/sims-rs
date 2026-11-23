@@ -87,7 +87,7 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
             continue;
         };
 
-        let file_arities = arity_catalog.resolve(ResourceMatch::Unique(resource_index), &iff);
+        let file_arities = arity_catalog.resolve(ResourceMatch::Unique(resource_index));
 
         let is_fridges = name
             .rsplit(['/', '\\'])

@@ -25,23 +25,45 @@
 //! A tree outside those cases never runs, and its owner-dependent ranges stay unknown.
 //! Unknown arities make the lifter keep the labeled-CFG layout, which is always sound.
 //!
-//! [`InstallArityCatalog`] resolves those files through `sims_content`'s [`Catalog`] (the
-//! same index, catalog, and `GLOB` links the VM boots from). The `structured_equiv` corpus
-//! test and `sims-antics lift` both use it, so the CLI and the corpus see the same arities.
+//! The rule: **a count is known only when the VM, booted the same way, would dispatch
+//! this exact call to this exact tree.** `InstallArityCatalog` (feature
+//! `install-catalog`, on by default) asks the VM's own code rather than restating it:
+//!
+//! - **Boot path.** It builds the `sims_content` index and catalog as the VM boots. A
+//!   `GLOB` target in a mount that a neighborhood's `Characters` directory precedes
+//!   (`Index::characters_mount`, e.g. `Downloads/` and the expansion mounts) could be
+//!   shadowed by a `Characters` file of the same name; `lift` does not know the
+//!   neighborhood, so that range is unknown.
+//! - **Registered owners.** A file's private trees run only if it holds the registered
+//!   (GUID-winning) `OBJD` of some object, and a file is a semi-global library only if
+//!   such an owner's `GLOB` names it. A `GLOB` in a file with no registered `OBJD`
+//!   counts for nothing.
+//! - **VM loader.** Every library that supplies counts (owner, semi-global, global) must
+//!   be a regular file the VM's library loader (`sims_vm::load_library`) accepts. If
+//!   `Global.iff` is rejected the VM does not link at all, so every range is unknown.
+//! - **Runnable callee.** The VM's own checks, shared in `sims_formats::behavior`
+//!   (`TreeScope`, `instruction_refused`, `Behavior::frame_dimensions`), drop a callee
+//!   the VM would not dispatch: an empty tree, an unsupported format, or a flagged
+//!   call opcode (`0x8000` set).
+//!
+//! The `structured_equiv` corpus test and `sims-antics lift` both use it, so the CLI and
+//! the corpus see the same arities.
 //!
 //! Roles are inferred only for a positively identified file: one under the install root
 //! that matches exactly one index entry by file identity ([`ResourceMatch::Unique`]).
-//! Anything else gets [`FileArities::no_role`], with every range unknown. A global or
-//! semi-global library supplies arities only if it is a regular file the VM's own
-//! library loader (`sims_vm::load_library`) accepts.
+//! Anything else gets [`FileArities::no_role`], with every range unknown.
 
-use crate::verify::bhav_param_limit;
+#[cfg(feature = "install-catalog")]
 use sims_content::{ArchivePool, Catalog, Index, Install, Resource};
-use sims_formats::behavior::Behavior;
+use sims_formats::behavior::{Behavior, TreeScope, instruction_refused};
 use sims_formats::iff::Iff;
 use std::collections::BTreeMap;
+#[cfg(feature = "install-catalog")]
+use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(not(unix), feature = "install-catalog"))]
+use std::path::PathBuf;
 
 /// Global tree IDs, resolved from `Global.iff`.
 pub const GLOBAL_TREES: RangeInclusive<u16> = 256..=4095;
@@ -50,12 +72,16 @@ pub const PRIVATE_TREES: RangeInclusive<u16> = 4096..=8191;
 /// Semi-global tree IDs, resolved from the owner's `GLOB`-linked IFF.
 pub const SEMI_GLOBAL_TREES: RangeInclusive<u16> = 8192..=u16::MAX;
 
-/// `tree ID -> argument count` for the BHAVs in `iff` whose ID is in `range`.
+/// `tree ID -> argument count` for the BHAVs in `iff` whose ID is in `range` and that
+/// a call could reach.
 ///
-/// Every parseable BHAV chunk counts, deleted or not, in any order: the VM's library
-/// loader keeps the last physical chunk of an ID (deleted ones included) while the
-/// original's loader skips deleted chunks. An ID whose chunks disagree on arity is left
-/// out (unknown), so the result is sound under either selection rule.
+/// The count is what the VM's call reads ([`Behavior::frame_dimensions`]); an ID the VM
+/// refuses as an instruction opcode ([`instruction_refused`]) is never called. Every
+/// BHAV chunk of an ID counts, deleted or not, in any order: the VM's library loader
+/// keeps the last physical chunk (deleted ones included) while the original's loader
+/// skips deleted chunks. An ID with a chunk that does not parse or cannot be called, or
+/// whose chunks disagree, is left out (unknown), so the result is sound under either
+/// selection rule.
 #[must_use]
 pub fn bhav_arities_in_range(iff: &Iff, range: RangeInclusive<u16>) -> BTreeMap<u16, usize> {
     let mut seen: BTreeMap<u16, Option<usize>> = BTreeMap::new();
@@ -63,16 +89,18 @@ pub fn bhav_arities_in_range(iff: &Iff, range: RangeInclusive<u16>) -> BTreeMap<
         if &chunk.tag != b"BHAV" || !range.contains(&chunk.id) {
             continue;
         }
-        if let Ok(bhav) = Behavior::parse(iff.data(chunk)) {
-            let arity = bhav_param_limit(&bhav);
-            seen.entry(chunk.id)
-                .and_modify(|known| {
-                    if *known != Some(arity) {
-                        *known = None;
-                    }
-                })
-                .or_insert(Some(arity));
-        }
+        let arity = Behavior::parse(iff.data(chunk))
+            .ok()
+            .and_then(|bhav| bhav.frame_dimensions().ok())
+            .map(|(args, _)| args)
+            .filter(|_| !instruction_refused(chunk.id));
+        seen.entry(chunk.id)
+            .and_modify(|known| {
+                if *known != arity {
+                    *known = None;
+                }
+            })
+            .or_insert(arity);
     }
     seen.into_iter()
         .filter_map(|(id, arity)| arity.map(|a| (id, a)))
@@ -143,6 +171,7 @@ pub const NO_ROLE_HINT: &str = "pass --no-catalog to use this file's own private
      --globals <Global.iff> or --semiglobal <file.iff> for the others";
 
 impl ResolvedArities {
+    #[cfg(feature = "install-catalog")]
     fn unset() -> Self {
         Self {
             arities: BTreeMap::new(),
@@ -158,12 +187,17 @@ impl ResolvedArities {
     /// `4096+` calls do).
     #[must_use]
     pub fn no_role(why: &str) -> Self {
-        let why = format!("no inferred role: {why}");
+        Self::unknown(&format!("no inferred role: {why}"))
+    }
+
+    /// Every range unknown for the same reason, with the flag hint.
+    #[must_use]
+    pub fn unknown(why: &str) -> Self {
         Self {
             arities: BTreeMap::new(),
-            private: ArityPart::missing(&why),
-            global: ArityPart::missing(&why),
-            semi_global: ArityPart::missing(&why),
+            private: ArityPart::missing(why),
+            global: ArityPart::missing(why),
+            semi_global: ArityPart::missing(why),
             hint: Some(NO_ROLE_HINT.to_owned()),
         }
     }
@@ -264,12 +298,10 @@ impl CallerScope {
     /// The scope a tree with ID `tree` runs in.
     #[must_use]
     pub fn of(tree: u16) -> Self {
-        if PRIVATE_TREES.contains(&tree) {
-            Self::Private
-        } else if SEMI_GLOBAL_TREES.contains(&tree) {
-            Self::SemiGlobal
-        } else {
-            Self::Global
+        match TreeScope::of(tree) {
+            Some(TreeScope::Private) => Self::Private,
+            Some(TreeScope::SemiGlobal) => Self::SemiGlobal,
+            Some(TreeScope::Global) | None => Self::Global,
         }
     }
 
@@ -305,6 +337,12 @@ impl FileArities {
     #[must_use]
     pub fn no_role(why: &str) -> Self {
         Self::uniform(ResolvedArities::no_role(why))
+    }
+
+    /// See [`ResolvedArities::unknown`].
+    #[must_use]
+    pub fn unknown(why: &str) -> Self {
+        Self::uniform(ResolvedArities::unknown(why))
     }
 
     /// See [`ResolvedArities::private_only`].
@@ -422,19 +460,27 @@ impl FileIdentity {
     }
 }
 
-/// An install's index and catalog, built exactly as the VM builds them, with
-/// `Global.iff` arities loaded, semi-global arities cached per resource, and a side
-/// table of file identities used only to find which entry a lifted file is.
+#[cfg(feature = "install-catalog")]
+/// An install's index and catalog, built exactly as the VM boots them, with callee
+/// arities taken from libraries the VM's own loader accepts, and a side table of file
+/// identities used only to find which entry a lifted file is.
 pub struct InstallArityCatalog {
     pub index: Index,
     pub pool: ArchivePool,
     pub catalog: Catalog,
     /// The install root, canonicalized.
     root_canonical: Option<PathBuf>,
-    /// `Global.iff` arities, or why they could not be read.
+    /// `Global.iff` arities, or why the VM could not link with it.
     global: Result<BTreeMap<u16, usize>, String>,
     global_location: String,
-    semi_cache: BTreeMap<usize, Result<BTreeMap<u16, usize>, String>>,
+    /// Callable arities of each library loaded so far, or why the VM rejects it.
+    libraries: BTreeMap<usize, Result<BTreeMap<u16, usize>, String>>,
+    /// Files holding the registered (GUID-winning) definition of some object: the only
+    /// files whose private trees run, with that file as code owner.
+    owners: BTreeSet<usize>,
+    /// The mount a neighborhood's `Characters` directory would take: a resource in a
+    /// mount at or above it can be shadowed by name by a `Characters` file.
+    characters_mount: usize,
     /// Each index resource's file identity when its path names a regular file.
     identities: Vec<Option<FileIdentity>>,
     /// Index resources whose path could not be `stat`ed for a reason other than
@@ -442,6 +488,7 @@ pub struct InstallArityCatalog {
     unidentified: Vec<(usize, String)>,
 }
 
+#[cfg(feature = "install-catalog")]
 impl InstallArityCatalog {
     /// Indexes the install at `root`, builds its catalog from the whole index (as the VM
     /// does), and loads `Global.iff` arities. Errors name paths relative to the install
@@ -483,7 +530,15 @@ impl InstallArityCatalog {
         }
 
         let global_location = index.resources[catalog.global].location(&index.root);
-        let global = library_arities(&index, &pool, catalog.global, true, GLOBAL_TREES);
+        let global = library_arities(&index, &pool, catalog.global, true);
+        let owners = catalog
+            .by_guid
+            .values()
+            .map(|&n| catalog.objects[n].resource)
+            .collect();
+        let characters_mount = index.characters_mount();
+        let mut libraries = BTreeMap::new();
+        libraries.insert(catalog.global, global.clone());
         Ok(Self {
             root_canonical: std::fs::canonicalize(root).ok(),
             index,
@@ -491,7 +546,9 @@ impl InstallArityCatalog {
             catalog,
             global,
             global_location,
-            semi_cache: BTreeMap::new(),
+            libraries,
+            owners,
+            characters_mount,
             identities,
             unidentified,
         })
@@ -571,22 +628,27 @@ impl InstallArityCatalog {
         }
     }
 
-    fn semi_arities(&mut self, semi_res: usize) -> Result<BTreeMap<u16, usize>, String> {
-        let is_global = semi_res == self.catalog.global;
+    /// Callable arities of the library at `resource`, as the VM would load it.
+    fn library(&mut self, resource: usize) -> Result<BTreeMap<u16, usize>, String> {
+        let is_global = resource == self.catalog.global;
         let (index, pool) = (&self.index, &self.pool);
-        self.semi_cache
-            .entry(semi_res)
-            .or_insert_with(|| library_arities(index, pool, semi_res, is_global, SEMI_GLOBAL_TREES))
+        self.libraries
+            .entry(resource)
+            .or_insert_with(|| library_arities(index, pool, resource, is_global))
             .clone()
     }
 
-    /// Merged arities for `iff`, matched to the index as `matched`, per calling tree,
+    fn location(&self, resource: usize) -> String {
+        self.index.resources[resource].location(&self.index.root)
+    }
+
+    /// Merged arities for the file matched to the index as `matched`, per calling tree,
     /// following the code-owner rules in the module docs. Catalog-derived arities (and
     /// the claim that private calls are local) apply only to a [`ResourceMatch::Unique`]
     /// file; anything else has no inferred role, and every range is unknown.
-    pub fn resolve(&mut self, matched: ResourceMatch, iff: &Iff) -> FileArities {
+    pub fn resolve(&mut self, matched: ResourceMatch) -> FileArities {
         match matched {
-            ResourceMatch::Unique(resource) => self.resolve_entry(resource, iff),
+            ResourceMatch::Unique(resource) => self.resolve_entry(resource),
             ResourceMatch::OutsideInstall => {
                 FileArities::no_role("file resolves outside the install root")
             }
@@ -619,97 +681,120 @@ impl InstallArityCatalog {
         }
     }
 
-    /// Merged arities for `iff` as the index resource `resource`, per calling tree.
-    fn resolve_entry(&mut self, resource: usize, iff: &Iff) -> FileArities {
+    /// Merged arities for the index resource `resource`, per calling tree: a callee's
+    /// count is known only when the VM, booted the same way, would dispatch that call
+    /// to that tree.
+    fn resolve_entry(&mut self, resource: usize) -> FileArities {
+        // Without Global.iff the VM does not link at all (`Program::link_with_pool`).
+        let global = match &self.global {
+            Ok(global) => global.clone(),
+            Err(why) => {
+                return FileArities::unknown(&format!("the VM cannot link this install: {why}"));
+            }
+        };
         let is_global = resource == self.catalog.global;
-        let linked = self
-            .catalog
-            .semi_globals
-            .values()
-            .any(|&target| target == Some(resource));
-        let own_link = self.catalog.semi_globals.get(&resource).copied();
-        let with_global = |this: &Self| {
+        let global_location = self.global_location.clone();
+        let with_global = || {
             let mut scope = ResolvedArities::unset();
-            this.apply_global(&mut scope);
+            scope.set_global(&global, AritySource::Catalog(global_location.clone()));
             scope
         };
 
         // 256..=4095 trees run only from Global.iff, under the calling object.
-        let mut global = with_global(self);
+        let mut global_scope = with_global();
         let why = if is_global {
             "owner-dependent: Global.iff runs under the calling object"
         } else {
             "never runs: the VM runs trees 256..=4095 only from Global.iff"
         };
-        global.private = ArityPart::missing(why);
-        global.semi_global = ArityPart::missing(why);
+        global_scope.private = ArityPart::missing(why);
+        global_scope.semi_global = ArityPart::missing(why);
 
-        // 4096..=8191 trees run only as this file's own private trees: this file is the
-        // code owner, and its own GLOB link is the semi-global library.
-        let mut private = with_global(self);
-        private.set_private(
-            &bhav_arities_in_range(iff, PRIVATE_TREES),
-            AritySource::ThisFile,
-        );
-        match own_link {
-            Some(Some(target)) => match self.semi_arities(target) {
-                Ok(map) => {
-                    let location = self.index.resources[target].location(&self.index.root);
-                    private.set_semi_global(&map, AritySource::Catalog(location));
-                }
-                Err(why) => private.semi_global = ArityPart::missing(&why),
-            },
-            Some(None) => private.semi_global = ArityPart::missing("GLOB link empty"),
-            None => private.semi_global = ArityPart::missing("no resolved GLOB link"),
+        // 4096..=8191 trees run only with this file as code owner, which takes a
+        // registered definition here; its own GLOB link is the semi-global library.
+        let mut private = with_global();
+        if self.owners.contains(&resource) {
+            match self.library(resource) {
+                Ok(own) => private.set_private(&own, AritySource::ThisFile),
+                Err(why) => private.private = ArityPart::missing(&why),
+            }
+            private.semi_global = match self.catalog.semi_globals.get(&resource).copied() {
+                Some(Some(target)) => self.semi_global_part(target, &mut private),
+                Some(None) => ArityPart::missing("GLOB link empty"),
+                None => ArityPart::missing("no resolved GLOB link"),
+            };
+        } else {
+            let why = "never runs: no registered object definition (OBJD) in this file";
+            private.private = ArityPart::missing(why);
+            private.semi_global = ArityPart::missing(why);
         }
 
-        // 8192+ trees run only as the semi-global library of an object linking here,
-        // under that object: semi-global callees are this file's, private ones the
-        // caller's.
-        let mut semi_global = with_global(self);
+        // 8192+ trees run only as the semi-global library of a registered object that
+        // links here, under that object: semi-global callees are this file's, private
+        // ones the caller's.
+        let mut semi = with_global();
+        let linked = self
+            .owners
+            .iter()
+            .any(|owner| self.catalog.semi_globals.get(owner).copied().flatten() == Some(resource));
         if linked {
-            semi_global.private = ArityPart::missing(
+            semi.private = ArityPart::missing(
                 "owner-dependent: semi-global file runs under the calling object",
             );
-            match self.semi_arities(resource) {
-                Ok(map) => semi_global.set_semi_global(
-                    &map,
+            match self.library(resource) {
+                Ok(own) => semi.set_semi_global(
+                    &own,
                     AritySource::ThisFileBecause("linked as a semi-global".to_owned()),
                 ),
-                Err(why) => semi_global.semi_global = ArityPart::missing(&why),
+                Err(why) => semi.semi_global = ArityPart::missing(&why),
             }
         } else {
-            let why = "never runs: no object links to this file as its semi-global";
-            semi_global.private = ArityPart::missing(why);
-            semi_global.semi_global = ArityPart::missing(why);
+            let why = "never runs: no registered object links to this file as its semi-global";
+            semi.private = ArityPart::missing(why);
+            semi.semi_global = ArityPart::missing(why);
         }
 
         FileArities {
-            global,
+            global: global_scope,
             private,
-            semi_global,
+            semi_global: semi,
         }
     }
 
-    fn apply_global(&self, resolved: &mut ResolvedArities) {
-        match &self.global {
-            Ok(global) => {
-                resolved.set_global(global, AritySource::Catalog(self.global_location.clone()))
+    /// The semi-global part an owner gets from its `GLOB` target `target`, also
+    /// merging its arities into `scope`. Unknown when a neighborhood's `Characters` file
+    /// of the same name could take precedence: `lift` does not know which neighborhood
+    /// the VM boots with, and the VM inserts that mount before `target`'s.
+    fn semi_global_part(&mut self, target: usize, scope: &mut ResolvedArities) -> ArityPart {
+        let location = self.location(target);
+        if self.index.resources[target].mount >= self.characters_mount {
+            return ArityPart::missing(&format!(
+                "a neighborhood's Characters file named {} would take precedence over {location}, \
+                 and the neighborhood is not known",
+                self.index.resources[target].file_name()
+            ));
+        }
+        match self.library(target) {
+            Ok(map) => {
+                scope.set_semi_global(&map, AritySource::Catalog(location));
+                scope.semi_global.clone()
             }
-            Err(why) => resolved.global = ArityPart::missing(why),
+            Err(why) => ArityPart::missing(&why),
         }
     }
 }
 
-/// `range` arities of the library at index resource `resource`, or why it supplies none:
-/// it must be a regular file (checked before any open, so a FIFO cannot block) that the
-/// VM's own library loader accepts. Errors name paths relative to the install.
+#[cfg(feature = "install-catalog")]
+/// Callable arities (all IDs) of the library at index resource `resource`, or why the
+/// VM would not load it. It must be a regular file (checked before any open, so a FIFO
+/// cannot block) that the VM's own library loader accepts; a count is kept only where
+/// the tree the VM keeps for an ID agrees with every chunk of that ID
+/// ([`bhav_arities_in_range`]). Errors name paths relative to the install.
 fn library_arities(
     index: &Index,
     pool: &ArchivePool,
     resource: usize,
     is_global: bool,
-    range: RangeInclusive<u16>,
 ) -> Result<BTreeMap<u16, usize>, String> {
     let file: &Resource = &index.resources[resource];
     let location = file.location(&index.root);
@@ -721,13 +806,23 @@ fn library_arities(
             Err(e) => return Err(format!("failed to read {location}: {e}")),
         }
     }
-    sims_vm::load_library(index, resource, is_global, pool)
+    let library = sims_vm::load_library(index, resource, is_global, pool)
         .map_err(|e| relative(format!("the VM would not load {location}: {e}")))?;
     let bytes = file
         .read_with(pool)
         .map_err(|e| relative(format!("failed to read {location}: {e}")))?;
     let iff = Iff::parse(bytes).map_err(|e| format!("failed to parse {location}: {e}"))?;
-    Ok(bhav_arities_in_range(&iff, range))
+    Ok(bhav_arities_in_range(&iff, 0..=u16::MAX)
+        .into_iter()
+        .filter(|(id, arity)| {
+            library
+                .behaviors
+                .get(id)
+                .and_then(|bhav| bhav.frame_dimensions().ok())
+                .map(|(args, _)| args)
+                == Some(*arity)
+        })
+        .collect())
 }
 
 #[cfg(test)]

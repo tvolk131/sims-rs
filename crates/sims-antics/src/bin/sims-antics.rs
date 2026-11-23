@@ -11,8 +11,8 @@
 //! - `sims-antics build <pack_dir> --out <dir>`
 
 use sims_antics::arity_catalog::{
-    AritySource, FileArities, FileIdentity, GLOBAL_TREES, InstallArityCatalog, ResolvedArities,
-    SEMI_GLOBAL_TREES, bhav_arities_in_range,
+    AritySource, FileArities, FileIdentity, GLOBAL_TREES, ResolvedArities, SEMI_GLOBAL_TREES,
+    bhav_arities_in_range,
 };
 use sims_antics::ir::BhavChunk;
 use sims_antics::{
@@ -405,25 +405,7 @@ fn resolve_lift_arities(
     let mut resolved = if opts.no_catalog {
         FileArities::private_only(iff, "--no-catalog")
     } else {
-        match InstallArityCatalog::find_install_root(input_path) {
-            Some(root) => match InstallArityCatalog::load(&root) {
-                Ok(mut catalog) => match input_identity {
-                    Ok(identity) => {
-                        let resource = catalog.resource_for(input_path, identity, member);
-                        catalog.resolve(resource, iff)
-                    }
-                    Err(why) => FileArities::no_role(&format!(
-                        "could not identify the opened file: {}",
-                        sanitize_single_line(why)
-                    )),
-                },
-                Err(err) => FileArities::no_role(&format!(
-                    "install catalog failed to load: {}",
-                    sanitize_single_line(&err)
-                )),
-            },
-            None => FileArities::no_role("no Sims install found above the input"),
-        }
+        catalog_arities(input_path, input_identity, member)
     };
     if let Some(spec) = &opts.globals {
         let (globals_iff, label) = read_override_iff(spec, Some("Global.iff"), "--globals")?;
@@ -440,6 +422,45 @@ fn resolve_lift_arities(
         );
     }
     Ok(resolved)
+}
+
+/// Arities from the enclosing install's catalog, for a positively identified file only.
+#[cfg(feature = "install-catalog")]
+fn catalog_arities(
+    input_path: &Path,
+    input_identity: Result<&FileIdentity, &str>,
+    member: Option<(&str, u64)>,
+) -> FileArities {
+    use sims_antics::arity_catalog::InstallArityCatalog;
+    match InstallArityCatalog::find_install_root(input_path) {
+        Some(root) => match InstallArityCatalog::load(&root) {
+            Ok(mut catalog) => match input_identity {
+                Ok(identity) => {
+                    let resource = catalog.resource_for(input_path, identity, member);
+                    catalog.resolve(resource)
+                }
+                Err(why) => FileArities::no_role(&format!(
+                    "could not identify the opened file: {}",
+                    sanitize_single_line(why)
+                )),
+            },
+            Err(err) => FileArities::no_role(&format!(
+                "install catalog failed to load: {}",
+                sanitize_single_line(&err)
+            )),
+        },
+        None => FileArities::no_role("no Sims install found above the input"),
+    }
+}
+
+/// Without the `install-catalog` feature there is no install catalog: no inferred role.
+#[cfg(not(feature = "install-catalog"))]
+fn catalog_arities(
+    _input_path: &Path,
+    _input_identity: Result<&FileIdentity, &str>,
+    _member: Option<(&str, u64)>,
+) -> FileArities {
+    FileArities::no_role("built without the install-catalog feature")
 }
 
 /// Reads an IFF named by an arity override: a `.iff` file, or a FAR archive member given
