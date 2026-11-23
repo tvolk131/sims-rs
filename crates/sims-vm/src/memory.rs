@@ -150,6 +150,25 @@ impl Machine<'_, '_> {
                 self.world.dirty_portraits.insert(guid);
             }
         }
+        // 0x453911 -> 0x4448a6, 0x45391a -> 0x444962: with write intent, a
+        // person's word 77 (its date) or 81 (fame) queues the person for
+        // the interface's indicator refresh, before the word is written
+        // (`sims_sim::IndicatorQueues`). The next frame drains the queues
+        // ([`Interpreter::refresh_indicators`]).
+        if write && let Cell::Person(id, index @ (77 | 81)) = resolved.0 {
+            if index == 77 {
+                let date = self
+                    .world
+                    .objects
+                    .get(&id)
+                    .and_then(|object| object.person.as_ref())
+                    .and_then(|person| person.data.get(77).copied())
+                    .unwrap_or(0);
+                self.world.indicator_queues.queue_date(id, date);
+            } else {
+                self.world.indicator_queues.queue_star(id);
+            }
+        }
         Ok(resolved)
     }
 

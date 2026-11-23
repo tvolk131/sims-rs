@@ -4129,7 +4129,16 @@ impl NeighborhoodShell {
                 (loaded.payload.clone(), None)
             }
             SavePayloadKind::WorldSnapshot => {
-                let world = sims_sim::World::decode(&loaded.payload).map_err(|e| e.to_string())?;
+                let (mut world, queues) = sims_sim::World::decode_snapshot_parts(&loaded.payload)
+                    .map_err(|e| e.to_string())?;
+                if loaded.metadata.format_version < sims_sim::AUTOSAVE_MADE_ORDER_FORMAT {
+                    world.characters.made.sort_by_guid();
+                }
+                // A payload saved before the queues were kept takes its star
+                // pools from where its stars stand, as a `Saved` of that age
+                // does.
+                let queues =
+                    queues.unwrap_or_else(|| sims_vm::boot::save::queues_saved_before_kept(&world));
                 // Obtain a compatible base `Saved` envelope without touching a
                 // potentially corrupt SAVED_LOTS entry: reuse the open lot if it
                 // matches `lot_id`, otherwise boot the clean base house in staging.
@@ -4153,6 +4162,12 @@ impl NeighborhoodShell {
                     }
                 };
                 let spliced = splice_world_into_saved_bytes(&base_saved, &world)?;
+                // The splice keeps the base lot's pending indicator refreshes,
+                // which may name people the restored world lacks: take the
+                // snapshot's own (`World::encode_snapshot`).
+                let mut spliced = Saved::decode(&spliced).map_err(|e| e.to_string())?;
+                spliced.set_indicator_queues(queues);
+                let spliced = spliced.encode();
                 (spliced, Some(loaded.metadata.sim_tick))
             }
             SavePayloadKind::Custom(tag) => {

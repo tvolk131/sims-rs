@@ -47,6 +47,7 @@ pub mod household;
 pub mod hud;
 pub mod loading;
 pub mod native_sort;
+pub mod needs_history;
 pub mod neighborhood;
 pub mod options;
 pub mod phonebook;

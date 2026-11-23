@@ -1225,9 +1225,7 @@ impl CoopController {
                                 ),
                             ),
                             RejectReason::ProtocolVersionMismatch { expected, actual } => {
-                                let msg = format!(
-                                    "Protocol version mismatch (host v{expected}, local v{actual})"
-                                );
+                                let msg = sims_net::protocol_mismatch_message(expected, actual);
                                 (ConnectionState::Error(msg.clone()), msg)
                             }
                             RejectReason::SessionFull { max_players } => {

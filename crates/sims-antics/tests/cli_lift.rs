@@ -3358,3 +3358,42 @@ fn lift_includes_a_bhav_whose_only_chunk_is_deleted() {
     assert!(stdout.contains("OnlyDeleted"), "{stdout}");
     assert!(stdout.contains("Caller4096"), "{stdout}");
 }
+
+/// A private call runs the code owner's tree. A semi-global caller's owner is not this
+/// file, so its call comments must not name this file's (here deleted-only) 4096; a
+/// private caller in the same file still names its own private callee.
+#[test]
+fn lift_names_private_callees_only_for_private_callers() {
+    let install = SyntheticInstall::new();
+    let path = install.global_dir().join("TestGlobals.iff");
+    let mut not_the_owners = bhav_chunk(&one_node_bhav(4096, 0));
+    not_the_owners.flags = 4;
+    not_the_owners.label = "NotTheOwners".to_owned();
+    std::fs::write(
+        &path,
+        write_iff(&[
+            bhav_chunk(&two_call_bhav(8192, 300, 4096)),
+            not_the_owners,
+            bhav_chunk(&two_call_bhav(4097, 300, 4096)),
+        ])
+        .expect("write_iff"),
+    )
+    .expect("write TestGlobals.iff");
+
+    for extra in [None, Some("--no-catalog")] {
+        let mut args = vec![path.as_os_str(), OsStr::new("--tree"), OsStr::new("8192")];
+        args.extend(extra.map(OsStr::new));
+        let (ok, stdout, stderr) = run_lift(&args);
+        assert!(ok, "stderr: {stderr}");
+        assert!(stdout.contains("call 4096"), "{stdout}");
+        assert!(!stdout.contains("NotTheOwners"), "{extra:?}: {stdout}");
+    }
+    let (ok, stdout, stderr) = run_lift(&[
+        path.as_os_str(),
+        OsStr::new("--tree"),
+        OsStr::new("4097"),
+        OsStr::new("--no-catalog"),
+    ]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(stdout.contains("\"NotTheOwners\""), "{stdout}");
+}
