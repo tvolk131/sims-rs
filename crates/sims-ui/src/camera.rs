@@ -827,11 +827,36 @@ fn draw_strip_bkg(frame: &mut Frame, strip: Rect, art: &Art) {
         let bh = (bg.height as i32).min(strip.height);
         let fw = i32::try_from(frame.width()).unwrap_or(i32::MAX);
         let visible_w = strip.width.min(fw.saturating_sub(strip.x).max(0));
-        let direct_w = bw.min(visible_w);
-        frame.draw(bg, Rect::new(0, 0, direct_w, bh), [strip.x, strip.y]);
-        // Match `hud.rs` Kind::Stretched: repeat the last column on wide viewports.
-        for x in direct_w..visible_w {
-            frame.draw(bg, Rect::new(bw - 1, 0, 1, bh), [strip.x + x, strip.y]);
+        if strip.width > bw && bw > 16 {
+            // Preserve the 8 px right bezel of `PanelBack.bmp` (`804×100`) on
+            // viewports wider than 1024 px, matching `hud.rs` `Kind::Stretched`.
+            const RIGHT_BEZEL: i32 = 8;
+            let body_w = bw - RIGHT_BEZEL;
+            let fill_col = bw - 16;
+            frame.draw(
+                bg,
+                Rect::new(0, 0, body_w.min(visible_w), bh),
+                [strip.x, strip.y],
+            );
+            let bezel_x = strip.width - RIGHT_BEZEL;
+            let fill_end = bezel_x.min(visible_w);
+            for x in body_w..fill_end {
+                frame.draw(bg, Rect::new(fill_col, 0, 1, bh), [strip.x + x, strip.y]);
+            }
+            if visible_w > bezel_x {
+                let draw_w = (visible_w - bezel_x).min(RIGHT_BEZEL);
+                frame.draw(
+                    bg,
+                    Rect::new(body_w, 0, draw_w, bh),
+                    [strip.x + bezel_x, strip.y],
+                );
+            }
+        } else {
+            let direct_w = bw.min(visible_w);
+            frame.draw(bg, Rect::new(0, 0, direct_w, bh), [strip.x, strip.y]);
+            for x in direct_w..visible_w {
+                frame.draw(bg, Rect::new(bw - 1, 0, 1, bh), [strip.x + x, strip.y]);
+            }
         }
     } else {
         frame.fill(strip, [24, 34, 112]);

@@ -59,10 +59,10 @@ fn the_goths_panel_from_the_original_art() {
         hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
         digests.push((name, digest(&frame).as_str().to_owned()));
         if name == "open 1280x720" {
-            // The needs keep to the right edge; the strip's background
-            // fills to it.
+            // The 7-button gadget stays anchored beside the portrait block at
+            // x = 413; the strip's background fills cleanly to the right edge.
             assert_eq!(
-                hud::press(&items, [1280 - 387 + 50, 720 - 100 + 15]),
+                hud::press(&items, [413 + 50, 720 - 100 + 15]),
                 Some(Command::OpenPanel(Panel::Interests))
             );
             assert_ne!(frame.pixel(1279, 650), Some([0, 0, 0]));
@@ -75,11 +75,11 @@ fn the_goths_panel_from_the_original_art() {
         ),
         (
             "open 800x600",
-            "3829280fd7136e5abc9d561e63fdec9aa38a28dec6ae0b3a72cbd3434b898f1a",
+            "8c29854af1d520b860ff97c6df97a67d9e540659586985d35a2d8f563ef083c8",
         ),
         (
             "open 1280x720",
-            "88a916a28ceae6f35248f44bc949d13006c5f7721e6a810c21a0754791e9c09d",
+            "ee9167b27c597535da0d2a702ebdf62b4a755f9304280daa6255d874c6412de6",
         ),
     ];
     let digests: Vec<(&str, &str)> = digests.iter().map(|(n, d)| (*n, d.as_str())).collect();
@@ -139,7 +139,7 @@ fn the_goths_personality_panel() {
     // screen (see docs/decisions/).
     assert_eq!(
         digest(&frame),
-        "ddc5cef05deafc9f9d7b56a0ea0dc55519f7197ef960c60840c3888d69fd000f"
+        "71013e6ee23e578bd874a40cb0f18dd023526724999d9e5e9e41a2c26b081d9e"
     );
 }
 
@@ -184,7 +184,7 @@ fn the_goths_sign_balloon() {
     );
     assert_eq!(
         digest(&frame),
-        "ab457a389a9d7411856cd4aa7c3a3f924f4bbc43d88c1a6bb40985a85afbfad8"
+        "595b37c19a714176053a4843977fa72417549215d58106079dbd0919e1382b57"
     );
 }
 
@@ -255,7 +255,7 @@ fn the_goths_job_panel() {
     // screen (see docs/decisions/).
     assert_eq!(
         draw(&opened.snapshot),
-        "2933c5ccdbddd5c2e14db77125169b9ea324cc01e1cb8ad675aa50877f79413e"
+        "154e5514ced4c334513df0ea06f03c4e1b60c099263de8e25c1f69fb25fa8acd"
     );
     // A level up the ladder, "Field Researcher" at $320: the next level,
     // "Science Teacher", needs a point of Charisma, three of Logic, which
@@ -275,7 +275,7 @@ fn the_goths_job_panel() {
     );
     assert_eq!(
         draw(&snapshot),
-        "95900f89b384d95110bddbed3482325f87c0f68580660f1c03c42e34ce8f41c2"
+        "50cb1d1271096e777ce37692e93d4615b2642099f62dff85e66ffef2bd1ad10c"
     );
     // Titles wider than the column break as the original's do: after a
     // hyphen or a space, and both lines start above the box's bottom.
@@ -295,7 +295,7 @@ fn the_goths_job_panel() {
     }
     assert_eq!(
         draw(&snapshot),
-        "d8835a991f6c3d51fab6da35e8f4619a93b0731c272d06567516ce8595a5a4f9"
+        "0a071502ea744252fb5dbb0ed3bb20e8f8c080c05b056d95c041b6895f0005dc"
     );
 }
 
@@ -347,7 +347,7 @@ fn the_goths_relationship_panel() {
     // screen (see docs/decisions/).
     assert_eq!(
         digest(&frame),
-        "f33c3a0c53302ab56f0818d272dd97fa596a5b97054337edd1173fe238c0aea1"
+        "8e50d3bb46331ffd62e455a3704fbd804c4fa0a6c52475561ef02c98a575d584"
     );
 }
 
@@ -439,7 +439,7 @@ fn the_goths_house_panel() {
     // screen (see docs/decisions/).
     assert_eq!(
         digest(&frame),
-        "2cd4d2e1ac37fb40b11fbc8971d8ed8bf7f9154c68f02ac5402ab3e454b3ed5a"
+        "414dd3f98cdf74e01e7b8363dae9f59a9ac17dcb1be9736721a8d7ae8a50a77c"
     );
 }
 

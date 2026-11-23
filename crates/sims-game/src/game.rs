@@ -5865,8 +5865,7 @@ impl Game {
                     Outcome::redraw()
                 }
                 UiCamera::Photo => {
-                    self.hud.toggle_camera_strip(self.view.size);
-                    self.hud.play(crate::hud::CLICK);
+                    self.toggle_camera_strip();
                     Outcome::redraw()
                 }
                 UiCamera::Roof => {
@@ -6275,6 +6274,208 @@ impl Game {
     /// The active control-panel mode (`Mode::Live`, `Mode::Buy`, etc.).
     pub fn mode(&self) -> Mode {
         self.hud.controls.mode
+    }
+
+    /// The active simulation speed (`Speed::Normal`, `Speed::Fast`, `Speed::Ultra`).
+    pub fn speed(&self) -> Speed {
+        self.pace.speed
+    }
+
+    /// Whether the bottom control panel strip is currently expanded.
+    pub fn panel_expanded(&self) -> bool {
+        self.hud.controls.expanded
+    }
+
+    /// Active wall display mode (`Walls::Up`, `Walls::Cutaway`, `Walls::Down`).
+    pub fn walls(&self) -> Walls {
+        self.view.camera.walls
+    }
+
+    /// Active displayed floor level (`1` = ground, `2` = upper).
+    pub fn level(&self) -> i32 {
+        self.view.camera.level
+    }
+
+    fn flush_hud_sounds(&mut self) {
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
+    }
+
+    /// Toggles the bottom control panel strip collapsed/expanded (`F10` or
+    /// pressing `F1` while already in Live Mode, `0x4cfc75`). Closes the Camera
+    /// strip if open and re-centers the active house viewport.
+    pub fn toggle_panel(&mut self) -> bool {
+        self.hud.close_camera_strip();
+        self.hud.controls.expanded = !self.hud.controls.expanded;
+        if self.hud.controls.mode == Mode::Live {
+            self.live_panel_expanded = self.hud.controls.expanded;
+        }
+        self.sync_view_centre();
+        if self.hud.controls.mode == Mode::Buy {
+            self.layout_buy();
+        } else if self.hud.controls.mode == Mode::Build {
+            self.layout_build();
+        }
+        self.hud.play(crate::hud::CLICK);
+        self.flush_hud_sounds();
+        true
+    }
+
+    /// Toggles the Camera / Photo Mode strip (`F4`, `0x4d1712` / `0x53a543`).
+    pub fn toggle_camera_strip(&mut self) -> bool {
+        let was_expanded = self.hud.controls.expanded;
+        self.hud.toggle_camera_strip(self.view.size);
+        if self.hud.controls.expanded != was_expanded {
+            if self.hud.controls.mode == Mode::Live {
+                self.live_panel_expanded = self.hud.controls.expanded;
+            }
+            self.sync_view_centre();
+            if self.hud.controls.mode == Mode::Buy {
+                self.layout_buy();
+            } else if self.hud.controls.mode == Mode::Build {
+                self.layout_build();
+            }
+        }
+        self.hud.play(crate::hud::CLICK);
+        self.flush_hud_sounds();
+        true
+    }
+
+    /// Authentic `Sims.exe` 1.91 `F1`/`F2`/`F3`/`F5` mode hotkey dispatch
+    /// (`0x4d16e2..0x4d1869`):
+    /// - `F1` (`Mode::Live`, `0x4d1826`): enters Live Mode, closes Camera strip
+    ///   if open, or toggles panel collapse/expand when already in Live Mode.
+    /// - `F2` (`Mode::Buy`, `0x4d1787`): expands/enters Buy Mode, or toggles
+    ///   `ByFunction` ↔ `ByRoom` sort when already in Buy Mode (`0x4cf3af`).
+    /// - `F3` (`Mode::Build`, `0x4d1750`): expands and enters Build Mode.
+    /// - `F5` (`Mode::Options`, `0x4d16e2`): expands and enters Options Mode.
+    pub fn hotkey_mode(&mut self, mode: Mode) {
+        match mode {
+            Mode::Live => {
+                if self.hud.controls.mode == Mode::Live {
+                    if self.hud.camera_strip_open() {
+                        self.hud.close_camera_strip();
+                        self.hud.play(crate::hud::CLICK);
+                        self.flush_hud_sounds();
+                    } else {
+                        self.toggle_panel();
+                    }
+                } else {
+                    self.set_mode(Mode::Live);
+                }
+            }
+            Mode::Buy => {
+                if self.hud.controls.mode == Mode::Buy && !self.hud.camera_strip_open() {
+                    if !self.hud.controls.expanded {
+                        self.toggle_panel();
+                    } else if self.toggle_buy_sort() {
+                        self.hud.play(crate::hud::CLICK);
+                        self.flush_hud_sounds();
+                    }
+                } else {
+                    self.set_mode(Mode::Buy);
+                }
+            }
+            Mode::Build => {
+                if self.hud.controls.mode == Mode::Build && !self.hud.camera_strip_open() {
+                    if !self.hud.controls.expanded {
+                        self.toggle_panel();
+                    }
+                } else {
+                    self.set_mode(Mode::Build);
+                }
+            }
+            Mode::Options => {
+                self.set_mode(Mode::Options);
+            }
+        }
+    }
+
+    /// Cycles selection to the next Sim in the household roster, wrapping
+    /// around (`Space` in Live Mode, `cWinLive::OnKeyDown` at `0x51ba2d..0x51ba7c`).
+    /// Closes any open pie menu and plays `UI_click`. If only one Sim is in the
+    /// household, centres the camera on that Sim.
+    pub fn select_next_sim(&mut self) -> bool {
+        let residents = self.hud.resident_object_ids(self.lot.world());
+        if residents.is_empty() {
+            return false;
+        }
+        let world = self.lot.world();
+        let current = self.local_selected_sim();
+        let current_guid = current
+            .and_then(|id| world.objects.get(&id))
+            .map(|o| o.guid);
+        let current_idx = residents.iter().position(|&id| {
+            current == Some(id)
+                || current_guid.is_some() && world.objects.get(&id).map(|o| o.guid) == current_guid
+        });
+        let next = match current_idx {
+            Some(idx) => residents[(idx + 1) % residents.len()],
+            None => residents[0],
+        };
+        self.close_menu();
+        self.select(next);
+        self.flush_hud_sounds();
+        true
+    }
+
+    /// Centres the camera on the currently selected Sim (`Enter` in
+    /// `OnKeyDown`, `0x4d1330 -> 0x4d14d2..0x4d1507`).
+    pub fn centre_on_selected(&mut self) -> bool {
+        let Some(sim) = self.local_selected_sim() else {
+            return false;
+        };
+        let world = self.lot.world();
+        let target = world
+            .objects
+            .get(&sim)
+            .and_then(|o| sims_ui::household::first_person_for_guid(world, o.guid))
+            .map_or(sim, |o| o.id);
+        let smooth = self.smooth_pan_active();
+        self.centre_on_with_pan(target, smooth);
+        true
+    }
+
+    /// Steps wall display mode upward (`Home`: `Down → Cutaway → Up`, `0x4d135b`)
+    /// or downward (`End`: `Up → Cutaway → Down`, `0x4d1393`), playing
+    /// `UI_error` at either boundary.
+    pub fn step_walls(&mut self, up: bool) -> bool {
+        let next = match (self.view.camera.walls, up) {
+            (Walls::Down, true) => Some(Walls::Cutaway),
+            (Walls::Cutaway, true) => Some(Walls::Up),
+            (Walls::Up, true) => None,
+            (Walls::Up, false) => Some(Walls::Cutaway),
+            (Walls::Cutaway, false) => Some(Walls::Down),
+            (Walls::Down, false) => None,
+        };
+        match next {
+            Some(walls) => self.apply(Move::Walls(walls)),
+            None => {
+                self.hud.play(crate::hud::ERROR);
+                self.flush_hud_sounds();
+                false
+            }
+        }
+    }
+
+    /// Toggles between ground floor (`1`) and upper floor (`2`) (`Tab` in
+    /// `OnKeyDown`, `0x4d1324 -> 0x4d150c`).
+    pub fn toggle_floor(&mut self) -> bool {
+        if self.view.camera.level <= 1 {
+            self.apply(Move::LevelUp)
+        } else {
+            self.apply(Move::LevelDown)
+        }
+    }
+
+    /// Steps the active Buy or Build catalog grid page by `delta` (`+1` for
+    /// `X`, `-1` for `Z`, `0x4d11b5` / `0x4d1224`).
+    pub fn page_catalog(&mut self, delta: i32) -> bool {
+        match self.hud.controls.mode {
+            Mode::Buy => self.page_buy(delta),
+            Mode::Build => self.page_build(delta),
+            _ => false,
+        }
     }
 
     /// The Buy Mode catalog master GUID currently armed for placement, if any.

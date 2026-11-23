@@ -31,8 +31,9 @@ use sims_game::neighborhood::{LoadingPresenter, NeighborhoodShell, ScreenKind, S
 use sims_game::sound::{self, Input};
 use sims_game::view::Move;
 use sims_game::{Game, Options};
-use sims_render::{Canvas, Walls, png};
+use sims_render::{Canvas, png};
 use sims_ui::art::Art;
+use sims_ui::command::{Mode, Speed};
 use sims_ui::frame::Frame;
 use sims_ui::loading::{LoadingKind, LoadingScreen, LoadingState, LoadingStrings};
 use softbuffer::{Context, Surface};
@@ -46,7 +47,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 use winit::window::{Window, WindowId};
 
@@ -1517,174 +1518,135 @@ impl App {
         }
     }
 
-    fn key(&mut self, key: &Key) {
+    fn key(&mut self, logical_key: &Key, physical_key: PhysicalKey, repeat: bool) {
+        let Some(action) = classify_lot_hotkey(
+            logical_key,
+            physical_key,
+            self.ctrl_or_cmd_held,
+            self.shift_held,
+            repeat,
+        ) else {
+            return;
+        };
         let Some(game) = self.session.game_mut() else {
             return;
         };
-        let step = 64;
-        let command = match key {
-            Key::Named(NamedKey::ArrowLeft) => Move::Scroll([step, 0]),
-            Key::Named(NamedKey::ArrowRight) => Move::Scroll([-step, 0]),
-            Key::Named(NamedKey::ArrowUp) => Move::Scroll([0, step]),
-            Key::Named(NamedKey::ArrowDown) => Move::Scroll([0, -step]),
-            Key::Named(NamedKey::PageUp) => Move::LevelUp,
-            Key::Named(NamedKey::PageDown) => Move::LevelDown,
-            Key::Named(NamedKey::Space) => {
+        match action {
+            LotHotkey::TogglePause => {
                 game.toggle_pause();
                 self.changed(true, true);
-                return;
             }
-            Key::Named(NamedKey::F1) => {
-                game.set_mode(sims_ui::command::Mode::Live);
+            LotHotkey::SetSpeed(speed) => {
+                game.set_speed(speed);
                 self.changed(true, true);
-                return;
             }
-            Key::Named(NamedKey::F2) => {
-                game.set_mode(sims_ui::command::Mode::Buy);
+            LotHotkey::Mode(mode) => {
+                game.hotkey_mode(mode);
                 self.changed(true, true);
-                return;
             }
-            Key::Named(NamedKey::F3) => {
-                game.set_mode(sims_ui::command::Mode::Build);
+            LotHotkey::ToggleCameraStrip => {
+                game.toggle_camera_strip();
                 self.changed(true, true);
-                return;
             }
-            Key::Named(NamedKey::F5) => {
+            LotHotkey::TogglePanel => {
+                game.toggle_panel();
+                self.changed(true, true);
+            }
+            LotHotkey::NextSim => {
+                if game.select_next_sim() {
+                    self.changed(true, true);
+                }
+            }
+            LotHotkey::CentreSelectedSim => {
+                if game.centre_on_selected() {
+                    self.changed(true, true);
+                }
+            }
+            LotHotkey::ToggleFloor => {
+                let redraw = game.toggle_floor();
+                self.changed(redraw, true);
+            }
+            LotHotkey::StepWalls(up) => {
+                let _ = game.step_walls(up);
+                self.changed(true, true);
+            }
+            LotHotkey::RotateHeldOrCamera(cw) => {
+                if game.rotate_held(cw) {
+                    self.changed(true, true);
+                } else {
+                    let redraw = game.apply(Move::Rotate(cw));
+                    self.changed(redraw, true);
+                }
+            }
+            LotHotkey::Move(mv) => {
+                let redraw = game.apply(mv);
+                self.changed(redraw, true);
+            }
+            LotHotkey::Photo => {
+                self.photo();
+            }
+            LotHotkey::CatalogPage(delta) => {
+                if game.page_catalog(delta) {
+                    self.changed(true, true);
+                }
+            }
+            LotHotkey::SellHeld => {
+                if game.sell_held() {
+                    self.changed(true, true);
+                }
+            }
+            LotHotkey::Undo => {
+                if game.undo_buy() {
+                    self.changed(true, true);
+                }
+            }
+            LotHotkey::Redo => {
+                if game.redo_buy() {
+                    self.changed(true, true);
+                }
+            }
+            LotHotkey::QuickSave => {
                 let _ = self.save(false);
-                return;
             }
-            Key::Named(NamedKey::F7) => {
+            LotHotkey::RestoreSave => {
+                let _ = self.save(true);
+            }
+            LotHotkey::OpenSaveManager => {
+                if let Session::Shell(shell) = &mut self.session
+                    && shell.open_save_manager(None)
+                {
+                    self.changed(true, true);
+                }
+            }
+            LotHotkey::OpenTravelDialog => {
                 if let Session::Shell(shell) = &mut self.session {
                     if let Err(err) = shell.open_default_travel_dialog() {
                         shell.show_notice("Travel", format!("Travel unavailable: {err}"));
                     }
                     self.changed(true, true);
                 }
-                return;
             }
-            Key::Named(NamedKey::F8) => {
+            LotHotkey::ReturnHome => {
+                if let Session::Shell(shell) = &mut self.session
+                    && shell.active_trip().is_some()
+                {
+                    if let Err(err) = shell.return_from_destination()
+                        && (shell.screen() == ScreenKind::Lot || shell.note().is_none())
+                    {
+                        shell.show_notice("Travel", format!("Could not return home: {err}"));
+                    }
+                    self.drain_shell_audio();
+                    self.changed(true, true);
+                }
+            }
+            LotHotkey::OpenShop => {
                 if let Some(kind) = game.shop_kind_for_lot()
                     && game.open_shop(kind)
                 {
                     self.changed(true, true);
                 }
-                return;
             }
-            Key::Named(NamedKey::F9) => {
-                let _ = self.save(true);
-                return;
-            }
-            Key::Named(NamedKey::F10) => {
-                if let Session::Shell(shell) = &mut self.session {
-                    if let Err(err) = shell.open_photo_album() {
-                        shell.show_notice("Photo Album", format!("Photo Album unavailable: {err}"));
-                    }
-                    self.changed(true, true);
-                }
-                return;
-            }
-            Key::Named(NamedKey::Delete | NamedKey::Backspace) => {
-                if game.sell_held() {
-                    self.changed(true, true);
-                }
-                return;
-            }
-            Key::Character(c) => {
-                if self.ctrl_or_cmd_held {
-                    match c.as_str() {
-                        "z" | "Z" if !self.shift_held => {
-                            if game.undo_buy() {
-                                self.changed(true, true);
-                            }
-                            return;
-                        }
-                        "z" | "Z" | "y" | "Y" => {
-                            if game.redo_buy() {
-                                self.changed(true, true);
-                            }
-                            return;
-                        }
-                        "l" | "L" if !self.shift_held => {
-                            if let Session::Shell(shell) = &mut self.session
-                                && shell.open_save_manager(None)
-                            {
-                                self.changed(true, true);
-                            }
-                            return;
-                        }
-                        "t" | "T" if !self.shift_held => {
-                            if let Session::Shell(shell) = &mut self.session {
-                                if let Err(err) = shell.open_default_travel_dialog() {
-                                    shell.show_notice(
-                                        "Travel",
-                                        format!("Travel unavailable: {err}"),
-                                    );
-                                }
-                                self.changed(true, true);
-                            }
-                            return;
-                        }
-                        "h" | "H" if !self.shift_held => {
-                            if let Session::Shell(shell) = &mut self.session
-                                && shell.active_trip().is_some()
-                            {
-                                if let Err(err) = shell.return_from_destination()
-                                    && (shell.screen() == ScreenKind::Lot || shell.note().is_none())
-                                {
-                                    shell.show_notice(
-                                        "Travel",
-                                        format!("Could not return home: {err}"),
-                                    );
-                                }
-                                self.drain_shell_audio();
-                                self.changed(true, true);
-                            }
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                match c.as_str() {
-                    "+" | "=" => Move::ZoomIn,
-                    "-" | "_" => Move::ZoomOut,
-                    "[" => Move::Rotate(false),
-                    "]" => Move::Rotate(true),
-                    "," | "<" => {
-                        if game.rotate_held(false) {
-                            self.changed(true, true);
-                            return;
-                        }
-                        Move::Rotate(false)
-                    }
-                    "." | ">" => {
-                        if game.rotate_held(true) {
-                            self.changed(true, true);
-                            return;
-                        }
-                        Move::Rotate(true)
-                    }
-                    "x" | "X" => {
-                        if game.page_buy(1) {
-                            self.changed(true, true);
-                        }
-                        return;
-                    }
-                    "z" | "Z" => {
-                        if game.page_buy(-1) {
-                            self.changed(true, true);
-                        }
-                        return;
-                    }
-                    "1" => Move::Walls(Walls::Up),
-                    "2" => Move::Walls(Walls::Cutaway),
-                    "3" => Move::Walls(Walls::Down),
-                    _ => return,
-                }
-            }
-            _ => return,
-        };
-        let redraw = game.apply(command);
-        self.changed(redraw, true);
+        }
     }
 
     /// Steps the active lot (or neighborhood animation timer) for the time
@@ -2402,12 +2364,14 @@ impl ApplicationHandler for App {
                 let book_open = self.session.game().is_some_and(Game::book_open)
                     || matches!(&self.session, Session::Shell(shell) if shell.credits_open());
                 let coop_lobby_open = self.session.coop_lobby_open();
+                let cheat_console_open = self.session.game().is_some_and(Game::cheat_console_open);
                 if is_coop_toggle
                     && !save_manager_open
                     && !album_open
                     && !travel_dialog_open
                     && !shop_open
                     && !book_open
+                    && !cheat_console_open
                     && self.session.screen_kind() != ScreenKind::CreateFamily
                     && (coop_lobby_open || !self.session.has_dialog())
                 {
@@ -2926,8 +2890,14 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
-                } else {
-                    self.key(&event.logical_key);
+                } else if !lot_hotkeys_blocked(LotInputFocus {
+                    cheat_console_open,
+                    has_dialog: self.session.has_dialog(),
+                    album_open,
+                    coop_lobby_open,
+                    create_family: self.session.screen_kind() == ScreenKind::CreateFamily,
+                }) {
+                    self.key(&event.logical_key, event.physical_key, event.repeat);
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -3517,6 +3487,139 @@ fn slot(house: &std::path::Path) -> String {
 /// after a refused snapback all consume Escape instead of quitting.
 fn escape_exits(closed_menu: bool, cancelled_buy: bool, has_buy_cursor: bool) -> bool {
     !closed_menu && !cancelled_buy && !has_buy_cursor
+}
+
+/// Active UI focus flags that suppress bare Lot-mode keyboard hotkeys so
+/// typing in any text-input surface never triggers pause/speed/mode/camera
+/// commands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LotInputFocus {
+    cheat_console_open: bool,
+    has_dialog: bool,
+    album_open: bool,
+    coop_lobby_open: bool,
+    create_family: bool,
+}
+
+/// Returns `true` when any text-input or modal surface has keyboard focus and
+/// Lot-mode hotkeys must be suppressed.
+fn lot_hotkeys_blocked(focus: LotInputFocus) -> bool {
+    focus.cheat_console_open
+        || focus.has_dialog
+        || focus.album_open
+        || focus.coop_lobby_open
+        || focus.create_family
+}
+
+/// Authentic `Sims.exe` 1.91 Lot-mode keyboard action (`0x4d0ef0` `OnChar`,
+/// `0x4d12b1` `OnKeyDown`, `0x51ba1c` `cWinLive::OnKeyDown`, and `UIText.iff`
+/// `STR# 161`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LotHotkey {
+    TogglePause,
+    SetSpeed(Speed),
+    Mode(Mode),
+    ToggleCameraStrip,
+    TogglePanel,
+    NextSim,
+    CentreSelectedSim,
+    ToggleFloor,
+    StepWalls(bool),
+    RotateHeldOrCamera(bool),
+    Move(Move),
+    Photo,
+    CatalogPage(i32),
+    SellHeld,
+    Undo,
+    Redo,
+    QuickSave,
+    RestoreSave,
+    OpenSaveManager,
+    OpenTravelDialog,
+    ReturnHome,
+    OpenShop,
+}
+
+/// Maps a pressed `winit` key event in Lot mode to its authentic `Sims.exe`
+/// 1.91 hotkey action, honoring Ctrl/Cmd modifiers, physical backquote /
+/// numpad keys, and key-repeat suppression on one-shot toggles.
+fn classify_lot_hotkey(
+    logical_key: &Key,
+    physical_key: PhysicalKey,
+    ctrl_or_cmd: bool,
+    shift: bool,
+    repeat: bool,
+) -> Option<LotHotkey> {
+    const SCROLL_STEP: i32 = 64;
+    if ctrl_or_cmd {
+        if let Key::Character(c) = logical_key {
+            return match c.as_str() {
+                "z" | "Z" if !shift => Some(LotHotkey::Undo),
+                "z" | "Z" | "y" | "Y" => Some(LotHotkey::Redo),
+                "s" | "S" if !shift && !repeat => Some(LotHotkey::QuickSave),
+                "l" | "L" if !shift && !repeat => Some(LotHotkey::OpenSaveManager),
+                "t" | "T" if !shift && !repeat => Some(LotHotkey::OpenTravelDialog),
+                "h" | "H" if !shift && !repeat => Some(LotHotkey::ReturnHome),
+                _ => None,
+            };
+        }
+        return None;
+    }
+
+    match physical_key {
+        PhysicalKey::Code(KeyCode::Backquote) => {
+            return (!repeat).then_some(LotHotkey::TogglePause);
+        }
+        PhysicalKey::Code(KeyCode::NumpadAdd) => {
+            return Some(LotHotkey::Move(Move::ZoomIn));
+        }
+        PhysicalKey::Code(KeyCode::NumpadSubtract) => {
+            return Some(LotHotkey::Move(Move::ZoomOut));
+        }
+        _ => {}
+    }
+
+    match logical_key {
+        Key::Named(NamedKey::ArrowLeft) => Some(LotHotkey::Move(Move::Scroll([SCROLL_STEP, 0]))),
+        Key::Named(NamedKey::ArrowRight) => Some(LotHotkey::Move(Move::Scroll([-SCROLL_STEP, 0]))),
+        Key::Named(NamedKey::ArrowUp) => Some(LotHotkey::Move(Move::Scroll([0, SCROLL_STEP]))),
+        Key::Named(NamedKey::ArrowDown) => Some(LotHotkey::Move(Move::Scroll([0, -SCROLL_STEP]))),
+        Key::Named(NamedKey::PageUp) => Some(LotHotkey::Move(Move::LevelUp)),
+        Key::Named(NamedKey::PageDown) => Some(LotHotkey::Move(Move::LevelDown)),
+        Key::Named(NamedKey::Home) => Some(LotHotkey::StepWalls(true)),
+        Key::Named(NamedKey::End) => Some(LotHotkey::StepWalls(false)),
+        Key::Named(NamedKey::Space) => (!repeat).then_some(LotHotkey::NextSim),
+        Key::Named(NamedKey::Enter) => (!repeat).then_some(LotHotkey::CentreSelectedSim),
+        Key::Named(NamedKey::Tab) => (!repeat).then_some(LotHotkey::ToggleFloor),
+        Key::Named(NamedKey::F1) => (!repeat).then_some(LotHotkey::Mode(Mode::Live)),
+        Key::Named(NamedKey::F2) => (!repeat).then_some(LotHotkey::Mode(Mode::Buy)),
+        Key::Named(NamedKey::F3) => (!repeat).then_some(LotHotkey::Mode(Mode::Build)),
+        Key::Named(NamedKey::F4) => (!repeat).then_some(LotHotkey::ToggleCameraStrip),
+        Key::Named(NamedKey::F5) => (!repeat).then_some(LotHotkey::Mode(Mode::Options)),
+        Key::Named(NamedKey::F7) => (!repeat).then_some(LotHotkey::OpenTravelDialog),
+        Key::Named(NamedKey::F8) => (!repeat).then_some(LotHotkey::OpenShop),
+        Key::Named(NamedKey::F9) => (!repeat).then_some(LotHotkey::RestoreSave),
+        Key::Named(NamedKey::F10) => (!repeat).then_some(LotHotkey::TogglePanel),
+        Key::Named(NamedKey::Delete | NamedKey::Backspace) => Some(LotHotkey::SellHeld),
+        Key::Character(c) => match c.as_str() {
+            "`" | "~" | "p" | "P" => (!repeat).then_some(LotHotkey::TogglePause),
+            "1" => Some(LotHotkey::SetSpeed(Speed::Normal)),
+            "2" => Some(LotHotkey::SetSpeed(Speed::Fast)),
+            "3" => Some(LotHotkey::SetSpeed(Speed::Ultra)),
+            " " => (!repeat).then_some(LotHotkey::NextSim),
+            "+" | "=" => Some(LotHotkey::Move(Move::ZoomIn)),
+            "-" | "_" => Some(LotHotkey::Move(Move::ZoomOut)),
+            "[" => Some(LotHotkey::Move(Move::Rotate(false))),
+            "]" => Some(LotHotkey::Move(Move::Rotate(true))),
+            "," | "<" => Some(LotHotkey::RotateHeldOrCamera(false)),
+            "." | ">" => Some(LotHotkey::RotateHeldOrCamera(true)),
+            "c" | "C" => (!repeat).then_some(LotHotkey::Photo),
+            "z" | "Z" => Some(LotHotkey::CatalogPage(-1)),
+            "x" | "X" => Some(LotHotkey::CatalogPage(1)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -4284,5 +4387,223 @@ mod tests {
             canvas_size(PhysicalSize::new(1200, 900), window_scale(1.5)),
             Some([1200, 900])
         );
+    }
+
+    #[test]
+    fn native_lot_hotkey_table_matches_sims_1_91() {
+        let unid = PhysicalKey::Code(KeyCode::KeyA);
+        let ch = |s: &str| Key::Character(s.into());
+
+        // Pause: backquote / tilde / physical Backquote / P (non-repeat only).
+        assert_eq!(
+            classify_lot_hotkey(&ch("`"), unid, false, false, false),
+            Some(LotHotkey::TogglePause)
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("~"), unid, false, true, false),
+            Some(LotHotkey::TogglePause)
+        );
+        assert_eq!(
+            classify_lot_hotkey(
+                &ch("§"),
+                PhysicalKey::Code(KeyCode::Backquote),
+                false,
+                false,
+                false
+            ),
+            Some(LotHotkey::TogglePause)
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("p"), unid, false, false, false),
+            Some(LotHotkey::TogglePause)
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("P"), unid, false, true, false),
+            Some(LotHotkey::TogglePause)
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("p"), unid, false, false, true),
+            None
+        );
+
+        // Speed 1 / 2 / 3 (NOT walls!).
+        assert_eq!(
+            classify_lot_hotkey(&ch("1"), unid, false, false, false),
+            Some(LotHotkey::SetSpeed(Speed::Normal))
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("2"), unid, false, false, false),
+            Some(LotHotkey::SetSpeed(Speed::Fast))
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("3"), unid, false, false, false),
+            Some(LotHotkey::SetSpeed(Speed::Ultra))
+        );
+
+        // Modes & panels: F1-F5 + F10, plus Ctrl+S save.
+        assert_eq!(
+            classify_lot_hotkey(&Key::Named(NamedKey::F1), unid, false, false, false),
+            Some(LotHotkey::Mode(Mode::Live))
+        );
+        assert_eq!(
+            classify_lot_hotkey(&Key::Named(NamedKey::F2), unid, false, false, false),
+            Some(LotHotkey::Mode(Mode::Buy))
+        );
+        assert_eq!(
+            classify_lot_hotkey(&Key::Named(NamedKey::F3), unid, false, false, false),
+            Some(LotHotkey::Mode(Mode::Build))
+        );
+        assert_eq!(
+            classify_lot_hotkey(&Key::Named(NamedKey::F4), unid, false, false, false),
+            Some(LotHotkey::ToggleCameraStrip)
+        );
+        assert_eq!(
+            classify_lot_hotkey(&Key::Named(NamedKey::F5), unid, false, false, false),
+            Some(LotHotkey::Mode(Mode::Options))
+        );
+        assert_eq!(
+            classify_lot_hotkey(&Key::Named(NamedKey::F10), unid, false, false, false),
+            Some(LotHotkey::TogglePanel)
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("s"), unid, true, false, false),
+            Some(LotHotkey::QuickSave)
+        );
+
+        // Sim selection, camera, walls, floor, zoom, rotate, snapshot, catalog paging.
+        assert_eq!(
+            classify_lot_hotkey(&Key::Named(NamedKey::Space), unid, false, false, false),
+            Some(LotHotkey::NextSim)
+        );
+        assert_eq!(
+            classify_lot_hotkey(&Key::Named(NamedKey::Enter), unid, false, false, false),
+            Some(LotHotkey::CentreSelectedSim)
+        );
+        assert_eq!(
+            classify_lot_hotkey(&Key::Named(NamedKey::Tab), unid, false, false, false),
+            Some(LotHotkey::ToggleFloor)
+        );
+        assert_eq!(
+            classify_lot_hotkey(&Key::Named(NamedKey::Home), unid, false, false, false),
+            Some(LotHotkey::StepWalls(true))
+        );
+        assert_eq!(
+            classify_lot_hotkey(&Key::Named(NamedKey::End), unid, false, false, false),
+            Some(LotHotkey::StepWalls(false))
+        );
+        assert_eq!(
+            classify_lot_hotkey(&Key::Named(NamedKey::PageUp), unid, false, false, false),
+            Some(LotHotkey::Move(Move::LevelUp))
+        );
+        assert_eq!(
+            classify_lot_hotkey(&Key::Named(NamedKey::PageDown), unid, false, false, false),
+            Some(LotHotkey::Move(Move::LevelDown))
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("+"), unid, false, true, false),
+            Some(LotHotkey::Move(Move::ZoomIn))
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("="), unid, false, false, false),
+            Some(LotHotkey::Move(Move::ZoomIn))
+        );
+        assert_eq!(
+            classify_lot_hotkey(
+                &ch("+"),
+                PhysicalKey::Code(KeyCode::NumpadAdd),
+                false,
+                false,
+                false
+            ),
+            Some(LotHotkey::Move(Move::ZoomIn))
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("-"), unid, false, false, false),
+            Some(LotHotkey::Move(Move::ZoomOut))
+        );
+        assert_eq!(
+            classify_lot_hotkey(
+                &ch("-"),
+                PhysicalKey::Code(KeyCode::NumpadSubtract),
+                false,
+                false,
+                false
+            ),
+            Some(LotHotkey::Move(Move::ZoomOut))
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch(","), unid, false, false, false),
+            Some(LotHotkey::RotateHeldOrCamera(false))
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("."), unid, false, false, false),
+            Some(LotHotkey::RotateHeldOrCamera(true))
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("c"), unid, false, false, false),
+            Some(LotHotkey::Photo)
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("z"), unid, false, false, false),
+            Some(LotHotkey::CatalogPage(-1))
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("x"), unid, false, false, false),
+            Some(LotHotkey::CatalogPage(1))
+        );
+        assert_eq!(
+            classify_lot_hotkey(&Key::Named(NamedKey::Delete), unid, false, false, false),
+            Some(LotHotkey::SellHeld)
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("z"), unid, true, false, false),
+            Some(LotHotkey::Undo)
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("z"), unid, true, true, false),
+            Some(LotHotkey::Redo)
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("y"), unid, true, false, false),
+            Some(LotHotkey::Redo)
+        );
+        // Ctrl+P / Ctrl+1 / Ctrl+C never fire bare Lot hotkeys.
+        assert_eq!(
+            classify_lot_hotkey(&ch("p"), unid, true, false, false),
+            None
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("1"), unid, true, false, false),
+            None
+        );
+        assert_eq!(
+            classify_lot_hotkey(&ch("c"), unid, true, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn text_input_guard_suppresses_hotkeys_in_all_five_text_surfaces() {
+        assert!(!lot_hotkeys_blocked(LotInputFocus::default()));
+        assert!(lot_hotkeys_blocked(LotInputFocus {
+            cheat_console_open: true,
+            ..LotInputFocus::default()
+        }));
+        assert!(lot_hotkeys_blocked(LotInputFocus {
+            has_dialog: true,
+            ..LotInputFocus::default()
+        }));
+        assert!(lot_hotkeys_blocked(LotInputFocus {
+            album_open: true,
+            ..LotInputFocus::default()
+        }));
+        assert!(lot_hotkeys_blocked(LotInputFocus {
+            coop_lobby_open: true,
+            ..LotInputFocus::default()
+        }));
+        assert!(lot_hotkeys_blocked(LotInputFocus {
+            create_family: true,
+            ..LotInputFocus::default()
+        }));
     }
 }
