@@ -777,6 +777,15 @@ impl TravelChrome {
         self.pressed
     }
 
+    /// Clears transient hover and press state (e.g. when the pointer leaves
+    /// the window or releases outside).
+    pub fn clear_pointer(&mut self) -> bool {
+        let had = self.hovered.is_some() || self.pressed.is_some();
+        self.hovered = None;
+        self.pressed = None;
+        had
+    }
+
     /// Updates hover state for a pointer move at `(x, y)`.
     pub fn pointer_move(&mut self, x: i32, y: i32, layout: &TravelLayout) {
         self.pointer = [x, y];

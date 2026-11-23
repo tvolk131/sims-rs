@@ -704,8 +704,12 @@ pub fn layout_with_options_lot(
     // below can overflow.
     let [width, height] = size.map(|v| v.clamp(0, 1 << 15));
     let mut items = Vec::new();
-    let tall = controls.mode == Mode::Buy;
-    let strip_height = if tall { TALL_STRIP } else { STRIP };
+    // Native `Sims.exe` `0x509af5`, `0x509d41`, `0x509e6f..0x509e9d`, `0x509f3c`:
+    // Live (residential), Buy (`cWinCatalog`), Build (`cWinArch`), and Options
+    // (`cWinOptions`) all use `kUniversalCPBkg` (`4910`, `PanelBack.bmp`, 100 px).
+    // `kTallSubpanel` (`4918`, `TallSubPanel.TGA`, 150 px) is only used by
+    // expansion community-lot Live Mode (`0x4cfde1` -> `0x509dc1`), never Buy Mode.
+    let strip_height = STRIP;
     let top = height - strip_height;
     let cluster = [0, height - CLUSTER[1]];
     let at = |x: i32, y: i32, w: i32, h: i32| Rect::new(cluster[0] + x, cluster[1] + y, w, h);
@@ -726,7 +730,7 @@ pub fn layout_with_options_lot(
         let strip = Rect::new(CLUSTER[0], top, width - CLUSTER[0], strip_height);
         items.push(Item {
             rect: strip,
-            kind: Kind::Stretched(if tall { 4918 } else { id::STRIP }),
+            kind: Kind::Stretched(id::STRIP),
             command: None,
         });
         match controls.mode {
@@ -864,8 +868,9 @@ pub fn layout_with_options_lot(
             true,
             Camera::FloorDown,
         ),
-        // Measured on the original's screen: the roof, the three wall
-        // views and the snapshot camera.
+        // Native `Sims.exe` `0x53ad4f..0x53adb5` 4-way mutually exclusive radio
+        // group (`[ui + 0x48]` = 8 Roof | 1 WallsUp | 4 Cutaway | 2 WallsDown):
+        // exactly one of the four curved view buttons is lit at any time.
         view(
             id::ROOF,
             at(32, 78, 22, 19),
@@ -876,21 +881,21 @@ pub fn layout_with_options_lot(
         view(
             id::WALLS_UP,
             at(56, 80, 21, 21),
-            camera.walls == Walls::Up,
+            !camera.roof && camera.walls == Walls::Up,
             true,
             Camera::Walls(Walls::Up),
         ),
         view(
             id::CUTAWAY,
             at(80, 85, 21, 21),
-            camera.walls == Walls::Cutaway,
+            !camera.roof && camera.walls == Walls::Cutaway,
             true,
             Camera::Walls(Walls::Cutaway),
         ),
         view(
             id::WALLS_DOWN,
             at(103, 95, 22, 15),
-            camera.walls == Walls::Down,
+            !camera.roof && camera.walls == Walls::Down,
             true,
             Camera::Walls(Walls::Down),
         ),
@@ -4745,9 +4750,8 @@ mod tests {
             }
         )));
 
-        // Buy mode's stretched 4918 (`kTallSubpanel`, 150 px) extends 50 px
-        // transparently above the 100 px strip: only its bottom `STRIP` px
-        // cover the lot.
+        // Buy mode uses the standard 100 px `id::STRIP` (`PanelBack.bmp`, 4910;
+        // `Sims.exe` `0x509e6f..0x509e9d`) with zero 50 px overhang into the lot.
         let buy_expanded = layout(
             [800, 600],
             &s,
@@ -4757,9 +4761,60 @@ mod tests {
                 ..controls
             },
         );
+        let buy_strip = buy_expanded
+            .iter()
+            .find(|i| matches!(i.kind, Kind::Stretched(_)))
+            .expect("expanded buy strip");
+        assert_eq!(buy_strip.kind, Kind::Stretched(id::STRIP));
+        assert_eq!(
+            buy_strip.rect,
+            Rect::new(CLUSTER[0], 600 - STRIP, 800 - CLUSTER[0], STRIP)
+        );
         assert!(!covers(&buy_expanded, [300, 470]));
         assert!(covers(&buy_expanded, [300, 520]));
         assert!(job_items.iter().any(|i| i.kind == Kind::Friends(12)));
+
+        // Roof / Walls Up / Cutaway / Walls Down form a strict 4-way radio group
+        // (`Sims.exe` `0x53ad4f..0x53adb5`): exactly one button is selected for
+        // every `(roof, walls)` combination.
+        for roof in [false, true] {
+            for walls in [Walls::Down, Walls::Cutaway, Walls::Up] {
+                let c = Controls {
+                    camera: CameraState {
+                        roof,
+                        walls,
+                        ..CameraState::default()
+                    },
+                    ..controls
+                };
+                let radio_items = layout([800, 600], &s, &c);
+                let selected_ids: Vec<i32> = radio_items
+                    .iter()
+                    .filter_map(|i| match i.kind {
+                        Kind::Button {
+                            id, selected: true, ..
+                        } if matches!(
+                            id,
+                            id::ROOF | id::WALLS_UP | id::CUTAWAY | id::WALLS_DOWN
+                        ) =>
+                        {
+                            Some(id)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let expected_id = if roof {
+                    id::ROOF
+                } else {
+                    match walls {
+                        Walls::Up => id::WALLS_UP,
+                        Walls::Cutaway => id::CUTAWAY,
+                        Walls::Down => id::WALLS_DOWN,
+                    }
+                };
+                assert_eq!(selected_ids, vec![expected_id]);
+            }
+        }
 
         // When show_money is false (global 32 == 1, 0x4f24fa -> 0x53b2a4),
         // both the money box and the family-friends counter are omitted.
