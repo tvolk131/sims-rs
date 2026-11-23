@@ -541,10 +541,21 @@ impl Machine<'_, '_> {
     ///    names nothing is left where it is, so later passes find it
     ///    again and the tokens after it are not reached.
     ///
-    /// The routine always ends with the true branch (0x44f7f0). A token
-    /// found at a place past 0x7fff, whose place the original cuts to a
-    /// negative word, fails loudly; an inventory never holds that many
-    /// (adding stops at 0x7fff tokens).
+    /// The routine always ends with the true branch (0x44f7f0).
+    ///
+    /// The place found is kept as a word (0x41f6e1), and adding stops at
+    /// 0x7fff tokens, but a loaded inventory can hold more. A token found
+    /// past 0x7fff is read and erased through its place cut to a signed
+    /// word:
+    /// - -1 (index 65535 and every 65536 after) reads as nothing found,
+    ///   and the pass ends;
+    /// - any other negative place is past the end for the read (0x41f746
+    ///   compares it unsigned), so the token keeps the values the routine
+    ///   gave it before the search (kind 0, GUID 0, count 1, 0x450a1d to
+    ///   0x450a23): motive 9 becomes 1, and nothing is erased (0x41f56b
+    ///   also compares unsigned);
+    /// - a place that wraps back to 0 or more reads, and erases, the
+    ///   token there, whatever its kind.
     fn restore_saved_state(&mut self) -> Result<(), Trap> {
         let temp = *self
             .me()?
@@ -570,23 +581,23 @@ impl Machine<'_, '_> {
             .get(31)
             .copied()
             .ok_or_else(|| Trap::Invalid("a person has no data word 31".into()))?;
-        let place = self.inventory_slot(neighbor);
-        let items = &self.world.neighbors.inventories[place].items;
+        let inventory = self.inventory_slot(neighbor);
+        let items = &self.world.neighbors.inventories[inventory].items;
         let passes = items.iter().filter(|item| item.kind == SAVED_STATE).count() as i16;
         for _ in 0..passes.max(0) {
-            let items = &self.world.neighbors.inventories[place].items;
+            let items = &self.world.neighbors.inventories[inventory].items;
             let Some(index) = items.iter().position(|item| item.kind == SAVED_STATE) else {
                 continue;
             };
-            if index > 0x7fff {
-                return Err(Trap::Unsupported(format!(
-                    "Generic Sims Call 21 found a token at place {index}, which the original \
-                     cuts to a negative word (0x41f6e1)"
-                )));
+            let place = (index as u16) as i16;
+            if place == -1 {
+                continue;
             }
-            let token = &items[index];
-            let count = token.count as i16;
-            let Some(target) = restored(token.guid) else {
+            let token = usize::try_from(place).ok().and_then(|at| items.get(at));
+            // A negative place reads nothing and leaves the routine's own
+            // values: GUID 0, count 1 (0x450a1d to 0x450a23).
+            let (guid, count) = token.map_or((0, 1), |token| (token.guid, token.count as i16));
+            let Some(target) = restored(guid) else {
                 continue;
             };
             match target {
@@ -605,7 +616,9 @@ impl Machine<'_, '_> {
                         })? = count;
                 }
             }
-            self.world.neighbors.inventories[place].items.remove(index);
+            if let Ok(at) = usize::try_from(place) {
+                self.world.neighbors.inventories[inventory].items.remove(at);
+            }
         }
         Ok(())
     }

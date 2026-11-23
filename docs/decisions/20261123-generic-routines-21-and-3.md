@@ -59,10 +59,14 @@ How it was checked:
 
 **Unverified:**
 
-- Whether the original's departure writes the kind-2 tokens routine 21
-  restores. Our travel carries live motives on the person, and on the trip
-  tested the travelers' inventories hold none, so routine 21 changes
-  nothing there.
+- Which kind-2 tokens a real trip leaves for routine 21 to restore. Our
+  travel carries live motives on the person, and on the trip tested the
+  travelers' inventories hold none, so routine 21 changes nothing there.
+  The likely writer is Generic Sims Call 17 (0x450660). It casts the caller
+  to a person and calls 0x45a22d with temps 0 to 3, which works on that
+  person's neighbor inventory (0x42a8a1) with token kind 2. For example,
+  `ClownPortal.iff` tree 0x1001 node 6 calls it. Routine 17 is one of the
+  residuals.
 - Whether the original keeps arriving Sims off the lot, or idle, until the
   marker places them. We place them by the arrival portal at load, so a
   Sim walking when the marker places it still shows in the new place for

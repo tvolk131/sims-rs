@@ -1551,3 +1551,34 @@ fn generic_call_3_takes_the_true_branch_and_changes_nothing() {
     assert_eq!(now.data, before.data);
     assert_eq!(now.motives, before.motives);
 }
+
+#[test]
+fn generic_call_21_reads_a_token_past_0x7fff_through_its_place_cut_to_a_word() {
+    // `at` tokens of kind 1 (the one at 5 with GUID 1 and count 44),
+    // then one of kind 2 with GUID 2 and count 9.
+    let run = |at: usize| {
+        let mut fx = neighbors();
+        let mut items = vec![token(1, 0, 3); at];
+        items[5] = token(1, 1, 44);
+        items.push(token(2, 2, 9));
+        fx.world.neighbors.inventories = vec![Inventory { neighbor: 1, items }];
+        fx.sim_mut().person.as_mut().unwrap().motives = [50.0; 16];
+        assert_eq!(restore(&mut fx, SIM as i16), Ok(true), "{at}");
+        let items = &fx.world.neighbors.inventories[0].items;
+        let motives = fx.sim().person.as_ref().unwrap().motives;
+        (items.len(), items[5].clone(), motives)
+    };
+    // Place -32768: nothing is read, so GUID 0 and count 1 restore motive
+    // 9, and nothing is erased.
+    let (len, fifth, motives) = run(0x8000);
+    assert_eq!((len, fifth), (0x8001, token(1, 1, 44)));
+    assert_eq!((motives[9], motives[5]), (1.0, 50.0));
+    // Place -1: not found.
+    let (len, _, motives) = run(0xffff);
+    assert_eq!((len, motives), (0x10000, [50.0; 16]));
+    // Place 5 (index 65541): the kind 1 token there is read (GUID 1,
+    // motive 6) and erased.
+    let (len, fifth, motives) = run(0x10005);
+    assert_eq!((len, fifth), (0x10005, token(1, 0, 3)));
+    assert_eq!((motives[6], motives[5]), (44.0, 50.0));
+}

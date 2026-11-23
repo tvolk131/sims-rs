@@ -139,14 +139,16 @@ fn the_middle_ped_marker_places_an_arriving_family_once() {
         .map(|o| o.id)
         .expect("lot 93 has a middle ped marker");
 
-    game.run(ARRIVAL);
+    assert_eq!(game.run(ARRIVAL), ARRIVAL, "lot 93 stopped advancing");
     let mut last: BTreeMap<u16, [i32; 3]> = travelers
         .iter()
         .map(|&id| (id, game.lot().world().objects[&id].position))
         .collect();
     let mut jumps = Vec::new();
     for _ in 0..WATCHED {
-        game.run(1);
+        // An unanswered dialog would stop the ticks without stopping the
+        // lot, and the positions would stand still.
+        assert_eq!(game.run(1), 1, "lot 93 stopped advancing");
         assert!(game.stopped().is_none(), "lot halted: {:?}", game.stopped());
         let tick = game.lot().ticks();
         for &id in &travelers {
