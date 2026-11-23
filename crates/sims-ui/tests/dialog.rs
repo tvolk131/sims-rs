@@ -621,6 +621,11 @@ fn ordinary_dialogs_format_tokens_resolve_icon_modes_and_caller_title_fallback()
         live_msg.icon.as_ref().map(|i| (i.width, i.height)),
         Some((133, 103))
     );
+    let live_laid = dialog::layout([800, 600], &live_msg, &art).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(live_laid.lines[3].0.as_bytes())),
+        "c6da3959e6ad3235004d9662458a497876cafddada3bd520d475c581b39337d0"
+    );
 
     // 2. Native 1.91 token semantics (`0x44bf66`, `0x44c034`, `0x44c861`, `0x44c9c4`):
     //    - `$FamilyAssets:N` uses family ID in local `N` and consumes `:N`
@@ -644,7 +649,7 @@ fn ordinary_dialogs_format_tokens_resolve_icon_modes_and_caller_title_fallback()
     let local_job = careers.title(2, 3, false).expect("career 2 level 3");
     let grade_2 = careers.grade(2);
     let formatted_all = dialog::format_text(
-        "fam=$Family assets=$FamilyAssets:0 grade=$Grade:2 time=$TimeLocal:3 cost=$$Local:1 cur=$Job single=$Job:4 both=$Job:4:5",
+        "fam=$Family assets=$FamilyAssets:0 unresolved=$FamilyAssets:99 grade=$Grade:2 time=$TimeLocal:3 cost=$$Local:1 cur=$Job single=$Job:4 both=$Job:4:5",
         sim_id,
         &fmt_world,
         &index,
@@ -654,7 +659,7 @@ fn ordinary_dialogs_format_tokens_resolve_icon_modes_and_caller_title_fallback()
     assert_eq!(
         formatted_all,
         format!(
-            "fam=Newbie assets=12345 grade={grade_2} time= 1:00 pm cost=$500 cur={caller_job} single={caller_job} both={local_job}"
+            "fam=Newbie assets=12345 unresolved=$FamilyAssets:99 grade={grade_2} time= 1:00 pm cost=$500 cur={caller_job} single={caller_job} both={local_job}"
         )
     );
 
@@ -680,6 +685,10 @@ fn ordinary_dialogs_format_tokens_resolve_icon_modes_and_caller_title_fallback()
             }
         }
         let mut operands = [0u8; 8];
+        if mode == 4 {
+            // Exercise mode 4's operand 1 string formatting path (`0x436297`).
+            operands[1] = msg_str_id;
+        }
         operands[2] = msg_str_id;
         operands[5] = 0; // kind 0 (OK)
         operands[6] = 0; // title fallback -> caller's display name (`sim_name`)

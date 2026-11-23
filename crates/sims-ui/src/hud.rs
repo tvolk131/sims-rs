@@ -2277,14 +2277,14 @@ fn interests(
     let left = arrow_w + 6;
     let right = panel.width - arrow_w - 4;
     // 0x519251 / 0x519274: 2 columns (6/page) at 800 px (`panel.width == 279`),
-    // 3 columns (9/page) at 1024 px (`panel.width == 503`), scaling smoothly on
-    // wider viewports.
-    let cols = if panel.width <= 300 {
-        ((right - left + 3) / col_stride).clamp(1, 2) as usize
-    } else if panel.width <= 520 {
-        3
+    // 3 columns (9/page) at 1024 px (`panel.width == 503`), never exceeding
+    // the columns that fit strictly inside `left..right` at intermediate widths
+    // such as 880 px.
+    let max_fit = ((right - left + 3) / col_stride).max(1) as usize;
+    let cols = if panel.width <= 520 {
+        max_fit.min(3)
     } else {
-        ((right - left + 3) / col_stride).max(3) as usize
+        max_fit
     };
     let per_page = (cols * rows).max(1);
     let pages = list.len().div_ceil(per_page).max(1);

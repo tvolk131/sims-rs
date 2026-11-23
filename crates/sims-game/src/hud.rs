@@ -274,6 +274,9 @@ pub struct Hud {
     pub build_state: BuildState,
     /// The Build Mode strip widgets and popup card as last laid out.
     build_layout: BuildLayout,
+    /// Neighborhood families (`FAMI` / `FAMs`) cached for ordinary VM dialog
+    /// `$Family` (`0x44c034`) and `$FamilyAssets:N` (`0x44bf66`) formatting.
+    families: std::collections::BTreeMap<i32, dialog::FamilyInfo>,
     /// The interface's sounds, until the game takes them.
     sounds: Vec<SoundEvent>,
 }
@@ -451,7 +454,9 @@ impl Hud {
             .and_then(|n| neighborhood.family_in(n))
             .map(|(_, f)| f.members.clone())
             .unwrap_or_default();
-        Self::open_with_members(install, members, assets, world, friendship)
+        let mut hud = Self::open_with_members(install, members, assets, world, friendship)?;
+        hud.families = load_neighborhood_families(&neighborhood);
+        Ok(hud)
     }
 
     /// Reads the art and faces for a lot whose occupying household members
@@ -524,7 +529,7 @@ impl Hud {
             .and_then(|n| neighborhood.family_in(n))
             .map(|(_, f)| f.members.clone())
             .unwrap_or_default();
-        Self::from_preloaded_with_members(
+        let mut hud = Self::from_preloaded_with_members(
             install,
             members,
             assets,
@@ -533,7 +538,9 @@ impl Hud {
             static_part,
             shared_part,
             pool,
-        )
+        )?;
+        hud.families = load_neighborhood_families(neighborhood);
+        Ok(hud)
     }
 
     /// Builds a [`Hud`] from preloaded [`HudStatic`] and [`HudShared`] tables
@@ -700,8 +707,15 @@ impl Hud {
                 ..BuildState::default()
             },
             build_layout: BuildLayout::default(),
+            families: std::collections::BTreeMap::new(),
             sounds: Vec::new(),
         }
+    }
+
+    /// Replaces the cached neighborhood family table used for ordinary VM dialog
+    /// `$Family` / `$FamilyAssets:N` formatting.
+    pub fn set_families(&mut self, families: std::collections::BTreeMap<i32, dialog::FamilyInfo>) {
+        self.families = families;
     }
 
     /// Forgets what the panel kept of the lot it showed, for a lot put
@@ -1929,7 +1943,7 @@ impl Hud {
             art: Some(&self.art),
             careers: Some(&self.careers),
             fame: Some(&self.fame),
-            families: None,
+            families: Some(&self.families),
         };
         let read = Message::read_with_context(
             world,
@@ -2540,7 +2554,13 @@ impl Hud {
                 ) {
                     continue;
                 }
-                if rects_overlap(coop, item.rect) || rects_overlap(saves, item.rect) {
+                let obstacle = match &item.kind {
+                    hud::Kind::OptionsTooltip(text) => {
+                        options::tooltip_rect(size, &self.art, item.rect, text).unwrap_or(item.rect)
+                    }
+                    _ => item.rect,
+                };
+                if rects_overlap(coop, obstacle) || rects_overlap(saves, obstacle) {
                     return false;
                 }
             }
@@ -2597,18 +2617,18 @@ impl Hud {
                 return Some((coop, saves));
             }
         }
-        // If an Options help balloon occupies the row immediately above the
-        // strip, step up cleanly above all floating balloons/tooltips.
+        // If an Options help balloon or Quick Tips tooltip occupies the row
+        // immediately above the strip, step up cleanly above their actual drawn boxes.
         let top_float = self
             .items
             .iter()
-            .filter(|i| {
-                matches!(
-                    i.kind,
-                    hud::Kind::OptionsBalloon(_) | hud::Kind::OptionsTooltip(_)
-                )
+            .filter_map(|i| match &i.kind {
+                hud::Kind::OptionsBalloon(_) => Some(i.rect.y),
+                hud::Kind::OptionsTooltip(text) => {
+                    options::tooltip_rect(size, &self.art, i.rect, text).map(|r| r.y)
+                }
+                _ => None,
             })
-            .map(|i| i.rect.y)
             .min()
             .unwrap_or(above_y);
         let lifted_y = (top_float - BTN_H - 4).max(4);
@@ -3558,6 +3578,38 @@ fn render_wall_swatch(
         depth: None,
     };
     render_image_to_swatch(&masked)
+}
+
+/// Reads neighborhood family surnames (`FAMs`) and net assets (`FAMI` budget +
+/// architecture value, `0x410241` / `0x410271`) from `Neighborhood.iff` so
+/// ordinary VM dialog `$Family` / `$FamilyAssets:N` tokens have live data.
+fn load_neighborhood_families(
+    neighborhood: &Neighborhood,
+) -> std::collections::BTreeMap<i32, dialog::FamilyInfo> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut surnames: std::collections::BTreeMap<u16, String> = std::collections::BTreeMap::new();
+    let iff_path = neighborhood.directory.join("Neighborhood.iff");
+    if let Ok(bytes) = std::fs::read(&iff_path)
+        && let Ok(iff) = sims_formats::iff::Iff::parse(bytes)
+    {
+        for chunk in &iff.chunks {
+            if chunk.kind() == "FAMs"
+                && let Ok(table) = sims_formats::strings::StringTable::parse(iff.data(chunk))
+                && let Some(name) = table
+                    .get(0, US_ENGLISH)
+                    .or_else(|| table.entries.first().map(|e| e.text.as_str()))
+                && !name.is_empty()
+            {
+                surnames.insert(chunk.id, name.to_owned());
+            }
+        }
+    }
+    for (&id, fam) in &neighborhood.families {
+        let name = surnames.remove(&id).unwrap_or_default();
+        let assets = fam.budget.saturating_add(fam.architecture_value);
+        out.insert(i32::from(id), dialog::FamilyInfo { name, assets });
+    }
+    out
 }
 
 #[cfg(test)]

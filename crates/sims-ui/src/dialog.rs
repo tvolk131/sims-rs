@@ -704,7 +704,21 @@ fn format_dialog_text(
         if let Some(info) = families.and_then(|f| f.get(&fam_id))
             && !info.name.is_empty()
         {
-            text = replace_token_safe(&text, "$Family", &info.name);
+            // Do not corrupt an unresolved `$FamilyAssets` token into `<Name>Assets`.
+            let mut out = String::with_capacity(text.len());
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find("$Family") {
+                out.push_str(&rest[..at]);
+                let after = &rest[at + "$Family".len()..];
+                if after.starts_with("Assets") {
+                    out.push_str("$Family");
+                } else {
+                    out.push_str(&info.name);
+                }
+                rest = after;
+            }
+            out.push_str(rest);
+            text = out;
         }
     }
 

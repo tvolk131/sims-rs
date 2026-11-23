@@ -1027,28 +1027,45 @@ pub fn draw_balloon(frame: &mut Frame, art: &Art, balloon: &OptionsBalloon) {
     }
 }
 
-/// Draws a Quick Tip tooltip box above an Options button (`0x517a6f`).
-pub fn draw_tooltip(frame: &mut Frame, art: &Art, anchor: Rect, text: &str) {
-    let Some(font) = art.font(LABEL_FONT) else {
-        return;
-    };
+/// Computes the screen rectangle of a Quick Tip tooltip box above `anchor`
+/// (`0x517a6f`), matching [`draw_tooltip`] byte-for-byte.
+pub fn tooltip_rect(size: [i32; 2], art: &Art, anchor: Rect, text: &str) -> Option<Rect> {
+    let font = art.font(LABEL_FONT)?;
     if text.is_empty() {
-        return;
+        return None;
     }
     let pad_x = 5;
     let pad_y = 2;
     let w = font.width(text) + pad_x * 2;
     let h = font.line_height.max(1) + pad_y * 2;
+    let x = (anchor.x + (anchor.width - w) / 2).clamp(0, (size[0] - w).max(0));
+    let y = (anchor.y - h - 2).clamp(0, (size[1] - h).max(0));
+    Some(Rect::new(x, y, w, h))
+}
+
+/// Draws a Quick Tip tooltip box above an Options button (`0x517a6f`).
+pub fn draw_tooltip(frame: &mut Frame, art: &Art, anchor: Rect, text: &str) {
     let fw = i32::try_from(frame.width()).unwrap_or(i32::MAX);
     let fh = i32::try_from(frame.height()).unwrap_or(i32::MAX);
-    let x = (anchor.x + (anchor.width - w) / 2).clamp(0, (fw - w).max(0));
-    let y = (anchor.y - h - 2).clamp(0, (fh - h).max(0));
-    frame.fill(Rect::new(x, y, w, h), LABEL);
+    let Some(r) = tooltip_rect([fw, fh], art, anchor, text) else {
+        return;
+    };
+    let Some(font) = art.font(LABEL_FONT) else {
+        return;
+    };
+    let pad_x = 5;
+    let pad_y = 2;
+    frame.fill(r, LABEL);
     frame.fill(
-        Rect::new(x + 1, y + 1, (w - 2).max(0), (h - 2).max(0)),
+        Rect::new(
+            r.x + 1,
+            r.y + 1,
+            (r.width - 2).max(0),
+            (r.height - 2).max(0),
+        ),
         TOOLTIP_BACK,
     );
-    font.draw(frame, text, [x + pad_x, y + pad_y], LABEL);
+    font.draw(frame, text, [r.x + pad_x, r.y + pad_y], LABEL);
 }
 
 /// Computes the x coordinate of a horizontal `cTSWinSlider`'s thumb

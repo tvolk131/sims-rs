@@ -272,6 +272,11 @@ fn buy_and_build_hover_popups_render_native_popup_info_tiles_chrome() {
         "Buy right edge"
     );
     assert_eq!(
+        frame.pixel(pr.x, pr.y + pr.height / 2),
+        Some(sheet_rgb(0, cell_h)),
+        "Buy left edge"
+    );
+    assert_eq!(
         frame.pixel(pr.x + 20, pr.y + pr.height - 16),
         Some(sheet_rgb(cell_w, cell_h)),
         "Buy tiled interior"
@@ -379,9 +384,19 @@ fn buy_and_build_hover_popups_render_native_popup_info_tiles_chrome() {
         "Build BR corner"
     );
     assert_eq!(
+        bframe.pixel(br.x + br.width / 2, br.y),
+        Some(sheet_rgb(cell_w, 0)),
+        "Build top edge"
+    );
+    assert_eq!(
         bframe.pixel(br.x + br.width / 2, br.y + br.height - 1),
         Some(sheet_rgb(cell_w, sheet.height - 1)),
         "Build bottom edge"
+    );
+    assert_eq!(
+        bframe.pixel(br.x, br.y + br.height / 2),
+        Some(sheet_rgb(0, cell_h)),
+        "Build left edge"
     );
     assert_eq!(
         bframe.pixel(br.x + br.width - 1, br.y + br.height / 2),

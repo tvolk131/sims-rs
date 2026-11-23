@@ -737,7 +737,7 @@ impl BuyCatalog {
                 // base_graphic_id != 0) or an interaction table.
                 let graphics = read_i16(data, OBJD_GRAPHICS);
                 let ttab = read_i16(data, OBJD_TTAB);
-                if any_sort == 0 || (master == 0 && graphics == 0 && ttab <= 0) {
+                if !is_buy_catalog_eligible(any_sort, master, graphics, ttab) {
                     if !name.is_empty() {
                         fallback_names.insert(guid, name);
                     }
@@ -1562,13 +1562,14 @@ fn read_ttab_usage(iff: &Iff, ttab_id: i16) -> (Option<UsageRestriction>, bool) 
     if non_debug == 0 {
         return (None, false);
     }
-    // 0x5086ef..0x50873e: check `adults_only`, `kids_only`, then `pets_only`
-    // (`0x457914`) BEFORE `dogs_only` (`0x4578a5`) and `cats_only` (`0x457836`).
+    // Check `adults_only`, `kids_only`, then distinguish both-species `pets_only`
+    // (`!(dogs_only ^ cats_only)`) from species-specific `dogs_only` / `cats_only`
+    // so all three Unleashed pet restriction labels (`STR# 160[17..=19]`) remain reachable.
     let restriction = if adults_only {
         Some(UsageRestriction::AdultsOnly)
     } else if kids_only {
         Some(UsageRestriction::KidsOnly)
-    } else if pets_only {
+    } else if pets_only && !(dogs_only ^ cats_only) {
         Some(UsageRestriction::PetsOnly)
     } else if dogs_only {
         Some(UsageRestriction::DogsOnly)
@@ -1578,6 +1579,12 @@ fn read_ttab_usage(iff: &Iff, ttab_id: i16) -> (Option<UsageRestriction>, bool) 
         None
     };
     (restriction, group_activity)
+}
+
+/// Whether an OBJD entry passes the Buy Mode catalog sort & art/interaction
+/// filter (`0x4cb905..0x4cbaa8`, `0x457588`).
+fn is_buy_catalog_eligible(any_sort: u16, master: i16, graphics: i16, ttab: i16) -> bool {
+    any_sort != 0 && !(master == 0 && graphics == 0 && ttab <= 0)
 }
 
 fn read_i16(data: &[u8], offset: usize) -> i16 {
@@ -1869,6 +1876,14 @@ mod tests {
 
     #[test]
     fn function_only_residential_item_is_retained_and_filtered_by_function() {
+        // OBJD eligibility helper used by `BuyCatalog::load` retains an object
+        // whose ONLY nonzero sort word is `function_sort` (`+0x50`) and rejects
+        // an object with all sort words zero.
+        let room_sort: u16 = 0;
+        let function_sort: u16 = 0x0001;
+        assert!(is_buy_catalog_eligible(room_sort | function_sort, 0, 1, 0));
+        assert!(!is_buy_catalog_eligible(0, 0, 1, 0));
+
         // An object with `room_sort == 0`, `function_sort != 0`, and
         // `function_subsort != 0` must be included in Residential ByFunction
         // (`0x50765c`) and `items_for_zone(BuyZone::Residential)`.
@@ -1931,13 +1946,23 @@ mod tests {
         let iff_bogus = Iff::parse(build_iff(&[(b"TTAB", 128, &bogus_join)])).unwrap();
         assert_eq!(read_ttab_usage(&iff_bogus, 128), (None, false));
 
-        // Precedence (`0x5086ef`): `no_adults (bit 6) | no_kids (bit 4)` satisfies
-        // `pets_only` (`0x457914`) AND `dogs_only` (`0x4578a5`, no cat bit 10) AND
-        // `cats_only` (`0x457836`, no dog bit 9). Native `0x5086ef` checks `pets_only`
-        // FIRST, returning `UsageRestriction::PetsOnly`.
+        // Pet restriction labels (`STR# 160[17..=19]`): dog-only, cat-only, and
+        // both-species Pets Only must all be reachable without shadowing each other.
         let pet_flags = (1 << 4) | (1 << 6);
-        let pets_ttab = build_ttab(&[(1, pet_flags | (1 << 9), -1)]);
-        let iff_pets = Iff::parse(build_iff(&[(b"TTAB", 128, &pets_ttab)])).unwrap();
+        let dog_ttab = build_ttab(&[(1, pet_flags | (1 << 9), -1)]);
+        let iff_dog = Iff::parse(build_iff(&[(b"TTAB", 128, &dog_ttab)])).unwrap();
+        assert_eq!(
+            read_ttab_usage(&iff_dog, 128),
+            (Some(UsageRestriction::DogsOnly), false)
+        );
+        let cat_ttab = build_ttab(&[(1, pet_flags | (1 << 10), -1)]);
+        let iff_cat = Iff::parse(build_iff(&[(b"TTAB", 128, &cat_ttab)])).unwrap();
+        assert_eq!(
+            read_ttab_usage(&iff_cat, 128),
+            (Some(UsageRestriction::CatsOnly), false)
+        );
+        let both_pets_ttab = build_ttab(&[(1, pet_flags | (1 << 9) | (1 << 10), -1)]);
+        let iff_pets = Iff::parse(build_iff(&[(b"TTAB", 128, &both_pets_ttab)])).unwrap();
         assert_eq!(
             read_ttab_usage(&iff_pets, 128),
             (Some(UsageRestriction::PetsOnly), false)

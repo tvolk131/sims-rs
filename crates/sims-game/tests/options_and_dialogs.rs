@@ -1279,11 +1279,22 @@ fn options_saves_and_coop_buttons_never_overlap_any_subpanel_widget_across_resol
                 ) {
                     continue;
                 }
+                let obstacle = match &item.kind {
+                    sims_ui::hud::Kind::OptionsTooltip(_) => {
+                        // Quick Tips tooltip draws immediately above its anchor rect (`0x517a6f`).
+                        sims_ui::frame::Rect::new(
+                            (item.rect.x - 40).max(0),
+                            (item.rect.y - 26).max(0),
+                            item.rect.width + 80,
+                            24,
+                        )
+                    }
+                    _ => item.rect,
+                };
                 assert!(
-                    !rects_overlap(r, item.rect),
-                    "Saves/Co-op {r:?} overlapped balloon/tooltip/widget {:?} ({:?})",
-                    item.kind,
-                    item.rect
+                    !rects_overlap(r, obstacle),
+                    "Saves/Co-op {r:?} overlapped balloon/tooltip/widget {:?} ({obstacle:?})",
+                    item.kind
                 );
             }
         }

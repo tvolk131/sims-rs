@@ -794,7 +794,24 @@ fn interests_and_gifts_panels_render_native_art_and_paginate() {
         .filter(|i| matches!(i.kind, hud::Kind::Interest { .. }))
         .count();
     assert_eq!(interest_count_p0, 6, "2 cols x 3 rows on 800x600 page 0");
-    // Native `0x519251`: 1024x768 shows 3 columns x 3 rows = 9 adult interests on page 0.
+    // Native `0x519251`: 1024x768 shows 3 columns x 3 rows = 9 adult interests on page 0,
+    // while intermediate width 880x600 keeps 2 columns (6 items) strictly left of the next arrow.
+    let page0_880 = hud::layout([880, 600], &snap, &ctrl);
+    let interest_880: Vec<Rect> = page0_880
+        .iter()
+        .filter(|i| matches!(i.kind, hud::Kind::Interest { .. }))
+        .map(|i| i.rect)
+        .collect();
+    let next_880 = page0_880
+        .iter()
+        .find(|i| i.command == Some(Command::InterestsPage(1)))
+        .expect("next arrow at 880x600")
+        .rect;
+    assert_eq!(interest_880.len(), 6, "2 cols x 3 rows at 880x600");
+    assert!(
+        interest_880.iter().all(|r| r.x + r.width <= next_880.x),
+        "880x600 interest cells must stay strictly left of next arrow"
+    );
     let page0_1024 = hud::layout([1024, 768], &snap, &ctrl);
     let interest_count_1024 = page0_1024
         .iter()
