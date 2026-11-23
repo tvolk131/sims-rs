@@ -227,6 +227,17 @@ impl Art {
         }
 
         // Core HUD chrome (`hud::RESOURCES` + `4918` tall Buy strip).
+        art.insert(
+            crate::hud::id::BACK_PATCH,
+            build_bevel_panel(
+                52,
+                crate::hud::STRIP as u32,
+                [26, 38, 62],
+                [66, 94, 138],
+                [14, 20, 34],
+                [26, 38, 62],
+            ),
+        );
         art.insert(crate::hud::id::CLUSTER, build_cluster_bg());
         art.insert(
             crate::hud::id::STRIP,
