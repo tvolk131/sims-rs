@@ -14,6 +14,7 @@ use super::{
     EquivMethod, EquivOptions, EquivResult, LiveContext, LiveOptions, bhav_param_limit,
     check_bhav_equivalent_combined, context_mismatch,
 };
+use crate::arity_catalog::vm_kept_bhavs;
 use crate::error::{Error, Result};
 use crate::ir::BhavChunk;
 use crate::lift::lift_bhav;
@@ -597,14 +598,14 @@ fn arities(iff: &Iff, extra: &BTreeMap<u16, usize>) -> BTreeMap<u16, usize> {
 }
 
 /// The argument count of each tree of a file as the VM's loader keeps the trees
-/// (`load_library_with_pool`, `program.rs:588`): every `BHAV` chunk in physical order,
-/// deleted ones included, the last copy of an ID replacing the earlier ones. `None`
-/// when that last copy does not parse (the loader then refuses the file, so the count
-/// is unknown).
+/// (`load_library_with_pool`, `program.rs:588`, selected by [`vm_kept_bhavs`]): every
+/// `BHAV` chunk in physical order, deleted ones included, the last copy of an ID
+/// replacing the earlier ones. `None` when that last copy does not parse (the loader
+/// then refuses the file, so the count is unknown).
 fn loaded_arities(iff: &Iff) -> BTreeMap<u16, Option<usize>> {
-    iff.chunks
-        .iter()
-        .filter(|c| &c.tag == b"BHAV")
+    vm_kept_bhavs(iff)
+        .chunks
+        .into_iter()
         .map(|c| {
             (
                 c.id,
