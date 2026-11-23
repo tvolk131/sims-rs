@@ -359,6 +359,103 @@ fn wave2_panels_open_and_draw_with_native_art() {
         }),
         "OK on preset 0 sends suit 48 for an adult man"
     );
+    // It is `cWinCharmDlg`, titled from its own `STR# 273` (`0x536c26`).
+    assert_eq!(charm.choice, Some(sims_ui::shop::ChoiceDialog::Charm));
+    // Cancel sends the suit on show as well (`0x5373fc`), not accepted:
+    // preset 2 is 44 for an adult man.
+    let charm_on = |game: &mut Game, world: &sims_sim::World| {
+        game.preview_special_panel(SpecialPanelRequest::CharmTransform { person: sim }, world);
+        game.render();
+    };
+    charm_on(&mut game, &world);
+    assert!(game.shop_select_next() && game.shop_select_next());
+    game.shop_escape();
+    assert_eq!(
+        game.preview_special_panel_reply(),
+        Some(&SpecialPanelResponse::Selection {
+            accepted: false,
+            index: 44,
+        }),
+        "Cancel on preset 2 sends suit 44 for an adult man"
+    );
+    // A woman's table (`0x5374de`: word 65 equal to 1): preset 1 is 43.
+    let mut woman = world.clone();
+    woman
+        .objects
+        .get_mut(&sim)
+        .expect("Mortimer")
+        .person
+        .as_mut()
+        .expect("person")
+        .data[KIND] = 1;
+    charm_on(&mut game, &woman);
+    assert!(game.shop_select_next());
+    game.shop_submit();
+    assert_eq!(
+        game.preview_special_panel_reply(),
+        Some(&SpecialPanelResponse::Selection {
+            accepted: true,
+            index: 43,
+        }),
+        "OK on preset 1 sends suit 43 for an adult woman"
+    );
+    // A child (word 58 nonzero and below 18, compared signed): even
+    // presets are the boy's 53, odd ones the skeleton, 60; age -1 counts.
+    for age in [10, -1] {
+        let mut child = world.clone();
+        child
+            .objects
+            .get_mut(&sim)
+            .expect("Mortimer")
+            .person
+            .as_mut()
+            .expect("person")
+            .data[58] = age;
+        charm_on(&mut game, &child);
+        game.shop_submit();
+        assert_eq!(
+            game.preview_special_panel_reply(),
+            Some(&SpecialPanelResponse::Selection {
+                accepted: true,
+                index: 53,
+            }),
+            "OK on preset 0 sends the boy's 53 at age {age}"
+        );
+        charm_on(&mut game, &child);
+        assert!(game.shop_select_prev());
+        game.shop_submit();
+        assert_eq!(
+            game.preview_special_panel_reply(),
+            Some(&SpecialPanelResponse::Selection {
+                accepted: true,
+                index: 60,
+            }),
+            "OK on preset 7 sends the skeleton, 60, at age {age}"
+        );
+    }
+    let mut girl = world.clone();
+    {
+        let data = &mut girl
+            .objects
+            .get_mut(&sim)
+            .expect("Mortimer")
+            .person
+            .as_mut()
+            .expect("person")
+            .data;
+        data[KIND] = 1;
+        data[58] = 8;
+    }
+    charm_on(&mut game, &girl);
+    game.shop_submit();
+    assert_eq!(
+        game.preview_special_panel_reply(),
+        Some(&SpecialPanelResponse::Selection {
+            accepted: true,
+            index: 54,
+        }),
+        "OK on preset 0 sends the girl's 54"
+    );
 
     // A dog in Mortimer's place, so the pet picker has a skeleton to turn.
     if let Some(guid) = dog_guid(&install) {

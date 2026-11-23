@@ -481,6 +481,16 @@ fn complete_collection_live_install_loads_uitext_and_renders_shop_picker() {
     assert!(!strings.title_swimwear.is_empty());
     assert!(!strings.title_pajamas.is_empty());
     assert!(!strings.title_pet.is_empty());
+    // Each choice dialog is titled from its own table: `STR# 220[4]`,
+    // `STR# 221[4]` and the Charm's `STR# 273[4]` (`0x536c26`).
+    assert_eq!(
+        strings.choice_title(ChoiceDialog::Clothing),
+        "Please Select Outfit"
+    );
+    assert_eq!(
+        strings.choice_title(ChoiceDialog::Charm),
+        "Choose the New You"
+    );
 
     let snap = sample_boutique_snapshot();
     let mut dialog = ShopPickerDialog::new();

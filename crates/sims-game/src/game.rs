@@ -10393,11 +10393,12 @@ impl Game {
     ) {
         self.ensure_shop_assets();
         let wallet = self.current_shop_wallet();
-        // Wardrobe and Charm open `cWinClothingChoiceDlg` (`0x5090d0`), the
-        // pet pen its pet twin (`0x521911`): one 3D view between arrows.
+        // The Wardrobe opens `cWinClothingChoiceDlg` (`0x5090d0`), the Charm
+        // `cWinCharmDlg` (`0x536a6b`) and the pet pen the pet dialog
+        // (`0x521911`): one 3D view between arrows.
         let choice = match request {
-            SpecialPanelRequest::WardrobeShop { .. }
-            | SpecialPanelRequest::CharmTransform { .. } => Some(ChoiceDialog::Clothing),
+            SpecialPanelRequest::WardrobeShop { .. } => Some(ChoiceDialog::Clothing),
+            SpecialPanelRequest::CharmTransform { .. } => Some(ChoiceDialog::Charm),
             SpecialPanelRequest::PetPicker { .. } => Some(ChoiceDialog::Pet),
             _ => None,
         };
@@ -10526,10 +10527,12 @@ impl Game {
             ..sims_people::caf_preview::TurntableParams::default()
         };
         match self.shop_snapshot.as_ref().and_then(|s| s.choice) {
-            Some(ChoiceDialog::Clothing) => sims_people::caf_preview::TurntableParams {
-                size: sims_ui::shop::CHOICE_VIEW,
-                ..defaults
-            },
+            Some(ChoiceDialog::Clothing | ChoiceDialog::Charm) => {
+                sims_people::caf_preview::TurntableParams {
+                    size: sims_ui::shop::CHOICE_VIEW,
+                    ..defaults
+                }
+            }
             Some(ChoiceDialog::Pet) => sims_people::caf_preview::TurntableParams {
                 size: sims_ui::shop::CHOICE_VIEW,
                 scale: defaults.scale * 5.0 / 3.25,
@@ -11214,7 +11217,8 @@ impl Game {
             .unwrap_or_default();
         let word = |idx: usize| data.get(idx).copied().unwrap_or(0);
         // `0x5374de`: word 65 (`+0x60e`) equal to 1; `0x5374eb..0x5374fb`:
-        // word 58 (`+0x600`, the age) from 1 to 17.
+        // word 58 (`+0x600`, the age) nonzero and below 18, compared
+        // signed (`jge` at `0x5374fb`), so a negative age is a child too.
         let female = word(sims_sim::neighbors::KIND) == 1;
         let age = word(58);
         let child = age != 0 && age < 18;
@@ -11308,7 +11312,9 @@ impl Game {
                     return None;
                 }
                 // `0x52304c..0x523064`: a neighbor whose type has an empty
-                // catalog name (`0x4573d9`) is not listed.
+                // catalog name (`0x4573d9`) is not listed. The name falls
+                // back to `*` and the definition's label, so only a
+                // definition the port cannot read is left out.
                 let name = self.catalog_name(world, record.guid);
                 if name.is_empty() {
                     return None;
@@ -11344,14 +11350,11 @@ impl Game {
     }
 
     /// The catalog name of person type `guid`, as `0x4573d9` reads it for
-    /// the Phonebook's check (`0x52304c`): `0x457d3b` asks `0x4061e3`,
-    /// which reads the definition's `CATS` resource (name is its second
-    /// string, `0x40631f..0x406352`) or else `CTSS` slot 1 in the game's
-    /// language (`0x470ca7(0, 0)`, `0x471411(1, -1)`); a person whose name
-    /// is still empty retries every language (`0x4062c1..0x4062f8`), and
-    /// `0x457d3b` falls back to the definition's own name, the `OBJD`
-    /// chunk label. A type Make New Character made reads the name it was
-    /// given (`0x44b0e8`), which the port keeps instead of a file.
+    /// the Phonebook's check (`0x52304c`): [`definition_catalog_name`] over
+    /// the definition's `CATS` or `CTSS` and its `OBJD` label. A type Make
+    /// New Character made reads the name it was given (`0x44b0e8`), which
+    /// the port keeps instead of a file. Empty only when the definition
+    /// cannot be read; native has no such case.
     fn catalog_name(&self, world: &sims_sim::World, guid: u32) -> String {
         if let Some(name) = self.lot.character_names().get(&guid)
             && !name.is_empty()
@@ -11377,42 +11380,16 @@ impl Game {
         let Some(chunk) = iff.get(b"OBJD", object.chunk) else {
             return String::new();
         };
-        let data = iff.data(chunk);
         // Definition word 41 (`+0x52`) names the catalog strings.
-        let table = data
+        let table = iff
+            .data(chunk)
             .get(0x52..0x54)
             .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
-        let name = if let Some(cats) = iff.get(b"CATS", table) {
-            iff.data(cats)
-                .split(|&b| b == 0)
-                .nth(1)
-                .map(|raw| sims_formats::strings::decode(raw, US_ENGLISH))
-                .unwrap_or_default()
-        } else {
-            iff.get(b"CTSS", table)
-                .and_then(|ctss| sims_formats::strings::StringTable::parse(iff.data(ctss)).ok())
-                .map(|strings| {
-                    let first = strings.get(0, US_ENGLISH).unwrap_or_default().to_owned();
-                    if !first.is_empty() || object.kind != 2 {
-                        return first;
-                    }
-                    let mut languages: Vec<u8> =
-                        strings.entries.iter().map(|e| e.language).collect();
-                    languages.dedup();
-                    languages
-                        .into_iter()
-                        .filter_map(|language| strings.get(0, language))
-                        .find(|s| !s.is_empty())
-                        .unwrap_or_default()
-                        .to_owned()
-                })
-                .unwrap_or_default()
-        };
-        if name.is_empty() {
-            chunk.label.clone()
-        } else {
-            name
-        }
+        let cats = iff.get(b"CATS", table).map(|c| iff.data(c));
+        let ctss = iff
+            .get(b"CTSS", table)
+            .and_then(|c| sims_formats::strings::StringTable::parse(iff.data(c)).ok());
+        definition_catalog_name(cats, ctss.as_ref(), object.kind == 2, &chunk.label)
     }
 
     fn neighbor_display_name(&self, guid: u32) -> Option<String> {
@@ -14031,6 +14008,66 @@ fn outfit_key(row: &str) -> (String, String) {
     (fit(suit), fit(texture))
 }
 
+/// A definition's catalog name (`0x457d3b`, which fills it by
+/// `0x4061e3`):
+///
+/// - with a `CATS` resource, its second string (`0x40631f..0x406352`);
+/// - else `CTSS` slot 1 in the game's language, US English
+///   (`0x470ca7(0, 0)`, `0x471411(1, -1)`). For a person whose name is
+///   empty (`0x4062c1`), `0x47145f(1, 0)` probes the languages in order
+///   and takes slot 1 of the first that has one, even when its text is
+///   empty (`0x471465..0x471479`);
+/// - a name still empty becomes `*` and the definition's own name, its
+///   `OBJD` label (`0x457db4..0x457de2`, `"*"` at `0x6c12fc`), so it is
+///   never empty.
+///
+/// A language's slot 1 is the first entry of its last run in the table,
+/// as the loader inserts each run in front (`program::loaded_order` in
+/// `sims-vm`).
+fn definition_catalog_name(
+    cats: Option<&[u8]>,
+    ctss: Option<&sims_formats::strings::StringTable>,
+    person: bool,
+    label: &str,
+) -> String {
+    let slot_one = |language: u8| {
+        let entries = &ctss?.entries;
+        let mut first = None;
+        let mut run = None;
+        for entry in entries {
+            if run != Some(entry.language) {
+                run = Some(entry.language);
+                if entry.language == language {
+                    first = Some(entry.text.clone());
+                }
+            }
+        }
+        first
+    };
+    let name = match cats {
+        Some(raw) => raw
+            .split(|&b| b == 0)
+            .nth(1)
+            .map(|raw| sims_formats::strings::decode(raw, US_ENGLISH))
+            .unwrap_or_default(),
+        None => {
+            let name = slot_one(US_ENGLISH).unwrap_or_default();
+            if name.is_empty() && person {
+                // The reader gives language 0 entries language 1, so the
+                // probe starts there.
+                (1..20).find_map(slot_one).unwrap_or_default()
+            } else {
+                name
+            }
+        }
+    };
+    if name.is_empty() {
+        format!("*{label}")
+    } else {
+        name
+    }
+}
+
 /// Every `(suit, "suit,BODY=texture")` of category `first` that a person
 /// of the given sex, age and skin tone can wear, in native wardrobe order:
 /// the filter of `ImportWardrobe::pick` (`0x409663`) — a 9-byte suit prefix
@@ -14223,6 +14260,78 @@ fn pet_breed_label(row: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ctss(entries: &[(u8, &str)]) -> sims_formats::strings::StringTable {
+        sims_formats::strings::StringTable {
+            format: sims_formats::strings::Format::Commented,
+            entries: entries
+                .iter()
+                .map(|&(language, text)| sims_formats::strings::TextEntry {
+                    language,
+                    text: text.to_owned(),
+                    comment: String::new(),
+                    raw_text: text.as_bytes().to_vec(),
+                    raw_comment: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    /// `0x457d3b` / `0x4061e3`: the catalog name the Phonebook checks
+    /// (`0x523064`) is never empty, and its language retry stops at the
+    /// first language that has the slot.
+    #[test]
+    fn catalog_names_fall_back_as_native_does() {
+        // `CATS`: the name is the second string.
+        assert_eq!(
+            definition_catalog_name(Some(b"desc\0Bella\0"), None, true, "Label"),
+            "Bella"
+        );
+        // US English first.
+        let table = ctss(&[(1, "Mortimer"), (2, "Morty")]);
+        assert_eq!(
+            definition_catalog_name(None, Some(&table), true, "Label"),
+            "Mortimer"
+        );
+        // No text and no label: `*` alone (`0x457db4`), so not skipped.
+        assert_eq!(definition_catalog_name(None, None, true, ""), "*");
+        assert_eq!(
+            definition_catalog_name(None, None, false, "Chair"),
+            "*Chair"
+        );
+        // A person whose US English slot is empty retries; the first
+        // language with the slot wins even when its text is empty
+        // (`0x47145f`), so language 3's name is never reached.
+        let table = ctss(&[(1, ""), (3, "Kaylynn")]);
+        assert_eq!(
+            definition_catalog_name(None, Some(&table), true, "Label"),
+            "*Label",
+            "US English has the slot, empty, so the probe stops there"
+        );
+        let table = ctss(&[(2, ""), (3, "Kaylynn")]);
+        assert_eq!(
+            definition_catalog_name(None, Some(&table), true, "Label"),
+            "*Label",
+            "language 2 has the slot, empty, so the probe stops there"
+        );
+        let table = ctss(&[(5, "Erin"), (3, "Kaylynn")]);
+        assert_eq!(
+            definition_catalog_name(None, Some(&table), true, "Label"),
+            "Kaylynn",
+            "the probe goes by language number, not file order"
+        );
+        // Only a person retries.
+        assert_eq!(
+            definition_catalog_name(None, Some(&table), false, "Label"),
+            "*Label"
+        );
+        // A language's slot 1 is the first entry of its last run.
+        let table = ctss(&[(1, "Old"), (2, "x"), (1, "New")]);
+        assert_eq!(
+            definition_catalog_name(None, Some(&table), false, "Label"),
+            "New"
+        );
+    }
 
     #[test]
     fn a_preview_never_stands_in_for_the_vm_request() {

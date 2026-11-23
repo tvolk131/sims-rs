@@ -564,19 +564,30 @@ fn native_camera_panel_wires_all_8_buttons_strings_album_and_clean_capture() {
     shell.release(album_pt);
     assert!(shell.album_open());
     assert!(!shell.game().unwrap().camera_strip_open());
+    let photos_before = shell.album_snapshot().map_or(0, |a| a.entries.len());
     shell.close_photo_album();
 
-    // Re-open CameraPanel, then click the house viewport -> closes CameraPanel and
-    // emits `photo == true` so PNG capture excludes CameraPanel!
+    // Re-open CameraPanel, then click the house viewport: the click closes
+    // CameraPanel and stores the photo in the album, and only there
+    // (`cWinCamera`): the host is not asked to write a file.
     shell.press(cam_pt);
     shell.release(cam_pt);
     shell.render();
     assert!(shell.game().unwrap().camera_strip_open());
     let viewport_snap = shell.press([400, 200]);
     assert!(
-        viewport_snap.photo,
-        "clicking house viewport in Camera Mode must capture snapshot"
+        !viewport_snap.photo,
+        "a Camera Mode click saves to the album, not a screenshot file"
     );
+    shell
+        .open_photo_album()
+        .expect("open the album after the photo");
+    assert_eq!(
+        shell.album_snapshot().map_or(0, |a| a.entries.len()),
+        photos_before + 1,
+        "clicking the house viewport in Camera Mode stores one album photo"
+    );
+    shell.close_photo_album();
     assert!(
         !shell.game().unwrap().camera_strip_open(),
         "viewport snapshot capture must close CameraPanel before PNG render"

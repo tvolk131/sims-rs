@@ -1262,6 +1262,21 @@ fn wave2_large_photo_album_60_snapshots_and_loading_presenter() {
     shell.show_notice("Photo Album", "A notice over the album.");
     assert!(!shell.wheel(-1.0), "the wheel does not reach the album");
     assert_eq!(shell.album_dialog().strip_scroll(), 0);
+    // The notice is centred on the window, and follows a resize.
+    let centre = |shell: &NeighborhoodShell| {
+        let rect = shell.dialog_layout().expect("the notice is in front").rect;
+        (rect.x + rect.width / 2, rect.y + rect.height / 2)
+    };
+    let small = centre(&shell);
+    shell.resize([1024, 768]);
+    let large = centre(&shell);
+    assert_eq!(
+        (large.0 - small.0, large.1 - small.1),
+        (112, 84),
+        "the notice moves with the window's centre"
+    );
+    shell.resize([800, 600]);
+    assert_eq!(centre(&shell), small);
     shell.escape();
     assert!(shell.album_open(), "Escape closes only the notice");
     assert!(shell.wheel(-1.0), "with the notice gone the strip scrolls");

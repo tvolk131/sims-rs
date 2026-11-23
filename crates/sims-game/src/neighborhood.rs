@@ -1597,9 +1597,11 @@ impl NeighborhoodShell {
         matches!(&self.screen, ActiveScreen::Lot(s) if s.game.destination_picker_open())
     }
 
+    /// The dialog in front: on a lot, the lot's, unless the shell's notice
+    /// is over the Photo Album ([`Self::album_notice_open`]).
     pub fn dialog_layout(&self) -> Option<&dialog::Layout> {
         match &self.screen {
-            ActiveScreen::Lot(session) => session.game.dialog(),
+            ActiveScreen::Lot(session) if !self.album_notice_open() => session.game.dialog(),
             _ => self.dialog.as_ref().and_then(|d| d.layout.as_ref()),
         }
     }
@@ -3609,10 +3611,13 @@ impl NeighborhoodShell {
     /// Quit, and Photo).
     pub fn handle_lot_outcome(&mut self, outcome: crate::game::Outcome) -> ShellOutcome {
         self.persist_options();
+        // A Camera Mode click's photo goes to the household's album only
+        // (`cWinCamera`, `0x4a9144`): the host writes no file for it. The
+        // screenshot hotkey keeps its own route.
         let mut out = ShellOutcome {
             redraw: outcome.redraw,
             quit: false,
-            photo: outcome.photo,
+            photo: false,
         };
         if outcome.photo
             && let Err(err) = self.capture_lot_photo()

@@ -5,7 +5,8 @@
 //! `5107`, `CamViewAlbum.bmp` `1105`) and `cTSWinTextEdit2` text inputs.
 //!
 //! All user-facing chrome strings can be loaded dynamically at runtime from
-//! `GameData/UIText.iff` (`STR# 140` `cammodestrs`, `STR# 141` `scrapbookstrs`,
+//! `GameData/UIText.iff` (`STR# 140` `cammodestrs`, `STR# 144`, the album table
+//! 1.91 loads at `0x52a689`,
 //! `STR# 142` `DefaultDialogButtons`, `STR# 154` `MiscStrings`) via
 //! [`AlbumStrings::load_from_install`], with zero verbatim game prose embedded
 //! in source.
@@ -16,7 +17,7 @@
 //! `sims-game`.
 //!
 //! Photos arrive only from Camera Mode, by clicking the lot (`cWinCamera`).
-//! The album itself has no capture or blank-page button: `STR# 141` lists
+//! The album itself has no capture or blank-page button: `STR# 144` lists
 //! only Done, Delete, First, Previous, Next and Last.
 
 use crate::art::Art;
@@ -34,8 +35,10 @@ use sims_formats::strings::StringTable;
 
 /// `GameData/UIText.iff` string table for Camera Mode tooltips (`cammodestrs`).
 pub const CAM_MODE_STRINGS: u16 = 140;
-/// `GameData/UIText.iff` string table for the Photo Album (`scrapbookstrs`).
-pub const SCRAPBOOK_STRINGS: u16 = 141;
+/// `GameData/UIText.iff` string table for the Photo Album: 1.91's
+/// `cWinScrapbook` loads `STR# 144` (`0x52a689`), not the older `STR# 141`
+/// `scrapbookstrs`, whose entries and Done position differ.
+pub const SCRAPBOOK_STRINGS: u16 = 144;
 /// `GameData/UIText.iff` default dialog button labels (`OK`, `Cancel`, `Yes`, `No`).
 pub const DIALOG_BUTTON_STRINGS: u16 = 142;
 /// `GameData/UIText.iff` miscellaneous UI strings (`MiscStrings`).
@@ -202,29 +205,32 @@ impl AlbumStrings {
         {
             strings.title = s;
         }
+        // `STR# 144`: each button's position, label and tooltip in turn
+        // (Done 0-2, Delete 3-5, Previous 6-7, Next 8-9, First 10-11, Last
+        // 12-13).
         if let Some(table) = read_table(SCRAPBOOK_STRINGS) {
-            if let Some(s) = lookup_clean(&table, 4, language) {
+            if let Some(s) = lookup_clean(&table, 1, language) {
                 strings.done = s;
             }
-            if let Some(s) = lookup_clean(&table, 5, language) {
+            if let Some(s) = lookup_clean(&table, 2, language) {
                 strings.done_tooltip = s;
             }
-            if let Some(s) = lookup_clean(&table, 7, language) {
+            if let Some(s) = lookup_clean(&table, 4, language) {
                 strings.delete = s;
             }
-            if let Some(s) = lookup_clean(&table, 8, language) {
+            if let Some(s) = lookup_clean(&table, 5, language) {
                 strings.delete_tooltip = s;
             }
-            if let Some(s) = lookup_clean(&table, 10, language) {
+            if let Some(s) = lookup_clean(&table, 7, language) {
                 strings.prev_tooltip = s;
             }
-            if let Some(s) = lookup_clean(&table, 12, language) {
-                strings.first_tooltip = s;
-            }
-            if let Some(s) = lookup_clean(&table, 14, language) {
+            if let Some(s) = lookup_clean(&table, 9, language) {
                 strings.next_tooltip = s;
             }
-            if let Some(s) = lookup_clean(&table, 16, language) {
+            if let Some(s) = lookup_clean(&table, 11, language) {
+                strings.first_tooltip = s;
+            }
+            if let Some(s) = lookup_clean(&table, 13, language) {
                 strings.last_tooltip = s;
             }
         }
@@ -652,7 +658,7 @@ impl PhotoAlbumDialog {
     ///
     /// On viewports `>= 700×560`, anchors the modal to native `scrapback.bmp`
     /// (`700×560`) and places the 6 native Scrapbook buttons (`1201..=1206`) at
-    /// their exact `UIText.iff STR# 141` pixel coordinates. On smaller viewports,
+    /// their exact `UIText.iff STR# 144` pixel coordinates. On smaller viewports,
     /// falls back cleanly to the responsive 9-slice layout.
     pub fn layout(&self, screen_w: i32, screen_h: i32) -> AlbumLayout {
         if screen_w >= NATIVE_WIDTH && screen_h >= NATIVE_HEIGHT {
@@ -722,18 +728,20 @@ impl PhotoAlbumDialog {
                 height: action_row_h,
             };
 
-            // Native `STR# 141` button positions over `scrapback.bmp` recesses:
+            // Native `STR# 144` button positions over `scrapback.bmp` recesses:
             // First `(19, 442)` 38x47, Prev `(58, 442)` 29x47,
             // Next `(614, 442)` 28x46, Last `(643, 442)` 37x46,
-            // Done `(150, 512)` 130x41, Delete `(442, 511)` 130x41.
+            // Done `(129, 512)` 130x41, Delete `(442, 511)` 130x41.
             let btn_first = Rect::new(mx + 19, my + 442, 38, 47);
             let btn_prev = Rect::new(mx + 58, my + 442, 29, 47);
             let btn_next = Rect::new(mx + 614, my + 442, 28, 46);
             let btn_last = Rect::new(mx + 643, my + 442, 37, 46);
-            let btn_done = Rect::new(mx + 150, my + 512, 130, 41);
+            let btn_done = Rect::new(mx + 129, my + 512, 130, 41);
             let btn_delete = Rect::new(mx + 442, my + 511, 130, 41);
 
-            // Middle thumbnail strip sits cleanly inside the `STR# 141` `(100, 430, 500, 72)` well.
+            // Middle thumbnail strip sits inside the `STR# 141` `(100, 430, 500, 72)`
+            // well. `STR# 144` entries 14-18 hold other geometry whose use is
+            // not traced, so the strip keeps the older table's box.
             let strip_box = Rect::new(mx + 100, my + 430, 500, 72);
             let arrow_w = 24;
             let strip_prev = Rect::new(

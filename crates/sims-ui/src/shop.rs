@@ -51,6 +51,9 @@ pub const DIALOG_LABELS_STR: u16 = 142;
 pub const CLOTHING_STR: u16 = 220;
 /// `GameData/UIText.iff` pet adoption picker labels (`STR# 221`).
 pub const PET_STR: u16 = 221;
+/// `GameData/UIText.iff` Charm Transform labels (`STR# 273`, loaded by
+/// `cWinCharmDlg` at `0x536c26`).
+pub const CHARM_STR: u16 = 273;
 
 /// Loads the native 1.91 9-slice frames, button strip, and bitmap fonts used
 /// by [`ShopPickerDialog`].
@@ -98,9 +101,10 @@ pub enum WardrobeCategory {
 /// arrows instead of a list (see [`ShopPickerDialog::layout`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChoiceDialog {
-    /// `cWinClothingChoiceDlg` (`0x5090d0`, `STR# 220`): Wardrobe and
-    /// Charm Transform.
+    /// `cWinClothingChoiceDlg` (`0x5090d0`, `STR# 220`): the Wardrobe.
     Clothing,
+    /// `cWinCharmDlg` (`0x536a6b`, `STR# 273`): Charm Transform.
+    Charm,
     /// The pet choice dialog (`0x521911`, `STR# 221`).
     Pet,
 }
@@ -165,6 +169,8 @@ pub struct ShopStrings {
     pub title_winterwear: String,
     pub title_vacation: String,
     pub title_pet: String,
+    /// The Charm's title, `STR# 273[4]` ("Choose the New You").
+    pub title_charm: String,
     pub title_studio: String,
     pub title_magic: String,
 }
@@ -189,6 +195,7 @@ impl Default for ShopStrings {
             title_winterwear: "Winterwear".into(),
             title_vacation: "Vacation Kiosk".into(),
             title_pet: "Pet Adoption".into(),
+            title_charm: "Choose the New You".into(),
             title_studio: "Studio Wardrobe".into(),
             title_magic: "Magic Vendor".into(),
         }
@@ -272,6 +279,16 @@ impl ShopStrings {
             }
         }
 
+        // `cWinCharmDlg` reads entries 0 to 4 into `+0xf4..+0x124`
+        // (`0x536c49..0x536cd5`), the title last, as the clothing dialog
+        // does with `STR# 220`.
+        if let Some(chunk) = iff.get(b"STR#", CHARM_STR)
+            && let Ok(table) = StringTable::parse(iff.data(chunk))
+            && let Some(s) = read_entry(&table, 4)
+        {
+            strings.title_charm = s;
+        }
+
         Ok(strings)
     }
 
@@ -295,6 +312,7 @@ impl ShopStrings {
     pub fn choice_title(&self, choice: ChoiceDialog) -> &str {
         match choice {
             ChoiceDialog::Clothing => &self.title_wardrobe,
+            ChoiceDialog::Charm => &self.title_charm,
             ChoiceDialog::Pet => &self.title_pet,
         }
     }

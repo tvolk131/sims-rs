@@ -111,14 +111,20 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
      wardrobe. It steps eight costume presets: the preset starts at 0
      (`0x536afe`), the arrows step it through `0..=7` with wrap
      (`0x537368`), and `0x5374d3` maps it to a suit by sex (person word
-     65 equal to 1) and age (word 58 from 1 to 17 is a child). Adult men
+     65 equal to 1) and age (word 58 nonzero and below 18, compared signed
+     at `0x5374f7`, is a child, so −1 is one too). Adult men
      wear `[48, 58, 44, 45, 39, 46, 47, 40]`, adult women
      `[48, 43, 44, 49, 39, 50, 51, 52]`, children 53 (boy) or 54 (girl)
      on even presets and 60 on odd ones. `0x56d819` dresses the view in
      the suit, and OK and Cancel both send it (`[view + 0x1b0]`,
      `0x5373df`, `0x5373fc`), so an immediate OK on an adult answers 48,
      which the VM writes to the calling script's `temp[0]`.
-     `ui_wave2_snapshots` checks that reply.
+     `ui_wave2_snapshots` checks OK and Cancel replies for a man, a
+     woman, a boy, a girl and age −1.
+   - Its title is its own: `cWinCharmDlg` loads `UIText.iff STR# 273`
+     (`0x536c26`) and reads entries 0 to 4 into `+0xf4..+0x124`, the
+     title, "Choose the New You", last, as the clothing dialog does with
+     `STR# 220`. `ChoiceDialog::Charm` carries it.
    - The dresser's apply path calls Generic Sims Call 24, which the VM
      does not implement; that is routed to Track 2's generic-routine
      work.
@@ -130,8 +136,13 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
 5. **Pet preview scale.** Pets render at 200×300 and ×5.0/3.25 the Sim
    preview's scale.
 6. **Photo Album.**
-   - `STR# 141` names only six buttons: Done, Delete, First, Previous,
-     Next and Last.
+   - 1.91's `cWinScrapbook` loads `UIText.iff STR# 144` (`0x52a689`), not
+     the older `STR# 141` `scrapbookstrs`. It names only six buttons:
+     Done, Delete, Previous, Next, First and Last, each as position,
+     label and tooltip. It puts Done at (129, 512), where `STR# 141` had
+     (150, 512); the other positions agree. Ours now reads `STR# 144`.
+     Its entries 14 to 18 hold more geometry whose use is not traced, so
+     the strip keeps `STR# 141`'s (100, 430, 500, 72) box.
    - "Snap", "Add", `AlbumCommand::CaptureSnapshot`/`AddBlankPage` and
      `AlbumSnapshot::can_capture_snapshot` are removed.
    - Photos now come from where they come from natively: clicking the lot
@@ -152,6 +163,10 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
        (`0x4d1f6e..0x4d1f98`), so a Large photo is 598×400.
      The viewer's PNG copy (`LotHotkey::Photo`) has no click: it frames
      the last pointer position, else the viewport centre.
+   - A Camera Mode click saves to the album only. The shell no longer
+     passes the click on as a host screenshot, which wrote a
+     `sims-game-N.png` file beside every album photo, even when the
+     album save failed. The screenshot hotkey keeps its own route.
    - A save that fails shows a notice. Once a photo is stored, its ID is
      returned. An open album is then refreshed without moving its
      selection or dropping a caption being typed. A refresh that fails
@@ -202,12 +217,17 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
        (`0x43ac10`). Ours uses the catalog through
        `Characters::definition`.
      - `0x52304c..0x523064`: the type's catalog name (`0x4573d9`) is
-       not empty. Ours reads it as native does (`Game::catalog_name`):
-       the name Make New Character gave a made type, else the
-       definition's `CATS` (its second string) or `CTSS` slot 1 in US
-       English, then for a person every other language
-       (`0x4061e3`), then the definition's own name, the `OBJD` label
-       (`0x457d3b`). The listed name is the same string.
+       not empty. Ours reads it as native does (`Game::catalog_name`,
+       `definition_catalog_name`): the name Make New Character gave a
+       made type; else the definition's `CATS` (its second string) or
+       `CTSS` slot 1 in US English (`0x4061e3`). For a person whose name
+       is empty, `0x47145f` probes the languages by number and takes
+       slot 1 of the first that has one, even when its text is empty.
+       A name still empty becomes `*` and the `OBJD` label
+       (`0x457db4..0x457de2`), so it is `*` alone with no label. The
+       name is therefore never empty, and the check skips no readable
+       definition; only one the port cannot read is left out. The
+       listed name is the same string.
    - Each neighbor is listed once, judged by their first row.
 
 ## Oracle tour
@@ -236,8 +256,8 @@ choice dialogs. All three were inspected by eye.
   - The size of the frame and its border.
   - The pet view's size; the dialog-area source is not traced.
   - That `cWinCharmDlg` (`0x536a6b`) lays out like
-    `cWinClothingChoiceDlg`. Its presets and reply are traced; its art
-    and button positions are not.
+    `cWinClothingChoiceDlg`. Its presets, reply and title are traced;
+    its art and button positions are not.
   - The turntable. Native's `cWin3DView` spins; ours shows a still pose.
   - What the `cWin3DView` parameter (3.25 for Sims, 5.0 for pets) means.
     We treat it as a zoom and scale pets by 5.0/3.25. If it is a camera
