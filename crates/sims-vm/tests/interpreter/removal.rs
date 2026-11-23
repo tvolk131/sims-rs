@@ -294,6 +294,96 @@ fn a_fault_in_the_removed_objects_callback_keeps_where_it_happened() {
     assert!(fx.world.removals.is_empty());
 }
 
+/// Deleting a holder removes what it holds (0x440eeb, 0x441196 ->
+/// 0x44123f). For a star marker that removal's prelude takes the star out
+/// of both pools (0x44126f -> 0x447d8b, 0x447e69 -> 0x448097) before the
+/// star is taken off the lot (0x4412a4). So when the holder's PLACED
+/// (function 9, 0x433125) faults after the star is detached from it, the
+/// star is in no pool, not left in use where Play Mode's fallback, which
+/// reads only the holder's slots, would not find it.
+#[test]
+fn a_fault_after_a_held_star_is_detached_leaves_it_in_no_pool() {
+    const STAR_MARKER: u32 = 0xE933_7020;
+    let (mut fx, file) = crate::find_location::placeable();
+    fx.lamp_mut().position = [40, 40, 1];
+    let holder = crate::find_location::widget(&mut fx);
+    assert_eq!(
+        crate::find_location::find(&mut fx, LAMP as i16, holder, 1),
+        Ok(true)
+    );
+    let star_file = fx.add_type(STAR_MARKER, 4, 0, 4096);
+    fx.add(
+        star_file,
+        4096,
+        tree(vec![assign(
+            scope::TEMPS,
+            0,
+            scope::LITERAL,
+            0,
+            RETURN_TRUE,
+        )]),
+    );
+    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let star = interpreter.create(&mut fx.world, STAR_MARKER).unwrap();
+
+    // The holder holds the star in its slot 1, and the star is in use.
+    let at = fx.world.objects[&holder].position;
+    let held = fx.world.objects.get_mut(&star).unwrap();
+    held.position = at;
+    // Container and slot (words 2, 3), and what it stands on and in
+    // which slot (words 26, 14).
+    held.data[2] = holder as i16;
+    held.data[3] = 1;
+    held.data[26] = holder as i16;
+    held.data[14] = 1;
+    let holding = fx.world.objects.get_mut(&holder).unwrap();
+    holding.slots.resize(
+        2,
+        sims_formats::saved_objects::Slot {
+            unknown: 0,
+            object: 0,
+        },
+    );
+    holding.slots[1].object = star as i16;
+    fx.world.indicator_queues.stars_in_use = vec![star];
+    fx.world.indicator_queues.available_stars = vec![];
+
+    // The holder's PLACED (function 9, tree 4300) calls a tree that is
+    // not there.
+    let table = fx
+        .program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .callbacks
+        .get_mut(&128)
+        .unwrap();
+    table.resize(
+        10,
+        sims_formats::execution::ObjectFunction {
+            condition: 0,
+            action: 0,
+        },
+    );
+    table[9].action = 4300;
+    fx.add(
+        file,
+        4300,
+        tree(vec![ins(4999, RETURN_TRUE, RETURN_FALSE, [0; 8])]),
+    );
+
+    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let fault = interpreter.remove_now(&mut fx.world, holder).unwrap_err();
+    assert_eq!(fault.object, holder, "{fault}");
+    // The star was detached and parked off the lot before the fault.
+    let parked = &fx.world.objects[&star];
+    assert_eq!(parked.data[2], 0);
+    assert_eq!(parked.position, [-16, -16, 1]);
+    assert_eq!(fx.world.objects[&holder].slots[1].object, 0);
+    assert!(fx.world.indicator_queues.stars_in_use.is_empty());
+    assert!(fx.world.indicator_queues.available_stars.is_empty());
+}
+
 #[test]
 fn an_object_whose_holder_is_queued_is_not_queued() {
     let (mut fx, file) = two();

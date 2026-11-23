@@ -22,7 +22,13 @@ What was decided:
   - the named snapshots: each record's version word goes from 32 to 33.
     `snapshot::FORMAT`, the version of the world's encoding, stays at 32,
     since `Saved` writes and checks it too and bumping it would make every
-    older `Saved` refuse.
+    older `Saved` refuse;
+  - the trip envelope (`TRVL`, the active trip kept in place of the home
+    lot while a household is away): its version goes from 2 to 3, for
+    the made types in its departure baseline.
+
+  Raw world bytes (`World::encode`, `World::encode_snapshot`) carry no
+  version of their own and are protected only by the wrappers above.
 
   `Saved` and the co-op protocol need no extra bump: this change already
   moved them (format 11, protocol 2), and main has neither.
@@ -30,8 +36,9 @@ What was decided:
   version before it, so the bump costs nothing but the version word.
 - **Older versions still load, by GUID.** A format-4 neighborhood, a
   format-1 or format-2 save record (`LoadedSave::decode_world`, and the
-  Save Manager's restore) and a named snapshot record of version 32 all
-  read their made types back in GUID order, as an older build wrote them.
+  Save Manager's restore), a named snapshot record of version 32 and a
+  trip envelope of version 1 or 2 all read their made types back in GUID
+  order, as an older build wrote them.
 
 What would reopen it: a need for an older build to open a new build's
 saves, such as a downgrade path. The bumps would then need a downgrade

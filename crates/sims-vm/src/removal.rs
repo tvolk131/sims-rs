@@ -226,6 +226,20 @@ impl Interpreter<'_> {
                 }
             }
         }
+        // 0x447e69 -> 0x448097: a star marker leaves both star pools here,
+        // before it is taken off the lot (0x4412a4), so a callback fault
+        // during the take-off leaves no in-use entry for a star detached
+        // from its head.
+        if interface_enabled
+            && world
+                .objects
+                .get(&id)
+                .is_some_and(|o| o.guid == crate::placement::STAR_MARKER)
+        {
+            let pools = &mut world.indicator_queues;
+            pools.available_stars.retain(|&star| star != id);
+            pools.stars_in_use.retain(|&star| star != id);
+        }
         // 0x447ed5..0x447f74 and 0x447fdd..0x448068: a person leaves the
         // indicator refresh queues, the first entry of each that names it
         // (0x448663 erases one element). Any other entry goes when the

@@ -52,8 +52,9 @@ pub struct Characters {
 /// would read it and save it back in GUID order, so each stored encoding
 /// that carries it has a version an older build refuses: the
 /// neighborhood store (format 5), the save records (format 3), the named
-/// snapshot records (record format 33) and `Saved` (format 11). An encoding of an older
-/// version reads back in GUID order ([`MadeTypes::sort_by_guid`]).
+/// snapshot records (record format 33), the trip envelope (`TRVL` version
+/// 3) and `Saved` (format 11). An encoding of an older version reads back
+/// in GUID order ([`MadeTypes::sort_by_guid`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MadeTypes(Vec<(u32, Character)>);
 
