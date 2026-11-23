@@ -122,25 +122,38 @@ fn terrain_water_and_roof_subtool_selection_and_popups() {
     let art = Art::default();
     let mut state = BuildState::default();
 
-    // Terrain subtools: click Level and Grass.
+    // Terrain subtools, left to right Grass, Level, Lower, Raise with Grass
+    // selected (oracle `build-terrain`); click Raise.
     state.select_tool(BuildTool::Terrain, &catalog);
+    assert_eq!(state.terrain_subtool, TerrainSubtool::Grass);
     let lay = build::layout([800, 600], &catalog, &state, &art, 1000, false, false, None);
     assert_eq!(lay.subtools.len(), 4);
-    let grass_btn = lay
+    let order: Vec<_> = lay.subtools.iter().map(|s| s.action).collect();
+    assert_eq!(
+        order,
+        [
+            TerrainSubtool::Grass,
+            TerrainSubtool::Level,
+            TerrainSubtool::Lower,
+            TerrainSubtool::Raise,
+        ]
+        .map(BuildSubtoolAction::Terrain)
+    );
+    let raise_btn = lay
         .subtools
         .iter()
-        .find(|s| s.action == BuildSubtoolAction::Terrain(TerrainSubtool::Grass))
-        .expect("Grass subtool button");
+        .find(|s| s.action == BuildSubtoolAction::Terrain(TerrainSubtool::Raise))
+        .expect("Raise subtool button");
     let pt = [
-        grass_btn.rect.x + grass_btn.rect.width / 2,
-        grass_btn.rect.y + grass_btn.rect.height / 2,
+        raise_btn.rect.x + raise_btn.rect.width / 2,
+        raise_btn.rect.y + raise_btn.rect.height / 2,
     ];
     assert_eq!(
         lay.press_subtool(pt),
-        Some(BuildSubtoolAction::Terrain(TerrainSubtool::Grass))
+        Some(BuildSubtoolAction::Terrain(TerrainSubtool::Raise))
     );
-    assert!(state.apply_subtool(BuildSubtoolAction::Terrain(TerrainSubtool::Grass), &catalog));
-    assert_eq!(state.terrain_subtool, TerrainSubtool::Grass);
+    assert!(state.apply_subtool(BuildSubtoolAction::Terrain(TerrainSubtool::Raise), &catalog));
+    assert_eq!(state.terrain_subtool, TerrainSubtool::Raise);
 
     // Hovering a Terrain subtool surfaces its popup card.
     let hovered = build::layout(
@@ -155,7 +168,7 @@ fn terrain_water_and_roof_subtool_selection_and_popups() {
     );
     assert_eq!(
         hovered.subtool_popup.as_ref().map(|p| p.name.as_str()),
-        Some("Grass")
+        Some("Raise Terrain")
     );
 
     // Water subtools: Pool ($75) & Water ($15).
@@ -240,10 +253,11 @@ fn live_install_roof_catalog_subtool_prices_and_narrow_layout_rendering() {
         18,
         "Complete Collection GameData/Roofs should enumerate 18 BMP patterns"
     );
-    assert_eq!(build_cat.roof_pattern(0).unwrap().stem, "r1_");
-    assert_eq!(build_cat.roof_pattern(1).unwrap().stem, "r2_");
-    assert_eq!(build_cat.roof_pattern(2).unwrap().stem, "r3_");
-    assert_eq!(build_cat.roof_pattern(3).unwrap().stem, "r4_");
+    // Plain case-insensitive name order, as the 1.91 oracle lists them.
+    assert_eq!(build_cat.roof_pattern(0).unwrap().stem, "gravel1");
+    assert_eq!(build_cat.roof_pattern(8).unwrap().stem, "r1_");
+    assert_eq!(build_cat.roof_pattern(10).unwrap().stem, "r3_");
+    assert_eq!(build_cat.roof_pattern(17).unwrap().stem, "tar1");
     for pat in build_cat.roof_patterns() {
         let swatch = pat
             .swatch

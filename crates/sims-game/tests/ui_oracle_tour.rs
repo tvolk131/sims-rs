@@ -34,27 +34,38 @@ const TOLERANCE: u8 = 40;
 /// Region floors: `(shot, region, floor)`. Measured score minus a small
 /// margin for platform rounding; ratchet upward only.
 const FLOORS: &[(&str, &str, f64)] = &[
-    ("live-expanded-needs-800", "puck", 0.0),
-    ("live-expanded-needs-800", "strip", 0.0),
-    ("live-expanded-needs-1024", "puck", 0.0),
-    ("live-expanded-needs-1024", "strip", 0.0),
-    ("view-roof-on", "view-radio", 0.0),
-    ("view-walls-up", "view-radio", 0.0),
-    ("view-cutaway", "view-radio", 0.0),
-    ("view-walls-down", "view-radio", 0.0),
-    ("buy-top-function", "strip", 0.0),
-    ("buy-subcat-seating", "strip", 0.0),
-    ("build-top", "strip", 0.0),
-    ("build-doors", "strip", 0.0),
-    ("build-windows", "strip", 0.0),
-    ("build-stairs", "strip", 0.0),
-    ("build-fireplace", "strip", 0.0),
-    ("camera-strip", "strip", 0.0),
-    ("options-strip", "strip", 0.0),
-    ("flow-magic-hole-picker", "frame", 0.0),
-    ("flow-magic-hole-picker", "header", 0.0),
-    ("flow-cab-downtown-picker", "frame", 0.0),
-    ("flow-cab-downtown-picker", "header", 0.0),
+    ("live-expanded-needs-800", "puck", 0.98),
+    ("live-expanded-needs-800", "strip", 0.99),
+    ("live-expanded-needs-1024", "puck", 0.86),
+    ("live-expanded-needs-1024", "strip", 0.99),
+    ("live-relationships-1024", "strip", 0.95),
+    ("live-job-1024", "strip", 0.95),
+    ("live-personality-1024", "strip", 0.96),
+    ("live-house-1024", "strip", 0.94),
+    ("view-roof-on", "view-radio", 0.99),
+    ("view-walls-up", "view-radio", 0.99),
+    ("view-cutaway", "view-radio", 0.99),
+    ("view-walls-down", "view-radio", 0.99),
+    ("buy-top-function", "strip", 0.99),
+    ("buy-subcat-seating", "strip", 0.98),
+    ("build-top", "strip", 0.97),
+    ("build-terrain", "strip", 0.95),
+    ("build-water", "strip", 0.98),
+    ("build-wall", "strip", 0.96),
+    ("build-wallpaper", "strip", 0.88),
+    ("build-plants", "strip", 0.98),
+    ("build-floor", "strip", 0.92),
+    ("build-roof", "strip", 0.97),
+    ("build-doors", "strip", 0.98),
+    ("build-windows", "strip", 0.98),
+    ("build-stairs", "strip", 0.98),
+    ("build-fireplace", "strip", 0.98),
+    ("camera-strip", "strip", 0.97),
+    ("options-strip", "strip", 0.98),
+    ("flow-magic-hole-picker", "frame", 0.99),
+    ("flow-magic-hole-picker", "header", 0.90),
+    ("flow-cab-downtown-picker", "frame", 0.99),
+    ("flow-cab-downtown-picker", "header", 0.96),
 ];
 
 /// `[x, y, width, height]`.
@@ -272,6 +283,13 @@ fn ui_oracle_tour_ratchet() {
         if !game.panel_expanded() {
             game.hotkey_mode(Mode::Live);
         }
+        // The 1024 oracle pressed `p` after expanding the panel and caught
+        // the pause button on its lit (red) blink row: one blink period on
+        // the presentation clock, with no simulation ticks.
+        if size == [1024, 768] && !game.paused() {
+            game.toggle_pause();
+            game.advance_while(sims_ui::hud::PAUSE_BLINK_US, 0, |_| false);
+        }
         game.render();
         let oracle = load(shot);
         write_debug(out, shot, game.canvas());
@@ -281,6 +299,23 @@ fn ui_oracle_tour_ratchet() {
     }
 
     let size = [1024, 768];
+
+    // Live Mode tabs, clicked at the oracle's own coordinates.
+    for (shot, point) in [
+        ("live-relationships-1024", [502, 686]),
+        ("live-job-1024", [502, 718]),
+        ("live-personality-1024", [470, 718]),
+        ("live-house-1024", [502, 750]),
+    ] {
+        let mut game = open_goth(&install, size);
+        if !game.panel_expanded() {
+            game.hotkey_mode(Mode::Live);
+        }
+        click(&mut game, point);
+        let oracle = load(shot);
+        write_debug(out, shot, game.canvas());
+        push(shot, "strip", score(game.canvas(), &oracle, hud_regions(size)[1].1));
+    }
 
     // 4-way view radio, clicked at the oracle's own coordinates.
     for (shot, point) in [
@@ -318,6 +353,13 @@ fn ui_oracle_tour_ratchet() {
     // Build Mode top level and key tools.
     for (shot, tool) in [
         ("build-top", None),
+        ("build-terrain", Some([290, 696])),
+        ("build-water", Some([332, 696])),
+        ("build-wall", Some([374, 696])),
+        ("build-wallpaper", Some([416, 696])),
+        ("build-plants", Some([290, 744])),
+        ("build-floor", Some([332, 744])),
+        ("build-roof", Some([458, 744])),
         ("build-doors", Some([374, 744])),
         ("build-windows", Some([416, 744])),
         ("build-stairs", Some([458, 696])),
