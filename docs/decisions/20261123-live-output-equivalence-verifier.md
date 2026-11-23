@@ -16,6 +16,13 @@ branches both return true, so a high-level `return true;` should be provably
 the same tree. Self assignments (`temp[0] := temp[0]`), temps that get
 overwritten, and locals that nothing reads are similar.
 
+One thing such a dummy tree does differ in is its own result. The VM keeps the
+result of the last instruction a thread ran (`last_result`). When the frame of
+the tree an action started pops, it records that result in the person's last
+action (`sims-vm/src/object_uses.rs:246`). The Fridge tree's test is false, so
+it leaves `false` where `return true;` leaves `true`. The checker reports that
+by default (see Policies).
+
 ## Decision
 
 ### 1. Live-output checker (`verify/live.rs`, `check_bhav_live_equivalent`)
@@ -24,14 +31,27 @@ Each tree runs on its own over symbolic inputs. Each path becomes a summary of
 what the rest of the game can observe:
 
 - **Exit:** true, false, error, a modeled VM trap with its native code, or a
-  jump to a missing node.
+  jump to a missing node. Branches to nodes 251 and 252, and kind-4 entries
+  past node 250, trap with 0x44c whatever the tree's length
+  (`interpreter.rs:766`, `interpreter.rs:1695`).
+- **Last branch result** at exit and before each primitive (a primitive may
+  start a tree that reads it, `found_action.rs:102`, `idle.rs:187`). The
+  `>=`, `<=` and `!=` tests take their false branch when the canonical atom
+  holds, so their own result is the atom's negation.
 - **Event trace:** primitives and calls with canonical operands; reads of
   memory that may trap or has side effects; writes to memory the checker
   does not track. Each event carries a snapshot of what it may read:
   - the changed tracked cells,
   - the scratch-pointer state,
   - the frame slots the primitive reads. This uses the same per-opcode table
-    as lockstep, now factored out as `primitive_frame_uses`.
+    as lockstep, now factored out as `primitive_frame_uses`;
+  - the running frame's `(params, locals)`, on every primitive. Frame storage
+    is one word stack, and any primitive may run a tree (a call, or a callback
+    such as a routing door tree), whose frame starts after this one;
+  - for calls, the callee's argument count in that side's file.
+- **Reads of locals the tree has not written yet.** The VM can fail reading
+  one, because it may hold half of a pointer an earlier frame left
+  (`interpreter.rs:1277`). So such a read is an event, not a dead read.
 - **Final values of the tracked cells.** These are `temp[0..8]` and
   `my.attr[0..N]`. Every object has at least 8 attributes
   (`sims-vm/src/factory.rs:314`), so N defaults to 8, and reads and writes of
@@ -59,7 +79,10 @@ term-versus-literal atoms.
 
 A difference becomes a **counterexample** only when both of these hold:
 
-- the joint condition constrains independent inputs only by literal bounds;
+- the joint condition constrains independent inputs only by literal bounds.
+  Inputs are the tree's starting values and reads made before any primitive
+  or untracked write. A value a primitive produced can be constrained by what
+  it does (a `Random` result is below its bound), so it is not free;
 - the differing values provably can differ.
 
 Anything else is `Inconclusive`. This includes extra or different reads,
@@ -81,6 +104,8 @@ What the checker models from `sims-vm`:
 - **Owner BCON reads** (scope 26, tables 0..63, private trees) fold to
   literals when the file's constants are known.
 
+- **Random** never takes its false branch: it succeeds or traps (`random.rs`).
+
 Global 34 operands, and Random or GetDirectionTo with Global 34 or scope 22
 aliasing, return `Inconclusive`. Kind-4 trees are checked from every entry
 node.
@@ -88,37 +113,66 @@ node.
 ### 2. Combined checker (`check_bhav_equivalent_combined`)
 
 The combined checker runs lockstep first and falls back to live-output. It
-reports which method decided (`EquivMethod`). A lockstep counterexample is a
-divergence in the stricter all-accesses-observable trace. When live-output
-cannot decide, the result is `Inconclusive`, with the lockstep note attached,
-rather than "different". `sims-antics equiv` now uses this checker.
-`lift --verify-equiv` still uses lockstep alone, because a structured lift
-should match node for node.
+reports which method decided (`EquivMethod`).
+
+- If the two files' BCON tables differ and either tree may read them (any
+  primitive, or a scope-26 operand), the result is `Inconclusive`: neither
+  checker sees constants a primitive or an unfolded operand reads
+  (`context_mismatch`).
+- Lockstep runs with silent steps off (`max_silent_steps: 0`), so every
+  `Expression` is matched. That keeps the scratch pointer and unwritten-local
+  reads in step. With `observe_last_result`, it also tracks whether the two
+  sides' own results may differ (`EquivOptions::observe_last_result`).
+- Its proof is taken only when it covers everything live-output observes
+  (`lockstep_suffices`). It is not taken when frame residue is observed, when
+  the frames differ and a tree has a primitive, when a tree has more than 251
+  nodes or branches to 251 or 252, or when a called tree's argument count
+  differs between the files.
+
+A lockstep counterexample is a divergence in the stricter
+all-accesses-observable trace. When live-output cannot decide, the result is
+`Inconclusive`, with the lockstep note attached, rather than "different".
+
+`sims-antics equiv` now uses this checker. So a mutated script whose tree
+live-output cannot bound comes out INCONCLUSIVE (still a non-zero exit), with
+the lockstep divergence named. One example is the open-pack toilet's motive
+loop. `tests/open_pack_household_sim.rs` now accepts that.
+
+`lift --verify-equiv` still uses lockstep alone, with its defaults (silent
+steps on, last result not compared), because a structured lift should match
+node for node.
 
 ### 3. Whole-file checker (`check_iff_equivalent`, `sims-antics verify-equiv`)
 
 Resources are matched by `(type, id)` the way the original looks them up
-(`Iff::get`). Deleted chunks and `rsmp` are skipped.
+(`Iff::get`). Deleted chunks and `rsmp` are skipped. Each side's callee
+arities and BCON tables come from the chunks it resolves.
 
 | Resource | How it is compared |
 |---|---|
-| `BHAV` | Combined checker. Each side uses its own file's arities and BCONs, plus any `--with <file.iff>` arities. An argument-count mismatch is a difference. Locals, format, revision and trailing bytes are notes. |
-| `STR#`, `CTSS`, `TTAs` | Parsed with the chunk's byte-order flag. Text and language must match; layout version and comments are notes. |
+| `BHAV` | Combined checker. Each side uses its own file's arities and BCONs, plus any `--with <file.iff>` arities. Identical bytes are `Identical` only when the tree's context matches too (BCONs it may read, callees' arities). A label difference is a difference: Run Tree By Name looks trees up by label (`sims-vm/src/program.rs:607`). An argument-count mismatch is a difference. Locals, format, revision and trailing bytes are notes. |
+| `STR#`, `CTSS`, `TTAs` | Parsed with the chunk's byte-order flag, then compared as the loader reads them. Version-0 tables load empty (0x4700d7). Length-prefixed strings get 0xa1 → `o` and 0xd5 → `'` (0x4700f5). Language-tagged tables must match language and text in order, and a change to or from that layout is `Inconclusive`. Layout version and comments are notes. A table that does not parse is `Inconclusive`. |
 | `BCON` | Values must match; the flags byte is a note. |
 | `TPRP`, `TRCN` | Editor metadata, notes only. |
 | Everything else | Bytes must match. |
 
-Chunk labels and flags are notes. Reports name resources and entry indices
-only, never string contents.
+Other chunks' labels, and all chunk flags, are notes. Reports name resources
+and entry indices only, never string contents.
 
-The verdict is Different if anything differs, otherwise Inconclusive if
-anything is undecided, otherwise Equivalent. The CLI exits 0, 1 or 2 for
+The verdict is Inconclusive if a resource map is unusable (the compared chunks
+may not be the ones the game loads). Otherwise it is Different if anything
+differs, otherwise Inconclusive if anything is undecided, otherwise
+Equivalent.
+
+With `--tree`, only that tree is compared. Its callees are assumed to behave
+the same; a whole-file run checks them as their own resources. The CLI exits 0, 1 or 2 for
 these, and with 2 on usage or I/O errors. The CLI flags are:
 
 - `--tree <id>`
 - `--with <iff>` (repeatable)
 - `--my-attributes <n>` (at least 8)
 - `--ignore-scratch-pointer`
+- `--ignore-last-result` (also on `equiv`)
 - `--strict-frame-residue`
 - `--all`
 
@@ -132,26 +186,34 @@ these, and with 2 on usage or I/O errors. The CLI flags are:
   placed before a primitive changes what a later Global 34 read sees. The
   Fridge tree and `return true;` both end in one `Expression`, so they agree.
   `--ignore-scratch-pointer` relaxes this.
+- **The last branch result is observed by default**, because the VM records
+  it (`object_uses.rs:246`). This makes the Fridge tree differ from
+  `return true;`, and a loop that returns from its failed exit test differ
+  from straight-line code. `--ignore-last-result`
+  (`LiveOptions::observe_last_result = false`) proves such trees equivalent.
+  Use it when the tree is not the root of an action, as a check tree is.
 - **Attributes 8 and up are opaque** unless `--my-attributes` says the
   running object has them. Reading them can trap (native 6).
 
 ## Results (Complete Collection, `SIMS_INSTALL`, in memory, counts only)
 
-`tests/live_equiv_corpus.rs`:
+`tests/live_equiv_corpus.rs`, default options (last result observed):
 
 - **Self-check:** 28,690 trees, each checked against itself.
-  - **16,862 Equivalent.**
-  - 11,828 Inconclusive. Of these, 11,419 have a loop whose exit depends on an
-    event or input, 302 exceed 4,096 paths, 98 exceed the pair budget and 9
+  - **16,868 Equivalent.**
+  - 11,822 Inconclusive. Of these, 11,423 have a loop whose exit depends on an
+    event or input, 298 exceed 4,096 paths, 92 exceed the pair budget and 9
     use Global 34.
   - **0 counterexamples.**
 - **Structured lift, recompiled:** of the 27,781 trees lockstep proves
-  equivalent, live-output agrees on 16,793, is Inconclusive on 10,988 (the
+  equivalent, live-output agrees on 16,794, is Inconclusive on 10,987 (the
   same loop limit), and **contradicts it on 0**.
-- **One-node dummy compares** whose branches agree: 309 trees. 218 are proven
-  equal to `return true;` or `return false;`, 0 are refuted, and the rest
-  read memory that can trap. **`Fridges.iff` tree 4143 is proven equal to
-  `return true;`.**
+- **One-node dummy compares** whose branches agree: 309 trees.
+  - Last result observed: 46 proven, 172 refuted, all on the last result
+    alone (0 on anything else).
+  - Last result ignored: 218 proven equal to `return true;` or
+    `return false;`, 0 refuted, and the rest read memory that can trap.
+    **`Fridges.iff` tree 4143 is proven equal to `return true;`.**
 
 ## Limits, and what would reopen this
 
