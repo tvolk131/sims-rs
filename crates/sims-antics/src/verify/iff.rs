@@ -219,6 +219,9 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
             report.file_problems.push(format!("file {side}: {problem}"));
         }
     }
+    if let Some(problem) = duplicate_problem(&iff_a, &iff_b) {
+        report.file_problems.push(problem);
+    }
     let ctx = |iff: &Iff, res: &BTreeMap<([u8; 4], u16), usize>| LiveContext {
         callee_arities: Some(arities(iff, res, &opts.extra_arities)),
         my_attribute_count: opts.my_attribute_count,
@@ -227,8 +230,11 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
     let (ctx_a, ctx_b) = (ctx(&iff_a, &res_a), ctx(&iff_b, &res_b));
     let keys: BTreeSet<([u8; 4], u16)> = res_a.keys().chain(res_b.keys()).copied().collect();
     for (tag, id) in keys {
+        // `--tree` skips the other trees, but keeps every other resource: the tree may
+        // read constants, strings and tables.
         if let Some(tree) = opts.tree
-            && (&tag != b"BHAV" || id != tree)
+            && &tag == b"BHAV"
+            && id != tree
         {
             continue;
         }
@@ -286,8 +292,8 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
                         }
                         v => v,
                     };
-                    if &tag == b"STR#" && id == TREE_NAMES {
-                        tree_names_check(verdict, da, fa, db, fb)
+                    if &tag == b"STR#" {
+                        vm_strings_check(verdict, da, fa, db, fb)
                     } else {
                         verdict
                     }
@@ -311,7 +317,8 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
         });
     }
     if let Some(tree) = opts.tree
-        && report.resources.is_empty()
+        && !res_a.contains_key(&(*b"BHAV", tree))
+        && !res_b.contains_key(&(*b"BHAV", tree))
     {
         return Err(Error::new(format!("neither file contains BHAV #{tree}")));
     }
@@ -449,44 +456,100 @@ fn selection_problem(iff: &Iff, res: &BTreeMap<([u8; 4], u16), usize>) -> Option
     })
 }
 
-/// The tree-name table Run Tree By Name reads (`sims-vm/src/program.rs:168`).
-const TREE_NAMES: u16 = 303;
+/// Flags duplicate chunks unless every physical copy is the same in both files.
+/// `sims-vm` parses every copy as it loads the file (`program.rs:601`), so an earlier
+/// malformed copy can stop the load even when a later one is the one kept.
+fn duplicate_problem(a: &Iff, b: &Iff) -> Option<String> {
+    type Copies<'a> = BTreeMap<([u8; 4], u16), Vec<(u16, &'a [u8])>>;
+    fn copies(iff: &Iff) -> Copies<'_> {
+        let mut out: Copies = BTreeMap::new();
+        for chunk in &iff.chunks {
+            if &chunk.tag != b"rsmp" && !COSMETIC_TAGS.contains(&&chunk.tag) {
+                out.entry((chunk.tag, chunk.id))
+                    .or_default()
+                    .push((chunk.flags, iff.data(chunk)));
+            }
+        }
+        out
+    }
+    let (ca, cb) = (copies(a), copies(b));
+    let keys: BTreeSet<&([u8; 4], u16)> = ca
+        .iter()
+        .chain(&cb)
+        .filter(|(_, v)| v.len() > 1)
+        .map(|(k, _)| k)
+        .collect();
+    let differ: Vec<String> = keys
+        .into_iter()
+        .filter(|k| ca.get(*k) != cb.get(*k))
+        .map(|(tag, id)| format!("{} #{id}", String::from_utf8_lossy(tag)))
+        .collect();
+    (!differ.is_empty()).then(|| {
+        let shown: Vec<&str> = differ.iter().take(4).map(String::as_str).collect();
+        format!(
+            "duplicate chunks differ between the files for {}{}; the game parses every copy, \
+             so the result depends on more than the copy each loader keeps",
+            shown.join(", "),
+            if differ.len() > 4 { ", ..." } else { "" }
+        )
+    })
+}
 
-/// The tree names `sims-vm` loads from `STR#` #303: it parses the table on its own
-/// (`program.rs:1826`) and keeps the language-1 entries (`program.rs:615`), which can
-/// differ from the original loader's reading (a version-0 table is read as empty).
-fn vm_tree_names(data: &[u8], flags: u16) -> Option<Vec<String>> {
+/// A string table as `sims-vm` loads it: it parses the table on its own
+/// (`program.rs:1826`), keeps the language-1 entries in file order for primitives
+/// (`program.rs:615`) and also indexes them by language runs (`program.rs:719`).
+fn vm_strings(data: &[u8], flags: u16) -> Option<(Vec<String>, Vec<String>)> {
     let table = StringTable::parse(data)
         .or_else(|_| StringTable::parse_chunk(data, flags))
         .ok()?;
-    Some(
-        table
-            .entries
-            .into_iter()
-            .filter(|e| e.language == 1)
-            .map(|e| e.text)
-            .collect(),
-    )
+    let in_order = table
+        .entries
+        .iter()
+        .filter(|e| e.language == 1)
+        .map(|e| e.text.clone())
+        .collect();
+    Some((
+        in_order,
+        crate::structure_lift::loaded_str_order(&table.entries),
+    ))
 }
 
-/// Downgrades a match of the tree-name table when `sims-vm` reads the two differently.
-fn tree_names_check(
+/// Combines the original loader's verdict with `sims-vm`'s reading: when the two
+/// readings disagree about whether the tables match, in either direction, the result
+/// is undecided.
+fn vm_strings_check(
     verdict: ResourceVerdict,
     da: &[u8],
     fa: u16,
     db: &[u8],
     fb: u16,
 ) -> ResourceVerdict {
-    if matches!(verdict, ResourceVerdict::Different { .. }) {
+    if matches!(verdict, ResourceVerdict::Inconclusive { .. }) {
         return verdict;
     }
-    match (vm_tree_names(da, fa), vm_tree_names(db, fb)) {
-        (Some(a), Some(b)) if a == b => verdict,
-        _ => ResourceVerdict::Inconclusive {
-            why: "the tree names Run Tree By Name uses differ as sims-vm loads them, though \
-                  the original loader reads the tables alike"
-                .to_owned(),
-        },
+    let original_same = !matches!(verdict, ResourceVerdict::Different { .. });
+    let vm_same = match (vm_strings(da, fa), vm_strings(db, fb)) {
+        (Some(a), Some(b)) => a == b,
+        _ => {
+            return ResourceVerdict::Inconclusive {
+                why: "a string table does not parse as sims-vm reads it".to_owned(),
+            };
+        }
+    };
+    if original_same == vm_same {
+        verdict
+    } else {
+        ResourceVerdict::Inconclusive {
+            why: format!(
+                "the original loader reads the tables as {} but sims-vm reads them as {}",
+                if original_same {
+                    "the same"
+                } else {
+                    "different"
+                },
+                if vm_same { "the same" } else { "different" }
+            ),
+        }
     }
 }
 

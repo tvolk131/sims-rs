@@ -6,8 +6,8 @@
 //! - `sims-antics expand <file.antics> [--pack <pack_dir>]`
 //! - `sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]`
-//! - `sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result]`
-//! - `sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--with <other.iff>]... [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--strict-frame-residue] [--all]`
+//! - `sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result] [--ignore-frame-residue]`
+//! - `sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--with <other.iff>]... [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--all]`
 //!   (exit 0 equivalent, 1 different, 2 inconclusive or error)
 //! - `sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv]`
 //! - `sims-antics build <pack_dir> --out <dir>`
@@ -146,8 +146,8 @@ fn print_usage() {
          sims-antics expand <file.antics> [--pack <pack_dir>]\n  \
          sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]\n  \
-         sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result]\n  \
-         sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--with <other.iff>]... [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--strict-frame-residue] [--all]   (exit 0 equivalent, 1 different, 2 inconclusive)\n  \
+         sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result] [--ignore-frame-residue]\n  \
+         sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--with <other.iff>]... [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--all]   (exit 0 equivalent, 1 different, 2 inconclusive)\n  \
          sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv]   (lifts to .air Antics IR)\n  \
          sims-antics build <pack_dir> --out <dir>"
     );
@@ -1451,6 +1451,11 @@ fn run() -> Result<(), CliError> {
                             i += 1;
                             continue;
                         }
+                        "--ignore-frame-residue" => {
+                            live_opts.observe_frame_residue = false;
+                            i += 1;
+                            continue;
+                        }
                         other if other.starts_with('-') => {
                             return Err(format!("unknown flag '{other}'").into());
                         }
@@ -1498,25 +1503,34 @@ fn run() -> Result<(), CliError> {
             let (iff_file, iff_len, iff_hdr) = read_regular_file_prefix(&iff_path)?;
             let iff_bytes = read_bounded_iff_file(&iff_path, iff_file, iff_len, iff_hdr)?;
             let bhav_b = extract_bhav_from_iff(&iff_bytes, tree_id).map_err(|e| e.to_string())?;
-            let mut arities = extract_bhav_arities_from_iff(&iff_bytes).unwrap_or_default();
-            for (&id, bhav) in &behaviors {
-                let argc = match bhav.format {
-                    0x8000 => 4,
-                    0x8001 => usize::from(bhav.args).min(4),
-                    _ => usize::from(bhav.args),
-                };
-                arities.entry(id).or_insert(argc);
-            }
-
-            let ctx = LiveContext {
-                callee_arities: Some(arities),
+            // Each side calls the trees of its own file: the compiled source's for A,
+            // the IFF's for B. A callee only one side defines has an unknown argument
+            // count on the other, which the checkers treat as a possible difference.
+            let arities_b = extract_bhav_arities_from_iff(&iff_bytes).unwrap_or_default();
+            let arities_a = behaviors
+                .iter()
+                .map(|(&id, bhav)| {
+                    let argc = match bhav.format {
+                        0x8000 => 4,
+                        0x8001 => usize::from(bhav.args).min(4),
+                        _ => usize::from(bhav.args),
+                    };
+                    (id, argc)
+                })
+                .collect();
+            let ctx_a = LiveContext {
+                callee_arities: Some(arities_a),
+                ..LiveContext::default()
+            };
+            let ctx_b = LiveContext {
+                callee_arities: Some(arities_b),
                 ..LiveContext::default()
             };
             let (method, result) = check_bhav_equivalent_combined(
                 bhav_a,
-                &ctx,
+                &ctx_a,
                 &bhav_b,
-                &ctx,
+                &ctx_b,
                 &EquivOptions::default(),
                 &live_opts,
             );
@@ -1730,8 +1744,8 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
                     i += 1;
                     continue;
                 }
-                "--strict-frame-residue" => {
-                    opts.live.observe_frame_residue = true;
+                "--ignore-frame-residue" => {
+                    opts.live.observe_frame_residue = false;
                     i += 1;
                     continue;
                 }

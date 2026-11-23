@@ -5587,8 +5587,10 @@ fn lockstep_suffices(
     ctx_b: &LiveContext,
     live: &LiveOptions,
 ) -> bool {
-    // Lockstep ignores the frame's final contents.
-    if live.observe_frame_residue {
+    // With silent steps off, lockstep matches every frame write (expression
+    // destinations and primitive operands), so equal frames end with equal contents;
+    // frames of different sizes leave different residue.
+    if live.observe_frame_residue && live::frame_dims(a) != live::frame_dims(b) {
         return false;
     }
     // Lockstep does not compare frame sizes, but a tree a primitive runs starts after

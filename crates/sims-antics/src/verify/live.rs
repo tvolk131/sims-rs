@@ -100,10 +100,11 @@ pub struct LiveOptions {
     /// Compare the scratch-pointer state at events and at exit. A caller that reads
     /// Global 34 right after the call observes it (`expression.rs:31`).
     pub observe_scratch_pointer: bool,
-    /// Compare the frame's final parameters and locals. They stay in the frame storage
-    /// after the tree returns and become the initial locals of a later frame
-    /// (`interpreter.rs:1195`); scripts that never read a local before writing it
-    /// cannot observe them.
+    /// Compare the frame's final parameters and locals (on by default). They stay in
+    /// the frame storage after the tree returns and become the initial locals of a
+    /// later frame at the same depth (`interpreter.rs:1216`), which can read them before
+    /// writing them. A difference here is only ever a possible one: it shows only if
+    /// such a reader runs.
     pub observe_frame_residue: bool,
     /// Compare the thread's last branch result where something reads it: at exit
     /// (popping the frame of the tree an action started records it in the person's
@@ -120,7 +121,7 @@ impl Default for LiveOptions {
             max_steps: 2048,
             max_pair_checks: 250_000,
             observe_scratch_pointer: true,
-            observe_frame_residue: false,
+            observe_frame_residue: true,
             observe_last_result: true,
         }
     }
@@ -655,6 +656,10 @@ struct Explorer<'a> {
     args: usize,
     locals: usize,
     entry: usize,
+    /// For a kind-4 tree, the raw entry the call passed, which is also `param[0]`
+    /// (`interpreter.rs:964`): exactly this value, or (`false`) at least it, for the
+    /// last node, which every larger entry is clamped to.
+    entry_param: Option<(i16, bool)>,
 }
 
 /// `(params, locals)` the VM gives a frame running `bhav` (`sims_vm::interpreter::dimensions`).
@@ -681,6 +686,15 @@ impl Explorer<'_> {
         let locals = (0..self.locals)
             .map(|i| interner.sym(SymKey::InitLocal((self.args + i) as u16)))
             .collect();
+        let mut params: Vec<Val> = params;
+        let mut cond = Vec::new();
+        if let (Some((raw, exact)), Some(first)) = (self.entry_param, params.first_mut()) {
+            if exact {
+                *first = Val::Const(raw);
+            } else if raw > 0 {
+                cond.push((Atom::Lt(Val::Const(raw - 1), *first), true));
+            }
+        }
         PathState {
             // An entry past the last node index fails before running anything; 251 is
             // the invalid target `step` treats that way.
@@ -697,7 +711,7 @@ impl Explorer<'_> {
             scratch: Scratch::Inherited,
             last_result: None,
             unwritten: vec![true; self.locals],
-            cond: Vec::new(),
+            cond,
             steps: 0,
             nodes: Vec::new(),
         }
@@ -1533,6 +1547,14 @@ pub fn check_bhav_live_equivalent(
             // Both fail with 0x44c before running anything.
             continue;
         }
+        // Entries below the last pair are passed exactly; the last pair stands for every
+        // larger entry too. A negative entry fails alike on both sides.
+        let entry_param = (a.kind == 4).then(|| {
+            (
+                i16::try_from(entry).unwrap_or(i16::MAX),
+                entry + 1 < entries,
+            )
+        });
         let explore =
             |bhav: &BhavChunk, ctx: &LiveContext, entry: usize, interner: &mut Interner| {
                 let (args, locals) = frame_dims(bhav);
@@ -1543,6 +1565,7 @@ pub fn check_bhav_live_equivalent(
                     args,
                     locals,
                     entry,
+                    entry_param,
                 }
                 .explore(interner)
             };
@@ -1718,28 +1741,19 @@ fn first_difference_inner(
     cond: &[(Atom, bool)],
     interner: &Interner,
 ) -> Difference {
-    let values = |what: String, x: Val, y: Val| -> Option<Difference> {
-        match can_differ(x, y, cond, interner) {
-            Some(false) => None,
-            Some(true) => Some(Difference::Definite(format!(
-                "{what}: A={} vs B={}",
-                interner.describe(x),
-                interner.describe(y)
-            ))),
-            None => Some(Difference::Possible(format!(
-                "{what}: A={} vs B={}",
-                interner.describe(x),
-                interner.describe(y)
-            ))),
-        }
-    };
-
     if a.prefix != b.prefix {
         for k in 0..ha.len().max(hb.len()) {
             match (ha.get(k), hb.get(k)) {
                 (Some(x), Some(y)) if x == y => continue,
+                // Two different events at the same point may still end the same way
+                // (both primitives may fail before doing anything), and a difference in
+                // what an opaque primitive is handed shows only if it reads it. Only
+                // differences the checker models through to the end are definite.
                 (Some(PrefixNode::Event(_, ea)), Some(PrefixNode::Event(_, eb))) => {
-                    return event_difference(k, ea, eb, cond, interner);
+                    return match event_difference(k, ea, eb, cond, interner) {
+                        Difference::Definite(what) => Difference::Possible(what),
+                        d => d,
+                    };
                 }
                 // A read that neither traps nor has side effects is unobservable, so an
                 // extra or different read alone does not prove the trees differ.
@@ -1756,7 +1770,7 @@ fn first_difference_inner(
                     ));
                 }
                 (Some(x), Some(y)) => {
-                    return Difference::Definite(format!(
+                    return Difference::Possible(format!(
                         "trace diverges at event {k}: A {} vs B {}",
                         describe_node(x),
                         describe_node(y)
@@ -1793,18 +1807,33 @@ fn first_difference_inner(
     if let Some(d) = store_difference("final", &a.store, &b.store, a.epoch, cond, interner) {
         return d;
     }
+    // What the frame leaves behind shows only if a later frame reads a local before
+    // writing it, so a difference in it is only a possible one.
     if let (Some((pa, la, ua)), Some((pb, lb, ub))) = (&a.residue, &b.residue) {
         if la.len() != lb.len() || pa.len() != pb.len() {
-            return Difference::Definite("frame residue layout differs".to_owned());
+            return Difference::Possible(
+                "frame residue layout differs (a later frame may read what this one leaves)"
+                    .to_owned(),
+            );
         }
-        for (i, (&x, &y)) in pa.iter().zip(pb).enumerate() {
-            if let Some(d) = values(format!("final param[{i}]"), x, y) {
-                return d;
-            }
-        }
-        for (i, (&x, &y)) in la.iter().zip(lb).enumerate() {
-            if let Some(d) = values(format!("final local[{i}]"), x, y) {
-                return d;
+        let slots = pa
+            .iter()
+            .zip(pb)
+            .enumerate()
+            .map(|(i, p)| (format!("final param[{i}]"), p))
+            .chain(
+                la.iter()
+                    .zip(lb)
+                    .enumerate()
+                    .map(|(i, p)| (format!("final local[{i}]"), p)),
+            );
+        for (what, (&x, &y)) in slots {
+            if can_differ(x, y, cond, interner) != Some(false) {
+                return Difference::Possible(format!(
+                    "{what} left in the frame storage: A={} vs B={} (a later frame may read it)",
+                    interner.describe(x),
+                    interner.describe(y)
+                ));
             }
         }
         if ua != ub {
@@ -1907,22 +1936,17 @@ fn event_difference(
         (
             EventKind::Primitive {
                 opcode: oa,
-                operands: xa,
-                inline_args: ia,
-                unknown_arity_suffix: sa,
                 callee_arity: ca,
-                caller_frame: fa,
+                ..
             },
             EventKind::Primitive {
                 opcode: ob,
-                operands: xb,
-                inline_args: ib,
-                unknown_arity_suffix: sb,
                 callee_arity: cb,
-                caller_frame: fb,
+                ..
             },
-        ) if oa == ob && xa == xb && ca != cb => {
-            // Checked before the inline arguments, whose span follows the arity.
+        ) if oa == ob && ca != cb => {
+            // Checked before the operands and inline arguments: the inline span follows
+            // the arity, and the call may fail before reading either.
             return Difference::Possible(format!(
                 "{at}: call #{oa} names trees with different argument counts in the two files \
                  ({ca:?} vs {cb:?})"

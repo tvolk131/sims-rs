@@ -201,24 +201,23 @@ fn last_branch_result_is_observed() {
     assert_eq!(method, EquivMethod::LiveOutput);
     assert_counterexample(&result);
 
-    // Before a primitive that reads it (Idle, `idle.rs:187`) or a call, too.
+    // Before a primitive or a call it is observed too, but only as a possible
+    // difference: the primitive (Idle, `idle.rs:187`) or the called tree may fail
+    // before reading it, and Play Sound never reads it (`sound.rs:64`). Different
+    // results after them are still compared at exit.
     let then = |test: Instruction, next: Instruction| tree(4096, 1, 0, vec![test, next]);
     let lt_test = expr((PARAM, 0), LT, (LIT, 5), 1, 1);
     let ge_test = expr((PARAM, 0), 14, (LIT, 5), 1, 1);
-    let idle = prim(17, [1, 0, 0, 0, 0, 0, 0, 0], T, T);
-    assert_counterexample(&live(
-        &then(lt_test.clone(), idle.clone()),
-        &then(ge_test.clone(), idle),
-    ));
-    let call = prim(0x1000, [0; 8], T, T);
-    assert_counterexample(&live(
-        &then(lt_test.clone(), call.clone()),
-        &then(ge_test.clone(), call),
-    ));
-    // Play Sound returns true whatever came before (`sound.rs:64`): only possibly
-    // different.
-    let sound = prim(23, [1, 0, 0, 0, 0, 0, 0, 0], T, T);
-    assert_inconclusive(&live(&then(lt_test, sound.clone()), &then(ge_test, sound)));
+    for next in [
+        prim(17, [1, 0, 0, 0, 0, 0, 0, 0], T, T),
+        prim(0x1000, [0; 8], T, T),
+        prim(23, [1, 0, 0, 0, 0, 0, 0, 0], T, T),
+    ] {
+        assert_inconclusive(&live(
+            &then(lt_test.clone(), next.clone()),
+            &then(ge_test.clone(), next),
+        ));
+    }
 }
 
 /// A self assignment `temp[0] := temp[0]` returning false leaves nothing behind.
@@ -293,19 +292,22 @@ fn overwritten_and_restored_temps_are_dead() {
 
 #[test]
 fn dead_locals_and_strict_frame_residue() {
+    // A local left in the frame storage can be read by a later frame at the same
+    // depth before it writes it (`interpreter.rs:1216`): observed by default, but only
+    // ever a possible difference.
     let writes_local = tree(4096, 0, 1, vec![expr((LOCAL, 0), SET, (LIT, 3), T, ERR)]);
     let nothing = tree(4096, 0, 1, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]);
-    assert_equivalent(&live(&writes_local, &nothing));
+    assert_inconclusive(&live(&writes_local, &nothing));
 
-    let strict = LiveOptions {
-        observe_frame_residue: true,
+    let ignoring = LiveOptions {
+        observe_frame_residue: false,
         ..LiveOptions::default()
     };
-    assert_counterexample(&live_with(
+    assert_equivalent(&live_with(
         &writes_local,
         &nothing,
         &LiveContext::default(),
-        &strict,
+        &ignoring,
     ));
 }
 
@@ -415,10 +417,11 @@ fn scratch_pointer_state_before_primitives_is_observed() {
         0,
         vec![expr((LIT, 0), EQ, (LIT, 0), 1, 1), prim(23, sound, T, T)],
     );
-    // Play Sound does not read it, but a tree a call runs may (Global 34).
+    // Play Sound does not read it, and a tree a call runs may or may not (Global 34):
+    // observed, but only a possible difference.
     assert_inconclusive(&live(&bare, &after_expression));
     let call = prim(0x1000, [0; 8], T, T);
-    assert_counterexample(&live(
+    assert_inconclusive(&live(
         &tree(4096, 0, 0, vec![call.clone()]),
         &tree(4096, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 0), 1, 1), call]),
     ));
@@ -435,9 +438,9 @@ fn scratch_pointer_state_before_primitives_is_observed() {
         &lenient,
     ));
 
-    // Different primitive operands are a counterexample.
+    // Different primitive operands differ only possibly: both may fail alike.
     let other_sound = tree(4096, 0, 0, vec![prim(23, [2, 0, 0, 0, 0, 0, 0, 0], T, T)]);
-    assert_counterexample(&live(&bare, &other_sound));
+    assert_inconclusive(&live(&bare, &other_sound));
 }
 
 #[test]
@@ -478,7 +481,8 @@ fn temps_passed_to_calls_are_compared_but_dead_ones_after_are_not() {
             expr((TEMP, 3), SET, (LIT, 4), T, ERR),
         ],
     );
-    assert_counterexample(&live(&a, &c));
+    // Compared, but the called tree may not read them: only a possible difference.
+    assert_inconclusive(&live(&a, &c));
 }
 
 #[test]
@@ -706,7 +710,8 @@ fn verify_equiv_cli_exit_codes() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{stdout}");
-    assert!(stdout.contains("EQUIVALENT: 1 resources"), "{stdout}");
+    // The other resources stay in: the tree may read them.
+    assert!(stdout.contains("EQUIVALENT: 2 resources"), "{stdout}");
     let out = cli().arg("verify-equiv").arg(&path_a).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
@@ -740,10 +745,20 @@ fn caller_frame_size_matters_when_calling_other_trees() {
     );
     assert_inconclusive(&combined);
 
-    // Without calls the frame size is unobservable (residue is opt-in).
+    // Without calls the frame size shows only in what the frame leaves behind.
     let no_call_more = tree(4096, 0, 4, vec![expr((TEMP, 0), SET, (LIT, 1), T, ERR)]);
     let no_call_fewer = tree(4096, 0, 0, vec![expr((TEMP, 0), SET, (LIT, 1), T, ERR)]);
-    assert_equivalent(&live(&no_call_more, &no_call_fewer));
+    assert_inconclusive(&live(&no_call_more, &no_call_fewer));
+    let ignoring = LiveOptions {
+        observe_frame_residue: false,
+        ..LiveOptions::default()
+    };
+    assert_equivalent(&live_with(
+        &no_call_more,
+        &no_call_fewer,
+        &LiveContext::default(),
+        &ignoring,
+    ));
 }
 
 /// Branch targets 251 and 252 are invalid whatever the tree's length (native 0x44c).
@@ -862,8 +877,18 @@ fn differing_constant_tables_are_inconclusive() {
         tree: Some(4096),
         ..IffEquivOptions::default()
     };
+    // `--tree` keeps the other resources, so the changed constant is reported.
     let report = check_iff_equivalent(&file(1), &file(2), &opts).expect("check");
-    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+    assert_eq!(report.verdict(), IffVerdict::Different, "{report:#?}");
+    let tree_report = report
+        .resources
+        .iter()
+        .find(|r| &r.tag == b"BHAV")
+        .expect("tree");
+    assert!(
+        matches!(tree_report.verdict, ResourceVerdict::Inconclusive { .. }),
+        "{report:#?}"
+    );
     let report =
         check_iff_equivalent(&file(1), &file(2), &IffEquivOptions::default()).expect("check");
     assert_eq!(report.verdict(), IffVerdict::Different, "{report:#?}");
@@ -880,7 +905,9 @@ fn bhav_labels_are_lookup_keys() {
     assert!(format!("{report:?}").contains("label"));
 }
 
-/// Length-prefixed string tables load with bytes 0xa1 and 0xd5 rewritten.
+/// Length-prefixed string tables load with bytes 0xa1 and 0xd5 rewritten by the
+/// original's loader, which `sims-vm` does not do: where the two readers disagree, the
+/// result is undecided.
 #[test]
 fn string_tables_compare_as_loaded() {
     let mac = ChunkData {
@@ -894,6 +921,10 @@ fn string_tables_compare_as_loaded() {
     let a = write_iff(&[mac]).expect("write");
     let b = write_iff(&[str_chunk(128, &[("fo", "")])]).expect("write");
     let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+    // Both readers agree on a comment-only change.
+    let commented = write_iff(&[str_chunk(128, &[("fo", "note")])]).expect("write");
+    let report = check_iff_equivalent(&b, &commented, &IffEquivOptions::default()).expect("check");
     assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
     let c = write_iff(&[str_chunk(128, &[("fx", "")])]).expect("write");
     let report = check_iff_equivalent(&a, &c, &IffEquivOptions::default()).expect("check");
@@ -1002,6 +1033,96 @@ fn live_checker_checks_constant_tables() {
     ));
 }
 
+/// Writes `chunks` with a version-0 resource map listing `(chunk index)` for each
+/// `(tag, id)` in `map`, appended as the last chunk.
+fn write_with_map(chunks: &[ChunkData], map: &[usize]) -> Vec<u8> {
+    let mut offsets = Vec::new();
+    let mut at = 64usize;
+    for c in chunks {
+        offsets.push(at);
+        at += 76 + c.data.len();
+    }
+    let mut by_tag: std::collections::BTreeMap<[u8; 4], Vec<usize>> = Default::default();
+    for &i in map {
+        by_tag.entry(chunks[i].tag).or_default().push(i);
+    }
+    let mut data = vec![0u8; 8];
+    data.extend(b"pmsr");
+    data.extend(0u32.to_le_bytes());
+    data.extend((by_tag.len() as u32).to_le_bytes());
+    for (tag, list) in &by_tag {
+        data.extend(u32::from_be_bytes(*tag).to_le_bytes());
+        data.extend((list.len() as u32).to_le_bytes());
+        for &i in list {
+            data.extend((offsets[i] as u32).to_le_bytes());
+            data.extend(chunks[i].id.to_le_bytes());
+            data.extend(chunks[i].flags.to_le_bytes());
+            data.push(0);
+            if data.len() % 2 != 0 {
+                data.push(0);
+            }
+        }
+    }
+    let mut all = chunks.to_vec();
+    all.push(ChunkData {
+        tag: *b"rsmp",
+        id: 0,
+        flags: 0x10,
+        label: String::new(),
+        data,
+    });
+    let mut bytes = write_iff(&all).expect("write");
+    bytes[60..64].copy_from_slice(&(at as u32).to_be_bytes());
+    bytes
+}
+
+/// A resource map that picks the first of two same-id chunks, while `sims-vm` keeps
+/// the last (`program.rs:601`): undecided.
+#[test]
+fn resource_map_and_file_order_disagree() {
+    let t = tree(4096, 0, 0, vec![prim(23, [0; 8], T, T)]);
+    let bcon = |value: i16| ChunkData {
+        tag: *b"BCON",
+        id: 4096,
+        flags: 0x10,
+        label: String::new(),
+        data: [vec![1, 0], value.to_le_bytes().to_vec()].concat(),
+    };
+    let a = write_with_map(&[bhav_chunk(&t, "T"), bcon(1), bcon(1)], &[0, 1]);
+    let b = write_with_map(&[bhav_chunk(&t, "T"), bcon(1), bcon(2)], &[0, 1]);
+    let parsed = sims_formats::iff::Iff::parse(b.clone()).expect("parse");
+    assert!(parsed.map_error().is_none());
+    assert_eq!(
+        parsed.data(parsed.get(b"BCON", 4096).expect("mapped")),
+        bcon(1).data.as_slice(),
+        "the map selects the first copy"
+    );
+    let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+}
+
+/// `sims-vm` parses every copy of a chunk, so a malformed copy before the one kept can
+/// stop the load: duplicates that differ between the files are undecided.
+#[test]
+fn malformed_duplicates_are_inconclusive() {
+    let t = tree(4096, 0, 0, vec![prim(23, [0; 8], T, T)]);
+    let bcon = |data: Vec<u8>| ChunkData {
+        tag: *b"BCON",
+        id: 4096,
+        flags: 0x10,
+        label: String::new(),
+        data,
+    };
+    let valid = vec![1, 0, 1, 0];
+    let a = write_iff(&[bhav_chunk(&t, "T"), bcon(vec![9]), bcon(valid.clone())]).expect("w");
+    let b = write_iff(&[bhav_chunk(&t, "T"), bcon(valid.clone())]).expect("w");
+    let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+    // The same copies in both files are fine.
+    let report = check_iff_equivalent(&a, &a, &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
+}
+
 /// A second chunk with the same type and id: the VM loads the later one
 /// (`program.rs:601`), whatever the resource map says.
 #[test]
@@ -1035,15 +1156,34 @@ fn tree_name_tables_follow_both_readers() {
     let b = write_iff(&[names(b"Beta")]).expect("write");
     let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
     assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
-    // Another table id read that way is empty on both sides.
+    // So is any other table: primitives read them too (Change Suit, `change_suit.rs:137`).
     let other = |name: &[u8]| ChunkData {
-        id: 128,
+        id: 304,
         ..names(name)
     };
     let a = write_iff(&[other(b"Alpha")]).expect("write");
     let b = write_iff(&[other(b"Beta")]).expect("write");
     let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
-    assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
+    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+
+    // The other direction: a localized table that changes only a non-English entry
+    // differs for the original's loader but not for `sims-vm`, which keeps language 1.
+    let localized = |other: &[u8]| ChunkData {
+        tag: *b"STR#",
+        id: 303,
+        flags: 0x10,
+        label: String::new(),
+        data: [
+            vec![0xFD, 0xFF, 2, 0, 1, b'a', 0, 0, 2],
+            other.to_vec(),
+            vec![0, 0],
+        ]
+        .concat(),
+    };
+    let a = write_iff(&[localized(b"x")]).expect("write");
+    let b = write_iff(&[localized(b"y")]).expect("write");
+    let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
 }
 
 /// Identical bytes that do not parse as a string table are still undecided.
@@ -1085,11 +1225,9 @@ fn inline_calls_with_different_arities_are_inconclusive() {
         4096,
         0,
         0,
-        vec![
-            prim(0x1000, [0xFF; 8], T, T),
-            filler.clone(),
-            filler.clone(),
-        ],
+        // Not all-0xFF, so the arguments past the fourth are read inline from the
+        // instructions that follow (10 or 12 bytes).
+        vec![prim(0x1000, [0; 8], T, T), filler.clone(), filler.clone()],
     );
     let ctx = |arity| LiveContext {
         callee_arities: Some([(0x1000, arity)].into_iter().collect()),
@@ -1123,4 +1261,65 @@ fn kind4_entries_follow_the_clamp() {
     assert_equivalent(&live(&short, &same));
     let differs = indexed(vec![node(T), node(T), node(F), node(T), node(F)]);
     assert_counterexample(&live(&short, &differs));
+}
+
+/// Scope 35 reads only ever give 0 or 1 (`memory.rs:542`), so a test against 2 that
+/// would separate the trees has no witness.
+#[test]
+fn opaque_reads_are_not_free_inputs() {
+    let a = tree(4096, 0, 0, vec![expr((35, 0), EQ, (LIT, 2), T, F)]);
+    let b = tree(4096, 0, 0, vec![expr((35, 0), EQ, (LIT, 3), F, F)]);
+    assert_inconclusive(&live(&a, &b));
+}
+
+/// A kind-4 entry is also `param[0]` (`interpreter.rs:964`): the second node of a
+/// two-node tree runs only for entries of 1 and up.
+#[test]
+fn kind4_entry_is_the_first_parameter() {
+    let indexed = |nodes: Vec<Instruction>| BhavChunk {
+        kind: 4,
+        ..tree(4096, 1, 0, nodes)
+    };
+    let one = indexed(vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]);
+    let two = indexed(vec![
+        expr((LIT, 0), EQ, (LIT, 0), T, T),
+        expr((PARAM, 0), 14, (LIT, 1), T, F),
+    ]);
+    assert_equivalent(&live(&one, &two));
+    let three = indexed(vec![
+        expr((LIT, 0), EQ, (LIT, 0), T, T),
+        expr((PARAM, 0), 14, (LIT, 2), T, F),
+    ]);
+    assert_counterexample(&live(&one, &three));
+}
+
+/// Calls to the same tree with different operands and argument counts: the argument
+/// count decides first, and only possibly.
+#[test]
+fn call_arity_is_checked_before_operands() {
+    let filler = expr((LIT, 0), EQ, (LIT, 0), T, T);
+    let caller = |ops: [u8; 8]| {
+        tree(
+            4096,
+            0,
+            0,
+            vec![prim(0x1000, ops, T, T), filler.clone(), filler.clone()],
+        )
+    };
+    let ctx = |arity| LiveContext {
+        callee_arities: Some([(0x1000, arity)].into_iter().collect()),
+        ..LiveContext::default()
+    };
+    match check_bhav_live_equivalent(
+        &caller([0; 8]),
+        &ctx(5),
+        &caller([1, 0, 0, 0, 0, 0, 0, 0]),
+        &ctx(6),
+        &LiveOptions::default(),
+    ) {
+        EquivResult::Inconclusive { reason } => {
+            assert!(reason.contains("argument counts"), "{reason}");
+        }
+        other => panic!("expected Inconclusive, got {other:?}"),
+    }
 }
