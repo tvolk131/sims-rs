@@ -872,7 +872,9 @@ impl Careers {
                         .to_owned()
                 };
                 let shown = match iff.get(b"STR#", chunk.id.wrapping_add(1000)) {
-                    Some(chunk) => Some(StringTable::parse(iff.data(chunk)).map_err(Error::Format)?),
+                    Some(chunk) => {
+                        Some(StringTable::parse(iff.data(chunk)).map_err(Error::Format)?)
+                    }
                     None => None,
                 };
                 let title = |i: usize| match &shown {

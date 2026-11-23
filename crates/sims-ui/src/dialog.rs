@@ -649,7 +649,11 @@ pub fn named_icon(text: &str) -> Option<NamedIcon> {
             .fold(0u32, |n, d| {
                 n.wrapping_mul(10).wrapping_add(u32::from(d - b'0'))
             });
-        (if negative { value.wrapping_neg() } else { value }) as i32
+        (if negative {
+            value.wrapping_neg()
+        } else {
+            value
+        }) as i32
     };
     let is = |name: &str| category.eq_ignore_ascii_case(name.as_bytes());
     if is("gz") || is("gzi") {
@@ -3668,7 +3672,14 @@ mod tests {
         // No category the original knows, or a number of 0: no icon. A tab
         // is no separator, and a NUL ends the string.
         for text in [
-            "", "gz", "gzi zero", "gz 0", "gz 4294967296", "gz\t4500", "pic 5", "my 0",
+            "",
+            "gz",
+            "gzi zero",
+            "gz 0",
+            "gz 4294967296",
+            "gz\t4500",
+            "pic 5",
+            "my 0",
             "gz\0 4500",
         ] {
             assert_eq!(named_icon(text), None, "{text}");
@@ -3679,10 +3690,7 @@ mod tests {
             Some(NamedIcon::Type(0)),
             "atol stops at the x"
         );
-        assert_eq!(
-            named_icon("GUID -1"),
-            Some(NamedIcon::Type(u32::MAX))
-        );
+        assert_eq!(named_icon("GUID -1"), Some(NamedIcon::Type(u32::MAX)));
         assert_eq!(named_icon("rel"), Some(NamedIcon::Relation));
         assert_eq!(named_icon("REL 7"), Some(NamedIcon::Relation));
         for (text, job) in [("JOB -1", -1), ("job", 0), ("Job 2 1", 21), ("job 22", 22)] {

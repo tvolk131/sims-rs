@@ -39,7 +39,6 @@ pub mod pose;
 pub mod rooms;
 pub mod route;
 mod snapshot;
-pub mod sort;
 pub mod speed;
 mod world;
 

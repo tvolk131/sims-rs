@@ -99,7 +99,12 @@ fn introsort<T: Copy>(mut items: &mut [T], mut depth: usize, less: &impl Fn(&T, 
 
 /// 0x44a8a4 then 0x44a949: sifts the hole at `hole` down to a leaf, then
 /// pushes `value` up from there, no higher than `hole` was.
-fn adjust_heap<T: Copy>(items: &mut [T], mut hole: usize, value: T, less: &impl Fn(&T, &T) -> bool) {
+fn adjust_heap<T: Copy>(
+    items: &mut [T],
+    mut hole: usize,
+    value: T,
+    less: &impl Fn(&T, &T) -> bool,
+) {
     let top = hole;
     let mut second = hole * 2 + 2;
     while second < items.len() {

@@ -5,6 +5,7 @@
 
 pub mod float;
 pub mod rng;
+pub mod sort;
 
 pub use float::{Ext, F32};
 pub use rng::{CrtRng, GameRng};
