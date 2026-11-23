@@ -153,7 +153,6 @@ fn live_mode_has_no_cam_view_album_overlap_and_camera_button_toggles_substrip() 
         let game = shell.game().expect("active game");
         assert!(!game.camera_strip_open());
         assert!(game.camera_strip_rect().is_none());
-        assert!(game.camera_snapshot_button_rect().is_none());
         assert!(game.album_button_rect().is_none());
     }
 
@@ -183,11 +182,6 @@ fn live_mode_has_no_cam_view_album_overlap_and_camera_button_toggles_substrip() 
         let game = shell.game().expect("active game");
         assert!(game.camera_strip_open());
         let strip = game.camera_strip_rect().expect("Camera sub-strip rect");
-        // `Sims.exe` 1.91 `camera-strip.png`: no synthetic Take Snapshot button.
-        assert!(
-            game.camera_snapshot_button_rect().is_none(),
-            "native cWinCamera has no Take Snapshot button"
-        );
         let album = game.album_button_rect().expect("Photo Album rect");
         // Strictly to the right of the 220px Live Mode cluster (zero overlap with clock/speed/Camera).
         assert!(
@@ -199,10 +193,18 @@ fn live_mode_has_no_cam_view_album_overlap_and_camera_button_toggles_substrip() 
     };
     assert!(strip_rect.width > 0 && strip_rect.height >= sims_ui::hud::STRIP);
 
-    // A click on the lot takes the snapshot and closes the Camera sub-strip.
+    // A click on the lot takes the snapshot into the album and closes the
+    // Camera sub-strip; the host writes no screenshot file for it.
     let snap_out = shell.press([400, 200]);
     shell.release([400, 200]);
-    assert!(snap_out.photo, "a lot click in Camera Mode must emit photo");
+    assert!(
+        !snap_out.photo,
+        "a lot click in Camera Mode saves to the album, not a file"
+    );
+    assert!(
+        !shell.has_dialog(),
+        "the album save succeeds, so no notice is raised"
+    );
     assert!(
         !shell.game().expect("active game").camera_strip_open(),
         "the snapshot closes the Camera sub-strip"

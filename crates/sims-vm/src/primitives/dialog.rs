@@ -325,8 +325,8 @@ pub enum SpecialPanelRequest {
     /// Kind 5 (`reg+0xea`, `0x4414cd` -> `0x549dae`): Hot Date Downtown lot picker (`21..=30`).
     DowntownLotPicker,
     /// Kind 6 (`reg+0xf4`/`+0xf6`/`+0xf8`, `0x4417b3` -> `0x508f22`): Wardrobe /
-    /// clothing shop picker. `mode` is the input `temp 0` (`0` everyday, `1` swimwear,
-    /// `2` formal, `3` pajamas, `4` winter, `5` high-fashion at `0x5097c9`).
+    /// clothing shop picker. `mode` is the input `temp 0` (`0` everyday, `1` formal,
+    /// `2` swimwear, `3` pajamas, `4` winter, `5` high-fashion at `0x5097c9`).
     WardrobeShop { person: u16, mode: i16 },
     /// Kind 7 (`reg+0xec`, `0x441df2` -> `0x5686e9`): Vacation Island lot picker (`40..=48`).
     /// `on_residential` mirrors `0x40745f` (`0x441f34`, loading transition 2 vs 1).

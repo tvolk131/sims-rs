@@ -126,16 +126,6 @@ pub enum OptionsDialog {
 /// `0x5e8c93..0x5e8e10`).
 pub const DIALOG_FADE_DURATION_MS: u32 = 200;
 
-/// Interactive button inside the bottom Camera subpanel (toggled by the
-/// cluster's Camera button, `Command::Camera(Photo)`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CameraStripAction {
-    /// Captures a PNG snapshot of the current lot view.
-    TakeSnapshot,
-    /// Opens the household Photo Album modal (`F10`).
-    PhotoAlbum,
-}
-
 pub struct Hud {
     pub art: Art,
     faces: Faces,
@@ -215,12 +205,8 @@ pub struct Hud {
     camera_strings: CameraStrings,
     /// Last laid-out native `CameraLayout` while Camera Mode is open.
     camera_layout: Option<CameraLayout>,
-    /// Whether the auxiliary Take Snapshot button beside `CamViewAlbum` is pressed.
-    pressed_camera_snapshot: bool,
     /// Last laid-out bounding rect of the Camera subpanel strip when open.
     camera_strip_rect: Option<Rect>,
-    /// Last laid-out screen rect of the Take Snapshot button (`CamSnap`), when wide enough to display.
-    camera_snapshot_rect: Option<Rect>,
     /// Whether the Roof camera toggle (`Camera::Roof`) is active.
     roof_view: bool,
     /// Classic Sims 1 top-left cheat console (`Ctrl+Shift+C` / `Cmd+Shift+C`).
@@ -642,12 +628,13 @@ impl Hud {
             install.expansions,
             friendship,
         );
+        let thumbnails = Thumbnails::with_template(&static_part.art);
         Self {
             art: static_part.art,
             ui: static_part.ui,
             boot_faces: faces.clone(),
             faces,
-            thumbnails: Thumbnails::default(),
+            thumbnails,
             problems: Vec::new(),
             careers: shared_part.careers,
             fame: static_part.fame,
@@ -685,9 +672,7 @@ impl Hud {
             },
             camera_strings: static_part.camera_strings,
             camera_layout: None,
-            pressed_camera_snapshot: false,
             camera_strip_rect: None,
-            camera_snapshot_rect: None,
             roof_view: false,
             cheat_console: CheatConsole::new(),
             menu: None,
@@ -754,9 +739,7 @@ impl Hud {
         self.camera_strip_open = false;
         self.camera_panel.clear_pointer();
         self.camera_layout = None;
-        self.pressed_camera_snapshot = false;
         self.camera_strip_rect = None;
-        self.camera_snapshot_rect = None;
         self.roof_view = false;
         self.controls.pressed_options_action = None;
         self.controls.help = None;
@@ -1010,21 +993,13 @@ impl Hud {
     fn clear_camera_strip_layout(&mut self) {
         self.camera_panel.clear_pointer();
         self.camera_layout = None;
-        self.pressed_camera_snapshot = false;
         self.camera_strip_rect = None;
-        self.camera_snapshot_rect = None;
     }
 
     /// Bounding rectangle of the Camera subpanel inside the bottom panel strip
     /// area, when open.
     pub fn camera_strip_rect(&self) -> Option<Rect> {
         self.camera_strip_rect
-    }
-
-    /// Screen rectangle of the Camera subpanel's "Take Snapshot" button (`CamSnap`),
-    /// when open and wide enough to display beside `CamViewAlbum`.
-    pub fn camera_snapshot_button_rect(&self) -> Option<Rect> {
-        self.camera_snapshot_rect
     }
 
     /// Screen rectangle of the native `CamViewAlbum` (`1105`) button, when the
@@ -1036,28 +1011,16 @@ impl Hud {
         self.camera_button_rect(CameraButton::ViewAlbum)
     }
 
-    /// Releases a held native `cWinCamera` button or Take Snapshot button,
-    /// returning `(changed, Option<CameraCommand>)`.
+    /// Releases a held native `cWinCamera` button, returning
+    /// `(changed, Option<CameraCommand>)`.
     ///
     /// Size and quality toggles update `self.camera_state` in place while
-    /// keeping the Camera subpanel open; `TakeSnapshot` and `OpenPhotoAlbum`
-    /// close the subpanel cleanly before returning so PNG capture never
-    /// includes the Camera strip.
+    /// keeping the Camera subpanel open; `OpenPhotoAlbum` closes the
+    /// subpanel before returning. Photos are taken by clicking the lot.
     pub fn release_camera_strip(
         &mut self,
         point: Option<[i32; 2]>,
     ) -> (bool, Option<CameraCommand>) {
-        if self.pressed_camera_snapshot {
-            self.pressed_camera_snapshot = false;
-            let activated = point
-                .is_some_and(|[x, y]| self.camera_snapshot_rect.is_some_and(|r| r.contains(x, y)));
-            if activated {
-                self.play(CLICK);
-                self.close_camera_strip();
-                return (true, Some(CameraCommand::TakeSnapshot));
-            }
-            return (true, None);
-        }
         if self.camera_panel.pressed().is_none() {
             return (false, None);
         }
@@ -1092,11 +1055,6 @@ impl Hud {
                 self.play(CLICK);
                 self.close_camera_strip();
                 (true, Some(CameraCommand::OpenPhotoAlbum))
-            }
-            Some(CameraCommand::TakeSnapshot) => {
-                self.play(CLICK);
-                self.close_camera_strip();
-                (true, Some(CameraCommand::TakeSnapshot))
             }
             Some(CameraCommand::Help(topic)) => {
                 self.play(WHOOSH);
@@ -1241,15 +1199,11 @@ impl Hud {
                         assets.floor(key, 1).map(render_image_to_swatch)
                     }
                 }
-                BuildItemId::Wallpaper(key) => {
-                    if let Some(frames) = assets.pattern(key, 0) {
-                        Some(render_image_to_swatch(&frames[0]))
-                    } else {
-                        assets
-                            .pattern(key, 1)
-                            .map(|frames| render_image_to_swatch(&frames[0]))
-                    }
-                }
+                BuildItemId::Wallpaper(key) => [2, 1, 0].into_iter().find_map(|zoom| {
+                    assets
+                        .pattern(key, zoom)
+                        .map(|frames| render_wallpaper_swatch(&frames[2]))
+                }),
                 BuildItemId::WallStyle(style_id) => {
                     let pat = sims_vm::WallStyle::from_style_id(style_id)
                         .map(sims_vm::WallStyle::default_pattern)
@@ -2729,7 +2683,6 @@ impl Hud {
         // divider, and Photo Album) — snapshots are taken by clicking the lot
         // viewport, with no synthetic button injected into the strip.
         self.camera_strip_rect = Some(strip);
-        self.camera_snapshot_rect = None;
         self.camera_layout = Some(layout);
     }
 
@@ -2948,9 +2901,7 @@ impl Hud {
                 .is_some_and(|[x, y]| self.saves_button_rect.is_some_and(|r| r.contains(x, y)));
             let c = pointer
                 .is_some_and(|[x, y]| self.coop_button_rect.is_some_and(|r| r.contains(x, y)));
-            let snap = pointer
-                .is_some_and(|[x, y]| self.camera_snapshot_rect.is_some_and(|r| r.contains(x, y)));
-            (s, c, snap)
+            (s, c)
         };
         let prev_camera_hover = self.camera_panel.hovered();
         let before = (
@@ -3120,27 +3071,20 @@ impl Hud {
             self.dismiss_help();
             return None;
         }
-        if self.camera_strip_open {
-            if self
-                .camera_snapshot_rect
-                .is_some_and(|r| r.contains(point[0], point[1]))
-            {
-                self.pressed_camera_snapshot = true;
+        if self.camera_strip_open
+            && let Some(strip) = self.camera_strip_rect
+        {
+            let state = self.camera_state();
+            if self.camera_panel.press(
+                point[0],
+                point[1],
+                strip,
+                &state,
+                &self.camera_strings,
+                &self.art,
+            ) {
+                self.dismiss_help();
                 return None;
-            }
-            if let Some(strip) = self.camera_strip_rect {
-                let state = self.camera_state();
-                if self.camera_panel.press(
-                    point[0],
-                    point[1],
-                    strip,
-                    &state,
-                    &self.camera_strings,
-                    &self.art,
-                ) {
-                    self.dismiss_help();
-                    return None;
-                }
             }
         }
         if self
@@ -3505,6 +3449,65 @@ fn render_image_to_swatch(src: &sims_render::Image) -> sims_formats::bitmap::Ima
         width: dw as u32,
         height: dh as u32,
         rgba: pixels,
+    }
+}
+
+/// Side of the square a wallpaper swatch is fitted into: the 41 px slot
+/// interior less a 2 px margin (oracle `build-wallpaper.png`: 19.7×37 at
+/// 615.6..635.4, 677..713 in a slot at 603, 673).
+const WALLPAPER_SWATCH_BOX: f32 = 37.0;
+
+/// A wallpaper's catalog swatch: the pattern's flat, camera-facing frame
+/// (frame 2, the diagonal wall) scaled to fit [`WALLPAPER_SWATCH_BOX`],
+/// centred in a [`sims_ui::thumbnail::SIZE`] slot, with area-averaged
+/// sampling so its edges blend like the original's.
+fn render_wallpaper_swatch(src: &sims_render::Image) -> sims_formats::bitmap::Image {
+    let cell = sims_ui::thumbnail::SIZE as usize;
+    let (sw, sh) = (src.width.max(1) as f32, src.height.max(1) as f32);
+    let scale = (WALLPAPER_SWATCH_BOX / sw).min(WALLPAPER_SWATCH_BOX / sh);
+    let ox = (cell as f32 - sw * scale) / 2.0;
+    let oy = (cell as f32 - sh * scale) / 2.0;
+    let area = 1.0 / (scale * scale);
+    let mut rgba = vec![0u8; cell * cell * 4];
+    for v in 0..cell {
+        let y0 = ((v as f32 - oy) / scale).max(0.0);
+        let y1 = ((v as f32 + 1.0 - oy) / scale).min(sh);
+        if y1 <= y0 {
+            continue;
+        }
+        for u in 0..cell {
+            let x0 = ((u as f32 - ox) / scale).max(0.0);
+            let x1 = ((u as f32 + 1.0 - ox) / scale).min(sw);
+            if x1 <= x0 {
+                continue;
+            }
+            let (mut a_sum, mut rgb) = (0.0f32, [0.0f32; 3]);
+            for sy in y0.floor() as usize..(y1.ceil() as usize).min(src.height) {
+                let wy = (y1.min(sy as f32 + 1.0) - y0.max(sy as f32)).max(0.0);
+                for sx in x0.floor() as usize..(x1.ceil() as usize).min(src.width) {
+                    let wx = (x1.min(sx as f32 + 1.0) - x0.max(sx as f32)).max(0.0);
+                    let i = (sy * src.width + sx) * 4;
+                    let a = f32::from(src.rgba[i + 3]) / 255.0 * wx * wy;
+                    a_sum += a;
+                    for (c, value) in rgb.iter_mut().enumerate() {
+                        *value += f32::from(src.rgba[i + c]) * a;
+                    }
+                }
+            }
+            if a_sum <= 0.0 {
+                continue;
+            }
+            let di = (v * cell + u) * 4;
+            for c in 0..3 {
+                rgba[di + c] = (rgb[c] / a_sum).round().clamp(0.0, 255.0) as u8;
+            }
+            rgba[di + 3] = (a_sum / area * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    sims_formats::bitmap::Image {
+        width: cell as u32,
+        height: cell as u32,
+        rgba,
     }
 }
 
