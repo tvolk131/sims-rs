@@ -933,8 +933,15 @@ impl Hud {
     pub fn toggle_camera_strip(&mut self, size: [i32; 2]) -> bool {
         self.camera_strip_open = !self.camera_strip_open;
         if self.camera_strip_open {
-            self.dismiss_help();
             self.layout_camera_strip(size);
+            if self.camera_strip_open {
+                // Native `0x4d1734..0x4d1746` / `0x53a543`: opening Camera Mode
+                // expands the control panel strip so `BackPatch.bmp` (`2036`)
+                // fills the curved cluster wedge next to the Camera/Options
+                // buttons. Only expand once layout accepts the viewport size.
+                self.controls.expanded = true;
+                self.dismiss_help();
+            }
         } else {
             self.clear_camera_strip_layout();
         }
@@ -1941,6 +1948,17 @@ impl Hud {
             .iter()
             .find(|f| f.id == id)
             .map_or(&[], |f| f.members.as_slice())
+    }
+
+    /// Household resident object IDs in roster order (`Snapshot::residents`),
+    /// used by the `Space` hotkey (`cWinLive::OnKeyDown`, `0x51ba2d`) to cycle
+    /// to the next Sim.
+    pub fn resident_object_ids(&self, world: &World) -> Vec<u16> {
+        Snapshot::read(world, self.members(world))
+            .residents
+            .into_iter()
+            .map(|r| r.object)
+            .collect()
     }
 
     /// The household with zoning-aware family friends, career needs/grades,

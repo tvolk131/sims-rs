@@ -34,6 +34,10 @@ pub const NEEDS_WIDTH: i32 = 387;
 
 /// Resources the panel draws (`UIGraphics/Res_CPanel.h`).
 pub mod id {
+    /// Background patch (`kBackPatch`, `CPanel/Backgrounds/BackPatch.bmp`, `52×100`)
+    /// drawn at `(168, height - 100)` behind `CLUSTER` whenever the bottom strip
+    /// is expanded (`0x50a19b`, `0x50a5e0..0x50a619`, `0x6f3630 = (168, 50)`).
+    pub const BACK_PATCH: i32 = 2036;
     pub const CLUSTER: i32 = 2037;
     pub const STRIP: i32 = 4910;
     pub const GAUGE: i32 = 4911;
@@ -133,12 +137,13 @@ pub const OPTIONAL_RESOURCES: [i32; 9] = [
 /// Every resource the panel needs, for [`Art::load`]. The help
 /// balloon's background, [`balloon::BACKGROUND`], is loaded apart with
 /// [`Art::load_optional`]: without it the balloon shows its text alone.
-pub const RESOURCES: [i32; 56] = [
+pub const RESOURCES: [i32; 57] = [
     id::WALLS_DOWN,
     id::CUTAWAY,
     id::WALLS_UP,
     id::ROOF,
     id::PHOTO,
+    id::BACK_PATCH,
     id::CLUSTER,
     id::STRIP,
     id::GAUGE,
@@ -712,6 +717,12 @@ pub fn layout_with_options_lot(
 
     // The strip, behind the cluster.
     if controls.expanded {
+        // Native `0x50a5e0..0x50a619`: `kBackPatch` (`BackPatch.bmp`, 52x100)
+        // sits behind `UniversalBack.TGA` at `(168, height - STRIP)` so the
+        // curved cluster edge next to the Camera/Options buttons joins
+        // `PanelBack.bmp` seamlessly instead of exposing the unrendered band
+        // below the shortened house viewport (`height - 100`).
+        items.push(image(at(168, 83, 52, STRIP), id::BACK_PATCH));
         let strip = Rect::new(CLUSTER[0], top, width - CLUSTER[0], strip_height);
         items.push(Item {
             rect: strip,
@@ -1096,15 +1107,18 @@ pub fn balloon_objects(items: &[Item]) -> impl Iterator<Item = u32> + '_ {
 }
 
 /// The live-mode strip: portraits at the left, the gadget and the subpanel
-/// at the right. At width 1024 (`0x518f40..0x518f48`, `0x51f258..0x51f260`,
-/// `0x51f527..0x51f52f`), the gadget stays at `x = 413` and only the subpanel's
-/// right edge extends by 224 pixels (`0xe0`).
+/// to its right. At width 800 the gadget sits at `x = 413` with a 279 px
+/// subpanel; at width 1024 (`0x518f40..0x518f48`, `0x51f258..0x51f260`,
+/// `0x51f527..0x51f52f`) the gadget stays at `x = 413` and the subpanel
+/// widens by 224 px (`0xe0`). Any wider viewport keeps the gadget anchored
+/// beside the 4-column portrait block at `x = 413` and gives the extra width
+/// to the active subpanel so the gadget never teleports away from the portraits.
 fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls: &Controls) {
-    let extra = if strip.x.saturating_add(strip.width) == 1024 {
-        224
-    } else {
-        0
-    };
+    let extra = strip
+        .x
+        .saturating_add(strip.width)
+        .saturating_sub(800)
+        .max(0);
     let subpanel_width = NEEDS_WIDTH - 108 + extra;
     let gadget = Rect::new(
         strip.x + strip.width - (NEEDS_WIDTH + extra),
@@ -2122,10 +2136,6 @@ const RELATION_BUTTONS: [(i32, Relations); 4] = [
 /// The install has no 6-point font, so the original gets an empty one:
 /// taken as 0 high (**unverified**).
 const RELATIONS_FONT_HEIGHT: i32 = 0;
-/// People a page (0x51926a). The original lists 10 in a window exactly
-/// 1024 wide; ours lists 5 at every size, as the subpanel's width there
-/// is **unverified**.
-const RELATIONS_PER_PAGE: usize = 5;
 /// The list's entries (0x5281cb, 0x51db6e): 45 by 90, in rows from (6
 /// right of the arrow and the first button, 18), to 2 short of the
 /// panel's right edge.
@@ -2170,11 +2180,18 @@ fn relationships(items: &mut Vec<Item>, panel: Rect, snapshot: &Snapshot, contro
             Relations::Everyone => true,
         })
         .collect();
+    // 0x519247..0x51926a: 5 people per page at 800px (`panel.width = 279`),
+    // 10 at 1024px (`panel.width = 503`), scaling cleanly with wider panels
+    // while keeping a gutter for the right page arrow (`arrow_w + 2`).
+    let [arrow_w, arrow_h] = [9, 49];
+    let [w, h] = RELATION_SIZE;
+    let left = arrow_w + button_w + 6;
+    let right = panel.width - arrow_w - 2;
+    let per_page = ((right - left) / w).max(1) as usize;
     // 0x51da2e: a page past the end steps back to the last one.
-    let pages = shown.len().div_ceil(RELATIONS_PER_PAGE).max(1);
+    let pages = shown.len().div_ceil(per_page).max(1);
     let page = (controls.relations_page as usize).min(pages - 1);
     // 0x51ddec: the arrows centred on the panel below the font's line.
-    let [arrow_w, arrow_h] = [9, 49];
     let arrow_y = (panel.height - arrow_h - fh) / 2 + fh;
     if page > 0 {
         items.push(Item {
@@ -2189,7 +2206,7 @@ fn relationships(items: &mut Vec<Item>, panel: Rect, snapshot: &Snapshot, contro
             command: Some(Command::RelationsPage((page - 1) as u32)),
         });
     }
-    if (page + 1) * RELATIONS_PER_PAGE < shown.len() {
+    if (page + 1) * per_page < shown.len() {
         items.push(Item {
             rect: panel
                 .offset(panel.width - arrow_w - 2, arrow_y)
@@ -2202,23 +2219,15 @@ fn relationships(items: &mut Vec<Item>, panel: Rect, snapshot: &Snapshot, contro
             command: Some(Command::RelationsPage((page + 1) as u32)),
         });
     }
-    // 0x4ebdfa: left to right, a new row where the next would pass the
-    // right edge.
-    let [w, h] = RELATION_SIZE;
-    let left = arrow_w + button_w + 6;
-    let right = panel.width - 2;
-    let (mut x, mut row) = (left, 0);
-    for relation in shown
+    // 0x4ebdfa: single row of `per_page` entries from `left` across the panel.
+    for (idx, relation) in shown
         .iter()
-        .skip(page * RELATIONS_PER_PAGE)
-        .take(RELATIONS_PER_PAGE)
+        .skip(page * per_page)
+        .take(per_page)
+        .enumerate()
     {
-        let rect = panel.offset(x, RELATIONS_TOP + h * row).with_size(w, h);
-        x += w;
-        if x + w > right {
-            row += 1;
-            x = left;
-        }
+        let x = left.saturating_add(w.saturating_mul(i32::try_from(idx).unwrap_or(0)));
+        let rect = panel.offset(x, RELATIONS_TOP).with_size(w, h);
         let lit = controls
             .pointer
             .is_some_and(|[px, py]| rect.contains(px, py));
@@ -2520,14 +2529,44 @@ pub fn draw_with_thumbnails(
                 if let Some(image) = art.image(*id) {
                     let w = i32::try_from(image.width).unwrap_or(0);
                     let h = i32::try_from(image.height).unwrap_or(0);
-                    frame.draw(image, Rect::new(0, 0, w.min(r.width), h), [r.x, r.y]);
-                    // The last column repeated across the part of the
-                    // item that is inside the frame.
-                    let left = i64::from(r.x);
-                    let start = i64::from(w).max(-left);
-                    let end = i64::from(r.width).min(i64::from(frame.width()) - left);
-                    for x in start..end {
-                        frame.draw(image, Rect::new(w - 1, 0, 1, h), [(left + x) as i32, r.y]);
+                    if *id == id::STRIP && r.width > w && w > 16 {
+                        // `PanelBack.bmp` (`804×100`) ends with an 8 px dark
+                        // right bezel (`796..804`). On viewports wider than
+                        // 1024 px (`r.width > 804`), repeat an interior navy
+                        // column (`w - 16`) across the extension and place the
+                        // right bezel at the viewport's right edge so no dark
+                        // vertical band appears at `x = 1024`. Widths <= 1024
+                        // take the `else` branch and stay 100% bit-exact.
+                        const RIGHT_BEZEL: i32 = 8;
+                        let body_w = w - RIGHT_BEZEL;
+                        frame.draw(image, Rect::new(0, 0, body_w, h), [r.x, r.y]);
+                        let left = i64::from(r.x);
+                        let fill_col = w - 16;
+                        let start = i64::from(body_w).max(-left);
+                        let end =
+                            i64::from(r.width - RIGHT_BEZEL).min(i64::from(frame.width()) - left);
+                        for x in start..end {
+                            frame.draw(
+                                image,
+                                Rect::new(fill_col, 0, 1, h),
+                                [(left + x) as i32, r.y],
+                            );
+                        }
+                        frame.draw(
+                            image,
+                            Rect::new(body_w, 0, RIGHT_BEZEL, h),
+                            [r.x.saturating_add(r.width - RIGHT_BEZEL), r.y],
+                        );
+                    } else {
+                        frame.draw(image, Rect::new(0, 0, w.min(r.width), h), [r.x, r.y]);
+                        // The last column repeated across the part of the
+                        // item that is inside the frame.
+                        let left = i64::from(r.x);
+                        let start = i64::from(w).max(-left);
+                        let end = i64::from(r.width).min(i64::from(frame.width()) - left);
+                        for x in start..end {
+                            frame.draw(image, Rect::new(w - 1, 0, 1, h), [(left + x) as i32, r.y]);
+                        }
                     }
                 }
             }
@@ -2989,10 +3028,12 @@ mod tests {
         assert_eq!(press(&items, [400, 300]), None);
         assert!(covers(&items, [5, 590]) && !covers(&items, [400, 300]));
         assert_eq!(hovered(&items, None), None);
-        // At a widescreen size the needs keep to the right edge.
+        // At a widescreen size the 7-button mood/tab gadget stays anchored beside
+        // the 4-column portrait block at `x = 413` while the active subpanel
+        // expands cleanly into the remaining width.
         let wide = layout([1280, 720], &snapshot(), &controls);
         assert_eq!(
-            press(&wide, [1280 - 388 + 50, 720 - 100 + 15]),
+            press(&wide, [413 + 50, 720 - 100 + 15]),
             Some(Command::OpenPanel(Panel::Interests))
         );
         // In a narrow window the cluster covers the gadget, and a press
@@ -3000,6 +3041,202 @@ mod tests {
         let narrow = layout([400, 600], &snapshot(), &controls);
         assert_eq!(press(&narrow, [60, 530]), None);
         assert_eq!(hovered(&narrow, Some([60, 530])), None);
+    }
+
+    #[test]
+    fn live_strip_anchors_gadget_at_413_across_all_widescreen_widths() {
+        let controls = Controls {
+            expanded: true,
+            panel: Some(Panel::Needs),
+            ..Controls::default()
+        };
+        for [w, h] in [
+            [800, 600],
+            [1024, 768],
+            [1280, 720],
+            [1600, 900],
+            [1920, 1080],
+        ] {
+            let items = layout([w, h], &snapshot(), &controls);
+            let gauge = items
+                .iter()
+                .find(|i| matches!(i.kind, Kind::Image(id::GAUGE)))
+                .expect("gauge present");
+            assert_eq!(
+                gauge.rect,
+                Rect::new(413, h - STRIP, 108, STRIP),
+                "gadget must stay anchored at x=413 at {w}x{h}"
+            );
+            assert_eq!(
+                press(&items, [413 + 50, h - STRIP + 15]),
+                Some(Command::OpenPanel(Panel::Interests)),
+                "Interests tab hit-target at {w}x{h}"
+            );
+            // Subpanel fills everything to the right of the gadget (`x = 521..w`).
+            let strip = items
+                .iter()
+                .find(|i| matches!(i.kind, Kind::Stretched(id::STRIP)))
+                .expect("strip present");
+            assert_eq!(
+                strip.rect,
+                Rect::new(CLUSTER[0], h - STRIP, w - CLUSTER[0], STRIP)
+            );
+        }
+    }
+
+    #[test]
+    fn back_patch_fills_camera_wedge_only_when_expanded() {
+        let snap = snapshot();
+        let collapsed = Controls::default();
+        let closed_items = layout([800, 600], &snap, &collapsed);
+        assert!(
+            !closed_items
+                .iter()
+                .any(|i| matches!(i.kind, Kind::Image(id::BACK_PATCH))),
+            "BackPatch must not be drawn while strip is collapsed"
+        );
+
+        let art = Art::clean_room_procedural();
+        let faces = Faces::default();
+        let bg = [115u8, 113, 115];
+        for mode in [Mode::Live, Mode::Buy, Mode::Build, Mode::Options] {
+            let controls = Controls {
+                expanded: true,
+                mode,
+                ..Controls::default()
+            };
+            let items = layout([1280, 720], &snap, &controls);
+            let patch_idx = items
+                .iter()
+                .position(|i| matches!(i.kind, Kind::Image(id::BACK_PATCH)))
+                .expect("BackPatch emitted when expanded");
+            let cluster_idx = items
+                .iter()
+                .position(|i| matches!(i.kind, Kind::Image(id::CLUSTER)))
+                .expect("Cluster emitted");
+            assert!(
+                patch_idx < cluster_idx,
+                "BackPatch must draw behind UniversalBack cluster ({mode:?})"
+            );
+            assert_eq!(
+                items[patch_idx].rect,
+                Rect::new(168, 720 - STRIP, 52, STRIP),
+                "BackPatch native rect (168, h-100, 52, 100)"
+            );
+            let mut frame = Frame::new(1280, 720, bg);
+            draw(&mut frame, &art, &faces, &items, &controls);
+            for y in (720 - STRIP)..720 {
+                for x in 168..220 {
+                    assert_ne!(
+                        frame.pixel(x, y),
+                        Some(bg),
+                        "gray background leaked at ({x}, {y}) in {mode:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn relationships_scales_per_page_with_subpanel_width() {
+        let mut snap = snapshot();
+        snap.relations = (0..25)
+            .map(|i| Relation {
+                id: (100 + i) as i16,
+                guid: 100 + i,
+                daily: 50,
+                lifetime: 50,
+                family: false,
+                friends: true,
+                star: false,
+                pink_heart: false,
+                red_heart: false,
+            })
+            .collect();
+        let controls = Controls {
+            expanded: true,
+            panel: Some(Panel::Relationships),
+            relations: Relations::Everyone,
+            ..Controls::default()
+        };
+        for ([w, h], expected_per_page) in [
+            ([800, 600], 5usize),
+            ([1024, 768], 10usize),
+            ([1280, 720], 15usize),
+            ([1600, 900], 22usize),
+        ] {
+            let items = layout([w, h], &snap, &controls);
+            let rels: Vec<Rect> = items
+                .iter()
+                .filter_map(|i| matches!(i.kind, Kind::Relation { .. }).then_some(i.rect))
+                .collect();
+            assert_eq!(
+                rels.len(),
+                expected_per_page,
+                "relationships per page at {w}x{h}"
+            );
+            let page_on = items
+                .iter()
+                .find(|i| {
+                    matches!(
+                        i.kind,
+                        Kind::Button {
+                            id: id::PAGE_ON,
+                            ..
+                        }
+                    )
+                })
+                .expect("next-page arrow shown for 25 relations");
+            for r in &rels {
+                assert!(
+                    r.x + r.width <= page_on.rect.x,
+                    "relation rect {:?} must not overlap PAGE_ON {:?} at {w}x{h}",
+                    r,
+                    page_on.rect
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn panel_back_stretch_preserves_right_bezel_above_1024() {
+        let mut art = Art::default();
+        let w = 804u32;
+        let h = STRIP as u32;
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let rgb = if x >= w - 8 { [0, 0, 49] } else { [0, 0, 82] };
+                let off = ((y * w + x) * 4) as usize;
+                rgba[off..off + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+        }
+        art.insert(
+            id::STRIP,
+            Image {
+                width: w,
+                height: h,
+                rgba,
+            },
+        );
+        let faces = Faces::default();
+        let controls = Controls {
+            expanded: true,
+            ..Controls::default()
+        };
+        let mut frame = Frame::new(1280, 720, [0, 0, 0]);
+        let item = Item {
+            rect: Rect::new(CLUSTER[0], 620, 1280 - CLUSTER[0], STRIP),
+            kind: Kind::Stretched(id::STRIP),
+            command: None,
+        };
+        draw(&mut frame, &art, &faces, &[item], &controls);
+        // No dark vertical seam at x = 1024 (old `220 + 804`), and bezel sits at right edge.
+        assert_eq!(frame.pixel(1020, 670), Some([0, 0, 82]));
+        assert_eq!(frame.pixel(1024, 670), Some([0, 0, 82]));
+        assert_eq!(frame.pixel(1271, 670), Some([0, 0, 82]));
+        assert_eq!(frame.pixel(1272, 670), Some([0, 0, 49]));
+        assert_eq!(frame.pixel(1279, 670), Some([0, 0, 49]));
     }
 
     #[test]
