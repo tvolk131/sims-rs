@@ -5,7 +5,9 @@
 
 use crate::error::{Error, Result, Span};
 use crate::manifest::{TomlValue, parse_toml};
-use crate::v2::ast::{FnDecl, ObjectDecl, TemplateDecl, V2File, V2Item};
+use crate::v2::ast::{
+    BitflagsDecl, EnumDecl, FnDecl, ObjectDecl, TemplateDecl, V2File, V2Item, object_type_ident,
+};
 use crate::v2::parser::parse_v2_file;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -19,10 +21,16 @@ pub struct ResolvedModule {
     pub functions: BTreeMap<String, (String, FnDecl)>,
     /// Templates visible by local name in this module (local + imported), paired with their owning module id.
     pub templates: BTreeMap<String, (String, TemplateDecl)>,
+    /// Enums visible by local name in this module (local + imported), paired with their owning module id.
+    pub enums: BTreeMap<String, (String, EnumDecl)>,
+    /// Bitflags visible by local name in this module (local + imported), paired with their owning module id.
+    pub bitflags: BTreeMap<String, (String, BitflagsDecl)>,
+    /// Object declarations visible by type name in this module (local + imported), paired with their owning module id.
+    pub imported_objects: BTreeMap<String, (String, ObjectDecl)>,
     /// Concrete object declarations defined in this module.
     pub objects: Vec<ObjectDecl>,
-    /// Every transitively loaded module's local function scope (keyed by module id) so
-    /// functions/templates imported from module M resolve their own helper calls inside M's scope.
+    /// Every transitively loaded module's local scope (keyed by module id) so
+    /// functions/templates/objects imported from module M resolve their own references inside M's scope.
     pub module_scopes: BTreeMap<String, ModuleScope>,
 }
 
@@ -31,6 +39,9 @@ pub struct ResolvedModule {
 pub struct ModuleScope {
     pub functions: BTreeMap<String, (String, FnDecl)>,
     pub templates: BTreeMap<String, (String, TemplateDecl)>,
+    pub enums: BTreeMap<String, (String, EnumDecl)>,
+    pub bitflags: BTreeMap<String, (String, BitflagsDecl)>,
+    pub objects: BTreeMap<String, (String, ObjectDecl)>,
 }
 
 /// Optional pack root and external dependency roots for `use` resolution.
@@ -434,9 +445,12 @@ fn verify_no_symlink_components(base: &Path, rel: &Path) -> Result<()> {
 }
 
 struct LoadedModuleData {
-    /// Only items declared `pub` in this module.
+    /// Only items declared `pub` in this module (plus object declarations exported by type name).
     pub_functions: BTreeMap<String, FnDecl>,
     pub_templates: BTreeMap<String, TemplateDecl>,
+    pub_enums: BTreeMap<String, EnumDecl>,
+    pub_bitflags: BTreeMap<String, BitflagsDecl>,
+    pub_objects: BTreeMap<String, ObjectDecl>,
     /// All items declared locally (for private-visibility error diagnostics).
     all_local_names: BTreeSet<String>,
     /// Complete scope visible inside this module.
@@ -460,9 +474,15 @@ impl<'a> ModuleLoader<'a> {
 
         let mut functions: BTreeMap<String, (String, FnDecl)> = BTreeMap::new();
         let mut templates: BTreeMap<String, (String, TemplateDecl)> = BTreeMap::new();
+        let mut enums: BTreeMap<String, (String, EnumDecl)> = BTreeMap::new();
+        let mut bitflags: BTreeMap<String, (String, BitflagsDecl)> = BTreeMap::new();
+        let mut imported_objects: BTreeMap<String, (String, ObjectDecl)> = BTreeMap::new();
         let mut objects = Vec::new();
         let mut pub_functions = BTreeMap::new();
         let mut pub_templates = BTreeMap::new();
+        let mut pub_enums = BTreeMap::new();
+        let mut pub_bitflags = BTreeMap::new();
+        let mut pub_objects = BTreeMap::new();
         let mut all_local_names = BTreeSet::new();
 
         // 1. Register local items first so duplicate local names are caught clearly.
@@ -492,7 +512,51 @@ impl<'a> ModuleLoader<'a> {
                     }
                     templates.insert(t.name.clone(), (module_id.clone(), t.clone()));
                 }
+                V2Item::Enum(e) => {
+                    if !all_local_names.insert(e.name.clone()) {
+                        return Err(Error::at(
+                            e.span,
+                            format!("duplicate top-level item '{}' in {module_id}", e.name),
+                        ));
+                    }
+                    if e.is_pub {
+                        pub_enums.insert(e.name.clone(), e.clone());
+                    }
+                    enums.insert(e.name.clone(), (module_id.clone(), e.clone()));
+                }
+                V2Item::Bitflags(b) => {
+                    if !all_local_names.insert(b.name.clone()) {
+                        return Err(Error::at(
+                            b.span,
+                            format!("duplicate top-level item '{}' in {module_id}", b.name),
+                        ));
+                    }
+                    if b.is_pub {
+                        pub_bitflags.insert(b.name.clone(), b.clone());
+                    }
+                    bitflags.insert(b.name.clone(), (module_id.clone(), b.clone()));
+                }
                 V2Item::Object(obj) => {
+                    let type_name = object_type_ident(&obj.name);
+                    if crate::v2::ast::is_reserved_type_name(&type_name) {
+                        return Err(Error::at(
+                            obj.span,
+                            format!(
+                                "object '{}' derives reserved built-in type name '{type_name}'",
+                                obj.name
+                            ),
+                        ));
+                    }
+                    if !all_local_names.insert(type_name.clone()) {
+                        return Err(Error::at(
+                            obj.span,
+                            format!(
+                                "duplicate top-level item/object type '{type_name}' in {module_id}"
+                            ),
+                        ));
+                    }
+                    pub_objects.insert(type_name.clone(), obj.clone());
+                    imported_objects.insert(type_name, (module_id.clone(), obj.clone()));
                     objects.push(obj.clone());
                 }
             }
@@ -507,8 +571,19 @@ impl<'a> ModuleLoader<'a> {
                 .expect("load_module_path inserts into self.loaded");
             for item in &use_decl.items {
                 let local_name = item.alias.as_ref().unwrap_or(&item.name);
+                if crate::v2::ast::is_reserved_type_name(local_name) {
+                    return Err(Error::at(
+                        item.span,
+                        format!("cannot bind import to reserved built-in type name '{local_name}'"),
+                    ));
+                }
+                let name_taken = functions.contains_key(local_name)
+                    || templates.contains_key(local_name)
+                    || enums.contains_key(local_name)
+                    || bitflags.contains_key(local_name)
+                    || imported_objects.contains_key(local_name);
                 if let Some(fn_decl) = target.pub_functions.get(&item.name) {
-                    if functions.contains_key(local_name) || templates.contains_key(local_name) {
+                    if name_taken {
                         return Err(Error::at(
                             item.span,
                             format!(
@@ -518,7 +593,7 @@ impl<'a> ModuleLoader<'a> {
                     }
                     functions.insert(local_name.clone(), (target_key.clone(), fn_decl.clone()));
                 } else if let Some(tpl_decl) = target.pub_templates.get(&item.name) {
-                    if functions.contains_key(local_name) || templates.contains_key(local_name) {
+                    if name_taken {
                         return Err(Error::at(
                             item.span,
                             format!(
@@ -527,11 +602,42 @@ impl<'a> ModuleLoader<'a> {
                         ));
                     }
                     templates.insert(local_name.clone(), (target_key.clone(), tpl_decl.clone()));
+                } else if let Some(enum_decl) = target.pub_enums.get(&item.name) {
+                    if name_taken {
+                        return Err(Error::at(
+                            item.span,
+                            format!(
+                                "imported name '{local_name}' collides with an existing binding"
+                            ),
+                        ));
+                    }
+                    enums.insert(local_name.clone(), (target_key.clone(), enum_decl.clone()));
+                } else if let Some(bf_decl) = target.pub_bitflags.get(&item.name) {
+                    if name_taken {
+                        return Err(Error::at(
+                            item.span,
+                            format!(
+                                "imported name '{local_name}' collides with an existing binding"
+                            ),
+                        ));
+                    }
+                    bitflags.insert(local_name.clone(), (target_key.clone(), bf_decl.clone()));
+                } else if let Some(obj_decl) = target.pub_objects.get(&item.name) {
+                    if name_taken {
+                        return Err(Error::at(
+                            item.span,
+                            format!(
+                                "imported name '{local_name}' collides with an existing binding"
+                            ),
+                        ));
+                    }
+                    imported_objects
+                        .insert(local_name.clone(), (target_key.clone(), obj_decl.clone()));
                 } else if target.all_local_names.contains(&item.name) {
                     return Err(Error::at(
                         item.span,
                         format!(
-                            "item '{}' in module '{}' is private (declare it 'pub fn' or 'pub template' to import)",
+                            "item '{}' in module '{}' is private (declare it 'pub' to import)",
                             item.name, target_key
                         ),
                     ));
@@ -549,6 +655,9 @@ impl<'a> ModuleLoader<'a> {
         let scope = ModuleScope {
             functions: functions.clone(),
             templates: templates.clone(),
+            enums: enums.clone(),
+            bitflags: bitflags.clone(),
+            objects: imported_objects.clone(),
         };
 
         if !is_root {
@@ -557,6 +666,9 @@ impl<'a> ModuleLoader<'a> {
                 LoadedModuleData {
                     pub_functions,
                     pub_templates,
+                    pub_enums,
+                    pub_bitflags,
+                    pub_objects,
                     all_local_names,
                     scope: scope.clone(),
                 },
@@ -574,6 +686,9 @@ impl<'a> ModuleLoader<'a> {
             module_id,
             functions,
             templates,
+            enums,
+            bitflags,
+            imported_objects,
             objects,
             module_scopes,
         })
@@ -664,31 +779,44 @@ fn resolve_module_file_in_root(
     if mod_segs.is_empty() {
         return Err(Error::at(span, "module path must specify a module name"));
     }
-    let last = mod_segs.last().expect("non-empty");
-    let prefix = &mod_segs[..mod_segs.len() - 1];
+    let mut candidates = Vec::new();
+    let mut push_candidates = |segs: &[String]| {
+        let last = segs.last().expect("non-empty");
+        let prefix = &segs[..segs.len() - 1];
 
-    // Candidate 1: `<root>/<prefix...>/<last>.antics`
-    // Candidate 2: `<root>/<prefix...>/<last>/mod.antics`
-    // Candidate 3: `<root>/src/<prefix...>/<last>.antics`
-    // Candidate 4: `<root>/src/<prefix...>/<last>/mod.antics`
-    let mut direct_file: Vec<String> = prefix.to_vec();
-    direct_file.push(format!("{last}.antics"));
+        let mut direct_file: Vec<String> = prefix.to_vec();
+        direct_file.push(format!("{last}.antics"));
+        candidates.push(direct_file);
 
-    let mut direct_mod: Vec<String> = mod_segs.to_vec();
-    direct_mod.push("mod.antics".to_owned());
+        let mut direct_mod: Vec<String> = segs.to_vec();
+        direct_mod.push("mod.antics".to_owned());
+        candidates.push(direct_mod);
 
-    let mut src_file: Vec<String> = vec!["src".to_owned()];
-    src_file.extend(prefix.iter().cloned());
-    src_file.push(format!("{last}.antics"));
+        let mut direct_obj: Vec<String> = segs.to_vec();
+        direct_obj.push("object.antics".to_owned());
+        candidates.push(direct_obj);
 
-    let mut src_mod: Vec<String> = vec!["src".to_owned()];
-    src_mod.extend(mod_segs.iter().cloned());
-    src_mod.push("mod.antics".to_owned());
+        let mut src_file: Vec<String> = vec!["src".to_owned()];
+        src_file.extend(prefix.iter().cloned());
+        src_file.push(format!("{last}.antics"));
+        candidates.push(src_file);
 
-    let mut found = Vec::new();
-    for candidate in [direct_file, direct_mod, src_file, src_mod] {
-        if let Some(path) = try_contained_regular_file(root_canon, &candidate, span)? {
-            found.push(path);
+        let mut src_mod: Vec<String> = vec!["src".to_owned()];
+        src_mod.extend(segs.iter().cloned());
+        src_mod.push("mod.antics".to_owned());
+        candidates.push(src_mod);
+    };
+
+    push_candidates(mod_segs);
+    let kebab_segs: Vec<String> = mod_segs.iter().map(|s| s.replace('_', "-")).collect();
+    if kebab_segs != mod_segs {
+        push_candidates(&kebab_segs);
+    }
+
+    let mut found = BTreeSet::new();
+    for candidate in &candidates {
+        if let Some(path) = try_contained_regular_file(root_canon, candidate, span)? {
+            found.insert(path);
         }
     }
     match found.len() {
@@ -700,7 +828,7 @@ fn resolve_module_file_in_root(
                 root_canon.display()
             ),
         )),
-        1 => Ok(found.remove(0)),
+        1 => Ok(found.into_iter().next().expect("len == 1")),
         _ => Err(Error::at(
             span,
             format!(

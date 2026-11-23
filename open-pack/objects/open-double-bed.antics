@@ -9,6 +9,11 @@ object "Open Double Bed" from BedBase {
     description: "A clean-room two-tile double bed with left/right entry slots, shared occupancy tracking, and player cancel cleanup.";
     sprite: Sprite::procedural("double_bed", primary: #4C6C92, accent: #ECE8DC, trim: #5E3E2A);
 
+    bitflags BedSide {
+        Left = 1,
+        Right = 2,
+    }
+
     master_id: 1;
     tiles: [
         tile {
@@ -39,7 +44,7 @@ object "Open Double Bed" from BedBase {
     max_entry_energy: 85;
     wake_energy: 95;
 
-    state occupancy_mask: i16 = 0;
+    state occupancy: BedSide = BedSide::None;
     state reserved: i16 = 0;
     state completed_cycles: i16 = 0;
 
@@ -51,15 +56,15 @@ object "Open Double Bed" from BedBase {
 
     fn sync_occupancy() {
         for part in self.parts() {
-            part.attr[0] = self.occupancy_mask;
+            part.occupancy = self.occupancy;
         }
     }
 
-    fn sleep_side(sim: Sim, side_flag: i16) {
-        self.occupancy_mask flag_set side_flag;
+    fn sleep_side(sim: Sim, side: BedSide) {
+        self.occupancy.set(side);
         sync_occupancy();
         defer {
-            self.occupancy_mask flag_clear side_flag;
+            self.occupancy.clear(side);
             sync_occupancy();
             play_sound(wake);
         }
@@ -71,9 +76,9 @@ object "Open Double Bed" from BedBase {
         autonomy: 60,
         attenuation: 0.015,
         advertises: [energy +90, comfort +40],
-        guard(sim) => !(self.occupancy_mask flag_test 1) && sim.motive.energy < max_entry_energy,
+        guard(sim) => !self.occupancy.contains(BedSide::Left) && sim.motive.energy < max_entry_energy,
         run(sim) {
-            sleep_side(sim, 1);
+            sleep_side(sim, BedSide::Left);
         }
     }
 
@@ -81,9 +86,9 @@ object "Open Double Bed" from BedBase {
         autonomy: 60,
         attenuation: 0.015,
         advertises: [energy +90, comfort +40],
-        guard(sim) => !(self.occupancy_mask flag_test 2) && sim.motive.energy < max_entry_energy,
+        guard(sim) => !self.occupancy.contains(BedSide::Right) && sim.motive.energy < max_entry_energy,
         run(sim) {
-            sleep_side(sim, 2);
+            sleep_side(sim, BedSide::Right);
         }
     }
 }

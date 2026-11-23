@@ -13,12 +13,14 @@ use crate::manifest::{
 };
 use crate::parser::{motive_by_name, skill_by_name};
 use crate::v2::ast::{
-    CallArg, ConstIntExpr, FnDecl, ForEachIter, FunctionalDecl, GuardBody, GuardDecl,
-    InteractionDecl, MetaField, MetaFieldKind, ObjectDecl, ObjectMember, ParamType, ParamValue,
-    SlotDecl, SoundDecl, SpriteDecl, StateDecl, StateInitValue, StateType, StringsDecl,
-    TemplateDecl, TileDecl, V2AssignOp, V2BinOp, V2Expr, V2Stmt, V2Type, V2UnaryOp,
+    BitflagsDecl, CallArg, ConstIntExpr, EnumDecl, FnDecl, ForEachIter, FunctionalDecl, GuardBody,
+    GuardDecl, InteractionDecl, MatchArm, MatchPattern, MetaField, MetaFieldKind, ObjectDecl,
+    ObjectMember, ParamType, ParamValue, SlotDecl, SoundDecl, SpriteDecl, StateDecl,
+    StateInitValue, StateType, StringsDecl, TemplateDecl, TileDecl, V2AssignOp, V2BinOp, V2Expr,
+    V2Stmt, V2Type, V2UnaryOp, object_type_ident,
 };
 use crate::v2::loader::{ModuleScope, ResolvedModule};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
@@ -72,7 +74,7 @@ struct OwnedFunctional {
 #[derive(Debug, Clone)]
 struct ResolvedState {
     attr_index: usize,
-    ty: StateType,
+    ty: ValueType,
     init: Option<StateInitValue>,
     span: Span,
 }
@@ -80,6 +82,178 @@ struct ResolvedState {
 #[derive(Debug, Clone)]
 struct ResolvedSound {
     id: u16,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedEnum {
+    canonical_key: String,
+    display_name: String,
+    variants: BTreeMap<String, i16>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedBitflags {
+    canonical_key: String,
+    display_name: String,
+    /// Flag name -> 1-based SimAntics bit position (`1..=16`).
+    flags: BTreeMap<String, u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FunctionalGuardSummary {
+    /// Functional declares no guard (always eligible if not in-use / disabled).
+    None,
+    /// Guard is a simple boolean check on `self.<bool_state>` (or `!self.<bool_state>`).
+    AttrBool {
+        attr_index: usize,
+        expect_true: bool,
+    },
+    /// Guard has arbitrary logic that cannot be evaluated inline from another object.
+    Complex,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedFunctionalSig {
+    params: Vec<ValueType>,
+    return_type: Option<ValueType>,
+    guard: FunctionalGuardSummary,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedObjectSchema {
+    canonical_key: String,
+    display_name: String,
+    /// Master GUID (used by `create_object::<T>()` to spawn single-tile or full multi-tile groups).
+    master_guid: u32,
+    /// Spawned lead-tile GUID (used by `objects_of::<T>()` and fallback searches; equals `master_guid` for single-tile objects).
+    lead_guid: u32,
+    /// All spawned tile GUIDs belonging to this object (used for runtime `test_object_type` checks).
+    tile_guids: Vec<u32>,
+    states: BTreeMap<String, (usize, ValueType)>,
+    functionals: BTreeMap<String, ResolvedFunctionalSig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedNamedType {
+    Enum(String),
+    Bitflags(String),
+    Object(String),
+}
+
+/// Mutable STR# 301 string interning table shared across all trees in one object.
+#[derive(Debug, Default)]
+struct DialogStringTable {
+    label: Option<String>,
+    entries: Vec<(Span, String, String)>,
+    by_text: BTreeMap<String, String>,
+    used_names: BTreeSet<String>,
+    next_auto_idx: usize,
+}
+
+impl DialogStringTable {
+    fn from_existing(existing: Option<&StringsDecl>) -> Self {
+        let mut tbl = Self::default();
+        if let Some(st) = existing {
+            tbl.label = st.label.clone();
+            for (span, name, text) in &st.entries {
+                tbl.entries.push((*span, name.clone(), text.clone()));
+                tbl.by_text
+                    .entry(text.clone())
+                    .or_insert_with(|| name.clone());
+                tbl.used_names.insert(name.clone());
+            }
+        }
+        tbl
+    }
+
+    fn intern(&mut self, text: &str, span: Span) -> Result<String> {
+        if let Some(existing) = self.by_text.get(text) {
+            return Ok(existing.clone());
+        }
+        if self.entries.len() >= 255 {
+            return Err(Error::at(
+                span,
+                "STR# 301 dialog string table exceeds maximum of 255 entries",
+            ));
+        }
+        let name = loop {
+            let candidate = format!("__dlg_str_{}", self.next_auto_idx);
+            self.next_auto_idx += 1;
+            if self.used_names.insert(candidate.clone()) {
+                break candidate;
+            }
+        };
+        self.entries.push((span, name.clone(), text.to_owned()));
+        self.by_text.insert(text.to_owned(), name.clone());
+        Ok(name)
+    }
+}
+
+fn builtin_bitflags() -> BTreeMap<String, ResolvedBitflags> {
+    let mut map = BTreeMap::new();
+    map.insert(
+        "builtin::Height".to_owned(),
+        ResolvedBitflags {
+            canonical_key: "builtin::Height".to_owned(),
+            display_name: "Height".to_owned(),
+            flags: BTreeMap::from([
+                ("Floor".to_owned(), 1),
+                ("LowTable".to_owned(), 2),
+                ("Table".to_owned(), 3),
+                ("Counter".to_owned(), 4),
+                ("NonStandard".to_owned(), 5),
+                ("InHand".to_owned(), 6),
+                ("Sitting".to_owned(), 7),
+                ("EndTable".to_owned(), 8),
+            ]),
+        },
+    );
+    map.insert(
+        "builtin::Placement".to_owned(),
+        ResolvedBitflags {
+            canonical_key: "builtin::Placement".to_owned(),
+            display_name: "Placement".to_owned(),
+            flags: BTreeMap::from([
+                ("Floor".to_owned(), 1),
+                ("Terrain".to_owned(), 2),
+                ("Water".to_owned(), 3),
+                ("Sloped".to_owned(), 9),
+                ("Air".to_owned(), 10),
+                ("Pool".to_owned(), 12),
+                ("WaterOnly".to_owned(), 14),
+            ]),
+        },
+    );
+    map
+}
+
+fn bit_to_mask(bit: u8) -> i16 {
+    debug_assert!((1..=16).contains(&bit));
+    (1u16 << (bit - 1)) as i16
+}
+
+fn resolve_enum_decl(canonical_key: String, decl: &EnumDecl) -> ResolvedEnum {
+    let mut variants = BTreeMap::new();
+    for v in &decl.variants {
+        variants.insert(v.name.clone(), v.value);
+    }
+    ResolvedEnum {
+        canonical_key,
+        display_name: decl.name.clone(),
+        variants,
+    }
+}
+
+fn resolve_bitflags_decl(canonical_key: String, decl: &BitflagsDecl) -> ResolvedBitflags {
+    let mut flags = BTreeMap::new();
+    for f in &decl.flags {
+        flags.insert(f.name.clone(), f.bit);
+    }
+    ResolvedBitflags {
+        canonical_key,
+        display_name: decl.name.clone(),
+        flags,
+    }
 }
 
 /// Flattened, validated object environment ready to emit `.air` and `ObjectManifest`.
@@ -96,7 +270,20 @@ struct ObjectEnv<'a> {
     slots: BTreeMap<String, (Option<u16>, SlotDecl)>,
     strings: BTreeMap<u16, StringsDecl>,
     string_names: BTreeMap<String, u16>,
+    dialog_strings: RefCell<DialogStringTable>,
     local_fns: BTreeMap<String, (String, FnDecl)>,
+    /// Object/template-local enums by short name -> canonical key.
+    local_enums: BTreeMap<String, String>,
+    /// Object/template-local bitflags by short name -> canonical key.
+    local_bitflags: BTreeMap<String, String>,
+    /// All resolved enums (built-in + module + object-local) keyed by canonical key.
+    all_enums: BTreeMap<String, ResolvedEnum>,
+    /// All resolved bitflags (built-in + module + object-local) keyed by canonical key.
+    all_bitflags: BTreeMap<String, ResolvedBitflags>,
+    /// All resolved object schemas (including `self_object_key` and imported objects) keyed by canonical key.
+    object_schemas: BTreeMap<String, ResolvedObjectSchema>,
+    /// Canonical schema key for the object currently being lowered (`Self`).
+    self_object_key: String,
 }
 
 impl<'a> ObjectEnv<'a> {
@@ -138,6 +325,141 @@ impl<'a> ObjectEnv<'a> {
             .get(owner_module)
             .and_then(|s: &ModuleScope| s.functions.get(name))
             .map(|(m, decl)| (m.clone(), decl.clone(), false))
+    }
+
+    /// Unified lexical type lookup used identically by declarations, paths, and constant folding:
+    /// 1. Object-local scope (when `allow_local`)
+    /// 2. Built-in types (`Height`, `Placement`, `Self`)
+    /// 3. Module scope of `owner_module` (enums, bitflags, objects)
+    fn lookup_named_type(
+        &self,
+        owner_module: &str,
+        name: &str,
+        allow_local: bool,
+    ) -> Option<ResolvedNamedType> {
+        if allow_local {
+            if let Some(key) = self.local_enums.get(name) {
+                return Some(ResolvedNamedType::Enum(key.clone()));
+            }
+            if let Some(key) = self.local_bitflags.get(name) {
+                return Some(ResolvedNamedType::Bitflags(key.clone()));
+            }
+        }
+        match name {
+            "Height" => return Some(ResolvedNamedType::Bitflags("builtin::Height".to_owned())),
+            "Placement" => {
+                return Some(ResolvedNamedType::Bitflags("builtin::Placement".to_owned()));
+            }
+            "Self" => return Some(ResolvedNamedType::Object(self.self_object_key.clone())),
+            _ => {}
+        }
+        if let Some(scope) = self.resolved.module_scopes.get(owner_module) {
+            if let Some((def_mod, decl)) = scope.enums.get(name) {
+                return Some(ResolvedNamedType::Enum(format!(
+                    "enum::{def_mod}::{}",
+                    decl.name
+                )));
+            }
+            if let Some((def_mod, decl)) = scope.bitflags.get(name) {
+                return Some(ResolvedNamedType::Bitflags(format!(
+                    "bitflags::{def_mod}::{}",
+                    decl.name
+                )));
+            }
+            if let Some((def_mod, decl)) = scope.objects.get(name) {
+                return Some(ResolvedNamedType::Object(format!(
+                    "object::{def_mod}::{}",
+                    object_type_ident(&decl.name)
+                )));
+            }
+        }
+        None
+    }
+
+    fn lookup_enum(
+        &self,
+        owner_module: &str,
+        name: &str,
+        allow_local: bool,
+    ) -> Option<&ResolvedEnum> {
+        match self.lookup_named_type(owner_module, name, allow_local) {
+            Some(ResolvedNamedType::Enum(key)) => self.all_enums.get(&key),
+            _ => None,
+        }
+    }
+
+    fn lookup_bitflags(
+        &self,
+        owner_module: &str,
+        name: &str,
+        allow_local: bool,
+    ) -> Option<&ResolvedBitflags> {
+        match self.lookup_named_type(owner_module, name, allow_local) {
+            Some(ResolvedNamedType::Bitflags(key)) => self.all_bitflags.get(&key),
+            _ => None,
+        }
+    }
+
+    fn lookup_object_schema(
+        &self,
+        owner_module: &str,
+        name: &str,
+        allow_local: bool,
+    ) -> Option<&ResolvedObjectSchema> {
+        match self.lookup_named_type(owner_module, name, allow_local) {
+            Some(ResolvedNamedType::Object(key)) => self.object_schemas.get(&key),
+            _ => None,
+        }
+    }
+
+    fn resolve_value_type(
+        &self,
+        ty: &V2Type,
+        owner_module: &str,
+        allow_local: bool,
+        span: Span,
+    ) -> Result<ValueType> {
+        match ty {
+            V2Type::I16 => Ok(ValueType::I16),
+            V2Type::Bool => Ok(ValueType::Bool),
+            V2Type::ObjectId => Ok(ValueType::ObjectId),
+            V2Type::Named(name) => match self.lookup_named_type(owner_module, name, allow_local) {
+                Some(ResolvedNamedType::Enum(k)) if self.all_enums.contains_key(&k) => {
+                    Ok(ValueType::Enum(k))
+                }
+                Some(ResolvedNamedType::Bitflags(k)) if self.all_bitflags.contains_key(&k) => {
+                    Ok(ValueType::Bitflags(k))
+                }
+                Some(ResolvedNamedType::Object(k)) if self.object_schemas.contains_key(&k) => {
+                    Ok(ValueType::ObjectRef(k))
+                }
+                _ => Err(Error::at(span, format!("unknown type '{name}'"))),
+            },
+            other => Err(Error::at(
+                span,
+                format!("unsupported value type '{}'", other.display_name()),
+            )),
+        }
+    }
+
+    fn display_value_type(&self, ty: &ValueType) -> String {
+        match ty {
+            ValueType::I16 => "i16".to_owned(),
+            ValueType::Bool => "bool".to_owned(),
+            ValueType::ObjectId => "ObjectId".to_owned(),
+            ValueType::Enum(k) => self
+                .all_enums
+                .get(k)
+                .map_or_else(|| k.clone(), |e| e.display_name.clone()),
+            ValueType::Bitflags(k) => self
+                .all_bitflags
+                .get(k)
+                .map_or_else(|| k.clone(), |b| b.display_name.clone()),
+            ValueType::ObjectRef(k) => self
+                .object_schemas
+                .get(k)
+                .map_or_else(|| k.clone(), |o| o.display_name.clone()),
+        }
     }
 }
 
@@ -203,6 +525,16 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
     let mut init_pinned_id: Option<u16> = None;
     let mut main_block: Option<OwnedStmtBlock> = None;
     let mut main_pinned_id: Option<u16> = None;
+    let mut load_blocks: Vec<OwnedStmtBlock> = Vec::new();
+    let mut load_pinned_id: Option<u16> = None;
+    let mut reset_blocks: Vec<OwnedStmtBlock> = Vec::new();
+    let mut reset_pinned_id: Option<u16> = None;
+    let mut cleanup_blocks: Vec<OwnedStmtBlock> = Vec::new();
+    let mut cleanup_pinned_id: Option<u16> = None;
+
+    let mut local_enums_raw: BTreeMap<String, (String, EnumDecl)> = BTreeMap::new();
+    let mut local_bitflags_raw: BTreeMap<String, (String, BitflagsDecl)> = BTreeMap::new();
+    let mut state_owners: BTreeMap<String, String> = BTreeMap::new();
 
     let mut functionals: Vec<OwnedFunctional> = Vec::new();
     let mut interactions: Vec<OwnedInteraction> = Vec::new();
@@ -217,6 +549,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         let mut seen_functionals_here = BTreeSet::new();
         let mut seen_interactions_here = BTreeSet::new();
         let mut seen_fns_here = BTreeSet::new();
+        let mut seen_types_here = BTreeSet::new();
         for member in members {
             match member {
                 ObjectMember::Meta(MetaField { span, kind }) => match kind {
@@ -288,6 +621,8 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
                             | "prep_score"
                             | "cook_score"
                             | "in_use"
+                            | "allowed_heights"
+                            | "placement"
                             | "attr"
                             | "data"
                             | "parts"
@@ -307,6 +642,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
                         ));
                     }
                     state_order.push(s.name.clone());
+                    state_owners.insert(s.name.clone(), owner_mod.to_owned());
                     raw_states.insert(s.name.clone(), s.clone());
                 }
                 ObjectMember::Sound(s) => {
@@ -366,6 +702,30 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
                     }
                     strings.insert(st.id, st.clone());
                 }
+                ObjectMember::Enum(e) => {
+                    if !seen_types_here.insert(e.name.clone())
+                        || local_enums_raw.contains_key(&e.name)
+                        || local_bitflags_raw.contains_key(&e.name)
+                    {
+                        return Err(Error::at(
+                            e.span,
+                            format!("duplicate local type declaration '{}'", e.name),
+                        ));
+                    }
+                    local_enums_raw.insert(e.name.clone(), (owner_mod.to_owned(), e.clone()));
+                }
+                ObjectMember::Bitflags(b) => {
+                    if !seen_types_here.insert(b.name.clone())
+                        || local_enums_raw.contains_key(&b.name)
+                        || local_bitflags_raw.contains_key(&b.name)
+                    {
+                        return Err(Error::at(
+                            b.span,
+                            format!("duplicate local type declaration '{}'", b.name),
+                        ));
+                    }
+                    local_bitflags_raw.insert(b.name.clone(), (owner_mod.to_owned(), b.clone()));
+                }
                 ObjectMember::Init(b) => {
                     if let Some(pid) = b.pinned_id {
                         init_pinned_id = Some(pid);
@@ -380,6 +740,33 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
                         main_pinned_id = Some(pid);
                     }
                     main_block = Some(OwnedStmtBlock {
+                        owner_module: owner_mod.to_owned(),
+                        stmts: b.body.clone(),
+                    });
+                }
+                ObjectMember::Load(b) => {
+                    if let Some(pid) = b.pinned_id {
+                        load_pinned_id = Some(pid);
+                    }
+                    load_blocks.push(OwnedStmtBlock {
+                        owner_module: owner_mod.to_owned(),
+                        stmts: b.body.clone(),
+                    });
+                }
+                ObjectMember::Reset(b) => {
+                    if let Some(pid) = b.pinned_id {
+                        reset_pinned_id = Some(pid);
+                    }
+                    reset_blocks.push(OwnedStmtBlock {
+                        owner_module: owner_mod.to_owned(),
+                        stmts: b.body.clone(),
+                    });
+                }
+                ObjectMember::Cleanup(b) => {
+                    if let Some(pid) = b.pinned_id {
+                        cleanup_pinned_id = Some(pid);
+                    }
+                    cleanup_blocks.push(OwnedStmtBlock {
                         owner_module: owner_mod.to_owned(),
                         stmts: b.body.clone(),
                     });
@@ -531,20 +918,170 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         ));
     }
 
-    // 4. Allocate state attribute indices `0..N`.
+    // 3b. Resolve all enums and bitflags (built-in + module-level + object/template-local).
+    let mut all_enums: BTreeMap<String, ResolvedEnum> = BTreeMap::new();
+    let mut all_bitflags: BTreeMap<String, ResolvedBitflags> = builtin_bitflags();
+    for scope in resolved.module_scopes.values() {
+        for (def_mod, edecl) in scope.enums.values() {
+            let key = format!("enum::{def_mod}::{}", edecl.name);
+            all_enums
+                .entry(key.clone())
+                .or_insert_with(|| resolve_enum_decl(key, edecl));
+        }
+        for (def_mod, bdecl) in scope.bitflags.values() {
+            let key = format!("bitflags::{def_mod}::{}", bdecl.name);
+            all_bitflags
+                .entry(key.clone())
+                .or_insert_with(|| resolve_bitflags_decl(key, bdecl));
+        }
+    }
+    let mut local_enums: BTreeMap<String, String> = BTreeMap::new();
+    for (ename, (owner_mod, edecl)) in &local_enums_raw {
+        let key = format!("local_enum::{owner_mod}::{slug}::{}", edecl.name);
+        all_enums.insert(key.clone(), resolve_enum_decl(key.clone(), edecl));
+        local_enums.insert(ename.clone(), key);
+    }
+    let mut local_bitflags: BTreeMap<String, String> = BTreeMap::new();
+    for (bname, (owner_mod, bdecl)) in &local_bitflags_raw {
+        let key = format!("local_bitflags::{owner_mod}::{slug}::{}", bdecl.name);
+        all_bitflags.insert(key.clone(), resolve_bitflags_decl(key.clone(), bdecl));
+        local_bitflags.insert(bname.clone(), key);
+    }
+
+    // 3c. Resolve imported object schemas across all loaded modules.
+    let mut object_schemas: BTreeMap<String, ResolvedObjectSchema> = BTreeMap::new();
+    for scope in resolved.module_scopes.values() {
+        for (def_mod, odecl) in scope.objects.values() {
+            let type_name = object_type_ident(&odecl.name);
+            let key = format!("object::{def_mod}::{type_name}");
+            if let std::collections::btree_map::Entry::Vacant(slot) = object_schemas.entry(key) {
+                let schema = build_object_schema(
+                    resolved,
+                    def_mod,
+                    odecl,
+                    slot.key(),
+                    &type_name,
+                    &mut all_enums,
+                    &mut all_bitflags,
+                )?;
+                slot.insert(schema);
+            }
+        }
+    }
+
+    let self_type_name = object_type_ident(&obj.name);
+    let self_object_key = format!("object::{}::{self_type_name}", resolved.module_id);
+
+    // Helper closure to resolve a StateType / V2Type inside this object.
+    let resolve_type_here = |ty: &V2Type, owner_mod: &str, span: Span| -> Result<ValueType> {
+        match ty {
+            V2Type::I16 => Ok(ValueType::I16),
+            V2Type::Bool => Ok(ValueType::Bool),
+            V2Type::ObjectId => Ok(ValueType::ObjectId),
+            V2Type::Named(tname) => {
+                if let Some(k) = local_enums.get(tname) {
+                    return Ok(ValueType::Enum(k.clone()));
+                }
+                if let Some(k) = local_bitflags.get(tname) {
+                    return Ok(ValueType::Bitflags(k.clone()));
+                }
+                match tname.as_str() {
+                    "Height" => return Ok(ValueType::Bitflags("builtin::Height".to_owned())),
+                    "Placement" => return Ok(ValueType::Bitflags("builtin::Placement".to_owned())),
+                    "Self" => return Ok(ValueType::ObjectRef(self_object_key.clone())),
+                    _ => {}
+                }
+                if let Some(sc) = resolved.module_scopes.get(owner_mod) {
+                    if let Some((def_mod, ed)) = sc.enums.get(tname) {
+                        return Ok(ValueType::Enum(format!("enum::{def_mod}::{}", ed.name)));
+                    }
+                    if let Some((def_mod, bd)) = sc.bitflags.get(tname) {
+                        return Ok(ValueType::Bitflags(format!(
+                            "bitflags::{def_mod}::{}",
+                            bd.name
+                        )));
+                    }
+                    if let Some((def_mod, od)) = sc.objects.get(tname) {
+                        return Ok(ValueType::ObjectRef(format!(
+                            "object::{def_mod}::{}",
+                            object_type_ident(&od.name)
+                        )));
+                    }
+                }
+                Err(Error::at(span, format!("unknown type '{tname}'")))
+            }
+            other => Err(Error::at(
+                span,
+                format!("unsupported type '{}'", other.display_name()),
+            )),
+        }
+    };
+
+    // 4. Allocate state attribute indices `0..N` with resolved types.
     let mut states = BTreeMap::new();
+    let mut self_schema_states = BTreeMap::new();
     for (idx, sname) in state_order.iter().enumerate() {
         let s = &raw_states[sname];
+        let owner_mod = state_owners
+            .get(sname)
+            .map_or(resolved.module_id.as_str(), String::as_str);
+        let resolved_ty = match &s.ty {
+            StateType::Bool => ValueType::Bool,
+            StateType::I16 => ValueType::I16,
+            StateType::ObjectId => ValueType::ObjectId,
+            StateType::Named(tname) => {
+                resolve_type_here(&V2Type::Named(tname.clone()), owner_mod, s.span)?
+            }
+        };
+        self_schema_states.insert(sname.clone(), (idx, resolved_ty.clone()));
         states.insert(
             sname.clone(),
             ResolvedState {
                 attr_index: idx,
-                ty: s.ty,
+                ty: resolved_ty,
                 init: s.init.clone(),
                 span: s.span,
             },
         );
     }
+
+    // Register self schema (with its resolved states, functionals, and tile GUIDs) so `self.parts()`
+    // and self-typed references resolve named states with full type safety!
+    let mut self_schema_funcs = BTreeMap::new();
+    for f in &functionals {
+        let mut p_tys = Vec::with_capacity(f.decl.params.len());
+        for fp in &f.decl.params {
+            p_tys.push(resolve_type_here(&fp.ty, &f.owner_module, fp.span)?);
+        }
+        let r_ty = match &f.decl.return_type {
+            Some(rt) => Some(resolve_type_here(rt, &f.owner_module, f.decl.span)?),
+            None => None,
+        };
+        self_schema_funcs.insert(
+            f.decl.kind.clone(),
+            ResolvedFunctionalSig {
+                params: p_tys,
+                return_type: r_ty,
+                guard: summarize_functional_guard(f.decl.guard.as_ref(), &self_schema_states),
+            },
+        );
+    }
+    let self_lead_guid = select_lead_tile_guid(&tiles, guid);
+    let self_tile_guids = if tiles.is_empty() {
+        vec![guid]
+    } else {
+        tiles.iter().map(|t| t.guid).collect()
+    };
+    let self_schema = ResolvedObjectSchema {
+        canonical_key: self_object_key.clone(),
+        display_name: self_type_name,
+        master_guid: guid,
+        lead_guid: self_lead_guid,
+        tile_guids: self_tile_guids,
+        states: self_schema_states,
+        functionals: self_schema_funcs,
+    };
+    object_schemas.insert(self_object_key.clone(), self_schema);
 
     // 5. Assign FWAV sound IDs (`1..`, honoring explicit IDs).
     let mut used_sound_ids: BTreeSet<u16> = BTreeSet::new();
@@ -629,6 +1166,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         slots.insert(sl_name.clone(), (routing_idx, sl));
     }
 
+    let dialog_strings = RefCell::new(DialogStringTable::from_existing(strings.get(&301)));
     let env = ObjectEnv {
         resolved,
         name: obj.name.clone(),
@@ -641,7 +1179,14 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         slots,
         strings,
         string_names,
+        dialog_strings,
         local_fns,
+        local_enums,
+        local_bitflags,
+        all_enums,
+        all_bitflags,
+        object_schemas,
+        self_object_key,
     };
 
     // 7. Allocate deterministic private BHAV IDs (`4096..=8191`), respecting `@id` / `@guard_id`.
@@ -662,6 +1207,15 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         register_pinned(id, obj.span)?;
     }
     if let Some(id) = main_pinned_id {
+        register_pinned(id, obj.span)?;
+    }
+    if let Some(id) = load_pinned_id {
+        register_pinned(id, obj.span)?;
+    }
+    if let Some(id) = reset_pinned_id {
+        register_pinned(id, obj.span)?;
+    }
+    if let Some(id) = cleanup_pinned_id {
         register_pinned(id, obj.span)?;
     }
     for f in &functionals {
@@ -711,47 +1265,9 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
     let init_id = alloc_tree_id(init_pinned_id, Some(4096), obj.span)?;
     let main_id = alloc_tree_id(main_pinned_id, Some(4097), obj.span)?;
 
-    // 8. Emit `.air` (Antics IR) text deterministically!
-    let mut air = String::new();
-    let _ = writeln!(
-        air,
-        "// Generated .air (Antics IR) from .antics v2 object \"{}\" (GUID {guid:#010x})",
-        escape_str(&env.name)
-    );
-    if !env.state_order.is_empty() {
-        air.push_str("// Attributes: ");
-        for (i, sname) in env.state_order.iter().enumerate() {
-            if i > 0 {
-                air.push_str(", ");
-            }
-            let _ = write!(air, "attr[{i}] = {sname}");
-        }
-        air.push('\n');
-    }
-    air.push('\n');
-
-    // 8a. BCON 4096 from i16 params.
-    if !env.i16_param_order.is_empty() {
-        let _ = writeln!(air, "bcon 4096 \"{}Tuning\" {{", camel_label(&env.name));
-        for pname in &env.i16_param_order {
-            let val = env.i16_params[pname];
-            let _ = writeln!(air, "    {pname} = {val},");
-        }
-        air.push_str("}\n\n");
-    }
-
-    // 8b. STR# tables from `strings` blocks.
-    for st in env.strings.values() {
-        let lbl = st
-            .label
-            .clone()
-            .unwrap_or_else(|| format!("{}Strings_{}", camel_label(&env.name), st.id));
-        let _ = writeln!(air, "str {} \"{}\" {{", st.id, escape_str(&lbl));
-        for (_, ename, text) in &st.entries {
-            let _ = writeln!(air, "    {ename} = \"{}\",", escape_str(text));
-        }
-        air.push_str("}\n\n");
-    }
+    // 8. Emit all trees into `trees_air` first so inline dialog strings interned into
+    // `env.dialog_strings` are complete before we emit the STR# 301 table at the top!
+    let mut trees_air = String::new();
 
     // 8c. Init tree.
     {
@@ -786,39 +1302,27 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         // Auto-initialize all declared states in declaration order.
         for sname in &env.state_order {
             let st = &env.states[sname];
+            let owner_mod = state_owners
+                .get(sname)
+                .map_or(resolved.module_id.as_str(), String::as_str);
             let rhs = match &st.init {
-                None => "0".to_owned(),
-                Some(StateInitValue::Int(v)) => v.to_string(),
-                Some(StateInitValue::Bool(b)) => if *b { "1" } else { "0" }.to_owned(),
-                Some(StateInitValue::Param(pname)) => {
-                    if env.i16_params.contains_key(pname) {
-                        if st.ty == StateType::Bool {
-                            return Err(Error::at(
-                                st.span,
-                                format!(
-                                    "bool state '{sname}' cannot initialize from i16 param '{pname}'"
-                                ),
-                            ));
-                        }
-                        format!("bcon.{pname}")
-                    } else if let Some(&bval) = env.bool_params.get(pname) {
-                        if st.ty != StateType::Bool {
-                            return Err(Error::at(
-                                st.span,
-                                format!(
-                                    "state '{sname}' cannot initialize from bool param '{pname}'"
-                                ),
-                            ));
-                        }
-                        if bval { "1" } else { "0" }.to_owned()
-                    } else {
+                None => {
+                    if let ValueType::Enum(ref key) = st.ty
+                        && let Some(e) = env.all_enums.get(key)
+                        && !e.variants.values().any(|&v| v == 0)
+                    {
                         return Err(Error::at(
                             st.span,
                             format!(
-                                "state '{sname}' initializer references unknown param '{pname}'"
+                                "state '{sname}' of enum type '{}' requires an explicit initializer (0 is not a declared variant)",
+                                e.display_name
                             ),
                         ));
                     }
+                    "0".to_owned()
+                }
+                Some(init_val) => {
+                    resolve_state_init_air(&env, owner_mod, sname, &st.ty, init_val, st.span)?
                 }
             };
             ctx.line(format!("my.attr[{}] := {rhs};", st.attr_index));
@@ -828,7 +1332,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             ctx.with_owner_module(&blk.owner_module, |c| {
                 c.push_scope(ScopeFrame::block());
                 let r = c.lower_stmts(&blk.stmts);
-                let p = if stmts_always_return(&blk.stmts) {
+                let p = if stmts_always_return(&blk.stmts, &env, &blk.owner_module, true) {
                     c.pop_scope_discard_cleanups();
                     Ok(())
                 } else {
@@ -839,14 +1343,14 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         }
         if !init_blocks
             .last()
-            .is_some_and(|b| stmts_always_return(&b.stmts))
+            .is_some_and(|b| stmts_always_return(&b.stmts, &env, &b.owner_module, true))
         {
             ctx.emit_all_cleanups()?;
             ctx.line("return true;".to_owned());
         }
-        let _ = writeln!(air, "tree {init_id} \"Init\" {{");
-        air.push_str(&ctx.finish());
-        air.push_str("}\n\n");
+        let _ = writeln!(trees_air, "tree {init_id} \"Init\" {{");
+        trees_air.push_str(&ctx.finish());
+        trees_air.push_str("}\n\n");
     }
 
     // 8d. Main tree.
@@ -856,7 +1360,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             ctx.with_owner_module(&blk.owner_module, |c| {
                 c.push_scope(ScopeFrame::block());
                 let r = c.lower_stmts(&blk.stmts);
-                let p = if stmts_always_return(&blk.stmts) {
+                let p = if stmts_always_return(&blk.stmts, &env, &blk.owner_module, true) {
                     c.pop_scope_discard_cleanups();
                     Ok(())
                 } else {
@@ -864,27 +1368,68 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
                 };
                 r.and(p)
             })?;
-            if !stmts_always_return(&blk.stmts) {
+            if !stmts_always_return(&blk.stmts, &env, &blk.owner_module, true) {
                 ctx.emit_all_cleanups()?;
                 ctx.line("return true;".to_owned());
             }
         } else {
             ctx.line("return true;".to_owned());
         }
-        let _ = writeln!(air, "tree {main_id} \"Main\" {{");
-        air.push_str(&ctx.finish());
-        air.push_str("}\n\n");
+        let _ = writeln!(trees_air, "tree {main_id} \"Main\" {{");
+        trees_air.push_str(&ctx.finish());
+        trees_air.push_str("}\n\n");
+    }
+
+    // 8d2. Optional OBJf lifecycle hooks: `load` (OBJf 2), `reset` (OBJf 3), `cleanup` (OBJf 4).
+    let mut callback_specs = Vec::with_capacity(functionals.len() + 3);
+    for (cb_index, tree_label, pinned_id, blocks) in [
+        (2usize, "Load", load_pinned_id, &load_blocks),
+        (3usize, "Reset", reset_pinned_id, &reset_blocks),
+        (4usize, "Cleanup", cleanup_pinned_id, &cleanup_blocks),
+    ] {
+        if blocks.is_empty() {
+            continue;
+        }
+        let tid = alloc_tree_id(pinned_id, None, obj.span)?;
+        let mut ctx = TreeLowerer::new(&env, TreeContext::ObjectSelf, &resolved.module_id, false);
+        for blk in blocks {
+            ctx.with_owner_module(&blk.owner_module, |c| {
+                c.push_scope(ScopeFrame::block());
+                let r = c.lower_stmts(&blk.stmts);
+                let p = if stmts_always_return(&blk.stmts, &env, &blk.owner_module, true) {
+                    c.pop_scope_discard_cleanups();
+                    Ok(())
+                } else {
+                    c.pop_scope_and_run_cleanups()
+                };
+                r.and(p)
+            })?;
+        }
+        if !blocks
+            .last()
+            .is_some_and(|b| stmts_always_return(&b.stmts, &env, &b.owner_module, true))
+        {
+            ctx.emit_all_cleanups()?;
+            ctx.line("return true;".to_owned());
+        }
+        let _ = writeln!(trees_air, "tree {tid} \"{tree_label}\" {{");
+        trees_air.push_str(&ctx.finish());
+        trees_air.push_str("}\n\n");
+        callback_specs.push(CallbackSpec {
+            index: cb_index,
+            action: Some(TreeRef::Id(tid)),
+            condition: None,
+        });
     }
 
     // 8e. Functional callback trees (OBJf).
-    let mut callback_specs = Vec::with_capacity(functionals.len());
     for func in &functionals {
         let (cb_index, _) = functional_kind_info(&func.decl.kind, func.decl.kind_span)?;
         let guard_id = if let Some(guard) = &func.decl.guard {
             let gid = alloc_tree_id(func.decl.pinned_guard_id, None, guard.span)?;
             let label = format!("Can_{}", capitalize(&func.decl.kind));
             emit_guard_tree(
-                &mut air,
+                &mut trees_air,
                 &env,
                 &func.owner_module,
                 gid,
@@ -898,8 +1443,31 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         };
         let action_id = alloc_tree_id(func.decl.pinned_id, None, func.decl.span)?;
         let action_label = format!("Functional_{}", capitalize(&func.decl.kind));
-        let needs_self_save =
-            stmts_may_clobber_stack_obj(&func.decl.body, &env, &func.owner_module, true, 0);
+        let func_ret_ty = match &func.decl.return_type {
+            Some(rt) => {
+                Some(env.resolve_value_type(rt, &func.owner_module, true, func.decl.span)?)
+            }
+            None => None,
+        };
+        if func_ret_ty.is_some()
+            && !stmts_always_return(&func.decl.body, &env, &func.owner_module, true)
+        {
+            return Err(Error::at(
+                func.decl.span,
+                format!(
+                    "functional '{}' declares a return type and must return a value on all control-flow paths",
+                    func.decl.kind
+                ),
+            ));
+        }
+        let needs_self_save = stmts_may_clobber_stack_obj(
+            &func.decl.body,
+            &env,
+            &func.owner_module,
+            true,
+            Some(&func.decl.sim_binding),
+            0,
+        );
         let mut ctx = TreeLowerer::new(
             &env,
             TreeContext::SimOnObject {
@@ -908,6 +1476,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             &func.owner_module,
             needs_self_save,
         );
+        ctx.functional_return_type = func_ret_ty;
         if needs_self_save {
             ctx.line("let __self_obj = stack_obj;".to_owned());
         }
@@ -915,21 +1484,21 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             ctx.bind_func_param(&fp.name, pidx, &fp.ty, fp.span)?;
         }
         ctx.lower_stmts(&func.decl.body)?;
-        if !ends_with_unconditional_return(&func.decl.body) {
+        if !stmts_always_return(&func.decl.body, &env, &func.owner_module, true) {
             ctx.emit_all_cleanups()?;
             ctx.line("return true;".to_owned());
         }
         if func.decl.params.is_empty() {
-            let _ = writeln!(air, "tree {action_id} \"{action_label}\" {{");
+            let _ = writeln!(trees_air, "tree {action_id} \"{action_label}\" {{");
         } else {
             let _ = writeln!(
-                air,
+                trees_air,
                 "tree {action_id} \"{action_label}\" (args: {}) {{",
                 func.decl.params.len()
             );
         }
-        air.push_str(&ctx.finish());
-        air.push_str("}\n\n");
+        trees_air.push_str(&ctx.finish());
+        trees_air.push_str("}\n\n");
 
         callback_specs.push(CallbackSpec {
             index: cb_index,
@@ -948,20 +1517,16 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             inter.decl.lock
         {
             let st = env.states.get(field_name).ok_or_else(|| {
-                    Error::at(
-                        lspan,
-                        format!(
-                            "interaction '{}' lock 'self.{field_name}' references unknown state '{field_name}'",
-                            inter.decl.label
-                        ),
-                    )
-                })?;
-            if st.ty != StateType::Bool {
-                let actual_ty = match st.ty {
-                    StateType::Bool => "bool",
-                    StateType::I16 => "i16",
-                    StateType::ObjectId => "ObjectId",
-                };
+                Error::at(
+                    lspan,
+                    format!(
+                        "interaction '{}' lock 'self.{field_name}' references unknown state '{field_name}'",
+                        inter.decl.label
+                    ),
+                )
+            })?;
+            if st.ty != ValueType::Bool {
+                let actual_ty = env.display_value_type(&st.ty);
                 return Err(Error::at(
                     lspan,
                     format!(
@@ -984,6 +1549,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
                 None => GuardDecl {
                     span: lspan,
                     sim_binding: inter.decl.sim_binding.clone(),
+                    autonomous_binding: None,
                     kind: GuardBody::Expr(not_locked),
                 },
                 Some(existing) => match &existing.kind {
@@ -1001,6 +1567,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
                         GuardDecl {
                             span: existing.span,
                             sim_binding: existing.sim_binding.clone(),
+                            autonomous_binding: existing.autonomous_binding.clone(),
                             kind: GuardBody::Expr(combined),
                         }
                     }
@@ -1019,6 +1586,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
                         GuardDecl {
                             span: existing.span,
                             sim_binding: existing.sim_binding.clone(),
+                            autonomous_binding: existing.autonomous_binding.clone(),
                             kind: GuardBody::Block(body),
                         }
                     }
@@ -1038,7 +1606,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             let gid = alloc_tree_id(inter.decl.pinned_guard_id, None, guard.span)?;
             let glabel = format!("Can_{base_ident}");
             emit_guard_tree(
-                &mut air,
+                &mut trees_air,
                 &env,
                 &inter.owner_module,
                 gid,
@@ -1051,8 +1619,14 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             None
         };
         let action_id = alloc_tree_id(inter.decl.pinned_id, None, inter.decl.span)?;
-        let needs_self_save =
-            stmts_may_clobber_stack_obj(&effective_run_body, &env, &inter.owner_module, true, 0);
+        let needs_self_save = stmts_may_clobber_stack_obj(
+            &effective_run_body,
+            &env,
+            &inter.owner_module,
+            true,
+            Some(&inter.decl.sim_binding),
+            0,
+        );
         let mut ctx = TreeLowerer::new(
             &env,
             TreeContext::SimOnObject {
@@ -1065,13 +1639,13 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             ctx.line("let __self_obj = stack_obj;".to_owned());
         }
         ctx.lower_stmts(&effective_run_body)?;
-        if !stmts_always_return(&effective_run_body) {
+        if !stmts_always_return(&effective_run_body, &env, &inter.owner_module, true) {
             ctx.emit_all_cleanups()?;
             ctx.line("return true;".to_owned());
         }
-        let _ = writeln!(air, "interaction {action_id} \"{base_ident}\" {{");
-        air.push_str(&ctx.finish());
-        air.push_str("}\n\n");
+        let _ = writeln!(trees_air, "interaction {action_id} \"{base_ident}\" {{");
+        trees_air.push_str(&ctx.finish());
+        trees_air.push_str("}\n\n");
 
         let mut motives = Vec::with_capacity(inter.decl.advertises.len());
         for ad in &inter.decl.advertises {
@@ -1097,6 +1671,77 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             motives,
         });
     }
+
+    // 8g. Assemble final `.air` output: header + BCON 4096 + STR# tables (including auto-interned 301) + trees.
+    let mut air = String::new();
+    let _ = writeln!(
+        air,
+        "// Generated .air (Antics IR) from .antics v2 object \"{}\" (GUID {guid:#010x})",
+        escape_str(&env.name)
+    );
+    if !env.state_order.is_empty() {
+        air.push_str("// Attributes: ");
+        for (i, sname) in env.state_order.iter().enumerate() {
+            if i > 0 {
+                air.push_str(", ");
+            }
+            let _ = write!(air, "attr[{i}] = {sname}");
+        }
+        air.push('\n');
+    }
+    air.push('\n');
+
+    if !env.i16_param_order.is_empty() {
+        let _ = writeln!(air, "bcon 4096 \"{}Tuning\" {{", camel_label(&env.name));
+        for pname in &env.i16_param_order {
+            let val = env.i16_params[pname];
+            let _ = writeln!(air, "    {pname} = {val},");
+        }
+        air.push_str("}\n\n");
+    }
+
+    // Emit STR# tables in deterministic ID order, merging any auto-interned STR# 301 dialog strings.
+    let dlg_table = env.dialog_strings.borrow();
+    let mut emitted_301 = false;
+    for (&str_id, st) in &env.strings {
+        if str_id == 301 {
+            emitted_301 = true;
+            if !dlg_table.entries.is_empty() {
+                let lbl = dlg_table
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| format!("{}Strings_301", camel_label(&env.name)));
+                let _ = writeln!(air, "str 301 \"{}\" {{", escape_str(&lbl));
+                for (_, ename, text) in &dlg_table.entries {
+                    let _ = writeln!(air, "    {ename} = \"{}\",", escape_str(text));
+                }
+                air.push_str("}\n\n");
+            }
+            continue;
+        }
+        let lbl = st
+            .label
+            .clone()
+            .unwrap_or_else(|| format!("{}Strings_{}", camel_label(&env.name), st.id));
+        let _ = writeln!(air, "str {} \"{}\" {{", st.id, escape_str(&lbl));
+        for (_, ename, text) in &st.entries {
+            let _ = writeln!(air, "    {ename} = \"{}\",", escape_str(text));
+        }
+        air.push_str("}\n\n");
+    }
+    if !emitted_301 && !dlg_table.entries.is_empty() {
+        let lbl = dlg_table
+            .label
+            .clone()
+            .unwrap_or_else(|| format!("{}Dialogs", camel_label(&env.name)));
+        let _ = writeln!(air, "str 301 \"{}\" {{", escape_str(&lbl));
+        for (_, ename, text) in &dlg_table.entries {
+            let _ = writeln!(air, "    {ename} = \"{}\",", escape_str(text));
+        }
+        air.push_str("}\n\n");
+    }
+    drop(dlg_table);
+    air.push_str(&trees_air);
 
     // 9. Build SpriteSpec + optional extra graphics + multi-tile TileSpecs.
     let (base_sprite, extra_graphics) = if !graphics.is_empty() {
@@ -1186,6 +1831,367 @@ fn sprite_decl_to_spec(sp: SpriteDecl) -> SpriteSpec {
     }
 }
 
+fn build_object_schema(
+    resolved: &ResolvedModule,
+    owner_mod: &str,
+    obj: &ObjectDecl,
+    canonical_key: &str,
+    display_name: &str,
+    all_enums: &mut BTreeMap<String, ResolvedEnum>,
+    all_bitflags: &mut BTreeMap<String, ResolvedBitflags>,
+) -> Result<ResolvedObjectSchema> {
+    let mut guid: Option<u32> = None;
+    let mut tiles: Vec<crate::v2::ast::TileDecl> = Vec::new();
+    let mut raw_states: Vec<(String, String, StateDecl)> = Vec::new();
+    let mut seen_states = BTreeSet::new();
+    let mut local_enums: BTreeMap<String, String> = BTreeMap::new();
+    let mut local_bitflags: BTreeMap<String, String> = BTreeMap::new();
+    let mut raw_funcs: Vec<(String, FunctionalDecl)> = Vec::new();
+    let slug = make_slug(&obj.name);
+
+    let mut collect = |m_owner: &str, members: &[ObjectMember]| {
+        for member in members {
+            match member {
+                ObjectMember::Meta(MetaField {
+                    kind: MetaFieldKind::Guid(g),
+                    ..
+                }) => guid = Some(*g),
+                ObjectMember::Meta(MetaField {
+                    kind: MetaFieldKind::Tiles(t),
+                    ..
+                }) => tiles = t.clone(),
+                ObjectMember::Enum(e) => {
+                    let key = format!("local_enum::{m_owner}::{slug}::{}", e.name);
+                    all_enums
+                        .entry(key.clone())
+                        .or_insert_with(|| resolve_enum_decl(key.clone(), e));
+                    local_enums.insert(e.name.clone(), key);
+                }
+                ObjectMember::Bitflags(b) => {
+                    let key = format!("local_bitflags::{m_owner}::{slug}::{}", b.name);
+                    all_bitflags
+                        .entry(key.clone())
+                        .or_insert_with(|| resolve_bitflags_decl(key.clone(), b));
+                    local_bitflags.insert(b.name.clone(), key);
+                }
+                ObjectMember::State(s) => {
+                    if seen_states.insert(s.name.clone()) {
+                        raw_states.push((m_owner.to_owned(), s.name.clone(), s.clone()));
+                    }
+                }
+                ObjectMember::Functional(f) => {
+                    if let Some(pos) = raw_funcs.iter().position(|(_, x)| x.kind == f.kind) {
+                        raw_funcs[pos] = (m_owner.to_owned(), f.clone());
+                    } else {
+                        raw_funcs.push((m_owner.to_owned(), f.clone()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
+
+    if let Some((tpl_name, _)) = &obj.from_template
+        && let Some(scope) = resolved.module_scopes.get(owner_mod)
+        && let Some((tpl_mod, tpl_decl)) = scope.templates.get(tpl_name)
+    {
+        collect(tpl_mod, &tpl_decl.members);
+    }
+    collect(owner_mod, &obj.members);
+
+    let resolve_ty = |ty: &V2Type, m_owner: &str, span: Span| -> Result<ValueType> {
+        match ty {
+            V2Type::I16 => Ok(ValueType::I16),
+            V2Type::Bool => Ok(ValueType::Bool),
+            V2Type::ObjectId => Ok(ValueType::ObjectId),
+            V2Type::Named(tname) => {
+                if let Some(k) = local_enums.get(tname) {
+                    return Ok(ValueType::Enum(k.clone()));
+                }
+                if let Some(k) = local_bitflags.get(tname) {
+                    return Ok(ValueType::Bitflags(k.clone()));
+                }
+                match tname.as_str() {
+                    "Height" => return Ok(ValueType::Bitflags("builtin::Height".to_owned())),
+                    "Placement" => return Ok(ValueType::Bitflags("builtin::Placement".to_owned())),
+                    "Self" => return Ok(ValueType::ObjectRef(canonical_key.to_owned())),
+                    _ => {}
+                }
+                if let Some(sc) = resolved.module_scopes.get(m_owner) {
+                    if let Some((def_mod, ed)) = sc.enums.get(tname) {
+                        return Ok(ValueType::Enum(format!("enum::{def_mod}::{}", ed.name)));
+                    }
+                    if let Some((def_mod, bd)) = sc.bitflags.get(tname) {
+                        return Ok(ValueType::Bitflags(format!(
+                            "bitflags::{def_mod}::{}",
+                            bd.name
+                        )));
+                    }
+                    if let Some((def_mod, od)) = sc.objects.get(tname) {
+                        return Ok(ValueType::ObjectRef(format!(
+                            "object::{def_mod}::{}",
+                            object_type_ident(&od.name)
+                        )));
+                    }
+                }
+                Err(Error::at(
+                    span,
+                    format!("unknown type '{tname}' in imported object '{display_name}'"),
+                ))
+            }
+            other => Err(Error::at(
+                span,
+                format!(
+                    "unsupported type '{}' in imported object '{display_name}'",
+                    other.display_name()
+                ),
+            )),
+        }
+    };
+
+    let mut states = BTreeMap::new();
+    for (idx, (m_owner, sname, sdecl)) in raw_states.into_iter().enumerate() {
+        let vty = match &sdecl.ty {
+            StateType::Bool => ValueType::Bool,
+            StateType::I16 => ValueType::I16,
+            StateType::ObjectId => ValueType::ObjectId,
+            StateType::Named(tname) => {
+                resolve_ty(&V2Type::Named(tname.clone()), &m_owner, sdecl.span)?
+            }
+        };
+        states.insert(sname, (idx, vty));
+    }
+
+    let mut functionals = BTreeMap::new();
+    for (m_owner, fdecl) in raw_funcs {
+        let mut p_tys = Vec::with_capacity(fdecl.params.len());
+        for fp in &fdecl.params {
+            p_tys.push(resolve_ty(&fp.ty, &m_owner, fp.span)?);
+        }
+        let r_ty = match &fdecl.return_type {
+            Some(rt) => Some(resolve_ty(rt, &m_owner, fdecl.span)?),
+            None => None,
+        };
+        functionals.insert(
+            fdecl.kind,
+            ResolvedFunctionalSig {
+                params: p_tys,
+                return_type: r_ty,
+                guard: summarize_functional_guard(fdecl.guard.as_ref(), &states),
+            },
+        );
+    }
+
+    let guid = guid.ok_or_else(|| {
+        Error::at(
+            obj.span,
+            format!("imported object '{display_name}' is missing required 'guid' field"),
+        )
+    })?;
+    let lead_guid = select_lead_tile_guid(&tiles, guid);
+    let tile_guids = if tiles.is_empty() {
+        vec![guid]
+    } else {
+        tiles.iter().map(|t| t.guid).collect()
+    };
+
+    Ok(ResolvedObjectSchema {
+        canonical_key: canonical_key.to_owned(),
+        display_name: display_name.to_owned(),
+        master_guid: guid,
+        lead_guid,
+        tile_guids,
+        states,
+        functionals,
+    })
+}
+
+/// Mirrors `compile.rs`'s multi-tile lead selection rule: explicit `lead: true` first,
+/// otherwise the `(sub_index == 0, level == 0)` origin tile, falling back to the first tile.
+fn select_lead_tile_guid(tiles: &[crate::v2::ast::TileDecl], master_guid: u32) -> u32 {
+    if tiles.is_empty() {
+        return master_guid;
+    }
+    if let Some(t) = tiles.iter().find(|t| t.lead) {
+        return t.guid;
+    }
+    if let Some(t) = tiles.iter().find(|t| t.sub_index == 0 && t.level == 0) {
+        return t.guid;
+    }
+    tiles[0].guid
+}
+
+fn summarize_functional_guard(
+    guard: Option<&GuardDecl>,
+    states: &BTreeMap<String, (usize, ValueType)>,
+) -> FunctionalGuardSummary {
+    let Some(g) = guard else {
+        return FunctionalGuardSummary::None;
+    };
+    let GuardBody::Expr(expr) = &g.kind else {
+        return FunctionalGuardSummary::Complex;
+    };
+    let (inner, expect_true) = match expr {
+        V2Expr::Unary {
+            op: V2UnaryOp::Not,
+            inner,
+            ..
+        } => (inner.as_ref(), false),
+        other => (other, true),
+    };
+    if let V2Expr::Field { base, field, .. } = inner
+        && matches!(base.as_ref(), V2Expr::Ident(_, b) if b == "self")
+        && let Some((idx, ValueType::Bool)) = states.get(field)
+    {
+        return FunctionalGuardSummary::AttrBool {
+            attr_index: *idx,
+            expect_true,
+        };
+    }
+    FunctionalGuardSummary::Complex
+}
+
+fn resolve_state_init_air(
+    env: &ObjectEnv<'_>,
+    owner_mod: &str,
+    sname: &str,
+    ty: &ValueType,
+    init: &StateInitValue,
+    span: Span,
+) -> Result<String> {
+    match init {
+        StateInitValue::Int(v) => {
+            if !matches!(ty, ValueType::I16 | ValueType::ObjectId) {
+                return Err(Error::at(
+                    span,
+                    format!(
+                        "state '{sname}' of type '{}' cannot initialize from integer literal {v}",
+                        env.display_value_type(ty)
+                    ),
+                ));
+            }
+            Ok(v.to_string())
+        }
+        StateInitValue::Bool(b) => {
+            if *ty != ValueType::Bool {
+                return Err(Error::at(
+                    span,
+                    format!(
+                        "state '{sname}' of type '{}' cannot initialize from bool literal",
+                        env.display_value_type(ty)
+                    ),
+                ));
+            }
+            Ok(if *b { "1" } else { "0" }.to_owned())
+        }
+        StateInitValue::Param(pname) => {
+            if env.i16_params.contains_key(pname) {
+                if !matches!(ty, ValueType::I16 | ValueType::ObjectId) {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "state '{sname}' of type '{}' cannot initialize from i16 param '{pname}'",
+                            env.display_value_type(ty)
+                        ),
+                    ));
+                }
+                Ok(format!("bcon.{pname}"))
+            } else if let Some(&bval) = env.bool_params.get(pname) {
+                if *ty != ValueType::Bool {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "state '{sname}' of type '{}' cannot initialize from bool param '{pname}'",
+                            env.display_value_type(ty)
+                        ),
+                    ));
+                }
+                Ok(if bval { "1" } else { "0" }.to_owned())
+            } else {
+                Err(Error::at(
+                    span,
+                    format!("state '{sname}' initializer references unknown param '{pname}'"),
+                ))
+            }
+        }
+        StateInitValue::Path(pspan, segs) => {
+            if segs.len() != 2 {
+                return Err(Error::at(
+                    *pspan,
+                    format!(
+                        "expected 'Type::Variant' in state '{sname}' initializer, found '{}'",
+                        segs.join("::")
+                    ),
+                ));
+            }
+            let (tname, vname) = (&segs[0], &segs[1]);
+            if let Some(e) = env.lookup_enum(owner_mod, tname, true) {
+                let Some(&val) = e.variants.get(vname) else {
+                    return Err(Error::at(
+                        *pspan,
+                        format!("enum '{}' has no variant '{vname}'", e.display_name),
+                    ));
+                };
+                if *ty != ValueType::Enum(e.canonical_key.clone()) {
+                    return Err(Error::at(
+                        *pspan,
+                        format!(
+                            "type mismatch: state '{sname}' has type '{}', cannot initialize from '{}'",
+                            env.display_value_type(ty),
+                            e.display_name
+                        ),
+                    ));
+                }
+                return Ok(val.to_string());
+            }
+            if let Some(bf) = env.lookup_bitflags(owner_mod, tname, true) {
+                if *ty != ValueType::Bitflags(bf.canonical_key.clone()) {
+                    return Err(Error::at(
+                        *pspan,
+                        format!(
+                            "type mismatch: state '{sname}' has type '{}', cannot initialize from '{}'",
+                            env.display_value_type(ty),
+                            bf.display_name
+                        ),
+                    ));
+                }
+                let mask = if vname == "None" {
+                    0i16
+                } else if let Some(&bit) = bf.flags.get(vname) {
+                    bit_to_mask(bit)
+                } else {
+                    return Err(Error::at(
+                        *pspan,
+                        format!("bitflags '{}' has no flag '{vname}'", bf.display_name),
+                    ));
+                };
+                return Ok(mask.to_string());
+            }
+            Err(Error::at(
+                *pspan,
+                format!("unknown enum or bitflags type '{tname}' in state '{sname}' initializer"),
+            ))
+        }
+        StateInitValue::BitOr(bspan, lhs, rhs) => {
+            let ValueType::Bitflags(_) = ty else {
+                return Err(Error::at(
+                    *bspan,
+                    format!(
+                        "'|' in state '{sname}' initializer is only supported for bitflags types"
+                    ),
+                ));
+            };
+            let l_val: i16 = resolve_state_init_air(env, owner_mod, sname, ty, lhs, *bspan)?
+                .parse()
+                .map_err(|_| Error::at(*bspan, "bitflags initializer must be constant"))?;
+            let r_val: i16 = resolve_state_init_air(env, owner_mod, sname, ty, rhs, *bspan)?
+                .parse()
+                .map_err(|_| Error::at(*bspan, "bitflags initializer must be constant"))?;
+            Ok((l_val | r_val).to_string())
+        }
+    }
+}
+
 fn emit_guard_tree(
     air: &mut String,
     env: &ObjectEnv<'_>,
@@ -1196,8 +2202,12 @@ fn emit_guard_tree(
     func_params: &[crate::v2::ast::FnParam],
 ) -> Result<()> {
     let needs_self_save = match &guard.kind {
-        GuardBody::Expr(e) => expr_may_clobber_stack_obj(e, env, owner_module, true, 0),
-        GuardBody::Block(stmts) => stmts_may_clobber_stack_obj(stmts, env, owner_module, true, 0),
+        GuardBody::Expr(e) => {
+            expr_may_clobber_stack_obj(e, env, owner_module, true, Some(&guard.sim_binding), 0)
+        }
+        GuardBody::Block(stmts) => {
+            stmts_may_clobber_stack_obj(stmts, env, owner_module, true, Some(&guard.sim_binding), 0)
+        }
     };
     let mut ctx = TreeLowerer::new(
         env,
@@ -1210,6 +2220,9 @@ fn emit_guard_tree(
     if needs_self_save {
         ctx.line("let __self_obj = stack_obj;".to_owned());
     }
+    if let Some(ref auto_name) = guard.autonomous_binding {
+        ctx.bind_var(auto_name.clone(), Binding::AutonomousFlag);
+    }
     for (pidx, fp) in func_params.iter().enumerate() {
         ctx.bind_func_param(&fp.name, pidx, &fp.ty, fp.span)?;
     }
@@ -1219,13 +2232,22 @@ fn emit_guard_tree(
         }
         GuardBody::Block(stmts) => {
             ctx.lower_stmts(stmts)?;
-            if !ends_with_unconditional_return(stmts) {
+            if !stmts_always_return(stmts, env, owner_module, true) {
                 ctx.emit_all_cleanups()?;
                 ctx.line("return true;".to_owned());
             }
         }
     }
-    let _ = writeln!(air, "tree {tree_id} \"{label}\" {{");
+    let arg_count = if guard.autonomous_binding.is_some() {
+        1
+    } else {
+        func_params.len()
+    };
+    if arg_count > 0 {
+        let _ = writeln!(air, "tree {tree_id} \"{label}\" (args: {arg_count}) {{");
+    } else {
+        let _ = writeln!(air, "tree {tree_id} \"{label}\" {{");
+    }
     air.push_str(&ctx.finish());
     air.push_str("}\n\n");
     Ok(())
@@ -1269,6 +2291,16 @@ enum Binding {
     ConstI16 { air: String, value: i16 },
     /// Immutable constant `bool` value forwarded into an inline helper.
     ConstBool(bool),
+    /// Immutable constant `enum` value forwarded into an inline helper.
+    ConstEnum { key: String, value: i16 },
+    /// Immutable constant `bitflags` value forwarded into an inline helper (retains 1-based bit index for single flags!).
+    ConstBitflag {
+        key: String,
+        mask: i16,
+        single_bit: Option<u8>,
+    },
+    /// TTAB interaction guard autonomy probe parameter (`param[0] == 1`).
+    AutonomousFlag,
     /// Immutable BHAV `param[idx]` (from a `functional` parameter).
     BhavParam { index: usize, ty: ValueType },
     /// Mutable reference (`&mut T`) bound to a caller lvalue during helper inlining.
@@ -1289,11 +2321,33 @@ enum Binding {
     ForeignObject { air_name: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ValueType {
     I16,
     Bool,
     ObjectId,
+    Enum(String),
+    Bitflags(String),
+    ObjectRef(String),
+}
+
+impl ValueType {
+    fn is_object_handle(&self) -> bool {
+        matches!(self, Self::ObjectId | Self::ObjectRef(_))
+    }
+}
+
+fn types_compatible_for_assign(target: &ValueType, value: &ValueType) -> bool {
+    if target == value {
+        return true;
+    }
+    match (target, value) {
+        // Typed ObjectRef implicitly upcasts to untyped ObjectId.
+        (ValueType::ObjectId, ValueType::ObjectRef(_)) => true,
+        // Preserve backwards compatibility for raw ObjectId <-> i16 temp/attr interop.
+        (ValueType::ObjectId, ValueType::I16) | (ValueType::I16, ValueType::ObjectId) => true,
+        _ => false,
+    }
 }
 
 /// A resolved assignable storage location in `.air`.
@@ -1302,16 +2356,25 @@ enum LValue {
     /// Direct `.air` operand (e.g., `stack.attr[0]`, `my.motive.energy`, `v_x_0`, `temp[2]`).
     Direct { air: String, ty: ValueType },
     /// Attribute on a foreign `ObjectId` local (`stack_obj := obj_air; stack.attr[idx] ...; stack_obj := __self_obj;`).
-    ForeignAttr { obj_air: String, attr_index: i16 },
+    ForeignAttr {
+        obj_air: String,
+        attr_index: i16,
+        ty: ValueType,
+    },
     /// Object data word on a foreign `ObjectId` local.
-    ForeignData { obj_air: String, data_index: i16 },
+    ForeignData {
+        obj_air: String,
+        data_index: i16,
+        ty: ValueType,
+    },
 }
 
 impl LValue {
-    fn value_type(&self) -> ValueType {
+    fn value_type(&self) -> &ValueType {
         match self {
-            LValue::Direct { ty, .. } => *ty,
-            LValue::ForeignAttr { .. } | LValue::ForeignData { .. } => ValueType::I16,
+            LValue::Direct { ty, .. }
+            | LValue::ForeignAttr { ty, .. }
+            | LValue::ForeignData { ty, .. } => ty,
         }
     }
 }
@@ -1357,11 +2420,11 @@ impl ScopeFrame {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum FnReturnKind {
     Void,
     Bool,
-    I16,
+    Value(ValueType),
 }
 
 struct ActiveInlineFn {
@@ -1377,10 +2440,16 @@ struct TreeLowerer<'a> {
     env: &'a ObjectEnv<'a>,
     tree_ctx: TreeContext,
     owner_module: String,
-    /// `true` when lowering code inside the object/template (can see `local_fns`),
+    /// `true` when lowering code inside the object/template (can see `local_fns` / local types),
     /// `false` inside an imported/module-level helper function.
     in_object_scope: bool,
     has_self_obj_local: bool,
+    /// Set to `true` when an `ObjectSelf` lifecycle tree (`init`/`main`/`load`/`reset`/`cleanup`)
+    /// touches `stack_obj` for a foreign object access, so `finish()` preserves the incoming
+    /// `stack_obj` (e.g. the cancelling Sim in `cleanup` / OBJf 4) into `__saved_stack_obj`.
+    used_saved_stack_obj: bool,
+    /// Non-`None` when lowering a typed value-returning `functional kind(...) -> T` body.
+    functional_return_type: Option<ValueType>,
     out: String,
     indent: usize,
     next_id: usize,
@@ -1413,6 +2482,8 @@ impl<'a> TreeLowerer<'a> {
             owner_module: owner_module.to_owned(),
             in_object_scope: true,
             has_self_obj_local,
+            used_saved_stack_obj: false,
+            functional_return_type: None,
             out: String::new(),
             indent: 1,
             next_id: 0,
@@ -1431,8 +2502,21 @@ impl<'a> TreeLowerer<'a> {
         self.current_defer_id.is_some()
     }
 
+    fn emit_restore_stack_obj(&mut self) {
+        if self.has_self_obj_local {
+            self.line("stack_obj := __self_obj;".to_owned());
+        } else if matches!(self.tree_ctx, TreeContext::ObjectSelf) {
+            self.used_saved_stack_obj = true;
+            self.line("stack_obj := __saved_stack_obj;".to_owned());
+        }
+    }
+
     fn finish(self) -> String {
-        self.out
+        if self.used_saved_stack_obj {
+            format!("    let __saved_stack_obj = stack_obj;\n{}", self.out)
+        } else {
+            self.out
+        }
     }
 
     fn fresh(&mut self, prefix: &str) -> String {
@@ -1476,20 +2560,18 @@ impl<'a> TreeLowerer<'a> {
     }
 
     fn bind_func_param(&mut self, name: &str, idx: usize, ty: &V2Type, span: Span) -> Result<()> {
-        let vty = match ty {
-            V2Type::I16 => ValueType::I16,
-            V2Type::Bool => ValueType::Bool,
-            V2Type::ObjectId => ValueType::ObjectId,
-            other => {
-                return Err(Error::at(
+        let vty = self
+            .env
+            .resolve_value_type(ty, &self.owner_module, self.in_object_scope, span)
+            .map_err(|_| {
+                Error::at(
                     span,
                     format!(
-                        "functional parameter '{name}' has unsupported type '{}' (expected i16, bool, or ObjectId)",
-                        other.display_name()
+                        "functional parameter '{name}' has unsupported type '{}' (expected i16, bool, ObjectId, enum, bitflags, or object type)",
+                        ty.display_name()
                     ),
-                ));
-            }
-        };
+                )
+            })?;
         self.bind_var(
             name.to_owned(),
             Binding::BhavParam {
@@ -1703,36 +2785,28 @@ impl<'a> TreeLowerer<'a> {
                 ty,
                 init,
             } => {
-                let (val_air, inferred_ty) = self.lower_value_expr(init)?;
+                let air_name = self.fresh(&format!("v_{name}"));
+                let inferred_ty = if is_compound_arith_or_neg(init) {
+                    self.lower_arith_into_dest(init, &air_name, true)?
+                } else {
+                    let (val_air, inferred) = self.lower_value_expr(init)?;
+                    self.line(format!("let {air_name} = {val_air};"));
+                    inferred
+                };
                 let final_ty = if let Some(ann) = ty {
-                    let expected = match ann {
-                        V2Type::I16 => ValueType::I16,
-                        V2Type::Bool => ValueType::Bool,
-                        V2Type::ObjectId => ValueType::ObjectId,
-                        other => {
-                            return Err(Error::at(
-                                *span,
-                                format!(
-                                    "unsupported 'let' variable type '{}'",
-                                    other.display_name()
-                                ),
-                            ));
-                        }
-                    };
-                    if expected == ValueType::Bool && inferred_ty != ValueType::Bool {
+                    let expected = self.env.resolve_value_type(
+                        ann,
+                        &self.owner_module,
+                        self.in_object_scope,
+                        *span,
+                    )?;
+                    if !types_compatible_for_assign(&expected, &inferred_ty) {
                         return Err(Error::at(
                             *span,
                             format!(
-                                "cannot initialize bool variable '{name}' from non-bool expression"
-                            ),
-                        ));
-                    }
-                    if expected != ValueType::Bool && inferred_ty == ValueType::Bool {
-                        return Err(Error::at(
-                            *span,
-                            format!(
-                                "cannot initialize '{}' variable '{name}' from bool expression",
-                                ann.display_name()
+                                "cannot initialize '{}' variable '{name}' from {} expression",
+                                self.env.display_value_type(&expected),
+                                self.env.display_value_type(&inferred_ty)
                             ),
                         ));
                     }
@@ -1740,8 +2814,6 @@ impl<'a> TreeLowerer<'a> {
                 } else {
                     inferred_ty
                 };
-                let air_name = self.fresh(&format!("v_{name}"));
-                self.line(format!("let {air_name} = {val_air};"));
                 self.bind_var(
                     name.clone(),
                     Binding::Local {
@@ -1754,9 +2826,10 @@ impl<'a> TreeLowerer<'a> {
             V2Stmt::LetSome {
                 span,
                 name,
+                ty,
                 init,
                 else_body,
-            } => self.lower_let_some(*span, name, init, else_body),
+            } => self.lower_let_some(*span, name, ty.as_ref(), init, else_body),
             V2Stmt::Assign {
                 span,
                 target,
@@ -1764,24 +2837,85 @@ impl<'a> TreeLowerer<'a> {
                 value,
             } => {
                 let lval = self.resolve_lvalue(target)?;
+                let target_ty = lval.value_type().clone();
+                // Handle bitflags `flag_set` / `flag_clear` explicitly (1-based bit index!).
+                if matches!(op, V2AssignOp::FlagSet | V2AssignOp::FlagClear)
+                    && let ValueType::Bitflags(ref key) = target_ty
+                {
+                    let Some((_, Some(bit))) = self.try_eval_const_bitflag(value, key)? else {
+                        return Err(Error::at(
+                            value.span(),
+                            format!(
+                                "'flag_set'/'flag_clear' on bitflags '{}' requires a single flag constant (use '.set(...)' / '.clear(...)' for masks)",
+                                self.env.display_value_type(&target_ty)
+                            ),
+                        ));
+                    };
+                    return self.emit_lvalue_assign(&lval, *op, &bit.to_string());
+                }
+                // Compact in-place compound arithmetic lowering when target is Direct, alias-free,
+                // side-effect-free, and cannot trap partway through!
+                if *op == V2AssignOp::Set
+                    && let LValue::Direct { ref air, .. } = lval
+                    && is_compound_arith_or_neg(value)
+                    && self.can_lower_arith_in_place(air, value, false)
+                {
+                    let val_ty = self.lower_arith_into_dest(value, air, false)?;
+                    if !types_compatible_for_assign(&target_ty, &val_ty) {
+                        return Err(Error::at(
+                            *span,
+                            format!(
+                                "cannot assign '{}' expression to '{}' target",
+                                self.env.display_value_type(&val_ty),
+                                self.env.display_value_type(&target_ty)
+                            ),
+                        ));
+                    }
+                    return Ok(());
+                }
                 let (val_air, val_ty) = self.lower_value_expr(value)?;
-                let target_ty = lval.value_type();
-                if target_ty == ValueType::Bool && *op != V2AssignOp::Set {
-                    return Err(Error::at(
-                        *span,
-                        "compound arithmetic assignment is not allowed on a bool target",
-                    ));
+                if *op != V2AssignOp::Set {
+                    match &target_ty {
+                        ValueType::Bool => {
+                            return Err(Error::at(
+                                *span,
+                                "compound assignment is not allowed on a bool target",
+                            ));
+                        }
+                        ValueType::Enum(_) | ValueType::ObjectRef(_) => {
+                            return Err(Error::at(
+                                *span,
+                                format!(
+                                    "compound assignment is not allowed on '{}' target",
+                                    self.env.display_value_type(&target_ty)
+                                ),
+                            ));
+                        }
+                        ValueType::Bitflags(_) => {
+                            if !matches!(
+                                op,
+                                V2AssignOp::BitAnd | V2AssignOp::BitOr | V2AssignOp::BitXor
+                            ) {
+                                return Err(Error::at(
+                                    *span,
+                                    format!(
+                                        "arithmetic assignment is not allowed on bitflags '{}' (use |=, &=, ^=, .set(), or .clear())",
+                                        self.env.display_value_type(&target_ty)
+                                    ),
+                                ));
+                            }
+                        }
+                        ValueType::I16 | ValueType::ObjectId => {}
+                    }
                 }
-                if target_ty == ValueType::Bool && val_ty != ValueType::Bool {
+                if !types_compatible_for_assign(&target_ty, &val_ty) {
                     return Err(Error::at(
                         *span,
-                        "cannot assign a non-bool expression to a bool target",
-                    ));
-                }
-                if target_ty != ValueType::Bool && val_ty == ValueType::Bool {
-                    return Err(Error::at(
-                        *span,
-                        "cannot assign a bool expression to a non-bool target",
+                        format!(
+                            "cannot assign '{}' expression to '{}' target",
+                            self.env.display_value_type(&val_ty),
+                            self.env.display_value_type(&target_ty)
+                        ),
                     ));
                 }
                 self.emit_lvalue_assign(&lval, *op, &val_air)
@@ -1792,7 +2926,7 @@ impl<'a> TreeLowerer<'a> {
                 body,
             } => {
                 let lval = self.resolve_lvalue(lock_expr)?;
-                if lval.value_type() != ValueType::Bool {
+                if *lval.value_type() != ValueType::Bool {
                     return Err(Error::at(
                         *span,
                         "with lock(...) requires a bool state or &mut bool target",
@@ -1816,7 +2950,12 @@ impl<'a> TreeLowerer<'a> {
                     repeat_counter: None,
                 });
                 let res = self.lower_stmts(body);
-                let pop_res = if stmts_always_return(body) {
+                let pop_res = if stmts_always_return(
+                    body,
+                    self.env,
+                    &self.owner_module,
+                    self.in_object_scope,
+                ) {
                     self.pop_scope_discard_cleanups();
                     Ok(())
                 } else {
@@ -2017,12 +3156,37 @@ impl<'a> TreeLowerer<'a> {
             } => {
                 let iter_var = self.fresh(&format!("v_{binding}"));
                 let mut parts_root_opt = None;
-                match iter {
+                let binding_ty = match iter {
                     ForEachIter::ObjectsByGuid(guid) => {
                         self.line(format!("let {iter_var} = 0;"));
                         self.line(format!(
                             "while set_to_next(guid, {guid:#010x}, dest: {iter_var}) {{"
                         ));
+                        ValueType::ObjectId
+                    }
+                    ForEachIter::ObjectsOf { span, object_type } => {
+                        let schema = self
+                            .env
+                            .lookup_object_schema(
+                                &self.owner_module,
+                                object_type,
+                                self.in_object_scope,
+                            )
+                            .ok_or_else(|| {
+                                Error::at(
+                                    *span,
+                                    format!(
+                                        "unknown object type '{object_type}' in 'objects_of::<{object_type}>()' (import it with 'use ...::{object_type};')"
+                                    ),
+                                )
+                            })?;
+                        let guid = schema.lead_guid;
+                        let key = schema.canonical_key.clone();
+                        self.line(format!("let {iter_var} = 0;"));
+                        self.line(format!(
+                            "while set_to_next(guid, {guid:#010x}, dest: {iter_var}) {{"
+                        ));
+                        ValueType::ObjectRef(key)
                     }
                     ForEachIter::SelfParts => {
                         let root_expr = match self.tree_ctx {
@@ -2044,8 +3208,9 @@ impl<'a> TreeLowerer<'a> {
                         self.line(format!("let {iter_var} = {root_expr};"));
                         self.line(format!("while set_to_next(part, dest: {iter_var}) {{"));
                         parts_root_opt = Some(root_expr);
+                        ValueType::ObjectRef(self.env.self_object_key.clone())
                     }
-                }
+                };
                 self.indent += 1;
                 if let Some(root_expr) = parts_root_opt {
                     self.line(format!("if {iter_var} == {root_expr} {{"));
@@ -2067,16 +3232,14 @@ impl<'a> TreeLowerer<'a> {
                     binding.clone(),
                     Binding::Local {
                         air_name: iter_var,
-                        ty: ValueType::ObjectId,
+                        ty: binding_ty,
                     },
                 );
                 let res = self.lower_stmts(body);
                 let pop_res = self.pop_scope_and_run_cleanups();
                 self.indent -= 1;
                 self.line("}".to_owned());
-                if self.has_self_obj_local {
-                    self.line("stack_obj := __self_obj;".to_owned());
-                }
+                self.emit_restore_stack_obj();
                 res.and(pop_res)?;
                 self.emit_inline_fn_return_propagation()?;
                 self.emit_cancel_propagation()?;
@@ -2126,6 +3289,11 @@ impl<'a> TreeLowerer<'a> {
                     r1.and(p1).and(r2).and(p2)
                 }
             }
+            V2Stmt::Match {
+                span,
+                scrutinee,
+                arms,
+            } => self.lower_match(*span, scrutinee, arms),
             V2Stmt::Break { span } => {
                 self.emit_loop_cleanups(*span, false)?;
                 self.line("break;".to_owned());
@@ -2146,7 +3314,7 @@ impl<'a> TreeLowerer<'a> {
                     }
                     let ret_flag = active_fn.ret_flag.clone();
                     let ret_val = active_fn.ret_val.clone();
-                    let ret_kind = active_fn.ret_kind;
+                    let ret_kind = active_fn.ret_kind.clone();
                     match (ret_kind, value) {
                         (FnReturnKind::Void, Some(_)) => {
                             return Err(Error::at(
@@ -2154,7 +3322,7 @@ impl<'a> TreeLowerer<'a> {
                                 "void helper function cannot return a value",
                             ));
                         }
-                        (FnReturnKind::Bool | FnReturnKind::I16, None) => {
+                        (FnReturnKind::Bool | FnReturnKind::Value(_), None) => {
                             return Err(Error::at(
                                 *span,
                                 "helper function with return type must return a value",
@@ -2164,22 +3332,35 @@ impl<'a> TreeLowerer<'a> {
                         (FnReturnKind::Bool, Some(expr)) => {
                             self.emit_bool_into_local(expr, &ret_val)?;
                         }
-                        (FnReturnKind::I16, Some(expr)) => {
-                            let (val_air, val_ty) = self.lower_value_expr(expr)?;
-                            if val_ty != ValueType::I16 {
-                                let actual = match val_ty {
-                                    ValueType::Bool => "bool",
-                                    ValueType::ObjectId => "ObjectId",
-                                    ValueType::I16 => "i16",
-                                };
-                                return Err(Error::at(
-                                    *span,
-                                    format!(
-                                        "helper function returning 'i16' cannot return '{actual}' expression"
-                                    ),
-                                ));
+                        (FnReturnKind::Value(expected_ty), Some(expr)) => {
+                            if is_compound_arith_or_neg(expr)
+                                && self.can_lower_arith_in_place(&ret_val, expr, true)
+                            {
+                                let val_ty = self.lower_arith_into_dest(expr, &ret_val, false)?;
+                                if !types_compatible_for_assign(&expected_ty, &val_ty) {
+                                    return Err(Error::at(
+                                        *span,
+                                        format!(
+                                            "helper function returning '{}' cannot return '{}' expression",
+                                            self.env.display_value_type(&expected_ty),
+                                            self.env.display_value_type(&val_ty)
+                                        ),
+                                    ));
+                                }
+                            } else {
+                                let (val_air, val_ty) = self.lower_value_expr(expr)?;
+                                if !types_compatible_for_assign(&expected_ty, &val_ty) {
+                                    return Err(Error::at(
+                                        *span,
+                                        format!(
+                                            "helper function returning '{}' cannot return '{}' expression",
+                                            self.env.display_value_type(&expected_ty),
+                                            self.env.display_value_type(&val_ty)
+                                        ),
+                                    ));
+                                }
+                                self.line(format!("{ret_val} := {val_air};"));
                             }
-                            self.line(format!("{ret_val} := {val_air};"));
                         }
                     }
                     self.emit_all_cleanups()?;
@@ -2192,6 +3373,71 @@ impl<'a> TreeLowerer<'a> {
                         *span,
                         "'return' cannot exit out of a 'defer' block",
                     ));
+                }
+
+                // Value-returning `functional kind(...) -> T` tree:
+                // `return None;` / `return false;` (for non-bool T) exits with `return false;`
+                // `return Some(expr);` / `return expr;` writes `temp[0] := val;` and exits `return true;`
+                if let Some(expected_ty) = self.functional_return_type.clone() {
+                    match value {
+                        None => {
+                            return Err(Error::at(
+                                *span,
+                                format!(
+                                    "functional declaring '-> {}' must return a value (or 'return false;' / 'return None;' on failure)",
+                                    self.env.display_value_type(&expected_ty)
+                                ),
+                            ));
+                        }
+                        Some(V2Expr::Ident(_, n)) if n == "None" => {
+                            self.emit_all_cleanups()?;
+                            self.line("return false;".to_owned());
+                            return Ok(());
+                        }
+                        Some(V2Expr::Bool(_, false)) if expected_ty != ValueType::Bool => {
+                            self.emit_all_cleanups()?;
+                            self.line("return false;".to_owned());
+                            return Ok(());
+                        }
+                        Some(raw_expr) => {
+                            let inner_expr = match raw_expr {
+                                V2Expr::Call {
+                                    callee,
+                                    type_args,
+                                    args,
+                                    ..
+                                } if type_args.is_empty()
+                                    && args.len() == 1
+                                    && args[0].name.is_none()
+                                    && matches!(callee.as_ref(), V2Expr::Ident(_, s) if s == "Some") =>
+                                {
+                                    &args[0].value
+                                }
+                                other => other,
+                            };
+                            let (val_air, val_ty) = self.lower_value_expr(inner_expr)?;
+                            if !types_compatible_for_assign(&expected_ty, &val_ty) {
+                                return Err(Error::at(
+                                    *span,
+                                    format!(
+                                        "functional returning '{}' cannot return '{}' expression",
+                                        self.env.display_value_type(&expected_ty),
+                                        self.env.display_value_type(&val_ty)
+                                    ),
+                                ));
+                            }
+                            if self.has_active_cleanups() {
+                                let ret_snap = self.fresh("fret");
+                                self.line(format!("let {ret_snap} = {val_air};"));
+                                self.emit_all_cleanups()?;
+                                self.line(format!("temp[0] := {ret_snap};"));
+                            } else {
+                                self.line(format!("temp[0] := {val_air};"));
+                            }
+                            self.line("return true;".to_owned());
+                            return Ok(());
+                        }
+                    }
                 }
 
                 match value {
@@ -2287,14 +3533,516 @@ impl<'a> TreeLowerer<'a> {
         Ok(())
     }
 
+    fn lower_match(&mut self, span: Span, scrutinee: &V2Expr, arms: &[MatchArm]) -> Result<()> {
+        if let V2Expr::Call {
+            span: cspan,
+            callee,
+            type_args,
+            args,
+        } = scrutinee
+            && type_args.is_empty()
+            && matches!(callee.as_ref(), V2Expr::Ident(_, fname) if fname == "dialog")
+        {
+            return self.lower_match_dialog(span, *cspan, args, arms);
+        }
+        self.lower_match_value(span, scrutinee, arms)
+    }
+
+    fn lower_match_dialog(
+        &mut self,
+        match_span: Span,
+        call_span: Span,
+        args: &[CallArg],
+        arms: &[MatchArm],
+    ) -> Result<()> {
+        let opts = self.parse_dialog_options(args, call_span, true)?;
+        if (opts.effective_flags & 1) != 0 {
+            return Err(Error::at(
+                call_span,
+                "'match dialog(...)' cannot set the inform bit ('inform: true' or 'flags' bit 0), because informational dialogs do not wait for a button choice",
+            ));
+        }
+
+        let arms_have_third = arms.iter().any(|a| {
+            matches!(
+                &a.pattern,
+                MatchPattern::Ident(_, n) if matches!(n.as_str(), "Button3" | "Cancel")
+            ) || matches!(&a.pattern, MatchPattern::Int(_, 2))
+        });
+        let is_three_way = match opts.kind_num {
+            Some(1) => false,
+            Some(2) => true,
+            Some(other) => {
+                return Err(Error::at(
+                    call_span,
+                    format!(
+                        "'match dialog(...)' only supports 2-button ('yes_no') or 3-button ('yes_no_cancel') dialogs, found kind {other}"
+                    ),
+                ));
+            }
+            None => opts.button_count == 3 || arms_have_third,
+        };
+        if let Some(tuple_len) = opts.buttons_tuple_len {
+            let expected_len = if is_three_way { 3 } else { 2 };
+            if tuple_len != expected_len {
+                return Err(Error::at(
+                    call_span,
+                    format!(
+                        "dialog 'buttons:' tuple has {tuple_len} entries, but {} dialog requires exactly {expected_len}",
+                        if is_three_way {
+                            "'yes_no_cancel'"
+                        } else {
+                            "'yes_no'"
+                        }
+                    ),
+                ));
+            }
+        }
+
+        // Map arm patterns to button indices: 0 (Button1/Yes/0), 1 (Button2/No/1), 2 (Button3/Cancel/2).
+        let mut arm_bodies: [Option<&[V2Stmt]>; 3] = [None, None, None];
+        let mut wildcard_body: Option<&[V2Stmt]> = None;
+        for arm in arms {
+            if wildcard_body.is_some() {
+                return Err(Error::at(
+                    arm.span,
+                    "unreachable arm after '_' wildcard in 'match dialog'",
+                ));
+            }
+            let slot: Option<usize> = match &arm.pattern {
+                MatchPattern::Wildcard(_) => {
+                    wildcard_body = Some(arm.body.as_slice());
+                    None
+                }
+                MatchPattern::Ident(pspan, name) => match name.as_str() {
+                    "Button1" | "Yes" => Some(0),
+                    "Button2" | "No" => Some(1),
+                    "Button3" | "Cancel" => {
+                        if !is_three_way {
+                            return Err(Error::at(
+                                *pspan,
+                                format!(
+                                    "arm '{name}' is invalid for 2-button 'yes_no' dialog (expected Button1/Yes or Button2/No)"
+                                ),
+                            ));
+                        }
+                        Some(2)
+                    }
+                    other => {
+                        return Err(Error::at(
+                            *pspan,
+                            format!(
+                                "invalid 'match dialog' arm '{other}' (expected Button1/Yes, Button2/No{}{})",
+                                if is_three_way { ", Button3/Cancel" } else { "" },
+                                ", 0/1/2, or _"
+                            ),
+                        ));
+                    }
+                },
+                MatchPattern::Int(pspan, v) => match *v {
+                    0 => Some(0),
+                    1 => Some(1),
+                    2 if is_three_way => Some(2),
+                    other => {
+                        return Err(Error::at(
+                            *pspan,
+                            format!(
+                                "invalid 'match dialog' button index {other} (expected {})",
+                                if is_three_way { "0, 1, or 2" } else { "0 or 1" }
+                            ),
+                        ));
+                    }
+                },
+                MatchPattern::Path(pspan, segs) => {
+                    return Err(Error::at(
+                        *pspan,
+                        format!(
+                            "unexpected path pattern '{}' in 'match dialog' (expected Button1/Button2/Button3, Yes/No/Cancel, 0/1/2, or _)",
+                            segs.join("::")
+                        ),
+                    ));
+                }
+            };
+            if let Some(idx) = slot {
+                if arm_bodies[idx].is_some() {
+                    return Err(Error::at(
+                        arm.span,
+                        format!("duplicate arm for button {} in 'match dialog'", idx + 1),
+                    ));
+                }
+                arm_bodies[idx] = Some(arm.body.as_slice());
+            }
+        }
+
+        let required = if is_three_way { 3 } else { 2 };
+        for (i, slot) in arm_bodies.iter_mut().enumerate().take(required) {
+            if slot.is_none() {
+                if let Some(wc) = wildcard_body {
+                    *slot = Some(wc);
+                } else {
+                    return Err(Error::at(
+                        match_span,
+                        format!(
+                            "non-exhaustive 'match dialog': missing arm for Button{} (add the missing arm or a '_' fallback)",
+                            i + 1
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // Build effective dialog() args (injecting kind: and temp: 0 for 3-way dialogs if omitted).
+        let mut effective_args: Vec<CallArg> = args.to_vec();
+        if opts.kind_num.is_none() {
+            effective_args.insert(
+                0,
+                CallArg {
+                    span: call_span,
+                    name: Some("kind".to_owned()),
+                    value: V2Expr::Ident(
+                        call_span,
+                        if is_three_way {
+                            "yes_no_cancel".to_owned()
+                        } else {
+                            "yes_no".to_owned()
+                        },
+                    ),
+                },
+            );
+        }
+        let temp_slot = opts.effective_temp_slot;
+        let save_implicit_temp = is_three_way && !opts.explicit_temp_specified;
+        if save_implicit_temp {
+            effective_args.push(CallArg {
+                span: call_span,
+                name: Some("temp".to_owned()),
+                value: V2Expr::Int(call_span, i64::from(temp_slot)),
+            });
+        }
+
+        let saved_temp_local = if save_implicit_temp {
+            let s = self.fresh("dlg_t0");
+            self.line(format!("let {s} = temp[{temp_slot}];"));
+            Some(s)
+        } else {
+            None
+        };
+
+        let dlg_air = self.format_dialog(&effective_args, call_span)?;
+        let body0 = arm_bodies[0].unwrap();
+        self.line(format!("if {dlg_air} {{"));
+        self.indent += 1;
+        self.push_scope(ScopeFrame::block());
+        let r0 = self.lower_stmts(body0);
+        let p0 = if stmts_always_return(body0, self.env, &self.owner_module, self.in_object_scope) {
+            self.pop_scope_discard_cleanups();
+            Ok(())
+        } else {
+            self.pop_scope_and_run_cleanups()
+        };
+        self.indent -= 1;
+        r0.and(p0)?;
+
+        let body1 = arm_bodies[1].unwrap();
+        if !is_three_way {
+            self.line("} else {".to_owned());
+            self.indent += 1;
+            self.push_scope(ScopeFrame::block());
+            let r1 = self.lower_stmts(body1);
+            let p1 =
+                if stmts_always_return(body1, self.env, &self.owner_module, self.in_object_scope) {
+                    self.pop_scope_discard_cleanups();
+                    Ok(())
+                } else {
+                    self.pop_scope_and_run_cleanups()
+                };
+            self.indent -= 1;
+            self.line("}".to_owned());
+            r1.and(p1)
+        } else if let Some(saved_t) = saved_temp_local {
+            // Restore implicit temp[0] BEFORE executing Button2/Button3 user code or defers!
+            self.line("} else {".to_owned());
+            self.indent += 1;
+            let choice = self.fresh("dlg_choice");
+            self.line(format!("let {choice} = temp[{temp_slot}];"));
+            self.line(format!("temp[{temp_slot}] := {saved_t};"));
+            self.line(format!("if {choice} == 0 {{"));
+            self.indent += 1;
+            self.push_scope(ScopeFrame::block());
+            let r1 = self.lower_stmts(body1);
+            let p1 =
+                if stmts_always_return(body1, self.env, &self.owner_module, self.in_object_scope) {
+                    self.pop_scope_discard_cleanups();
+                    Ok(())
+                } else {
+                    self.pop_scope_and_run_cleanups()
+                };
+            self.indent -= 1;
+            r1.and(p1)?;
+            let body2 = arm_bodies[2].unwrap();
+            self.line("} else {".to_owned());
+            self.indent += 1;
+            self.push_scope(ScopeFrame::block());
+            let r2 = self.lower_stmts(body2);
+            let p2 =
+                if stmts_always_return(body2, self.env, &self.owner_module, self.in_object_scope) {
+                    self.pop_scope_discard_cleanups();
+                    Ok(())
+                } else {
+                    self.pop_scope_and_run_cleanups()
+                };
+            self.indent -= 1;
+            self.line("}".to_owned());
+            self.indent -= 1;
+            self.line("}".to_owned());
+            r2.and(p2)
+        } else {
+            self.line(format!("}} else if temp[{temp_slot}] == 0 {{"));
+            self.indent += 1;
+            self.push_scope(ScopeFrame::block());
+            let r1 = self.lower_stmts(body1);
+            let p1 =
+                if stmts_always_return(body1, self.env, &self.owner_module, self.in_object_scope) {
+                    self.pop_scope_discard_cleanups();
+                    Ok(())
+                } else {
+                    self.pop_scope_and_run_cleanups()
+                };
+            self.indent -= 1;
+            r1.and(p1)?;
+            let body2 = arm_bodies[2].unwrap();
+            self.line("} else {".to_owned());
+            self.indent += 1;
+            self.push_scope(ScopeFrame::block());
+            let r2 = self.lower_stmts(body2);
+            let p2 =
+                if stmts_always_return(body2, self.env, &self.owner_module, self.in_object_scope) {
+                    self.pop_scope_discard_cleanups();
+                    Ok(())
+                } else {
+                    self.pop_scope_and_run_cleanups()
+                };
+            self.indent -= 1;
+            self.line("}".to_owned());
+            r2.and(p2)
+        }
+    }
+
+    fn lower_match_value(
+        &mut self,
+        span: Span,
+        scrutinee: &V2Expr,
+        arms: &[MatchArm],
+    ) -> Result<()> {
+        let (val_air, val_ty) = self.lower_value_expr(scrutinee)?;
+        if !matches!(val_ty, ValueType::I16 | ValueType::Enum(_)) {
+            return Err(Error::at(
+                span,
+                format!(
+                    "'match' scrutinee must be 'dialog(...)', an enum, or 'i16', found '{}'",
+                    self.env.display_value_type(&val_ty)
+                ),
+            ));
+        }
+        let scrut_local = self.fresh("match");
+        self.line(format!("let {scrut_local} = {val_air};"));
+
+        let mut cases: Vec<(i16, &[V2Stmt])> = Vec::new();
+        let mut wildcard: Option<&[V2Stmt]> = None;
+        let mut seen_vals = BTreeSet::new();
+
+        for arm in arms {
+            if wildcard.is_some() {
+                return Err(Error::at(
+                    arm.span,
+                    "unreachable match arm after '_' wildcard",
+                ));
+            }
+            match &arm.pattern {
+                MatchPattern::Wildcard(_) => {
+                    wildcard = Some(arm.body.as_slice());
+                }
+                MatchPattern::Int(pspan, v) => {
+                    if val_ty != ValueType::I16 {
+                        return Err(Error::at(
+                            *pspan,
+                            format!(
+                                "integer pattern {v} cannot match '{}'",
+                                self.env.display_value_type(&val_ty)
+                            ),
+                        ));
+                    }
+                    if !seen_vals.insert(*v) {
+                        return Err(Error::at(
+                            *pspan,
+                            format!("duplicate match arm for value {v}"),
+                        ));
+                    }
+                    cases.push((*v, arm.body.as_slice()));
+                }
+                MatchPattern::Path(pspan, segs) => {
+                    let ValueType::Enum(ref expected_key) = val_ty else {
+                        return Err(Error::at(
+                            *pspan,
+                            format!(
+                                "enum pattern '{}' cannot match '{}'",
+                                segs.join("::"),
+                                self.env.display_value_type(&val_ty)
+                            ),
+                        ));
+                    };
+                    if segs.len() != 2 {
+                        return Err(Error::at(
+                            *pspan,
+                            format!(
+                                "expected 'Enum::Variant' pattern, found '{}'",
+                                segs.join("::")
+                            ),
+                        ));
+                    }
+                    let e = self
+                        .env
+                        .lookup_enum(&self.owner_module, &segs[0], self.in_object_scope)
+                        .ok_or_else(|| Error::at(*pspan, format!("unknown enum '{}'", segs[0])))?;
+                    if &e.canonical_key != expected_key {
+                        return Err(Error::at(
+                            *pspan,
+                            format!(
+                                "mismatched enum pattern '{}': expected '{}'",
+                                e.display_name,
+                                self.env.display_value_type(&val_ty)
+                            ),
+                        ));
+                    }
+                    let Some(&v) = e.variants.get(&segs[1]) else {
+                        return Err(Error::at(
+                            *pspan,
+                            format!("enum '{}' has no variant '{}'", e.display_name, segs[1]),
+                        ));
+                    };
+                    if !seen_vals.insert(v) {
+                        return Err(Error::at(
+                            *pspan,
+                            format!("duplicate match arm for '{}::{}'", e.display_name, segs[1]),
+                        ));
+                    }
+                    cases.push((v, arm.body.as_slice()));
+                }
+                MatchPattern::Ident(pspan, name) => {
+                    return Err(Error::at(
+                        *pspan,
+                        format!(
+                            "unexpected identifier pattern '{name}' in match (use 'Enum::Variant', integer literal, or '_')"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // Enforce exhaustiveness for enum matches when no `_` fallback is provided.
+        let mut exhaustive_enum_without_wildcard = false;
+        if let ValueType::Enum(ref key) = val_ty
+            && wildcard.is_none()
+            && let Some(e) = self.env.all_enums.get(key)
+        {
+            for (vname, &vval) in &e.variants {
+                if !seen_vals.contains(&vval) {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "non-exhaustive match on enum '{}': missing variant '{}' (add the missing arm or a '_' fallback)",
+                            e.display_name, vname
+                        ),
+                    ));
+                }
+            }
+            exhaustive_enum_without_wildcard = true;
+        }
+
+        if let Some(wc) = wildcard
+            && cases.is_empty()
+        {
+            self.push_scope(ScopeFrame::block());
+            let r = self.lower_stmts(wc);
+            let p = if stmts_always_return(wc, self.env, &self.owner_module, self.in_object_scope) {
+                self.pop_scope_discard_cleanups();
+                Ok(())
+            } else {
+                self.pop_scope_and_run_cleanups()
+            };
+            return r.and(p);
+        }
+
+        if exhaustive_enum_without_wildcard && cases.len() == 1 {
+            let body = cases[0].1;
+            self.push_scope(ScopeFrame::block());
+            let r = self.lower_stmts(body);
+            let p = if stmts_always_return(body, self.env, &self.owner_module, self.in_object_scope)
+            {
+                self.pop_scope_discard_cleanups();
+                Ok(())
+            } else {
+                self.pop_scope_and_run_cleanups()
+            };
+            return r.and(p);
+        }
+
+        let last_idx = cases.len().saturating_sub(1);
+        for (idx, (val, body)) in cases.iter().enumerate() {
+            if idx == 0 {
+                self.line(format!("if {scrut_local} == {val} {{"));
+            } else if exhaustive_enum_without_wildcard && idx == last_idx {
+                self.line("} else {".to_owned());
+            } else {
+                self.line(format!("}} else if {scrut_local} == {val} {{"));
+            }
+            self.indent += 1;
+            self.push_scope(ScopeFrame::block());
+            let r = self.lower_stmts(body);
+            let p = if stmts_always_return(body, self.env, &self.owner_module, self.in_object_scope)
+            {
+                self.pop_scope_discard_cleanups();
+                Ok(())
+            } else {
+                self.pop_scope_and_run_cleanups()
+            };
+            self.indent -= 1;
+            r.and(p)?;
+        }
+        if let Some(wc) = wildcard {
+            self.line("} else {".to_owned());
+            self.indent += 1;
+            self.push_scope(ScopeFrame::block());
+            let r = self.lower_stmts(wc);
+            let p = if stmts_always_return(wc, self.env, &self.owner_module, self.in_object_scope) {
+                self.pop_scope_discard_cleanups();
+                Ok(())
+            } else {
+                self.pop_scope_and_run_cleanups()
+            };
+            self.indent -= 1;
+            self.line("}".to_owned());
+            r.and(p)
+        } else {
+            self.line("}".to_owned());
+            Ok(())
+        }
+    }
+
     fn lower_let_some(
         &mut self,
         span: Span,
         name: &str,
+        ty_ann: Option<&V2Type>,
         init: &V2Expr,
         else_body: &[V2Stmt],
     ) -> Result<()> {
-        if !stmts_unconditionally_diverge(else_body) {
+        if !stmts_unconditionally_diverge(
+            else_body,
+            self.env,
+            &self.owner_module,
+            self.in_object_scope,
+        ) {
             return Err(Error::at(
                 span,
                 format!(
@@ -2302,36 +4050,265 @@ impl<'a> TreeLowerer<'a> {
                 ),
             ));
         }
-        let V2Expr::Call { callee, args, .. } = init else {
+        // Form 1: `let Some(val) = obj.run_functional(kind [, args...]) else { ... };`
+        if let V2Expr::MethodCall {
+            span: mspan,
+            receiver,
+            method,
+            type_args,
+            args,
+        } = init
+            && method == "run_functional"
+        {
+            let ret_ty = self.emit_run_functional_let_some(
+                receiver, type_args, args, *mspan, name, ty_ann, else_body,
+            )?;
+            let air_name = self.fresh(&format!("v_{name}"));
+            self.line(format!("let {air_name} = temp[0];"));
+            self.emit_restore_stack_obj();
+            self.bind_var(
+                name.to_owned(),
+                Binding::Local {
+                    air_name,
+                    ty: ret_ty,
+                },
+            );
+            return Ok(());
+        }
+
+        // Form 2: `let Some(obj) = find_best_object[::<T>](...) | create_object[::<T>](...) else { ... };`
+        let V2Expr::Call {
+            callee,
+            type_args,
+            args,
+            ..
+        } = init
+        else {
             return Err(Error::at(
                 span,
-                "'let Some(x) = ... else { ... }' requires find_best_object(...) or create_object(...)",
+                "'let Some(x) = ... else { ... }' requires find_best_object(...), create_object(...), or obj.run_functional(...)",
             ));
         };
         let V2Expr::Ident(_, fname) = callee.as_ref() else {
             return Err(Error::at(
                 span,
-                "'let Some(x) = ... else { ... }' requires find_best_object(...) or create_object(...)",
+                "'let Some(x) = ... else { ... }' requires find_best_object(...), create_object(...), or obj.run_functional(...)",
             ));
         };
-        let prim_air = match fname.as_str() {
-            "find_best_object" => self.format_find_best_object(args, span)?,
-            "create_object" => self.format_create_object(args, span)?,
+
+        // Typed `find_best_object::<T>(kind [, flags: f])`: runtime-checked against T's GUIDs so
+        // a higher-scoring foreign object can NEVER be bound as T, AND a lower-scoring T is still
+        // found via fallback `set_to_next(guid, T::lead_guid)` scan!
+        if fname == "find_best_object" && !type_args.is_empty() {
+            let plan = self.parse_find_best_object(type_args, args, span)?;
+            let schema = plan
+                .typed_schema
+                .expect("non-empty type_args yields schema");
+            let inferred_ty = ValueType::ObjectRef(schema.canonical_key.clone());
+            let final_ty = if let Some(ann) = ty_ann {
+                let expected = self.env.resolve_value_type(
+                    ann,
+                    &self.owner_module,
+                    self.in_object_scope,
+                    span,
+                )?;
+                if !types_compatible_for_assign(&expected, &inferred_ty) {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "'let Some({name}: {})' does not match '{}' result",
+                            self.env.display_value_type(&expected),
+                            self.env.display_value_type(&inferred_ty)
+                        ),
+                    ));
+                }
+                expected
+            } else {
+                inferred_ty
+            };
+
+            let found_var = self.fresh(&format!("v_{name}"));
+            let raw_var = self.fresh("fbo_raw");
+            let cand_var = self.fresh("fbo_cand");
+            let score_field = match plan.kind_name.as_str() {
+                "prep" => Some("stack.prep_score"),
+                "cook" => Some("stack.cook_score"),
+                _ => None,
+            };
+            let guard_summary = schema
+                .functionals
+                .get(&plan.kind_name)
+                .map_or(FunctionalGuardSummary::Complex, |s| s.guard);
+            let allow_fallback = !matches!(guard_summary, FunctionalGuardSummary::Complex);
+            self.line(format!("let {found_var} = 0;"));
+            self.line(format!("if {} {{", plan.prim_air));
+            self.indent += 1;
+            self.line(format!("let {raw_var} = stack_obj;"));
+            self.line(format!("let {cand_var} = 0;"));
+            let best_var = if allow_fallback && score_field.is_some() {
+                let b = self.fresh("fbo_best");
+                self.line(format!("let {b} = 0;"));
+                Some(b)
+            } else {
+                None
+            };
+            self.line(format!(
+                "while set_to_next(guid, {:#010x}, dest: {cand_var}) {{",
+                schema.lead_guid
+            ));
+            self.indent += 1;
+            self.line(format!("if {cand_var} == {raw_var} {{"));
+            self.indent += 1;
+            self.line(format!("{found_var} := {cand_var};"));
+            self.line("break;".to_owned());
+            self.indent -= 1;
+            self.line("}".to_owned());
+            if allow_fallback {
+                self.line(format!("stack_obj := {cand_var};"));
+                self.line("if stack.in_use == 0 {".to_owned());
+                self.indent += 1;
+                self.line("if !stack.data[8] flag_test 10 {".to_owned());
+                self.indent += 1;
+                let mut extra_blocks = 0usize;
+                if (plan.flags & 4) != 0 {
+                    self.line("if stack.room == my.room {".to_owned());
+                    self.indent += 1;
+                    extra_blocks += 1;
+                }
+                if let FunctionalGuardSummary::AttrBool {
+                    attr_index,
+                    expect_true,
+                } = guard_summary
+                {
+                    let cond = if expect_true {
+                        format!("stack.attr[{attr_index}] != 0")
+                    } else {
+                        format!("stack.attr[{attr_index}] == 0")
+                    };
+                    self.line(format!("if {cond} {{"));
+                    self.indent += 1;
+                    extra_blocks += 1;
+                }
+                if let (Some(sf), Some(bvar)) = (score_field, &best_var) {
+                    self.line(format!("if {sf} > 0 {{"));
+                    self.indent += 1;
+                    self.line(format!("if {found_var} == 0 {{"));
+                    self.indent += 1;
+                    self.line(format!("{found_var} := {cand_var};"));
+                    self.line(format!("{bvar} := {sf};"));
+                    self.indent -= 1;
+                    self.line(format!("}} else if {sf} > {bvar} {{"));
+                    self.indent += 1;
+                    self.line(format!("{found_var} := {cand_var};"));
+                    self.line(format!("{bvar} := {sf};"));
+                    self.indent -= 1;
+                    self.line("}".to_owned());
+                    self.indent -= 1;
+                    self.line("}".to_owned());
+                } else {
+                    self.line(format!("if {found_var} == 0 {{"));
+                    self.indent += 1;
+                    self.line(format!("{found_var} := {cand_var};"));
+                    self.indent -= 1;
+                    self.line("}".to_owned());
+                }
+                for _ in 0..extra_blocks {
+                    self.indent -= 1;
+                    self.line("}".to_owned());
+                }
+                self.indent -= 1;
+                self.line("}".to_owned());
+                self.indent -= 1;
+                self.line("}".to_owned());
+            }
+            self.indent -= 1;
+            self.line("}".to_owned());
+
+            // Multi-tile object support: if the VM's winner was a non-lead tile of T, accept it too.
+            for &tile_guid in &schema.tile_guids {
+                if tile_guid == schema.lead_guid {
+                    continue;
+                }
+                let tchk = self.fresh("fbo_tile");
+                self.line(format!("if {found_var} != {raw_var} {{"));
+                self.indent += 1;
+                self.line(format!("let {tchk} = 0;"));
+                self.line(format!(
+                    "while set_to_next(guid, {tile_guid:#010x}, dest: {tchk}) {{"
+                ));
+                self.indent += 1;
+                self.line(format!("if {tchk} == {raw_var} {{"));
+                self.indent += 1;
+                self.line(format!("{found_var} := {raw_var};"));
+                self.line("break;".to_owned());
+                self.indent -= 1;
+                self.line("}".to_owned());
+                self.indent -= 1;
+                self.line("}".to_owned());
+                self.indent -= 1;
+                self.line("}".to_owned());
+            }
+            self.indent -= 1;
+            self.line("}".to_owned());
+
+            self.line(format!("if {found_var} == 0 {{"));
+            self.indent += 1;
+            self.emit_restore_stack_obj();
+            self.push_scope(ScopeFrame::block());
+            let r = self.lower_stmts(else_body);
+            let p = self.pop_scope_and_run_cleanups();
+            self.indent -= 1;
+            self.line("}".to_owned());
+            r.and(p)?;
+
+            self.emit_restore_stack_obj();
+            self.bind_var(
+                name.to_owned(),
+                Binding::Local {
+                    air_name: found_var,
+                    ty: final_ty,
+                },
+            );
+            return Ok(());
+        }
+
+        let (prim_air, inferred_ty) = match fname.as_str() {
+            "find_best_object" => {
+                let plan = self.parse_find_best_object(type_args, args, span)?;
+                (plan.prim_air, ValueType::ObjectId)
+            }
+            "create_object" => self.format_create_object(type_args, args, span)?,
             other => {
                 return Err(Error::at(
                     span,
                     format!(
-                        "'let Some({name}) = {other}(...)' is not supported (expected 'find_best_object' or 'create_object')"
+                        "'let Some({name}) = {other}(...)' is not supported (expected 'find_best_object', 'create_object', or 'obj.run_functional')"
                     ),
                 ));
             }
         };
+        let final_ty = if let Some(ann) = ty_ann {
+            let expected =
+                self.env
+                    .resolve_value_type(ann, &self.owner_module, self.in_object_scope, span)?;
+            if !types_compatible_for_assign(&expected, &inferred_ty) {
+                return Err(Error::at(
+                    span,
+                    format!(
+                        "'let Some({name}: {})' does not match '{}' result",
+                        self.env.display_value_type(&expected),
+                        self.env.display_value_type(&inferred_ty)
+                    ),
+                ));
+            }
+            expected
+        } else {
+            inferred_ty
+        };
 
         self.line(format!("if !{prim_air} {{"));
         self.indent += 1;
-        if self.has_self_obj_local {
-            self.line("stack_obj := __self_obj;".to_owned());
-        }
+        self.emit_restore_stack_obj();
         self.push_scope(ScopeFrame::block());
         let r = self.lower_stmts(else_body);
         let p = self.pop_scope_and_run_cleanups();
@@ -2341,14 +4318,12 @@ impl<'a> TreeLowerer<'a> {
 
         let air_name = self.fresh(&format!("v_{name}"));
         self.line(format!("let {air_name} = stack_obj;"));
-        if self.has_self_obj_local {
-            self.line("stack_obj := __self_obj;".to_owned());
-        }
+        self.emit_restore_stack_obj();
         self.bind_var(
             name.to_owned(),
             Binding::Local {
                 air_name,
-                ty: ValueType::ObjectId,
+                ty: final_ty,
             },
         );
         Ok(())
@@ -2356,7 +4331,18 @@ impl<'a> TreeLowerer<'a> {
 
     fn lower_expr_stmt(&mut self, expr: &V2Expr) -> Result<()> {
         match expr {
-            V2Expr::Call { span, callee, args } => {
+            V2Expr::Call {
+                span,
+                callee,
+                type_args,
+                args,
+            } => {
+                if !type_args.is_empty() {
+                    return Err(Error::at(
+                        *span,
+                        "type arguments are only supported on 'create_object::<T>', 'find_best_object::<T>', and 'objects_of::<T>'",
+                    ));
+                }
                 if let V2Expr::Ident(_, fname) = callee.as_ref() {
                     match fname.as_str() {
                         "sleep" | "idle" => return self.emit_sleep(args, *span),
@@ -2437,7 +4423,7 @@ impl<'a> TreeLowerer<'a> {
                             return Ok(());
                         }
                         _ => {
-                            // User helper function call (discarding optional bool return).
+                            // User helper function call (discarding optional return value).
                             if let Some((fn_mod, fn_decl, is_local)) =
                                 self.env
                                     .lookup_fn(&self.owner_module, fname, self.in_object_scope)
@@ -2456,11 +4442,33 @@ impl<'a> TreeLowerer<'a> {
                 span,
                 receiver,
                 method,
+                type_args,
                 args,
             } => match method.as_str() {
                 "run_functional" => {
+                    if !type_args.is_empty() {
+                        return Err(Error::at(
+                            *span,
+                            "type arguments on run_functional are only valid inside 'let Some(x) = obj.run_functional::<T>(...)'",
+                        ));
+                    }
                     self.emit_run_functional(receiver, args, *span, None)?;
                     Ok(())
+                }
+                "set" => {
+                    if !type_args.is_empty() {
+                        return Err(Error::at(*span, "'.set()' does not accept type arguments"));
+                    }
+                    self.emit_bitflag_mutate(receiver, args, *span, true)
+                }
+                "clear" => {
+                    if !type_args.is_empty() {
+                        return Err(Error::at(
+                            *span,
+                            "'.clear()' does not accept type arguments",
+                        ));
+                    }
+                    self.emit_bitflag_mutate(receiver, args, *span, false)
                 }
                 _ => Err(Error::at(*span, format!("unknown method '.{method}(...)'"))),
             },
@@ -2468,6 +4476,78 @@ impl<'a> TreeLowerer<'a> {
                 other.span(),
                 "expression has no effect as a statement",
             )),
+        }
+    }
+
+    fn maybe_auto_deref_mut_ref(&self, expr: &V2Expr) -> Option<V2Expr> {
+        if let V2Expr::Ident(span, name) = expr
+            && matches!(self.lookup_var(name), Some(Binding::MutRef { .. }))
+        {
+            return Some(V2Expr::Deref {
+                span: *span,
+                inner: Box::new(expr.clone()),
+            });
+        }
+        None
+    }
+
+    fn emit_bitflag_mutate(
+        &mut self,
+        receiver: &V2Expr,
+        args: &[CallArg],
+        span: Span,
+        is_set: bool,
+    ) -> Result<()> {
+        let method = if is_set { "set" } else { "clear" };
+        if args.len() != 1 || args[0].name.is_some() {
+            return Err(Error::at(
+                span,
+                format!("'.{method}(flag)' expects exactly 1 positional argument"),
+            ));
+        }
+        let derefed = self.maybe_auto_deref_mut_ref(receiver);
+        let lval = self.resolve_lvalue(derefed.as_ref().unwrap_or(receiver))?;
+        let ValueType::Bitflags(key) = lval.value_type().clone() else {
+            return Err(Error::at(
+                span,
+                format!(
+                    "'.{method}(...)' requires a bitflags target, found '{}'",
+                    self.env.display_value_type(lval.value_type())
+                ),
+            ));
+        };
+        if let Some((mask, single_bit)) = self.try_eval_const_bitflag(&args[0].value, &key)? {
+            if let Some(bit) = single_bit {
+                let op = if is_set {
+                    V2AssignOp::FlagSet
+                } else {
+                    V2AssignOp::FlagClear
+                };
+                return self.emit_lvalue_assign(&lval, op, &bit.to_string());
+            }
+            if is_set {
+                return self.emit_lvalue_assign(&lval, V2AssignOp::BitOr, &mask.to_string());
+            }
+            return self.emit_lvalue_assign(&lval, V2AssignOp::BitAnd, &(!mask).to_string());
+        }
+        let (rhs_air, rhs_ty) = self.lower_value_expr(&args[0].value)?;
+        if rhs_ty != ValueType::Bitflags(key.clone()) {
+            return Err(Error::at(
+                args[0].span,
+                format!(
+                    "type mismatch in '.{method}(...)': expected '{}', found '{}'",
+                    self.env.display_value_type(&ValueType::Bitflags(key)),
+                    self.env.display_value_type(&rhs_ty)
+                ),
+            ));
+        }
+        if is_set {
+            self.emit_lvalue_assign(&lval, V2AssignOp::BitOr, &rhs_air)
+        } else {
+            let inv = self.fresh("bf_inv");
+            self.line(format!("let {inv} = -1;"));
+            self.line(format!("{inv} ^= {rhs_air};"));
+            self.emit_lvalue_assign(&lval, V2AssignOp::BitAnd, &inv)
         }
     }
 
@@ -2512,13 +4592,12 @@ impl<'a> TreeLowerer<'a> {
         Ok(())
     }
 
-    fn emit_run_functional(
+    fn prepare_run_functional(
         &mut self,
         receiver: &V2Expr,
         args: &[CallArg],
         span: Span,
-        result_local: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<(String, Option<ResolvedFunctionalSig>, String)> {
         if args.is_empty() {
             return Err(Error::at(
                 span,
@@ -2533,16 +4612,41 @@ impl<'a> TreeLowerer<'a> {
         };
         let _ = functional_kind_info(kind_name, *kspan)?;
         let (target_air, target_ty) = self.lower_value_expr(receiver)?;
-        if target_ty == ValueType::Bool {
+        if !matches!(
+            target_ty,
+            ValueType::ObjectId | ValueType::ObjectRef(_) | ValueType::I16
+        ) {
             return Err(Error::at(
                 receiver.span(),
-                "run_functional() receiver must be an ObjectId, not bool",
+                format!(
+                    "run_functional() receiver must be an ObjectId or typed object reference, found '{}'",
+                    self.env.display_value_type(&target_ty)
+                ),
             ));
         }
+        let sig_opt = if let ValueType::ObjectRef(ref schema_key) = target_ty {
+            let schema = self
+                .env
+                .object_schemas
+                .get(schema_key)
+                .expect("ObjectRef schema must exist");
+            let sig = schema.functionals.get(kind_name).cloned().ok_or_else(|| {
+                Error::at(
+                    *kspan,
+                    format!(
+                        "object '{}' does not declare 'functional {kind_name}'",
+                        schema.display_name
+                    ),
+                )
+            })?;
+            Some(sig)
+        } else {
+            None
+        };
         let staged_target = self.fresh("rf_obj");
         self.line(format!("let {staged_target} = {target_air};"));
         let mut change_icon = false;
-        let mut staged_args = Vec::new();
+        let mut staged_args: Vec<(String, ValueType, Span)> = Vec::new();
         for arg in &args[1..] {
             if let Some(aname) = &arg.name {
                 if aname == "change_icon" {
@@ -2554,10 +4658,10 @@ impl<'a> TreeLowerer<'a> {
                     ));
                 }
             } else {
-                let (val, _) = self.lower_value_expr(&arg.value)?;
+                let (val, val_ty) = self.lower_value_expr(&arg.value)?;
                 let staged = self.fresh("rf_arg");
                 self.line(format!("let {staged} = {val};"));
-                staged_args.push(staged);
+                staged_args.push((staged, val_ty, arg.span));
             }
         }
         if staged_args.len() > 8 {
@@ -2566,7 +4670,34 @@ impl<'a> TreeLowerer<'a> {
                 "run_functional() supports at most 8 temp arguments (temp[0..7])",
             ));
         }
-        for (i, val) in staged_args.iter().enumerate() {
+        if let Some(ref sig) = sig_opt {
+            if staged_args.len() != sig.params.len() {
+                return Err(Error::at(
+                    span,
+                    format!(
+                        "functional '{kind_name}' expects {} argument(s), found {}",
+                        sig.params.len(),
+                        staged_args.len()
+                    ),
+                ));
+            }
+            for (idx, ((_, actual_ty, aspan), expected_ty)) in
+                staged_args.iter().zip(sig.params.iter()).enumerate()
+            {
+                if !types_compatible_for_assign(expected_ty, actual_ty) {
+                    return Err(Error::at(
+                        *aspan,
+                        format!(
+                            "argument {} to functional '{kind_name}' expects '{}', found '{}'",
+                            idx + 1,
+                            self.env.display_value_type(expected_ty),
+                            self.env.display_value_type(actual_ty)
+                        ),
+                    ));
+                }
+            }
+        }
+        for (i, (val, _, _)) in staged_args.iter().enumerate() {
             self.line(format!("temp[{i}] := {val};"));
         }
         self.line(format!("stack_obj := {staged_target};"));
@@ -2575,6 +4706,17 @@ impl<'a> TreeLowerer<'a> {
         } else {
             format!("run_functional_tree({kind_name})")
         };
+        Ok((prim, sig_opt, kind_name.clone()))
+    }
+
+    fn emit_run_functional(
+        &mut self,
+        receiver: &V2Expr,
+        args: &[CallArg],
+        span: Span,
+        result_local: Option<&str>,
+    ) -> Result<()> {
+        let (prim, _, _) = self.prepare_run_functional(receiver, args, span)?;
         if let Some(dst) = result_local {
             self.line(format!("if {prim} {{"));
             self.indent += 1;
@@ -2588,14 +4730,109 @@ impl<'a> TreeLowerer<'a> {
         } else {
             self.line(format!("{prim};"));
         }
-        if self.has_self_obj_local {
-            self.line("stack_obj := __self_obj;".to_owned());
-        }
+        self.emit_restore_stack_obj();
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_run_functional_let_some(
+        &mut self,
+        receiver: &V2Expr,
+        type_args: &[V2Type],
+        args: &[CallArg],
+        span: Span,
+        binding_name: &str,
+        ty_ann: Option<&V2Type>,
+        else_body: &[V2Stmt],
+    ) -> Result<ValueType> {
+        if type_args.len() > 1 {
+            return Err(Error::at(
+                span,
+                "run_functional::<T>() accepts at most 1 return type argument",
+            ));
+        }
+        let (prim, sig_opt, kind_name) = self.prepare_run_functional(receiver, args, span)?;
+        let is_untyped_receiver = sig_opt.is_none();
+        let inferred_ty = match sig_opt {
+            Some(sig) => sig.return_type.ok_or_else(|| {
+                Error::at(
+                    span,
+                    format!(
+                        "functional '{kind_name}' does not declare a return type (use 'if !obj.run_functional({kind_name})' instead of 'let Some(...)')"
+                    ),
+                )
+            })?,
+            None => {
+                if let Some(t) = type_args.first() {
+                    self.env
+                        .resolve_value_type(t, &self.owner_module, self.in_object_scope, span)?
+                } else {
+                    ValueType::I16
+                }
+            }
+        };
+        let after_generic_ty = if let Some(t) = type_args.first() {
+            let expected =
+                self.env
+                    .resolve_value_type(t, &self.owner_module, self.in_object_scope, span)?;
+            if !types_compatible_for_assign(&expected, &inferred_ty) {
+                return Err(Error::at(
+                    span,
+                    format!(
+                        "run_functional::<{}> does not match functional '{kind_name}' return type '{}'",
+                        self.env.display_value_type(&expected),
+                        self.env.display_value_type(&inferred_ty)
+                    ),
+                ));
+            }
+            expected
+        } else {
+            inferred_ty
+        };
+        let final_ty = if let Some(ann) = ty_ann {
+            let expected =
+                self.env
+                    .resolve_value_type(ann, &self.owner_module, self.in_object_scope, span)?;
+            if !types_compatible_for_assign(&expected, &after_generic_ty) {
+                return Err(Error::at(
+                    span,
+                    format!(
+                        "'let Some({binding_name}: {})' does not match functional '{kind_name}' return type '{}'",
+                        self.env.display_value_type(&expected),
+                        self.env.display_value_type(&after_generic_ty)
+                    ),
+                ));
+            }
+            expected
+        } else {
+            after_generic_ty
+        };
+        if is_untyped_receiver && !matches!(final_ty, ValueType::I16 | ValueType::ObjectId) {
+            return Err(Error::at(
+                span,
+                format!(
+                    "untyped ObjectId.run_functional({kind_name}) cannot safely manufacture nominal type '{}' (bind the target via a typed object reference such as 'find_best_object::<T>' or 'objects_of::<T>')",
+                    self.env.display_value_type(&final_ty)
+                ),
+            ));
+        }
+
+        self.line(format!("if !{prim} {{"));
+        self.indent += 1;
+        self.emit_restore_stack_obj();
+        self.push_scope(ScopeFrame::block());
+        let r = self.lower_stmts(else_body);
+        let p = self.pop_scope_and_run_cleanups();
+        self.indent -= 1;
+        self.line("}".to_owned());
+        r.and(p)?;
+        Ok(final_ty)
     }
 
     fn bind_helper_arg(
         &mut self,
+        fn_mod: &str,
+        is_local_fn: bool,
         fn_decl: &FnDecl,
         param: &crate::v2::ast::FnParam,
         arg_expr: &V2Expr,
@@ -2613,10 +4850,14 @@ impl<'a> TreeLowerer<'a> {
                     }
                 } else {
                     let (air, ty) = self.lower_value_expr(arg_expr)?;
-                    if ty == ValueType::Bool {
+                    if !types_compatible_for_assign(&ValueType::I16, &ty) {
                         return Err(Error::at(
                             arg_span,
-                            format!("parameter '{}' expects i16, found bool", param.name),
+                            format!(
+                                "parameter '{}' expects i16, found '{}'",
+                                param.name,
+                                self.env.display_value_type(&ty)
+                            ),
                         ));
                     }
                     let loc = self.fresh(&format!("arg_{}", param.name));
@@ -2651,12 +4892,13 @@ impl<'a> TreeLowerer<'a> {
             V2Type::ObjectId => {
                 let (air, ty) = self.lower_value_expr(arg_expr)?;
                 let is_null_zero = matches!(arg_expr, V2Expr::Int(_, 0));
-                if ty != ValueType::ObjectId && !is_null_zero {
+                if !ty.is_object_handle() && !is_null_zero {
                     return Err(Error::at(
                         arg_span,
                         format!(
-                            "parameter '{}' expects ObjectId (or 0), found {ty:?} (convert numeric temps explicitly via 'let id: ObjectId = ...;')",
-                            param.name
+                            "parameter '{}' expects ObjectId (or 0), found '{}' (convert numeric temps explicitly via 'let id: ObjectId = ...;')",
+                            param.name,
+                            self.env.display_value_type(&ty)
                         ),
                     ));
                 }
@@ -2665,6 +4907,49 @@ impl<'a> TreeLowerer<'a> {
                 Binding::Local {
                     air_name: loc,
                     ty: ValueType::ObjectId,
+                }
+            }
+            V2Type::Named(_) => {
+                let expected =
+                    self.env
+                        .resolve_value_type(&param.ty, fn_mod, is_local_fn, param.span)?;
+                if !stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name) {
+                    if let ValueType::Bitflags(ref bf_key) = expected
+                        && let Some((mask, single_bit)) =
+                            self.try_eval_const_bitflag(arg_expr, bf_key)?
+                    {
+                        return Ok(Binding::ConstBitflag {
+                            key: bf_key.clone(),
+                            mask,
+                            single_bit,
+                        });
+                    }
+                    if let ValueType::Enum(ref e_key) = expected
+                        && let Some(val) = self.try_eval_const_enum(arg_expr, e_key)?
+                    {
+                        return Ok(Binding::ConstEnum {
+                            key: e_key.clone(),
+                            value: val,
+                        });
+                    }
+                }
+                let (air, ty) = self.lower_value_expr(arg_expr)?;
+                if !types_compatible_for_assign(&expected, &ty) {
+                    return Err(Error::at(
+                        arg_span,
+                        format!(
+                            "parameter '{}' expects '{}', found '{}'",
+                            param.name,
+                            self.env.display_value_type(&expected),
+                            self.env.display_value_type(&ty)
+                        ),
+                    ));
+                }
+                let loc = self.fresh(&format!("arg_{}", param.name));
+                self.line(format!("let {loc} = {air};"));
+                Binding::Local {
+                    air_name: loc,
+                    ty: expected,
                 }
             }
             V2Type::MutRef(inner) => {
@@ -2694,19 +4979,17 @@ impl<'a> TreeLowerer<'a> {
                         ));
                     }
                 };
-                let expected_inner = match inner.as_ref() {
-                    V2Type::Bool => ValueType::Bool,
-                    V2Type::I16 => ValueType::I16,
-                    V2Type::ObjectId => ValueType::ObjectId,
-                    _ => unreachable!("parser restricts &mut inner types"),
-                };
-                if lval.value_type() != expected_inner {
+                let expected_inner =
+                    self.env
+                        .resolve_value_type(inner, fn_mod, is_local_fn, param.span)?;
+                if lval.value_type() != &expected_inner {
                     return Err(Error::at(
                         arg_span,
                         format!(
-                            "type mismatch for '&mut {}' parameter '{}'",
-                            inner.display_name(),
-                            param.name
+                            "type mismatch for '&mut {}' parameter '{}' (found '{}')",
+                            self.env.display_value_type(&expected_inner),
+                            param.name,
+                            self.env.display_value_type(lval.value_type())
                         ),
                     ));
                 }
@@ -2746,12 +5029,13 @@ impl<'a> TreeLowerer<'a> {
                     Binding::SelfHandle
                 } else {
                     let (air, ty) = self.lower_value_expr(arg_expr)?;
-                    if ty != ValueType::ObjectId {
+                    if !ty.is_object_handle() {
                         return Err(Error::at(
                             arg_span,
                             format!(
-                                "parameter '{}' expects 'self' or ObjectId, found {ty:?}",
-                                param.name
+                                "parameter '{}' expects 'self' or ObjectId, found '{}'",
+                                param.name,
+                                self.env.display_value_type(&ty)
                             ),
                         ));
                     }
@@ -2893,7 +5177,8 @@ impl<'a> TreeLowerer<'a> {
         let mut bound_params: BTreeMap<String, Binding> = BTreeMap::new();
         for (param_idx, arg) in call_order {
             let param = &fn_decl.params[param_idx];
-            let binding = self.bind_helper_arg(fn_decl, param, &arg.value, arg.span)?;
+            let binding =
+                self.bind_helper_arg(fn_mod, is_local_fn, fn_decl, param, &arg.value, arg.span)?;
             bound_params.insert(param.name.clone(), binding);
         }
 
@@ -2914,7 +5199,14 @@ impl<'a> TreeLowerer<'a> {
                             .default
                             .as_ref()
                             .expect("missing required args rejected above");
-                        let binding = c.bind_helper_arg(fn_decl, param, def_expr, param.span)?;
+                        let binding = c.bind_helper_arg(
+                            fn_mod,
+                            is_local_fn,
+                            fn_decl,
+                            param,
+                            def_expr,
+                            param.span,
+                        )?;
                         bound_params.insert(param.name.clone(), binding);
                     }
                 }
@@ -2931,20 +5223,29 @@ impl<'a> TreeLowerer<'a> {
         let ret_kind = match &fn_decl.return_type {
             None => FnReturnKind::Void,
             Some(V2Type::Bool) => FnReturnKind::Bool,
-            Some(V2Type::I16) => FnReturnKind::I16,
             Some(other) => {
-                self.inline_call_stack.pop();
-                return Err(Error::at(
-                    fn_decl.span,
-                    format!(
-                        "helper function '{}' has unsupported return type '{}' (supported: '-> bool', '-> i16', or void)",
-                        fn_decl.name,
-                        other.display_name()
-                    ),
-                ));
+                match self
+                    .env
+                    .resolve_value_type(other, fn_mod, is_local_fn, fn_decl.span)
+                {
+                    Ok(vty) => FnReturnKind::Value(vty),
+                    Err(_) => {
+                        self.inline_call_stack.pop();
+                        return Err(Error::at(
+                            fn_decl.span,
+                            format!(
+                                "helper function '{}' has unsupported return type '{}'",
+                                fn_decl.name,
+                                other.display_name()
+                            ),
+                        ));
+                    }
+                }
             }
         };
-        if ret_kind != FnReturnKind::Void && !stmts_always_return(&fn_decl.body) {
+        if ret_kind != FnReturnKind::Void
+            && !stmts_always_return(&fn_decl.body, self.env, fn_mod, is_local_fn)
+        {
             self.inline_call_stack.pop();
             return Err(Error::at(
                 fn_decl.span,
@@ -2987,7 +5288,7 @@ impl<'a> TreeLowerer<'a> {
                     c.active_inline_fn = Some(ActiveInlineFn {
                         ret_flag,
                         ret_val: rv_name,
-                        ret_kind,
+                        ret_kind: ret_kind.clone(),
                         owner_defer_id: c.current_defer_id,
                     });
                 }
@@ -3035,7 +5336,7 @@ impl<'a> TreeLowerer<'a> {
         Ok(ret_val_local.map(|rv| {
             let vty = match ret_kind {
                 FnReturnKind::Bool => ValueType::Bool,
-                FnReturnKind::I16 => ValueType::I16,
+                FnReturnKind::Value(v) => v,
                 FnReturnKind::Void => unreachable!("ret_val_local only set for non-void"),
             };
             (rv, vty)
@@ -3138,20 +5439,23 @@ impl<'a> TreeLowerer<'a> {
                 if let V2Expr::Ident(bspan, bname) = base.as_ref() {
                     if self.is_self_ident(bname) {
                         if let Some(st) = self.env.states.get(field) {
-                            let ty = match st.ty {
-                                StateType::Bool => ValueType::Bool,
-                                StateType::I16 => ValueType::I16,
-                                StateType::ObjectId => ValueType::ObjectId,
-                            };
                             return Ok(LValue::Direct {
                                 air: format!("{}.attr[{}]", self.self_prefix(), st.attr_index),
-                                ty,
+                                ty: st.ty.clone(),
                             });
                         }
                         return match field.as_str() {
                             "graphic" => Ok(LValue::Direct {
                                 air: format!("{}.data[0]", self.self_prefix()),
                                 ty: ValueType::I16,
+                            }),
+                            "allowed_heights" => Ok(LValue::Direct {
+                                air: format!("{}.data[4]", self.self_prefix()),
+                                ty: ValueType::Bitflags("builtin::Height".to_owned()),
+                            }),
+                            "placement" => Ok(LValue::Direct {
+                                air: format!("{}.data[42]", self.self_prefix()),
+                                ty: ValueType::Bitflags("builtin::Placement".to_owned()),
                             }),
                             "prep_score" => Ok(LValue::Direct {
                                 air: format!("{}.prep_score", self.self_prefix()),
@@ -3190,6 +5494,58 @@ impl<'a> TreeLowerer<'a> {
                             *bspan,
                             "'sim' is not available in init/main (object lifecycle context)",
                         ));
+                    }
+                    // Typed foreign object field access (`fridge.stock`, `plate.nutrition`, `part.occupancy`, etc.)
+                    if let Some(binding) = self.lookup_var(bname).cloned() {
+                        let foreign_info = match binding {
+                            Binding::Local {
+                                air_name,
+                                ty: ValueType::ObjectRef(schema_key),
+                            } => Some((air_name, schema_key)),
+                            Binding::BhavParam {
+                                index,
+                                ty: ValueType::ObjectRef(schema_key),
+                            } => Some((format!("param[{index}]"), schema_key)),
+                            _ => None,
+                        };
+                        if let Some((obj_air, schema_key)) = foreign_info {
+                            let schema = self
+                                .env
+                                .object_schemas
+                                .get(&schema_key)
+                                .expect("ObjectRef schema must exist");
+                            if let Some((attr_idx, state_ty)) = schema.states.get(field) {
+                                return Ok(LValue::ForeignAttr {
+                                    obj_air,
+                                    attr_index: *attr_idx as i16,
+                                    ty: state_ty.clone(),
+                                });
+                            }
+                            return match field.as_str() {
+                                "graphic" => Ok(LValue::ForeignData {
+                                    obj_air,
+                                    data_index: 0,
+                                    ty: ValueType::I16,
+                                }),
+                                "allowed_heights" => Ok(LValue::ForeignData {
+                                    obj_air,
+                                    data_index: 4,
+                                    ty: ValueType::Bitflags("builtin::Height".to_owned()),
+                                }),
+                                "placement" => Ok(LValue::ForeignData {
+                                    obj_air,
+                                    data_index: 42,
+                                    ty: ValueType::Bitflags("builtin::Placement".to_owned()),
+                                }),
+                                other => Err(Error::at(
+                                    *span,
+                                    format!(
+                                        "object '{}' has no state field '{other}'",
+                                        schema.display_name
+                                    ),
+                                )),
+                            };
+                        }
                     }
                 }
                 Err(Error::at(
@@ -3260,23 +5616,20 @@ impl<'a> TreeLowerer<'a> {
                             )),
                         };
                     }
-                    // Foreign ObjectId variable: `plate.attr[0] = nutrition;`
+                    // Foreign ObjectId / ObjectRef variable: `plate.attr[0] = nutrition;`
                     if let Some(binding) = self.lookup_var(rname).cloned() {
                         let obj_air = match binding {
-                            Binding::Local {
-                                air_name,
-                                ty: ValueType::ObjectId,
+                            Binding::Local { air_name, ty } if ty.is_object_handle() => air_name,
+                            Binding::ForeignObject { air_name } => air_name,
+                            Binding::BhavParam { index, ty } if ty.is_object_handle() => {
+                                format!("param[{index}]")
                             }
-                            | Binding::ForeignObject { air_name } => air_name,
-                            Binding::BhavParam {
-                                index,
-                                ty: ValueType::ObjectId,
-                            } => format!("param[{index}]"),
                             Binding::Local { ty, .. } | Binding::BhavParam { ty, .. } => {
                                 return Err(Error::at(
                                     *span,
                                     format!(
-                                        "cannot index '{rname}.{field}[...]': '{rname}' has type {ty:?}, expected ObjectId"
+                                        "cannot index '{rname}.{field}[...]': '{rname}' has type '{}', expected ObjectId",
+                                        self.env.display_value_type(&ty)
                                     ),
                                 ));
                             }
@@ -3292,10 +5645,12 @@ impl<'a> TreeLowerer<'a> {
                             "attr" => Ok(LValue::ForeignAttr {
                                 obj_air,
                                 attr_index: idx,
+                                ty: ValueType::I16,
                             }),
                             "data" => Ok(LValue::ForeignData {
                                 obj_air,
                                 data_index: idx,
+                                ty: ValueType::I16,
                             }),
                             other => Err(Error::at(
                                 *span,
@@ -3334,6 +5689,7 @@ impl<'a> TreeLowerer<'a> {
             LValue::ForeignAttr {
                 obj_air,
                 attr_index,
+                ..
             } => {
                 let effective_rhs = if rhs_air.starts_with("stack.") || rhs_air == "stack_obj" {
                     let snap = self.fresh("frhs");
@@ -3346,13 +5702,12 @@ impl<'a> TreeLowerer<'a> {
                 self.line(format!(
                     "stack.attr[{attr_index}] {op_str} {effective_rhs};"
                 ));
-                if self.has_self_obj_local {
-                    self.line("stack_obj := __self_obj;".to_owned());
-                }
+                self.emit_restore_stack_obj();
             }
             LValue::ForeignData {
                 obj_air,
                 data_index,
+                ..
             } => {
                 let effective_rhs = if rhs_air.starts_with("stack.") || rhs_air == "stack_obj" {
                     let snap = self.fresh("frhs");
@@ -3365,12 +5720,532 @@ impl<'a> TreeLowerer<'a> {
                 self.line(format!(
                     "stack.data[{data_index}] {op_str} {effective_rhs};"
                 ));
-                if self.has_self_obj_local {
-                    self.line("stack_obj := __self_obj;".to_owned());
-                }
+                self.emit_restore_stack_obj();
             }
         }
         Ok(())
+    }
+
+    /// Resolves a compile-time `Enum` constant (`Enum::Variant` or `Binding::ConstEnum`).
+    fn try_eval_const_enum(&self, expr: &V2Expr, expected_key: &str) -> Result<Option<i16>> {
+        match expr {
+            V2Expr::Path(span, segs) if segs.len() == 2 => {
+                if let Some(e) =
+                    self.env
+                        .lookup_enum(&self.owner_module, &segs[0], self.in_object_scope)
+                {
+                    if e.canonical_key != expected_key {
+                        return Err(Error::at(
+                            *span,
+                            format!(
+                                "type mismatch: expected '{}', found '{}'",
+                                self.env
+                                    .display_value_type(&ValueType::Enum(expected_key.to_owned())),
+                                e.display_name
+                            ),
+                        ));
+                    }
+                    let &val = e.variants.get(&segs[1]).ok_or_else(|| {
+                        Error::at(
+                            *span,
+                            format!("enum '{}' has no variant '{}'", e.display_name, segs[1]),
+                        )
+                    })?;
+                    return Ok(Some(val));
+                }
+                Ok(None)
+            }
+            V2Expr::Ident(span, name) => {
+                if let Some(Binding::ConstEnum { key, value }) = self.lookup_var(name) {
+                    if key != expected_key {
+                        return Err(Error::at(
+                            *span,
+                            format!(
+                                "type mismatch: expected '{}', found '{}'",
+                                self.env
+                                    .display_value_type(&ValueType::Enum(expected_key.to_owned())),
+                                self.env.display_value_type(&ValueType::Enum(key.clone()))
+                            ),
+                        ));
+                    }
+                    return Ok(Some(*value));
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Resolves a compile-time `Bitflags` constant expression (single flag, `None`, or `|`/`&`/`^` of constants),
+    /// returning `(mask, single_bit_1_based)` when constant!
+    fn try_eval_const_bitflag(
+        &self,
+        expr: &V2Expr,
+        expected_key: &str,
+    ) -> Result<Option<(i16, Option<u8>)>> {
+        match expr {
+            V2Expr::Path(span, segs) if segs.len() == 2 => {
+                if let Some(bf) =
+                    self.env
+                        .lookup_bitflags(&self.owner_module, &segs[0], self.in_object_scope)
+                {
+                    if bf.canonical_key != expected_key {
+                        return Err(Error::at(
+                            *span,
+                            format!(
+                                "type mismatch: expected bitflags '{}', found '{}'",
+                                self.env.display_value_type(&ValueType::Bitflags(
+                                    expected_key.to_owned()
+                                )),
+                                bf.display_name
+                            ),
+                        ));
+                    }
+                    if segs[1] == "None" {
+                        return Ok(Some((0, None)));
+                    }
+                    let &bit = bf.flags.get(&segs[1]).ok_or_else(|| {
+                        Error::at(
+                            *span,
+                            format!("bitflags '{}' has no flag '{}'", bf.display_name, segs[1]),
+                        )
+                    })?;
+                    return Ok(Some((bit_to_mask(bit), Some(bit))));
+                }
+                Ok(None)
+            }
+            V2Expr::Ident(span, name) => {
+                if let Some(Binding::ConstBitflag {
+                    key,
+                    mask,
+                    single_bit,
+                }) = self.lookup_var(name)
+                {
+                    if key != expected_key {
+                        return Err(Error::at(
+                            *span,
+                            format!(
+                                "type mismatch: expected bitflags '{}', found '{}'",
+                                self.env.display_value_type(&ValueType::Bitflags(
+                                    expected_key.to_owned()
+                                )),
+                                self.env
+                                    .display_value_type(&ValueType::Bitflags(key.clone()))
+                            ),
+                        ));
+                    }
+                    return Ok(Some((*mask, *single_bit)));
+                }
+                Ok(None)
+            }
+            V2Expr::Binary {
+                lhs,
+                op: op @ (V2BinOp::BitOr | V2BinOp::BitAnd | V2BinOp::BitXor),
+                rhs,
+                ..
+            } => {
+                let Some((lmask, _)) = self.try_eval_const_bitflag(lhs, expected_key)? else {
+                    return Ok(None);
+                };
+                let Some((rmask, _)) = self.try_eval_const_bitflag(rhs, expected_key)? else {
+                    return Ok(None);
+                };
+                let mask = match op {
+                    V2BinOp::BitOr => lmask | rmask,
+                    V2BinOp::BitAnd => lmask & rmask,
+                    V2BinOp::BitXor => lmask ^ rmask,
+                    _ => unreachable!(),
+                };
+                let single_bit = single_bit_of_mask(mask);
+                Ok(Some((mask, single_bit)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Detects if `expr` is a compile-time constant `Bitflags` expression of ANY bitflags type.
+    fn try_eval_any_const_bitflag(
+        &self,
+        expr: &V2Expr,
+    ) -> Result<Option<(String, i16, Option<u8>)>> {
+        match expr {
+            V2Expr::Path(span, segs) if segs.len() == 2 => {
+                if let Some(bf) =
+                    self.env
+                        .lookup_bitflags(&self.owner_module, &segs[0], self.in_object_scope)
+                {
+                    let key = bf.canonical_key.clone();
+                    if segs[1] == "None" {
+                        return Ok(Some((key, 0, None)));
+                    }
+                    let &bit = bf.flags.get(&segs[1]).ok_or_else(|| {
+                        Error::at(
+                            *span,
+                            format!("bitflags '{}' has no flag '{}'", bf.display_name, segs[1]),
+                        )
+                    })?;
+                    return Ok(Some((key, bit_to_mask(bit), Some(bit))));
+                }
+                Ok(None)
+            }
+            V2Expr::Ident(_, name) => {
+                if let Some(Binding::ConstBitflag {
+                    key,
+                    mask,
+                    single_bit,
+                }) = self.lookup_var(name)
+                {
+                    return Ok(Some((key.clone(), *mask, *single_bit)));
+                }
+                Ok(None)
+            }
+            V2Expr::Binary {
+                lhs,
+                op: op @ (V2BinOp::BitOr | V2BinOp::BitAnd | V2BinOp::BitXor),
+                rhs,
+                ..
+            } => {
+                let Some((key, lmask, _)) = self.try_eval_any_const_bitflag(lhs)? else {
+                    return Ok(None);
+                };
+                let Some((rmask, _)) = self.try_eval_const_bitflag(rhs, &key)? else {
+                    return Ok(None);
+                };
+                let mask = match op {
+                    V2BinOp::BitOr => lmask | rmask,
+                    V2BinOp::BitAnd => lmask & rmask,
+                    V2BinOp::BitXor => lmask ^ rmask,
+                    _ => unreachable!(),
+                };
+                Ok(Some((key, mask, single_bit_of_mask(mask))))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Returns `true` iff `expr` contains a division or remainder whose divisor is not a known
+    /// non-zero compile-time constant (and therefore could trap partway through evaluation).
+    fn expr_may_trap_arith(&self, expr: &V2Expr) -> bool {
+        match expr {
+            V2Expr::Binary { lhs, op, rhs, .. } => {
+                if matches!(op, V2BinOp::Div | V2BinOp::Mod)
+                    && !self.eval_const_i16(rhs).is_ok_and(|v| v != 0)
+                {
+                    return true;
+                }
+                self.expr_may_trap_arith(lhs) || self.expr_may_trap_arith(rhs)
+            }
+            V2Expr::Unary { inner, .. }
+            | V2Expr::Deref { inner, .. }
+            | V2Expr::MutRef { inner, .. } => self.expr_may_trap_arith(inner),
+            V2Expr::Index { base, index, .. } => {
+                self.expr_may_trap_arith(base) || self.expr_may_trap_arith(index)
+            }
+            V2Expr::Field { base, .. } => self.expr_may_trap_arith(base),
+            V2Expr::Tuple(_, elems) => elems.iter().any(|e| self.expr_may_trap_arith(e)),
+            V2Expr::Call { .. } | V2Expr::MethodCall { .. } => true,
+            V2Expr::Int(..)
+            | V2Expr::Bool(..)
+            | V2Expr::Str(..)
+            | V2Expr::Ident(..)
+            | V2Expr::Path(..) => false,
+        }
+    }
+
+    /// Returns `true` iff `expr` can be lowered directly in-place into `dst_air` without aliasing,
+    /// partial writes on trap, observable VM write side effects, or premature motive/skill clamping!
+    fn can_lower_arith_in_place(&self, dst_air: &str, expr: &V2Expr, is_fresh_local: bool) -> bool {
+        let canon_dst = canonical_air_cell(dst_air);
+        if canon_dst.starts_with("my.motive")
+            || canon_dst.starts_with("stack.motive")
+            || canon_dst.starts_with("my.person")
+            || canon_dst.starts_with("stack.person")
+            || canon_dst.starts_with("my.data[")
+            || canon_dst.starts_with("stack.data[")
+            || canon_dst.starts_with("global[")
+        {
+            return false;
+        }
+        if !is_fresh_local && self.expr_may_trap_arith(expr) {
+            return false;
+        }
+        let (base, ops) = flatten_arith_chain(expr);
+        if ops.is_empty() {
+            if let V2Expr::Unary {
+                op: V2UnaryOp::Neg,
+                inner,
+                ..
+            } = base
+            {
+                return !self.expr_may_read_or_clobber_air(inner, &canon_dst);
+            }
+            return true;
+        }
+        if ops
+            .iter()
+            .any(|(_, rhs)| self.expr_may_read_or_clobber_air(rhs, &canon_dst))
+        {
+            return false;
+        }
+        // If `base` itself is unary `-inner`, emitting `dst := 0; dst -= inner;` would overwrite
+        // `dst` before reading `inner` if `inner` reads `dst`!
+        if let V2Expr::Unary {
+            op: V2UnaryOp::Neg,
+            inner,
+            ..
+        } = base
+        {
+            return !self.expr_may_read_or_clobber_air(inner, &canon_dst);
+        }
+        true
+    }
+
+    /// Conservatively checks whether evaluating `expr` could read or mutate `canon_target`
+    /// (already canonicalized via [`canonical_air_cell`]).
+    fn expr_may_read_or_clobber_air(&self, expr: &V2Expr, canon_target: &str) -> bool {
+        match expr {
+            V2Expr::Int(_, _) | V2Expr::Bool(_, _) | V2Expr::Str(_, _) | V2Expr::Path(_, _) => {
+                false
+            }
+            V2Expr::Ident(_, name) => match self.lookup_var(name) {
+                Some(Binding::Local { air_name, .. }) => {
+                    canonical_air_cell(air_name) == canon_target
+                }
+                Some(Binding::BhavParam { index, .. }) => format!("param[{index}]") == canon_target,
+                Some(Binding::MutRef {
+                    target: LValue::Direct { air, .. },
+                }) => canonical_air_cell(air) == canon_target,
+                Some(Binding::MutRef { .. }) => true,
+                Some(Binding::ConstI16 { air, .. }) => canonical_air_cell(air) == canon_target,
+                _ => false,
+            },
+            V2Expr::Deref { inner, .. } => {
+                if let V2Expr::Ident(_, pname) = inner.as_ref() {
+                    match self.lookup_var(pname) {
+                        Some(Binding::MutRef {
+                            target: LValue::Direct { air, .. },
+                        }) => canonical_air_cell(air) == canon_target,
+                        _ => true,
+                    }
+                } else {
+                    true
+                }
+            }
+            V2Expr::Field { base, field, .. } => {
+                if let V2Expr::Ident(_, bname) = base.as_ref() {
+                    if self.is_self_ident(bname) {
+                        if let Some(st) = self.env.states.get(field) {
+                            return format!("{}.attr[{}]", self.self_prefix(), st.attr_index)
+                                == canon_target;
+                        }
+                        let prop_air = match field.as_str() {
+                            "graphic" => format!("{}.data[0]", self.self_prefix()),
+                            "allowed_heights" => format!("{}.data[4]", self.self_prefix()),
+                            "placement" => format!("{}.data[42]", self.self_prefix()),
+                            "prep_score" => format!("{}.data[31]", self.self_prefix()),
+                            "cook_score" => format!("{}.data[32]", self.self_prefix()),
+                            "in_use" => format!("{}.data[25]", self.self_prefix()),
+                            "id" => format!("{}.data[11]", self.self_prefix()),
+                            "room" => format!("{}.data[29]", self.self_prefix()),
+                            _ => return true,
+                        };
+                        return prop_air == canon_target;
+                    }
+                    if self.is_sim_ident(bname) {
+                        let sim_air = match field.as_str() {
+                            "id" => "my.data[11]",
+                            "priority" => "my.person[33]",
+                            "room" => "my.data[29]",
+                            _ => return true,
+                        };
+                        return sim_air == canon_target;
+                    }
+                    // Foreign object field access swaps `stack_obj` AND the foreign handle may
+                    // alias the current object (`stack.*` in interactions OR `my.attr`/`my.data`
+                    // in `ObjectSelf` lifecycle hooks such as `for p in objects_of::<Self>()`)!
+                    return canon_target.starts_with("stack.")
+                        || canon_target == "stack_obj"
+                        || canon_target.starts_with("my.attr[")
+                        || canon_target.starts_with("my.data[");
+                }
+                if let V2Expr::Field {
+                    base: root,
+                    field: group,
+                    ..
+                } = base.as_ref()
+                    && let V2Expr::Ident(_, rname) = root.as_ref()
+                    && self.is_sim_ident(rname)
+                {
+                    let sim_air = match group.as_str() {
+                        "motive" => canonical_air_cell(&format!("my.motive.{field}")),
+                        "skill" => canonical_air_cell(&format!("my.skill.{field}")),
+                        _ => return true,
+                    };
+                    return sim_air == canon_target;
+                }
+                true
+            }
+            V2Expr::Index { base, index, .. } => {
+                if self.expr_may_read_or_clobber_air(index, canon_target) {
+                    return true;
+                }
+                if let V2Expr::Ident(_, bname) = base.as_ref()
+                    && matches!(bname.as_str(), "temp" | "global")
+                {
+                    return if let Ok(idx) = self.eval_const_i16(index) {
+                        format!("{bname}[{idx}]") == canon_target
+                    } else {
+                        true
+                    };
+                }
+                if let V2Expr::Field {
+                    base: root, field, ..
+                } = base.as_ref()
+                    && let V2Expr::Ident(_, rname) = root.as_ref()
+                    && self.is_self_ident(rname)
+                    && matches!(field.as_str(), "attr" | "data")
+                {
+                    return if let Ok(idx) = self.eval_const_i16(index) {
+                        format!("{}.{field}[{idx}]", self.self_prefix()) == canon_target
+                    } else {
+                        true
+                    };
+                }
+                true
+            }
+            V2Expr::Unary { inner, .. } | V2Expr::MutRef { inner, .. } => {
+                self.expr_may_read_or_clobber_air(inner, canon_target)
+            }
+            V2Expr::Binary { lhs, rhs, .. } => {
+                self.expr_may_read_or_clobber_air(lhs, canon_target)
+                    || self.expr_may_read_or_clobber_air(rhs, canon_target)
+            }
+            V2Expr::Tuple(_, elems) => elems
+                .iter()
+                .any(|e| self.expr_may_read_or_clobber_air(e, canon_target)),
+            // Calls/method calls may have arbitrary side effects.
+            V2Expr::Call { .. } | V2Expr::MethodCall { .. } => true,
+        }
+    }
+
+    /// Lowers a compound arithmetic/bitwise/unary-negation expression directly into `dst_air`,
+    /// collapsing left-associative chains `(a * 24) / 5 + 1` into zero extra scratch locals!
+    fn lower_arith_into_dest(
+        &mut self,
+        expr: &V2Expr,
+        dst_air: &str,
+        declare_let: bool,
+    ) -> Result<ValueType> {
+        // Constant-fold compile-time `Bitflags` expressions (e.g. `Placement::Floor | Placement::Terrain` -> `3`).
+        if let Some((key, mask, _)) = self.try_eval_any_const_bitflag(expr)? {
+            if declare_let {
+                self.line(format!("let {dst_air} = {mask};"));
+            } else {
+                self.line(format!("{dst_air} := {mask};"));
+            }
+            return Ok(ValueType::Bitflags(key));
+        }
+
+        let (base, ops) = flatten_arith_chain(expr);
+
+        // Emit base into `dst_air`.
+        let base_ty = match base {
+            V2Expr::Unary {
+                span,
+                op: V2UnaryOp::Neg,
+                inner,
+            } => {
+                if let V2Expr::Int(_, v) = inner.as_ref() {
+                    let n = v
+                        .checked_neg()
+                        .and_then(|x| i16::try_from(x).ok())
+                        .ok_or_else(|| {
+                            Error::at(*span, format!("negated integer -{v} out of i16 range"))
+                        })?;
+                    if declare_let {
+                        self.line(format!("let {dst_air} = {n};"));
+                    } else {
+                        self.line(format!("{dst_air} := {n};"));
+                    }
+                    ValueType::I16
+                } else {
+                    let (v_air, v_ty) = self.lower_value_expr(inner)?;
+                    if v_ty != ValueType::I16 {
+                        return Err(Error::at(
+                            *span,
+                            format!(
+                                "cannot apply unary '-' to '{}' expression",
+                                self.env.display_value_type(&v_ty)
+                            ),
+                        ));
+                    }
+                    if declare_let {
+                        self.line(format!("let {dst_air} = 0;"));
+                    } else {
+                        self.line(format!("{dst_air} := 0;"));
+                    }
+                    self.line(format!("{dst_air} -= {v_air};"));
+                    ValueType::I16
+                }
+            }
+            other => {
+                let (b_air, b_ty) = self.lower_value_expr(other)?;
+                if !ops.is_empty() && !matches!(b_ty, ValueType::I16 | ValueType::Bitflags(_)) {
+                    return Err(Error::at(
+                        other.span(),
+                        format!(
+                            "arithmetic/bitwise operator cannot be applied to '{}' operand",
+                            self.env.display_value_type(&b_ty)
+                        ),
+                    ));
+                }
+                if declare_let {
+                    self.line(format!("let {dst_air} = {b_air};"));
+                } else if b_air != dst_air {
+                    self.line(format!("{dst_air} := {b_air};"));
+                }
+                b_ty
+            }
+        };
+
+        for (op, rhs) in ops {
+            if matches!(base_ty, ValueType::Bitflags(_))
+                && !matches!(op, V2BinOp::BitAnd | V2BinOp::BitOr | V2BinOp::BitXor)
+            {
+                return Err(Error::at(
+                    rhs.span(),
+                    format!(
+                        "arithmetic operator cannot be applied to bitflags '{}' (only |, &, ^ are allowed)",
+                        self.env.display_value_type(&base_ty)
+                    ),
+                ));
+            }
+            let (r_air, r_ty) = self.lower_value_expr(rhs)?;
+            if r_ty != base_ty {
+                return Err(Error::at(
+                    rhs.span(),
+                    format!(
+                        "mismatched operand types in arithmetic/bitwise expression: '{}' vs '{}'",
+                        self.env.display_value_type(&base_ty),
+                        self.env.display_value_type(&r_ty)
+                    ),
+                ));
+            }
+            let aop = match op {
+                V2BinOp::Add => "+=",
+                V2BinOp::Sub => "-=",
+                V2BinOp::Mul => "*=",
+                V2BinOp::Div => "/=",
+                V2BinOp::Mod => "%=",
+                V2BinOp::BitAnd => "&=",
+                V2BinOp::BitOr => "|=",
+                V2BinOp::BitXor => "^=",
+                _ => unreachable!(),
+            };
+            self.line(format!("{dst_air} {aop} {r_air};"));
+        }
+
+        Ok(base_ty)
     }
 
     /// Lowers a value-producing expression into an `.air` operand string + its [`ValueType`].
@@ -3382,6 +6257,50 @@ impl<'a> TreeLowerer<'a> {
                 Ok((n.to_string(), ValueType::I16))
             }
             V2Expr::Bool(_, b) => Ok((if *b { "1" } else { "0" }.to_owned(), ValueType::Bool)),
+            V2Expr::Path(span, segs) => {
+                if segs.len() != 2 {
+                    return Err(Error::at(
+                        *span,
+                        format!("unsupported path expression '{}'", segs.join("::")),
+                    ));
+                }
+                let (tname, vname) = (&segs[0], &segs[1]);
+                if let Some(e) =
+                    self.env
+                        .lookup_enum(&self.owner_module, tname, self.in_object_scope)
+                {
+                    let &val = e.variants.get(vname).ok_or_else(|| {
+                        Error::at(
+                            *span,
+                            format!("enum '{}' has no variant '{vname}'", e.display_name),
+                        )
+                    })?;
+                    return Ok((val.to_string(), ValueType::Enum(e.canonical_key.clone())));
+                }
+                if let Some(bf) =
+                    self.env
+                        .lookup_bitflags(&self.owner_module, tname, self.in_object_scope)
+                {
+                    let mask = if vname == "None" {
+                        0i16
+                    } else if let Some(&bit) = bf.flags.get(vname) {
+                        bit_to_mask(bit)
+                    } else {
+                        return Err(Error::at(
+                            *span,
+                            format!("bitflags '{}' has no flag '{vname}'", bf.display_name),
+                        ));
+                    };
+                    return Ok((
+                        mask.to_string(),
+                        ValueType::Bitflags(bf.canonical_key.clone()),
+                    ));
+                }
+                Err(Error::at(
+                    *span,
+                    format!("unknown enum or bitflags type '{tname}'"),
+                ))
+            }
             V2Expr::Ident(span, name) => {
                 if let Some(binding) = self.lookup_var(name).cloned() {
                     return match binding {
@@ -3389,6 +6308,22 @@ impl<'a> TreeLowerer<'a> {
                         Binding::ConstI16 { air, .. } => Ok((air, ValueType::I16)),
                         Binding::ConstBool(b) => {
                             Ok((if b { "1" } else { "0" }.to_owned(), ValueType::Bool))
+                        }
+                        Binding::ConstEnum { key, value } => {
+                            Ok((value.to_string(), ValueType::Enum(key)))
+                        }
+                        Binding::ConstBitflag { key, mask, .. } => {
+                            Ok((mask.to_string(), ValueType::Bitflags(key)))
+                        }
+                        Binding::AutonomousFlag => {
+                            let tmp = self.fresh("auto");
+                            self.line(format!("let {tmp} = 0;"));
+                            self.line("if param[0] == 1 {".to_owned());
+                            self.indent += 1;
+                            self.line(format!("{tmp} := 1;"));
+                            self.indent -= 1;
+                            self.line("}".to_owned());
+                            Ok((tmp, ValueType::Bool))
                         }
                         Binding::BhavParam { index, ty } => Ok((format!("param[{index}]"), ty)),
                         Binding::ForeignObject { air_name } => Ok((air_name, ValueType::ObjectId)),
@@ -3517,30 +6452,12 @@ impl<'a> TreeLowerer<'a> {
                             })?;
                         return Ok((n.to_string(), ValueType::I16));
                     }
-                    let (v_air, v_ty) = self.lower_value_expr(inner)?;
-                    if v_ty != ValueType::I16 {
-                        let actual = match v_ty {
-                            ValueType::Bool => "bool",
-                            ValueType::ObjectId => "ObjectId",
-                            ValueType::I16 => "i16",
-                        };
-                        return Err(Error::at(
-                            *span,
-                            format!("cannot apply unary '-' to '{actual}' expression"),
-                        ));
-                    }
                     let tmp = self.fresh("neg");
-                    self.line(format!("let {tmp} = 0;"));
-                    self.line(format!("{tmp} -= {v_air};"));
-                    Ok((tmp, ValueType::I16))
+                    let ty = self.lower_arith_into_dest(expr, &tmp, true)?;
+                    Ok((tmp, ty))
                 }
             },
-            V2Expr::Binary {
-                span: _,
-                lhs,
-                op,
-                rhs,
-            } => match op {
+            V2Expr::Binary { op, .. } => match op {
                 V2BinOp::And
                 | V2BinOp::Or
                 | V2BinOp::Eq
@@ -3563,52 +6480,27 @@ impl<'a> TreeLowerer<'a> {
                 | V2BinOp::BitAnd
                 | V2BinOp::BitOr
                 | V2BinOp::BitXor => {
-                    let (l_air, l_ty) = self.lower_value_expr(lhs)?;
-                    if l_ty != ValueType::I16 {
-                        let actual = match l_ty {
-                            ValueType::Bool => "bool",
-                            ValueType::ObjectId => "ObjectId",
-                            ValueType::I16 => "i16",
-                        };
-                        return Err(Error::at(
-                            lhs.span(),
-                            format!(
-                                "arithmetic/bitwise operator cannot be applied to '{actual}' operand"
-                            ),
-                        ));
+                    // Constant-fold pure Bitflags expressions into an immediate literal!
+                    if let Some((key, mask, _)) = self.try_eval_any_const_bitflag(expr)? {
+                        return Ok((mask.to_string(), ValueType::Bitflags(key)));
                     }
                     let tmp = self.fresh("arith");
-                    self.line(format!("let {tmp} = {l_air};"));
-                    let (r_air, r_ty) = self.lower_value_expr(rhs)?;
-                    if r_ty != ValueType::I16 {
-                        let actual = match r_ty {
-                            ValueType::Bool => "bool",
-                            ValueType::ObjectId => "ObjectId",
-                            ValueType::I16 => "i16",
-                        };
-                        return Err(Error::at(
-                            rhs.span(),
-                            format!(
-                                "arithmetic/bitwise operator cannot be applied to '{actual}' operand"
-                            ),
-                        ));
-                    }
-                    let aop = match op {
-                        V2BinOp::Add => "+=",
-                        V2BinOp::Sub => "-=",
-                        V2BinOp::Mul => "*=",
-                        V2BinOp::Div => "/=",
-                        V2BinOp::Mod => "%=",
-                        V2BinOp::BitAnd => "&=",
-                        V2BinOp::BitOr => "|=",
-                        V2BinOp::BitXor => "^=",
-                        _ => unreachable!(),
-                    };
-                    self.line(format!("{tmp} {aop} {r_air};"));
-                    Ok((tmp, ValueType::I16))
+                    let ty = self.lower_arith_into_dest(expr, &tmp, true)?;
+                    Ok((tmp, ty))
                 }
             },
-            V2Expr::Call { span, callee, args } => {
+            V2Expr::Call {
+                span,
+                callee,
+                type_args,
+                args,
+            } => {
+                if !type_args.is_empty() {
+                    return Err(Error::at(
+                        *span,
+                        "type arguments are only supported on 'create_object::<T>', 'find_best_object::<T>', and 'objects_of::<T>'",
+                    ));
+                }
                 if let V2Expr::Ident(_, fname) = callee.as_ref() {
                     if fname == "random" {
                         if args.len() != 1 || args[0].name.is_some() {
@@ -3657,11 +6549,26 @@ impl<'a> TreeLowerer<'a> {
                 span,
                 receiver,
                 method,
+                type_args,
                 args,
             } if method == "run_functional" => {
+                if !type_args.is_empty() {
+                    return Err(Error::at(
+                        *span,
+                        "type arguments on run_functional are only valid inside 'let Some(x) = obj.run_functional::<T>(...)'",
+                    ));
+                }
                 let tmp = self.fresh("rf");
                 self.line(format!("let {tmp} = 0;"));
                 self.emit_run_functional(receiver, args, *span, Some(&tmp))?;
+                Ok((tmp, ValueType::Bool))
+            }
+            V2Expr::MethodCall { method, .. }
+                if matches!(method.as_str(), "contains" | "intersects" | "is_empty") =>
+            {
+                let tmp = self.fresh("bf");
+                self.line(format!("let {tmp} = 0;"));
+                self.emit_bool_into_local(expr, &tmp)?;
                 Ok((tmp, ValueType::Bool))
             }
             other => Err(Error::at(
@@ -3673,30 +6580,28 @@ impl<'a> TreeLowerer<'a> {
 
     fn read_lvalue(&mut self, lval: &LValue) -> Result<(String, ValueType)> {
         match lval {
-            LValue::Direct { air, ty } => Ok((air.clone(), *ty)),
+            LValue::Direct { air, ty } => Ok((air.clone(), ty.clone())),
             LValue::ForeignAttr {
                 obj_air,
                 attr_index,
+                ty,
             } => {
                 let tmp = self.fresh("fattr");
                 self.line(format!("stack_obj := {obj_air};"));
                 self.line(format!("let {tmp} = stack.attr[{attr_index}];"));
-                if self.has_self_obj_local {
-                    self.line("stack_obj := __self_obj;".to_owned());
-                }
-                Ok((tmp, ValueType::I16))
+                self.emit_restore_stack_obj();
+                Ok((tmp, ty.clone()))
             }
             LValue::ForeignData {
                 obj_air,
                 data_index,
+                ty,
             } => {
                 let tmp = self.fresh("fdata");
                 self.line(format!("stack_obj := {obj_air};"));
                 self.line(format!("let {tmp} = stack.data[{data_index}];"));
-                if self.has_self_obj_local {
-                    self.line("stack_obj := __self_obj;".to_owned());
-                }
-                Ok((tmp, ValueType::I16))
+                self.emit_restore_stack_obj();
+                Ok((tmp, ty.clone()))
             }
         }
     }
@@ -3862,7 +6767,16 @@ impl<'a> TreeLowerer<'a> {
     /// Returns `true` iff lowering `expr` emits zero setup statements and has zero side effects.
     fn is_pure_single_operand(&self, expr: &V2Expr) -> bool {
         match expr {
-            V2Expr::Int(_, _) | V2Expr::Bool(_, _) | V2Expr::Ident(_, _) => true,
+            V2Expr::Int(_, _) | V2Expr::Bool(_, _) | V2Expr::Path(_, _) => true,
+            V2Expr::Ident(_, name) => !matches!(
+                self.lookup_var(name),
+                Some(
+                    Binding::AutonomousFlag
+                        | Binding::MutRef {
+                            target: LValue::ForeignAttr { .. } | LValue::ForeignData { .. }
+                        }
+                )
+            ),
             V2Expr::Unary {
                 op: V2UnaryOp::Neg,
                 inner,
@@ -3887,16 +6801,21 @@ impl<'a> TreeLowerer<'a> {
                 }
                 _ => false,
             },
-            V2Expr::Index { base, .. } => match base.as_ref() {
-                V2Expr::Ident(_, bname) => matches!(bname.as_str(), "temp" | "global"),
-                V2Expr::Field { base: root, .. } => {
-                    matches!(
-                        root.as_ref(),
-                        V2Expr::Ident(_, rname) if self.is_self_ident(rname) || self.is_sim_ident(rname)
-                    )
+            V2Expr::Index { base, index, .. } => {
+                if self.eval_const_i16(index).is_err() {
+                    return false;
                 }
-                _ => false,
-            },
+                match base.as_ref() {
+                    V2Expr::Ident(_, bname) => matches!(bname.as_str(), "temp" | "global"),
+                    V2Expr::Field { base: root, .. } => {
+                        matches!(
+                            root.as_ref(),
+                            V2Expr::Ident(_, rname) if self.is_self_ident(rname) || self.is_sim_ident(rname)
+                        )
+                    }
+                    _ => false,
+                }
+            }
             _ => false,
         }
     }
@@ -3906,6 +6825,11 @@ impl<'a> TreeLowerer<'a> {
     fn is_pure_simple_air_cond(&self, expr: &V2Expr) -> bool {
         match expr {
             V2Expr::Bool(_, _) => true,
+            V2Expr::Ident(_, name)
+                if matches!(self.lookup_var(name), Some(Binding::AutonomousFlag)) =>
+            {
+                true
+            }
             V2Expr::Unary {
                 op: V2UnaryOp::Not,
                 inner,
@@ -3923,22 +6847,187 @@ impl<'a> TreeLowerer<'a> {
                 }
                 _ => false,
             },
+            V2Expr::MethodCall {
+                receiver,
+                method,
+                args,
+                ..
+            } if method == "is_empty" && args.is_empty() => self.is_pure_single_operand(receiver),
             V2Expr::Call { .. } | V2Expr::MethodCall { .. } => false,
             _ => self.is_pure_single_operand(expr),
         }
     }
 
-    fn lower_cmp_operands(&mut self, lhs: &V2Expr, rhs: &V2Expr) -> Result<(String, String)> {
-        let (l, _) = self.lower_value_expr(lhs)?;
-        if self.is_pure_single_operand(rhs) {
-            let (r, _) = self.lower_value_expr(rhs)?;
-            Ok((l, r))
+    fn lower_cmp_operands(
+        &mut self,
+        lhs: &V2Expr,
+        op: V2BinOp,
+        rhs: &V2Expr,
+        span: Span,
+    ) -> Result<(String, String)> {
+        let (l, l_ty) = self.lower_value_expr(lhs)?;
+        if op == V2BinOp::FlagTest
+            && let ValueType::Bitflags(ref key) = l_ty
+        {
+            let Some((_, Some(bit))) = self.try_eval_const_bitflag(rhs, key)? else {
+                return Err(Error::at(
+                    rhs.span(),
+                    format!(
+                        "'flag_test' on bitflags '{}' requires a single flag constant (use '.contains(...)' for masks)",
+                        self.env.display_value_type(&l_ty)
+                    ),
+                ));
+            };
+            return Ok((l, bit.to_string()));
+        }
+        let (l_eff, r, r_ty) = if self.is_pure_single_operand(rhs) {
+            let (r, r_ty) = self.lower_value_expr(rhs)?;
+            (l, r, r_ty)
         } else {
             let snap_l = self.fresh("cmp_l");
             self.line(format!("let {snap_l} = {l};"));
-            let (r, _) = self.lower_value_expr(rhs)?;
-            Ok((snap_l, r))
+            let (r, r_ty) = self.lower_value_expr(rhs)?;
+            (snap_l, r, r_ty)
+        };
+        match op {
+            V2BinOp::Eq | V2BinOp::Ne => {
+                if !types_compatible_for_assign(&l_ty, &r_ty)
+                    && !types_compatible_for_assign(&r_ty, &l_ty)
+                {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "cannot compare '{}' with '{}'",
+                            self.env.display_value_type(&l_ty),
+                            self.env.display_value_type(&r_ty)
+                        ),
+                    ));
+                }
+            }
+            V2BinOp::Lt | V2BinOp::Le | V2BinOp::Gt | V2BinOp::Ge => {
+                if !matches!(l_ty, ValueType::I16 | ValueType::ObjectId)
+                    || !matches!(r_ty, ValueType::I16 | ValueType::ObjectId)
+                {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "ordering comparison is not supported between '{}' and '{}'",
+                            self.env.display_value_type(&l_ty),
+                            self.env.display_value_type(&r_ty)
+                        ),
+                    ));
+                }
+            }
+            V2BinOp::FlagTest if l_ty != ValueType::I16 || r_ty != ValueType::I16 => {
+                return Err(Error::at(
+                    span,
+                    format!(
+                        "'flag_test' requires matching bitflags or i16 operands, found '{}' and '{}'",
+                        self.env.display_value_type(&l_ty),
+                        self.env.display_value_type(&r_ty)
+                    ),
+                ));
+            }
+            _ => {}
         }
+        Ok((l_eff, r))
+    }
+
+    fn lower_bitflag_predicate(
+        &mut self,
+        receiver: &V2Expr,
+        method: &str,
+        args: &[CallArg],
+        span: Span,
+        negated: bool,
+    ) -> Result<String> {
+        let derefed = self.maybe_auto_deref_mut_ref(receiver);
+        let (lhs_air, lhs_ty) = self.lower_value_expr(derefed.as_ref().unwrap_or(receiver))?;
+        let ValueType::Bitflags(key) = lhs_ty else {
+            return Err(Error::at(
+                span,
+                format!(
+                    "'.{method}(...)' requires a bitflags receiver, found '{}'",
+                    self.env.display_value_type(&lhs_ty)
+                ),
+            ));
+        };
+        if method == "is_empty" {
+            if !args.is_empty() {
+                return Err(Error::at(span, "'.is_empty()' takes no arguments"));
+            }
+            return Ok(if negated {
+                format!("{lhs_air} != 0")
+            } else {
+                format!("{lhs_air} == 0")
+            });
+        }
+        if args.len() != 1 || args[0].name.is_some() {
+            return Err(Error::at(
+                span,
+                format!("'.{method}(flag)' expects exactly 1 positional argument"),
+            ));
+        }
+        if let Some((mask, single_bit)) = self.try_eval_const_bitflag(&args[0].value, &key)? {
+            if let Some(bit) = single_bit {
+                return Ok(if negated {
+                    format!("!{lhs_air} flag_test {bit}")
+                } else {
+                    format!("{lhs_air} flag_test {bit}")
+                });
+            }
+            if mask == 0 {
+                let res = method == "contains";
+                let effective = if negated { !res } else { res };
+                return Ok(if effective { "1 == 1" } else { "1 == 0" }.to_owned());
+            }
+            let tmp = self.fresh("bf_tst");
+            self.line(format!("let {tmp} = {lhs_air};"));
+            self.line(format!("{tmp} &= {mask};"));
+            return Ok(if method == "contains" {
+                if negated {
+                    format!("{tmp} != {mask}")
+                } else {
+                    format!("{tmp} == {mask}")
+                }
+            } else if negated {
+                format!("{tmp} == 0")
+            } else {
+                format!("{tmp} != 0")
+            });
+        }
+        let lhs_snap = if self.is_pure_single_operand(&args[0].value) {
+            lhs_air
+        } else {
+            let s = self.fresh("bf_lhs");
+            self.line(format!("let {s} = {lhs_air};"));
+            s
+        };
+        let (rhs_air, rhs_ty) = self.lower_value_expr(&args[0].value)?;
+        if rhs_ty != ValueType::Bitflags(key.clone()) {
+            return Err(Error::at(
+                args[0].span,
+                format!(
+                    "type mismatch in '.{method}(...)': expected '{}', found '{}'",
+                    self.env.display_value_type(&ValueType::Bitflags(key)),
+                    self.env.display_value_type(&rhs_ty)
+                ),
+            ));
+        }
+        let tmp = self.fresh("bf_tst");
+        self.line(format!("let {tmp} = {lhs_snap};"));
+        self.line(format!("{tmp} &= {rhs_air};"));
+        Ok(if method == "contains" {
+            if negated {
+                format!("{tmp} != {rhs_air}")
+            } else {
+                format!("{tmp} == {rhs_air}")
+            }
+        } else if negated {
+            format!("{tmp} == 0")
+        } else {
+            format!("{tmp} != 0")
+        })
     }
 
     /// Tries to lower a boolean condition into a single `.air` `Condition` string (no `&&`/`||`).
@@ -3946,6 +7035,11 @@ impl<'a> TreeLowerer<'a> {
         match expr {
             V2Expr::Bool(_, true) => Ok(Some("1 == 1".to_owned())),
             V2Expr::Bool(_, false) => Ok(Some("1 == 0".to_owned())),
+            V2Expr::Ident(_, name)
+                if matches!(self.lookup_var(name), Some(Binding::AutonomousFlag)) =>
+            {
+                Ok(Some("param[0] == 1".to_owned()))
+            }
             V2Expr::Unary {
                 op: V2UnaryOp::Not,
                 inner,
@@ -3956,7 +7050,7 @@ impl<'a> TreeLowerer<'a> {
                 }
                 Ok(None)
             }
-            V2Expr::Binary { lhs, op, rhs, .. } => match op {
+            V2Expr::Binary { span, lhs, op, rhs } => match op {
                 V2BinOp::And | V2BinOp::Or => Ok(None),
                 V2BinOp::Eq
                 | V2BinOp::Ne
@@ -3965,7 +7059,7 @@ impl<'a> TreeLowerer<'a> {
                 | V2BinOp::Gt
                 | V2BinOp::Ge
                 | V2BinOp::FlagTest => {
-                    let (l, r) = self.lower_cmp_operands(lhs, rhs)?;
+                    let (l, r) = self.lower_cmp_operands(lhs, *op, rhs, *span)?;
                     let sym = cmp_op_str(*op);
                     Ok(Some(format!("{l} {sym} {r}")))
                 }
@@ -3974,7 +7068,15 @@ impl<'a> TreeLowerer<'a> {
                     "arithmetic expression cannot be used directly as a boolean condition",
                 )),
             },
-            V2Expr::Call { span, callee, args } => {
+            V2Expr::Call {
+                span,
+                callee,
+                type_args,
+                args,
+            } => {
+                if !type_args.is_empty() {
+                    return Ok(None);
+                }
                 if let V2Expr::Ident(_, fname) = callee.as_ref() {
                     match fname.as_str() {
                         "can_afford" => {
@@ -3997,6 +7099,23 @@ impl<'a> TreeLowerer<'a> {
                 Ok(None)
             }
             V2Expr::MethodCall { method, .. } if method == "run_functional" => Ok(None),
+            V2Expr::MethodCall {
+                span,
+                receiver,
+                method,
+                type_args,
+                args,
+            } if matches!(method.as_str(), "contains" | "intersects" | "is_empty") => {
+                if !type_args.is_empty() {
+                    return Err(Error::at(
+                        *span,
+                        format!("'.{method}()' does not accept type arguments"),
+                    ));
+                }
+                Ok(Some(self.lower_bitflag_predicate(
+                    receiver, method, args, *span, false,
+                )?))
+            }
             _ => {
                 let (val, ty) = self.lower_value_expr(expr)?;
                 if ty != ValueType::Bool {
@@ -4014,39 +7133,44 @@ impl<'a> TreeLowerer<'a> {
         match expr {
             V2Expr::Bool(_, true) => Ok(Some("1 == 0".to_owned())),
             V2Expr::Bool(_, false) => Ok(Some("1 == 1".to_owned())),
+            V2Expr::Ident(_, name)
+                if matches!(self.lookup_var(name), Some(Binding::AutonomousFlag)) =>
+            {
+                Ok(Some("param[0] != 1".to_owned()))
+            }
             V2Expr::Unary {
                 op: V2UnaryOp::Not,
                 inner,
                 ..
             } => self.try_lower_simple_air_cond(inner),
-            V2Expr::Binary { lhs, op, rhs, .. } => match op {
+            V2Expr::Binary { span, lhs, op, rhs } => match op {
                 V2BinOp::And | V2BinOp::Or => Ok(None),
                 V2BinOp::Eq => {
-                    let (l, r) = self.lower_cmp_operands(lhs, rhs)?;
+                    let (l, r) = self.lower_cmp_operands(lhs, *op, rhs, *span)?;
                     Ok(Some(format!("{l} != {r}")))
                 }
                 V2BinOp::Ne => {
-                    let (l, r) = self.lower_cmp_operands(lhs, rhs)?;
+                    let (l, r) = self.lower_cmp_operands(lhs, *op, rhs, *span)?;
                     Ok(Some(format!("{l} == {r}")))
                 }
                 V2BinOp::Lt => {
-                    let (l, r) = self.lower_cmp_operands(lhs, rhs)?;
+                    let (l, r) = self.lower_cmp_operands(lhs, *op, rhs, *span)?;
                     Ok(Some(format!("{l} >= {r}")))
                 }
                 V2BinOp::Le => {
-                    let (l, r) = self.lower_cmp_operands(lhs, rhs)?;
+                    let (l, r) = self.lower_cmp_operands(lhs, *op, rhs, *span)?;
                     Ok(Some(format!("{l} > {r}")))
                 }
                 V2BinOp::Gt => {
-                    let (l, r) = self.lower_cmp_operands(lhs, rhs)?;
+                    let (l, r) = self.lower_cmp_operands(lhs, *op, rhs, *span)?;
                     Ok(Some(format!("{l} <= {r}")))
                 }
                 V2BinOp::Ge => {
-                    let (l, r) = self.lower_cmp_operands(lhs, rhs)?;
+                    let (l, r) = self.lower_cmp_operands(lhs, *op, rhs, *span)?;
                     Ok(Some(format!("{l} < {r}")))
                 }
                 V2BinOp::FlagTest => {
-                    let (l, r) = self.lower_cmp_operands(lhs, rhs)?;
+                    let (l, r) = self.lower_cmp_operands(lhs, *op, rhs, *span)?;
                     Ok(Some(format!("!{l} flag_test {r}")))
                 }
                 _ => Err(Error::at(
@@ -4061,6 +7185,23 @@ impl<'a> TreeLowerer<'a> {
                 Ok(None)
             }
             V2Expr::MethodCall { method, .. } if method == "run_functional" => Ok(None),
+            V2Expr::MethodCall {
+                span,
+                receiver,
+                method,
+                type_args,
+                args,
+            } if matches!(method.as_str(), "contains" | "intersects" | "is_empty") => {
+                if !type_args.is_empty() {
+                    return Err(Error::at(
+                        *span,
+                        format!("'.{method}()' does not accept type arguments"),
+                    ));
+                }
+                Ok(Some(self.lower_bitflag_predicate(
+                    receiver, method, args, *span, true,
+                )?))
+            }
             _ => {
                 let (val, ty) = self.lower_value_expr(expr)?;
                 if ty != ValueType::Bool {
@@ -4145,11 +7286,29 @@ impl<'a> TreeLowerer<'a> {
                 span,
                 receiver,
                 method,
+                type_args,
                 args,
             } if method == "run_functional" => {
+                if !type_args.is_empty() {
+                    return Err(Error::at(
+                        *span,
+                        "type arguments on run_functional are only valid inside 'let Some(x) = obj.run_functional::<T>(...)'",
+                    ));
+                }
                 self.emit_run_functional(receiver, args, *span, Some(dst_local))
             }
-            V2Expr::Call { span, callee, args } => {
+            V2Expr::Call {
+                span,
+                callee,
+                type_args,
+                args,
+            } => {
+                if !type_args.is_empty() {
+                    return Err(Error::at(
+                        *span,
+                        "type arguments are only supported on 'create_object::<T>', 'find_best_object::<T>', and 'objects_of::<T>'",
+                    ));
+                }
                 if let Some(simple) = self.try_lower_simple_air_cond(expr)? {
                     self.line(format!("if {simple} {{"));
                     self.indent += 1;
@@ -4176,15 +7335,11 @@ impl<'a> TreeLowerer<'a> {
                             )
                         })?;
                     if vty != ValueType::Bool {
-                        let actual = match vty {
-                            ValueType::I16 => "i16",
-                            ValueType::ObjectId => "ObjectId",
-                            ValueType::Bool => "bool",
-                        };
+                        let actual = self.env.display_value_type(&vty);
                         return Err(Error::at(
                             *span,
                             format!(
-                                "helper function '{fname}' returns '{actual}' and cannot be used directly as a bool condition (use an explicit comparison like '{fname}(...) != 0')"
+                                "helper function '{fname}' returns '{actual}' and cannot be used directly as a bool condition (use an explicit comparison)"
                             ),
                         ));
                     }
@@ -4523,7 +7678,12 @@ impl<'a> TreeLowerer<'a> {
         Ok(out)
     }
 
-    fn format_find_best_object(&self, args: &[CallArg], span: Span) -> Result<String> {
+    fn parse_find_best_object(
+        &self,
+        type_args: &[V2Type],
+        args: &[CallArg],
+        span: Span,
+    ) -> Result<FindBestObjectPlan> {
         if args.is_empty() {
             return Err(Error::at(
                 span,
@@ -4537,11 +7697,47 @@ impl<'a> TreeLowerer<'a> {
             ));
         };
         let _ = functional_kind_info(kind_name, *kspan)?;
-        let mut flags: Option<u8> = None;
+        let typed_schema = if type_args.is_empty() {
+            None
+        } else if type_args.len() == 1 {
+            let V2Type::Named(ref obj_name) = type_args[0] else {
+                return Err(Error::at(
+                    span,
+                    "find_best_object::<T>() expects an imported object type name",
+                ));
+            };
+            let schema = self
+                .env
+                .lookup_object_schema(&self.owner_module, obj_name, self.in_object_scope)
+                .ok_or_else(|| {
+                    Error::at(
+                        span,
+                        format!(
+                            "unknown object type '{obj_name}' in 'find_best_object::<{obj_name}>({kind_name})'"
+                        ),
+                    )
+                })?;
+            if !schema.functionals.contains_key(kind_name) {
+                return Err(Error::at(
+                    *kspan,
+                    format!(
+                        "object '{}' does not declare 'functional {kind_name}'",
+                        schema.display_name
+                    ),
+                ));
+            }
+            Some(schema.clone())
+        } else {
+            return Err(Error::at(
+                span,
+                "find_best_object::<T>() accepts at most 1 type argument",
+            ));
+        };
+        let mut flags_opt: Option<u8> = None;
         for arg in &args[1..] {
             if arg.name.as_deref() == Some("flags") || arg.name.is_none() {
                 let f = self.eval_const_i16(&arg.value)?;
-                flags = Some(
+                flags_opt = Some(
                     u8::try_from(f)
                         .map_err(|_| Error::at(arg.span, format!("flags {f} out of u8 range")))?,
                 );
@@ -4555,30 +7751,83 @@ impl<'a> TreeLowerer<'a> {
                 ));
             }
         }
-        Ok(match flags {
+        let flags = flags_opt.unwrap_or(0);
+        if typed_schema.is_some() && (flags & 0x0b) != 0 {
+            return Err(Error::at(
+                span,
+                format!(
+                    "typed find_best_object::<T>() does not support indoor/outdoor or custom-origin flags ({flags:#04x}); use default flags (0) or same-room (4)"
+                ),
+            ));
+        }
+        let prim_air = match flags_opt {
             Some(f) => format!("find_best_object({kind_name}, flags: {f})"),
             None => format!("find_best_object({kind_name})"),
+        };
+        Ok(FindBestObjectPlan {
+            kind_name: kind_name.clone(),
+            flags,
+            prim_air,
+            typed_schema,
         })
     }
 
-    fn format_create_object(&self, args: &[CallArg], span: Span) -> Result<String> {
-        if args.is_empty() {
-            return Err(Error::at(
-                span,
-                "create_object(guid [, mode: ..., flags: ...]) requires a GUID",
-            ));
-        }
-        let V2Expr::Int(gspan, gval) = args[0].value else {
-            return Err(Error::at(
-                args[0].span,
-                "create_object() requires an integer GUID literal",
-            ));
+    fn format_create_object(
+        &self,
+        type_args: &[V2Type],
+        args: &[CallArg],
+        span: Span,
+    ) -> Result<(String, ValueType)> {
+        let is_typed = !type_args.is_empty();
+        let (guid, result_ty, opt_args) = if is_typed {
+            if type_args.len() != 1 {
+                return Err(Error::at(
+                    span,
+                    "create_object::<T>() expects exactly 1 object type argument",
+                ));
+            }
+            let V2Type::Named(ref obj_name) = type_args[0] else {
+                return Err(Error::at(
+                    span,
+                    "create_object::<T>() expects an imported object type name",
+                ));
+            };
+            let schema = self
+                .env
+                .lookup_object_schema(&self.owner_module, obj_name, self.in_object_scope)
+                .ok_or_else(|| {
+                    Error::at(
+                        span,
+                        format!(
+                            "unknown object type '{obj_name}' in 'create_object::<{obj_name}>(...)'"
+                        ),
+                    )
+                })?;
+            (
+                schema.master_guid,
+                ValueType::ObjectRef(schema.canonical_key.clone()),
+                args,
+            )
+        } else {
+            if args.is_empty() {
+                return Err(Error::at(
+                    span,
+                    "create_object(guid [, mode: ..., flags: ...]) requires a GUID or type argument 'create_object::<T>(...)'",
+                ));
+            }
+            let V2Expr::Int(gspan, gval) = args[0].value else {
+                return Err(Error::at(
+                    args[0].span,
+                    "create_object() requires an integer GUID literal or 'create_object::<ObjectType>(...)'",
+                ));
+            };
+            let guid = u32::try_from(gval)
+                .map_err(|_| Error::at(gspan, format!("GUID {gval} out of u32 range")))?;
+            (guid, ValueType::ObjectId, &args[1..])
         };
-        let guid = u32::try_from(gval)
-            .map_err(|_| Error::at(gspan, format!("GUID {gval} out of u32 range")))?;
         let mut mode = "here".to_owned();
         let mut flags = 0u8;
-        for arg in &args[1..] {
+        for arg in opt_args {
             match arg.name.as_deref() {
                 Some("mode") => match &arg.value {
                     V2Expr::Ident(_, m) => mode = m.clone(),
@@ -4609,8 +7858,15 @@ impl<'a> TreeLowerer<'a> {
                 }
             }
         }
-        Ok(format!(
-            "create_object({guid:#010x}, mode: {mode}, flags: {flags:#04x})"
+        if is_typed && (flags & 0x04) != 0 {
+            return Err(Error::at(
+                span,
+                "create_object::<T>() cannot set FROM_RECORD flag (0x04), which overrides T's GUID from a neighbor record at runtime; use untyped create_object(0, ..., flags: 0x04)",
+            ));
+        }
+        Ok((
+            format!("create_object({guid:#010x}, mode: {mode}, flags: {flags:#04x})"),
+            result_ty,
         ))
     }
 
@@ -4655,42 +7911,149 @@ impl<'a> TreeLowerer<'a> {
         Ok(format!("set_motive_change({m}, {delta_arg}, {stop})"))
     }
 
-    fn format_dialog(&self, args: &[CallArg], span: Span) -> Result<String> {
-        let mut parts = Vec::new();
+    fn resolve_dialog_str_arg(&self, expr: &V2Expr, field: &str, span: Span) -> Result<String> {
+        match expr {
+            V2Expr::Str(sspan, text) => {
+                let interned = self.env.dialog_strings.borrow_mut().intern(text, *sspan)?;
+                Ok(format!("{field}: str.{interned}"))
+            }
+            V2Expr::Ident(ispan, sname) => {
+                if !self.env.string_names.contains_key(sname) {
+                    return Err(Error::at(
+                        *ispan,
+                        format!(
+                            "unknown string entry '{sname}' (declare it in 'strings {{ ... }}' or pass an inline string literal \"...\")"
+                        ),
+                    ));
+                }
+                Ok(format!("{field}: str.{sname}"))
+            }
+            V2Expr::Int(_, n) => Ok(format!("{field}: {n}")),
+            _ => Err(Error::at(span, format!("invalid dialog {field}"))),
+        }
+    }
+
+    fn parse_dialog_options(
+        &self,
+        args: &[CallArg],
+        span: Span,
+        for_match: bool,
+    ) -> Result<ParsedDialogOptions> {
+        let mut kind_num: Option<u8> = None;
+        let mut effective_flags: u8 = 0;
+        let mut explicit_temp_specified = false;
+        let mut button_count: usize = 0;
+        let mut buttons_tuple_len: Option<usize> = None;
+        let mut saw_buttons_tuple = false;
+        let mut saw_explicit_button = false;
+
         for arg in args {
             let Some(k) = arg.name.as_deref() else {
                 return Err(Error::at(arg.span, "dialog() arguments must be named"));
             };
-            let formatted = match k {
+            match k {
                 "kind" => match &arg.value {
-                    V2Expr::Ident(_, s) => format!("kind: {s}"),
-                    V2Expr::Int(_, n) => format!("kind: {n}"),
-                    _ => return Err(Error::at(arg.span, "invalid dialog kind")),
-                },
-                "title" | "message" | "text" | "button1" | "button2" | "button3" | "mode4_str" => {
-                    match &arg.value {
-                        V2Expr::Ident(ispan, sname) => {
-                            if !self.env.string_names.contains_key(sname) {
+                    V2Expr::Ident(_, s) => {
+                        kind_num = Some(match s.as_str() {
+                            "ok" | "message" => 0,
+                            "yes_no" => 1,
+                            "yes_no_cancel" | "three_choice" => 2,
+                            "text_entry" => 3,
+                            "icon" => 4,
+                            other => {
                                 return Err(Error::at(
-                                    *ispan,
-                                    format!(
-                                        "unknown string entry '{sname}' (declare it in 'strings {{ ... }}')"
-                                    ),
+                                    arg.span,
+                                    format!("unknown dialog kind '{other}'"),
                                 ));
                             }
-                            format!("{k}: str.{sname}")
-                        }
-                        V2Expr::Int(_, n) => format!("{k}: {n}"),
-                        _ => return Err(Error::at(arg.span, format!("invalid dialog {k}"))),
+                        });
+                    }
+                    V2Expr::Int(_, n) => {
+                        let kn = u8::try_from(*n).map_err(|_| {
+                            Error::at(arg.span, format!("dialog kind {n} out of u8 range"))
+                        })?;
+                        kind_num = Some(kn);
+                    }
+                    _ => return Err(Error::at(arg.span, "invalid dialog kind")),
+                },
+                "title" | "message" | "text" | "mode4_str" => {}
+                "button1" | "button2" | "button3" => {
+                    if saw_buttons_tuple {
+                        return Err(Error::at(
+                            arg.span,
+                            "cannot combine 'buttons: (...)' with explicit 'button1'/'button2'/'button3'",
+                        ));
+                    }
+                    saw_explicit_button = true;
+                    let idx = match k {
+                        "button1" => 1,
+                        "button2" => 2,
+                        _ => 3,
+                    };
+                    button_count = button_count.max(idx);
+                }
+                "buttons" => {
+                    if saw_explicit_button || saw_buttons_tuple {
+                        return Err(Error::at(
+                            arg.span,
+                            "duplicate 'buttons:' or conflict with 'button1'/'button2'/'button3'",
+                        ));
+                    }
+                    saw_buttons_tuple = true;
+                    let V2Expr::Tuple(tspan, elems) = &arg.value else {
+                        return Err(Error::at(
+                            arg.span,
+                            "dialog 'buttons:' expects a tuple of 1 to 3 strings, e.g. buttons: (\"Yes\", \"No\")",
+                        ));
+                    };
+                    if elems.is_empty() || elems.len() > 3 {
+                        return Err(Error::at(
+                            *tspan,
+                            format!(
+                                "dialog 'buttons:' tuple must have 1 to 3 entries, found {}",
+                                elems.len()
+                            ),
+                        ));
+                    }
+                    buttons_tuple_len = Some(elems.len());
+                    button_count = elems.len();
+                }
+                "flags" => {
+                    let n = self.eval_const_i16(&arg.value)?;
+                    let raw = u8::try_from(n).map_err(|_| {
+                        Error::at(arg.span, format!("dialog flags {n} out of u8 range"))
+                    })?;
+                    effective_flags |= raw;
+                    if (raw & 0x70) != 0 {
+                        explicit_temp_specified = true;
                     }
                 }
-                "temp" | "icon_mode" | "flags" => {
-                    let n = self.eval_const_i16(&arg.value)?;
-                    format!("{k}: {n}")
+                "inform" => {
+                    if self.eval_const_bool_required(&arg.value, arg.span)? {
+                        effective_flags |= 1;
+                    }
                 }
-                "inform" | "non_modal" => {
-                    let b = self.eval_const_bool_required(&arg.value, arg.span)?;
-                    format!("{k}: {b}")
+                "non_modal" => {
+                    if self.eval_const_bool_required(&arg.value, arg.span)? {
+                        effective_flags |= 0x80;
+                    }
+                }
+                "icon_mode" => {
+                    let n = self.eval_const_i16(&arg.value)?;
+                    let mode = u8::try_from(n)
+                        .ok()
+                        .filter(|&m| m <= 7)
+                        .ok_or_else(|| Error::at(arg.span, "dialog icon_mode must be in 0..=7"))?;
+                    effective_flags = (effective_flags & !(7 << 1)) | (mode << 1);
+                }
+                "temp" => {
+                    let n = self.eval_const_i16(&arg.value)?;
+                    let t = u8::try_from(n)
+                        .ok()
+                        .filter(|&m| m <= 7)
+                        .ok_or_else(|| Error::at(arg.span, "dialog temp must be in 0..=7"))?;
+                    effective_flags = (effective_flags & !(7 << 4)) | (t << 4);
+                    explicit_temp_specified = true;
                 }
                 other => {
                     return Err(Error::at(
@@ -4698,11 +8061,208 @@ impl<'a> TreeLowerer<'a> {
                         format!("unknown dialog() argument '{other}'"),
                     ));
                 }
-            };
-            parts.push(formatted);
+            }
         }
-        let _ = span;
+
+        if !for_match && let Some(tuple_len) = buttons_tuple_len {
+            let eff_kind = kind_num.unwrap_or(0) & 0x7f;
+            let expected = match eff_kind {
+                0 => Some((1, "'ok'")),
+                1 => Some((2, "'yes_no'")),
+                2 => Some((3, "'yes_no_cancel'")),
+                3 => Some((1, "'text_entry'")),
+                4 => Some((1, "'icon'")),
+                _ => None,
+            };
+            match expected {
+                Some((exp, label)) if tuple_len != exp => {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "dialog 'buttons:' tuple has {tuple_len} entries, but {label} dialog requires exactly {exp}"
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "dialog kind {eff_kind} does not accept custom 'buttons:' tuple labels"
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(ParsedDialogOptions {
+            kind_num,
+            effective_flags,
+            effective_temp_slot: (effective_flags >> 4) & 7,
+            explicit_temp_specified,
+            button_count,
+            buttons_tuple_len,
+        })
+    }
+
+    fn format_dialog(&self, args: &[CallArg], span: Span) -> Result<String> {
+        let _opts = self.parse_dialog_options(args, span, false)?;
+        let mut parts = Vec::new();
+        for arg in args {
+            let Some(k) = arg.name.as_deref() else {
+                return Err(Error::at(arg.span, "dialog() arguments must be named"));
+            };
+            match k {
+                "kind" => match &arg.value {
+                    V2Expr::Ident(_, s) => parts.push(format!("kind: {s}")),
+                    V2Expr::Int(_, n) => parts.push(format!("kind: {n}")),
+                    _ => return Err(Error::at(arg.span, "invalid dialog kind")),
+                },
+                "title" | "message" | "text" | "mode4_str" | "button1" | "button2" | "button3" => {
+                    parts.push(self.resolve_dialog_str_arg(&arg.value, k, arg.span)?);
+                }
+                "buttons" => {
+                    let V2Expr::Tuple(_, elems) = &arg.value else {
+                        unreachable!("validated in parse_dialog_options");
+                    };
+                    let btn_fields = ["button1", "button2", "button3"];
+                    for (idx, elem) in elems.iter().enumerate() {
+                        parts.push(self.resolve_dialog_str_arg(
+                            elem,
+                            btn_fields[idx],
+                            elem.span(),
+                        )?);
+                    }
+                }
+                "temp" | "icon_mode" | "flags" => {
+                    let n = self.eval_const_i16(&arg.value)?;
+                    parts.push(format!("{k}: {n}"));
+                }
+                "inform" | "non_modal" => {
+                    let b = self.eval_const_bool_required(&arg.value, arg.span)?;
+                    parts.push(format!("{k}: {b}"));
+                }
+                other => {
+                    return Err(Error::at(
+                        arg.span,
+                        format!("unknown dialog() argument '{other}'"),
+                    ));
+                }
+            }
+        }
         Ok(format!("dialog({})", parts.join(", ")))
+    }
+}
+
+struct FindBestObjectPlan {
+    kind_name: String,
+    flags: u8,
+    prim_air: String,
+    typed_schema: Option<ResolvedObjectSchema>,
+}
+
+struct ParsedDialogOptions {
+    kind_num: Option<u8>,
+    effective_flags: u8,
+    effective_temp_slot: u8,
+    explicit_temp_specified: bool,
+    button_count: usize,
+    buttons_tuple_len: Option<usize>,
+}
+
+/// Normalizes `.air` operand spellings to their canonical SimAntics VM storage cell so alias
+/// analysis treats `self.prep_score` (`stack.prep_score`) and `self.data[31]` (`stack.data[31]`)
+/// as the exact same cell.
+fn canonical_air_cell(air: &str) -> String {
+    if let Some((prefix, rest)) = air.split_once('.')
+        && matches!(prefix, "my" | "stack")
+    {
+        match rest {
+            "id" => return format!("{prefix}.data[11]"),
+            "in_use" => return format!("{prefix}.data[25]"),
+            "room" => return format!("{prefix}.data[29]"),
+            "prep_score" => return format!("{prefix}.data[31]"),
+            "cook_score" => return format!("{prefix}.data[32]"),
+            "priority" => return format!("{prefix}.person[33]"),
+            _ => {}
+        }
+        if let Some(mname) = rest.strip_prefix("motive.")
+            && let Some(id) = motive_by_name(mname)
+        {
+            return format!("{prefix}.motive[{id}]");
+        }
+        if let Some(sname) = rest.strip_prefix("skill.")
+            && let Some(id) = skill_by_name(sname)
+        {
+            return format!("{prefix}.person[{id}]");
+        }
+        if let Some(pname) = rest.strip_prefix("person.")
+            && let Some(id) = person_field_by_name(pname)
+        {
+            return format!("{prefix}.person[{id}]");
+        }
+    }
+    air.to_owned()
+}
+
+fn person_field_by_name(name: &str) -> Option<u8> {
+    match name {
+        "cooking" => Some(9),
+        "charisma" => Some(10),
+        "mechanical" | "mechanic" => Some(11),
+        "creativity" => Some(14),
+        "body" => Some(15),
+        "logic" => Some(16),
+        "priority" => Some(33),
+        _ => None,
+    }
+}
+
+fn is_arith_or_bit_binop(op: V2BinOp) -> bool {
+    matches!(
+        op,
+        V2BinOp::Add
+            | V2BinOp::Sub
+            | V2BinOp::Mul
+            | V2BinOp::Div
+            | V2BinOp::Mod
+            | V2BinOp::BitAnd
+            | V2BinOp::BitOr
+            | V2BinOp::BitXor
+    )
+}
+
+fn is_compound_arith_or_neg(expr: &V2Expr) -> bool {
+    match expr {
+        V2Expr::Binary { op, .. } => is_arith_or_bit_binop(*op),
+        V2Expr::Unary {
+            op: V2UnaryOp::Neg,
+            inner,
+            ..
+        } => !matches!(inner.as_ref(), V2Expr::Int(_, _)),
+        _ => false,
+    }
+}
+
+fn flatten_arith_chain(expr: &V2Expr) -> (&V2Expr, Vec<(V2BinOp, &V2Expr)>) {
+    let mut ops = Vec::new();
+    let mut cur = expr;
+    while let V2Expr::Binary { lhs, op, rhs, .. } = cur
+        && is_arith_or_bit_binop(*op)
+    {
+        ops.push((*op, rhs.as_ref()));
+        cur = lhs.as_ref();
+    }
+    ops.reverse();
+    (cur, ops)
+}
+
+fn single_bit_of_mask(mask: i16) -> Option<u8> {
+    let bits = mask as u16;
+    if bits != 0 && (bits & (bits - 1)) == 0 {
+        Some((bits.trailing_zeros() as u8) + 1)
+    } else {
+        None
     }
 }
 
@@ -4839,10 +8399,6 @@ fn expr_starts_with_not_self_field(expr: &V2Expr, field_name: &str) -> bool {
     }
 }
 
-fn ends_with_unconditional_return(stmts: &[V2Stmt]) -> bool {
-    matches!(stmts.last(), Some(V2Stmt::Return { .. }))
-}
-
 fn stmts_mutate_or_borrow_ident(stmts: &[V2Stmt], target_name: &str) -> bool {
     stmts.iter().any(|s| match s {
         V2Stmt::Let { name, init, .. } => {
@@ -4891,6 +8447,14 @@ fn stmts_mutate_or_borrow_ident(stmts: &[V2Stmt], target_name: &str) -> bool {
                 || stmts_mutate_or_borrow_ident(then_body, target_name)
                 || stmts_mutate_or_borrow_ident(else_body, target_name)
         }
+        V2Stmt::Match {
+            scrutinee, arms, ..
+        } => {
+            expr_borrows_ident(scrutinee, target_name)
+                || arms
+                    .iter()
+                    .any(|a| stmts_mutate_or_borrow_ident(&a.body, target_name))
+        }
         V2Stmt::Return { value: Some(e), .. } | V2Stmt::Expr { expr: e, .. } => {
             expr_borrows_ident(e, target_name)
         }
@@ -4916,14 +8480,22 @@ fn expr_borrows_ident(expr: &V2Expr, target_name: &str) -> bool {
         V2Expr::Binary { lhs, rhs, .. } => {
             expr_borrows_ident(lhs, target_name) || expr_borrows_ident(rhs, target_name)
         }
+        V2Expr::Tuple(_, elems) => elems.iter().any(|e| expr_borrows_ident(e, target_name)),
         V2Expr::Call { callee, args, .. } => {
             expr_borrows_ident(callee, target_name)
                 || args
                     .iter()
                     .any(|a| expr_borrows_ident(&a.value, target_name))
         }
-        V2Expr::MethodCall { receiver, args, .. } => {
-            expr_borrows_ident(receiver, target_name)
+        V2Expr::MethodCall {
+            receiver,
+            method,
+            args,
+            ..
+        } => {
+            (matches!(method.as_str(), "set" | "clear")
+                && matches!(receiver.as_ref(), V2Expr::Ident(_, n) if n == target_name))
+                || expr_borrows_ident(receiver, target_name)
                 || args
                     .iter()
                     .any(|a| expr_borrows_ident(&a.value, target_name))
@@ -4936,7 +8508,66 @@ fn expr_borrows_ident(expr: &V2Expr, target_name: &str) -> bool {
     }
 }
 
-fn stmts_unconditionally_diverge(stmts: &[V2Stmt]) -> bool {
+fn match_is_exhaustive(
+    scrutinee: &V2Expr,
+    arms: &[MatchArm],
+    env: &ObjectEnv<'_>,
+    owner_module: &str,
+    allow_local: bool,
+) -> bool {
+    if arms
+        .iter()
+        .any(|a| matches!(a.pattern, MatchPattern::Wildcard(_)))
+    {
+        return true;
+    }
+    // `match dialog(...)` is always validated as exhaustive by `lower_match_dialog`.
+    if matches!(
+        scrutinee,
+        V2Expr::Call { callee, .. } if matches!(callee.as_ref(), V2Expr::Ident(_, n) if n == "dialog")
+    ) {
+        return true;
+    }
+    // Type-aware enum exhaustiveness: if every arm matches `Enum::Variant` of the same enum
+    // and every declared variant discriminant is covered, the match is exhaustive!
+    let mut enum_key: Option<String> = None;
+    let mut covered = BTreeSet::new();
+    for arm in arms {
+        let MatchPattern::Path(_, segs) = &arm.pattern else {
+            return false;
+        };
+        if segs.len() != 2 {
+            return false;
+        }
+        let Some(e) = env.lookup_enum(owner_module, &segs[0], allow_local) else {
+            return false;
+        };
+        if let Some(ref k) = enum_key {
+            if k != &e.canonical_key {
+                return false;
+            }
+        } else {
+            enum_key = Some(e.canonical_key.clone());
+        }
+        let Some(&val) = e.variants.get(&segs[1]) else {
+            return false;
+        };
+        covered.insert(val);
+    }
+    if let Some(key) = enum_key
+        && let Some(e) = env.all_enums.get(&key)
+    {
+        return e.variants.values().all(|v| covered.contains(v));
+    }
+    false
+}
+
+fn stmts_unconditionally_diverge(
+    stmts: &[V2Stmt],
+    env: &ObjectEnv<'_>,
+    owner_module: &str,
+    allow_local: bool,
+) -> bool {
     match stmts.last() {
         Some(V2Stmt::Return { .. } | V2Stmt::Break { .. } | V2Stmt::Continue { .. }) => true,
         Some(V2Stmt::If {
@@ -4945,10 +8576,21 @@ fn stmts_unconditionally_diverge(stmts: &[V2Stmt]) -> bool {
             ..
         }) => {
             !else_body.is_empty()
-                && stmts_unconditionally_diverge(then_body)
-                && stmts_unconditionally_diverge(else_body)
+                && stmts_unconditionally_diverge(then_body, env, owner_module, allow_local)
+                && stmts_unconditionally_diverge(else_body, env, owner_module, allow_local)
         }
-        Some(V2Stmt::WithLock { body, .. }) => stmts_unconditionally_diverge(body),
+        Some(V2Stmt::Match {
+            scrutinee, arms, ..
+        }) => {
+            !arms.is_empty()
+                && match_is_exhaustive(scrutinee, arms, env, owner_module, allow_local)
+                && arms
+                    .iter()
+                    .all(|a| stmts_unconditionally_diverge(&a.body, env, owner_module, allow_local))
+        }
+        Some(V2Stmt::WithLock { body, .. }) => {
+            stmts_unconditionally_diverge(body, env, owner_module, allow_local)
+        }
         _ => false,
     }
 }
@@ -4967,11 +8609,17 @@ fn stmts_have_return(stmts: &[V2Stmt]) -> bool {
             else_body,
             ..
         } => stmts_have_return(then_body) || stmts_have_return(else_body),
+        V2Stmt::Match { arms, .. } => arms.iter().any(|a| stmts_have_return(&a.body)),
         _ => false,
     })
 }
 
-fn stmts_always_return(stmts: &[V2Stmt]) -> bool {
+fn stmts_always_return(
+    stmts: &[V2Stmt],
+    env: &ObjectEnv<'_>,
+    owner_module: &str,
+    allow_local: bool,
+) -> bool {
     for stmt in stmts {
         match stmt {
             V2Stmt::Return { .. } => return true,
@@ -4981,13 +8629,29 @@ fn stmts_always_return(stmts: &[V2Stmt]) -> bool {
                 ..
             } => {
                 if !else_body.is_empty()
-                    && stmts_always_return(then_body)
-                    && stmts_always_return(else_body)
+                    && stmts_always_return(then_body, env, owner_module, allow_local)
+                    && stmts_always_return(else_body, env, owner_module, allow_local)
                 {
                     return true;
                 }
             }
-            V2Stmt::WithLock { body, .. } if stmts_always_return(body) => return true,
+            V2Stmt::Match {
+                scrutinee, arms, ..
+            } => {
+                if !arms.is_empty()
+                    && match_is_exhaustive(scrutinee, arms, env, owner_module, allow_local)
+                    && arms
+                        .iter()
+                        .all(|a| stmts_always_return(&a.body, env, owner_module, allow_local))
+                {
+                    return true;
+                }
+            }
+            V2Stmt::WithLock { body, .. }
+                if stmts_always_return(body, env, owner_module, allow_local) =>
+            {
+                return true;
+            }
             _ => {}
         }
     }
@@ -4999,6 +8663,7 @@ fn stmts_may_clobber_stack_obj(
     env: &ObjectEnv<'_>,
     owner_mod: &str,
     allow_local_fns: bool,
+    sim_name: Option<&str>,
     depth: usize,
 ) -> bool {
     if depth > MAX_INLINE_DEPTH {
@@ -5008,32 +8673,67 @@ fn stmts_may_clobber_stack_obj(
         V2Stmt::LetSome {
             init, else_body, ..
         } => {
-            expr_may_clobber_stack_obj(init, env, owner_mod, allow_local_fns, depth)
-                || stmts_may_clobber_stack_obj(else_body, env, owner_mod, allow_local_fns, depth)
+            expr_may_clobber_stack_obj(init, env, owner_mod, allow_local_fns, sim_name, depth)
+                || stmts_may_clobber_stack_obj(
+                    else_body,
+                    env,
+                    owner_mod,
+                    allow_local_fns,
+                    sim_name,
+                    depth,
+                )
         }
         V2Stmt::Let { init, .. } => {
-            expr_may_clobber_stack_obj(init, env, owner_mod, allow_local_fns, depth)
+            expr_may_clobber_stack_obj(init, env, owner_mod, allow_local_fns, sim_name, depth)
         }
         V2Stmt::Assign { target, value, .. } => {
-            expr_may_clobber_stack_obj(target, env, owner_mod, allow_local_fns, depth)
-                || expr_may_clobber_stack_obj(value, env, owner_mod, allow_local_fns, depth)
+            expr_may_clobber_stack_obj(target, env, owner_mod, allow_local_fns, sim_name, depth)
+                || expr_may_clobber_stack_obj(
+                    value,
+                    env,
+                    owner_mod,
+                    allow_local_fns,
+                    sim_name,
+                    depth,
+                )
         }
         V2Stmt::WithLock {
             lock_expr, body, ..
         } => {
-            expr_may_clobber_stack_obj(lock_expr, env, owner_mod, allow_local_fns, depth)
-                || stmts_may_clobber_stack_obj(body, env, owner_mod, allow_local_fns, depth)
+            expr_may_clobber_stack_obj(lock_expr, env, owner_mod, allow_local_fns, sim_name, depth)
+                || stmts_may_clobber_stack_obj(
+                    body,
+                    env,
+                    owner_mod,
+                    allow_local_fns,
+                    sim_name,
+                    depth,
+                )
         }
         V2Stmt::Defer { body, .. } => {
-            stmts_may_clobber_stack_obj(body, env, owner_mod, allow_local_fns, depth)
+            stmts_may_clobber_stack_obj(body, env, owner_mod, allow_local_fns, sim_name, depth)
         }
         V2Stmt::Repeat { count, body, .. } => {
-            expr_may_clobber_stack_obj(count, env, owner_mod, allow_local_fns, depth)
-                || stmts_may_clobber_stack_obj(body, env, owner_mod, allow_local_fns, depth)
+            expr_may_clobber_stack_obj(count, env, owner_mod, allow_local_fns, sim_name, depth)
+                || stmts_may_clobber_stack_obj(
+                    body,
+                    env,
+                    owner_mod,
+                    allow_local_fns,
+                    sim_name,
+                    depth,
+                )
         }
         V2Stmt::While { cond, body, .. } => {
-            expr_may_clobber_stack_obj(cond, env, owner_mod, allow_local_fns, depth)
-                || stmts_may_clobber_stack_obj(body, env, owner_mod, allow_local_fns, depth)
+            expr_may_clobber_stack_obj(cond, env, owner_mod, allow_local_fns, sim_name, depth)
+                || stmts_may_clobber_stack_obj(
+                    body,
+                    env,
+                    owner_mod,
+                    allow_local_fns,
+                    sim_name,
+                    depth,
+                )
         }
         V2Stmt::ForEach { .. } | V2Stmt::RawAir { .. } => true,
         V2Stmt::If {
@@ -5042,12 +8742,41 @@ fn stmts_may_clobber_stack_obj(
             else_body,
             ..
         } => {
-            expr_may_clobber_stack_obj(cond, env, owner_mod, allow_local_fns, depth)
-                || stmts_may_clobber_stack_obj(then_body, env, owner_mod, allow_local_fns, depth)
-                || stmts_may_clobber_stack_obj(else_body, env, owner_mod, allow_local_fns, depth)
+            expr_may_clobber_stack_obj(cond, env, owner_mod, allow_local_fns, sim_name, depth)
+                || stmts_may_clobber_stack_obj(
+                    then_body,
+                    env,
+                    owner_mod,
+                    allow_local_fns,
+                    sim_name,
+                    depth,
+                )
+                || stmts_may_clobber_stack_obj(
+                    else_body,
+                    env,
+                    owner_mod,
+                    allow_local_fns,
+                    sim_name,
+                    depth,
+                )
+        }
+        V2Stmt::Match {
+            scrutinee, arms, ..
+        } => {
+            expr_may_clobber_stack_obj(scrutinee, env, owner_mod, allow_local_fns, sim_name, depth)
+                || arms.iter().any(|a| {
+                    stmts_may_clobber_stack_obj(
+                        &a.body,
+                        env,
+                        owner_mod,
+                        allow_local_fns,
+                        sim_name,
+                        depth,
+                    )
+                })
         }
         V2Stmt::Return { value: Some(e), .. } | V2Stmt::Expr { expr: e, .. } => {
-            expr_may_clobber_stack_obj(e, env, owner_mod, allow_local_fns, depth)
+            expr_may_clobber_stack_obj(e, env, owner_mod, allow_local_fns, sim_name, depth)
         }
         _ => false,
     })
@@ -5058,6 +8787,7 @@ fn expr_may_clobber_stack_obj(
     env: &ObjectEnv<'_>,
     owner_mod: &str,
     allow_local_fns: bool,
+    sim_name: Option<&str>,
     depth: usize,
 ) -> bool {
     if depth > MAX_INLINE_DEPTH {
@@ -5071,26 +8801,47 @@ fn expr_may_clobber_stack_obj(
                 }
                 if let Some((fmod, fdecl, is_local)) =
                     env.lookup_fn(owner_mod, fname, allow_local_fns)
-                    && (stmts_may_clobber_stack_obj(&fdecl.body, env, &fmod, is_local, depth + 1)
-                        || fdecl
-                            .params
-                            .iter()
-                            .filter_map(|p| p.default.as_ref())
-                            .any(|def_expr| {
-                                expr_may_clobber_stack_obj(
-                                    def_expr,
-                                    env,
-                                    &fmod,
-                                    is_local,
-                                    depth + 1,
-                                )
-                            }))
                 {
-                    return true;
+                    let fn_sim = fdecl
+                        .params
+                        .iter()
+                        .find(|p| p.ty == V2Type::Sim)
+                        .map(|p| p.name.as_str());
+                    if stmts_may_clobber_stack_obj(
+                        &fdecl.body,
+                        env,
+                        &fmod,
+                        is_local,
+                        fn_sim,
+                        depth + 1,
+                    ) || fdecl
+                        .params
+                        .iter()
+                        .filter_map(|p| p.default.as_ref())
+                        .any(|def_expr| {
+                            expr_may_clobber_stack_obj(
+                                def_expr,
+                                env,
+                                &fmod,
+                                is_local,
+                                fn_sim,
+                                depth + 1,
+                            )
+                        })
+                    {
+                        return true;
+                    }
                 }
             }
             args.iter().any(|a| {
-                expr_may_clobber_stack_obj(&a.value, env, owner_mod, allow_local_fns, depth)
+                expr_may_clobber_stack_obj(
+                    &a.value,
+                    env,
+                    owner_mod,
+                    allow_local_fns,
+                    sim_name,
+                    depth,
+                )
             })
         }
         V2Expr::MethodCall {
@@ -5100,15 +8851,26 @@ fn expr_may_clobber_stack_obj(
             ..
         } => {
             method == "run_functional"
-                || expr_may_clobber_stack_obj(receiver, env, owner_mod, allow_local_fns, depth)
+                || expr_may_clobber_stack_obj(
+                    receiver,
+                    env,
+                    owner_mod,
+                    allow_local_fns,
+                    sim_name,
+                    depth,
+                )
                 || args.iter().any(|a| {
-                    expr_may_clobber_stack_obj(&a.value, env, owner_mod, allow_local_fns, depth)
+                    expr_may_clobber_stack_obj(
+                        &a.value,
+                        env,
+                        owner_mod,
+                        allow_local_fns,
+                        sim_name,
+                        depth,
+                    )
                 })
         }
         V2Expr::Index { base, index, .. } => {
-            // Foreign `obj.attr[i]` or `obj.data[i]` swaps `stack_obj` (even if the helper
-            // parameter happens to be named `sim: Object`, since Sim handles do not expose
-            // `.attr[...]` or `.data[...]`).
             if let V2Expr::Field {
                 base: root, field, ..
             } = base.as_ref()
@@ -5118,19 +8880,38 @@ fn expr_may_clobber_stack_obj(
             {
                 return true;
             }
-            expr_may_clobber_stack_obj(base, env, owner_mod, allow_local_fns, depth)
-                || expr_may_clobber_stack_obj(index, env, owner_mod, allow_local_fns, depth)
+            expr_may_clobber_stack_obj(base, env, owner_mod, allow_local_fns, sim_name, depth)
+                || expr_may_clobber_stack_obj(
+                    index,
+                    env,
+                    owner_mod,
+                    allow_local_fns,
+                    sim_name,
+                    depth,
+                )
         }
-        V2Expr::Field { base, .. }
-        | V2Expr::Deref { inner: base, .. }
+        V2Expr::Field { base, .. } => {
+            // Typed foreign object field access (`fridge.stock`, `plate.nutrition`, etc.) swaps `stack_obj`!
+            if let V2Expr::Ident(_, rname) = base.as_ref()
+                && rname != "self"
+                && Some(rname.as_str()) != sim_name
+            {
+                return true;
+            }
+            expr_may_clobber_stack_obj(base, env, owner_mod, allow_local_fns, sim_name, depth)
+        }
+        V2Expr::Deref { inner: base, .. }
         | V2Expr::MutRef { inner: base, .. }
         | V2Expr::Unary { inner: base, .. } => {
-            expr_may_clobber_stack_obj(base, env, owner_mod, allow_local_fns, depth)
+            expr_may_clobber_stack_obj(base, env, owner_mod, allow_local_fns, sim_name, depth)
         }
         V2Expr::Binary { lhs, rhs, .. } => {
-            expr_may_clobber_stack_obj(lhs, env, owner_mod, allow_local_fns, depth)
-                || expr_may_clobber_stack_obj(rhs, env, owner_mod, allow_local_fns, depth)
+            expr_may_clobber_stack_obj(lhs, env, owner_mod, allow_local_fns, sim_name, depth)
+                || expr_may_clobber_stack_obj(rhs, env, owner_mod, allow_local_fns, sim_name, depth)
         }
+        V2Expr::Tuple(_, elems) => elems.iter().any(|e| {
+            expr_may_clobber_stack_obj(e, env, owner_mod, allow_local_fns, sim_name, depth)
+        }),
         _ => false,
     }
 }

@@ -18,13 +18,13 @@ object "Open Oak Counter" {
     slot top_surface = container([0.0, 0.0, 0.64]);
     slot front = routing([0.0, -0.75, 0.0]);
 
-    functional prep {
+    functional prep -> i16 {
         score: prep_score,
         guard(sim) => !self.occupied,
         run(sim) {
             self.meals_prepped += 1;
-            temp[3] = prep_nutrition_bonus;
             play_sound(chop);
+            return prep_nutrition_bonus;
         }
     }
 }

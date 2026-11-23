@@ -5,8 +5,9 @@ use crate::audio::SoundPreset;
 use crate::error::{Error, Result, Span};
 use crate::parser::motive_by_name;
 use crate::v2::ast::{
-    AdvertiseDecl, CallArg, ConstIntExpr, FnDecl, FnParam, ForEachIter, FunctionalDecl, GuardBody,
-    GuardDecl, InteractionDecl, LifecycleBlock, MetaField, MetaFieldKind, ObjectDecl, ObjectMember,
+    AdvertiseDecl, BitflagVariant, BitflagsDecl, CallArg, ConstIntExpr, EnumDecl, EnumVariant,
+    FnDecl, FnParam, ForEachIter, FunctionalDecl, GuardBody, GuardDecl, InteractionDecl,
+    LifecycleBlock, MatchArm, MatchPattern, MetaField, MetaFieldKind, ObjectDecl, ObjectMember,
     ParamAssignDecl, ParamDecl, ParamType, ParamValue, SlotDecl, SoundDecl, SpriteDecl, StateDecl,
     StateInitValue, StateType, StringsDecl, TemplateDecl, TileDecl, UseDecl, UseItem, V2AssignOp,
     V2BinOp, V2Expr, V2File, V2Item, V2Stmt, V2Type, V2UnaryOp,
@@ -209,16 +210,19 @@ impl Parser {
                 continue;
             }
             let is_pub = self.eat_ident("pub");
-            let (kw, kw_span) =
-                self.expect_ident("top-level item ('use', 'fn', 'template', 'object')")?;
+            let (kw, kw_span) = self.expect_ident(
+                "top-level item ('use', 'fn', 'template', 'object', 'enum', 'bitflags')",
+            )?;
             match kw.as_str() {
                 "fn" => items.push(V2Item::Fn(self.parse_fn(kw_span, is_pub)?)),
                 "template" => items.push(V2Item::Template(self.parse_template(kw_span, is_pub)?)),
+                "enum" => items.push(V2Item::Enum(self.parse_enum(kw_span, is_pub)?)),
+                "bitflags" => items.push(V2Item::Bitflags(self.parse_bitflags(kw_span, is_pub)?)),
                 "object" => {
                     if is_pub {
                         return Err(Error::at(
                             span,
-                            "'object' declarations cannot be marked 'pub' (export templates or functions instead)",
+                            "'object' declarations cannot be marked 'pub' (objects are automatically importable by type name)",
                         ));
                     }
                     items.push(V2Item::Object(self.parse_object(kw_span)?));
@@ -228,7 +232,7 @@ impl Parser {
                         kw_span,
                         format!(
                             "unexpected top-level keyword '{other}' in .antics v2 file \
-                             (expected 'use', 'pub', 'fn', 'template', or 'object')"
+                             (expected 'use', 'pub', 'fn', 'template', 'enum', 'bitflags', or 'object')"
                         ),
                     ));
                 }
@@ -296,6 +300,148 @@ impl Parser {
         })
     }
 
+    fn parse_enum(&mut self, span: Span, is_pub: bool) -> Result<EnumDecl> {
+        let (name, nspan) = self.expect_ident("enum name")?;
+        if crate::v2::ast::is_reserved_type_name(&name) {
+            return Err(Error::at(
+                nspan,
+                format!("'{name}' is a reserved built-in type name"),
+            ));
+        }
+        self.expect(&TokenKind::LBrace, "'{'")?;
+        let mut variants = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut seen_vals = BTreeSet::new();
+        let mut next_val: i32 = 0;
+        while !self.eat(&TokenKind::RBrace) {
+            let (vname, vspan) = self.expect_ident("enum variant name")?;
+            if !seen.insert(vname.clone()) {
+                return Err(Error::at(
+                    vspan,
+                    format!("duplicate variant '{vname}' in enum '{name}'"),
+                ));
+            }
+            let value = if self.eat(&TokenKind::Assign) {
+                let v = self.expect_i16("enum discriminant")?;
+                next_val = i32::from(v) + 1;
+                v
+            } else {
+                let v = i16::try_from(next_val).map_err(|_| {
+                    Error::at(
+                        vspan,
+                        format!("enum '{name}' variant '{vname}' discriminant overflows i16"),
+                    )
+                })?;
+                next_val += 1;
+                v
+            };
+            if !seen_vals.insert(value) {
+                return Err(Error::at(
+                    vspan,
+                    format!("duplicate discriminant value {value} in enum '{name}'"),
+                ));
+            }
+            variants.push(EnumVariant {
+                span: vspan,
+                name: vname,
+                value,
+            });
+            if !self.eat(&TokenKind::Comma) {
+                self.expect(&TokenKind::RBrace, "'}'")?;
+                break;
+            }
+        }
+        self.eat(&TokenKind::Semicolon);
+        if variants.is_empty() {
+            return Err(Error::at(
+                span,
+                format!("enum '{name}' must declare at least one variant"),
+            ));
+        }
+        Ok(EnumDecl {
+            span,
+            is_pub,
+            name,
+            variants,
+        })
+    }
+
+    fn parse_bitflags(&mut self, span: Span, is_pub: bool) -> Result<BitflagsDecl> {
+        let (name, nspan) = self.expect_ident("bitflags name")?;
+        if crate::v2::ast::is_reserved_type_name(&name) {
+            return Err(Error::at(
+                nspan,
+                format!("'{name}' is a reserved built-in type name"),
+            ));
+        }
+        self.expect(&TokenKind::LBrace, "'{'")?;
+        let mut flags = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut seen_bits = BTreeSet::new();
+        let mut next_bit: u16 = 1;
+        while !self.eat(&TokenKind::RBrace) {
+            let (fname, fspan) = self.expect_ident("bitflag name")?;
+            if fname == "None" {
+                return Err(Error::at(
+                    fspan,
+                    format!("'None' is reserved for the empty bitmask (0) on bitflags '{name}'"),
+                ));
+            }
+            if !seen.insert(fname.clone()) {
+                return Err(Error::at(
+                    fspan,
+                    format!("duplicate flag '{fname}' in bitflags '{name}'"),
+                ));
+            }
+            let bit_u16 = if self.eat(&TokenKind::Assign) {
+                let b = self.expect_u16("1-based bitflag index (1..=16)")?;
+                next_bit = b.saturating_add(1);
+                b
+            } else {
+                let b = next_bit;
+                next_bit = next_bit.saturating_add(1);
+                b
+            };
+            if !(1..=16).contains(&bit_u16) {
+                return Err(Error::at(
+                    fspan,
+                    format!(
+                        "bitflags '{name}::{fname}' bit index {bit_u16} must be in 1..=16 \
+                         (SimAntics 1-based bit positions)"
+                    ),
+                ));
+            }
+            if !seen_bits.insert(bit_u16) {
+                return Err(Error::at(
+                    fspan,
+                    format!("duplicate bit index {bit_u16} in bitflags '{name}'"),
+                ));
+            }
+            flags.push(BitflagVariant {
+                span: fspan,
+                name: fname,
+                bit: bit_u16 as u8,
+            });
+            if !self.eat(&TokenKind::Comma) {
+                self.expect(&TokenKind::RBrace, "'}'")?;
+                break;
+            }
+        }
+        self.eat(&TokenKind::Semicolon);
+        if flags.is_empty() {
+            return Err(Error::at(
+                span,
+                format!("bitflags '{name}' must declare at least one flag"),
+            ));
+        }
+        Ok(BitflagsDecl {
+            span,
+            is_pub,
+            name,
+            flags,
+        })
+    }
+
     fn parse_type(&mut self) -> Result<V2Type> {
         let span = self.span();
         if self.eat(&TokenKind::Amp) {
@@ -310,21 +456,21 @@ impl Parser {
             self.leave_nesting();
             let inner = inner?;
             match inner {
-                V2Type::Bool | V2Type::I16 | V2Type::ObjectId => {
+                V2Type::Bool | V2Type::I16 | V2Type::ObjectId | V2Type::Named(_) => {
                     return Ok(V2Type::MutRef(Box::new(inner)));
                 }
                 other => {
                     return Err(Error::at(
                         span,
                         format!(
-                            "cannot take '&mut' of type '{}' (supported: bool, i16, ObjectId)",
+                            "cannot take '&mut' of type '{}' (supported: bool, i16, ObjectId, enum, bitflags)",
                             other.display_name()
                         ),
                     ));
                 }
             }
         }
-        let (name, nspan) = self.expect_ident("type name")?;
+        let (name, _nspan) = self.expect_ident("type name")?;
         match name.as_str() {
             "i16" => Ok(V2Type::I16),
             "bool" => Ok(V2Type::Bool),
@@ -335,7 +481,7 @@ impl Parser {
             "Skill" => Ok(V2Type::Skill),
             "Sound" => Ok(V2Type::Sound),
             "Slot" => Ok(V2Type::Slot),
-            other => Err(Error::at(nspan, format!("unknown type '{other}'"))),
+            other => Ok(V2Type::Named(other.to_owned())),
         }
     }
 
@@ -473,11 +619,14 @@ impl Parser {
             let span = self.span();
             let (kw, kw_span) = self.expect_ident("object or template member")?;
             if (pinned_id.is_some() || pinned_guard_id.is_some())
-                && !matches!(kw.as_str(), "init" | "main" | "functional" | "interaction")
+                && !matches!(
+                    kw.as_str(),
+                    "init" | "main" | "load" | "reset" | "cleanup" | "functional" | "interaction"
+                )
             {
                 return Err(Error::at(
                     kw_span,
-                    "@id/@guard_id annotations are only allowed on init, main, functional, or interaction",
+                    "@id/@guard_id annotations are only allowed on init, main, load, reset, cleanup, functional, or interaction",
                 ));
             }
             if pinned_guard_id.is_some() && !matches!(kw.as_str(), "functional" | "interaction") {
@@ -510,6 +659,12 @@ impl Parser {
                 "strings" => {
                     members.push(ObjectMember::Strings(self.parse_strings_decl(kw_span)?));
                 }
+                "enum" => {
+                    members.push(ObjectMember::Enum(self.parse_enum(kw_span, false)?));
+                }
+                "bitflags" => {
+                    members.push(ObjectMember::Bitflags(self.parse_bitflags(kw_span, false)?));
+                }
                 "init" => {
                     let body = self.parse_block()?;
                     members.push(ObjectMember::Init(LifecycleBlock {
@@ -521,6 +676,30 @@ impl Parser {
                 "main" => {
                     let body = self.parse_block()?;
                     members.push(ObjectMember::Main(LifecycleBlock {
+                        span: kw_span,
+                        pinned_id,
+                        body,
+                    }));
+                }
+                "load" => {
+                    let body = self.parse_block()?;
+                    members.push(ObjectMember::Load(LifecycleBlock {
+                        span: kw_span,
+                        pinned_id,
+                        body,
+                    }));
+                }
+                "reset" => {
+                    let body = self.parse_block()?;
+                    members.push(ObjectMember::Reset(LifecycleBlock {
+                        span: kw_span,
+                        pinned_id,
+                        body,
+                    }));
+                }
+                "cleanup" => {
+                    let body = self.parse_block()?;
+                    members.push(ObjectMember::Cleanup(LifecycleBlock {
                         span: kw_span,
                         pinned_id,
                         body,
@@ -669,46 +848,17 @@ impl Parser {
     fn parse_state_decl(&mut self, span: Span) -> Result<StateDecl> {
         let (name, _) = self.expect_ident("state field name")?;
         self.expect(&TokenKind::Colon, "':'")?;
-        let (ty_name, ty_span) = self.expect_ident("state type ('bool', 'i16', or 'ObjectId')")?;
+        let (ty_name, _ty_span) =
+            self.expect_ident("state type ('bool', 'i16', 'ObjectId', enum, or bitflags)")?;
         let ty = match ty_name.as_str() {
             "bool" => StateType::Bool,
             "i16" => StateType::I16,
             "ObjectId" => StateType::ObjectId,
-            other => {
-                return Err(Error::at(
-                    ty_span,
-                    format!(
-                        "state '{name}' has unsupported type '{other}' (expected 'bool', 'i16', or 'ObjectId')"
-                    ),
-                ));
-            }
+            other => StateType::Named(other.to_owned()),
         };
         let init = if self.eat(&TokenKind::Assign) {
             let ispan = self.span();
-            let val = match &self.peek().kind {
-                TokenKind::Ident(s) if s == "true" => {
-                    self.bump();
-                    StateInitValue::Bool(true)
-                }
-                TokenKind::Ident(s) if s == "false" => {
-                    self.bump();
-                    StateInitValue::Bool(false)
-                }
-                TokenKind::Ident(s) => {
-                    let pname = s.clone();
-                    self.bump();
-                    StateInitValue::Param(pname)
-                }
-                TokenKind::Int(_) | TokenKind::Minus | TokenKind::Plus => {
-                    StateInitValue::Int(self.expect_i16("state initial value")?)
-                }
-                other => {
-                    return Err(Error::at(
-                        ispan,
-                        format!("expected state initial value, found {other:?}"),
-                    ));
-                }
-            };
+            let val = self.parse_state_init_value()?;
             match (&ty, &val) {
                 (StateType::Bool, StateInitValue::Int(_)) => {
                     return Err(Error::at(
@@ -737,6 +887,51 @@ impl Parser {
             ty,
             init,
         })
+    }
+
+    fn parse_state_init_value(&mut self) -> Result<StateInitValue> {
+        let mut lhs = self.parse_state_init_primary()?;
+        while self.peek().kind == TokenKind::Pipe {
+            let pspan = self.bump().span;
+            let rhs = self.parse_state_init_primary()?;
+            lhs = StateInitValue::BitOr(pspan, Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_state_init_primary(&mut self) -> Result<StateInitValue> {
+        let ispan = self.span();
+        match &self.peek().kind {
+            TokenKind::Ident(s) if s == "true" => {
+                self.bump();
+                Ok(StateInitValue::Bool(true))
+            }
+            TokenKind::Ident(s) if s == "false" => {
+                self.bump();
+                Ok(StateInitValue::Bool(false))
+            }
+            TokenKind::Ident(s) => {
+                let first = s.clone();
+                self.bump();
+                if self.peek().kind == TokenKind::ColonColon {
+                    let mut segs = vec![first];
+                    while self.eat(&TokenKind::ColonColon) {
+                        let (seg, _) = self.expect_ident("enum/bitflags variant name")?;
+                        segs.push(seg);
+                    }
+                    Ok(StateInitValue::Path(ispan, segs))
+                } else {
+                    Ok(StateInitValue::Param(first))
+                }
+            }
+            TokenKind::Int(_) | TokenKind::Minus | TokenKind::Plus => {
+                Ok(StateInitValue::Int(self.expect_i16("state initial value")?))
+            }
+            other => Err(Error::at(
+                ispan,
+                format!("expected state initial value, found {other:?}"),
+            )),
+        }
     }
 
     fn parse_sound_decl(&mut self, span: Span) -> Result<SoundDecl> {
@@ -1356,10 +1551,28 @@ impl Parser {
         }
     }
 
-    fn parse_guard(&mut self, span: Span) -> Result<GuardDecl> {
+    fn parse_guard(&mut self, span: Span, allow_autonomous: bool) -> Result<GuardDecl> {
         let mut sim_binding = "sim".to_owned();
+        let mut autonomous_binding: Option<String> = None;
         if self.eat(&TokenKind::LParen) && !self.eat(&TokenKind::RParen) {
             sim_binding = self.expect_ident("guard sim parameter")?.0;
+            if self.eat(&TokenKind::Comma) && self.peek().kind != TokenKind::RParen {
+                let (auto_name, aspan) = self.expect_ident("guard is_autonomous parameter")?;
+                if !allow_autonomous {
+                    return Err(Error::at(
+                        aspan,
+                        "functional guards do not support a second 'is_autonomous' parameter (only interaction guards do)",
+                    ));
+                }
+                if auto_name == sim_binding {
+                    return Err(Error::at(
+                        aspan,
+                        format!("duplicate guard parameter name '{auto_name}'"),
+                    ));
+                }
+                autonomous_binding = Some(auto_name);
+                let _ = self.eat(&TokenKind::Comma);
+            }
             self.expect(&TokenKind::RParen, "')'")?;
         }
         let kind = if self.eat(&TokenKind::FatArrow) {
@@ -1370,6 +1583,7 @@ impl Parser {
         Ok(GuardDecl {
             span,
             sim_binding,
+            autonomous_binding,
             kind,
         })
     }
@@ -1385,6 +1599,11 @@ impl Parser {
             self.parse_fn_params(false)?
         } else {
             Vec::new()
+        };
+        let return_type = if self.eat(&TokenKind::Arrow) {
+            Some(self.parse_type()?)
+        } else {
+            None
         };
         self.expect(&TokenKind::LBrace, "'{'")?;
 
@@ -1404,6 +1623,7 @@ impl Parser {
                 kind,
                 kind_span,
                 params,
+                return_type,
                 score: None,
                 pinned_id,
                 pinned_guard_id,
@@ -1430,7 +1650,7 @@ impl Parser {
                     if guard.is_some() {
                         return Err(Error::at(fspan, "duplicate 'guard' in functional block"));
                     }
-                    guard = Some(self.parse_guard(fspan)?);
+                    guard = Some(self.parse_guard(fspan, false)?);
                     self.eat_member_terminator();
                 }
                 "run" => {
@@ -1465,6 +1685,7 @@ impl Parser {
             kind,
             kind_span,
             params,
+            return_type,
             score,
             pinned_id,
             pinned_guard_id,
@@ -1569,7 +1790,7 @@ impl Parser {
                             format!("duplicate 'guard' in interaction '{label}'"),
                         ));
                     }
-                    guard = Some(self.parse_guard(fspan)?);
+                    guard = Some(self.parse_guard(fspan, true)?);
                     self.eat_member_terminator();
                 }
                 "run" => {
@@ -1697,6 +1918,7 @@ impl Parser {
                 "while" => return self.parse_while_stmt(span),
                 "for" => return self.parse_for_stmt(span),
                 "if" => return self.parse_if_stmt(span),
+                "match" => return self.parse_match_stmt(span),
                 "break" => {
                     self.bump();
                     self.expect(&TokenKind::Semicolon, "';'")?;
@@ -1760,10 +1982,15 @@ impl Parser {
 
     fn parse_let_stmt(&mut self, span: Span) -> Result<V2Stmt> {
         self.bump(); // 'let'
-        // `let Some(name) = expr else { ... };`
+        // `let Some(name [: Type]) = expr else { ... };`
         if self.eat_ident("Some") {
             self.expect(&TokenKind::LParen, "'('")?;
             let (name, _) = self.expect_ident("binding name")?;
+            let ty = if self.eat(&TokenKind::Colon) {
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
             self.expect(&TokenKind::RParen, "')'")?;
             self.expect(&TokenKind::Assign, "'='")?;
             let init = self.parse_expr()?;
@@ -1778,6 +2005,7 @@ impl Parser {
             return Ok(V2Stmt::LetSome {
                 span,
                 name,
+                ty,
                 init,
                 else_body,
             });
@@ -1850,13 +2078,26 @@ impl Parser {
             return Err(Error::at(self.span(), "expected 'in' in 'for' loop"));
         }
         let ispan = self.span();
-        let (src, _) = self.expect_ident("iterator ('objects_by_guid' or 'self')")?;
+        let (src, _) =
+            self.expect_ident("iterator ('objects_by_guid', 'objects_of', or 'self')")?;
         let iter = match src.as_str() {
             "objects_by_guid" => {
                 self.expect(&TokenKind::LParen, "'('")?;
                 let guid = self.expect_u32("object GUID")?;
                 self.expect(&TokenKind::RParen, "')'")?;
                 ForEachIter::ObjectsByGuid(guid)
+            }
+            "objects_of" => {
+                self.expect(&TokenKind::ColonColon, "'::'")?;
+                self.expect(&TokenKind::Lt, "'<'")?;
+                let (object_type, ospan) = self.expect_ident("object type name")?;
+                self.expect(&TokenKind::Gt, "'>'")?;
+                self.expect(&TokenKind::LParen, "'('")?;
+                self.expect(&TokenKind::RParen, "')'")?;
+                ForEachIter::ObjectsOf {
+                    span: ospan,
+                    object_type,
+                }
             }
             "self" => {
                 self.expect(&TokenKind::Dot, "'.'")?;
@@ -1875,7 +2116,7 @@ impl Parser {
                 return Err(Error::at(
                     ispan,
                     format!(
-                        "unsupported 'for' iterator '{other}' (expected 'objects_by_guid(0x...)' or 'self.parts()')"
+                        "unsupported 'for' iterator '{other}' (expected 'objects_of::<Type>()', 'objects_by_guid(0x...)', or 'self.parts()')"
                     ),
                 ));
             }
@@ -1912,6 +2153,94 @@ impl Parser {
             then_body,
             else_body,
         })
+    }
+
+    fn parse_match_stmt(&mut self, span: Span) -> Result<V2Stmt> {
+        self.bump(); // 'match'
+        let scrutinee = self.parse_expr()?;
+        let open_span = self.expect(&TokenKind::LBrace, "'{'")?;
+        self.enter_nesting(open_span)?;
+        let mut arms = Vec::new();
+        let res = loop {
+            if self.eat(&TokenKind::RBrace) {
+                break Ok(arms);
+            }
+            if self.peek().kind == TokenKind::Eof {
+                break Err(Error::at(open_span, "unterminated 'match { ... }' block"));
+            }
+            let arm_span = self.span();
+            let pattern = match self.parse_match_pattern() {
+                Ok(p) => p,
+                Err(e) => break Err(e),
+            };
+            if let Err(e) = self.expect(&TokenKind::FatArrow, "'=>'") {
+                break Err(e);
+            }
+            let body = if self.peek().kind == TokenKind::LBrace {
+                match self.parse_block() {
+                    Ok(b) => {
+                        let _ = self.eat(&TokenKind::Comma);
+                        b
+                    }
+                    Err(e) => break Err(e),
+                }
+            } else {
+                match self.parse_stmt() {
+                    Ok(s) => {
+                        let _ = self.eat(&TokenKind::Comma);
+                        vec![s]
+                    }
+                    Err(e) => break Err(e),
+                }
+            };
+            arms.push(MatchArm {
+                span: arm_span,
+                pattern,
+                body,
+            });
+        };
+        self.leave_nesting();
+        let arms = res?;
+        if arms.is_empty() {
+            return Err(Error::at(span, "'match' must have at least one arm"));
+        }
+        Ok(V2Stmt::Match {
+            span,
+            scrutinee,
+            arms,
+        })
+    }
+
+    fn parse_match_pattern(&mut self) -> Result<MatchPattern> {
+        let span = self.span();
+        match &self.peek().kind {
+            TokenKind::Ident(s) if s == "_" => {
+                self.bump();
+                Ok(MatchPattern::Wildcard(span))
+            }
+            TokenKind::Ident(s) => {
+                let first = s.clone();
+                self.bump();
+                if self.peek().kind == TokenKind::ColonColon {
+                    let mut segs = vec![first];
+                    while self.eat(&TokenKind::ColonColon) {
+                        let (seg, _) = self.expect_ident("pattern path segment")?;
+                        segs.push(seg);
+                    }
+                    Ok(MatchPattern::Path(span, segs))
+                } else {
+                    Ok(MatchPattern::Ident(span, first))
+                }
+            }
+            TokenKind::Int(_) | TokenKind::Minus | TokenKind::Plus => {
+                let val = self.expect_i16("match integer pattern")?;
+                Ok(MatchPattern::Int(span, val))
+            }
+            other => Err(Error::at(
+                span,
+                format!("expected match pattern, found {other:?}"),
+            )),
+        }
     }
 
     fn parse_expr(&mut self) -> Result<V2Expr> {
@@ -2171,6 +2500,26 @@ impl Parser {
         }
     }
 
+    fn parse_turbofish_type_args(&mut self) -> Result<Vec<V2Type>> {
+        self.expect(&TokenKind::ColonColon, "'::'")?;
+        self.expect(&TokenKind::Lt, "'<'")?;
+        let mut types = Vec::new();
+        while !self.eat(&TokenKind::Gt) {
+            types.push(self.parse_type()?);
+            if !self.eat(&TokenKind::Comma) {
+                self.expect(&TokenKind::Gt, "'>'")?;
+                break;
+            }
+        }
+        if types.is_empty() {
+            return Err(Error::at(
+                self.span(),
+                "turbofish '::<...>' requires at least one type argument",
+            ));
+        }
+        Ok(types)
+    }
+
     fn parse_postfix_expr(&mut self) -> Result<V2Expr> {
         let mut expr = self.parse_primary_expr()?;
         let mut chain = 0usize;
@@ -2188,12 +2537,25 @@ impl Parser {
                         ));
                     }
                     let (field, _) = self.expect_ident("field or method name")?;
-                    if self.peek().kind == TokenKind::LParen {
+                    if self.peek().kind == TokenKind::ColonColon
+                        && self.peek_at(1).kind == TokenKind::Lt
+                    {
+                        let type_args = self.parse_turbofish_type_args()?;
                         let args = self.parse_call_args()?;
                         expr = V2Expr::MethodCall {
                             span,
                             receiver: Box::new(expr),
                             method: field,
+                            type_args,
+                            args,
+                        };
+                    } else if self.peek().kind == TokenKind::LParen {
+                        let args = self.parse_call_args()?;
+                        expr = V2Expr::MethodCall {
+                            span,
+                            receiver: Box::new(expr),
+                            method: field,
+                            type_args: Vec::new(),
                             args,
                         };
                     } else {
@@ -2203,6 +2565,26 @@ impl Parser {
                             field,
                         };
                     }
+                }
+                TokenKind::ColonColon if self.peek_at(1).kind == TokenKind::Lt => {
+                    let span = self.span();
+                    chain += 1;
+                    if self.depth + chain > MAX_NESTING_DEPTH {
+                        return Err(Error::at(
+                            span,
+                            format!(
+                                "expression nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
+                            ),
+                        ));
+                    }
+                    let type_args = self.parse_turbofish_type_args()?;
+                    let args = self.parse_call_args()?;
+                    expr = V2Expr::Call {
+                        span,
+                        callee: Box::new(expr),
+                        type_args,
+                        args,
+                    };
                 }
                 TokenKind::LBracket => {
                     let span = self.bump().span;
@@ -2241,6 +2623,7 @@ impl Parser {
                     expr = V2Expr::Call {
                         span,
                         callee: Box::new(expr),
+                        type_args: Vec::new(),
                         args,
                     };
                 }
@@ -2308,9 +2691,14 @@ impl Parser {
                     "true" => Ok(V2Expr::Bool(tok.span, true)),
                     "false" => Ok(V2Expr::Bool(tok.span, false)),
                     _ => {
-                        if self.peek().kind == TokenKind::ColonColon {
+                        if self.peek().kind == TokenKind::ColonColon
+                            && self.peek_at(1).kind != TokenKind::Lt
+                        {
                             let mut segs = vec![s];
-                            while self.eat(&TokenKind::ColonColon) {
+                            while self.peek().kind == TokenKind::ColonColon
+                                && self.peek_at(1).kind != TokenKind::Lt
+                            {
+                                self.bump();
                                 let (seg, _) = self.expect_ident("path segment")?;
                                 segs.push(seg);
                             }
@@ -2324,11 +2712,25 @@ impl Parser {
             TokenKind::LParen => {
                 self.bump();
                 self.enter_nesting(tok.span)?;
-                let inner = self.parse_expr();
+                let res = (|| {
+                    let first = self.parse_expr()?;
+                    if self.eat(&TokenKind::Comma) {
+                        let mut elems = vec![first];
+                        while !self.eat(&TokenKind::RParen) {
+                            elems.push(self.parse_expr()?);
+                            if !self.eat(&TokenKind::Comma) {
+                                self.expect(&TokenKind::RParen, "')'")?;
+                                break;
+                            }
+                        }
+                        Ok(V2Expr::Tuple(tok.span, elems))
+                    } else {
+                        self.expect(&TokenKind::RParen, "')'")?;
+                        Ok(first)
+                    }
+                })();
                 self.leave_nesting();
-                let inner = inner?;
-                self.expect(&TokenKind::RParen, "')'")?;
-                Ok(inner)
+                res
             }
             other => Err(Error::at(
                 tok.span,
