@@ -1,4 +1,4 @@
-//! Recursive-descent parser for the two-tier `.antics` language.
+//! Recursive-descent parser for the `.air` (Antics IR) low-level textual IR layer.
 
 use crate::ast::{
     AssignOp, BconDecl, Branches, CallTarget, CompareOp, Condition, Item, LocalRef, Module,

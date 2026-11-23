@@ -1,4 +1,4 @@
-//! Abstract syntax tree for the two-tier `.antics` language.
+//! Abstract syntax tree for the `.air` (Antics IR) low-level textual IR layer.
 
 use crate::error::Span;
 

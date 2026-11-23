@@ -618,11 +618,11 @@ impl PackManifest {
         let root = parse_toml(source)?;
         for (key, value) in &root {
             match (key.as_str(), value) {
-                ("pack", TomlValue::Table(_)) => {}
-                ("pack", _) => {
-                    return Err(Error::new(
-                        "section '[pack]' must be a table, not an array of tables",
-                    ));
+                ("pack" | "dependencies", TomlValue::Table(_)) => {}
+                ("pack" | "dependencies", _) => {
+                    return Err(Error::new(format!(
+                        "section '[{key}]' must be a table, not an array of tables"
+                    )));
                 }
                 (other, _) => {
                     return Err(Error::new(format!(
@@ -676,7 +676,7 @@ fn validate_slug(slug: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_relative_filename(name: &str, field: &str) -> Result<()> {
+pub(crate) fn validate_relative_filename(name: &str, field: &str) -> Result<()> {
     let valid_chars = !name.is_empty()
         && !name.starts_with('.')
         && !name.contains("..")
@@ -735,6 +735,7 @@ pub struct ObjectManifest {
     pub guid: u32,
     pub price: u16,
     pub object_type: u16,
+    pub catalog_sort_flags: u16,
     pub objd_id: u16,
     pub ttab_id: u16,
     pub slot_id: u16,
@@ -750,6 +751,8 @@ pub struct ObjectManifest {
     pub main: Option<TreeRef>,
     pub scripts: Vec<String>,
     pub sprite: SpriteSpec,
+    /// Optional additional graphic states emitted at `dgrp_id + 1..` (`OBJD.num_graphics`).
+    pub extra_graphics: Vec<SpriteSpec>,
     pub interactions: Vec<InteractionSpec>,
     pub slots: Vec<SlotSpec>,
     pub sounds: Vec<SoundSpec>,
@@ -1061,6 +1064,7 @@ impl ObjectManifest {
             guid,
             price,
             object_type,
+            catalog_sort_flags: 0,
             objd_id,
             ttab_id,
             slot_id,
@@ -1076,6 +1080,7 @@ impl ObjectManifest {
             main,
             scripts,
             sprite,
+            extra_graphics: Vec::new(),
             interactions,
             slots,
             sounds,

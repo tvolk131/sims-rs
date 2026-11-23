@@ -1,6 +1,6 @@
-//! In-memory structured high-level lifter from raw `BHAV` bytecode into
-//! structured high-level `.antics` source text (`if`/`else`, `while`, `return`,
-//! named `Expression` assignments/comparisons, readable primitives, and `call`),
+//! In-memory structured lifter from raw `BHAV` bytecode into structured
+//! `.air` (Antics IR) source text (`if`/`else`, `while`, `return`, named
+//! `Expression` assignments/comparisons, readable primitives, and `call`),
 //! with ZERO raw `op 0xNNNN` instructions.
 //!
 //! Strictly in-memory: never writes any lifted representation to disk.
@@ -539,8 +539,14 @@ fn lift_instruction(
 /// structured `.antics` source text (recovering `if`/`else`, `while`, `return`,
 /// named `Expression`s, readable primitives, and `call` — ZERO raw `op` lines!).
 ///
+/// Alias for [`lift_bhav_structured`] emphasizing that lifted output is `.air` (Antics IR).
+#[must_use]
+pub fn lift_bhav_air_structured(chunk: &BhavChunk) -> StructuredLiftOutcome {
+    lift_bhav_structured(chunk)
+}
+
 /// Uses a metadata-only synthetic label `Tree_<id>` so no commercial strings
-/// ever appear in the generated source text.
+/// ever appear in the generated `.air` (Antics IR) source text.
 #[must_use]
 pub fn lift_bhav_structured(chunk: &BhavChunk) -> StructuredLiftOutcome {
     let Some((max_args, max_locals)) = format_limits(chunk.format) else {
