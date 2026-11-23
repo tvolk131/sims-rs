@@ -21,7 +21,7 @@ use sims_sim::neighbors::{FAMILY, KIND, Row};
 use sims_ui::art::Art;
 use sims_ui::neighborhood::{BarButton, BarLayout};
 use sims_ui::shop::ShopCommand;
-use sims_vm::SpecialPanelRequest;
+use sims_vm::{SpecialPanelRequest, SpecialPanelResponse};
 use std::path::{Path, PathBuf};
 
 const SIZE: [i32; 2] = [800, 600];
@@ -329,8 +329,36 @@ fn wave2_panels_open_and_draw_with_native_art() {
         &world,
         &before,
     );
-    let charms = game.shop_snapshot().expect("charm").items.len();
-    assert!(charms > 0, "the charm transform lists outfits");
+    // `cWinCharmDlg` (`0x536a6b`) steps eight costume presets, starting at
+    // preset 0; for an adult man preset 0 is suit 48 (`0x5374d3`), and an
+    // immediate OK sends it (`0x5373df`).
+    let charm = game.shop_snapshot().expect("charm").clone();
+    assert_eq!(charm.items.len(), 8, "the Charm has eight presets");
+    assert_eq!(
+        charm.tried_on_item_id.as_deref(),
+        Some("special_charm:0"),
+        "the Charm opens on preset 0"
+    );
+    // The arrows wrap through all eight: previous from preset 0 is 7.
+    assert!(game.shop_select_prev(), "the previous arrow moves");
+    assert_eq!(
+        game.shop_snapshot()
+            .expect("charm")
+            .tried_on_item_id
+            .as_deref(),
+        Some("special_charm:7"),
+        "previous wraps from preset 0 to 7"
+    );
+    assert!(game.shop_select_next(), "the next arrow moves");
+    game.shop_submit();
+    assert_eq!(
+        game.preview_special_panel_reply(),
+        Some(&SpecialPanelResponse::Selection {
+            accepted: true,
+            index: 48,
+        }),
+        "OK on preset 0 sends suit 48 for an adult man"
+    );
 
     // A dog in Mortimer's place, so the pet picker has a skeleton to turn.
     if let Some(guid) = dog_guid(&install) {
@@ -354,7 +382,7 @@ fn wave2_panels_open_and_draw_with_native_art() {
         assert!(game.shop_dialog().chosen_item(&snap).is_none());
         assert_eq!(
             game.shop_dialog().submit(&snap),
-            Some(ShopCommand::KeepCurrent),
+            Some(ShopCommand::NoSelection),
             "OK with no breed in the view answers -1"
         );
         assert_eq!(snap.preview_label.as_deref(), Some("Current outfit"));

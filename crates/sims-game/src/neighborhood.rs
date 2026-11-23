@@ -1722,17 +1722,19 @@ impl NeighborhoodShell {
         let size = [size[0].max(1), size[1].max(1)];
         let changed = self.size != size;
         self.size = size;
+        if changed {
+            // The shell's notice (also the one over the Photo Album on a
+            // lot) is centred on the window.
+            self.relayout_dialog();
+        }
         if let ActiveScreen::Lot(session) = &mut self.screen {
             return session.game.resize(size) || changed;
         }
-        if changed {
-            self.relayout_dialog();
-            if matches!(self.screen, ActiveScreen::Neighborhood) {
-                if let Some(point) = self.pointer {
-                    let _ = self.hover(point);
-                }
-                self.refresh_hovered_lot();
+        if changed && matches!(self.screen, ActiveScreen::Neighborhood) {
+            if let Some(point) = self.pointer {
+                let _ = self.hover(point);
             }
+            self.refresh_hovered_lot();
         }
         changed
     }
@@ -2522,6 +2524,11 @@ impl NeighborhoodShell {
                 }
                 return self.credits_dialog.scroll(delta, snapshot).is_some();
             }
+            return false;
+        }
+        if self.album_notice_open() {
+            // A notice over the album takes the wheel too: nothing behind
+            // it scrolls.
             return false;
         }
         if self.album_dialog.is_open() {
@@ -6097,6 +6104,7 @@ impl NeighborhoodShell {
             preview_label: None,
             hide_wallet_and_prices: true,
             choice: None,
+            body_shapes: Vec::new(),
         });
         self.import_picker.open();
         true
@@ -6117,7 +6125,7 @@ impl NeighborhoodShell {
             // The import picker is a list, never a choice dialog.
             ShopCommand::TryOn { .. }
             | ShopCommand::RotatePreview(_)
-            | ShopCommand::KeepCurrent => ShellOutcome::redraw(),
+            | ShopCommand::NoSelection => ShellOutcome::redraw(),
             ShopCommand::Buy { item_id, .. } => {
                 let Some(entry) = self.import_picker_entries.get(&item_id).cloned() else {
                     return ShellOutcome::redraw();
@@ -6386,6 +6394,10 @@ impl NeighborhoodShell {
             .family_token(&nh_id, family_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("family {family_id} not found in neighborhood {nh_id:?}"))?;
+        // A fresh view, as native's new `cWinScrapbook` is (see
+        // `PhotoAlbumDialog::reset_view`).
+        self.album_dialog.reset_view();
+        self.album_strip_scroll = 0;
         let (snapshot, has_image) = self.build_album_snapshot(&nh_id, family_id, None)?;
         self.clear_hover_state();
         if let ActiveScreen::Lot(session) = &mut self.screen {
@@ -6398,6 +6410,7 @@ impl NeighborhoodShell {
         self.album_strip_pressed = None;
         self.album_dialog.open(&snapshot);
         self.album_snapshot = Some(snapshot);
+        self.hydrate_album_images();
         Ok(())
     }
 

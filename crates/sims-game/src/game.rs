@@ -217,6 +217,15 @@ pub struct SpecialLotEntry {
     pub zoning: i16,
 }
 
+/// What a choice dialog's view opens on.
+enum ChoiceOpening {
+    /// The person as they are, with the first item equal to their current
+    /// row chosen (`0x56d3d9`, then `0x56d852` on OK), or none.
+    Current(Option<ShopPreviewTarget>),
+    /// The first item: the Charm's preset 0.
+    First,
+}
+
 /// Outfit / skin / pet target resolved for live 3D "Try On" turntable preview rendering.
 #[derive(Debug, Clone)]
 struct ShopPreviewTarget {
@@ -316,6 +325,9 @@ pub struct Game {
     /// Where the last Camera Mode lot click was (`0x4ab80d` records the
     /// pointer at `+0x4c4`/`+0x4c8`), for [`Game::take_photo`]'s frame.
     photo_point: Option<[i32; 2]>,
+    /// What the last synthetic special-panel preview would have sent the VM
+    /// ([`Game::preview_special_panel`]), for tests.
+    preview_reply: Option<SpecialPanelResponse>,
     /// The object the pointer last reached on the lot, if it is still on
     /// it.
     reached: Option<u16>,
@@ -1085,6 +1097,7 @@ impl Game {
             highlighted_relationships: BTreeSet::new(),
             pointer: None,
             photo_point: None,
+            preview_reply: None,
             reached: None,
             listed: None,
             highlighted: None,
@@ -1476,6 +1489,7 @@ impl Game {
             highlighted_relationships: BTreeSet::new(),
             pointer: None,
             photo_point: None,
+            preview_reply: None,
             reached: None,
             listed: None,
             highlighted: None,
@@ -1823,6 +1837,7 @@ impl Game {
             highlighted_relationships: BTreeSet::new(),
             pointer: None,
             photo_point: None,
+            preview_reply: None,
             reached: None,
             listed: None,
             highlighted: None,
@@ -2031,6 +2046,7 @@ impl Game {
             highlighted_relationships: BTreeSet::new(),
             pointer: None,
             photo_point: None,
+            preview_reply: None,
             reached: None,
             listed: None,
             highlighted: None,
@@ -9211,6 +9227,7 @@ impl Game {
             preview_label: None,
             hide_wallet_and_prices: false,
             choice: None,
+            body_shapes: Vec::new(),
         });
         self.shop_preview_yaw_deg = 0;
         self.shop_preview_body = None;
@@ -9341,7 +9358,7 @@ impl Game {
         }
         match cmd {
             // Community shops are lists, never choice dialogs.
-            ShopCommand::Cancel | ShopCommand::KeepCurrent => {
+            ShopCommand::Cancel | ShopCommand::NoSelection => {
                 self.close_shop();
                 self.hud.play(crate::hud::CLICK);
                 let sounds = self.hud.take_sounds();
@@ -10083,7 +10100,16 @@ impl Game {
     #[doc(hidden)]
     pub fn preview_special_panel(&mut self, request: SpecialPanelRequest, world: &sims_sim::World) {
         self.close_special_panel_ui();
+        self.preview_reply = None;
         self.open_special_panel_ui(0, request, world, None, true);
+    }
+
+    /// What the last preview panel would have answered the VM, had a request
+    /// opened it: the reply [`Game::answer_special_panel`] got while
+    /// previewing.
+    #[doc(hidden)]
+    pub fn preview_special_panel_reply(&self) -> Option<&SpecialPanelResponse> {
+        self.preview_reply.as_ref()
     }
 
     /// Whether the open special panel is a synthetic preview rather than a
@@ -10261,6 +10287,15 @@ impl Game {
                 let (items, responses, preview_targets) =
                     self.build_wardrobe_picker_items(world, *person, *mode);
                 let current = self.current_look(world, *person, wardrobe_mode_row(*mode), None);
+                let shapes = items
+                    .iter()
+                    .map(|item| {
+                        preview_targets
+                            .get(&item.id)
+                            .map(|t| body_shape(&t.suit).to_owned())
+                            .unwrap_or_default()
+                    })
+                    .collect();
                 self.open_special_picker(
                     tick,
                     request,
@@ -10271,7 +10306,8 @@ impl Game {
                     items,
                     responses,
                     preview_targets,
-                    current,
+                    shapes,
+                    ChoiceOpening::Current(current),
                     preview,
                 );
             }
@@ -10284,6 +10320,7 @@ impl Game {
                     .and_then(|o| self.person_body_string(o.guid, 0))
                     .filter(|s| !s.trim().is_empty());
                 let current = self.current_look(world, *pet, 1, skeleton);
+                // Pets' arrows skip no body shape (`0x40d265`: kind 2 and up).
                 self.open_special_picker(
                     tick,
                     request,
@@ -10294,7 +10331,8 @@ impl Game {
                     items,
                     responses,
                     preview_targets,
-                    current,
+                    Vec::new(),
+                    ChoiceOpening::Current(current),
                     preview,
                 );
             }
@@ -10315,10 +10353,10 @@ impl Game {
             }
             SpecialPanelRequest::CharmTransform { person } => {
                 let shopper = self.person_display_name(world, *person);
-                let (items, responses, preview_targets) =
-                    self.build_charm_transform_items(world, *person);
-                // `0x5372d4`: the charm's view is kind 0, the everyday body.
-                let current = self.current_look(world, *person, 1, None);
+                let (items, responses) = Self::build_charm_transform_items(world, *person);
+                // The costumes are dressed by the VM's suit table
+                // (`0x58a948..0x58d475`), which the preview cannot reach:
+                // the view names the costume instead.
                 self.open_special_picker(
                     tick,
                     request,
@@ -10328,8 +10366,9 @@ impl Game {
                     shopper,
                     items,
                     responses,
-                    preview_targets,
-                    current,
+                    BTreeMap::new(),
+                    Vec::new(),
+                    ChoiceOpening::First,
                     preview,
                 );
             }
@@ -10348,7 +10387,8 @@ impl Game {
         items: Vec<ShopItem>,
         responses: BTreeMap<String, SpecialPanelResponse>,
         preview_targets: BTreeMap<String, ShopPreviewTarget>,
-        current: Option<ShopPreviewTarget>,
+        body_shapes: Vec<String>,
+        opening: ChoiceOpening,
         preview: bool,
     ) {
         self.ensure_shop_assets();
@@ -10366,18 +10406,26 @@ impl Game {
         // the view's outfit (`0x56d852` → `0x40d0a4` and its kin compare
         // suit and texture, ignoring case): the first item equal to the
         // person's current row, or none (`-1`).
-        let shown_id = choice.and(current.as_ref()).and_then(|look| {
-            let key = outfit_key(look.row.as_deref()?);
-            items
-                .iter()
-                .find(|item| {
-                    preview_targets
-                        .get(&item.id)
-                        .and_then(|t| t.row.as_deref())
-                        .is_some_and(|row| outfit_key(row) == key)
-                })
-                .map(|item| item.id.clone())
-        });
+        // The Charm's view opens on its first preset instead (`0x536afe`
+        // zeroes it, `0x5372d9` shows it).
+        let (current, shown_id) = match opening {
+            ChoiceOpening::Current(current) => {
+                let shown = choice.and(current.as_ref()).and_then(|look| {
+                    let key = outfit_key(look.row.as_deref()?);
+                    items
+                        .iter()
+                        .find(|item| {
+                            preview_targets
+                                .get(&item.id)
+                                .and_then(|t| t.row.as_deref())
+                                .is_some_and(|row| outfit_key(row) == key)
+                        })
+                        .map(|item| item.id.clone())
+                });
+                (current, shown)
+            }
+            ChoiceOpening::First => (None, items.first().map(|item| item.id.clone())),
+        };
         self.shop_snapshot = Some(ShopSnapshot {
             kind,
             title_override,
@@ -10392,6 +10440,7 @@ impl Game {
             // tree charges (if anything), so never show a bogus `$0` wallet.
             hide_wallet_and_prices: true,
             choice,
+            body_shapes,
         });
         self.shop_preview_yaw_deg = 0;
         self.shop_preview_body = None;
@@ -10497,6 +10546,7 @@ impl Game {
         if self.previewing_special_panel() {
             // A synthetic preview panel never answers a real VM request,
             // even one that happens to be waiting.
+            self.preview_reply = Some(response);
             self.close_special_panel_ui();
             return false;
         }
@@ -10610,7 +10660,7 @@ impl Game {
                 self.keep_sounds(sounds);
                 Outcome::redraw()
             }
-            ShopCommand::KeepCurrent => {
+            ShopCommand::NoSelection => {
                 // OK with none of the items in the view: index `-1`.
                 let mut keep = special_panel_cancel_response(&active.request);
                 if let SpecialPanelResponse::Selection { accepted, index } = &mut keep {
@@ -11145,25 +11195,54 @@ impl Game {
             .map(|s| s.trim().to_owned())
     }
 
-    /// `Dialog` kind 14 (`0x536a6b`): the caller's own Create-a-Sim body list
-    /// (everyday `b` bodies matching sex, age and skin tone, native order,
-    /// uncapped). No MagiCoin price: the charm, not the picker, pays.
+    /// `Dialog` kind 14 (`cWinCharmDlg`, `0x536a6b`): the Charm's eight
+    /// costume presets, not the wardrobe. The preset starts at 0
+    /// (`0x536afe`), the arrows step it through `0..=7` with wrap
+    /// (`0x537384`, `0x5373a7`), and each preset is a suit number by the
+    /// person's age and sex (`0x5374d3`, [`charm_suit`]). That number is
+    /// what the view wears (`0x56d819` writes it to person word 8) and what
+    /// OK and Cancel send (`0x5373df`, `0x5373fc`: `[view + 0x1b0]`).
     fn build_charm_transform_items(
-        &mut self,
         world: &sims_sim::World,
         person: u16,
-    ) -> (
-        Vec<ShopItem>,
-        BTreeMap<String, SpecialPanelResponse>,
-        BTreeMap<String, ShopPreviewTarget>,
-    ) {
-        let (female, child) = Self::person_sex_and_age(world, person);
-        let skin = self.person_skin_tone(world, person);
-        let outfits = self
-            .ensure_ordered_wardrobe()
-            .map(|w| category_outfits(w, b'b', female, child, &skin))
+    ) -> (Vec<ShopItem>, BTreeMap<String, SpecialPanelResponse>) {
+        let data = world
+            .objects
+            .get(&person)
+            .and_then(|o| o.person.as_ref())
+            .map(|p| p.data.as_slice())
             .unwrap_or_default();
-        Self::outfit_picker_items("special_charm", person, outfits)
+        let word = |idx: usize| data.get(idx).copied().unwrap_or(0);
+        // `0x5374de`: word 65 (`+0x60e`) equal to 1; `0x5374eb..0x5374fb`:
+        // word 58 (`+0x600`, the age) from 1 to 17.
+        let female = word(sims_sim::neighbors::KIND) == 1;
+        let age = word(58);
+        let child = age != 0 && age < 18;
+        let mut items = Vec::with_capacity(8);
+        let mut responses = BTreeMap::new();
+        for preset in 0..8 {
+            let suit = charm_suit(preset, female, child);
+            let id = format!("special_charm:{preset}");
+            items.push(ShopItem {
+                id: id.clone(),
+                name: charm_costume_label(suit).to_owned(),
+                description: String::new(),
+                price: 0,
+                currency: CurrencyKind::Simoleons,
+                icon: None,
+                supports_try_on: true,
+                owned: false,
+                available: true,
+            });
+            responses.insert(
+                id,
+                SpecialPanelResponse::Selection {
+                    accepted: true,
+                    index: suit,
+                },
+            );
+        }
+        (items, responses)
     }
 
     /// Builds the call-eligible neighbor list for the native Phonebook
@@ -11178,8 +11257,8 @@ impl Game {
     /// where a neighbor is. It filters by family (`0x522ea1`), kind and a
     /// relationship row with values (`0x522f17`), and skips a neighbor whose
     /// GUID no longer resolves to a definition (`0x523011` after
-    /// `0x43ac10`) or whose type's catalog name is empty (`0x523064`; the
-    /// port reads the name as the Sim's display name). See
+    /// `0x43ac10`) or whose type's catalog name is empty (`0x523064`,
+    /// read as native does by [`Game::catalog_name`]). See
     /// [`phonebook_eligible`]. Each target is judged by
     /// its first row, as `0x464f74` finds it, and listed once.
     ///
@@ -11230,9 +11309,10 @@ impl Game {
                 }
                 // `0x52304c..0x523064`: a neighbor whose type has an empty
                 // catalog name (`0x4573d9`) is not listed.
-                let name = self
-                    .neighbor_display_name(record.guid)
-                    .filter(|name| !name.is_empty())?;
+                let name = self.catalog_name(world, record.guid);
+                if name.is_empty() {
+                    return None;
+                }
                 Some({
                     let daily = row.values.first().copied().unwrap_or(0);
                     let lifetime = row.values.get(1).copied().unwrap_or(0);
@@ -11260,6 +11340,78 @@ impl Game {
             prev_label: "<".into(),
             next_label: ">".into(),
             empty_message,
+        }
+    }
+
+    /// The catalog name of person type `guid`, as `0x4573d9` reads it for
+    /// the Phonebook's check (`0x52304c`): `0x457d3b` asks `0x4061e3`,
+    /// which reads the definition's `CATS` resource (name is its second
+    /// string, `0x40631f..0x406352`) or else `CTSS` slot 1 in the game's
+    /// language (`0x470ca7(0, 0)`, `0x471411(1, -1)`); a person whose name
+    /// is still empty retries every language (`0x4062c1..0x4062f8`), and
+    /// `0x457d3b` falls back to the definition's own name, the `OBJD`
+    /// chunk label. A type Make New Character made reads the name it was
+    /// given (`0x44b0e8`), which the port keeps instead of a file.
+    fn catalog_name(&self, world: &sims_sim::World, guid: u32) -> String {
+        if let Some(name) = self.lot.character_names().get(&guid)
+            && !name.is_empty()
+        {
+            return name.clone();
+        }
+        let catalog = self.assets.catalog();
+        let Some(object) = catalog.object(world.characters.definition(guid)) else {
+            return String::new();
+        };
+        let Some(bytes) = self
+            .assets
+            .index()
+            .resources
+            .get(object.resource)
+            .and_then(|r| r.read().ok())
+        else {
+            return String::new();
+        };
+        let Ok(iff) = sims_formats::iff::Iff::parse(bytes) else {
+            return String::new();
+        };
+        let Some(chunk) = iff.get(b"OBJD", object.chunk) else {
+            return String::new();
+        };
+        let data = iff.data(chunk);
+        // Definition word 41 (`+0x52`) names the catalog strings.
+        let table = data
+            .get(0x52..0x54)
+            .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+        let name = if let Some(cats) = iff.get(b"CATS", table) {
+            iff.data(cats)
+                .split(|&b| b == 0)
+                .nth(1)
+                .map(|raw| sims_formats::strings::decode(raw, US_ENGLISH))
+                .unwrap_or_default()
+        } else {
+            iff.get(b"CTSS", table)
+                .and_then(|ctss| sims_formats::strings::StringTable::parse(iff.data(ctss)).ok())
+                .map(|strings| {
+                    let first = strings.get(0, US_ENGLISH).unwrap_or_default().to_owned();
+                    if !first.is_empty() || object.kind != 2 {
+                        return first;
+                    }
+                    let mut languages: Vec<u8> =
+                        strings.entries.iter().map(|e| e.language).collect();
+                    languages.dedup();
+                    languages
+                        .into_iter()
+                        .filter_map(|language| strings.get(0, language))
+                        .find(|s| !s.is_empty())
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .unwrap_or_default()
+        };
+        if name.is_empty() {
+            chunk.label.clone()
+        } else {
+            name
         }
     }
 
@@ -13884,6 +14036,56 @@ fn outfit_key(row: &str) -> (String, String) {
 /// the filter of `ImportWardrobe::pick` (`0x409663`) — a 9-byte suit prefix
 /// `<first>NNN<sex|u><age>xxx` and textures `<prefix><skin>…` — with the
 /// category letter in place of `b`.
+/// A wardrobe suit's body shape as the clothing dialog's arrows read it:
+/// up to three characters after the first six (`0x40d1f0..0x40d1fc`,
+/// `b004mafit_01` → `fit`). The port's suit names are those of its
+/// wardrobe list ([`category_outfits`]).
+fn body_shape(suit: &str) -> &str {
+    let bytes = suit.as_bytes();
+    let start = bytes.len().min(6);
+    let end = bytes.len().min(9);
+    suit.get(start..end).unwrap_or("")
+}
+
+/// The Charm Transform's suit for `preset` (`0x5374d3`): children
+/// alternate one costume with the skeleton (60), adults pick from an
+/// eight-entry table by sex (jump tables `0x537595` and `0x5375b5`).
+fn charm_suit(preset: usize, female: bool, child: bool) -> i16 {
+    const MALE: [i16; 8] = [48, 58, 44, 45, 39, 46, 47, 40];
+    const FEMALE: [i16; 8] = [48, 43, 44, 49, 39, 50, 51, 52];
+    match (child, preset.is_multiple_of(2)) {
+        (true, true) if female => 54,
+        (true, true) => 53,
+        (true, false) => 60,
+        (false, _) if female => FEMALE[preset % 8],
+        (false, _) => MALE[preset % 8],
+    }
+}
+
+/// A name for a Charm costume, from its body in the VM's suit table
+/// (`sims_vm` `costume_spec`, `0x58a948..0x58d475`). Native shows no name;
+/// the port shows it while the view cannot draw the costume.
+fn charm_costume_label(suit: i16) -> &'static str {
+    match suit {
+        39 => "Blue Genie",
+        40 => "Minotaur",
+        43 | 58 => "Vampire",
+        44 => "Werewolf",
+        45 => "Headless",
+        46 => "Troll",
+        47 => "Hunchback",
+        48 => "Sorcerer",
+        49 => "Witch",
+        50 => "Ogress",
+        51 => "Crone",
+        52 => "Nymph",
+        53 => "Goblin",
+        54 => "Wizard Girl",
+        60 => "Skeleton",
+        _ => "Costume",
+    }
+}
+
 fn category_outfits(
     wardrobe: &sims_content::ImportWardrobe,
     first: u8,

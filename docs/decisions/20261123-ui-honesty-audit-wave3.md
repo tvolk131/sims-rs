@@ -72,6 +72,16 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
    - Each arrow steps the selection and tries the item on. The arrows
      wrap at both ends, as native's do (`0x40d229` past the last goes to
      the first, `0x40d360` before the first goes to the last).
+   - **Body shape.** Every kind's arrows (`0x40d19b`, `0x40d2d3`,
+     `0x40d62c` and their kin) take the shown outfit's body shape, the
+     three characters after the suit name's first six, and pass over
+     outfits whose shape differs (case-sensitive `strcmp`,
+     `0x40d6fa..0x40d714`). An arrow that comes back to the shown outfit
+     leaves the view as it is. `ShopSnapshot::body_shapes` carries the
+     shapes; the items keep their full catalog indices. Kind 0 skips
+     only for a man or woman (`0x40ccac` reads 0 or 1), so pets never
+     skip; our pet and Charm lists carry no shapes. With nothing shown,
+     native reads a shape from before its list; ours steps unfiltered.
    - The view opens on the person as they are (`0x56d3d9` copies them).
      OK and Cancel both send the index of the first item equal to the
      view's outfit (`0x5098b3`, `0x5098d1`; pets `0x522069`, `0x522087`):
@@ -80,11 +90,14 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
      dialog opens with the first item equal to the person's current row
      selected and tried on. A repeated outfit answers its first index.
    - The row is the person's body string for the view kind, a 1-based
-     slot through `0x472ec4`: everyday 1 (Wardrobe mode 0, Charm
-     `0x5372d4` and the pet dialog `0x521fd8`, all kind 0), then formal
+     slot through `0x472ec4`: everyday 1 (Wardrobe mode 0 and the pet
+     dialog `0x521fd8`, both kind 0), then formal
      30, swim 31, pajamas 32, winter 33 and high fashion 34.
    - When no item matches, the view shows the person as they are and no
-     item is chosen. OK then answers `-1` (`ShopCommand::KeepCurrent`);
+     item is chosen. OK then answers `-1` (`ShopCommand::NoSelection`,
+     the native `-1` reply; what it means is the caller's: Make New
+     Character draws a random breed for the pet dialog's `-1`,
+     `0x44b064..0x44b09b`);
      the next arrow goes to the first item and the previous arrow to the
      last (`0x40d1bb` starts from `-1`). Cancel sends the shown index, or
      `-1`, as native does.
@@ -92,8 +105,23 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
      `0, 4, 2, 5, 0x11, 0x12`, whose lists filter by the letters at
      `0x6c0fac` (`B F S L W H`). Mode 1 lists formal and mode 2 swimwear;
      Wave 2 had them swapped. The `SpecialPanelRequest::WardrobeShop`
-     doc in `sims-vm` still says 1 is swimwear; that crate is outside
-     this track.
+     doc in `sims-vm` said 1 was swimwear; it is corrected here (a doc
+     line only).
+   - **Charm Transform** (`cWinCharmDlg`, `0x536a6b`) is not the
+     wardrobe. It steps eight costume presets: the preset starts at 0
+     (`0x536afe`), the arrows step it through `0..=7` with wrap
+     (`0x537368`), and `0x5374d3` maps it to a suit by sex (person word
+     65 equal to 1) and age (word 58 from 1 to 17 is a child). Adult men
+     wear `[48, 58, 44, 45, 39, 46, 47, 40]`, adult women
+     `[48, 43, 44, 49, 39, 50, 51, 52]`, children 53 (boy) or 54 (girl)
+     on even presets and 60 on odd ones. `0x56d819` dresses the view in
+     the suit, and OK and Cancel both send it (`[view + 0x1b0]`,
+     `0x5373df`, `0x5373fc`), so an immediate OK on an adult answers 48,
+     which the VM writes to the calling script's `temp[0]`.
+     `ui_wave2_snapshots` checks that reply.
+   - The dresser's apply path calls Generic Sims Call 24, which the VM
+     does not implement; that is routed to Track 2's generic-routine
+     work.
    - **Not native:** when the view cannot render (a pet without a
      skeleton, a missing mesh), the view names the item, so OK never
      accepts an unseen choice.
@@ -131,6 +159,13 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
    - A notice raised while the album is open is the shell's dialog,
      drawn above the album and answered before it (pointer, Enter,
      Escape and typed keys).
+   - Native builds a fresh `cWinScrapbook` on every open (`new` at
+     `0x4d2100` and `0x503e9e`; the constructor `0x52a4c9` zeroes its
+     state). Ours resets the album's view on open (selection, drafts,
+     strip offset) and loads the opening strip's thumbnails, so a
+     reopened album is never blank.
+   - A notice over the album also takes the wheel, so nothing behind it
+     scrolls, and it is laid out again when the window is resized.
    - The album loads thumbnails for the strip the dialog draws. The
      shell's copy of the strip offset is now read from the dialog, so a
      refresh can no longer move the loaded window away from the shown
@@ -167,8 +202,12 @@ the 1.91 disassembly, and the installed assets. The pet skeleton naming in
        (`0x43ac10`). Ours uses the catalog through
        `Characters::definition`.
      - `0x52304c..0x523064`: the type's catalog name (`0x4573d9`) is
-       not empty. Ours reads the Sim's display name (Make New Character
-       names, then the catalog name the HUD loaded).
+       not empty. Ours reads it as native does (`Game::catalog_name`):
+       the name Make New Character gave a made type, else the
+       definition's `CATS` (its second string) or `CTSS` slot 1 in US
+       English, then for a person every other language
+       (`0x4061e3`), then the definition's own name, the `OBJD` label
+       (`0x457d3b`). The listed name is the same string.
    - Each neighbor is listed once, judged by their first row.
 
 ## Oracle tour
@@ -196,9 +235,9 @@ choice dialogs. All three were inspected by eye.
 - **Choice dialogs.**
   - The size of the frame and its border.
   - The pet view's size; the dialog-area source is not traced.
-  - That Charm Transform (kind 14) uses `cWinClothingChoiceDlg`. This is
-    inferred; the call path through `0x4417xx` would not disassemble
-    cleanly.
+  - That `cWinCharmDlg` (`0x536a6b`) lays out like
+    `cWinClothingChoiceDlg`. Its presets and reply are traced; its art
+    and button positions are not.
   - The turntable. Native's `cWin3DView` spins; ours shows a still pose.
   - What the `cWin3DView` parameter (3.25 for Sims, 5.0 for pets) means.
     We treat it as a zoom and scale pets by 5.0/3.25. If it is a camera
@@ -224,6 +263,11 @@ choice dialogs. All three were inspected by eye.
   reading above, so we left them alone.
 - **No oracle shot** shows the wardrobe, charm or pet dialog, or a second
   roof page.
+- **Charm preview.** The view should wear the preset's costume
+  (`0x56d819`). The costume suits live in `sims-vm`'s crate-private
+  outfit table, so the UI cannot dress the preview; the view names the
+  costume instead. Exposing a costume preview from `sims-vm` is left for
+  the VM track.
 - **Camera quality.** Native passes Low/Medium/High as 20/50/90
   (`0x4cfc53`) with the photo to the album writer (`0x4a9144` →
   `0x4ed79c`, entry `+8`), which hands it to its JPEG file writer

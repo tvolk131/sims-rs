@@ -447,6 +447,23 @@ impl PhotoAlbumDialog {
         self.focus = None;
     }
 
+    /// Forgets the last opening's view: no selection (the first photo is
+    /// chosen on the next sync), no draft, and the strip at its start.
+    /// Native builds a new `cWinScrapbook` for every opening (`0x4d2100`,
+    /// `0x503e9e` → `0x52a4c9`, which zeroes its state), so nothing of an
+    /// earlier opening carries over.
+    pub fn reset_view(&mut self) {
+        self.selected_id = None;
+        self.draft_title.clear();
+        self.draft_caption.clear();
+        self.title_cursor = 0;
+        self.caption_cursor = 0;
+        self.caption_scroll_line = 0;
+        self.dirty = false;
+        self.pending_delete = None;
+        self.strip_scroll = 0;
+    }
+
     /// The first thumbnail the strip shows (its horizontal scroll).
     pub fn strip_scroll(&self) -> usize {
         self.strip_scroll

@@ -375,6 +375,12 @@ pub struct ShopSnapshot {
     pub hide_wallet_and_prices: bool,
     /// Draws the native choice dialog instead of the list.
     pub choice: Option<ChoiceDialog>,
+    /// A choice dialog's body shapes, one per item: the three characters
+    /// of its suit name after the first six (`b004mafit_01` → `fit`), which
+    /// the clothing dialog's arrows match against the shown item's
+    /// (`0x40d1e5`, `0x40d24f`, compared with `strcmp` at `0x40d280`).
+    /// Empty when the arrows skip nothing: the pet and Charm dialogs.
+    pub body_shapes: Vec<String>,
 }
 
 /// Typed commands emitted by [`ShopPickerDialog`] for `sims-game` / `sims-vm`.
@@ -392,10 +398,12 @@ pub enum ShopCommand {
     },
     /// Close the shop picker without purchasing.
     Cancel,
-    /// A choice dialog's OK while none of its items is in the view: the
-    /// person keeps the look they opened it in. Native answers index `-1`
-    /// (`0x5098b3`: `0x56d852` finds no item equal to the view's outfit).
-    KeepCurrent,
+    /// A choice dialog's OK while none of its items is in the view: native
+    /// answers index `-1` (`0x5098b3`: `0x56d852` finds no item equal to the
+    /// view's outfit). What `-1` means is the caller's: the pet dialog's
+    /// `-1` makes Make New Character draw a random breed
+    /// (`0x44b064..0x44b09b`).
+    NoSelection,
 }
 
 /// Interactive hit targets inside [`ShopPickerDialog`].
@@ -529,7 +537,7 @@ impl ShopPickerDialog {
     }
 
     /// Chooses no item. A choice dialog then shows the person as they
-    /// are, its OK answers [`ShopCommand::KeepCurrent`], and its arrows
+    /// are, its OK answers [`ShopCommand::NoSelection`], and its arrows
     /// start from before the first item (`0x40d1bb`: next from `-1` is
     /// item 0; previous wraps to the last).
     pub fn clear_selection(&mut self) {
@@ -682,7 +690,7 @@ impl ShopPickerDialog {
             return None;
         }
         if snapshot.choice.is_some() && self.chosen_item(snapshot).is_none() {
-            return Some(ShopCommand::KeepCurrent);
+            return Some(ShopCommand::NoSelection);
         }
         if !self.can_buy_selected(snapshot) {
             return None;
@@ -1017,7 +1025,7 @@ impl ShopPickerDialog {
             }
             ShopHit::BuyButton => {
                 if snapshot.choice.is_some() && self.chosen_item(snapshot).is_none() {
-                    return Some(ShopCommand::KeepCurrent);
+                    return Some(ShopCommand::NoSelection);
                 }
                 let (expected_id, expected_currency, expected_price) = pressed_item?;
                 if !self.can_buy_selected(snapshot) {
@@ -1044,10 +1052,18 @@ impl ShopPickerDialog {
 
     /// A choice dialog's arrow: the next or previous item, wrapping at
     /// either end as native does (`0x40d229` past the last goes to the
-    /// first, `0x40d360` before the first goes to the last). The item is
-    /// always tried on, so the view (or its fallback) follows the
-    /// selection even when no picture can be rendered. None only when
-    /// there is nothing to move to.
+    /// first, `0x40d360` before the first goes to the last).
+    ///
+    /// With [`ShopSnapshot::body_shapes`], items of another body shape than
+    /// the shown one are passed over (`0x40d27a..0x40d28c`); an arrow that
+    /// comes back to the shown item without finding one leaves the view as
+    /// it is (`0x40d222`). With no item shown, next goes to the first item
+    /// and previous to the last, unfiltered (native reads a shape from
+    /// before its list there).
+    ///
+    /// The item moved to is always tried on, so the view (or its fallback)
+    /// follows the selection even when no picture can be rendered. None
+    /// when there is nothing to move to.
     pub fn choose(&mut self, snapshot: &ShopSnapshot, next: bool) -> Option<ShopCommand> {
         let count = snapshot.items.len();
         if count == 0 {
@@ -1056,10 +1072,25 @@ impl ShopPickerDialog {
         let current = self
             .chosen_item(snapshot)
             .and_then(|item| snapshot.items.iter().position(|i| i.id == item.id));
+        let step = |idx: usize| {
+            if next {
+                (idx + 1) % count
+            } else {
+                (idx + count - 1) % count
+            }
+        };
         let to = match current {
-            Some(_) if count < 2 => return None,
-            Some(idx) if next => (idx + 1) % count,
-            Some(idx) => (idx + count - 1) % count,
+            Some(idx) => {
+                let shapes = (snapshot.body_shapes.len() == count).then_some(&snapshot.body_shapes);
+                let mut to = step(idx);
+                while to != idx && shapes.is_some_and(|shapes| shapes[to] != shapes[idx]) {
+                    to = step(to);
+                }
+                if to == idx {
+                    return None;
+                }
+                to
+            }
             None if next => 0,
             None => count - 1,
         };

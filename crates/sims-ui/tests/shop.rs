@@ -88,6 +88,7 @@ fn sample_boutique_snapshot() -> ShopSnapshot {
         preview_label: None,
         hide_wallet_and_prices: false,
         choice: None,
+        body_shapes: Vec::new(),
     }
 }
 
@@ -186,6 +187,19 @@ fn choice_dialog_is_a_view_between_arrows_with_ok_and_cancel() {
     let mut single = snap.clone();
     single.items.truncate(1);
     assert_eq!(dialog.choose(&single, true), None);
+    // The wardrobe's arrows pass over outfits of another body shape
+    // (`0x40d6fa..0x40d714`), keeping each outfit's own place in the list.
+    let mut shaped = snap.clone();
+    shaped.body_shapes = vec!["fit".into(), "fat".into(), "fit".into()];
+    let mut arrows = dialog.clone();
+    arrows.select_item("formal_01");
+    assert_eq!(arrows.choose(&shaped, true), try_on("formal_03"));
+    assert_eq!(arrows.choose(&shaped, true), try_on("formal_01"));
+    assert_eq!(arrows.choose(&shaped, false), try_on("formal_03"));
+    // The only `fat` outfit: an arrow comes back to it and nothing moves.
+    arrows.select_item("formal_02");
+    assert_eq!(arrows.choose(&shaped, true), None);
+    assert_eq!(arrows.choose(&shaped, false), None);
 
     // Cancel closes without buying.
     let mut cancelled = dialog.clone();
@@ -309,6 +323,7 @@ fn magic_vendor_magicoins_and_negative_price_guard() {
         preview_label: None,
         hide_wallet_and_prices: false,
         choice: None,
+        body_shapes: Vec::new(),
     };
 
     let mut dialog = ShopPickerDialog::new();

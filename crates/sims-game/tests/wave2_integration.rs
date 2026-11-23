@@ -1236,6 +1236,37 @@ fn wave2_large_photo_album_60_snapshots_and_loading_presenter() {
         );
     }
     shell.close_photo_album();
+
+    // Native builds a fresh `cWinScrapbook` on every open (`0x4d2100`,
+    // `0x52a4c9` zeroes its state): the album reopens at its start, its
+    // first photo chosen, with the strip's thumbnails loaded.
+    shell.open_photo_album().expect("reopen the Goths' album");
+    assert_eq!(
+        shell.album_dialog().strip_scroll(),
+        0,
+        "reopens at the start"
+    );
+    let reopened = shell.album_snapshot().expect("album");
+    assert_eq!(
+        shell.album_dialog().selected_id(),
+        Some(reopened.entries[0].id)
+    );
+    assert!(reopened.entries[0].image.is_some(), "the first photo shows");
+    for (idx, entry) in reopened.entries.iter().enumerate().take(slots) {
+        assert!(
+            entry.thumbnail.is_some(),
+            "reopened strip slot {idx} shows a loaded thumbnail"
+        );
+    }
+    // A notice over the album takes the wheel: the strip behind stays put.
+    shell.show_notice("Photo Album", "A notice over the album.");
+    assert!(!shell.wheel(-1.0), "the wheel does not reach the album");
+    assert_eq!(shell.album_dialog().strip_scroll(), 0);
+    shell.escape();
+    assert!(shell.album_open(), "Escape closes only the notice");
+    assert!(shell.wheel(-1.0), "with the notice gone the strip scrolls");
+    assert_eq!(shell.album_dialog().strip_scroll(), 1);
+    shell.close_photo_album();
     shell
         .enqueue_background_lot_save(sims_sim::autosave::SaveTarget::Manual)
         .expect("enqueue manual lot save");
