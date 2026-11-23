@@ -99,16 +99,29 @@ pub struct ScriptError {
 }
 
 /// What play mode did with an object after its error.
+///
+/// For faults outside `pass()` (`end_of_update` and daily rollover), Play Mode
+/// reuses the existing variants with the following convention:
+/// - [`Recovery::Reset`]: non-terminal fallback recovery (dynamic-group forced
+///   unlink before normal removal, auto-answering/dismissing a non-modal or
+///   unported dialog, reconciling selection/global 3 after a reselection fault,
+///   or daily rollover / grass-growth fallback).
+/// - [`Recovery::Parked`]`(None)`: an object queued for removal was
+///   force-removed after a missing definition or failed `remove_now` (it is no
+///   longer on the lot).
+/// - [`Recovery::Parked`]`(Some(fault))`: a surviving person could not restart
+///   at `Main` during forced-removal recovery and was parked with `fault`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Recovery {
     /// What the original does: the other objects were told and the object
-    /// was reset.
+    /// was reset (or, outside `pass()`, a non-terminal fallback completed).
     Reset,
     /// The reset failed with this fault; the object's thread restarted at
     /// Main instead.
     Restarted(Fault),
-    /// The object was parked and is never ticked again: it faulted on its
-    /// first tick after a reset, or (with this fault) even restarting its
+    /// The object was parked (or force-removed in `end_of_update`) and is
+    /// never ticked again: it faulted on its first tick after a reset, was
+    /// force-removed on a failed deletion, or (with this fault) restarting its
     /// thread failed.
     Parked(Option<Fault>),
 }

@@ -71,8 +71,8 @@ use crate::interpreter::{Interpreter, Status, Stream};
 use crate::placement::Refreshing;
 use crate::play::{Play, Recovery, ScriptError};
 use crate::primitives::dialog::{
-    self, CALL_NEIGHBOR_CANCELLED, DONE, InlineSpecialPanel, NEW, SHOWN, SPECIAL_PANEL_ACCEPTED,
-    SPECIAL_PANEL_CANCELLED, SpecialPanelRequest, SpecialPanelResponse,
+    self, CALL_NEIGHBOR_CANCELLED, DONE, FIRST, InlineSpecialPanel, NEW, SHOWN,
+    SPECIAL_PANEL_ACCEPTED, SPECIAL_PANEL_CANCELLED, SpecialPanelRequest, SpecialPanelResponse,
 };
 use crate::primitives::ui_effect::UiEffectEvent;
 use crate::selection::{publish_waited_for, selected};
@@ -1298,6 +1298,12 @@ impl Interpreter<'_> {
         mut play: Option<&mut Play>,
         update: &mut Update,
     ) -> Result<(), TickError> {
+        if play.is_some() {
+            world
+                .dialogs
+                .records
+                .retain(|record| world.objects.contains_key(&record.caller));
+        }
         loop {
             let records = &mut world.dialogs.records;
             let Some(index) = records
@@ -1307,6 +1313,10 @@ impl Interpreter<'_> {
                 break;
             };
             if records[index].status == DONE {
+                records.remove(index);
+                continue;
+            }
+            if play.is_some() && !world.objects.contains_key(&records[index].caller) {
                 records.remove(index);
                 continue;
             }
@@ -1358,7 +1368,14 @@ impl Interpreter<'_> {
                 let msg =
                     format!("object {caller}'s dialog is of a kind that is not ported (0x436da0)");
                 if play.is_some() {
-                    record.status = DONE;
+                    // An informing dialog already branched; a yielding dialog
+                    // needs `FIRST` so its caller consumes the answer once on
+                    // its next tick instead of recreating the record forever.
+                    record.status = if dialog::informs(&record.operands) {
+                        DONE
+                    } else {
+                        FIRST
+                    };
                     update.errors.push(ScriptError {
                         tick: world.ticks,
                         object: caller,
@@ -1382,7 +1399,14 @@ impl Interpreter<'_> {
                      while the game runs is not ported (0x436da0)"
                 );
                 if play.is_some() {
-                    record.status = DONE;
+                    // For a non-modal choice dialog (`!informs`), supply
+                    // `FIRST` so the yielding caller advances on its next turn
+                    // and then marks the record `DONE`.
+                    record.status = if dialog::informs(&record.operands) {
+                        DONE
+                    } else {
+                        FIRST
+                    };
                     update.errors.push(ScriptError {
                         tick: world.ticks,
                         object: caller,
@@ -1482,9 +1506,13 @@ impl Interpreter<'_> {
                                 then: None,
                                 recovery: Recovery::Parked(None),
                             });
-                            for gone in self.force_remove_object(world, id) {
+                            for gone in self.force_remove_object(world, id, &mut update.errors) {
                                 play.fresh.remove(&gone);
                             }
+                            world
+                                .dialogs
+                                .records
+                                .retain(|r| world.objects.contains_key(&r.caller));
                             update.removed.push(id);
                             continue;
                         }
@@ -1505,7 +1533,7 @@ impl Interpreter<'_> {
                             fault,
                             in_thread: false,
                             then: None,
-                            recovery: Recovery::Parked(None),
+                            recovery: Recovery::Reset,
                         });
                         crate::placement::unlink_tile_force(world, id);
                     } else {
@@ -1515,6 +1543,10 @@ impl Interpreter<'_> {
                 if !world.objects.contains_key(&id) {
                     if let Some(play) = play.as_deref_mut() {
                         play.fresh.remove(&id);
+                        world
+                            .dialogs
+                            .records
+                            .retain(|r| world.objects.contains_key(&r.caller));
                     }
                     update.removed.push(id);
                     continue;
@@ -1540,17 +1572,24 @@ impl Interpreter<'_> {
                             recovery: Recovery::Parked(None),
                         });
                         for part in group_parts {
-                            for gone in self.force_remove_object(world, part) {
+                            for gone in self.force_remove_object(world, part, &mut update.errors) {
                                 play.fresh.remove(&gone);
                             }
                         }
                         if world.objects.contains_key(&id) {
-                            for gone in self.force_remove_object(world, id) {
+                            for gone in self.force_remove_object(world, id, &mut update.errors) {
                                 play.fresh.remove(&gone);
                             }
                         }
                         play.fresh.remove(&id);
                     }
+                    // Drop any orphaned dialog records left by deleted held
+                    // children, multi-tile partners, or removal callbacks that
+                    // posted an informing dialog on an object being removed.
+                    world
+                        .dialogs
+                        .records
+                        .retain(|r| world.objects.contains_key(&r.caller));
                 } else {
                     self.remove_now(world, id)?;
                 }
@@ -1584,9 +1623,11 @@ impl Interpreter<'_> {
         };
         if reselect {
             let before = selected(world);
+            let mut reselect_faulted = false;
             let chosen = match self.select_next_resident(world) {
                 Ok(chosen) => chosen,
                 Err(fault) if play.is_some() => {
+                    reselect_faulted = true;
                     update.errors.push(ScriptError {
                         tick: world.ticks,
                         object: fault.object,
@@ -1595,10 +1636,12 @@ impl Interpreter<'_> {
                         then: None,
                         recovery: Recovery::Reset,
                     });
-                    if selected(world).is_none()
-                        && let Some(slot) = world.globals.get_mut(3)
-                    {
-                        *slot = 0;
+                    // Reconcile global 3 with the live `selected` flag (for
+                    // example if `select` marked a resident selected before
+                    // faulting on an unported date marker in `move_indicators`).
+                    let reconciled = selected(world).map_or(0, |sim| sim as i16);
+                    if let Some(slot) = world.globals.get_mut(3) {
+                        *slot = reconciled;
                     }
                     None
                 }
@@ -1606,7 +1649,7 @@ impl Interpreter<'_> {
             };
             let after = selected(world);
             if let Some(coop) = self.coop
-                && (chosen.is_some() || after != before)
+                && (chosen.is_some() || after != before || reselect_faulted)
             {
                 let mut ctx = coop.borrow_mut();
                 let host_id = ctx.session.host_id;

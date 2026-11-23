@@ -628,7 +628,10 @@ fn place_test_person(fx: &mut Fixture, person_id: u16) {
         };
         6
     ];
-    sim.person.as_mut().unwrap().data[73] = 0;
+    let person = sim.person.as_mut().unwrap();
+    person.data[73] = 0;
+    person.data[77] = 0; // no active date
+    person.data[81] = 0; // not famous
     fx.program
         .people
         .profiles
@@ -639,35 +642,56 @@ fn place_test_person(fx: &mut Fixture, person_id: u16) {
 }
 
 #[test]
-fn deleting_a_person_releases_head_slot_indicator_instead_of_deleting_it() {
+fn deleting_a_person_handles_head_slot_indicator_without_leaving_stale_indicator_id() {
     let (mut fx, _) = crate::visits::lot();
     let person_id = 50u16;
     place_test_person(&mut fx, person_id);
 
     let interpreter = fx.interpreter();
-    let mut world = fx.world.clone();
-    // Create the lot's indicator pair (`world.indicators = [first, second]`).
-    let [first, _second] = interpreter.create_indicators(&mut world).unwrap();
-    // Put the first indicator into `person_id`'s head slot (slot 2) while
-    // `selected == false` (modeling a date marker / star marker / stale head slot).
-    world.objects.get_mut(&person_id).unwrap().selected = false;
-    world.objects.get_mut(&person_id).unwrap().slots[2].object = first as i16;
-    world.objects.get_mut(&first).unwrap().data[2] = person_id as i16;
-    world.objects.get_mut(&first).unwrap().data[3] = 1;
-    world.objects.get_mut(&first).unwrap().data[14] = 2;
-    world.objects.get_mut(&first).unwrap().data[26] = person_id as i16;
 
-    // Removing `person_id` releases `first` off-lot (`0x4481eb`) rather than
-    // deleting it in `delete_one`'s held-children walk (`0x4410e7`).
-    assert_eq!(interpreter.remove_now(&mut world, person_id), Ok(()));
-    assert!(!world.objects.contains_key(&person_id));
-    assert!(
-        world.objects.contains_key(&first),
-        "indicator {first} must survive person deletion"
-    );
-    assert_eq!(world.indicators[0], first);
-    assert_eq!(world.objects[&first].data[2], 0);
-    assert_eq!(world.objects[&first].position, [-16, -16, 1]);
+    // 1. Deleting a *selected* person deselects it (`0x445449` -> `deselect`),
+    // taking `indicators[0]` off-lot before `0x4410e7` so the plumb bob
+    // survives and remains registered in `world.indicators[0]`.
+    {
+        let mut world = fx.world.clone();
+        let [first, _second] = interpreter.create_indicators(&mut world).unwrap();
+        assert_eq!(interpreter.select(&mut world, Some(person_id)), Ok(()));
+        assert_eq!(world.objects[&person_id].slots[2].object, first as i16);
+        assert_eq!(interpreter.remove_now(&mut world, person_id), Ok(()));
+        assert!(!world.objects.contains_key(&person_id));
+        assert!(
+            world.objects.contains_key(&first),
+            "indicator {first} must survive selected-person deletion"
+        );
+        assert_eq!(world.indicators[0], first);
+        assert_eq!(world.objects[&first].data[2], 0);
+        assert_eq!(world.objects[&first].position, [-16, -16, 1]);
+    }
+
+    // 2. Deleting a *non-selected* person that still holds `first` in slot 2
+    // follows native `0x4410e7` + `0x447d8b -> 0x448097`: `first` is deleted
+    // as a held child and unregistered from `world.indicators[0]` (zeroed), so
+    // subsequent selection/deselection never raises `missing object (0x0a)`.
+    {
+        let mut world = fx.world.clone();
+        let [first, _second] = interpreter.create_indicators(&mut world).unwrap();
+        world.objects.get_mut(&person_id).unwrap().selected = false;
+        world.objects.get_mut(&person_id).unwrap().slots[2].object = first as i16;
+        world.objects.get_mut(&first).unwrap().data[2] = person_id as i16;
+        world.objects.get_mut(&first).unwrap().data[3] = 1;
+        world.objects.get_mut(&first).unwrap().data[14] = 2;
+        world.objects.get_mut(&first).unwrap().data[26] = person_id as i16;
+
+        assert_eq!(interpreter.remove_now(&mut world, person_id), Ok(()));
+        assert!(!world.objects.contains_key(&person_id));
+        assert!(!world.objects.contains_key(&first));
+        assert_eq!(
+            world.indicators[0], 0,
+            "0x447d8b -> 0x448097 must unregister deleted indicator {first}"
+        );
+        // Selecting / deselecting nobody now succeeds without 0x0a.
+        assert_eq!(interpreter.select(&mut world, None), Ok(()));
+    }
 }
 
 #[test]

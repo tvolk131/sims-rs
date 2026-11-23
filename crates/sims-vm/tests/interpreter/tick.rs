@@ -2452,7 +2452,7 @@ fn play_mode_survives_partial_pass_person_removal_and_dialog_owner_removal() {
 
 #[test]
 fn play_mode_survives_daily_rollover_faults_while_strict_mode_fails() {
-    let make_midnight_fx = || {
+    let make_midnight_base = || {
         let mut fx = lot(sleeper());
         // Clock at 23:59:58 so the next full update triggers midnight rollover.
         fx.world.globals[0] = 23; // HOURS
@@ -2462,27 +2462,84 @@ fn play_mode_survives_daily_rollover_faults_while_strict_mode_fails() {
         fx.world.globals[7] = 6; // MONTH
         fx.world.globals[8] = 1997; // YEAR
         fx.world.globals[28] = 0; // DAYS_PLAYED
-        // Unsaved budget day triggers `shift_budget` Trap::Unsupported, and a
-        // missing object ID in `world.order` triggers per-object faults in both
-        // `daily::turn_day` and `day_statistics`.
-        fx.world.budget.days = vec![None; 6];
-        fx.world.order.push(777);
         fx
     };
 
-    let mut strict = make_midnight_fx();
+    // 1. Unsaved budget day ONLY (no missing object in `world.order`), so the
+    // budget fallback diagnostic and shifted day arrays are verified directly.
+    let make_budget_fx = || {
+        let mut fx = make_midnight_base();
+        fx.world.budget.days = vec![Some([7, 0, 0, 0, 0, 0, 0, 0]), None, None, None, None, None];
+        fx
+    };
+    let mut strict_budget = make_budget_fx();
+    let strict_budget_err = update(&mut strict_budget, &mut answers(&[])).unwrap_err();
+    assert!(
+        matches!(
+            strict_budget_err,
+            TickError::Fault(ref f) if matches!(f.trap, Trap::Unsupported(ref msg) if msg.contains("0x46d417"))
+        ),
+        "strict mode must fail on unsaved budget day: {strict_budget_err:?}"
+    );
+    let mut played_budget = make_budget_fx();
+    let mut play_budget = Play::default();
+    let ub1 = play_update(&mut played_budget, &mut play_budget);
+    assert!(ub1.full);
+    assert!(
+        ub1.errors.iter().any(|e| matches!(
+            e.fault.trap,
+            Trap::Unsupported(ref msg) if msg.contains("0x46d417")
+        ) && e.recovery == Recovery::Reset),
+        "expected unsaved budget diagnostic with Recovery::Reset, got {:?}",
+        ub1.errors
+    );
+    assert_eq!(played_budget.world.budget.days[0], Some([0; 8]));
+    assert_eq!(
+        played_budget.world.budget.days[1],
+        Some([7, 0, 0, 0, 0, 0, 0, 0])
+    );
+    for day in &played_budget.world.budget.days[2..] {
+        assert_eq!(*day, Some([0; 8]));
+    }
+    assert_eq!(
+        (
+            played_budget.world.globals[0],
+            played_budget.world.globals[5],
+            played_budget.world.globals[6],
+            played_budget.world.globals[1],
+            played_budget.world.globals[28],
+        ),
+        (0, 0, 0, 11, 1)
+    );
+    let ub2 = play_update(&mut played_budget, &mut play_budget);
+    assert!(ub2.full && ub2.errors.is_empty());
+
+    // 2. Missing object ID in `world.order` triggers per-object faults in both
+    // `daily::turn_day_play` and `day_statistics_play` without halting.
+    let make_missing_fx = || {
+        let mut fx = make_midnight_base();
+        fx.world.budget.days = vec![Some([0; 8]); 6];
+        fx.world.order.push(777);
+        fx
+    };
+    let mut strict = make_missing_fx();
     let strict_err = update(&mut strict, &mut answers(&[])).unwrap_err();
     assert!(
-        matches!(strict_err, TickError::Fault(_)),
-        "strict mode must fail on daily rollover fault: {strict_err:?}"
+        matches!(strict_err, TickError::Fault(ref f) if f.object == 777),
+        "strict mode must fail on missing object 777 during daily rollover: {strict_err:?}"
     );
 
-    let mut played = make_midnight_fx();
+    let mut played = make_missing_fx();
     let mut play = Play::default();
     let u1 = play_update(&mut played, &mut play);
     assert!(u1.full);
-    assert!(!u1.errors.is_empty());
-    // The clock still turned to 00:00:00 on day 11, days_played == 1.
+    assert!(
+        u1.errors
+            .iter()
+            .any(|e| e.object == 777 && e.recovery == Recovery::Reset),
+        "expected missing-object 777 diagnostic, got {:?}",
+        u1.errors
+    );
     assert_eq!(
         (
             played.world.globals[0],
@@ -2493,7 +2550,6 @@ fn play_mode_survives_daily_rollover_faults_while_strict_mode_fails() {
         ),
         (0, 0, 0, 11, 1)
     );
-    // Subsequent tick runs cleanly.
     let u2 = play_update(&mut played, &mut play);
     assert!(u2.full && u2.errors.is_empty());
 }
@@ -2505,15 +2561,33 @@ fn play_mode_catches_dynamic_group_leave_group_fault_and_removes_tile() {
 
     let make_dyn_fx = || {
         let mut fx = lot(sleeper());
-        // Give LAMP a definition with word[10] != 0 (multi-tile group) and a
-        // faulting callback function 8 (DYNAMIC_GROUP).
-        fx.program
-            .libraries
-            .get_mut(&LAMP_FILE)
-            .unwrap()
-            .definitions
-            .get_mut(&128)
-            .unwrap()[10] = 1;
+        fx.world.size = 64;
+        let empty_grid = || sims_formats::lot::Array {
+            width: 64,
+            height: 64,
+            stride: 2,
+            encoding: 0,
+            data: vec![0; 64 * 64 * 2],
+        };
+        fx.world.arrays.insert(3, empty_grid());
+        fx.world.arrays.insert(103, empty_grid());
+        fx.world.rooms.map = [vec![0; 64 * 64], vec![0; 64 * 64]];
+        fx.world.rooms.rooms.insert(
+            0,
+            sims_sim::rooms::Room {
+                outdoors: true,
+                ..Default::default()
+            },
+        );
+        // Give LAMP a definition with word[10] != 0 (multi-tile group), a
+        // catalog master OBJD (word[11] == -1), and a faulting callback
+        // function 8 (DYNAMIC_GROUP).
+        let lib = fx.program.libraries.get_mut(&LAMP_FILE).unwrap();
+        lib.definitions.get_mut(&128).unwrap()[10] = 1;
+        let mut master_def = lib.definitions[&128];
+        master_def[11] = -1;
+        lib.definitions.insert(129, master_def);
+        lib.definition_order.push(129);
         fx.add(LAMP_FILE, 4098, tree(vec![ins(2, ERROR, ERROR, [0; 8])]));
         let mut callbacks = vec![
             ObjectFunction {
@@ -2564,14 +2638,16 @@ fn play_mode_catches_dynamic_group_leave_group_fault_and_removes_tile() {
     let mut strict = make_dyn_fx();
     assert!(update(&mut strict, &mut answers(&[])).is_err());
 
-    // Play Mode catches the `leave_group` fault, unlinks LAMP cleanly without
-    // deleting surviving partner tile 90, removes LAMP, and keeps ticking!
+    // Play Mode catches the `leave_group` fault (recorded as Recovery::Reset
+    // because LAMP is unlinked and then removed normally), does not delete
+    // surviving partner tile 90, removes LAMP, and keeps ticking!
     let mut played = make_dyn_fx();
     let mut play = Play::default();
     let u1 = play_update(&mut played, &mut play);
     assert!(u1.full);
     assert_eq!(u1.removed, vec![LAMP]);
-    assert!(!u1.errors.is_empty());
+    assert_eq!(u1.errors.len(), 1);
+    assert_eq!(u1.errors[0].recovery, Recovery::Reset);
     assert!(!played.world.objects.contains_key(&LAMP));
     assert!(played.world.objects.contains_key(&90));
     assert_eq!(
@@ -2580,4 +2656,770 @@ fn play_mode_catches_dynamic_group_leave_group_fault_and_removes_tile() {
     );
     let u2 = play_update(&mut played, &mut play);
     assert!(u2.full && u2.errors.is_empty());
+}
+
+#[test]
+fn play_mode_forced_removal_preserves_promoted_tile_neighbor_after_move_tree_fault() {
+    use sims_formats::saved_objects::Slot;
+
+    let mut fx = lot(sleeper());
+    // Give LAMP's definition a non-zero inset (word 24 = 4) so `move_tree`
+    // rejects diagonal facing 1 (`Trap::Unsupported`) AFTER `take_off_one` has
+    // already promoted slot-0 neighbor `B` to the grid head of tile (2, 3, 1)!
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .definitions
+        .get_mut(&128)
+        .unwrap()[24] = 4;
+
+    // Make sure the lot has an object grid (array 3, 64*64*2 bytes) and rooms.
+    fx.world.size = 64;
+    let empty_grid = || sims_formats::lot::Array {
+        width: 64,
+        height: 64,
+        stride: 2,
+        encoding: 0,
+        data: vec![0; 64 * 64 * 2],
+    };
+    fx.world.arrays.insert(3, empty_grid());
+    fx.world.arrays.insert(103, empty_grid());
+    // Ensure room_at(OFF_LOT) succeeds so `move_tree` reaches `footprint` and
+    // faults on diagonal facing with insets (after `relink` promoted `B`).
+    fx.world.rooms.map = [vec![0; 64 * 64], vec![0; 64 * 64]];
+    fx.world.rooms.rooms.insert(
+        0,
+        sims_sim::rooms::Room {
+            outdoors: true,
+            ..Default::default()
+        },
+    );
+
+    let tile_pos = [2 * 16 + 8, 3 * 16 + 8, 1];
+    let cell = ((2 * 64 + 3) * 2) as usize;
+    let b_id = 90u16;
+    let mut b = fx.lamp().clone();
+    b.id = b_id;
+    b.position = tile_pos;
+    b.data[1] = 0; // valid cardinal facing
+    b.data[2] = 0;
+    b.data[3] = -1;
+    b.data[14] = 0; // slot 0 behind LAMP
+    b.data[26] = LAMP as i16;
+    b.slots = vec![Slot {
+        unknown: 0,
+        object: 0,
+    }];
+    b.set_countdown(5);
+    fx.world.objects.insert(b_id, b);
+    fx.world.order.push(b_id);
+
+    let lamp = fx.lamp_mut();
+    lamp.set_countdown(5);
+    lamp.position = tile_pos;
+    lamp.data[1] = 10; // facing > 9 -> `footprint` faults with insets after B is promoted!
+    lamp.data[2] = 0;
+    lamp.data[3] = -1;
+    lamp.data[14] = -1;
+    lamp.data[26] = 0;
+    lamp.slots = vec![Slot {
+        unknown: 0,
+        object: b_id as i16,
+    }];
+    // Grid cell (2, 3, 1) holds LAMP as head, with B behind it in slot 0.
+    fx.world.arrays.get_mut(&3).unwrap().data[cell..cell + 2].copy_from_slice(&LAMP.to_le_bytes());
+    fx.world.removals = vec![LAMP];
+
+    let mut play = Play::default();
+    let u1 = play_update(&mut fx, &mut play);
+    assert!(u1.full);
+    assert_eq!(u1.removed, vec![LAMP]);
+    assert_eq!(u1.errors.len(), 1);
+    assert_eq!(u1.errors[0].recovery, Recovery::Parked(None));
+    assert!(!fx.world.objects.contains_key(&LAMP));
+    assert!(fx.world.objects.contains_key(&b_id));
+    // Crucial: B was promoted to the grid cell by `take_off_one`'s `relink`
+    // before `move_tree` faulted, and `force_remove_object` MUST NOT erase B!
+    let head_bytes: [u8; 2] = fx.world.arrays[&3].data[cell..cell + 2].try_into().unwrap();
+    assert_eq!(
+        u16::from_le_bytes(head_bytes),
+        b_id,
+        "surviving neighbor {b_id} must remain grid head after forced removal of {LAMP}"
+    );
+    assert_eq!(fx.world.objects[&b_id].data[26], 0);
+    assert_eq!(fx.world.objects[&b_id].data[14], -1);
+}
+
+#[test]
+fn play_mode_failed_dynamic_unlink_repairs_surviving_tiles_when_intermediate_missing() {
+    use sims_formats::execution::ObjectFunction;
+    use sims_formats::saved_objects::Multipart;
+
+    let mut fx = lot(sleeper());
+    fx.world.size = 64;
+    let empty_grid = || sims_formats::lot::Array {
+        width: 64,
+        height: 64,
+        stride: 2,
+        encoding: 0,
+        data: vec![0; 64 * 64 * 2],
+    };
+    fx.world.arrays.insert(3, empty_grid());
+    fx.world.arrays.insert(103, empty_grid());
+    fx.world.rooms.map = [vec![0; 64 * 64], vec![0; 64 * 64]];
+    fx.world.rooms.rooms.insert(
+        0,
+        sims_sim::rooms::Room {
+            outdoors: true,
+            ..Default::default()
+        },
+    );
+    let lib = fx.program.libraries.get_mut(&LAMP_FILE).unwrap();
+    lib.definitions.get_mut(&128).unwrap()[10] = 1;
+    let mut master_def = lib.definitions[&128];
+    master_def[11] = -1;
+    lib.definitions.insert(129, master_def);
+    lib.definition_order.push(129);
+    let mut callbacks = vec![
+        ObjectFunction {
+            condition: 0,
+            action: 0,
+        };
+        9
+    ];
+    callbacks[1].action = 4096;
+    callbacks[8].action = 4096; // valid DYNAMIC_GROUP callback
+    lib.callbacks.insert(128, callbacks);
+
+    // Damaged chain: LAMP (A) -> 91 (B, MISSING!) -> 92 (C, live with C.parent = LAMP).
+    let mut c = fx.lamp().clone();
+    c.id = 92;
+    c.position = [-16, -16, 1];
+    c.data[2] = 0;
+    c.slots.truncate(1);
+    c.set_countdown(5);
+    c.multipart = Some(Multipart {
+        parent: LAMP as i16,
+        group: [2, 0, 0],
+        offset: [2, 0, 0],
+    });
+    fx.world.objects.insert(92, c);
+    fx.world.order.push(92);
+    fx.world.next_parts.insert(LAMP, 91);
+    fx.world.next_parts.insert(91, 92);
+
+    let lamp = fx.lamp_mut();
+    lamp.set_countdown(5);
+    lamp.position = [-16, -16, 1];
+    lamp.data[2] = 0;
+    lamp.slots.truncate(1);
+    lamp.multipart = Some(Multipart {
+        parent: 0,
+        group: [0, 0, 0],
+        offset: [0, 0, 0],
+    });
+    fx.world.removals = vec![LAMP];
+
+    let mut play = Play::default();
+    let u1 = play_update(&mut fx, &mut play);
+    assert!(u1.full);
+    assert_eq!(u1.removed, vec![LAMP]);
+    assert_eq!(u1.errors.len(), 1);
+    assert_eq!(u1.errors[0].recovery, Recovery::Reset);
+    assert!(!fx.world.objects.contains_key(&LAMP));
+    assert!(fx.world.objects.contains_key(&92));
+    // B -> C must be cleaned out and C promoted to standalone lead (`parent == 0`).
+    assert!(!fx.world.next_parts.contains_key(&91));
+    assert!(!fx.world.next_parts.contains_key(&LAMP));
+    assert_eq!(fx.world.objects[&92].multipart.as_ref().unwrap().parent, 0);
+    let u2 = play_update(&mut fx, &mut play);
+    assert!(u2.full && u2.errors.is_empty());
+}
+
+#[test]
+fn play_mode_cyclic_adjacent_tile_does_not_hang_dynamic_group_removal() {
+    use sims_formats::execution::ObjectFunction;
+    use sims_formats::saved_objects::{Multipart, Slot};
+
+    let mut fx = lot(sleeper());
+    fx.world.size = 64;
+    fx.world.arrays.insert(
+        3,
+        sims_formats::lot::Array {
+            width: 64,
+            height: 64,
+            stride: 2,
+            encoding: 0,
+            data: vec![0; 64 * 64 * 2],
+        },
+    );
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .definitions
+        .get_mut(&128)
+        .unwrap()[10] = 1;
+    let mut callbacks = vec![
+        ObjectFunction {
+            condition: 0,
+            action: 0,
+        };
+        9
+    ];
+    callbacks[1].action = 4096;
+    callbacks[8].action = 4096;
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .callbacks
+        .insert(128, callbacks);
+
+    // Put surviving dynamic-group partner 90 on tile (4, 4, 1) and two
+    // cyclically-linked objects (95 <-> 96 in slot 0) on adjacent tile (4, 3, 1).
+    let mut partner = fx.lamp().clone();
+    partner.id = 90;
+    partner.position = [4 * 16 + 8, 4 * 16 + 8, 1];
+    partner.data[1] = 0;
+    partner.data[2] = 0;
+    partner.data[14] = -1;
+    partner.data[26] = 0;
+    partner.slots = vec![Slot {
+        unknown: 0,
+        object: 0,
+    }];
+    partner.set_countdown(5);
+    partner.multipart = Some(Multipart {
+        parent: LAMP as i16,
+        group: [1, 0, 0],
+        offset: [1, 0, 0],
+    });
+    let mut x = fx.lamp().clone();
+    x.id = 95;
+    x.position = [4 * 16 + 8, 3 * 16 + 8, 1];
+    x.data[14] = -1;
+    x.data[26] = 0;
+    x.slots = vec![Slot {
+        unknown: 0,
+        object: 96,
+    }];
+    x.set_countdown(5);
+    let mut y = fx.lamp().clone();
+    y.id = 96;
+    y.position = [4 * 16 + 8, 3 * 16 + 8, 1];
+    y.data[14] = 0;
+    y.data[26] = 95;
+    y.slots = vec![Slot {
+        unknown: 0,
+        object: 95,
+    }];
+    y.set_countdown(5);
+
+    fx.world.objects.insert(90, partner);
+    fx.world.objects.insert(95, x);
+    fx.world.objects.insert(96, y);
+    fx.world.order.extend([90, 95, 96]);
+    fx.world.next_parts.insert(LAMP, 90);
+    let adj_cell = ((4 * 64 + 3) * 2) as usize;
+    fx.world.arrays.get_mut(&3).unwrap().data[adj_cell..adj_cell + 2]
+        .copy_from_slice(&95u16.to_le_bytes());
+
+    let lamp = fx.lamp_mut();
+    lamp.set_countdown(5);
+    lamp.position = [-16, -16, 1];
+    lamp.data[2] = 0;
+    lamp.slots.truncate(1);
+    lamp.multipart = Some(Multipart {
+        parent: 0,
+        group: [0, 0, 0],
+        offset: [0, 0, 0],
+    });
+    fx.world.removals = vec![LAMP];
+
+    // Must terminate immediately (no infinite loop!) and catch the cycle fault.
+    let mut play = Play::default();
+    let u1 = play_update(&mut fx, &mut play);
+    assert!(u1.full);
+    assert_eq!(u1.removed, vec![LAMP]);
+    assert!(
+        u1.errors.iter().any(|e| matches!(
+            e.fault.trap,
+            Trap::Invalid(ref msg) if msg.contains("loop")
+        ) && e.recovery == Recovery::Reset),
+        "expected cycle Trap::Invalid with Recovery::Reset, got {:?}",
+        u1.errors
+    );
+    assert!(!fx.world.objects.contains_key(&LAMP));
+}
+
+#[test]
+fn play_mode_non_modal_choice_dialog_advances_caller_on_next_tick() {
+    // LAMP tree:
+    //   0: Dialog(kind = 0, flags = 0x80 => non-modal, !informs) -> true: 1, false: ERROR
+    //   1: temps[0] := 42 -> 2
+    //   2: Sleep(param 0) -> 2
+    let non_modal_choice = [0, 0, 0, 0, 0, 0, 0, 0x80];
+    let mut fx = lot(tree(vec![
+        ins(36, 1, ERROR, non_modal_choice),
+        assign(scope::TEMPS, 0, scope::LITERAL, 42, 2),
+        ins(0, 2, ERROR, [0, 0, 0, 0, 0, 0, 0, 0]),
+    ]));
+
+    let mut play = Play::default();
+    // Tick 1: LAMP yields on the non-modal dialog; end_of_update records ONE
+    // Unsupported error and marks the record `FIRST` (2) so LAMP can consume it.
+    let u1 = play_update(&mut fx, &mut play);
+    assert!(u1.full);
+    assert_eq!(u1.errors.len(), 1);
+    assert_eq!(u1.errors[0].recovery, Recovery::Reset);
+    assert_eq!(fx.world.dialogs.records.len(), 1);
+    assert_eq!(fx.world.dialogs.records[0].status, 2); // FIRST
+
+    // Tick 2: LAMP consumes `FIRST`, branches true, writes temps[0] = 42, and
+    // marks the record `DONE` (cleaned up at end_of_update); zero new errors!
+    let u2 = play_update(&mut fx, &mut play);
+    assert!(u2.full, "{:?}", u2.errors);
+    assert!(u2.errors.is_empty(), "{:?}", u2.errors);
+    assert_eq!(fx.lamp().temps[0], 42);
+    assert!(fx.world.dialogs.records.is_empty());
+}
+
+#[test]
+fn play_mode_cleans_orphaned_dialogs_from_held_children_and_removal_callbacks() {
+    use sims_formats::execution::ObjectFunction;
+    use sims_formats::saved_objects::Slot;
+
+    let mut fx = lot(sleeper());
+    fx.world.size = 64;
+    let empty_grid = || sims_formats::lot::Array {
+        width: 64,
+        height: 64,
+        stride: 2,
+        encoding: 0,
+        data: vec![0; 64 * 64 * 2],
+    };
+    fx.world.arrays.insert(3, empty_grid());
+    fx.world.arrays.insert(103, empty_grid());
+    fx.world.rooms.map = [vec![0; 64 * 64], vec![0; 64 * 64]];
+    fx.world.rooms.rooms.insert(
+        0,
+        sims_sim::rooms::Room {
+            outdoors: true,
+            ..Default::default()
+        },
+    );
+    // LAMP's Reset tree (4097) posts an informing dialog owned by LAMP itself
+    // (operand 7 bit 0 = 1) and succeeds cleanly (`RETURN_TRUE`).
+    fx.add(
+        LAMP_FILE,
+        4097,
+        tree(vec![ins(36, RETURN_TRUE, ERROR, [0, 0, 0, 0, 0, 0, 0, 1])]),
+    );
+    let callbacks = [0, 4096, 0, 4097].map(|action| ObjectFunction {
+        condition: 0,
+        action,
+    });
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .callbacks
+        .insert(128, callbacks.to_vec());
+
+    // Held child 91 sits in LAMP's slot 1 and owns an unanswered NEW dialog.
+    let mut child = fx.lamp().clone();
+    child.id = 91;
+    child.position = [-16, -16, 1];
+    child.data[2] = LAMP as i16;
+    child.data[3] = 0;
+    child.data[14] = 1;
+    child.data[26] = LAMP as i16;
+    child.slots = vec![Slot {
+        unknown: 0,
+        object: 0,
+    }];
+    child.set_countdown(5);
+    fx.world.objects.insert(91, child);
+    fx.world.order.push(91);
+
+    let lamp = fx.lamp_mut();
+    lamp.set_countdown(5);
+    lamp.position = [-16, -16, 1];
+    lamp.data[2] = 0;
+    lamp.slots = vec![
+        Slot {
+            unknown: 0,
+            object: 0,
+        },
+        Slot {
+            unknown: 0,
+            object: 91,
+        },
+    ];
+    // Pre-existing SHOWN dialog on held child 91 (not LAMP!) plus an already-
+    // orphaned dialog on non-existent object 999.
+    fx.world.dialogs.records.push(Dialog {
+        caller: 91,
+        operands: dialog(0, 0),
+        status: 1, // SHOWN
+    });
+    fx.world.dialogs.records.push(Dialog {
+        caller: 999,
+        operands: dialog(0, 0),
+        status: 0, // NEW
+    });
+    fx.world.removals = vec![LAMP];
+
+    let mut play = Play::default();
+    let u1 = play_update(&mut fx, &mut play);
+    assert!(u1.full);
+    assert!(u1.errors.is_empty(), "{:?}", u1.errors);
+    assert!(!fx.world.objects.contains_key(&LAMP));
+    assert!(!fx.world.objects.contains_key(&91));
+    // All orphaned dialogs (from 999, held child 91, and LAMP's own RESET
+    // callback) must be gone so the next tick never prompts for a dead object.
+    assert!(
+        fx.world.dialogs.records.is_empty(),
+        "orphaned dialogs survived: {:?}",
+        fx.world.dialogs.records
+    );
+    let u2 = play_update(&mut fx, &mut play);
+    assert!(u2.full && u2.errors.is_empty());
+}
+
+#[test]
+fn play_mode_reselection_fault_reconciles_global_3_with_selected_sim() {
+    use sims_formats::saved_objects::Slot;
+
+    let mut fx = lot(sleeper());
+    fx.world.size = 64;
+    fx.world.globals[9] = 1; // FAMILY = 1
+    fx.world.globals[3] = 0; // SELECTED = 0
+    fx.world.families.push(sims_sim::neighbors::Family {
+        id: 1,
+        house: 1,
+        members: vec![SIM_GUID],
+        friends: 0,
+        stale: false,
+    });
+    // Put indicator objects 383 and 384 in the world; SIM stands off-lot so
+    // `move_indicators` skips head-slot placement and faults on SIM's date
+    // word (`person::DATE = 77`) AFTER `select` already set `SIM.selected = true`!
+    let mut ind0 = fx.lamp().clone();
+    ind0.id = 383;
+    ind0.guid = sims_vm::INDICATORS[0];
+    ind0.position = [-16, -16, 1];
+    ind0.data[2] = 0;
+    ind0.slots = vec![Slot {
+        unknown: 0,
+        object: 0,
+    }];
+    ind0.set_countdown(5);
+    let mut ind1 = ind0.clone();
+    ind1.id = 384;
+    ind1.guid = sims_vm::INDICATORS[1];
+    fx.world.objects.insert(383, ind0);
+    fx.world.objects.insert(384, ind1);
+    fx.world.order.extend([383, 384]);
+    fx.world.indicators = [383, 384];
+
+    let sim = fx.sim_mut();
+    sim.selected = false;
+    sim.position = [-16, -16, 1];
+    sim.person.as_mut().unwrap().data[77] = 1; // DATE != 0 -> unsupported!
+
+    let mut play = Play::default();
+    let u1 = play_update(&mut fx, &mut play);
+    assert!(u1.full);
+    assert_eq!(u1.errors.len(), 1);
+    assert_eq!(u1.errors[0].recovery, Recovery::Reset);
+    assert!(fx.world.objects[&SIM].selected);
+    // Global 3 MUST be reconciled with `selected(world)` == Some(SIM) so it is
+    // not left out of sync at 0!
+    assert_eq!(fx.world.globals[3], SIM as i16);
+
+    // Next tick sees SIM selected (resident) and does not re-fault on reselect!
+    let u2 = play_update(&mut fx, &mut play);
+    assert!(u2.full && u2.errors.is_empty(), "{:?}", u2.errors);
+}
+
+#[test]
+fn removal_scrubs_route_door_and_seat_candidates_preventing_id_reuse() {
+    use sims_formats::execution::ObjectFunction;
+    use sims_sim::route::{Candidate, Context, Route, RouteSlot};
+
+    let mut fx = lot(sleeper());
+    // Give SIM_FILE a valid Main callback (4096) so SIM restarts at Main in
+    // place while Sim 70 (whose definition has Main == 0) is parked instead.
+    fx.program
+        .libraries
+        .get_mut(&SIM_FILE)
+        .unwrap()
+        .callbacks
+        .insert(
+            128,
+            [0, 4096]
+                .map(|action| ObjectFunction {
+                    condition: 0,
+                    action,
+                })
+                .to_vec(),
+        );
+    // LAMP's Reset tree faults so Play Mode exercises `force_remove_object`.
+    fx.add(LAMP_FILE, 4097, tree(vec![ins(2, ERROR, ERROR, [0; 8])]));
+    let callbacks = [0, 4096, 0, 4097].map(|action| ObjectFunction {
+        condition: 0,
+        action,
+    });
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .callbacks
+        .insert(128, callbacks.to_vec());
+
+    // Add a surviving route target (88) and a door (89) to remove alongside
+    // faulting seat LAMP (1), ensuring neither holds SIM in its slots.
+    let mut target = fx.lamp().clone();
+    target.id = 88;
+    target.position = [-16, -16, 1];
+    target.data[2] = 0;
+    target.slots.truncate(1);
+    target.set_countdown(5);
+    let mut door = target.clone();
+    door.id = 89;
+    fx.world.objects.insert(88, target);
+    fx.world.objects.insert(89, door);
+    fx.world.order.extend([88, 89]);
+
+    let lamp = fx.lamp_mut();
+    lamp.set_countdown(5);
+    lamp.position = [-16, -16, 1];
+    lamp.data[2] = 0;
+    lamp.slots.truncate(1);
+
+    let seat_cand = Candidate {
+        position: [16, 16],
+        score: 10,
+        word_c: LAMP as i16,
+        word_e: None,
+    };
+    let stand_cand = Candidate {
+        position: [32, 32],
+        score: 5,
+        word_c: 0,
+        word_e: None,
+    };
+    fx.world.routing.routes.insert(
+        SIM,
+        Route {
+            contexts: vec![Context {
+                candidates: vec![seat_cand, stand_cand],
+                slot: RouteSlot {
+                    offset: [0; 3],
+                    number: 1,
+                    standing: 1,
+                    sitting: 1,
+                    ground: 0,
+                    flags: 0,
+                    snap_target: 0,
+                    proximity: [0; 3],
+                    gradient: 0,
+                    facing: 0,
+                    resolution: 0,
+                },
+                target: 88,
+                person: SIM,
+                chosen: 0, // chose seat LAMP!
+                best: 10,
+                word_58: 0,
+                time: 0,
+                saved: [0; 2],
+                word_68: i32::from(89u16), // door 89
+                start: [0; 3],
+                byte_78: false,
+                objects: [LAMP, 0],
+                byte_84: false,
+                result: 0,
+                word_8c: 0,
+                byte_8e: false,
+                word_94: 0,
+                limit: 0x30,
+                action: 0,
+            }],
+            path: vec![[0, 0], [16, 16]],
+        },
+    );
+    fx.world.removals = vec![LAMP, 89];
+
+    let mut play = Play::default();
+    let u1 = play_update(&mut fx, &mut play);
+    assert!(u1.full);
+    assert!(!fx.world.objects.contains_key(&LAMP));
+    assert!(!fx.world.objects.contains_key(&89));
+
+    // Immediately reuse ID `LAMP` for a brand-new replacement object.
+    let mut replacement = fx.world.objects[&88].clone();
+    replacement.id = LAMP;
+    fx.world.objects.insert(LAMP, replacement);
+
+    let route = &fx.world.routing.routes[&SIM];
+    let ctx = &route.contexts[0];
+    assert_eq!(ctx.target, 88, "surviving target 88 stays intact");
+    assert_eq!(ctx.word_68, 0, "deleted door 89 must be cleared");
+    assert_eq!(ctx.objects[0], 0, "deleted objects[0] must be cleared");
+    assert!(
+        ctx.candidates.iter().all(|c| c.word_c != LAMP as i16),
+        "deleted seat candidate must be removed before ID reuse"
+    );
+    assert_eq!(ctx.candidates.len(), 1);
+    assert_eq!(ctx.chosen, -1, "invalidated chosen seat must reset to -1");
+    assert!(
+        route.path.is_empty(),
+        "path to deleted chosen seat must be cleared"
+    );
+}
+
+#[test]
+fn play_mode_force_removal_repairs_use_counts_callback_free_and_parks_sim_without_main() {
+    use sims_formats::execution::ObjectFunction;
+    use sims_formats::saved_objects::ObjectUse;
+
+    let mut fx = lot(sleeper());
+    // Give SIM_FILE a valid Main callback (4096) so SIM restarts at Main in
+    // place while Sim 70 (whose definition has Main == 0) is parked instead.
+    fx.program
+        .libraries
+        .get_mut(&SIM_FILE)
+        .unwrap()
+        .callbacks
+        .insert(
+            128,
+            [0, 4096]
+                .map(|action| ObjectFunction {
+                    condition: 0,
+                    action,
+                })
+                .to_vec(),
+        );
+    // LAMP's Reset tree faults so Play Mode exercises `force_remove_object`.
+    fx.add(LAMP_FILE, 4097, tree(vec![ins(2, ERROR, ERROR, [0; 8])]));
+    let callbacks = [0, 4096, 0, 4097].map(|action| ObjectFunction {
+        condition: 0,
+        action,
+    });
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .callbacks
+        .insert(128, callbacks.to_vec());
+
+    // Surviving object OTHER (id 80) shares LAMP's faulting Reset tree! If
+    // forced removal ever ran callbacks on OTHER, it would fault/mutate state.
+    let mut other = fx.lamp().clone();
+    other.id = 80;
+    other.position = [-16, -16, 1];
+    other.data[62] = 1; // USERS == 1 (used by SIM)
+    other.set_countdown(5);
+    fx.world.objects.insert(80, other);
+    fx.world.order.push(80);
+
+    // Surviving Sim `SIM` uses both LAMP and OTHER, and has LAMP on its stack.
+    let lamp = fx.lamp_mut();
+    lamp.set_countdown(5);
+    lamp.position = [-16, -16, 1];
+    lamp.data[2] = 0;
+    lamp.slots.truncate(1);
+    lamp.data[62] = 1;
+
+    let sim = fx.sim_mut();
+    sim.set_countdown(5);
+    sim.stack[0].stack_object = LAMP as i16;
+    sim.person.as_mut().unwrap().object_uses = vec![
+        ObjectUse {
+            target: LAMP as i16,
+            stack_depth: 1,
+            unknown: 0,
+        },
+        ObjectUse {
+            target: 80,
+            stack_depth: 1,
+            unknown: 0,
+        },
+    ];
+
+    // Second surviving Sim (id 70) whose definition has NO Main tree (callback
+    // 1 == 0) and whose stack holds `stack_object = LAMP`.
+    let no_main_guid = 0xDEAD_BEEFu32;
+    let no_main_file = 99usize;
+    let mut no_main_def = fx.program.libraries[&SIM_FILE].definitions[&128];
+    no_main_def[9] = 2;
+    let mut lib = sims_vm::Library::default();
+    lib.definitions.insert(128, no_main_def);
+    lib.callbacks.insert(
+        128,
+        vec![
+            ObjectFunction {
+                condition: 0,
+                action: 0,
+            };
+            4
+        ],
+    );
+    fx.program.libraries.insert(no_main_file, lib);
+    fx.catalog.objects.push(sims_content::Object {
+        guid: no_main_guid,
+        resource: no_main_file,
+        chunk: 128,
+        kind: 2,
+        master: 0,
+    });
+    let mut sim_no_main = fx.world.objects[&SIM].clone();
+    sim_no_main.id = 70;
+    sim_no_main.guid = no_main_guid;
+    sim_no_main.set_countdown(5);
+    sim_no_main.set_flags(1, true); // READY
+    sim_no_main.stack[0].stack_object = LAMP as i16;
+    sim_no_main.person.as_mut().unwrap().object_uses.clear();
+    fx.world.objects.insert(70, sim_no_main);
+    fx.world.order.push(70);
+    fx.world.people.push(70);
+
+    fx.world.removals = vec![LAMP];
+
+    let mut play = Play::default();
+    let u1 = play_update(&mut fx, &mut play);
+    assert!(u1.full);
+    assert!(!fx.world.objects.contains_key(&LAMP));
+    // 1. OTHER's USERS counter was repaired back to 0 without running callbacks.
+    assert_eq!(fx.world.objects[&80].data[62], 0);
+    assert!(u1.errors.iter().all(|e| e.object != 80));
+    // 2. SIM's uses were cleared and its stack restarted cleanly at Main.
+    assert!(
+        fx.world.objects[&SIM]
+            .person
+            .as_ref()
+            .unwrap()
+            .object_uses
+            .is_empty()
+    );
+    assert_eq!(fx.world.objects[&SIM].stack[0].stack_object, 0);
+    // 3. Sim 70 (no Main tree) had its stale frame cleared, was parked
+    // (READY bit 0 cleared), and recorded a secondary `Recovery::Parked(Some(_))`
+    // fault in `update.errors`!
+    assert!(fx.world.objects[&70].stack.is_empty());
+    assert_eq!(fx.world.objects[&70].flags() & 1, 0);
+    assert!(
+        u1.errors
+            .iter()
+            .any(|e| e.object == 70 && matches!(e.recovery, Recovery::Parked(Some(_)))),
+        "expected secondary Parked(Some(_)) fault for Sim 70, got {:?}",
+        u1.errors
+    );
+    // Next tick runs cleanly with zero errors.
+    let u2 = play_update(&mut fx, &mut play);
+    assert!(u2.full && u2.errors.is_empty(), "{:?}", u2.errors);
 }

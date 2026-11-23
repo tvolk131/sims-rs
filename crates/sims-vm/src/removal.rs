@@ -40,6 +40,7 @@ use std::collections::BTreeSet;
 
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Machine};
+use crate::play::{Recovery, ScriptError};
 use crate::sounds::SoundEvent;
 use sims_sim::World;
 use sims_sim::rooms::RoomError;
@@ -437,41 +438,15 @@ impl Interpreter<'_> {
             marks.borrow_mut().insert(id);
         }
         self.drop_references(world, id)?;
-        // Record target loss on any surviving route context pointing at `id` so
-        // immediate object-ID reuse before `Go To Routing Slot` next ticks
-        // cannot redirect the route onto an unrelated newly-created object.
-        for route in world.routing.routes.values_mut() {
-            for context in &mut route.contexts {
-                if context.target == id {
-                    context.target = DELETED_ROUTE_TARGET;
-                }
-            }
-        }
+        // Scrub references to `id` in surviving route contexts (target, door
+        // `word_68`, `objects[0]`, and candidate seats `word_c`) so immediate
+        // object-ID reuse before `Go To Routing Slot` next ticks cannot
+        // redirect a surviving route onto a newly-created object.
+        scrub_route_contexts(world, id, false);
         if person {
             self.reset_person_to_delete(world, id)?;
         } else {
             self.reset(world, id, true)?;
-        }
-        // 0x4481eb: release any indicator or pooled star marker sitting in a
-        // person's head slot (slot 2) before `0x4410e7` deletes held children,
-        // so deleting a Sim (such as a famous visitor or date partner) never
-        // destroys the lot's plumb bob (`world.indicators[0]`), date marker
-        // (`world.indicators[1]`), or Superstar star marker pool.
-        if person
-            && world.room_at([OFF_LOT, OFF_LOT, 1]).is_ok()
-            && let Some(held) = world
-                .objects
-                .get(&id)
-                .and_then(|o| o.slots.get(2))
-                .and_then(|s| u16::try_from(s.object).ok())
-                .filter(|&held| held != 0)
-            && world.objects.get(&held).is_some_and(|o| {
-                world.indicators.contains(&held)
-                    || crate::load::INDICATORS.contains(&o.guid)
-                    || o.guid == crate::placement::STAR_MARKER
-            })
-        {
-            self.take_off(world, held, false)?;
         }
         let object = world
             .objects
@@ -505,6 +480,9 @@ impl Interpreter<'_> {
         // The object's destructor stops its sounds (0x4323c9).
         self.sound(SoundEvent::Stop { object: id as i16 });
         world.objects.remove(&id);
+        // 0x447d8b -> 0x448097 (`legacy/crates/sims-vm/src/indicator_unregister.rs`):
+        // unregister a deleted indicator from `world.indicators` so later
+        // selection/deselection never dereferences a missing indicator ID.
         for indicator in &mut world.indicators {
             if *indicator == id {
                 *indicator = 0;
@@ -656,7 +634,12 @@ impl Interpreter<'_> {
     /// multi-tile group and non-indicator held children) cleanly without
     /// running object callbacks so the lot never halts and leaves zero
     /// dangling references.
-    pub(crate) fn force_remove_object(&self, world: &mut World, id: u16) -> Vec<u16> {
+    pub(crate) fn force_remove_object(
+        &self,
+        world: &mut World,
+        id: u16,
+        errors: &mut Vec<ScriptError>,
+    ) -> Vec<u16> {
         let mut to_remove = Vec::new();
         let mut seen = BTreeSet::new();
         let mut queue = std::collections::VecDeque::new();
@@ -768,14 +751,13 @@ impl Interpreter<'_> {
         let mut people_to_recover = BTreeSet::new();
         for &victim in &to_remove {
             let victim_i16 = victim as i16;
-            let (old_tile, is_person, was_selected, is_portal) = match world.objects.get(&victim) {
+            let (old_tile, was_selected, is_portal) = match world.objects.get(&victim) {
                 Some(obj) => (
                     World::tile(obj.position),
-                    obj.person.is_some(),
                     obj.selected,
                     self.is_portal_object(world, victim).unwrap_or(false),
                 ),
-                None => ([0, 0, 1], false, false, false),
+                None => ([0, 0, 1], false, false),
             };
             if world.event_owner == victim {
                 world.event_owner = 0;
@@ -818,19 +800,10 @@ impl Interpreter<'_> {
                     *indicator = 0;
                 }
             }
-            // Scrub route contexts referencing `victim`.
-            for route in world.routing.routes.values_mut() {
-                for context in &mut route.contexts {
-                    if context.target == victim {
-                        context.target = DELETED_ROUTE_TARGET;
-                    }
-                    if is_person && context.objects[1] == victim {
-                        context.byte_84 = true;
-                        context.objects[1] = 0;
-                        context.action = 0;
-                    }
-                }
-            }
+            // Scrub route contexts referencing `victim` (target, door
+            // `word_68`, `objects[0]`, asked person `objects[1]`, and
+            // candidate seats `word_c`).
+            scrub_route_contexts(world, victim, true);
             // Scrub references in all surviving objects.
             let target_i32 = i32::from(victim_i16);
             for (&other_id, obj) in &mut world.objects {
@@ -929,30 +902,142 @@ impl Interpreter<'_> {
                 .retain(|&(other, _)| other != victim);
         }
 
+        // Recover surviving people whose active action, uses, or stack
+        // referenced a force-removed object. Strictly callback-free: resets
+        // state and clears frames in place, installs Main, and explicitly
+        // parks the Sim (recording the secondary fault) if Main cannot be
+        // installed.
         for other in people_to_recover {
-            if world
+            if !world
                 .objects
                 .get(&other)
                 .is_some_and(|o| o.person.is_some())
-                && self.reset_person_after_purge(world, other).is_err()
             {
-                if let Some(route) = world.routing.routes.get_mut(&other) {
-                    route.contexts.clear();
+                continue;
+            }
+            if let Some(route) = world.routing.routes.get_mut(&other) {
+                route.contexts.clear();
+                route.path.clear();
+            }
+            world.headlines.remove(&other);
+            crate::people::clear_person_uses_and_counts(world, other);
+            if let Some(obj) = world.objects.get_mut(&other) {
+                if let Some(slot) = obj.data.get_mut(34) {
+                    *slot = 0;
                 }
-                world.headlines.remove(&other);
-                crate::people::clear_person_uses_and_counts(world, other);
-                if let Some(person) = world
-                    .objects
-                    .get_mut(&other)
-                    .and_then(|o| o.person.as_mut())
-                {
+                if let Some(slot) = obj.data.get_mut(9) {
+                    *slot = 0;
+                }
+                if let Some(person) = obj.person.as_mut() {
                     person.active = crate::object_uses::no_action();
                     person.motive_deltas.clear();
+                    for word in [0, 30, 33, 40, 59, 71, 72] {
+                        if let Some(slot) = person.data.get_mut(word) {
+                            *slot = 0;
+                        }
+                    }
                 }
-                let _ = self.machine(world, other, 0, false).install_main();
+            }
+            // Clear frames unconditionally before attempting `install_main` so
+            // a failure there can never leave a stale frame naming `victim`.
+            if self.machine(world, other, 0, false).clear_frames().is_err() {
+                if let Some(obj) = world.objects.get_mut(&other) {
+                    obj.stack.clear();
+                }
+                world.frame_storage.remove(&other);
+                if world.dirty_frames.contains_key(&other) {
+                    world.dirty_frames.as_mut().remove(&other);
+                }
+            }
+            if let Err(trap) = self.machine(world, other, 0, false).install_main() {
+                if let Some(obj) = world.objects.get_mut(&other) {
+                    obj.stack.clear();
+                    // Park: clear scheduler READY flag (bit 0) so the Sim is
+                    // never ticked again without a valid Main frame.
+                    obj.set_flags(1, false);
+                }
+                world.frame_storage.remove(&other);
+                if world.dirty_frames.contains_key(&other) {
+                    world.dirty_frames.as_mut().remove(&other);
+                }
+                let secondary = Fault {
+                    object: other,
+                    at: None,
+                    trap,
+                };
+                errors.push(ScriptError {
+                    tick: world.ticks,
+                    object: other,
+                    fault: secondary.clone(),
+                    in_thread: false,
+                    then: None,
+                    recovery: Recovery::Parked(Some(secondary)),
+                });
             }
         }
         to_remove
+    }
+}
+
+/// Scrubs references to deleted/removed object `victim` out of all surviving
+/// route contexts so immediate ID reuse cannot redirect a route onto an
+/// unrelated replacement object (target, door `word_68`, `objects[0]`,
+/// optionally asked person `objects[1]`, and candidate seats `word_c`).
+fn scrub_route_contexts(world: &mut World, victim: u16, scrub_asked: bool) {
+    let victim_i16 = victim as i16;
+    let victim_i32 = i32::from(victim);
+    for route in world.routing.routes.values_mut() {
+        let last_index = route.contexts.len().saturating_sub(1);
+        let mut clear_path = false;
+        for (ctx_idx, context) in route.contexts.iter_mut().enumerate() {
+            if context.target == victim {
+                context.target = DELETED_ROUTE_TARGET;
+            }
+            if context.word_68 == victim_i32 {
+                context.word_68 = 0;
+            }
+            if context.objects[0] == victim {
+                context.objects[0] = 0;
+            }
+            if scrub_asked && context.objects[1] == victim {
+                context.byte_84 = true;
+                context.objects[1] = 0;
+                context.action = 0;
+            }
+            if context.candidates.iter().any(|c| c.word_c == victim_i16) {
+                if let Ok(chosen_idx) = usize::try_from(context.chosen) {
+                    if context
+                        .candidates
+                        .get(chosen_idx)
+                        .is_some_and(|c| c.word_c == victim_i16)
+                    {
+                        context.chosen = -1;
+                        context.best = -1;
+                        if ctx_idx == last_index {
+                            clear_path = true;
+                        }
+                    } else {
+                        let removed_before = context.candidates
+                            [..chosen_idx.min(context.candidates.len())]
+                            .iter()
+                            .filter(|c| c.word_c == victim_i16)
+                            .count();
+                        context.chosen = (chosen_idx - removed_before) as i32;
+                    }
+                }
+                context.candidates.retain(|c| c.word_c != victim_i16);
+                if context.candidates.is_empty() {
+                    context.chosen = -1;
+                    context.best = -1;
+                    if ctx_idx == last_index {
+                        clear_path = true;
+                    }
+                }
+            }
+        }
+        if clear_path {
+            route.path.clear();
+        }
     }
 }
 
