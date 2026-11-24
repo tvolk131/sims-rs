@@ -12,12 +12,19 @@
 //!   lowering cleanly to `.air` + IFF metadata.
 
 pub mod ast;
+pub mod decompile;
+pub mod fmt;
 pub mod lexer;
 pub mod loader;
 pub mod lower;
 mod opt;
 pub mod parser;
 
+pub use decompile::{
+    DecompileV2Options, DecompileV2Report, DecompiledTree, TreeCheck, TreeStyle,
+    decompile_iff_to_v2, decompile_iff_to_v2_report,
+};
+pub use fmt::{format_v2_source, is_v2_formatted};
 pub use loader::{PackResolverConfig, ResolvedModule, resolve_v2_file, resolve_v2_source};
 pub use lower::{ExpandedV2Object, VariantSpec, lower_resolved_module};
 pub use parser::parse_v2_file;
