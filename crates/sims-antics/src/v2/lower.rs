@@ -5285,10 +5285,22 @@ impl<'a> TreeLowerer<'a> {
                         self.indent -= 1;
                         self.line("}".to_owned());
                     }
-                    let cond_loc = self.fresh("wcond");
-                    self.line(format!("let {cond_loc} = 0;"));
-                    let cond_res = self.emit_bool_into_local(cond, &cond_loc);
-                    self.line(format!("if {cond_loc} == 0 {{"));
+                    // The condition is tested at the top of every pass. One that lowers to a
+                    // single `.air` condition (a call, `!f()`) needs no local to hold it.
+                    let cond_res = match self.try_lower_negated_simple_air_cond(cond) {
+                        Ok(Some(exit)) => {
+                            self.line(format!("if {exit} {{"));
+                            Ok(())
+                        }
+                        Ok(None) => {
+                            let cond_loc = self.fresh("wcond");
+                            self.line(format!("let {cond_loc} = 0;"));
+                            let r = self.emit_bool_into_local(cond, &cond_loc);
+                            self.line(format!("if {cond_loc} == 0 {{"));
+                            r
+                        }
+                        Err(e) => Err(e),
+                    };
                     self.indent += 1;
                     self.line("break;".to_owned());
                     self.indent -= 1;
@@ -9546,6 +9558,12 @@ impl<'a> TreeLowerer<'a> {
                                 ty: ValueType::I16,
                             });
                         }
+                        "local" if self.lookup_var("local").is_none() => {
+                            return Err(Error::at(
+                                *span,
+                                "'local[N]' is read-only (a raw block writes a numbered local slot; name the local with 'let' instead)",
+                            ));
+                        }
                         // `param[n]`: the call frame's argument word, readable and assignable
                         // inside the frame (positional params, `@frame(args:)`, functionals).
                         "param" if self.lookup_var("param").is_none() => {
@@ -10597,6 +10615,12 @@ impl<'a> TreeLowerer<'a> {
                 let lval = self.resolve_lvalue(expr)?;
                 self.read_lvalue(&lval)
             }
+            V2Expr::Index { span, base, index }
+                if matches!(base.as_ref(), V2Expr::Ident(_, n) if n == "local")
+                    && self.lookup_var("local").is_none() =>
+            {
+                self.read_frame_local_slot(*span, index)
+            }
             V2Expr::Index { .. } => {
                 let lval = self.resolve_lvalue(expr)?;
                 self.read_lvalue(&lval)
@@ -10900,6 +10924,22 @@ impl<'a> TreeLowerer<'a> {
         let tmp = self.fresh("dist");
         self.line(format!("let {tmp} = temp[{temp}];"));
         Ok((tmp, ValueType::I16))
+    }
+
+    /// `local[N]` read: frame word N as a raw block wrote it. Like a raw block, naming a slot
+    /// pins the tree's layout (`.air` puts the named locals after every explicit slot, and the
+    /// optimizer leaves the tree alone), so it cannot share a tree with a pinned
+    /// `push_interaction` object slot.
+    fn read_frame_local_slot(&mut self, span: Span, index: &V2Expr) -> Result<(String, ValueType)> {
+        let idx = self.eval_builtin_int(index, "local slot", 0, 255)?;
+        if self.checking_discarded == 0 {
+            self.raw_span.get_or_insert(span);
+            self.keep_layout = true;
+            if self.pin_span.is_some() {
+                return Err(Error::at(span, RAW_WITH_PIN));
+            }
+        }
+        Ok((format!("local[{idx}]"), ValueType::I16))
     }
 
     fn read_lvalue(&mut self, lval: &LValue) -> Result<(String, ValueType)> {
@@ -13556,7 +13596,7 @@ fn is_int_literal_expr(e: &V2Expr) -> bool {
     }
 }
 
-const RAW_WITH_PIN: &str = "push_interaction(object: <handle>) and 'raw { ... }' cannot share a tree: raw .air may name local slots the pinned object slot could collide with; pass a constant parameter index or move the raw block to its own tree";
+const RAW_WITH_PIN: &str = "push_interaction(object: <handle>) cannot share a tree with 'raw { ... }' or a 'local[N]' read: they may name local slots the pinned object slot could collide with; pass a constant parameter index or move the raw block to its own tree";
 
 /// Placeholder for the per-tree pinned local slot of `push_interaction(object: <handle>)`,
 /// replaced in `TreeLowerer::finish` (not an identifier character, so no name contains it).

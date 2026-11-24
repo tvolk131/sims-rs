@@ -38,6 +38,7 @@ pub(crate) fn optimize_tree_body(body: &str) -> String {
         unwrap_single_pass_loops(&mut nodes);
         drop_dead_local_stores(&mut nodes);
         forward_copies(&mut nodes);
+        drop_identity_stores(&mut nodes);
         merge_duplicate_tails(&mut nodes);
         coalesce_locals(&mut nodes);
         drop_unused_decls(&mut nodes);
@@ -1460,6 +1461,32 @@ fn forward_copies(nodes: &mut Vec<Node>) {
                 None => {
                     block.remove(i);
                 }
+            }
+        }
+    });
+}
+
+/// Drops `x := x;` for a temp, a call-frame word, or a local (what forwarding a staged argument
+/// copy leaves behind): the store changes nothing, and the next node does not read its result.
+fn drop_identity_stores(nodes: &mut Vec<Node>) {
+    for_each_block(nodes, &mut |block| {
+        for i in (0..block.len()).rev() {
+            let Node::Line(l) = &block[i] else {
+                continue;
+            };
+            let Kind::Assign { lhs, op: ":=", rhs } = classify(l) else {
+                continue;
+            };
+            let plain = lhs.starts_with("temp[")
+                || lhs.starts_with("param[")
+                || lhs.starts_with("local[")
+                || is_ident(lhs);
+            if lhs == rhs
+                && plain
+                && lhs != "stack_obj"
+                && next_ignores_last_result(&block[i + 1..])
+            {
+                block.remove(i);
             }
         }
     });

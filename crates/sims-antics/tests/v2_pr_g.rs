@@ -468,3 +468,62 @@ fn tier2_distance_to_measures_to_the_stack_object() {
         expect_err(name, &sim_tree(body), needle);
     }
 }
+
+#[test]
+fn tier3_call_conditions_and_staged_temps_cost_no_extra_nodes() {
+    let air = expand(
+        "loops.antics",
+        &obj(
+            "    extern mod g { @id(300) fn probe() -> bool; @id(301) fn rate(a: i16, b: i16) -> bool; }\n    \
+             tree t (sim: Sim) { \
+                 while !g::probe() { self.n += 1; } \
+                 while g::probe() { self.n -= 1; } \
+                 if g::rate(temp[0], self.n) { self.n = 0; } \
+             }",
+        ),
+    );
+    assert!(!air.contains("wcond"), "{air}");
+    assert!(
+        air.contains("if call 300(temps) {\n            break;"),
+        "{air}"
+    );
+    assert!(
+        air.contains("if !call 300(temps) {\n            break;"),
+        "{air}"
+    );
+    // `temp[0]` passed in argument slot 0 is already where the call reads it.
+    assert!(!air.contains("temp[0] := temp[0];"), "{air}");
+    assert!(air.contains("temp[1] := stack.attr[0];"), "{air}");
+}
+
+#[test]
+fn tier3_local_slot_reads_pin_the_layout() {
+    let air = expand(
+        "local_read.antics",
+        &sim_tree(
+            "raw { op 0x0002 (2, 0, 7, 0, 5, 25, 7, 0); } \
+             let x = 4; \
+             if local[2] > 0 { self.n = local[2]; } \
+             self.n += x;",
+        ),
+    );
+    assert!(air.contains("if local[2] > 0 {"), "{air}");
+    assert!(air.contains("stack.attr[0] := local[2];"), "{air}");
+    // Layout is kept: `x` stays a named local.
+    assert!(air.contains("let __v_x_0 = 4;"), "{air}");
+    for (name, body, needle) in [
+        (
+            "local_write.antics",
+            "local[2] = 1;",
+            "'local[N]' is read-only",
+        ),
+        ("local_range.antics", "self.n = local[300];", "local slot"),
+        (
+            "local_pin.antics",
+            "self.n = local[1]; push_interaction(menu: 0, object: sim);",
+            "cannot share a tree",
+        ),
+    ] {
+        expect_err(name, &sim_tree(body), needle);
+    }
+}
