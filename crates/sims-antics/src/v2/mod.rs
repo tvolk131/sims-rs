@@ -159,7 +159,50 @@ pub fn compile_expanded_v2_object(expanded: ExpandedV2Object) -> Result<Compiled
         compiled.iff_bytes =
             append_variants(&compiled.iff_bytes, objd_id, ctss_id, &expanded.variants)?;
     }
+    if !expanded.shared_sound_names.is_empty() {
+        compiled.iff_bytes =
+            rename_shared_sounds(&compiled.iff_bytes, &expanded.shared_sound_names)?;
+        for (_, placeholder, _) in &expanded.shared_sound_names {
+            compiled.sounds_wav.remove(placeholder);
+        }
+    }
     Ok(compiled)
+}
+
+/// Gives each listed FWAV chunk (`(id, placeholder, name)`) its shared sound name and label
+/// back. The compiler rejects repeated sound names, so the manifest carried placeholders.
+fn rename_shared_sounds(iff_bytes: &[u8], renames: &[(u16, String, String)]) -> Result<Vec<u8>> {
+    use crate::encode::{encode_fwav, encode_iff_with_rsmp};
+    use crate::ir::FwavChunk;
+    use sims_formats::iff::{ChunkData, Iff};
+
+    let iff = Iff::parse(iff_bytes.to_vec())
+        .map_err(|e| Error::new(format!("re-reading compiled IFF for sound names: {e}")))?;
+    let mut chunks: Vec<ChunkData> = iff
+        .chunks
+        .iter()
+        .filter(|c| &c.tag != b"rsmp")
+        .map(|c| ChunkData {
+            tag: c.tag,
+            id: c.id,
+            flags: c.flags,
+            label: c.label.clone(),
+            data: iff.data(c).to_vec(),
+        })
+        .collect();
+    for (id, placeholder, name) in renames {
+        let chunk = chunks
+            .iter_mut()
+            .find(|c| &c.tag == b"FWAV" && c.id == *id && c.label == *placeholder)
+            .ok_or_else(|| Error::new(format!("compiled IFF has no FWAV #{id} '{placeholder}'")))?;
+        chunk.label = name.clone();
+        chunk.data = encode_fwav(&FwavChunk {
+            id: *id,
+            label: name.clone(),
+            sound_name: name.clone(),
+        })?;
+    }
+    encode_iff_with_rsmp(&chunks)
 }
 
 /// OBJD words a catalog variant replaces (word index into the chunk, version words included).

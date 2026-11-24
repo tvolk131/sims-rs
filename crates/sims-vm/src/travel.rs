@@ -92,6 +92,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub mod trip;
+
 /// Magic prefix and format version for persisted active-trip envelopes stored
 /// in `NEIGHBORHOOD_LOTS[(neighborhood_id, home_house)]` while a household is
 /// away from home. Because `Saved::decode` expects `Saved::FORMAT` (`9u32`) LE, this
@@ -113,7 +115,12 @@ const TRAVEL_ENVELOPE_MAGIC: &[u8; 4] = b"TRVL";
 ///   which decides the family the destination's game holds. A build that
 ///   does not know it refuses the trip. Versions 1 to 3 are still read, and
 ///   their arrival family is worked out ([`ArrivalFamily::derived`]).
-const TRAVEL_ENVELOPE_VERSION: u32 = 4;
+/// - Version 5: the arrival family is followed by whether the departure
+///   left saved-state tokens (kind 2) in the travelers' inventories
+///   ([`PersistedTravelRecord::departure_tokens`], the neighbor ids whose
+///   inventories got them). Versions 1 to 4 are
+///   still read, and their departure left none.
+const TRAVEL_ENVELOPE_VERSION: u32 = 5;
 /// The oldest envelope version still read; the payload is the same.
 const OLDEST_TRAVEL_ENVELOPE_VERSION: u32 = 1;
 /// The first version whose date departure wrote the companion's token.
@@ -123,6 +130,11 @@ const COMPANION_TOKEN_ENVELOPE_VERSION: u32 = 2;
 const MADE_ORDER_ENVELOPE_VERSION: u32 = 3;
 /// The first version that records the trip's [`ArrivalFamily`].
 const ARRIVAL_FAMILY_ENVELOPE_VERSION: u32 = 4;
+/// The first envelope version that records whether the departure left the
+/// travelers' saved-state tokens (kind 2) in their inventories, as Generic
+/// Sims Call 17 writes them (0x45a22d). The trip home and an aborted trip
+/// take them back out only when it did.
+const TRIP_TOKEN_ENVELOPE_VERSION: u32 = 5;
 
 static NEXT_TRIP_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -1502,6 +1514,14 @@ struct PersistedTravelRecord {
     /// on; `None` for an older trip.
     #[serde(skip)]
     arrival: Option<ArrivalFamily>,
+    /// The neighbor ids whose inventories the departure left saved-state
+    /// tokens (kind 2) in (routine 17, 0x45a22d), written after the arrival
+    /// family from version 5 on; empty for an older trip. A trip's return
+    /// or abort takes kind-2 tokens out of these only, so a traveler routine
+    /// 17 did not save (a trip that wrote none, or a companion that was not
+    /// on the lot) keeps the ones it already held.
+    #[serde(skip)]
+    departure_tokens: Vec<i16>,
 }
 
 impl PersistedTravelRecord {
@@ -1605,6 +1625,11 @@ fn encode_travel_envelope(record: &PersistedTravelRecord) -> Result<Vec<u8>, Tra
             .map_err(|e| TravelError::Lot(format!("encoding active travel envelope: {e}")))?;
         out.extend_from_slice(&tail);
     }
+    if record.version >= TRIP_TOKEN_ENVELOPE_VERSION {
+        let tail = postcard::to_allocvec(&record.departure_tokens)
+            .map_err(|e| TravelError::Lot(format!("encoding active travel envelope: {e}")))?;
+        out.extend_from_slice(&tail);
+    }
     Ok(out)
 }
 
@@ -1627,6 +1652,12 @@ fn decode_travel_envelope(bytes: &[u8]) -> Result<PersistedTravelRecord, TravelE
         let (arrival, after) = postcard::take_from_bytes::<ArrivalFamily>(rest)
             .map_err(|e| TravelError::SessionMismatch(format!("corrupt travel envelope: {e}")))?;
         record.arrival = Some(arrival);
+        rest = after;
+    }
+    if version >= TRIP_TOKEN_ENVELOPE_VERSION {
+        let (departure_tokens, after) = postcard::take_from_bytes::<Vec<i16>>(rest)
+            .map_err(|e| TravelError::SessionMismatch(format!("corrupt travel envelope: {e}")))?;
+        record.departure_tokens = departure_tokens;
         rest = after;
     }
     if !rest.is_empty() {
@@ -1744,6 +1775,135 @@ pub fn depart_to_destination(
     home_lot: &mut Lot,
     request: &TravelRequest,
 ) -> Result<DepartureResult, TravelError> {
+    depart(
+        install_root,
+        store,
+        neighborhood_id,
+        home_lot,
+        request,
+        DepartureTokens::Write,
+    )
+}
+
+/// Whether a departure still has to write the travelers' saved-state and
+/// arrival-clock tokens (Generic Sims Call 17, 0x45a22d), or a script's
+/// routine 17 already did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DepartureTokens {
+    Write,
+    /// The neighbor ids whose inventories routine 17 wrote.
+    AlreadyWritten(Vec<i16>),
+}
+
+/// The hour and minute the Go Downtown plugin adds to the clock for the
+/// arrival (GUID 0xA6F31853, tree 0x1004: temp 1 = 0, temp 2 = 30, mode 0).
+const DOWNTOWN_ARRIVAL_DELAY: (i16, i16) = (0, 30);
+
+/// Carries out the trip a script asked for with Generic Sims Call 17
+/// ([`World::trip_request`]), as the main loop does when it finds the
+/// game's byte +0x1c +0xe1 set between ticks.
+///
+/// The request becomes a [`TravelRequest`] ([`travel_request_for_trip`])
+/// and departs like [`depart_to_destination`], except that routine 17
+/// already wrote the travelers' tokens, and the script already paid the
+/// fare (the Go Downtown plugin's Alter Budget), so the fare is 0. The
+/// request is cleared once the departure succeeds; on an error it stays.
+pub fn depart_from_request(
+    install_root: &Path,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    home_lot: &mut Lot,
+) -> Result<DepartureResult, TravelError> {
+    let trip = home_lot.world.trip_request.clone().ok_or_else(|| {
+        TravelError::Lot("no trip was asked for (Generic Sims Call 17 has not run)".into())
+    })?;
+    let request = travel_request_for_trip(&home_lot.world, &trip)?;
+    let result = depart(
+        install_root,
+        store,
+        neighborhood_id,
+        home_lot,
+        &request,
+        DepartureTokens::AlreadyWritten(trip.saved),
+    )?;
+    home_lot.world.trip_request = None;
+    Ok(result)
+}
+
+/// The [`TravelRequest`] for a routine-17 request (0x4fc713's fields).
+///
+/// - A family (mode 1) is the whole family, led by the person that ran
+///   routine 17.
+/// - A GUID (mode 0) is that person alone, or a date when its inventory
+///   holds a kind-1 token, the companion Manage Inventory operation 5
+///   wrote; the first such token names it, as 0x45a34b reads it.
+/// - The transport is the destination's default, and the fare 0.
+pub fn travel_request_for_trip(
+    world: &World,
+    trip: &sims_sim::TripRequest,
+) -> Result<TravelRequest, TravelError> {
+    let destination_house = u32::try_from(trip.house)
+        .ok()
+        .filter(|&house| house > 0)
+        .ok_or_else(|| {
+            TravelError::Lot(format!(
+                "routine 17 asked for house {}, which is no destination",
+                trip.house
+            ))
+        })?;
+    let party = if trip.family != 0 {
+        let leader_guid = world
+            .objects
+            .get(&trip.caller)
+            .map(|o| o.guid)
+            .ok_or_else(|| {
+                TravelError::Lot(format!(
+                    "the person {} that asked for the trip is gone",
+                    trip.caller
+                ))
+            })?;
+        TravelParty::WholeFamily { leader_guid }
+    } else {
+        let leader_guid = trip.leader_guid;
+        let companion = world.neighbors.first_of(leader_guid).and_then(|record| {
+            let inventory = world
+                .neighbors
+                .inventories
+                .iter()
+                .find(|i| i.neighbor == record.id)?;
+            let place = trip::token_place(&inventory.items, COMPANION_TOKEN_KIND, 0);
+            (place >= 0).then(|| trip::read_token(&inventory.items, place).guid)
+        });
+        match companion {
+            Some(companion_guid) => TravelParty::Date {
+                leader_guid,
+                companion_guid,
+            },
+            None => TravelParty::Single {
+                sim_guid: leader_guid,
+            },
+        }
+    };
+    Ok(TravelRequest {
+        destination_house,
+        party,
+        transport: None,
+        accommodation: VacationAccommodation::None,
+        fare_override: Some(0),
+        answers: vec![3],
+        frames: Frames::default(),
+        view_centre: None,
+    })
+}
+
+fn depart(
+    install_root: &Path,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    home_lot: &mut Lot,
+    request: &TravelRequest,
+    tokens: DepartureTokens,
+) -> Result<DepartureResult, TravelError> {
     if home_lot.load.finished.is_none() {
         return Err(TravelError::Lot("home lot load did not complete".into()));
     }
@@ -1856,13 +2016,47 @@ pub fn depart_to_destination(
     // A date leaves its companion's token in the leader's inventory, as
     // the date's departure tree does with Manage Inventory operation 5; the
     // arrival marker's Generic Sims Call 19 reads it to bring the
-    // companion back.
-    if let TravelParty::Date { companion_guid, .. } = request.party {
+    // companion back. A departure a script asked for found the token there
+    // already (that is how it became a date), so it is left as it is.
+    if tokens == DepartureTokens::Write
+        && let TravelParty::Date { companion_guid, .. } = request.party
+    {
         write_companion_token(
             &mut frozen_home.world,
             plan.members[0].neighbor_id,
             companion_guid,
         );
+    }
+
+    // The Go Downtown plugin then runs Generic Sims Call 17 (0x45a22d):
+    // the leader's, and the companion's, saved state and the arrival clock
+    // go into their inventories as kind-2 tokens, which the middle ped
+    // marker's routine 21 reads back. A departure a script asked for
+    // already has them.
+    let mut departure_tokens = match &tokens {
+        DepartureTokens::AlreadyWritten(saved) => saved.clone(),
+        DepartureTokens::Write => Vec::new(),
+    };
+    if tokens == DepartureTokens::Write
+        && plan.destination == TravelDestination::Downtown
+        && matches!(
+            request.party,
+            TravelParty::Single { .. } | TravelParty::Date { .. }
+        )
+    {
+        let leader = plan.members[0].home_object_id.ok_or_else(|| {
+            TravelError::InvalidParty("the trip's leader is not on the home lot".into())
+        })?;
+        let house = i16::try_from(request.destination_house)
+            .map_err(|e| TravelError::Lot(e.to_string()))?;
+        let (hour, minute) = DOWNTOWN_ARRIVAL_DELAY;
+        let asked = Interpreter::new(&home_lot.program, &home_lot.catalog, Stream::Global)
+            .machine(&mut frozen_home.world, leader, 0, true)
+            .request_trip(house, hour, minute, 0)
+            .map_err(|e| TravelError::Lot(format!("writing the departure tokens: {e}")))?;
+        if let Some(asked) = asked {
+            departure_tokens = asked.saved;
+        }
     }
 
     // Deduct travel fare from the staged home lot snapshot.
@@ -1969,6 +2163,8 @@ pub fn depart_to_destination(
         home_family,
         funds_at_arrival,
         &snapshots,
+        &departure_tokens,
+        true,
         dest_snapshot.saved_lot.as_deref(),
         dest_snapshot.base_house,
     )?;
@@ -2013,6 +2209,7 @@ pub fn depart_to_destination(
         frozen_home_bytes,
         version: TRAVEL_ENVELOPE_VERSION,
         arrival: Some(arrival),
+        departure_tokens,
     })?;
     let (committed_instance, committed_revision) = match store.save_lot_and_neighborhood_checked(
         neighborhood_id,
@@ -2210,6 +2407,8 @@ pub fn resume_active_trip(
         persisted.session.home_family,
         persisted.session.funds_at_arrival,
         &persisted.departure_snapshots,
+        &persisted.departure_tokens,
+        persisted.version >= COMPANION_TOKEN_ENVELOPE_VERSION,
         dest_snapshot.saved_lot.as_deref(),
         dest_snapshot.base_house,
     )?;
@@ -2342,6 +2541,15 @@ pub fn abort_active_trip(
             COMPANION_TOKEN_KIND,
             companion.guid,
         );
+    }
+
+    // The saved-state tokens the departure wrote never reached an arrival
+    // marker either; left behind, the next marker's routine 21 would
+    // restore them. A traveler it did not save keeps its own.
+    for inv in updated_stored.inventories.iter_mut().flatten() {
+        if persisted.departure_tokens.contains(&inv.neighbor) {
+            inv.items.retain(|it| it.kind != trip::SAVED_STATE_KIND);
+        }
     }
 
     let home_runtime = StoreRuntime::from_snapshot(
@@ -2510,6 +2718,15 @@ fn verify_persisted_trip_against_snapshot(
         )));
     }
     Ok(())
+}
+
+/// Erases every saved-state token (kind 2) of `neighbor_id`'s inventory.
+fn clear_saved_state_tokens(world: &mut World, neighbor_id: i16) {
+    for inv in &mut world.neighbors.inventories {
+        if inv.neighbor == neighbor_id {
+            inv.items.retain(|it| it.kind != trip::SAVED_STATE_KIND);
+        }
+    }
 }
 
 fn clear_stored_inventory_token(
@@ -3136,13 +3353,53 @@ pub fn return_from_destination(
         }
     }
 
+    // 2b. The saved-state tokens the departure wrote: the arrival marker's
+    //     routine 21 took the motives and words, and left the clock (GUIDs 7
+    //     and 8). Natively the trip home writes them all again (routine 17)
+    //     and the Go Downtown plugin's tail on the home lot reads them back
+    //     (routines 23 and 21, then 20 and 21 for the companion). That tail
+    //     needs the frozen stack, which the curb placement below drops, so
+    //     the tokens go as the tail would leave them: none. A traveler the
+    //     departure did not save keeps its own.
+    for &neighbor in &persisted.departure_tokens {
+        clear_saved_state_tokens(&mut dest_saved.world, neighbor);
+    }
+
     // 3. Capture returning state for every traveler on the destination lot
     //    using the exact same resolved live IDs as step 1.
     let resolved_by_index: BTreeMap<usize, u16> = preferred_traveler_ids.into_iter().collect();
+
+    // A date's companion the middle ped marker has not brought in yet
+    // (Generic Sims Call 19 makes it from the leader's kind-1 token) never
+    // arrived: its token goes back with the trip, as an abort's does, so
+    // the leader's next trip does not bring it along.
+    if persisted.is_date
+        && persisted.version >= COMPANION_TOKEN_ENVELOPE_VERSION
+        && let [leader, companion] = auth_session.travelers.as_slice()
+        && companion.destination_object_id == 0
+        && !resolved_by_index.contains_key(&1)
+    {
+        set_neighbor_token_count(
+            &mut dest_saved.world,
+            leader.neighbor_id,
+            COMPANION_TOKEN_KIND,
+            companion.guid,
+            0,
+        );
+    }
+
     let mut returning_states: Vec<LiveTravelerSnapshot> =
         Vec::with_capacity(auth_session.travelers.len());
     for (idx, traveler) in auth_session.travelers.iter().enumerate() {
         let live_id = resolved_by_index.get(&idx).copied();
+        // A traveler that never arrived (a companion the marker had not
+        // made yet: destination object 0) comes home as it left. One that
+        // arrived and was then removed keeps what its record holds.
+        let departed = persisted
+            .departure_snapshots
+            .iter()
+            .find(|snap| snap.guid == traveler.guid)
+            .filter(|_| traveler.destination_object_id == 0);
         let made_outfits = dest_saved.world.made_outfits.get(&traveler.guid).cloned();
         if let Some(id) = live_id
             && let Some(obj) = dest_saved.world.objects.get(&id)
@@ -3160,6 +3417,16 @@ pub fn return_from_destination(
                 outfit: dest_saved.world.person_outfits.get(&id).cloned(),
                 made_outfits,
                 had_hotel_key_before_trip: traveler.had_hotel_key_before_trip,
+            });
+        } else if let Some(snap) = departed {
+            returning_states.push(LiveTravelerSnapshot {
+                guid: traveler.guid,
+                neighbor_id: traveler.neighbor_id,
+                is_household_member: traveler.is_household_member,
+                home_object_id: traveler.home_object_id,
+                made_outfits,
+                had_hotel_key_before_trip: traveler.had_hotel_key_before_trip,
+                ..snap.clone()
             });
         } else if let Some(record) = dest_saved.world.neighbors.first_of(traveler.guid) {
             returning_states.push(LiveTravelerSnapshot {
@@ -3971,6 +4238,8 @@ fn boot_destination_lot(
     home_family: u16,
     arrival_funds: i32,
     snapshots: &[LiveTravelerSnapshot],
+    departure_tokens: &[i16],
+    companion_from_token: bool,
     saved_lot: Option<&[u8]>,
     base_house: Option<Vec<u8>>,
 ) -> Result<(Lot, Vec<TravelerRecord>), TravelError> {
@@ -4100,8 +4369,42 @@ fn boot_destination_lot(
         let mut records = Vec::with_capacity(snapshots.len());
         let mut leader_obj_id = None;
         let mut used_tiles = BTreeSet::new();
+        let leader_neighbor = snapshots
+            .iter()
+            .find(|snap| snap.guid == leader_guid)
+            .map(|snap| snap.neighbor_id);
+        // Routine 21 on Downtown's middle ped marker restores the saved
+        // state the departure wrote, so a traveler holding it keeps the
+        // motives it is made with rather than the live ones: a motive cut to
+        // 0 has no token, and the live fraction would outlive the restore.
+        let tokens_restored = TravelDestination::classify(dest_house, &program.zoning)
+            == Some(TravelDestination::Downtown);
 
         for snap in ordered {
+            // A date's companion is not made here when the leader holds its
+            // kind-1 token: the middle ped marker's Generic Sims Call 19
+            // makes it from that token (EP3 PedMarkers tree 0x100e, node 11),
+            // and the trip home finds it by its GUID. A version 1 trip's
+            // departure wrote no token (any the leader holds was its own),
+            // so its companion is made here, with the date links, as that
+            // build did.
+            if is_date
+                && companion_from_token
+                && snap.guid != leader_guid
+                && leader_neighbor.is_some_and(|nid| {
+                    neighbor_token_count(&world, nid, COMPANION_TOKEN_KIND, snap.guid) > 0
+                })
+            {
+                records.push(TravelerRecord {
+                    guid: snap.guid,
+                    neighbor_id: snap.neighbor_id,
+                    is_household_member: snap.is_household_member,
+                    home_object_id: snap.home_object_id,
+                    destination_object_id: 0,
+                    had_hotel_key_before_trip: snap.had_hotel_key_before_trip,
+                });
+                continue;
+            }
             let mut matching: Vec<u16> = world
                 .people
                 .iter()
@@ -4190,7 +4493,16 @@ fn boot_destination_lot(
             }
 
             // Overlay live motives, skills, career/fame, accessories, outfits, and visitor word.
-            apply_traveler_live_state(&mut world, person_id, snap, residential, saved_fame, None);
+            let keep_motives = tokens_restored && departure_tokens.contains(&snap.neighbor_id);
+            apply_traveler_live_state(
+                &mut world,
+                person_id,
+                snap,
+                residential,
+                saved_fame,
+                None,
+                keep_motives,
+            );
             if snap.guid == leader_guid {
                 leader_obj_id = Some(person_id);
             }
@@ -4215,24 +4527,27 @@ fn boot_destination_lot(
         })?;
         select_sim_in_world(&interpreter, &mut world, leader)?;
 
-        // Establish the mutual VM date link (`person.data[77] = partner_id`)
-        // on Downtown Date arrivals after initial selection so date scripts see
-        // each Sim's active date partner (`0x44664c`).
-        if is_date && records.len() == 2 {
-            let id_a = records[0].destination_object_id;
-            let id_b = records[1].destination_object_id;
-            if let Some(person_a) = world.objects.get_mut(&id_a).and_then(|o| o.person.as_mut())
-                && let Some(slot) = person_a.data.get_mut(PERSON_DATE)
-            {
-                *slot = id_b as i16;
-            }
-            if let Some(person_b) = world.objects.get_mut(&id_b).and_then(|o| o.person.as_mut())
-                && let Some(slot) = person_b.data.get_mut(PERSON_DATE)
-            {
-                *slot = id_a as i16;
+        // A date's links (person word 77) are the middle ped marker's: the
+        // companion's names the leader, the leader's the companion, negated
+        // (EP3 PedMarkers tree 0x100e). A companion made here (a version 1
+        // trip, above) gets the mutual links that build wrote.
+        if is_date
+            && let [a, b] = records.as_slice()
+            && a.destination_object_id != 0
+            && b.destination_object_id != 0
+        {
+            let (id_a, id_b) = (a.destination_object_id, b.destination_object_id);
+            for (id, partner) in [(id_a, id_b), (id_b, id_a)] {
+                if let Some(slot) = world
+                    .objects
+                    .get_mut(&id)
+                    .and_then(|o| o.person.as_mut())
+                    .and_then(|p| p.data.get_mut(PERSON_DATE))
+                {
+                    *slot = partner as i16;
+                }
             }
         }
-
         interpreter
             .go_live(&mut world)
             .map_err(|e| TravelError::Lot(e.to_string()))?;
@@ -4593,6 +4908,7 @@ fn reconcile_frozen_home_lot(
                 true,
                 saved_fame,
                 Some(home_i16),
+                false,
             );
             if snap.guid == session.leader_guid {
                 leader_home_id = Some(person_id);
@@ -4729,12 +5045,15 @@ fn apply_traveler_live_state(
     residential: bool,
     fame_level: i16,
     home_house_override: Option<i16>,
+    keep_motives: bool,
 ) {
     if let Some(obj) = world.objects.get_mut(&person_id)
         && let Some(person) = obj.person.as_mut()
     {
-        person.motives = snap.motives;
-        person.previous_motives = snap.previous_motives;
+        if !keep_motives {
+            person.motives = snap.motives;
+            person.previous_motives = snap.previous_motives;
+        }
         // Copy persistent fields + outfit words (8, 21, 22, 23).
         for word in people::persistent_fields(10).into_iter().chain([
             PERSON_BODY_SUIT,
@@ -5821,6 +6140,7 @@ mod tests {
             frozen_home_bytes: vec![],
             version: TRAVEL_ENVELOPE_VERSION,
             arrival: Some(ArrivalFamily::Solo),
+            departure_tokens: vec![7, -3],
         };
         let keys = |record: &PersistedTravelRecord| {
             record
@@ -5833,11 +6153,39 @@ mod tests {
         };
 
         let mut bytes = encode_travel_envelope(&record).unwrap();
-        assert_eq!(bytes[4..8], 4u32.to_le_bytes());
+        assert_eq!(bytes[4..8], 5u32.to_le_bytes());
         let now = decode_travel_envelope(&bytes).unwrap();
         assert_eq!(keys(&now), [0x0005_7000, 0x0005_1000]);
-        assert_eq!(now.version, 4);
+        assert_eq!(now.version, 5);
         assert_eq!(now.arrival, Some(ArrivalFamily::Solo));
+        assert_eq!(now.departure_tokens, [7, -3]);
+        // A trip that wrote no tokens says so.
+        let none = decode_travel_envelope(
+            &encode_travel_envelope(&PersistedTravelRecord {
+                departure_tokens: Vec::new(),
+                ..record.clone()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(none.departure_tokens.is_empty());
+
+        // Version 4 has no departure tokens after the arrival family (here
+        // a length and two zig-zag varints).
+        bytes.truncate(bytes.len() - 3);
+        bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
+        let v4 = decode_travel_envelope(&bytes).unwrap();
+        assert_eq!(keys(&v4), [0x0005_7000, 0x0005_1000]);
+        assert_eq!(v4.version, 4);
+        assert_eq!(v4.arrival, Some(ArrivalFamily::Solo));
+        assert!(
+            v4.departure_tokens.is_empty(),
+            "a version 4 trip wrote no tokens"
+        );
+        // A version 5 envelope without them is corrupt, not version 4.
+        let mut short = bytes.clone();
+        short[4..8].copy_from_slice(&5u32.to_le_bytes());
+        assert!(decode_travel_envelope(&short).is_err());
 
         // Versions before 4 have no arrival family after the payload.
         bytes.pop();
@@ -6467,6 +6815,9 @@ mod tests {
         );
 
         // The companion is famous, so it arrives with a star (0x447a82).
+        // Routine 19 makes it from its record, which holds fame (word 81)
+        // from revision 8 (`people::persistent_fields`): a record saved by
+        // 0x425a69 has revision 9.
         if let Some(row) = goth
             .world
             .neighbors
@@ -6475,6 +6826,7 @@ mod tests {
             .flatten()
             .find(|row| row.guid == non_goth_adult_guid)
         {
+            row.revision = people::SAVED_REVISION;
             row.data[PERSON_FAME_LEVEL] = 15;
         }
 
@@ -6488,47 +6840,53 @@ mod tests {
         assert!(!session.travelers[1].is_household_member);
         assert_eq!(session.magic_coins_at_arrival, 100);
 
-        // Verify Downtown Date established mutual `person.data[PERSON_DATE]` link!
+        // The departure makes only the leader. The middle ped marker's
+        // Generic Sims Call 19 makes the companion from the leader's kind-1
+        // token, places both, and links them (EP3 PedMarkers tree 0x100e):
+        // the companion's word 77 names the leader, the leader's names the
+        // companion, negated.
         let dt_mortimer_id = session.travelers[0].destination_object_id;
-        let dt_companion_id = session.travelers[1].destination_object_id;
-        assert_eq!(
-            dt.world.objects[&dt_mortimer_id]
-                .person
-                .as_ref()
-                .unwrap()
-                .data[PERSON_DATE],
-            dt_companion_id as i16
-        );
-        assert_eq!(
-            dt.world.objects[&dt_companion_id]
-                .person
-                .as_ref()
-                .unwrap()
-                .data[PERSON_DATE],
-            dt_mortimer_id as i16
-        );
-
-        // The famous companion is not selected: placing it on the lot puts a
-        // pooled star over its head (0x447a57 -> 0x447a82). The person
-        // factory leaves it off the lot (0x4e9719 -> 0x440b2d), so the star
-        // comes when the middle ped marker places it. The leader is selected
-        // and has none.
-        assert!(!dt.world.objects[&dt_companion_id].selected);
+        assert_eq!(session.travelers[1].destination_object_id, 0);
+        let companion_of = |dt: &crate::boot::Lot| {
+            dt.world
+                .people
+                .iter()
+                .copied()
+                .find(|&id| dt.world.objects[&id].guid == non_goth_adult_guid)
+        };
+        assert_eq!(companion_of(&dt), None, "the departure makes no companion");
         let on_lot = |dt: &crate::boot::Lot, id: u16| {
             let position = dt.world.objects[&id].position;
             position[0] >= 0 && position[1] >= 0
         };
-        assert!(!on_lot(&dt, dt_companion_id));
         for _ in 0..220 {
-            if on_lot(&dt, dt_companion_id) && on_lot(&dt, dt_mortimer_id) {
+            if companion_of(&dt).is_some_and(|id| on_lot(&dt, id)) && on_lot(&dt, dt_mortimer_id) {
                 break;
             }
             dt.step_play().unwrap();
         }
+        let dt_companion_id = companion_of(&dt).expect("routine 19 makes the companion");
         assert!(
             on_lot(&dt, dt_companion_id),
             "the marker places the companion"
         );
+        let date = |id: u16| dt.world.objects[&id].person.as_ref().unwrap().data[PERSON_DATE];
+        assert_eq!(date(dt_companion_id), dt_mortimer_id as i16);
+        assert_eq!(date(dt_mortimer_id), -(dt_companion_id as i16));
+        assert!(
+            !dt.world
+                .neighbors
+                .inventories
+                .iter()
+                .any(|inv| inv.neighbor == mortimer_nid
+                    && inv.items.iter().any(|i| i.kind == COMPANION_TOKEN_KIND)),
+            "routine 19 took the companion token"
+        );
+
+        // The famous companion is not selected: placing it on the lot puts a
+        // pooled star over its head (0x447a57 -> 0x447a82). The leader is
+        // selected and has none.
+        assert!(!dt.world.objects[&dt_companion_id].selected);
         let star_over = |id: u16| {
             dt.world.objects.values().any(|o| {
                 o.guid == crate::placement::STAR_MARKER
@@ -7230,11 +7588,9 @@ mod tests {
         // the leader had held it before the trip.
         let snapshot = store.load_lot_snapshot("UserData", 5).unwrap().unwrap();
         assert_eq!(leader_tokens(&snapshot.neighborhood), 1);
-        let mut envelope = snapshot.saved_lot.clone().unwrap();
+        let envelope = snapshot.saved_lot.clone().unwrap();
         assert_eq!(envelope[4..8], TRAVEL_ENVELOPE_VERSION.to_le_bytes());
-        envelope[4..8].copy_from_slice(&1u32.to_le_bytes());
-        // Version 1 had no arrival family after the payload.
-        envelope.pop();
+        let envelope = as_version(&envelope, 1);
         store
             .save_lot_and_neighborhood_checked(
                 "UserData",
@@ -7374,11 +7730,9 @@ mod tests {
         assert_eq!(envelope[4..8], TRAVEL_ENVELOPE_VERSION.to_le_bytes());
         let record = decode_travel_envelope(&envelope).unwrap();
         assert_eq!(record.arrival, Some(ArrivalFamily::Solo));
-        drop(check("version 4"));
+        drop(check("version 5"));
 
-        let mut older = envelope;
-        older[4..8].copy_from_slice(&3u32.to_le_bytes());
-        older.pop();
+        let older = as_version(&envelope, 3);
         store
             .save_lot_and_neighborhood_checked(
                 "UserData",
@@ -7405,5 +7759,381 @@ mod tests {
         .unwrap();
         assert_eq!(returned.home_lot.world.globals[9], goth_family as i16);
         assert_eq!(returned.home_lot.world.budget.funds, goth_budget - fare);
+    }
+    /// `envelope` written again as `version` would have written it (no
+    /// arrival family before 4, no departure tokens before 5).
+    fn as_version(envelope: &[u8], version: u32) -> Vec<u8> {
+        let mut record = decode_travel_envelope(envelope).unwrap();
+        record.version = version;
+        let bytes = encode_travel_envelope(&record).unwrap();
+        assert_eq!(decode_travel_envelope(&bytes).unwrap().version, version);
+        bytes
+    }
+
+    /// A store with the install's UserData neighborhood, removed when the
+    /// guard drops.
+    fn live_store(root: &Path, label: &str) -> (NeighborhoodStore, impl Drop) {
+        struct Guard(PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let db_path = std::env::temp_dir().join(format!(
+            "sims-vm-travel-{label}-{}.redb",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        let guard = Guard(db_path.clone());
+        let store = NeighborhoodStore::open(&db_path).unwrap();
+        store
+            .import_directory("UserData", &root.join("UserData"), 0xff)
+            .unwrap();
+        (store, guard)
+    }
+
+    fn person_with_guid(world: &World, guid: u32) -> Option<u16> {
+        world
+            .people
+            .iter()
+            .copied()
+            .find(|id| world.objects.get(id).is_some_and(|o| o.guid == guid))
+    }
+
+    fn stored_tokens(stored: &StoredNeighborhood, neighbor: i16, kind: i32) -> Vec<(u32, u16)> {
+        stored
+            .inventories
+            .iter()
+            .flatten()
+            .filter(|i| i.neighbor == neighbor)
+            .flat_map(|i| &i.items)
+            .filter(|t| t.kind == kind)
+            .map(|t| (t.guid, t.count))
+            .collect()
+    }
+
+    /// Only a trip whose departure wrote saved-state tokens takes kind-2
+    /// tokens back out: an Old Town trip writes none, so the abort leaves
+    /// the ones Mortimer already held.
+    #[test]
+    fn a_trip_that_wrote_no_tokens_leaves_the_travelers_saved_state() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard) = live_store(&root, "no-tokens");
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let mortimer_guid = nh.family_in(5).unwrap().1.members[0];
+        let mut goth =
+            crate::lifecycle::enter_lot(&root, &store, "UserData", 5, &[3], Frames::default())
+                .unwrap();
+        let mortimer_nid = goth.world.neighbors.first_of(mortimer_guid).unwrap().id;
+        set_neighbor_token_count(&mut goth.world, mortimer_nid, trip::SAVED_STATE_KIND, 3, 7);
+        depart_to_destination(
+            &root,
+            &store,
+            "UserData",
+            &mut goth,
+            &TravelRequest::old_town(58, mortimer_guid),
+        )
+        .unwrap();
+        let snapshot = store.load_lot_snapshot("UserData", 5).unwrap().unwrap();
+        let record = decode_travel_envelope(snapshot.saved_lot.as_deref().unwrap()).unwrap();
+        assert_eq!(record.version, TRAVEL_ENVELOPE_VERSION);
+        assert!(
+            record.departure_tokens.is_empty(),
+            "Old Town's departure writes none"
+        );
+
+        abort_active_trip(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
+        let after = store.load_neighborhood("UserData").unwrap().unwrap();
+        assert_eq!(
+            stored_tokens(&after, mortimer_nid, trip::SAVED_STATE_KIND),
+            [(3, 7)],
+            "the abort took a token the trip never wrote"
+        );
+    }
+
+    /// The Downtown departure keeps the motives a traveler is made with
+    /// where routine 21 restores the saved state: a motive cut to 0 has no
+    /// token, so the live fraction must not come along.
+    #[test]
+    fn a_downtown_traveler_is_not_given_its_live_motives() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard) = live_store(&root, "motives");
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let mortimer_guid = nh.family_in(5).unwrap().1.members[0];
+        let mut goth =
+            crate::lifecycle::enter_lot(&root, &store, "UserData", 5, &[3], Frames::default())
+                .unwrap();
+        let mortimer = person_with_guid(&goth.world, mortimer_guid).unwrap();
+        let person = goth
+            .world
+            .objects
+            .get_mut(&mortimer)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap();
+        // Token GUID 0 is motive 9: 0.75 cuts to 0, so it gets no token.
+        person.motives[9] = 0.75;
+        person.motives[6] = 41.9;
+        let departed = depart_to_destination(
+            &root,
+            &store,
+            "UserData",
+            &mut goth,
+            &TravelRequest::downtown(21, mortimer_guid),
+        )
+        .unwrap();
+        let world = &departed.destination_lot.world;
+        let nid = world.neighbors.first_of(mortimer_guid).unwrap().id;
+        let tokens: Vec<(u32, u16)> = world
+            .neighbors
+            .inventories
+            .iter()
+            .filter(|i| i.neighbor == nid)
+            .flat_map(|i| &i.items)
+            .filter(|t| t.kind == trip::SAVED_STATE_KIND)
+            .map(|t| (t.guid, t.count))
+            .collect();
+        assert!(!tokens.iter().any(|&(guid, _)| guid == 0), "{tokens:?}");
+        assert!(tokens.contains(&(1, 41)), "{tokens:?}");
+        let traveler = person_with_guid(world, mortimer_guid).unwrap();
+        let motives = world.objects[&traveler].person.as_ref().unwrap().motives;
+        assert!(
+            (motives[9] - 0.75).abs() > 0.01 && (motives[6] - 41.9).abs() > 0.01,
+            "the traveler was given its live motives: {motives:?}"
+        );
+    }
+
+    /// Going home before the middle ped marker brings the date's companion
+    /// in: the companion comes home as it left, and the leader's kind-1
+    /// token goes back with the trip.
+    #[test]
+    fn returning_before_the_date_arrives_keeps_the_companion_as_it_left() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard) = live_store(&root, "early-return");
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let members = nh.family_in(5).unwrap().1.members.clone();
+        let (mortimer_guid, bella_guid) = (members[0], members[1]);
+        let mut goth =
+            crate::lifecycle::enter_lot(&root, &store, "UserData", 5, &[3], Frames::default())
+                .unwrap();
+        let bella = person_with_guid(&goth.world, bella_guid).unwrap();
+        let bella_person = goth
+            .world
+            .objects
+            .get_mut(&bella)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap();
+        bella_person.motives[9] = 33.25;
+        let bella_before = bella_person.motives;
+        let mortimer_nid = goth.world.neighbors.first_of(mortimer_guid).unwrap().id;
+        let departed = depart_to_destination(
+            &root,
+            &store,
+            "UserData",
+            &mut goth,
+            &TravelRequest::downtown_date(21, mortimer_guid, bella_guid),
+        )
+        .unwrap();
+        let mut downtown = departed.destination_lot;
+        assert_eq!(person_with_guid(&downtown.world, bella_guid), None);
+
+        let returned = return_from_destination(
+            &root,
+            &store,
+            &departed.session,
+            &mut downtown,
+            &[3],
+            Frames::default(),
+        )
+        .unwrap();
+        let home = &returned.home_lot.world;
+        let bella = person_with_guid(home, bella_guid).unwrap();
+        assert_eq!(
+            home.objects[&bella].person.as_ref().unwrap().motives,
+            bella_before,
+            "Bella came home with made-up motives"
+        );
+        assert_eq!(
+            neighbor_token_count(home, mortimer_nid, COMPANION_TOKEN_KIND, bella_guid),
+            0,
+            "the companion's token stayed behind"
+        );
+        let after = store.load_neighborhood("UserData").unwrap().unwrap();
+        assert!(stored_tokens(&after, mortimer_nid, COMPANION_TOKEN_KIND).is_empty());
+    }
+
+    /// A version 1 date's departure wrote no kind-1 token, so the marker
+    /// has nothing to make the companion from: resuming it makes the
+    /// companion on arrival, with the mutual date links, as that build did.
+    #[test]
+    fn a_tokenless_version_1_date_makes_its_companion_on_arrival() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard) = live_store(&root, "v1-date");
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let members = nh.family_in(5).unwrap().1.members.clone();
+        let (mortimer_guid, bella_guid) = (members[0], members[1]);
+        let mut goth =
+            crate::lifecycle::enter_lot(&root, &store, "UserData", 5, &[3], Frames::default())
+                .unwrap();
+        let mortimer_nid = goth.world.neighbors.first_of(mortimer_guid).unwrap().id;
+        depart_to_destination(
+            &root,
+            &store,
+            "UserData",
+            &mut goth,
+            &TravelRequest::downtown_date(21, mortimer_guid, bella_guid),
+        )
+        .unwrap();
+
+        let snapshot = store.load_lot_snapshot("UserData", 5).unwrap().unwrap();
+        let mut stored = snapshot.neighborhood.clone();
+        for inv in stored.inventories.iter_mut().flatten() {
+            if inv.neighbor == mortimer_nid {
+                inv.items.retain(|t| t.kind != COMPANION_TOKEN_KIND);
+            }
+        }
+        let envelope = as_version(snapshot.saved_lot.as_deref().unwrap(), 1);
+        store
+            .save_lot_and_neighborhood_checked("UserData", 5, None, &envelope, &stored, &[])
+            .unwrap()
+            .unwrap();
+
+        let resumed =
+            resume_active_trip(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
+        let world = &resumed.destination_lot.world;
+        let companion = resumed
+            .session
+            .travelers
+            .iter()
+            .find(|t| t.guid == bella_guid)
+            .unwrap()
+            .destination_object_id;
+        assert_ne!(companion, 0, "the companion was not made");
+        assert_eq!(person_with_guid(world, bella_guid), Some(companion));
+        let leader = person_with_guid(world, mortimer_guid).unwrap();
+        let date = |id: u16| world.objects[&id].person.as_ref().unwrap().data[PERSON_DATE];
+        assert_eq!(
+            (date(leader), date(companion)),
+            (companion as i16, leader as i16)
+        );
+    }
+    /// The Goth house, Mortimer, and a non-Goth adult who is not on the lot.
+    fn goth_and_outsider(root: &Path, store: &NeighborhoodStore) -> (Lot, u32, u32) {
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let goth_members = nh.family_in(5).unwrap().1.members.clone();
+        let outsider = nh
+            .neighbors
+            .iter()
+            .flatten()
+            .find(|n| {
+                !goth_members.contains(&n.guid)
+                    && n.person_data.len() > PERSON_KIND
+                    && n.person_data[61] != 0
+                    && is_adult_human(n.person_data[PERSON_AGE], n.person_data[PERSON_KIND])
+            })
+            .expect("a non-Goth adult")
+            .guid;
+        let goth = crate::lifecycle::enter_lot(root, store, "UserData", 5, &[3], Frames::default())
+            .unwrap();
+        assert_eq!(person_with_guid(&goth.world, outsider), None);
+        (goth, goth_members[0], outsider)
+    }
+
+    /// Routine 17 saves only a companion on the lot, so a date with an
+    /// outsider records the leader alone, and the abort leaves the
+    /// outsider's own kind-2 tokens.
+    #[test]
+    fn a_date_abort_leaves_the_tokens_of_a_companion_routine_17_did_not_save() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard) = live_store(&root, "outsider-abort");
+        let (mut goth, mortimer_guid, outsider) = goth_and_outsider(&root, &store);
+        let mortimer_nid = goth.world.neighbors.first_of(mortimer_guid).unwrap().id;
+        let outsider_nid = goth.world.neighbors.first_of(outsider).unwrap().id;
+        set_neighbor_token_count(&mut goth.world, outsider_nid, trip::SAVED_STATE_KIND, 3, 7);
+        depart_to_destination(
+            &root,
+            &store,
+            "UserData",
+            &mut goth,
+            &TravelRequest::downtown_date(21, mortimer_guid, outsider),
+        )
+        .unwrap();
+        let snapshot = store.load_lot_snapshot("UserData", 5).unwrap().unwrap();
+        let record = decode_travel_envelope(snapshot.saved_lot.as_deref().unwrap()).unwrap();
+        assert_eq!(record.departure_tokens, [mortimer_nid]);
+
+        abort_active_trip(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
+        let after = store.load_neighborhood("UserData").unwrap().unwrap();
+        assert_eq!(
+            stored_tokens(&after, outsider_nid, trip::SAVED_STATE_KIND),
+            [(3, 7)]
+        );
+        assert!(stored_tokens(&after, mortimer_nid, trip::SAVED_STATE_KIND).is_empty());
+    }
+
+    /// A version 1 date whose leader held the companion's token before the
+    /// trip: the token was the leader's own, so the companion is made on
+    /// arrival and the trip home leaves the token.
+    #[test]
+    fn a_version_1_date_keeps_the_leaders_own_token_through_resume_and_return() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard) = live_store(&root, "v1-own-token");
+        let (mut goth, mortimer_guid, outsider) = goth_and_outsider(&root, &store);
+        let mortimer_nid = goth.world.neighbors.first_of(mortimer_guid).unwrap().id;
+        depart_to_destination(
+            &root,
+            &store,
+            "UserData",
+            &mut goth,
+            &TravelRequest::downtown_date(21, mortimer_guid, outsider),
+        )
+        .unwrap();
+        let snapshot = store.load_lot_snapshot("UserData", 5).unwrap().unwrap();
+        let envelope = as_version(snapshot.saved_lot.as_deref().unwrap(), 1);
+        store
+            .save_lot_and_neighborhood_checked(
+                "UserData",
+                5,
+                None,
+                &envelope,
+                &snapshot.neighborhood,
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let token = |world: &World| {
+            neighbor_token_count(world, mortimer_nid, COMPANION_TOKEN_KIND, outsider)
+        };
+
+        let mut resumed =
+            resume_active_trip(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
+        let companion = resumed.session.travelers[1].destination_object_id;
+        assert_ne!(companion, 0, "a version 1 companion is made on arrival");
+        assert_eq!(token(&resumed.destination_lot.world), 1);
+        let returned = return_from_destination(
+            &root,
+            &store,
+            &resumed.session,
+            &mut resumed.destination_lot,
+            &[3],
+            Frames::default(),
+        )
+        .unwrap();
+        assert_eq!(token(&returned.home_lot.world), 1, "the return took it");
     }
 }

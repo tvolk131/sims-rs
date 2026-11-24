@@ -32,13 +32,16 @@ pub(crate) fn optimize_tree_body(body: &str) -> String {
     for _ in 0..8 {
         let snapshot = nodes.clone();
         drop_unreachable(&mut nodes);
+        forward_entry_save(&mut nodes);
         drop_dead_stack_obj_stores(&mut nodes);
+        drop_stack_obj_stores_before_exit(&mut nodes, false);
         unwrap_single_pass_loops(&mut nodes);
         drop_dead_local_stores(&mut nodes);
         forward_copies(&mut nodes);
         merge_duplicate_tails(&mut nodes);
         coalesce_locals(&mut nodes);
         drop_unused_decls(&mut nodes);
+        drop_unread_entry_save_node(&mut nodes);
         if nodes == snapshot {
             break;
         }
@@ -49,6 +52,240 @@ pub(crate) fn optimize_tree_body(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     print_nodes(&nodes, 1, &mut out);
     out
+}
+
+/// Drops the Sim-tree entry save `let __self_obj = stack_obj;` when nothing else names
+/// `__self_obj`. This works line by line, so it also applies to trees the full pass leaves alone
+/// (`raw` blocks): a raw block that reads the save names it. The save is an expression node,
+/// so it goes only when the node after it cannot observe the last result.
+pub(crate) fn drop_unread_entry_save(body: &str) -> Option<String> {
+    const SAVE: &str = "let __self_obj = stack_obj;";
+    // Deleting the node would shift numeric branch targets (`-> true: 3`), and deleting the
+    // local would move the frame words of the named locals after it, which a raw op or a
+    // `scope(25, N)` cell may name by number. (`.air` places named locals after every explicit
+    // `local[N]`, so those keep their words.)
+    if body.contains("/*")
+        || body.contains("->")
+        || body.lines().any(|l| names_local_slot(&strip_strings(l)))
+    {
+        return None;
+    }
+    let mut lines = body
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty());
+    let (save_at, first) = lines.next()?;
+    if first.trim() != SAVE {
+        return None;
+    }
+    let mentions: usize = body
+        .lines()
+        .map(|l| idents(l).iter().filter(|id| **id == "__self_obj").count())
+        .sum();
+    if mentions != 1 {
+        return None;
+    }
+    let next = lines
+        .map(|(_, l)| l.trim())
+        .find(|l| !matches!(classify(l), Kind::Let { init: None, .. }))?;
+    let stripped = strip_strings(next);
+    let ignores = match classify(next) {
+        Kind::Assign { .. } | Kind::Let { init: Some(_), .. } | Kind::Return => {
+            !names_local_slot(&stripped) && !stripped.contains('{')
+        }
+        _ => ["if ", "while "]
+            .iter()
+            .any(|kw| header(&stripped, next, kw).is_some_and(|c| !c.contains('(') && c != "true")),
+    };
+    if !ignores {
+        return None;
+    }
+    let mut out = String::with_capacity(body.len());
+    for (i, l) in body.lines().enumerate() {
+        if i != save_at {
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
+    Some(out)
+}
+
+/// Whether `text` (an `.air` statement or `if` condition) starts with a `push_interaction`
+/// primitive, which does not read the last result.
+fn is_push_interaction(text: &str) -> bool {
+    let t = text.trim_start();
+    let t = t.strip_prefix('!').unwrap_or(t).trim_start();
+    t.starts_with("push_interaction(")
+}
+
+/// In a tree whose pinned pushes all copy the same plain local `s` into `local[0]`
+/// (`local[0] := s;` right before each `push_interaction(.., object: 0, ..)`), makes `s` live in
+/// `local[0]` itself and drops the copies. `.air` places named locals after `local[0]`, a pinned
+/// tree has no `raw`, and only the push reads the slot, so the slot and `s` always agree.
+pub(crate) fn pin_in_place(body: &str) -> String {
+    const PIN: &str = "local[0]";
+    let Some(mut nodes) = parse_body(body) else {
+        return body.to_owned();
+    };
+    let mut copied: BTreeSet<String> = BTreeSet::new();
+    let mut ok = true;
+    check_pins(&nodes, &mut copied, &mut ok);
+    let mut lets = Vec::new();
+    collect_lets(&nodes, &mut lets);
+    let source = match copied.iter().next() {
+        Some(s) if ok && copied.len() == 1 => s.clone(),
+        _ => return body.to_owned(),
+    };
+    if !lets.contains(&source)
+        || merge_group(&source).is_none()
+        || matches!(source.as_str(), "__self_obj" | "__saved_stack_obj")
+        // Every named local moves down one word once `s` leaves the named list, so none may be
+        // read before it is written (frame words keep what an earlier frame left there).
+        || !lets
+            .iter()
+            .all(|name| defined_before_reads(&nodes, name, &mut false))
+    {
+        return body.to_owned();
+    }
+    drop_pins(&mut nodes);
+    let rename = BTreeMap::from([(source, PIN.to_owned())]);
+    rewrite(&mut nodes, &rename);
+    let mut out = String::with_capacity(body.len());
+    print_nodes(&nodes, 1, &mut out);
+    out
+}
+
+/// Collects the sources of `local[0] := s;` copies; clears `ok` if `local[0]` is named in any
+/// other way, or if a copy is not directly followed by a `push_interaction`.
+fn check_pins(nodes: &[Node], copied: &mut BTreeSet<String>, ok: &mut bool) {
+    for (i, n) in nodes.iter().enumerate() {
+        match n {
+            Node::Line(l) => {
+                let stripped = strip_strings(l);
+                if !stripped.contains("local[") {
+                    continue;
+                }
+                let followed_by_push = match nodes[i + 1..].iter().find(|n| !is_decl(n)) {
+                    Some(Node::Line(next)) => is_push_interaction(next),
+                    Some(Node::If { arms, .. }) => is_push_interaction(&arms[0].0),
+                    _ => false,
+                };
+                match classify(l) {
+                    Kind::Assign {
+                        lhs: "local[0]",
+                        op: ":=",
+                        rhs,
+                    } if is_ident(rhs) && followed_by_push => {
+                        copied.insert(rhs.to_owned());
+                    }
+                    _ => *ok = false,
+                }
+            }
+            Node::If { arms, else_body } => {
+                for (cond, body) in arms {
+                    if strip_strings(cond).contains("local[") {
+                        *ok = false;
+                    }
+                    check_pins(body, copied, ok);
+                }
+                if let Some(body) = else_body {
+                    check_pins(body, copied, ok);
+                }
+            }
+            Node::While { cond, body } => {
+                if cond
+                    .as_deref()
+                    .is_some_and(|c| strip_strings(c).contains("local["))
+                {
+                    *ok = false;
+                }
+                check_pins(body, copied, ok);
+            }
+        }
+    }
+}
+
+/// Whether every read of `name` in `nodes` comes after a plain write of it on every path
+/// (`defined` says it is written on entry). A local read before any write reads whatever its
+/// frame word held, so moving it to another word would change the value read.
+fn defined_before_reads(nodes: &[Node], name: &str, defined: &mut bool) -> bool {
+    let reads = |text: &str| idents(text).contains(&name);
+    for n in nodes {
+        match n {
+            Node::Line(l) => match classify(l) {
+                Kind::Let { name: n, init } if n == name => {
+                    if let Some(init) = init {
+                        if reads(init) {
+                            return false;
+                        }
+                        *defined = true;
+                    }
+                }
+                Kind::Assign { lhs, op: ":=", rhs } if lhs == name => {
+                    if reads(rhs) {
+                        return false;
+                    }
+                    *defined = true;
+                }
+                _ => {
+                    if !*defined && reads(l) {
+                        return false;
+                    }
+                }
+            },
+            Node::If { arms, else_body } => {
+                let mut all = else_body.is_some();
+                for (cond, body) in arms {
+                    if !*defined && reads(cond) {
+                        return false;
+                    }
+                    let mut d = *defined;
+                    if !defined_before_reads(body, name, &mut d) {
+                        return false;
+                    }
+                    all &= d;
+                }
+                if let Some(body) = else_body {
+                    let mut d = *defined;
+                    if !defined_before_reads(body, name, &mut d) {
+                        return false;
+                    }
+                    all &= d;
+                }
+                *defined |= all;
+            }
+            Node::While { cond, body } => {
+                if !*defined && cond.as_deref().is_some_and(reads) {
+                    return false;
+                }
+                let mut d = *defined;
+                if !defined_before_reads(body, name, &mut d) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn drop_pins(nodes: &mut Vec<Node>) {
+    nodes.retain(|n| {
+        !matches!(n, Node::Line(l) if matches!(classify(l), Kind::Assign { lhs: "local[0]", op: ":=", .. }))
+    });
+    for n in nodes.iter_mut() {
+        match n {
+            Node::Line(_) => {}
+            Node::If { arms, else_body } => {
+                for (_, body) in arms.iter_mut() {
+                    drop_pins(body);
+                }
+                if let Some(body) = else_body {
+                    drop_pins(body);
+                }
+            }
+            Node::While { body, .. } => drop_pins(body),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -466,14 +703,30 @@ fn is_decl(n: &Node) -> bool {
     matches!(n, Node::Line(l) if matches!(classify(l), Kind::Let { init: None, .. }))
 }
 
+/// `scope(S, I) op rhs;` with a call-free `rhs`: an expression node on a raw scope cell.
+fn is_scope_store(line: &str) -> bool {
+    let stripped = strip_strings(line);
+    let Some(rest) = stripped.strip_prefix("scope(") else {
+        return false;
+    };
+    let Some((_, after)) = rest.split_once(')') else {
+        return false;
+    };
+    let mut parts = after.trim_start().splitn(2, ' ');
+    matches!((parts.next(), parts.next()), (Some(op), Some(rhs))
+        if ASSIGN_OPS.contains(&op) && !rhs.contains('(') && rhs.trim_end().ends_with(';'))
+}
+
 /// `rest` is the block after the node; `let x;` declarations emit nothing and are skipped.
 fn next_ignores_last_result(rest: &[Node]) -> bool {
     let next = rest.iter().find(|n| !is_decl(n));
     match next {
-        Some(Node::Line(l)) => matches!(
-            classify(l),
-            Kind::Assign { .. } | Kind::Let { init: Some(_), .. } | Kind::Return
-        ),
+        Some(Node::Line(l)) => {
+            matches!(
+                classify(l),
+                Kind::Assign { .. } | Kind::Let { init: Some(_), .. } | Kind::Return
+            ) || is_scope_store(l)
+        }
         Some(Node::If { arms, .. }) => !arms[0].0.contains('('),
         Some(Node::While { cond: Some(c), .. }) => !c.contains('('),
         _ => false,
@@ -576,10 +829,12 @@ fn drop_dead_stack_obj_stores(nodes: &mut Vec<Node>) {
                 let next_is_store = matches!(next, Some(Node::Line(l))
                     if stack_obj_store(l).is_some_and(|r| r != "stack_obj" && is_safe_operand(r)));
                 let redundant = known.as_deref() == Some(rhs) || rhs == "stack_obj";
+                // Nothing reads the value before it is overwritten or the frame returns.
+                let unread = stack_obj_fate(&block[i + 1..]) == StackObjFate::Dead;
                 if safe
                     && (next_is_return
                         || next_is_store
-                        || (redundant && next_ignores_last_result(&block[i + 1..])))
+                        || ((redundant || unread) && next_ignores_last_result(&block[i + 1..])))
                 {
                     block.remove(i);
                     continue;
@@ -614,24 +869,407 @@ fn drop_dead_stack_obj_stores(nodes: &mut Vec<Node>) {
     });
 }
 
+/// Primitives that never write the stack object, as v2 spells them.
+const STACK_OBJ_KEEPING_PRIMS: &[&str] = &["test_object_type", "action_string", "alter_budget"];
+
+/// Each call-like `name(` in a (string-stripped) text: `call N` for a subroutine call, the
+/// primitive's name, `scope`, or `""` for a bare parenthesis.
+fn callees(stripped: &str) -> impl Iterator<Item = &str> {
+    stripped.match_indices('(').map(move |(at, _)| {
+        let before = stripped[..at].trim_end();
+        let start = before
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |i| i + 1);
+        let word = &before[start..];
+        if !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()) {
+            let rest = before[..start].trim_end();
+            if rest.ends_with("call") {
+                return "call";
+            }
+        }
+        word
+    })
+}
+
+/// Raw scopes whose cells never involve the stack object: my attributes, globals, literals,
+/// temps, params, advertisements, my person data and slots, locals, tuning constants, and the
+/// job and neighborhood tables. Every other scope may (scope 27, the sprite flags, reads the
+/// stack object's; scope 10 is the stack object itself).
+const STACK_FREE_SCOPES: &[u32] = &[
+    0, 3, 6, 7, 8, 9, 11, 12, 14, 18, 20, 25, 26, 28, 29, 30, 33, 34, 36,
+];
+
+/// Whether every `scope(S, ..)` in a (string-stripped) text names a stack-free scope.
+fn scopes_stack_free(stripped: &str) -> bool {
+    stripped.match_indices("scope(").all(|(at, _)| {
+        let preceded = stripped[..at]
+            .bytes()
+            .next_back()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_');
+        let rest = &stripped[at + "scope(".len()..];
+        let num = rest.split(',').next().unwrap_or("").trim();
+        preceded
+            || num
+                .parse::<u32>()
+                .is_ok_and(|n| STACK_FREE_SCOPES.contains(&n))
+    })
+}
+
+/// Whether a statement or condition may read the stack object: it names `stack_obj` or a
+/// `stack.` cell or a raw scope that involves the stack object, or runs anything (a call
+/// inherits the stack object; a primitive may read it).
+fn may_read_stack_obj(text: &str) -> bool {
+    let stripped = strip_strings(text);
+    stripped.contains("stack")
+        || !scopes_stack_free(&stripped)
+        || callees(&stripped).any(|c| c != "scope")
+}
+
+/// Whether a statement or condition may write the stack object. Subroutine calls cannot (the
+/// callee's frame has its own copy).
+fn may_write_stack_obj(text: &str) -> bool {
+    if matches!(
+        classify(text),
+        Kind::Assign {
+            lhs: "stack_obj",
+            op: ":=",
+            rhs: "stack_obj"
+        }
+    ) {
+        return false;
+    }
+    if matches!(
+        classify(text),
+        Kind::Assign {
+            lhs: "stack_obj",
+            ..
+        }
+    ) {
+        return true;
+    }
+    let stripped = strip_strings(text);
+    stripped.contains("dest: stack_obj")
+        || scope_store_lhs(&stripped).is_some_and(|n| n == 10)
+        || callees(&stripped)
+            .any(|c| !matches!(c, "call" | "scope") && !STACK_OBJ_KEEPING_PRIMS.contains(&c))
+}
+
+/// The scope number of a `scope(S, I) op ..` store's target.
+fn scope_store_lhs(stripped: &str) -> Option<u32> {
+    let rest = stripped.trim_start().strip_prefix("scope(")?;
+    let (num, after) = rest.split_once(',')?;
+    let (_, after) = after.split_once(')')?;
+    let op = after.trim_start().split(' ').next()?;
+    if !ASSIGN_OPS.contains(&op) {
+        return None;
+    }
+    // A non-literal scope number counts as the stack object, to stay conservative.
+    Some(num.trim().parse::<u32>().unwrap_or(10))
+}
+
+fn writes_stack_obj_anywhere(nodes: &[Node]) -> bool {
+    nodes.iter().any(|n| match n {
+        Node::Line(l) => may_write_stack_obj(l),
+        Node::If { arms, else_body } => {
+            arms.iter()
+                .any(|(c, b)| may_write_stack_obj(c) || writes_stack_obj_anywhere(b))
+                || else_body.as_deref().is_some_and(writes_stack_obj_anywhere)
+        }
+        Node::While { cond, body } => {
+            cond.as_deref().is_some_and(may_write_stack_obj) || writes_stack_obj_anywhere(body)
+        }
+    })
+}
+
+/// The entry save `let __self_obj = stack_obj;` (or `__saved_stack_obj`), as its name.
+fn entry_save(nodes: &[Node]) -> Option<&str> {
+    match nodes.first()? {
+        Node::Line(l) => match classify(l) {
+            Kind::Let {
+                name: name @ ("__self_obj" | "__saved_stack_obj"),
+                init: Some("stack_obj"),
+            } => Some(name),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Reads of the entry save become `stack_obj` while nothing can have changed the stack object
+/// since entry: one fewer use of the save, and a restore there becomes `stack_obj := stack_obj`.
+fn forward_entry_save(nodes: &mut [Node]) {
+    let Some(name) = entry_save(nodes) else {
+        return;
+    };
+    let map = BTreeMap::from([(name.to_owned(), "stack_obj".to_owned())]);
+    forward_save_block(&mut nodes[1..], &map);
+}
+
+/// Renames per `map` up to the first node that may write `stack_obj`; returns whether control
+/// falling off the end of `nodes` still has the entry stack object.
+fn forward_save_block(nodes: &mut [Node], map: &BTreeMap<String, String>) -> bool {
+    // `Err` when a primitive names the save other than as a labelled value operand: it may be
+    // a local-slot operand (`icon:`, `local:`, ...) or a destination, so forwarding stops.
+    let renamed = |text: &str| -> Result<Option<String>, ()> {
+        if !idents(text).iter().any(|id| map.contains_key(*id)) {
+            return Ok(None);
+        }
+        if !value_operands_only(text, map) {
+            return Err(());
+        }
+        Ok(Some(rename_idents(text, map)))
+    };
+    for n in nodes.iter_mut() {
+        match n {
+            Node::Line(l) => {
+                let writes_save = match classify(l) {
+                    Kind::Let { name, .. } | Kind::Assign { lhs: name, .. } => {
+                        map.contains_key(name)
+                    }
+                    _ => false,
+                };
+                if writes_save {
+                    return false;
+                }
+                match renamed(l) {
+                    Ok(Some(r)) => *l = r,
+                    Ok(None) => {}
+                    Err(()) => return false,
+                }
+                if may_write_stack_obj(l) {
+                    return false;
+                }
+            }
+            Node::If { arms, else_body } => {
+                let mut kept = true;
+                for (cond, body) in arms.iter_mut() {
+                    match renamed(cond) {
+                        Ok(Some(r)) => *cond = r,
+                        Ok(None) => {}
+                        Err(()) => return false,
+                    }
+                    if may_write_stack_obj(cond) {
+                        return false;
+                    }
+                    kept &= forward_save_block(body, map);
+                }
+                if let Some(body) = else_body {
+                    kept &= forward_save_block(body, map);
+                }
+                if !kept {
+                    return false;
+                }
+            }
+            Node::While { cond, body } => {
+                if cond.as_deref().is_some_and(may_write_stack_obj)
+                    || writes_stack_obj_anywhere(body)
+                {
+                    return false;
+                }
+                if let Some(c) = cond {
+                    match renamed(c) {
+                        Ok(Some(r)) => *c = r,
+                        Ok(None) => {}
+                        Err(()) => return false,
+                    }
+                }
+                forward_save_block(body, map);
+            }
+        }
+    }
+    true
+}
+
+/// Primitive arguments `.air` parses as a local slot rather than a value.
+const LOCAL_SLOT_ARGS: &[&str] = &["icon", "skin", "age", "sex", "local", "dest"];
+
+/// Whether every mention of a `map` key in `text` is a plain value read: the text runs no
+/// primitive, or each mention is a labelled primitive argument (`label: name`) whose label
+/// takes a value.
+fn value_operands_only(text: &str, map: &BTreeMap<String, String>) -> bool {
+    let stripped = strip_strings(text);
+    if !callees(&stripped).any(|c| !c.is_empty() && c != "scope") {
+        return true;
+    }
+    let bytes = stripped.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            if follows_dot(bytes, start) || !map.contains_key(&stripped[start..i]) {
+                continue;
+            }
+            let before = stripped[..start].trim_end();
+            let Some(label_end) = before.strip_suffix(':') else {
+                return false;
+            };
+            let label_end = label_end.trim_end();
+            let label_start = label_end
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map_or(0, |p| p + 1);
+            if LOCAL_SLOT_ARGS.contains(&&label_end[label_start..]) {
+                return false;
+            }
+            let after = stripped[i..].trim_start();
+            if !(after.starts_with(',') || after.starts_with(')')) {
+                return false;
+            }
+        } else if c.is_ascii_digit() {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    true
+}
+
+/// Drops an entry save nothing else names, when the node after it cannot observe the last
+/// result the save sets (a primitive such as `idle_for_input` may read it).
+fn drop_unread_entry_save_node(nodes: &mut Vec<Node>) {
+    let Some(name) = entry_save(nodes) else {
+        return;
+    };
+    if !mentions(&nodes[1..], name) && next_ignores_last_result(&nodes[1..]) {
+        nodes.remove(0);
+    }
+}
+
+/// What happens to the stack object after a point, scanning forward in one block.
+#[derive(PartialEq, Eq)]
+enum StackObjFate {
+    /// Overwritten or the frame returns before anything can read it, on every path.
+    Dead,
+    /// Something may read it.
+    Live,
+    /// Control falls off the end of the block without reading it.
+    Through,
+}
+
+fn stack_obj_fate(nodes: &[Node]) -> StackObjFate {
+    for n in nodes {
+        match n {
+            Node::Line(l) => {
+                if let Some(rhs) = stack_obj_store(l)
+                    && !may_read_stack_obj(rhs)
+                {
+                    return StackObjFate::Dead;
+                }
+                match classify(l) {
+                    Kind::Return if !may_read_stack_obj(l) => return StackObjFate::Dead,
+                    Kind::Break | Kind::Continue => return StackObjFate::Live,
+                    _ if may_read_stack_obj(l) => return StackObjFate::Live,
+                    _ => {}
+                }
+            }
+            Node::If { arms, else_body } => {
+                let mut all_dead = else_body.is_some();
+                for (cond, body) in arms {
+                    if may_read_stack_obj(cond) {
+                        return StackObjFate::Live;
+                    }
+                    match stack_obj_fate(body) {
+                        StackObjFate::Live => return StackObjFate::Live,
+                        StackObjFate::Through => all_dead = false,
+                        StackObjFate::Dead => {}
+                    }
+                }
+                if let Some(body) = else_body {
+                    match stack_obj_fate(body) {
+                        StackObjFate::Live => return StackObjFate::Live,
+                        StackObjFate::Through => all_dead = false,
+                        StackObjFate::Dead => {}
+                    }
+                }
+                if all_dead {
+                    return StackObjFate::Dead;
+                }
+            }
+            Node::While { .. } => return StackObjFate::Live,
+        }
+    }
+    StackObjFate::Through
+}
+
+/// A plain `stack_obj := x;` store that is dead when control next reaches a `return` (the frame,
+/// and its stack object, goes away; `return` sets the result).
+fn is_droppable_stack_obj_store(n: &Node) -> bool {
+    matches!(n, Node::Line(l) if stack_obj_store(l).is_some_and(|r| is_safe_operand(r) || r == "stack_obj"))
+}
+
+/// Drops `stack_obj` stores that end an `if` arm when the `if` itself is followed by `return`
+/// (`if c { ..; stack_obj := s; } return x;`), at any depth, and then an `else` left empty.
+/// `tail_returns` says that falling off the end of `nodes` reaches a `return`.
+fn drop_stack_obj_stores_before_exit(nodes: &mut Vec<Node>, tail_returns: bool) {
+    for i in 0..nodes.len() {
+        let next = nodes[i + 1..].iter().find(|n| !is_decl(n));
+        let next_returns = match next {
+            Some(Node::Line(l)) => classify(l) == Kind::Return,
+            Some(_) => false,
+            None => tail_returns,
+        };
+        match &mut nodes[i] {
+            Node::If { arms, else_body } => {
+                for (_, body) in arms.iter_mut() {
+                    drop_stack_obj_stores_before_exit(body, next_returns);
+                }
+                if let Some(body) = else_body {
+                    drop_stack_obj_stores_before_exit(body, next_returns);
+                    if body.is_empty() {
+                        *else_body = None;
+                    }
+                }
+            }
+            Node::While { body, .. } => drop_stack_obj_stores_before_exit(body, false),
+            Node::Line(_) => {}
+        }
+    }
+    if tail_returns {
+        while let Some(pos) = nodes.iter().rposition(|n| !is_decl(n)) {
+            if !is_droppable_stack_obj_store(&nodes[pos]) {
+                break;
+            }
+            nodes.remove(pos);
+        }
+    }
+}
+
+/// Whether any line or condition in `nodes` names `name`.
+fn mentions(nodes: &[Node], name: &str) -> bool {
+    let named = |text: &str| text.contains(name) && idents(text).contains(&name);
+    nodes.iter().any(|n| match n {
+        Node::Line(l) => named(l),
+        Node::If { arms, else_body } => {
+            arms.iter().any(|(c, b)| named(c) || mentions(b, name))
+                || else_body.as_deref().is_some_and(|b| mentions(b, name))
+        }
+        Node::While { cond, body } => cond.as_deref().is_some_and(named) || mentions(body, name),
+    })
+}
+
 /// Every mention of each identifier: `(reads, writes-only lines)`.
-fn mention_counts(nodes: &[Node], counts: &mut BTreeMap<String, (usize, usize)>) {
-    let add_text = |text: &str, counts: &mut BTreeMap<String, (usize, usize)>| {
+fn mention_counts<'a>(nodes: &'a [Node], counts: &mut BTreeMap<&'a str, (usize, usize)>) {
+    let add_text = |text: &'a str, counts: &mut BTreeMap<&'a str, (usize, usize)>| {
         for id in idents(text) {
-            counts.entry(id.to_owned()).or_default().0 += 1;
+            counts.entry(id).or_default().0 += 1;
         }
     };
     for n in nodes {
         match n {
             Node::Line(l) => match classify(l) {
                 Kind::Let { name, init } => {
-                    counts.entry(name.to_owned()).or_default().1 += 1;
+                    counts.entry(name).or_default().1 += 1;
                     if let Some(init) = init {
                         add_text(init, counts);
                     }
                 }
                 Kind::Assign { lhs, op: ":=", rhs } if is_ident(lhs) => {
-                    counts.entry(lhs.to_owned()).or_default().1 += 1;
+                    counts.entry(lhs).or_default().1 += 1;
                     add_text(rhs, counts);
                 }
                 _ => add_text(l, counts),
@@ -826,19 +1464,26 @@ fn forward_copies(nodes: &mut Vec<Node>) {
 
 /// Drops `let x;` declarations of names nothing else mentions.
 fn drop_unused_decls(nodes: &mut Vec<Node>) {
-    let mut counts = BTreeMap::new();
-    mention_counts(nodes, &mut counts);
+    // Only the names to drop are copied out of the borrowed counts.
+    let unused: BTreeSet<String> = {
+        let mut counts = BTreeMap::new();
+        mention_counts(nodes, &mut counts);
+        counts
+            .into_iter()
+            .filter(|&(_, (reads, writes))| reads == 0 && writes <= 1)
+            .map(|(name, _)| name.to_owned())
+            .collect()
+    };
     for_each_block(nodes, &mut |block| {
-        block.retain(|n| match n {
-            Node::Line(l) => match classify(l) {
-                Kind::Let { name, init: None } => {
-                    let (reads, writes) = counts.get(name).copied().unwrap_or_default();
-                    reads > 0 || writes > 1
-                }
+        if !unused.is_empty() {
+            block.retain(|n| match n {
+                Node::Line(l) => match classify(l) {
+                    Kind::Let { name, init: None } => !unused.contains(name),
+                    _ => true,
+                },
                 _ => true,
-            },
-            _ => true,
-        });
+            });
+        }
         // `let x;` right before `x := e;` is spelled `let x = e;` (the same node).
         let mut i = 0;
         while i + 1 < block.len() {
@@ -1130,7 +1775,7 @@ fn rewrite(nodes: &mut Vec<Node>, rename: &BTreeMap<String, String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::optimize_tree_body;
+    use super::{drop_unread_entry_save, optimize_tree_body, pin_in_place};
 
     #[test]
     fn dead_stores_unread_self_obj_and_coalescing() {
@@ -1253,6 +1898,70 @@ mod tests {
         ] {
             let body = format!("{dead}    {line}\n    return true;\n");
             assert_ne!(optimize_tree_body(&body), body, "{line}");
+        }
+    }
+
+    #[test]
+    fn review_regressions_keep_observers() {
+        // A primitive may read the last result the save sets, so the save stays before it.
+        let body =
+            "    let __self_obj = stack_obj;\n    idle_for_input(param[0], 1);\n    return true;\n";
+        assert_eq!(optimize_tree_body(body), body);
+        // Scope 27 (sprite flags) reads the stack object, so the switch before it stays.
+        let body = "    stack_obj := my.id;\n    temp[0] := 0;\n    scope(27, 0) := 1;\n    return true;\n";
+        assert_eq!(optimize_tree_body(body), body);
+        // A local-slot operand keeps naming the save.
+        let body = "    let __self_obj = stack_obj;\n    push_interaction(menu: 0, object: 0, priority: 2, flags: 1, icon: __self_obj);\n    stack_obj := my.id;\n    return true;\n";
+        assert!(optimize_tree_body(body).contains("icon: __self_obj"));
+        // Raw numeric targets keep the line-based save drop away.
+        let body = "    let __self_obj = stack_obj;\n    stack_obj := my.id;\n    random(temp[0], 1) -> true: 3, false: 3;\n    return true;\n";
+        assert_eq!(drop_unread_entry_save(body), None);
+        // A local read before any write is not moved into the pin slot.
+        let body = "    let o;\n    local[0] := o;\n    push_interaction(menu: 0, object: 0, priority: 2, flags: 3, icon: 0);\n    return true;\n";
+        assert_eq!(pin_in_place(body), body);
+        // Nor when another local read before any write would move to a different word.
+        let body = "    let __v_o_0 = stack_obj;\n    let __v_inherited_1;\n    temp[0] := __v_inherited_1;\n    local[0] := __v_o_0;\n    push_interaction(menu: 0, object: 0, priority: 2, flags: 3, icon: 0);\n    return true;\n";
+        assert_eq!(pin_in_place(body), body);
+        // With every local written first, the pin applies.
+        let body = "    let __v_o_0 = stack_obj;\n    local[0] := __v_o_0;\n    push_interaction(menu: 0, object: 0, priority: 2, flags: 3, icon: 0);\n    return true;\n";
+        assert_eq!(
+            pin_in_place(body),
+            "    local[0] := stack_obj;\n    push_interaction(menu: 0, object: 0, priority: 2, flags: 3, icon: 0);\n    return true;\n"
+        );
+    }
+
+    #[test]
+    fn entry_save_forwards_until_a_write_and_then_goes() {
+        // Nothing changes the stack object before the restore, which becomes a no-op.
+        let body = "    let __self_obj = stack_obj;\n    my.attr[0] := stack.attr[1];\n    stack_obj := __self_obj;\n    my.attr[2] := 1;\n    return true;\n";
+        assert_eq!(
+            optimize_tree_body(body),
+            "    my.attr[0] := stack.attr[1];\n    my.attr[2] := 1;\n    return true;\n"
+        );
+        // After a write the restore is real, and so is the save.
+        let body = "    let __self_obj = stack_obj;\n    stack_obj := my.id;\n    my.attr[0] := stack.attr[1];\n    stack_obj := __self_obj;\n    my.attr[1] := stack.attr[2];\n    return true;\n";
+        assert_eq!(optimize_tree_body(body), body);
+        // A primitive may write it too.
+        let body = "    let __self_obj = stack_obj;\n    set_to_next(all);\n    stack_obj := __self_obj;\n    my.attr[1] := stack.attr[2];\n    return true;\n";
+        assert_eq!(optimize_tree_body(body), body);
+    }
+
+    #[test]
+    fn unread_stack_obj_stores_drop() {
+        // Nothing reads the store before the frame returns.
+        let body = "    let __o_1 = my.id;\n    stack_obj := __o_1;\n    my.attr[0] := 1;\n    return true;\n";
+        assert_eq!(
+            optimize_tree_body(body),
+            "    my.attr[0] := 1;\n    return true;\n"
+        );
+        // A read on one path keeps it; so does a loop.
+        for tail in [
+            "    if my.attr[0] == 1 {\n        my.attr[1] := stack.attr[0];\n    }\n    return true;\n",
+            "    while my.attr[0] < 3 {\n        my.attr[0] += 1;\n    }\n    return true;\n",
+        ] {
+            let body = format!("    let __o_1 = my.id;\n    stack_obj := __o_1;\n{tail}");
+            let out = optimize_tree_body(&body);
+            assert!(out.starts_with("    stack_obj := my.id;\n"), "{out}");
         }
     }
 

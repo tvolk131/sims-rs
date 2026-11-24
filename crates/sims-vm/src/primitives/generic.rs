@@ -64,7 +64,7 @@
 //!   of an arriving family.
 //! - 19 (0x450787): bring back the person who traveled with the person
 //!   whose object ID is in the running object's temp 0: temp 0 becomes the
-//!   companion's object ID, or -1. See [`Machine::find_companion`].
+//!   companion's object ID, or -1. See [`Machine::bring_back`].
 //!   Downtown's middle ped marker (EP3 `PedMarkers.iff` tree 0x100e,
 //!   node 11) runs it for the arriving family's first member.
 //! - 3 (0x44fb41): take down the interface's travel picture, if it shows
@@ -79,9 +79,29 @@
 //!   arriving family is placed (tree 0x100e, node 36). What else reads
 //!   +0x7c (the pause's refusal, `sims_sim::World::pause`; Dialog's
 //!   modal check, `dialog.rs`) is not modeled either.
+//! - 17 (0x450660): ask for a trip. The running object must be a person
+//!   (error 0x1c). 0x45a22d(temp 0 house, temp 1 hour, temp 2 minute,
+//!   temp 3 mode) writes the travelers' saved state and the arrival clock
+//!   into their neighbor inventories and records the house change, which
+//!   is left in [`World::trip_request`] for the shell (the game's byte
+//!   +0x1c +0xe1). See [`crate::travel::trip`]. The message the routine
+//!   sends the interface window `[0x6f3b2c]` is presentation.
+//! - 20 (0x45087d): routine 19 with kind 3, the token naming whom a
+//!   traveler takes home. See [`Machine::bring_back`].
+//! - 22 (0x45141f, routine 7's entry): native error 0x2a.
+//! - 23 (0x450b2b): read the arrival clock back. See
+//!   [`Machine::read_arrival_clock`].
+//! - 25 (0x450c02): the running object, which must be a person (error
+//!   0x1c), is saved to its neighbor record (0x425a69,
+//!   [`crate::people::save_to_record`]).
+//!
+//! Routine 24 (0x44ff6e), the outfit editor of dressers and clothing racks,
+//! is not ported: it needs the editor struct (0x408b3b), its 18 category
+//! accessors (0x40d4ff to 0x40e1f9) and its commit (0x409492).
 
 use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
+use crate::travel::trip::{self, SavedField};
 use sims_core::F32;
 use sims_sim::World;
 
@@ -167,7 +187,30 @@ impl Machine<'_, '_> {
                 Ok(true)
             }
             19 => {
-                self.find_companion()?;
+                self.bring_back(COMPANION)?;
+                Ok(true)
+            }
+            20 => {
+                self.bring_back(trip::HOMEBOUND_COMPANION_KIND)?;
+                Ok(true)
+            }
+            17 => {
+                self.request_trip_from_temps()?;
+                Ok(true)
+            }
+            22 => Err(Trap::native(
+                0x2a,
+                "Generic Sims Call 22 (routine 7's entry)",
+            )),
+            23 => {
+                self.read_arrival_clock()?;
+                Ok(true)
+            }
+            25 => {
+                if self.me()?.person.is_none() {
+                    return Err(Trap::native(0x1c, "object is not a person"));
+                }
+                crate::people::save_to_record(self.world, self.me)?;
                 Ok(true)
             }
             // Presentation only (see the module's notes).
@@ -504,43 +547,15 @@ impl Machine<'_, '_> {
 }
 
 /// The inventory token kind routine 21 restores from.
-const SAVED_STATE: i32 = 2;
+const SAVED_STATE: i32 = trip::SAVED_STATE_KIND;
 
 /// The inventory token kind routine 19 reads: the GUID of a person who
 /// travels with the token's owner.
-const COMPANION: i32 = 1;
+const COMPANION: i32 = trip::OUTBOUND_COMPANION_KIND;
 
 /// Definition word 9, the object's type, and the type a person has.
 const TYPE: usize = 9;
 const PERSON_TYPE: i16 = 2;
-
-/// Where routine 21 puts a token's count, by the token's GUID (the
-/// switch at 0x450a53, through the table at 0x4514ea).
-enum Restored {
-    /// A motive, set to the count as a float (0x45d133: person +0x78c).
-    Motive(usize),
-    /// A person data word, set to the count.
-    Word(usize),
-}
-
-/// GUIDs 0 to 6 name motives, 9 to 12 person data words (+0x59c, +0x62c,
-/// +0x630, +0x62e); 7, 8 and anything above 12 name nothing.
-fn restored(guid: u32) -> Option<Restored> {
-    Some(match guid {
-        0 => Restored::Motive(9),
-        1 => Restored::Motive(6),
-        2 => Restored::Motive(5),
-        3 => Restored::Motive(15),
-        4 => Restored::Motive(7),
-        5 => Restored::Motive(8),
-        6 => Restored::Motive(14),
-        9 => Restored::Word(8),
-        10 => Restored::Word(80),
-        11 => Restored::Word(82),
-        12 => Restored::Word(81),
-        _ => return None,
-    })
-}
 
 impl Machine<'_, '_> {
     /// The person whose object ID is in the running object's temp 0
@@ -586,12 +601,14 @@ impl Machine<'_, '_> {
         Ok(())
     }
 
-    /// Routine 19 (0x450787 to 0x450985).
+    /// Routines 19 (0x450787 to 0x450985) and 20 (0x45087d to 0x450985),
+    /// which differ only in the token kind they read: 1, whom a traveler
+    /// took along on the way out, or 3, whom it takes home.
     ///
     /// 1. The running object's temp 0 names a person ([`Self::temp_0_person`]),
     ///    and that person's neighbor inventory is found, or added empty
     ///    (0x42a8a1).
-    /// 2. The first token of kind 1, any GUID, is found from the start
+    /// 2. The first token of `kind`, any GUID, is found from the start
     ///    (0x41f69c). Its place is kept as a word; a negative one (none
     ///    found, or an index past 0x7fff that wraps negative) sets temp 0
     ///    to -1 and ends the routine there, with nothing erased and no
@@ -609,33 +626,95 @@ impl Machine<'_, '_> {
     /// The routine always ends with the true branch (0x44f7f0). Kind-1
     /// tokens are what Manage Inventory's operation 5 writes: the GUID of
     /// the neighbor a traveler takes along.
-    fn find_companion(&mut self) -> Result<(), Trap> {
+    fn bring_back(&mut self, kind: i32) -> Result<(), Trap> {
         let (_, neighbor) = self.temp_0_person()?;
         let inventory = self.inventory_slot(neighbor);
         let items = &self.world.neighbors.inventories[inventory].items;
-        let place = items
-            .iter()
-            .position(|item| item.kind == COMPANION)
-            .map_or(-1, |index| (index as u16) as i16);
+        let place = trip::token_place(items, kind, 0);
         // A place of 0 or more is at or before the token's index, so it
         // is in the inventory (0x41f6fb reads it).
-        let Ok(at) = usize::try_from(place) else {
+        if place < 0 {
             return self.set_temp_0(-1);
-        };
-        let guid = items[at].guid;
+        }
+        let guid = trip::read_token(items, place).guid;
         let companion = self.person_of_type(guid)?;
         self.set_temp_0(companion.map_or(-1, |id| id as i16))?;
         // 0x41f56b(place, 1), on the inventory as it is now: making the
         // companion ran its scripts.
         let inventory = self.inventory_slot(neighbor);
-        let items = &mut self.world.neighbors.inventories[inventory].items;
-        if let Some(item) = items.get_mut(at) {
-            let remaining = i32::from(item.count as i16) - 1;
-            if remaining > 0 {
-                item.count = remaining as u16;
-            } else {
-                items.remove(at);
+        trip::take_token(
+            &mut self.world.neighbors.inventories[inventory].items,
+            place,
+            1,
+        );
+        Ok(())
+    }
+
+    /// Routine 17 (0x450660): the running object must be a person (the
+    /// cast at 0x635abe throws error 0x1c). 0x45a22d runs with temps 0 to
+    /// 3 ([`Self::request_trip`]); the request it records is left in
+    /// [`World::trip_request`], which stands for the game's byte +0x1c
+    /// +0xe1 and 0x4fc713's fields. When it records none (no neighbor
+    /// record, or a mode other than 0 and 1) the request stays as it was.
+    /// 0x4fc713 also ignores a request while one is pending (its byte
+    /// +0x130), so the first request stands until the shell carries it out;
+    /// a later call still writes its tokens.
+    fn request_trip_from_temps(&mut self) -> Result<(), Trap> {
+        let me = self.me()?;
+        if me.person.is_none() {
+            return Err(Trap::native(0x1c, "object is not a person"));
+        }
+        let temp = |index: usize| me.temps.get(index).copied().unwrap_or(0);
+        let (house, hour, minute, mode) = (temp(0), temp(1), temp(2), temp(3));
+        if let Some(request) = self.request_trip(house, hour, minute, mode)? {
+            match &mut self.world.trip_request {
+                // The pending request stands; the inventories this call
+                // wrote are the trip's to take back too.
+                Some(pending) => {
+                    for neighbor in request.saved {
+                        if !pending.saved.contains(&neighbor) {
+                            pending.saved.push(neighbor);
+                        }
+                    }
+                }
+                none => *none = Some(request),
             }
+        }
+        Ok(())
+    }
+
+    /// Routine 23 (0x450b2b to 0x450bfd): the running object must be a
+    /// person (error 0x1c); its neighbor inventory is found, or added
+    /// empty (0x42a8a1). The first kind-2 token of GUID 7 (0x41f69c) gives
+    /// its count to temp 0 and is erased (0x41f56b with -1); then the
+    /// first of GUID 8 gives its count to temp 1 and is erased. When
+    /// either is missing the routine stops there. It always takes the true
+    /// branch (0x44f7f0).
+    ///
+    /// A place past 0x7fff that wraps to another negative word reads the
+    /// routine's own token (count 1, 0x450b87) and erases nothing.
+    fn read_arrival_clock(&mut self) -> Result<(), Trap> {
+        let me = self.me;
+        let neighbor = trip::person_neighbor(self.world, me)
+            .ok_or(Trap::native(0x1c, "object is not a person"))?;
+        let inventory = self.inventory_slot(neighbor);
+        for (guid, temp) in [(trip::ARRIVAL_HOUR_GUID, 0), (trip::ARRIVAL_MINUTE_GUID, 1)] {
+            let items = &self.world.neighbors.inventories[inventory].items;
+            let place = trip::token_place(items, SAVED_STATE, guid);
+            if place == -1 {
+                return Ok(());
+            }
+            let count = trip::read_token(items, place).count as i16;
+            *self
+                .me_mut()?
+                .temps
+                .get_mut(temp)
+                .ok_or_else(|| Trap::Invalid(format!("object has no temp {temp}")))? = count;
+            trip::take_token(
+                &mut self.world.neighbors.inventories[inventory].items,
+                place,
+                -1,
+            );
         }
         Ok(())
     }
@@ -691,7 +770,7 @@ impl Machine<'_, '_> {
     /// 3. The tokens of kind 2 are counted (0x41f7a7), and the count cut
     ///    to a signed word. That many times: the first token of kind 2,
     ///    any GUID, is found from the start (0x41f69c, from place -1 each
-    ///    time). Its GUID says where its count goes ([`restored`]): a
+    ///    time). Its GUID says where its count goes ([`trip::saved_field`]): a
     ///    motive takes the signed count as a float, a data word the count.
     ///    The token is then erased (0x41f56b with -1). A token whose GUID
     ///    names nothing is left where it is, so later passes find it
@@ -730,14 +809,14 @@ impl Machine<'_, '_> {
             // A negative place reads nothing and leaves the routine's own
             // values: GUID 0, count 1 (0x450a1d to 0x450a23).
             let (guid, count) = token.map_or((0, 1), |token| (token.guid, token.count as i16));
-            let Some(target) = restored(guid) else {
+            let Some(target) = trip::saved_field(guid) else {
                 continue;
             };
             match target {
-                Restored::Motive(motive) => {
+                SavedField::Motive(motive) => {
                     self.set_motive(person, motive, F32::from_f32(f32::from(count)))?;
                 }
-                Restored::Word(word) => {
+                SavedField::Word(word) => {
                     *self
                         .world
                         .objects
