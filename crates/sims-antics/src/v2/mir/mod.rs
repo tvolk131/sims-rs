@@ -4,14 +4,25 @@
 //! [`InstKind`]: declaration, store, `return` / `break` / `continue` exit, or other), `if` chains and
 //! `while` loops. Every branch of the tree is a structured edge.
 //!
-//! The modelled subset is exactly what `parse_body` accepts. Each non-blank line must be one of:
-//! - an `if COND {`, `} else if COND {`, `} else {` or `while COND {` header, or a `}` closer;
+//! The modelled subset is exactly what `parse_body` accepts. Lines are trimmed and blank lines
+//! skipped; every check below looks at the line with its string literals' contents removed. Each
+//! line must be one of:
+//! - an `if COND {` or `while COND {` header (`COND` holding no `;`, `{` or `}`), which opens a
+//!   block;
+//! - a `}`, `} else if COND {` or `} else {` line, which closes the open block. Every block must be
+//!   closed by the matching kind (`} else ...` only after an `if` arm, then a final `}`), so a
+//!   stray or missing closer rejects the body;
 //! - one simple statement: exactly one `;`, at the end, and no braces.
 //!
-//! A line is rejected (and `parse_body` returns `None`) when, outside string literals, it holds
-//! `//`, `/*`, `*/`, `->` or `#`, or when `names_local_slot` holds for it: a raw `op` or a
-//! `scope(N, ...)` whose scope is the locals scope (25) or not a literal. (`local[N]` and a
-//! same-line label such as `done: return true;` still parse, as opaque instructions.)
+//! A line is rejected (and `parse_body` returns `None`) when it holds `//`, `/*`, `*/`, `->` or
+//! `#`, or when `names_local_slot` holds for it: a raw `op` (except the operand-free spelling
+//! `op N (0, 0, 0, 0, 0, 0, 0, 0)` of the opcodes in `OPERAND_FREE_OPS`), or a `scope(N, ...)`
+//! whose scope is the locals scope (25) or not a literal.
+//!
+//! An accepted statement keeps its text; [`classify`] gives its typed view. A numbered-local
+//! operand is not rejected and takes part in that view like any other (`local[0] := x;` is an
+//! assignment). A same-line label is also accepted, and its statement classifies as
+//! [`InstKind::Other`] (`done: return true;`).
 //!
 //! The passes that need the tree (the optimizer, `pin_in_place`) leave a rejected body untouched.
 //! The others still run on it: `drop_unread_entry_save` works line by line (checking definitions

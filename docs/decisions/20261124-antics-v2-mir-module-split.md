@@ -33,16 +33,13 @@ The work is a refactor that is strictly behaviour-preserving. It adds no syntax 
   - The only edits are a `pub(super)` on moved items that had no visibility, and the module headers.
   - Types, structs and enums stay in `lower/mod.rs`, so their private fields stay visible to every child.
 - **A new `v2/mir/` layer** takes what was mixed into `opt.rs`. See the module map below.
-- **`opt.rs`** keeps only the optimizer passes over the MIR. It went from 2,723 lines to 810.
+- **`opt.rs`** keeps only the optimizer passes over the MIR and their tests. It went from 2,723 lines to about 800.
 - **`mir::Emitter`** replaces `TreeLowerer`'s `out` / `indent` fields. It writes lines at a depth and gives the marks that trial lowering uses: `mark`, `truncate`, `split_off`, `since`, `take_text` / `set_text` / `append`.
 - **`mir::StackObjOp`** types the stack-object saves and plain stores the lowering generates (`Save`: `let X = stack_obj;`, `Set`: `stack_obj := X;`). `StackObjOp::text()` is the shared formatter, and `TreeLowerer::stack_op` is the helper that emits one.
   - The dedicated save and restore sites call `stack_op`.
   - The `__self_obj` entry save calls `stack_op`. The `__saved_stack_obj` entry save (prepended in `finish`) and the `for` cursor initializer format with `text()`.
-  - The generic writers `emit_let` / `emit_store` route a stack-object operand to `stack_op`. These cover:
-    - every `let A = B;` and `A := B;` the lowering writes from two named operands;
-    - every `A := N;` it writes with an integer constant `N`, including `lower_arith_into_dest`'s constant and mask stores.
-
-    So a source `stack_obj = self.id;`, a `let saved = stack_obj;`, a `distance_to` snapshot, and the first store of `stack_obj = -x;` or `stack_obj = -1 + x;` are typed too.
+  - The generic writers `emit_let` / `emit_store` route a stack-object operand to `stack_op`. They are used at every site whose destination or saved value can be `stack_obj`, so a source `stack_obj = self.id;`, a `let saved = stack_obj;`, a `distance_to` snapshot, and the stores `lower_arith_into_dest` writes for `stack_obj = -x;` or `stack_obj = -1 + x;` are typed too.
+  - The claim is about plain (`:=`) writes of `stack_obj` and `let X = stack_obj;` saves only. Stores whose destination is fixed and is never `stack_obj` are still formatted directly: `temp[i] := 4;` from `job_data(4, 2, 5)`, the pinned `local[N] := obj;`, the dialog `temp` restores, and the generated counters and flags.
   - Out of scope: raw `.air` text, which passes through as written, and compound writes (`stack_obj += x;`, `stack_obj -= x;`), which stay plain stores. The next PR makes the coverage total by construction, once the emitter builds typed instructions.
 - **`mir::finish_body` with `FrameFacts`** is the per-tree backend pipeline. It takes over what `TreeLowerer::finish` ran inline:
   - the entry-save drop or the optimizer;
