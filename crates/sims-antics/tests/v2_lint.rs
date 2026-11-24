@@ -985,6 +985,25 @@ fn a_const_named_in_raw_is_used() {
         ),
         "unused_decl",
     );
+    // `const[K]` reads `K`, and `const K.e = ..` declares no `K`: a bare `K` there is a use.
+    for raw in [
+        "raw { temp[0] := const[LEVEL_SLOT]; }",
+        "raw { const LEVEL_SLOT.e = 2; temp[0] := LEVEL_SLOT; }",
+    ] {
+        none(
+            &obj(&format!(
+                "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {{\n        self.mode = Mode::Off;\n        self.level = 0;\n        {raw}\n    }}"
+            )),
+            "unused_decl",
+        );
+    }
+    // A field after `.` is not the constant.
+    one(
+        &obj(
+            "    const room = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { temp[0] := my.room; }\n    }",
+        ),
+        "unused_decl",
+    );
 }
 
 #[test]

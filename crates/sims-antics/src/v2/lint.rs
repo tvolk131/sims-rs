@@ -792,20 +792,8 @@ impl Symbols {
                     // Names and indices in `.air` code, not in its comments or strings
                     // (a quoted tree label may read `attr[7]`).
                     let outside = air_code_only(code);
-                    // A block's own `const K = ..;` (or `const T.e`) is its constant, not
-                    // the v2 one: v2 declares no second `K` for that block.
-                    let words: Vec<&str> = air_words(&outside).collect();
-                    let own: BTreeSet<&str> = words
-                        .windows(2)
-                        .filter(|w| w[0] == "const")
-                        .map(|w| w[1])
-                        .collect();
-                    self.raw_words.extend(
-                        words
-                            .iter()
-                            .filter(|w| !own.contains(*w))
-                            .map(|w| (*w).to_owned()),
-                    );
+                    self.raw_words
+                        .extend(air_name_uses(&outside).into_iter().map(str::to_owned));
                     for (word, n) in raw_index_words(&outside) {
                         if !matches!(word, "local" | "temp" | "param") {
                             self.raw_index_literals.insert(n);
@@ -1520,6 +1508,49 @@ fn air_code_only(code: &str) -> String {
 }
 
 /// The identifier-like words of `.air` text.
+/// The names `.air` code may read a v2 constant by: every word except a field (after
+/// `.`) and the block's own constant declarations. `const K = ..;` declares the block's
+/// own `K`, which every bare `K` in the block then means; `const K.e = ..` and
+/// `const[K]` declare nothing of that name.
+fn air_name_uses(code: &str) -> Vec<&str> {
+    let bytes = code.as_bytes();
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let prev = |at: usize| code[..at].trim_end().bytes().last();
+    let mut words: Vec<(usize, &str)> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_word(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && is_word(bytes[i]) {
+                i += 1;
+            }
+            words.push((start, &code[start..i]));
+        } else {
+            i += 1;
+        }
+    }
+    let mut own = BTreeSet::new();
+    let mut declaring = BTreeSet::new();
+    for pair in words.windows(2) {
+        let [(_, keyword), (name_at, name)] = pair else {
+            continue;
+        };
+        if *keyword != "const" || prev(*name_at) == Some(b'[') {
+            continue;
+        }
+        declaring.insert(*name_at);
+        let rest = code[name_at + name.len()..].trim_start();
+        if rest.starts_with('=') && !rest.starts_with("==") {
+            own.insert(*name);
+        }
+    }
+    words
+        .into_iter()
+        .filter(|(at, w)| prev(*at) != Some(b'.') && !declaring.contains(at) && !own.contains(w))
+        .map(|(_, w)| w)
+        .collect()
+}
+
 fn air_words(code: &str) -> impl Iterator<Item = &str> {
     code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .filter(|w| !w.is_empty())

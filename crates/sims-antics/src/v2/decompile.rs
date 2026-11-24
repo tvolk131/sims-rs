@@ -236,9 +236,16 @@ pub fn decompile_iff_to_v2_report(
                 }
                 // A block given its header may be all its callers were missing (a caller is
                 // proven only with its callees), so such a round lowers nothing else.
+                // A block the compiler renames is written as a plain tree, which keeps the
+                // label; that round too lowers nothing else.
                 let mut changed = false;
                 for &id in &unproven {
-                    changed |= plan.add_frame(&model, id);
+                    if model.renames_block(&plan, &recompiled, id) {
+                        plan.standalone.insert(id);
+                        changed = true;
+                    } else {
+                        changed |= plan.add_frame(&model, id);
+                    }
                 }
                 if !changed {
                     for &id in &unproven {
@@ -524,7 +531,7 @@ impl Model {
             let ident = unique_ident(&c.label, c.id, &mut used_idents);
             let mut tree = TreeModel {
                 id: c.id,
-                label: clean_label(&c.label),
+                label: tree_label(&c.label),
                 ident,
                 lifted: Vec::new(),
                 body_lines: (0, 0),
@@ -866,6 +873,9 @@ impl Model {
                 "the recompiled object has no tree with this ID".into(),
             );
         };
+        if let Some(gap) = header_gap(&t.original, b) {
+            return TreeCheck::Inconclusive(gap);
+        }
         // The checker does not model sounds: a tree that plays one whose event the
         // decompiled object names differently cannot be proven.
         if let Some(gap) = self.sound_gap(&t.original, recompiled) {
@@ -909,6 +919,19 @@ impl Model {
         };
         cache.insert(key, check.clone());
         check
+    }
+
+    /// Whether lifecycle block `id` must be written as a plain tree to keep its label:
+    /// the compiler names a block after its kind.
+    fn renames_block(&self, plan: &Plan, recompiled: &RecompiledFile, id: u16) -> bool {
+        self.tree(id).is_some_and(|t| {
+            t.lifecycle.is_some()
+                && !plan.standalone.contains(&id)
+                && recompiled
+                    .trees
+                    .get(&id)
+                    .is_some_and(|b| b.label != t.original.label)
+        })
     }
 
     /// Whether `tree` sees the same constants, attribute count and callee shapes in the
@@ -1681,9 +1704,24 @@ fn trcn_labels(data: &[u8], limit: usize) -> Option<Vec<String>> {
     Some(labels)
 }
 
+/// A tree's label as a v2 string body: [`clean_label`] without trimming, since Run Tree
+/// By Name compares the whole label (one the string cannot spell is left unproven).
+fn tree_label(label: &str) -> String {
+    let cleaned = clean_label_untrimmed(label);
+    if cleaned.trim().is_empty() {
+        String::new()
+    } else {
+        cleaned
+    }
+}
+
 /// A chunk label as a v2 string body: printable ASCII only, quotes and backslashes dropped.
 fn clean_label(label: &str) -> String {
-    let cleaned: String = label
+    clean_label_untrimmed(label).trim().to_owned()
+}
+
+fn clean_label_untrimmed(label: &str) -> String {
+    label
         .chars()
         .map(|c| {
             if c.is_ascii_graphic() || c == ' ' {
@@ -1693,8 +1731,7 @@ fn clean_label(label: &str) -> String {
             }
         })
         .filter(|&c| c != '"' && c != '\\')
-        .collect();
-    cleaned.trim().to_owned()
+        .collect()
 }
 
 /// The `extern bcon library_consts` entry name for a non-private constant address.
@@ -2190,15 +2227,15 @@ impl Plan {
             .filter(|t| t.lifecycle.is_some() && t.original.instructions.is_empty())
             .map(|t| t.id)
             .collect();
-        // Formats and kinds the compiler never gives a block by default start with `@frame`;
-        // anything else gets one when the default header does not compile or is not proven
-        // (see `add_frame`).
+        // Formats, kinds and revisions the compiler never gives a block by default start
+        // with `@frame`; anything else gets one when the default header does not compile or
+        // is not proven (see `add_frame`).
         let framed = model
             .trees
             .iter()
             .filter(|t| {
                 let b = &t.original;
-                t.lifecycle.is_some() && (b.format != 0x8002 || b.kind != 0)
+                t.lifecycle.is_some() && (b.format != 0x8002 || b.kind != 0 || b.revision != 0)
             })
             .map(|t| t.id)
             .collect();
@@ -3343,18 +3380,33 @@ impl Translator<'_> {
                     continue;
                 }
                 let value = |t: &str| t.starts_with(|c: char| c.is_ascii_digit());
-                let before = n.checked_sub(1).map(|p| &a[ta[p].clone()]);
+                let token = |p: Option<usize>| p.map(|p| &a[ta[p].clone()]);
+                let mut before = token(n.checked_sub(1));
                 let after = ta.get(n + 1).map(|r| &a[r.clone()]);
-                // A value operand only: not an index, a field, a negation, a pattern or
+                // A sign (a `-` after no operand) belongs to the value, in both arms.
+                let operand = |t: &str| {
+                    t.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                        || matches!(t, ")" | "]" | "\"")
+                };
+                let signed = before == Some("-")
+                    && token(n.checked_sub(2)).is_none_or(|t| !operand(t))
+                    && token(n.checked_sub(2)) != Some("@");
+                let (mut span, mut x, mut y) = (ra.clone(), x.to_owned(), y.to_owned());
+                if signed {
+                    span.start = ta[n - 1].start;
+                    (x, y) = (format!("-{x}"), format!("-{y}"));
+                    before = token(n.checked_sub(2));
+                }
+                // A value operand only: not an index, a field, a subtrahend, a pattern or
                 // a named argument's key.
-                if !value(x)
-                    || !value(y)
+                if !value(&a[ra.clone()])
+                    || !value(&b[rb.clone()])
                     || matches!(before, Some("[" | "." | "-" | "@"))
                     || matches!(after, Some("=" | ":" | "[" | "."))
                 {
                     return;
                 }
-                holes.push((k, ra.clone(), x.to_owned(), y.to_owned()));
+                holes.push((k, span, x, y));
             }
         }
         if holes.is_empty()
@@ -4448,9 +4500,8 @@ impl Translator<'_> {
                 Some(format!("self.slot[{}]", o.index))
             }
             3 if self.sim && o.index == 2 && self.extra() => Some("sim.container".to_owned()),
-            19 if o.index == 65 => {
-                let p = self.person_binding()?;
-                Some(format!("{p}.kind"))
+            19 if o.index == 65 && self.person_binding().is_some() => {
+                Some(format!("{}.kind", self.person_binding()?))
             }
             _ => self.lvalue(r),
         }
@@ -4567,6 +4618,24 @@ fn assign_operator(op: &AssignOp) -> Option<&'static str> {
         AssignOp::BitOr => "|=",
         AssignOp::BitXor => "^=",
         AssignOp::FlagSet | AssignOp::FlagClear | AssignOp::Sqrt => return None,
+    })
+}
+
+/// The parts of a tree's header the code checker does not compare but the game reads: the
+/// label (Run Tree By Name finds a tree by it) and the revision (saved objects are matched
+/// against it).
+fn header_gap(original: &BhavChunk, rebuilt: &BhavChunk) -> Option<String> {
+    if original.label != rebuilt.label {
+        return Some(format!(
+            "the rebuilt tree is labelled {:?}, not {:?}, which Run Tree By Name may see",
+            rebuilt.label, original.label
+        ));
+    }
+    (original.revision != rebuilt.revision).then(|| {
+        format!(
+            "the rebuilt tree has revision {}, not {}",
+            rebuilt.revision, original.revision
+        )
     })
 }
 

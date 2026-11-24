@@ -6,7 +6,7 @@ use sims_antics::compile_v2_source;
 use sims_antics::v2::{
     DecompileV2Options, PackResolverConfig, TreeCheck, decompile_iff_to_v2_report, lint_v2_source,
 };
-use sims_formats::iff::Iff;
+use sims_formats::iff::{ChunkData, Iff};
 
 fn compile(source: &str) -> Iff {
     let object = compile_v2_source("pr_h.antics", source, &PackResolverConfig::default())
@@ -16,8 +16,11 @@ fn compile(source: &str) -> Iff {
 
 /// Lifts `source`'s object: every tree proven, the text compiles again and lints clean.
 fn lift(source: &str) -> (String, Vec<sims_antics::v2::DecompiledTree>) {
-    let report =
-        decompile_iff_to_v2_report(&compile(source), &DecompileV2Options::default()).expect("lift");
+    lift_iff(&compile(source))
+}
+
+fn lift_iff(iff: &Iff) -> (String, Vec<sims_antics::v2::DecompiledTree>) {
+    let report = decompile_iff_to_v2_report(iff, &DecompileV2Options::default()).expect("lift");
     assert!(report.compiled);
     assert!(
         report
@@ -32,6 +35,27 @@ fn lift(source: &str) -> (String, Vec<sims_antics::v2::DecompiledTree>) {
     let lints = lint_v2_source(&report.source, "lifted.antics").expect("lint");
     assert!(lints.is_empty(), "{lints:?}\n{}", report.source);
     (report.source, report.trees)
+}
+
+/// `iff` with BHAV `id` relabelled `label`.
+fn relabel(iff: &Iff, id: u16, label: &str) -> Iff {
+    let chunks: Vec<ChunkData> = iff
+        .chunks
+        .iter()
+        .filter(|c| &c.tag != b"rsmp")
+        .map(|c| ChunkData {
+            tag: c.tag,
+            id: c.id,
+            flags: c.flags,
+            label: if &c.tag == b"BHAV" && c.id == id {
+                label.to_owned()
+            } else {
+                c.label.clone()
+            },
+            data: iff.data(c).to_vec(),
+        })
+        .collect();
+    Iff::parse(sims_formats::iff::write(&chunks).expect("write IFF")).expect("parse IFF")
 }
 
 fn has(lifted: &str, spellings: &[&str]) {
@@ -196,4 +220,104 @@ fn argless_calls_between_sim_trees_name_the_sim() {
     );
     has(&lifted, &["tune_4300(sim)"]);
     assert!(!lifted.contains("raw"), "{lifted}");
+}
+
+#[test]
+fn a_lifecycle_tree_the_compiler_would_rename_is_written_plain() {
+    // Run Tree By Name finds a tree by its label: a block would be relabelled `Main`.
+    let iff = relabel(
+        &compile(
+            r#"object "Fable Clock" {
+    guid: 0x7E00_0127;
+    @id(4200) main { temp[0] = 1; }
+    @id(4201) init { temp[1] = 2; }
+}"#,
+        ),
+        4200,
+        "Tick",
+    );
+    let (lifted, trees) = lift_iff(&iff);
+    has(&lifted, &["\"Tick\" {", "@id(4201) init {"]);
+    assert!(
+        trees.iter().any(|t| t.id == 4200 && t.standalone_lifecycle),
+        "{trees:?}"
+    );
+}
+
+#[test]
+fn a_lifecycle_revision_is_kept() {
+    let (lifted, _) = lift(
+        r#"object "Fable Ledger" {
+    guid: 0x7E00_0128;
+    @id(4200) @frame(revision: 7) main { temp[0] = 1; }
+}"#,
+    );
+    has(&lifted, &["revision: 7) main {"]);
+}
+
+#[test]
+fn signed_literals_lift_as_const_bindings_of_one_sign() {
+    let (lifted, _) = lift(
+        r#"object "Fable Gauge" {
+    guid: 0x7E00_0129;
+    @id(4300) @frame(locals: 0) tree dip {
+        if temp[0] > 3 { temp[1] = -5; } else { temp[1] = -6; }
+        temp[4] = 7;
+    }
+}"#,
+    );
+    has(&lifted, &["= if temp[0] > 3 { -5 } else { -6 };"]);
+    // Opposite signs differ by a token: the `if` stays.
+    let (lifted, _) = lift(
+        r#"object "Fable Gauge" {
+    guid: 0x7E00_012A;
+    @id(4300) @frame(locals: 0) tree dip {
+        if temp[0] > 3 { temp[1] = -5; } else { temp[1] = 6; }
+        temp[4] = 7;
+    }
+}"#,
+    );
+    assert!(!lifted.contains("const"), "{lifted}");
+}
+
+#[test]
+fn an_inherit_tree_reads_the_stack_objects_person_kind() {
+    let (lifted, _) = lift(
+        r#"object "Fable Gong" {
+    guid: 0x7E00_012B;
+    @id(4300) @frame(locals: 0) @context(inherit) tree ring "Ring" {
+        me.person[3] = 1;
+        temp[0] = stack_obj.person[65];
+    }
+    @id(4301) @frame(locals: 0) tree from_object "From Object" { ring(); }
+    @id(4302) @frame(locals: 0) tree from_sim "From Sim" (sim: Sim) {
+        sim.motive[1] = 2;
+        ring();
+    }
+}"#,
+    );
+    has(&lifted, &["temp[0] = stack_obj.person[65];"]);
+    assert!(!lifted.contains("raw {"), "{lifted}");
+}
+
+#[test]
+fn a_beside_step_names_its_local() {
+    let (lifted, _) = lift(
+        r#"object "Fable Hinge" {
+    guid: 0x7E00_012C;
+    @id(4300) @frame(locals: 3) tree near -> bool {
+        @slot(2) let side: i16 = 1;
+        if !set_to_next(beside, dest: stack_obj, local: side) { return false; }
+        return true;
+    }
+}"#,
+    );
+    has(
+        &lifted,
+        &[
+            "@slot(2) let slot_2: i16;",
+            "set_to_next(beside, dest: stack_obj, local: slot_2)",
+        ],
+    );
+    assert!(!lifted.contains("raw {"), "{lifted}");
 }

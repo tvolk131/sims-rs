@@ -48,17 +48,29 @@ Checked over 689 pilot `.antics` files:
 ## Decision 2: `lint`
 
 - **`unused_const`:** a `const` named in a `raw { }` block counts as used, and the "raw does not resolve const" advice is gone.
-  - A raw block's own `.air` `const K = ..;` declarations are not uses of a v2 `const K`.
+  - A raw block's own `.air` `const K = ..;` declares that block's `K`, so a bare `K` in the block is not a use of a v2 `const K`.
+  - `const[K]` reads `K`. `const K.e = ..` declares no `K`, so another bare `K` in that block still counts.
+  - A field after `.` (`my.room`) is not a use of a v2 `const room`.
 - **`@slot(N) let`:** a pinned local (with or without an initializer) is neither `unused_decl` nor `uninitialized_local_read`, since a raw primitive or text reads it by number.
 
 ## Decision 3: `lift --v2` writes the PR H idioms where they are proven
 
 Every idiom stays behind the decompiler's existing proof loop. A tree whose recompile is not proven `IDENTICAL`/`EQUIVALENT` drops the idiom, then lowers.
 
+The code check compares frames and code but not two header fields the game reads, so the lift now checks those itself:
+
+- **The label:** Run Tree By Name finds a tree by it.
+- **The revision:** saved objects are matched against it.
+
+A rebuilt tree whose label or revision differs is never proven (`header_gap`). Tree labels keep their exact spaces: `"Grill "` is no longer trimmed to `"Grill"`.
+
+This also closes a gap on main: a lifecycle block was reported proven although the compiler names a block after its kind (`Main`), whatever the original label was.
+
 1. **Lifecycle blocks keep their header.**
    - An `init`/`main`/... block the default header does not reproduce is written `@id(N) @frame(args, locals, format, revision[, kind]) main {`, instead of a plain tree plus a generated stub. A block whose default header is proven is still written bare.
+   - A block whose label the compiler would change (`Tick` written as `main` becomes `Main`) is written as a plain tree instead, since the plain-tree header keeps the label. That round lowers nothing else.
    - Order of adding `@frame`:
-     - Formats other than 0x8002, and nonzero kinds, start framed.
+     - Formats other than 0x8002, nonzero kinds and nonzero revisions start framed.
      - Any other block gets `@frame` before anything else is tried, when it fails to compile (for example `param[0]` outside a zero-argument frame) or is not proven.
      - A round that adds a frame lowers nothing else, because a caller is proven only together with its callees.
    - Only a 0-node lifecycle tree still starts plain: `@frame(empty)` is refused on blocks.
@@ -74,11 +86,13 @@ Every idiom stays behind the decompiler's existing proof loop. A tree whose reco
    - its arms are token-for-token equal except for 1–4 integer literals;
    - there are no `raw`, attributes, `let`s or blank lines.
 
+   A literal's unary `-` belongs to it, so `-5`/`-6` arms lift too. Arms of opposite sign differ by a token and stay an `if`.
+
    The rewrite is `const ARM_n = if c { a } else { b };` (or the tuple form), followed by the arm once with the literals named.
    - The last arm statement must use a binding. PR H's specialization region ends at the last statement naming a bound name, so a binding used only earlier would leave that tail outside the region.
 6. **`@context(inherit)` + `me.*`.** A private, non-lifecycle tree called from a tree of the other context (by the contexts the trees prefer) is written `@context(inherit)` when idiomatic:
    - its own-object scopes print as `me.attr/data/motive/person/slot[i]`;
-   - stack-object scopes print as `stack_obj.*`.
+   - stack-object scopes print as `stack_obj.*`, including `stack_obj.person[65]` outside a `for p in lot.sims()` loop.
 7. **Argless calls between Sim trees** now pass `sim`, like calls with temps already did.
 
 Not lifted: the rare raw `sleep` statements.
@@ -92,9 +106,9 @@ Not lifted: the rare raw `sleep` statements.
 | proven (identical + equivalent) | 2699 (367 + 2332) | 2699 (367 + 2332) |
 | inconclusive / omitted / DIFFERENT | 22 / 1 / **0** | 22 / 1 / **0** |
 | idiomatic trees | 870 | 891 |
-| raw statements inside idiomatic trees | 1119 | 769 (−31%) |
+| raw statements inside idiomatic trees | 1119 | 738 (−34%) |
 | raw trees | 1851 | 1830 |
-| init/main written as plain trees | 101 | 0 |
+| init/main written as plain trees | 101 (format/kind) | 103 (label/empty; main reported renamed blocks proven) |
 | lint warnings on the lifted files | 29 | 17 (`magic_guid_literal` 11 → 0) |
 
 - **Open Starter Pack:** 116/116 trees proven, 0 DIFFERENT. The lifted files lint clean and pass `fmt --check`, and are byte-identical to main's lift.
@@ -109,3 +123,5 @@ Not lifted: the rare raw `sleep` statements.
   - the path cap.
 - A single-value ladder needs its binding in the arm's last statement (see Decision 3.5).
 - A block call stays `raw` (see Decision 3.1).
+- Most base-game lifecycle trees carry labels other than the compiler's block names, so they stay plain trees. A v2 way to label a block would belong to the compiler track.
+- `@slot(N) let x: T;` is exempt from `uninitialized_local_read` as a whole. A pinned slot exists so raw code or text can use it by number, and lint does not model raw writes by slot number.
