@@ -105,7 +105,8 @@ Every new spelling is an extra idiom: a tree that does not prove falls back to t
   | open-pack | 2 | 2 |
   | fridges pilot | 21 | 8 |
   | open-pack lifted | 38 | 2 |
-  | base-game lifted | 125 | 45 |
+  | base-game lifted | 125 | 48 |
 
-  - The 17 `raw_bare_call_false_exit` hits in lifted base-game code are real false exits followed by `return true;`.
+  - The base-game figure is for the new lift output, which spells more conditions as calls.
+  - Its 6 `raw_bare_call_false_exit` hits are real false exits followed by `return true;`.
 - Every committed fixture is synthetic, with GUIDs in `0x7E00_xxxx`.
