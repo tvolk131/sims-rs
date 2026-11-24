@@ -183,6 +183,12 @@ pub fn decompile_iff_to_v2_report(
     for _ in 0..max_rounds {
         let generated = model.generate(&plan);
         match model.compile(&generated.text) {
+            Err(Failure::V2 { line, message })
+                if plan.drop_variants(&model, &generated, line, &message) => {}
+            Err(Failure::Air {
+                tree: None,
+                message,
+            }) if plan.drop_variants(&model, &generated, None, &message) => {}
             Err(Failure::V2 { line, message }) => {
                 if !plan.lower_at_line(&model, &generated, line) {
                     // A tree that fails at its lowest level is left out.
@@ -286,6 +292,17 @@ struct TreeModel {
     omitted: Option<String>,
 }
 
+/// One catalog variant (`variant "Name" { ... }`).
+struct VariantModel {
+    objd_id: u16,
+    name: String,
+    guid: u32,
+    price: u16,
+    description: Option<String>,
+    init: u16,
+    main: u16,
+}
+
 struct BconModel {
     id: u16,
     label: String,
@@ -296,7 +313,14 @@ struct Model {
     name: String,
     guid: u32,
     price: u16,
+    /// Further OBJDs that are neither catalog variants nor written (multi-tile parts).
     extra_objds: usize,
+    /// Catalog variants: further OBJDs that differ from the first only in the words a v2
+    /// `variant` sets.
+    variants: Vec<VariantModel>,
+    /// The first OBJD's init and main tree IDs.
+    primary_init: u16,
+    primary_main: u16,
     bcons: Vec<BconModel>,
     /// Private BCON chunk id -> reference name.
     bcon_names: BTreeMap<u16, String>,
@@ -346,6 +370,41 @@ impl Model {
         let state_limit = attributes.map_or(MAX_STATE_SLOT, |a| {
             i16::try_from(a).map_or(MAX_STATE_SLOT, |a| (a - 1).min(MAX_STATE_SLOT))
         });
+        let primary_name = primary_object_name(&objd_chunk.label);
+        let mut variants: Vec<VariantModel> = Vec::new();
+        for c in &objds[1..] {
+            let data = iff.data(c);
+            let name = clean_label(&c.label);
+            let Some(v) = variant_words(objd_data, data) else {
+                continue;
+            };
+            let guid = u32::from(v[1]) | (u32::from(v[2]) << 16);
+            // What the v2 compiler requires of a variant: its own name and GUID, and a
+            // name whose chunk labels (`{name} Functions`) fit.
+            if name.is_empty()
+                || name.len() > MAX_CHUNK_LABEL - " Functions".len()
+                || name == primary_name
+                || guid == objd.guid
+                || variants.iter().any(|w| w.name == name || w.guid == guid)
+            {
+                continue;
+            }
+            let description = iff
+                .get(b"CTSS", v[4])
+                .and_then(|t| StringTable::parse_chunk(iff.data(t), t.flags).ok())
+                .and_then(|t| t.entries.get(1).map(|e| clean_label(&e.text)));
+            variants.push(VariantModel {
+                objd_id: c.id,
+                name,
+                guid,
+                price: v[3],
+                description,
+                init: v[5],
+                main: v[0],
+            });
+        }
+        let primary_init = objd_word(OBJD_INIT_WORD).unwrap_or(0);
+        let primary_main = objd_word(OBJD_MAIN_WORD).unwrap_or(0);
         let mut lifecycle: BTreeMap<u16, Lifecycle> = BTreeMap::new();
         for (word, kind) in [
             (OBJD_INIT_WORD, Lifecycle::Init),
@@ -501,8 +560,13 @@ impl Model {
             {
                 tree.body = None;
             }
+            // A variant runs its init/main tree as the object itself.
+            let variant_tree = variants
+                .iter()
+                .any(|v| v.init == tree.id || v.main == tree.id);
             if let Some(body) = &tree.body {
-                tree.sim_ctx = tree.lifecycle.is_none() && prefers_sim_context(body);
+                tree.sim_ctx =
+                    tree.lifecycle.is_none() && !variant_tree && prefers_sim_context(body);
             }
             trees.push(tree);
         }
@@ -609,7 +673,10 @@ impl Model {
             name: objd_chunk.label.trim().to_owned(),
             guid: objd.guid,
             price: objd.price,
-            extra_objds: objds.len() - 1,
+            extra_objds: objds.len() - 1 - variants.len(),
+            variants,
+            primary_init,
+            primary_main,
             bcons,
             bcon_names,
             extern_bcons,
@@ -671,6 +738,7 @@ impl Model {
             sounds: fwav_sounds(&iff),
             resources: resource_chunks(&iff),
             attributes: objd_attributes(&iff),
+            variants: objd_entries(&iff),
         })
     }
 
@@ -757,11 +825,78 @@ impl Model {
     }
 
     fn resources_not_reproduced(&self, recompiled: &RecompiledFile) -> Vec<String> {
-        self.original_resources
+        let mut out: Vec<String> = self
+            .original_resources
             .iter()
             .filter(|(key, data)| recompiled.resources.get(key) != Some(*data))
             .map(|((tag, id), _)| format!("{} {id}", String::from_utf8_lossy(tag)))
-            .collect()
+            .collect();
+        // A variant is reproduced when the recompiled object defines its GUID with the same
+        // price and the same init/main tree IDs.
+        for v in &self.variants {
+            let same = recompiled
+                .variants
+                .get(&v.guid)
+                .is_some_and(|&(price, init, main)| {
+                    (price, init, main) == (v.price, v.init, v.main)
+                });
+            if !same {
+                out.push(format!("OBJD {} (variant \"{}\")", v.objd_id, v.name));
+            }
+        }
+        out
+    }
+
+    /// The fields of a `variant` member, or why it cannot be written this round.
+    fn variant_fields(
+        &self,
+        v: &VariantModel,
+        plan: &Plan,
+    ) -> std::result::Result<Vec<String>, String> {
+        if let Some(why) = &plan.variants_off {
+            return Err(why.clone());
+        }
+        let mut fields = vec![
+            format!("guid: {}", hex_u32(v.guid)),
+            format!("price: {}", v.price),
+        ];
+        if let Some(d) = &v.description {
+            fields.push(format!("description: \"{d}\""));
+        }
+        for (role, id, primary) in [
+            ("init", v.init, self.primary_init),
+            ("main", v.main, self.primary_main),
+        ] {
+            let tree = self.tree(id).filter(|t| t.omitted.is_none());
+            let block = tree.and_then(|t| t.lifecycle.filter(|_| !plan.standalone.contains(&id)));
+            if id == primary && (tree.is_none() || block.is_some()) {
+                // The variant inherits the object's own init/main.
+                continue;
+            }
+            match (tree, block) {
+                (Some(t), None) if t.original.args <= 4 => {
+                    fields.push(format!("{role}: {}", t.ident));
+                }
+                (Some(t), None) => {
+                    return Err(format!(
+                        "its {role} tree {id} takes {} arguments",
+                        t.original.args
+                    ));
+                }
+                (Some(_), Some(kind)) => {
+                    return Err(format!(
+                        "its {role} tree {id} is written as the object's {} block",
+                        kind.keyword()
+                    ));
+                }
+                (None, _) => {
+                    return Err(format!(
+                        "its {role} tree {id} is not a written private tree"
+                    ));
+                }
+            }
+        }
+        Ok(fields)
     }
 
     /// Marks tree `id` as not writable at any level. Returns `false` if it already was.
@@ -776,6 +911,56 @@ impl Model {
             }
             _ => false,
         }
+    }
+}
+
+/// OBJD words (after the 32-bit version) a v2 `variant` sets: main, GUID low, GUID high,
+/// price, catalog strings ID, init.
+const VARIANT_WORDS: [usize; 6] = [3, 12, 13, 16, 39, OBJD_INIT_WORD];
+
+/// The [`VARIANT_WORDS`] of `other` if it differs from `primary` in no other word.
+fn variant_words(primary: &[u8], other: &[u8]) -> Option<[u16; 6]> {
+    let words = |d: &[u8]| -> Vec<u16> {
+        d.get(4..)
+            .unwrap_or_default()
+            .chunks(2)
+            .map(|b| u16::from_le_bytes([b[0], b.get(1).copied().unwrap_or(0)]))
+            .collect()
+    };
+    let (a, b) = (words(primary), words(other));
+    let same_rest = primary.len() == other.len()
+        && primary.get(..4) == other.get(..4)
+        && a.len() > OBJD_INIT_WORD
+        && a.iter()
+            .zip(&b)
+            .enumerate()
+            .all(|(w, (x, y))| x == y || VARIANT_WORDS.contains(&w));
+    same_rest.then(|| VARIANT_WORDS.map(|w| b[w]))
+}
+
+/// GUID -> (price, init, main) for every OBJD of `iff`.
+fn objd_entries(iff: &Iff) -> BTreeMap<u32, (u16, u16, u16)> {
+    let mut out = BTreeMap::new();
+    for c in iff.chunks.iter().filter(|c| &c.tag == b"OBJD") {
+        let data = iff.data(c);
+        let word = |w: usize| {
+            data.get(4 + w * 2..6 + w * 2)
+                .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
+        };
+        let guid = u32::from(word(12)) | (u32::from(word(13)) << 16);
+        out.entry(guid)
+            .or_insert((word(16), word(OBJD_INIT_WORD), word(OBJD_MAIN_WORD)));
+    }
+    out
+}
+
+/// The `object "..."` name written for an OBJD label.
+fn primary_object_name(label: &str) -> String {
+    let name = clean_label(label);
+    if name.is_empty() {
+        "Decompiled Object".to_owned()
+    } else {
+        name
     }
 }
 
@@ -880,6 +1065,8 @@ struct RecompiledFile {
     sounds: BTreeMap<u16, String>,
     resources: BTreeMap<([u8; 4], u16), Vec<u8>>,
     attributes: Option<u16>,
+    /// GUID -> (price, init, main) for every OBJD.
+    variants: BTreeMap<u32, (u16, u16, u16)>,
 }
 
 enum Failure {
@@ -1093,11 +1280,37 @@ struct ForEachParts<'a> {
 }
 
 fn for_each_parts<'a>(init: &Stmt, w: &'a Stmt, restore: &Stmt) -> Option<ForEachParts<'a>> {
-    let local = |r: &OperandRef| match r {
+    let Stmt::Assign {
+        lhs: rl,
+        op: AssignOp::Set,
+        rhs: rr,
+        ..
+    } = restore
+    else {
+        return None;
+    };
+    let saved = direct_local(rr)?;
+    if !is_operand(rl, 10, 0) {
+        return None;
+    }
+    for_each_core(init, w, Some(saved)).map(|(mode, body)| ForEachParts { saved, mode, body })
+}
+
+fn direct_local(r: &OperandRef) -> Option<i16> {
+    match r {
         OperandRef::Direct(Operand { scope: 25, index }) => Some(*index),
         _ => None,
-    };
-    let is = |r: &OperandRef, scope: u8, index: i16| matches!(r, OperandRef::Direct(o) if o.scope == scope && o.index == index);
+    }
+}
+
+fn is_operand(r: &OperandRef, scope: u8, index: i16) -> bool {
+    matches!(r, OperandRef::Direct(o) if o.scope == scope && o.index == index)
+}
+
+/// `local[v] := 0; while set_to_next(mode, dest: local[v]) { body }`: the mode and body,
+/// when the body names neither `local[v]` nor the local `stack_obj` is saved in.
+fn for_each_core<'a>(init: &Stmt, w: &'a Stmt, saved: Option<i16>) -> Option<(u8, &'a [Stmt])> {
+    let local = direct_local;
     let Stmt::Assign {
         lhs: il,
         op: AssignOp::Set,
@@ -1110,17 +1323,8 @@ fn for_each_parts<'a>(init: &Stmt, w: &'a Stmt, restore: &Stmt) -> Option<ForEac
     let Stmt::While { cond, body, .. } = w else {
         return None;
     };
-    let Stmt::Assign {
-        lhs: rl,
-        op: AssignOp::Set,
-        rhs: rr,
-        ..
-    } = restore
-    else {
-        return None;
-    };
-    let (saved, var) = (local(rr)?, local(il)?);
-    if !is(ir, 7, 0) || !is(rl, 10, 0) || saved == var {
+    let var = local(il)?;
+    if !is_operand(ir, 7, 0) || saved == Some(var) {
         return None;
     }
     let Condition::Primitive {
@@ -1144,13 +1348,9 @@ fn for_each_parts<'a>(init: &Stmt, w: &'a Stmt, restore: &Stmt) -> Option<ForEac
     walk_stmts(body, &mut |s| {
         names_local |= stmt_operands(s)
             .iter()
-            .any(|r| local(r).is_some_and(|l| l == saved || l == var));
+            .any(|r| local(r).is_some_and(|l| l == var || Some(l) == saved));
     });
-    (!names_local).then_some(ForEachParts {
-        saved,
-        mode: *mode,
-        body,
-    })
+    (!names_local).then_some((*mode, body.as_slice()))
 }
 
 /// The local a tree's first statement saves `stack_obj` into, when nothing but the
@@ -1366,6 +1566,8 @@ struct Plan {
     raw_stmts: BTreeMap<u16, BTreeSet<usize>>,
     /// `init`/`main` trees written as plain `tree`s.
     standalone: BTreeSet<u16>,
+    /// Why the catalog variants are left out (the compiler rejected them).
+    variants_off: Option<String>,
 }
 
 impl Plan {
@@ -1393,6 +1595,7 @@ impl Plan {
             styles,
             raw_stmts: BTreeMap::new(),
             standalone,
+            variants_off: None,
         }
     }
 
@@ -1452,6 +1655,27 @@ impl Plan {
     /// Lowers whatever generated line `line` (1-based) belongs to: the innermost idiomatic
     /// statement there goes `raw`, otherwise the enclosing tree moves down a style, and
     /// with no line or no tree every tree does.
+    /// Leaves the catalog variants out when the compiler rejects them, or rejects the file
+    /// at no particular line while they are written. `false` when that cannot help.
+    fn drop_variants(
+        &mut self,
+        model: &Model,
+        generated: &Generated,
+        line: Option<usize>,
+        message: &str,
+    ) -> bool {
+        let at_variant =
+            line.is_none_or(|l| generated.variant_lines.contains(&l.saturating_sub(1)));
+        if self.variants_off.is_some() || model.variants.is_empty() || !at_variant {
+            return false;
+        }
+        self.variants_off = Some(format!(
+            "the compiler rejected the variants: {}",
+            message.lines().next().unwrap_or_default()
+        ));
+        true
+    }
+
     fn lower_at_line(&mut self, model: &Model, generated: &Generated, line: Option<usize>) -> bool {
         let Some(line) = line else {
             return self.lower_all(model);
@@ -1508,6 +1732,8 @@ struct Generated {
     /// `(tree id, first line, last line)`, 0-based.
     tree_ranges: Vec<(u16, usize, usize)>,
     raw_counts: BTreeMap<u16, usize>,
+    /// 0-based lines holding the `variant` members.
+    variant_lines: std::ops::Range<usize>,
 }
 
 struct Out {
@@ -1585,11 +1811,7 @@ impl Model {
             out.line("");
         }
 
-        let name = if self.name.is_empty() {
-            "Decompiled Object".to_owned()
-        } else {
-            clean_label(&self.name)
-        };
+        let name = primary_object_name(&self.name);
         out.line(format!("object \"{name}\" {{"));
         out.indent += 1;
         out.line(format!("guid: {};", hex_u32(self.guid)));
@@ -1709,6 +1931,27 @@ impl Model {
             raw_counts.insert(t.id, raw_count);
             out.line("");
         }
+        let variant_start = out.lines.len();
+        for v in &self.variants {
+            match self.variant_fields(v, plan) {
+                Ok(fields) => {
+                    out.line(format!("variant \"{}\" {{", v.name));
+                    out.indent += 1;
+                    for f in fields {
+                        out.line(format!("{f},"));
+                    }
+                    out.indent -= 1;
+                    out.line("}");
+                }
+                Err(why) => out.line(format!(
+                    "// variant \"{}\" ({}) is not written: {why}.",
+                    v.name,
+                    hex_u32(v.guid)
+                )),
+            }
+            out.line("");
+        }
+        let variant_lines = variant_start..out.lines.len();
         while out.lines.last().is_some_and(String::is_empty) {
             out.lines.pop();
         }
@@ -1721,6 +1964,7 @@ impl Model {
             stmt_ranges,
             tree_ranges,
             raw_counts,
+            variant_lines,
         }
     }
 }
@@ -1950,36 +2194,35 @@ impl Translator<'_> {
     /// Without its own save, the loop restores from the tree's hoisted `local[a]` save
     /// (see [`hoisted_self_save`]). Returns how many statements it consumed.
     fn for_each_loop(&mut self, rest: &[Stmt], out: &mut Out) -> Option<usize> {
-        let (saved_here, parts) = match rest {
-            [save, init, w, restore, ..] if self_save_local(save).is_some() => {
-                let parts = for_each_parts(init, w, restore)?;
-                (
-                    true,
-                    (self_save_local(save) == Some(parts.saved)).then_some(parts)?,
-                )
-            }
-            [init, w, restore, ..] => {
-                let parts = for_each_parts(init, w, restore)?;
-                (
-                    false,
-                    (self.hoisted_save == Some(parts.saved)).then_some(parts)?,
-                )
-            }
-            _ => return None,
+        // (statements before the body, whether a restore follows it, mode, body)
+        let with_save = |save: &Stmt, init, w, restore| {
+            let p = for_each_parts(init, w, restore)?;
+            (self_save_local(save) == Some(p.saved)).then_some((3, true, p.mode, p.body))
         };
-        let ForEachParts { mode, body, .. } = parts;
-        let used = if saved_here { 4 } else { 3 };
+        let hoisted = |init, w, restore| {
+            let p = for_each_parts(init, w, restore)?;
+            (self.hoisted_save == Some(p.saved)).then_some((2, true, p.mode, p.body))
+        };
+        // v2's optimizer drops a save and restore nothing reads (a restore just before
+        // `return`), leaving the bare loop.
+        let bare = |init, w| for_each_core(init, w, None).map(|(m, b)| (2, false, m, b));
+        let (head, restores, mode, body) = match rest {
+            [save, init, w, restore, ..] if self_save_local(save).is_some() => {
+                with_save(save, init, w, restore)
+            }
+            [init, w, restore, ..] => hoisted(init, w, restore).or_else(|| bare(init, w)),
+            [init, w, ..] => bare(init, w),
+            _ => None,
+        }?;
+        let used = head + usize::from(restores);
         let id = self.next_id;
         // The save (if any), the init and the `while` come first in pre-order; the restore
         // follows the loop body.
-        let restore = id + used - 1 + count_stmts(body);
-        if (id..id + used - 1)
-            .chain([restore])
-            .any(|i| self.forced_raw(i))
-        {
+        let restore = restores.then_some(id + head + count_stmts(body));
+        if (id..id + head).chain(restore).any(|i| self.forced_raw(i)) {
             return None;
         }
-        self.next_id += used - 1;
+        self.next_id += head;
         self.flush_raw(out);
         let start = out.lines.len();
         let (var_name, source) = if mode == 1 {
@@ -2000,7 +2243,9 @@ impl Translator<'_> {
         self.flush_raw(out);
         out.indent -= 1;
         out.line("}");
-        self.next_id += 1; // the restore
+        if restores {
+            self.next_id += 1;
+        }
         self.record(id, start, out);
         Some(used)
     }

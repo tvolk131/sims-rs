@@ -517,6 +517,142 @@ fn a_caller_of_an_unproven_tree_is_not_proven() {
     assert!(proven(check(4300)));
 }
 
+/// Expression `match` and catalog `variant`s, written untidily.
+const MATCH_AND_VARIANTS: &str = r#"enum Mode { Off, Low, High }
+object "Synth Dimmer" {
+    guid: 0x7E00_0004; price: 40;
+    sprite: Sprite::procedural("floor_lamp", primary: #504030, accent: #A09080, trim: #201810);
+    state mode: Mode;
+    state level @ 2: i16;
+    fn pick(mode: Mode) -> i16 { return match mode { Mode::Off => 0, Mode::Low => 10, Mode::High => 20 }; }
+    fn band(x: i16) -> i16 {
+        return match x { -32768..=-1 => -1, 0 => 0, 1..=9 => 1, _ => 2 };
+    }
+    init {
+        self.mode = Mode::Low;
+        self.level = match self.mode { Mode::Off => pick(Mode::High),
+            Mode::Low => -band(3) * 2, // the usual case
+            _ => 7 };
+        let big = match self.level { 0 => self.level > 3, _ => !(self.level > 5) };
+        if big { self.level = 1; }
+    }
+    tree init_budget "Init Budget" { self.level = 2; }
+    tree main_budget "Main Budget" { loop { sleep(20); self.level += 1; } }
+    variant "Budget Dimmer" { guid: 0x7E00_0005, price: 15, description: "A cheaper dimmer.", init: init_budget, main: main_budget }
+    /// Same trees, another price.
+    variant "Plain Dimmer" { guid: 0x7E00_0006 }
+}
+"#;
+
+#[test]
+fn formatter_handles_match_expressions_and_variants() {
+    let formatted = format_v2_source(MATCH_AND_VARIANTS).expect("format");
+    assert!(is_v2_formatted(&formatted).expect("check"), "{formatted}");
+    assert_eq!(
+        format_v2_source(&formatted).expect("reformat"),
+        formatted,
+        "idempotent"
+    );
+    for expected in [
+        "        return match mode {\n            Mode::Off => 0,\n            Mode::Low => 10,\n            Mode::High => 20\n        };\n",
+        "            -32768..=-1 => -1,\n",
+        "            Mode::Low => -band(3) * 2, // the usual case\n",
+        "            _ => !(self.level > 5)\n        };\n",
+        "\n\n    variant \"Budget Dimmer\" {\n        guid: 0x7E00_0005,\n        price: 15,\n",
+        "\n\n    /// Same trees, another price.\n    variant \"Plain Dimmer\" {\n        guid: 0x7E00_0006\n    }\n}\n",
+    ] {
+        assert!(
+            formatted.contains(expected),
+            "missing {expected:?} in\n{formatted}"
+        );
+    }
+    // Formatting changes no compiled byte.
+    assert_eq!(
+        compile("dimmer.antics", MATCH_AND_VARIANTS).iff_bytes,
+        compile("dimmer.antics", &formatted).iff_bytes
+    );
+}
+
+#[test]
+fn catalog_variants_round_trip() {
+    let iff = parse_iff(&compile("synth-dimmer.antics", MATCH_AND_VARIANTS).iff_bytes);
+    let report =
+        decompile_iff_to_v2_report(&iff, &DecompileV2Options::default()).expect("decompile");
+    let source = &report.source;
+    assert!(
+        report.trees.iter().all(|t| proven(&t.check)),
+        "{:?}\n{source}",
+        report.trees
+    );
+    assert!(
+        !report
+            .resources_not_reproduced
+            .iter()
+            .any(|r| r.starts_with("OBJD")),
+        "{:?}",
+        report.resources_not_reproduced
+    );
+    assert!(!source.contains("multi-tile"), "{source}");
+    assert!(
+        source.contains("    variant \"Budget Dimmer\" {\n        guid: 0x7E00_0005,\n        price: 15,\n        description: \"A cheaper dimmer.\",\n        init: "),
+        "{source}"
+    );
+    assert!(
+        source.contains(
+            "    variant \"Plain Dimmer\" {\n        guid: 0x7E00_0006,\n        price: 40,\n"
+        ),
+        "{source}"
+    );
+    let again = parse_iff(&compile("decompiled.antics", source).iff_bytes);
+    let guids = |iff: &Iff| {
+        iff.chunks
+            .iter()
+            .filter(|c| &c.tag == b"OBJD")
+            .map(|c| c.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(guids(&iff).len(), 3);
+    assert_eq!(guids(&again).len(), 3);
+}
+
+#[test]
+fn a_variant_v2_cannot_spell_is_reported() {
+    let iff = parse_iff(&compile("synth-counter.antics", COUNTER).iff_bytes);
+    let objd = iff.chunks.iter().find(|c| &c.tag == b"OBJD").expect("OBJD");
+    // A catalog variant whose init is the object's main tree, which v2 writes as the
+    // `main` block.
+    let mut data = iff.data(objd).to_vec();
+    let main = [data[10], data[11]];
+    data[28..32].copy_from_slice(&0x7E00_0009u32.to_le_bytes());
+    data[86..88].copy_from_slice(&main);
+    let iff = with_chunks(
+        &iff,
+        vec![ChunkData {
+            tag: *b"OBJD",
+            id: objd.id + 1,
+            flags: objd.flags,
+            label: "Odd Counter".to_owned(),
+            data,
+        }],
+    );
+    let report =
+        decompile_iff_to_v2_report(&iff, &DecompileV2Options::default()).expect("decompile");
+    let source = &report.source;
+    assert!(
+        source.contains("// variant \"Odd Counter\" (0x7E00_0009) is not written: its init tree 4097 is written as the object's main block."),
+        "{source}"
+    );
+    assert!(!source.contains("multi-tile"), "{source}");
+    assert!(
+        report
+            .resources_not_reproduced
+            .iter()
+            .any(|r| r.starts_with("OBJD") && r.contains("Odd Counter")),
+        "{:?}",
+        report.resources_not_reproduced
+    );
+}
+
 #[test]
 fn validation_off_still_writes_formatted_source() {
     let original = compile("synth-lamp.antics", LAMP);

@@ -493,6 +493,7 @@ fn member_keyword(s: &str) -> Option<&'static str> {
         "functional" => "functional",
         "interaction" => "interaction",
         "multi_tile" => "multi_tile",
+        "variant" => "variant",
         _ => return None,
     })
 }
