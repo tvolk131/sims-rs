@@ -6,8 +6,8 @@
 use crate::error::{Error, Result, Span};
 use crate::manifest::{TomlValue, parse_toml};
 use crate::v2::ast::{
-    BitflagsDecl, EnumDecl, ExternBconDecl, ExternModDecl, FnDecl, ObjectDecl, TemplateDecl,
-    V2File, V2Item, object_type_ident,
+    BitflagsDecl, ConstDecl, EnumDecl, ExternBconDecl, ExternModDecl, FnDecl, ObjectDecl,
+    TemplateDecl, V2File, V2Item, object_type_ident,
 };
 use crate::v2::parser::parse_v2_file;
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,6 +47,8 @@ pub struct ModuleScope {
     pub extern_mods: BTreeMap<String, (String, ExternModDecl)>,
     /// `extern bcon` constant bindings visible by local name (local + imported), with their owning module id.
     pub extern_bcons: BTreeMap<String, (String, ExternBconDecl)>,
+    /// `const` items visible by local name (local + imported), with their owning module id.
+    pub consts: BTreeMap<String, (String, ConstDecl)>,
 }
 
 /// Optional pack root and external dependency roots for `use` resolution.
@@ -458,6 +460,7 @@ struct LoadedModuleData {
     pub_objects: BTreeMap<String, ObjectDecl>,
     pub_extern_mods: BTreeMap<String, ExternModDecl>,
     pub_extern_bcons: BTreeMap<String, ExternBconDecl>,
+    pub_consts: BTreeMap<String, ConstDecl>,
     /// All items declared locally (for private-visibility error diagnostics).
     all_local_names: BTreeSet<String>,
     /// Complete scope visible inside this module.
@@ -494,11 +497,25 @@ impl<'a> ModuleLoader<'a> {
         let mut extern_bcons: BTreeMap<String, (String, ExternBconDecl)> = BTreeMap::new();
         let mut pub_extern_mods = BTreeMap::new();
         let mut pub_extern_bcons = BTreeMap::new();
+        let mut consts: BTreeMap<String, (String, ConstDecl)> = BTreeMap::new();
+        let mut pub_consts = BTreeMap::new();
         let mut all_local_names = BTreeSet::new();
 
         // 1. Register local items first so duplicate local names are caught clearly.
         for item in &file.items {
             match item {
+                V2Item::Const(c) => {
+                    if !all_local_names.insert(c.name.clone()) {
+                        return Err(Error::at(
+                            c.span,
+                            format!("duplicate top-level item '{}' in {module_id}", c.name),
+                        ));
+                    }
+                    if c.is_pub {
+                        pub_consts.insert(c.name.clone(), c.clone());
+                    }
+                    consts.insert(c.name.clone(), (module_id.clone(), c.clone()));
+                }
                 V2Item::Fn(f) => {
                     if !all_local_names.insert(f.name.clone()) {
                         return Err(Error::at(
@@ -618,7 +635,8 @@ impl<'a> ModuleLoader<'a> {
                     || bitflags.contains_key(local_name)
                     || imported_objects.contains_key(local_name)
                     || extern_mods.contains_key(local_name)
-                    || extern_bcons.contains_key(local_name);
+                    || extern_bcons.contains_key(local_name)
+                    || consts.contains_key(local_name);
                 if let Some(fn_decl) = target.pub_functions.get(&item.name) {
                     if name_taken {
                         return Err(Error::at(
@@ -690,6 +708,16 @@ impl<'a> ModuleLoader<'a> {
                         ));
                     }
                     extern_bcons.insert(local_name.clone(), (target_key.clone(), b_decl.clone()));
+                } else if let Some(c_decl) = target.pub_consts.get(&item.name) {
+                    if name_taken {
+                        return Err(Error::at(
+                            item.span,
+                            format!(
+                                "imported name '{local_name}' collides with an existing binding"
+                            ),
+                        ));
+                    }
+                    consts.insert(local_name.clone(), (target_key.clone(), c_decl.clone()));
                 } else if target.all_local_names.contains(&item.name) {
                     return Err(Error::at(
                         item.span,
@@ -717,6 +745,7 @@ impl<'a> ModuleLoader<'a> {
             objects: imported_objects.clone(),
             extern_mods,
             extern_bcons,
+            consts,
         };
 
         if !is_root {
@@ -730,6 +759,7 @@ impl<'a> ModuleLoader<'a> {
                     pub_objects,
                     pub_extern_mods,
                     pub_extern_bcons,
+                    pub_consts,
                     all_local_names,
                     scope: scope.clone(),
                 },

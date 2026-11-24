@@ -32,6 +32,7 @@ pub struct UseItem {
 /// Top-level item inside a `.antics` v2 file.
 #[derive(Debug, Clone, PartialEq)]
 pub enum V2Item {
+    Const(ConstDecl),
     Fn(FnDecl),
     Template(TemplateDecl),
     Object(ObjectDecl),
@@ -102,6 +103,16 @@ pub struct ExternBconEntry {
     pub address: u16,
 }
 
+/// Compile-time integer constant (`[pub] const NAME = 0x...;`): an `i16` when it fits, otherwise a
+/// 32-bit GUID usable where a GUID is expected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstDecl {
+    pub span: Span,
+    pub is_pub: bool,
+    pub name: String,
+    pub value: i64,
+}
+
 /// External constant bindings (`[pub] extern bcon name { entry @ 16521; ... }`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternBconDecl {
@@ -134,6 +145,18 @@ pub struct TreeMemberDecl {
     pub params: Vec<AbiParam>,
     pub ret: ReturnAbi,
     pub body: Vec<V2Stmt>,
+    /// `@frame(args: N, locals: M, format: F, revision: R)` header pins (all optional).
+    pub frame: Option<TreeFrame>,
+}
+
+/// Explicit BHAV header fields for a standalone `tree` (`@frame(...)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TreeFrame {
+    pub span: Span,
+    pub args: Option<u8>,
+    pub locals: Option<u16>,
+    pub format: Option<u16>,
+    pub revision: Option<u32>,
 }
 
 /// Zero-cost integer enum declaration (`[pub] enum Name { VariantA, VariantB = 2 }`).
@@ -246,6 +269,7 @@ pub struct ObjectDecl {
 /// Flat top-level member inside a `template` or `object` body.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ObjectMember {
+    Const(ConstDecl),
     Meta(MetaField),
     Param(ParamDecl),
     ParamAssign(ParamAssignDecl),
@@ -634,6 +658,20 @@ pub enum V2Stmt {
         span: Span,
         code: String,
     },
+    /// `let name: Type;` — declares a local without initializing it.
+    LetUninit {
+        span: Span,
+        name: String,
+        ty: V2Type,
+    },
+    /// `animate(...);` (play to completion) or `animate(...) |event| { ... }` (run the body
+    /// once per animation event, with `event` bound to the event number).
+    Animate {
+        span: Span,
+        args: Vec<CallArg>,
+        event: Option<String>,
+        body: Vec<V2Stmt>,
+    },
 }
 
 /// One arm of a `match` statement (`Pattern => { ... }`).
@@ -651,14 +689,31 @@ pub enum MatchPattern {
     Ident(Span, String),
     Int(Span, i16),
     Path(Span, Vec<String>),
+    /// `lo..hi` / `lo..=hi` on an `i16` scrutinee (stored inclusive: `lo..=hi`).
+    Range(Span, i16, i16),
 }
 
 /// Built-in loop iteration sources for `for obj in ...`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ForEachIter {
-    ObjectsByGuid(u32),
-    ObjectsOf { span: Span, object_type: String },
+    /// `objects_by_guid(GUID)` (a literal or a `const`).
+    ObjectsByGuid(V2Expr),
+    ObjectsOf {
+        span: Span,
+        object_type: String,
+    },
     SelfParts,
+    /// `a..b` / `a..=b`, optionally `(a..b).rev()`.
+    Range {
+        start: V2Expr,
+        end: V2Expr,
+        inclusive: bool,
+        rev: bool,
+    },
+    /// `lot.sims()`: every person on the lot (`set_to_next` person mode).
+    LotSims,
+    /// `lot.objects()`: every object on the lot (`set_to_next` object mode).
+    LotObjects,
 }
 
 /// Named or positional call argument.

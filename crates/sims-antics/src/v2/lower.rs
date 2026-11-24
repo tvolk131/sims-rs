@@ -11,7 +11,7 @@ use crate::manifest::{
     CallbackSpec, InteractionSpec, MotiveAdSpec, ObjectManifest, SlotSpec, SoundSpec, SpriteSpec,
     TileSpec, TreeRef,
 };
-use crate::parser::{motive_by_name, skill_by_name};
+use crate::parser::{motive_by_name, person_field_by_name, skill_by_name};
 use crate::v2::ast::{
     AbiParam, AbiParamSlot, BconTableDecl, BitflagsDecl, CallArg, ConstIntExpr, EnumDecl,
     ExternBconDecl, ExternModDecl, FnDecl, ForEachIter, FunctionalDecl, GuardBody, GuardDecl,
@@ -206,7 +206,7 @@ enum ResolvedNamedType {
 }
 
 /// Mutable STR# 301 string interning table shared across all trees in one object.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct DialogStringTable {
     label: Option<String>,
     entries: Vec<(Span, String, String)>,
@@ -353,6 +353,8 @@ struct ObjectEnv<'a> {
     local_extern_mods: BTreeMap<String, (String, ExternModDecl)>,
     /// Object/template-local `extern bcon` blocks by name -> (owner module, decl).
     local_extern_bcons: BTreeMap<String, (String, ExternBconDecl)>,
+    /// Object/template-local `const` items by name.
+    local_consts: BTreeMap<String, i64>,
     /// Private named BCON tables by reference name (`LampTuning` and `lamp_tuning`).
     bcon_tables: BTreeMap<String, ResolvedBconTable>,
     /// Standalone sibling `tree` call signatures by call identifier.
@@ -545,6 +547,18 @@ impl<'a> ObjectEnv<'a> {
             .get(owner_module)
             .and_then(|s| s.extern_bcons.get(name))
             .map(|(_, decl)| decl)
+    }
+
+    /// Value of a `const` item visible from `owner_module` (object/template-local first).
+    fn lookup_const(&self, owner_module: &str, name: &str, allow_local: bool) -> Option<i64> {
+        if allow_local && let Some(&v) = self.local_consts.get(name) {
+            return Some(v);
+        }
+        self.resolved
+            .module_scopes
+            .get(owner_module)
+            .and_then(|s| s.consts.get(name))
+            .map(|(_, decl)| decl.value)
     }
 
     /// `true` if `name` refers to a private BCON table or `extern bcon` block in this scope.
@@ -769,6 +783,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
     let mut local_fns: BTreeMap<String, (String, FnDecl)> = BTreeMap::new();
     let mut local_extern_mods: BTreeMap<String, (String, ExternModDecl)> = BTreeMap::new();
     let mut local_extern_bcons: BTreeMap<String, (String, ExternBconDecl)> = BTreeMap::new();
+    let mut local_consts: BTreeMap<String, i64> = BTreeMap::new();
     let mut bcon_decls: Vec<BconTableDecl> = Vec::new();
     let mut tree_members: Vec<OwnedTree> = Vec::new();
     // Every module that contributes members (templates + the object): helper-fn lookups from any
@@ -789,8 +804,15 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         let mut seen_externs_here = BTreeSet::new();
         let mut seen_bcons_here = BTreeSet::new();
         let mut seen_trees_here = BTreeSet::new();
+        let mut seen_consts_here = BTreeSet::new();
         for member in members {
             match member {
+                ObjectMember::Const(c) => {
+                    if !seen_consts_here.insert(c.name.clone()) {
+                        return Err(Error::at(c.span, format!("duplicate const '{}'", c.name)));
+                    }
+                    local_consts.insert(c.name.clone(), c.value);
+                }
                 ObjectMember::Meta(MetaField { span, kind }) => match kind {
                     MetaFieldKind::Guid(v) => guid = Some(*v),
                     MetaFieldKind::Price(v) => price = *v,
@@ -1497,6 +1519,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         self_object_key,
         local_extern_mods,
         local_extern_bcons,
+        local_consts,
         bcon_tables,
         trees: BTreeMap::new(),
     };
@@ -2237,6 +2260,138 @@ const BUILTIN_CALL_NAMES: &[&str] = &[
     "None",
 ];
 
+/// How a primitive builtin argument is checked and spelled in `.air`.
+#[derive(Clone, Copy)]
+enum PrimArg {
+    /// Compile-time integer in `lo..=hi`.
+    Int(i64, i64),
+    /// Compile-time `bool`.
+    Bool,
+    /// 32-bit GUID literal or `const`.
+    Guid,
+    /// A v2 `i16` local variable (spelled by its `.air` local name).
+    Local,
+    /// `self` / `stack_obj` (or `0` / `1`).
+    RefreshTarget,
+}
+
+/// A v2 builtin that lowers one-to-one onto a named-argument `.air` primitive.
+struct PrimBuiltin {
+    v2: &'static str,
+    air: &'static str,
+    /// `(v2 key, .air key, kind)`, in `.air` emission order.
+    keys: &'static [(&'static str, &'static str, PrimArg)],
+}
+
+const U8: PrimArg = PrimArg::Int(0, 255);
+const U16: PrimArg = PrimArg::Int(0, 65535);
+const I16: PrimArg = PrimArg::Int(-32768, 32767);
+
+const PRIM_BUILTINS: &[PrimBuiltin] = &[
+    PrimBuiltin {
+        v2: "push_interaction",
+        air: "push_interaction",
+        keys: &[
+            ("menu", "menu", U8),
+            ("object", "object", U8),
+            ("priority", "priority", U8),
+            ("flags", "flags", U8),
+            ("icon", "icon", PrimArg::Local),
+        ],
+    },
+    PrimBuiltin {
+        v2: "run_tree_by_name",
+        air: "run_tree_by_name",
+        keys: &[
+            ("table", "table", U16),
+            ("index", "index", U8),
+            ("mode", "mode", U8),
+            ("global", "global", PrimArg::Bool),
+        ],
+    },
+    PrimBuiltin {
+        v2: "go_to_relative",
+        air: "go_to_relative",
+        keys: &[
+            ("location", "location", PrimArg::Int(-128, 127)),
+            ("facing", "facing", U8),
+            ("options", "options", U8),
+        ],
+    },
+    PrimBuiltin {
+        v2: "manage_inventory",
+        air: "manage_inventory",
+        keys: &[
+            ("op", "op", U8),
+            ("kind", "kind", U8),
+            ("flags", "flags", U16),
+            ("guid", "guid", PrimArg::Guid),
+        ],
+    },
+    PrimBuiltin {
+        v2: "refresh",
+        air: "refresh",
+        keys: &[
+            ("target", "target", PrimArg::RefreshTarget),
+            ("mode", "mode", U16),
+        ],
+    },
+    PrimBuiltin {
+        v2: "action_label",
+        air: "action_string",
+        keys: &[("table", "table", U16), ("index", "index", U8)],
+    },
+    PrimBuiltin {
+        v2: "show_string",
+        air: "show_string",
+        keys: &[("table", "table", U16), ("index", "index", U16)],
+    },
+    PrimBuiltin {
+        v2: "set_headline",
+        air: "set_headline",
+        keys: &[
+            ("kind", "kind", U8),
+            ("index", "index", U8),
+            ("duration", "duration", I16),
+            ("options", "options", U16),
+            ("stack_obj", "stack_obj", PrimArg::Bool),
+            ("local", "local", PrimArg::Local),
+        ],
+    },
+    PrimBuiltin {
+        v2: "special_effect",
+        air: "special_effect",
+        keys: &[
+            ("duration", "duration", I16),
+            ("kind", "kind", U8),
+            ("size", "size", U8),
+            ("flags", "flags", U8),
+            ("str_index", "str_index", U8),
+        ],
+    },
+];
+
+/// Argless low-level opcodes exposed as `name()`; each lowers to `op 0xNNNN (0, ..., 0)` and
+/// leaves `stack_obj` exactly as the primitive does (so `gosub_found_action()` sees
+/// `find_best_interaction()`'s pick).
+const OP_BUILTINS: &[(&str, u16)] = &[
+    ("find_best_interaction", 0x0003),
+    ("grab", 0x0004),
+    ("drop", 0x0005),
+    ("gosub_found_action", 0x001E),
+    ("notify_out_of_idle", 0x0031),
+];
+
+/// Bitflags key of `self.flags`: an untyped bitfield that accepts any `bitflags` value.
+const ANY_BITFLAGS: &str = "builtin::AnyFlags";
+
+/// Builtins added after user helpers could already use these names: a user `fn`, `tree`, or
+/// `extern` with the same name takes precedence.
+fn is_prim_builtin_name(name: &str) -> bool {
+    PRIM_BUILTINS.iter().any(|b| b.v2 == name)
+        || OP_BUILTINS.iter().any(|(n, _)| *n == name)
+        || matches!(name, "animate" | "breakpoint" | "random_into")
+}
 /// Allocates state attribute slots shared by object lowering and imported object schemas.
 ///
 /// Explicit `state x @ N: T;` slots are reserved first (overlaps are errors), then every
@@ -2492,13 +2647,48 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
         ctx.line("return true;".to_owned());
     }
     let label = escape_str(&d.label);
-    if positional == 0 {
+    let mut header: Vec<String> = Vec::new();
+    let frame = d.frame.unwrap_or_default();
+    match frame.args {
+        Some(args) if usize::from(args) < positional => {
+            return Err(Error::at(
+                frame.span,
+                format!(
+                    "@frame(args: {args}) on tree '{}' is below its {positional} positional parameter(s)",
+                    d.ident
+                ),
+            ));
+        }
+        Some(args) => header.push(format!("args: {args}")),
+        None if positional > 0 => header.push(format!("args: {positional}")),
+        None => {}
+    }
+    if let Some(locals) = frame.locals {
+        header.push(format!("locals: {locals}"));
+    }
+    if let Some(format) = frame.format {
+        if !(0x8000..=0x8002).contains(&format) {
+            return Err(Error::at(
+                frame.span,
+                format!(
+                    "@frame(format: {format:#06x}) on tree '{}' is not a supported BHAV format (0x8000, 0x8001, or 0x8002)",
+                    d.ident
+                ),
+            ));
+        }
+        header.push(format!("format: {format:#06x}"));
+    }
+    if let Some(revision) = frame.revision {
+        header.push(format!("revision: {revision}"));
+    }
+    if header.is_empty() {
         let _ = writeln!(trees_air, "tree {} \"{label}\" {{", sig.id);
     } else {
         let _ = writeln!(
             trees_air,
-            "tree {} \"{label}\" (args: {positional}) {{",
-            sig.id
+            "tree {} \"{label}\" ({}) {{",
+            sig.id,
+            header.join(", ")
         );
     }
     trees_air.push_str(&ctx.finish());
@@ -3031,6 +3221,12 @@ fn types_compatible_for_assign(target: &ValueType, value: &ValueType) -> bool {
         return true;
     }
     match (target, value) {
+        // `self.flags` takes (and yields) any bitflags type.
+        (ValueType::Bitflags(t), ValueType::Bitflags(v))
+            if t == ANY_BITFLAGS || v == ANY_BITFLAGS =>
+        {
+            true
+        }
         // Typed ObjectRef implicitly upcasts to untyped ObjectId.
         (ValueType::ObjectId, ValueType::ObjectRef(_)) => true,
         // Preserve backwards compatibility for raw ObjectId <-> i16 temp/attr interop.
@@ -3086,7 +3282,7 @@ struct ScopeFrame {
     /// `true` when this frame is the root lexical scope of an inlined helper function.
     is_fn_root: bool,
     /// `true` when this frame corresponds to an emitted `.air` `while` loop
-    /// (`repeat`, `while`, `for`, or wrapped inline helper `while 1 == 1`).
+    /// (`repeat`, `while`, `for`, or wrapped inline helper `while true`).
     is_air_while: bool,
     /// Active `defer` token when this scope was entered (used to distinguish loop breaks inside
     /// a defer-local loop from breaks attempting to escape out of a `defer` block).
@@ -3454,7 +3650,9 @@ impl<'a> TreeLowerer<'a> {
             self.line(format!("temp[{dst}] := {op};"));
         }
         Ok(match literals {
-            Some(l) if l.is_empty() => format!("call {}", sig.id),
+            // An argless call is spelled `(temps)` (`[0xFF; 8]`), the authoring tools' encoding:
+            // the callee sees the caller's temps as its arguments (the temps pass-through ABI).
+            Some(l) if l.is_empty() => format!("call {}(temps)", sig.id),
             Some(l) => {
                 let parts: Vec<String> = l.iter().map(i16::to_string).collect();
                 format!("call {}({})", sig.id, parts.join(", "))
@@ -4030,6 +4228,30 @@ impl<'a> TreeLowerer<'a> {
                 init,
                 else_body,
             } => self.lower_let_some(*span, name, ty.as_ref(), init, else_body),
+            V2Stmt::LetUninit { span, name, ty } => {
+                let resolved = self.env.resolve_value_type(
+                    ty,
+                    &self.owner_module,
+                    self.in_object_scope,
+                    *span,
+                )?;
+                let air_name = self.fresh(&format!("v_{name}"));
+                self.line(format!("let {air_name};"));
+                self.bind_var(
+                    name.clone(),
+                    Binding::Local {
+                        air_name,
+                        ty: resolved,
+                    },
+                );
+                Ok(())
+            }
+            V2Stmt::Animate {
+                span: _,
+                args,
+                event,
+                body,
+            } => self.lower_animate_stmt(args, event.as_deref(), body),
             V2Stmt::Assign {
                 span,
                 target,
@@ -4283,9 +4505,16 @@ impl<'a> TreeLowerer<'a> {
                 } else {
                     None
                 };
-                if self.is_pure_simple_air_cond(cond)
-                    && let Some(simple_cond) = self.try_lower_simple_air_cond(cond)?
-                {
+                // `loop { }` / `while true { }` lower to `.air` `while true`, which has no
+                // condition node at all.
+                let header = if self.try_eval_const_bool_inner(cond, true) == Some(true) {
+                    Some("true".to_owned())
+                } else if self.is_pure_simple_air_cond(cond) {
+                    self.try_lower_simple_air_cond(cond)?
+                } else {
+                    None
+                };
+                if let Some(simple_cond) = header {
                     self.line(format!("while {simple_cond} {{"));
                     self.indent += 1;
                     self.push_scope(ScopeFrame {
@@ -4311,7 +4540,7 @@ impl<'a> TreeLowerer<'a> {
                     self.line("}".to_owned());
                     res.and(pop_res)?;
                 } else {
-                    self.line("while 1 == 1 {".to_owned());
+                    self.line("while true {".to_owned());
                     self.indent += 1;
                     self.push_scope(ScopeFrame {
                         cleanups: Vec::new(),
@@ -4363,14 +4592,35 @@ impl<'a> TreeLowerer<'a> {
                 iter,
                 body,
             } => {
+                if let ForEachIter::Range {
+                    start,
+                    end,
+                    inclusive,
+                    rev,
+                } = iter
+                {
+                    return self.lower_range_for(binding, start, end, *inclusive, *rev, body);
+                }
                 let iter_var = self.fresh(&format!("v_{binding}"));
                 let mut parts_root_opt = None;
                 let binding_ty = match iter {
-                    ForEachIter::ObjectsByGuid(guid) => {
+                    ForEachIter::Range { .. } => unreachable!("handled above"),
+                    ForEachIter::ObjectsByGuid(guid_expr) => {
+                        let guid = self.resolve_guid_expr(guid_expr)?;
                         self.line(format!("let {iter_var} = 0;"));
                         self.line(format!(
                             "while set_to_next(guid, {guid:#010x}, dest: {iter_var}) {{"
                         ));
+                        ValueType::ObjectId
+                    }
+                    ForEachIter::LotSims | ForEachIter::LotObjects => {
+                        let mode = if matches!(iter, ForEachIter::LotSims) {
+                            "person"
+                        } else {
+                            "all"
+                        };
+                        self.line(format!("let {iter_var} = 0;"));
+                        self.line(format!("while set_to_next({mode}, dest: {iter_var}) {{"));
                         ValueType::ObjectId
                     }
                     ForEachIter::ObjectsOf { span, object_type } => {
@@ -4463,6 +4713,20 @@ impl<'a> TreeLowerer<'a> {
                 // Constant-fold literal boolean conditions (e.g. from `bool` params!).
                 if let Some(const_b) = self.try_eval_const_bool(cond) {
                     let chosen = if const_b { then_body } else { else_body };
+                    self.push_scope(ScopeFrame::block());
+                    let r = self.lower_stmts(chosen);
+                    let p = self.pop_scope_and_run_cleanups();
+                    return r.and(p);
+                }
+                // Literal comparisons (`kind == Menu::Meal` with a constant helper argument) fold
+                // too; the untaken branch is still lowered (and discarded) so it stays checked.
+                if let Some(const_b) = self.try_fold_literal_cond(cond) {
+                    let (chosen, dead) = if const_b {
+                        (then_body, else_body)
+                    } else {
+                        (else_body, then_body)
+                    };
+                    self.check_dead_branch(dead)?;
                     self.push_scope(ScopeFrame::block());
                     let r = self.lower_stmts(chosen);
                     let p = self.pop_scope_and_run_cleanups();
@@ -4692,6 +4956,94 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// `for i in a..b` → `i := a - 1; while i inc_lt b { ... }` and `(a..b).rev()` →
+    /// `i := b; while i dec_gt a - 1 { ... }` (one node per iteration). Non-literal bounds are
+    /// read once, before the loop; the loop variable is read-only.
+    fn lower_range_for(
+        &mut self,
+        binding: &str,
+        start: &V2Expr,
+        end: &V2Expr,
+        inclusive: bool,
+        rev: bool,
+        body: &[V2Stmt],
+    ) -> Result<()> {
+        if stmts_mutate_or_borrow_ident(body, binding) {
+            return Err(Error::at(
+                start.span(),
+                format!("the range loop variable '{binding}' is read-only"),
+            ));
+        }
+        // `start` is evaluated before `end` (Rust's order). Each bound becomes either a literal
+        // (adjusted at compile time) or a fresh local (adjusted at run time).
+        let bound = |c: &mut Self, expr: &V2Expr, delta: i16| -> Result<String> {
+            if let Some((air, v)) = c.try_const_i16_air_operand(expr)?
+                && air.parse::<i16>().is_ok()
+            {
+                return v
+                    .checked_add(delta)
+                    .map(|n| n.to_string())
+                    .ok_or_else(|| Error::at(expr.span(), "range bound overflows i16"));
+            }
+            let (air, ty) = c.lower_value_expr(expr)?;
+            if ty != ValueType::I16 {
+                return Err(Error::at(
+                    expr.span(),
+                    format!(
+                        "range bounds must be i16, found '{}'",
+                        c.env.display_value_type(&ty)
+                    ),
+                ));
+            }
+            let local = c.fresh("range");
+            c.line(format!("let {local} = {air};"));
+            match delta {
+                0 => {}
+                d if d > 0 => c.line(format!("{local} += {d};")),
+                d => c.line(format!("{local} -= {};", -d)),
+            }
+            Ok(local)
+        };
+        let iter_var = self.fresh(&format!("v_{binding}"));
+        if rev {
+            // Counts down from the last value; the cursor starts one past it.
+            let lo = bound(self, start, -1)?;
+            let hi = bound(self, end, i16::from(inclusive))?;
+            self.line(format!("let {iter_var} = {hi};"));
+            self.line(format!("while {iter_var} dec_gt {lo} {{"));
+        } else {
+            let lo = bound(self, start, -1)?;
+            let hi = bound(self, end, i16::from(inclusive))?;
+            self.line(format!("let {iter_var} = {lo};"));
+            self.line(format!("while {iter_var} inc_lt {hi} {{"));
+        }
+        self.indent += 1;
+        self.push_scope(ScopeFrame {
+            cleanups: Vec::new(),
+            is_loop_body: true,
+            is_fn_root: false,
+            is_air_while: true,
+            owner_defer_id: self.current_defer_id,
+            cancel_flag: None,
+            repeat_counter: None,
+        });
+        self.bind_var(
+            binding.to_owned(),
+            Binding::Local {
+                air_name: iter_var,
+                ty: ValueType::I16,
+            },
+        );
+        let res = self.lower_stmts(body);
+        let pop_res = self.pop_scope_and_run_cleanups();
+        self.indent -= 1;
+        self.line("}".to_owned());
+        res.and(pop_res)?;
+        self.emit_inline_fn_return_propagation()?;
+        self.emit_cancel_propagation()?;
+        Ok(())
+    }
+
     fn emit_inline_fn_return_propagation(&mut self) -> Result<()> {
         if let Some(active) = self.active_inline_fn.as_ref() {
             let ret_flag = active.ret_flag.clone();
@@ -4787,6 +5139,12 @@ impl<'a> TreeLowerer<'a> {
                 MatchPattern::Wildcard(_) => {
                     wildcard_body = Some(arm.body.as_slice());
                     None
+                }
+                MatchPattern::Range(pspan, ..) => {
+                    return Err(Error::at(
+                        *pspan,
+                        "range patterns cannot match a 'dialog(...)' result",
+                    ));
                 }
                 MatchPattern::Ident(pspan, name) => match name.as_str() {
                     "Button1" | "Yes" => Some(0),
@@ -5021,7 +5379,8 @@ impl<'a> TreeLowerer<'a> {
         let scrut_local = self.fresh("match");
         self.line(format!("let {scrut_local} = {val_air};"));
 
-        let mut cases: Vec<(i16, &[V2Stmt])> = Vec::new();
+        // Arms as inclusive ranges (`lo == hi` for a single value).
+        let mut cases: Vec<(i16, i16, &[V2Stmt])> = Vec::new();
         let mut wildcard: Option<&[V2Stmt]> = None;
         let mut seen_vals = BTreeSet::new();
 
@@ -5046,13 +5405,33 @@ impl<'a> TreeLowerer<'a> {
                             ),
                         ));
                     }
-                    if !seen_vals.insert(*v) {
+                    if !seen_vals.insert(*v)
+                        || cases.iter().any(|&(lo, hi, _)| (lo..=hi).contains(v))
+                    {
                         return Err(Error::at(
                             *pspan,
                             format!("duplicate match arm for value {v}"),
                         ));
                     }
-                    cases.push((*v, arm.body.as_slice()));
+                    cases.push((*v, *v, arm.body.as_slice()));
+                }
+                MatchPattern::Range(pspan, lo, hi) => {
+                    if val_ty != ValueType::I16 {
+                        return Err(Error::at(
+                            *pspan,
+                            format!(
+                                "range pattern {lo}..={hi} cannot match '{}'",
+                                self.env.display_value_type(&val_ty)
+                            ),
+                        ));
+                    }
+                    if cases.iter().any(|&(a, b, _)| a <= *hi && *lo <= b) {
+                        return Err(Error::at(
+                            *pspan,
+                            format!("range pattern {lo}..={hi} overlaps an earlier match arm"),
+                        ));
+                    }
+                    cases.push((*lo, *hi, arm.body.as_slice()));
                 }
                 MatchPattern::Path(pspan, segs) => {
                     let ValueType::Enum(ref expected_key) = val_ty else {
@@ -5100,7 +5479,7 @@ impl<'a> TreeLowerer<'a> {
                             format!("duplicate match arm for '{}::{}'", e.display_name, segs[1]),
                         ));
                     }
-                    cases.push((v, arm.body.as_slice()));
+                    cases.push((v, v, arm.body.as_slice()));
                 }
                 MatchPattern::Ident(pspan, name) => {
                     return Err(Error::at(
@@ -5148,7 +5527,7 @@ impl<'a> TreeLowerer<'a> {
         }
 
         if exhaustive_enum_without_wildcard && cases.len() == 1 {
-            let body = cases[0].1;
+            let body = cases[0].2;
             self.push_scope(ScopeFrame::block());
             let r = self.lower_stmts(body);
             let p = if stmts_always_return(body, self.env, &self.owner_module, self.in_object_scope)
@@ -5162,13 +5541,44 @@ impl<'a> TreeLowerer<'a> {
         }
 
         let last_idx = cases.len().saturating_sub(1);
-        for (idx, (val, body)) in cases.iter().enumerate() {
-            if idx == 0 {
-                self.line(format!("if {scrut_local} == {val} {{"));
-            } else if exhaustive_enum_without_wildcard && idx == last_idx {
-                self.line("} else {".to_owned());
+        // A bounded range needs two compares: its test is computed into a flag inside the
+        // previous arm's `else`, which nests (but never duplicates) the rest of the chain.
+        let mut extra_closes = 0usize;
+        for (idx, &(lo, hi, body)) in cases.iter().enumerate() {
+            let single = if lo == hi {
+                Some(format!("{scrut_local} == {lo}"))
+            } else if lo == i16::MIN {
+                Some(format!("{scrut_local} <= {hi}"))
+            } else if hi == i16::MAX {
+                Some(format!("{scrut_local} >= {lo}"))
             } else {
-                self.line(format!("}} else if {scrut_local} == {val} {{"));
+                None
+            };
+            match single {
+                Some(cond) if idx == 0 => self.line(format!("if {cond} {{")),
+                Some(_) if exhaustive_enum_without_wildcard && idx == last_idx => {
+                    self.line("} else {".to_owned());
+                }
+                Some(cond) => self.line(format!("}} else if {cond} {{")),
+                None => {
+                    if idx > 0 {
+                        self.line("} else {".to_owned());
+                        self.indent += 1;
+                        extra_closes += 1;
+                    }
+                    let flag = self.fresh("in_range");
+                    self.line(format!("let {flag} = 0;"));
+                    self.line(format!("if {scrut_local} >= {lo} {{"));
+                    self.indent += 1;
+                    self.line(format!("if {scrut_local} <= {hi} {{"));
+                    self.indent += 1;
+                    self.line(format!("{flag} := 1;"));
+                    self.indent -= 1;
+                    self.line("}".to_owned());
+                    self.indent -= 1;
+                    self.line("}".to_owned());
+                    self.line(format!("if {flag} != 0 {{"));
+                }
             }
             self.indent += 1;
             self.push_scope(ScopeFrame::block());
@@ -5196,10 +5606,19 @@ impl<'a> TreeLowerer<'a> {
             };
             self.indent -= 1;
             self.line("}".to_owned());
+            self.close_match_chain(extra_closes);
             r.and(p)
         } else {
             self.line("}".to_owned());
+            self.close_match_chain(extra_closes);
             Ok(())
+        }
+    }
+
+    fn close_match_chain(&mut self, extra_closes: usize) {
+        for _ in 0..extra_closes {
+            self.indent -= 1;
+            self.line("}".to_owned());
         }
     }
 
@@ -5544,6 +5963,15 @@ impl<'a> TreeLowerer<'a> {
                 type_args,
                 args,
             } => {
+                if let V2Expr::Ident(_, fname) = callee.as_ref()
+                    && fname == "create_object"
+                {
+                    // Both edges continue; the new object is dropped and `stack_obj` restored.
+                    let (prim, _) = self.format_create_object(type_args, args, *span)?;
+                    self.line(format!("{prim};"));
+                    self.emit_restore_stack_obj();
+                    return Ok(());
+                }
                 if !type_args.is_empty() {
                     return Err(Error::at(
                         *span,
@@ -5680,6 +6108,10 @@ impl<'a> TreeLowerer<'a> {
                                     .inline_helper_call(&fn_mod, &fn_decl, is_local, args, *span)?;
                                 return Ok(());
                             }
+                            if let Some(prim) = self.format_prim_builtin(fname, args, *span)? {
+                                self.line(format!("{prim};"));
+                                return Ok(());
+                            }
                             return Err(Error::at(*span, format!("unknown function '{fname}'")));
                         }
                     }
@@ -5779,7 +6211,9 @@ impl<'a> TreeLowerer<'a> {
             return self.emit_lvalue_assign(&lval, V2AssignOp::BitAnd, &(!mask).to_string());
         }
         let (rhs_air, rhs_ty) = self.lower_value_expr(&args[0].value)?;
-        if rhs_ty != ValueType::Bitflags(key.clone()) {
+        if !types_compatible_for_assign(&ValueType::Bitflags(key.clone()), &rhs_ty)
+            || !matches!(rhs_ty, ValueType::Bitflags(_))
+        {
             return Err(Error::at(
                 args[0].span,
                 format!(
@@ -5799,6 +6233,296 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// Compile-time integer argument for a primitive builtin (literal, enum, `const`, constant
+    /// helper binding, or a BCON entry with a known value), checked against `lo..=hi`.
+    fn eval_builtin_int(&self, expr: &V2Expr, what: &str, lo: i64, hi: i64) -> Result<i64> {
+        let v: i64 = match expr {
+            V2Expr::Int(_, v) => *v,
+            V2Expr::Ident(_, name)
+                if self.lookup_var(name).is_none() && self.const_item(name).is_some() =>
+            {
+                self.const_item(name).unwrap_or_default()
+            }
+            _ => match self.literal_compare_operand(expr) {
+                Some((_, v)) => i64::from(v),
+                None => i64::from(self.eval_const_i16(expr).map_err(|_| {
+                    Error::at(
+                        expr.span(),
+                        format!("{what} must be a compile-time constant"),
+                    )
+                })?),
+            },
+        };
+        if v < lo || v > hi {
+            return Err(Error::at(
+                expr.span(),
+                format!("{what} {v} out of range {lo}..={hi}"),
+            ));
+        }
+        Ok(v)
+    }
+
+    /// `.air` local name of a v2 `i16` local variable used as a primitive's local slot.
+    fn builtin_local_arg(&self, expr: &V2Expr, what: &str) -> Result<String> {
+        if let V2Expr::Ident(_, name) = expr
+            && let Some(Binding::Local { air_name, ty }) = self.lookup_var(name)
+            && matches!(ty, ValueType::I16 | ValueType::Enum(_))
+        {
+            return Ok(air_name.clone());
+        }
+        Err(Error::at(
+            expr.span(),
+            format!("{what} must name an i16 local variable (declare one with 'let x: i16;')"),
+        ))
+    }
+
+    /// Collects `name: value` arguments, rejecting positional, unknown, and repeated keys.
+    fn builtin_named_args<'e>(
+        &self,
+        prim: &str,
+        args: &'e [CallArg],
+        allowed: &[&str],
+    ) -> Result<BTreeMap<String, &'e CallArg>> {
+        let mut out = BTreeMap::new();
+        for a in args {
+            let Some(key) = &a.name else {
+                return Err(Error::at(
+                    a.span,
+                    format!(
+                        "{prim}() only takes named arguments ({})",
+                        allowed
+                            .iter()
+                            .map(|k| format!("'{k}:'"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ));
+            };
+            if !allowed.contains(&key.as_str()) {
+                return Err(Error::at(
+                    a.span,
+                    format!(
+                        "unknown {prim}() argument '{key}' (expected one of: {})",
+                        allowed.join(", ")
+                    ),
+                ));
+            }
+            if out.insert(key.clone(), a).is_some() {
+                return Err(Error::at(
+                    a.span,
+                    format!("duplicate {prim}() argument '{key}'"),
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Formats `animate(clip:, table:, flags:, events:, local:)` and returns the `.air` primitive
+    /// text plus the event local's `.air` name (`local:` sets flag `0x20`).
+    fn format_animate(&self, args: &[CallArg]) -> Result<(String, Option<String>)> {
+        let named = self.builtin_named_args(
+            "animate",
+            args,
+            &["clip", "table", "flags", "events", "local"],
+        )?;
+        let int = |key: &str, lo: i64, hi: i64| -> Result<i64> {
+            match named.get(key) {
+                Some(a) => self.eval_builtin_int(&a.value, &format!("animate {key}"), lo, hi),
+                None => Ok(0),
+            }
+        };
+        let clip = int("clip", 0, 65535)?;
+        let table = int("table", 0, 255)?;
+        let mut flags = int("flags", 0, 255)?;
+        let events = int("events", -128, 127)?;
+        let local = match named.get("local") {
+            Some(a) => {
+                flags |= 0x20;
+                Some(self.builtin_local_arg(&a.value, "animate(local:)")?)
+            }
+            None => None,
+        };
+        let mut text =
+            format!("animate(clip: {clip}, table: {table}, flags: {flags:#04x}, events: {events}");
+        if let Some(l) = &local {
+            text.push_str(&format!(", local: {l}"));
+        }
+        text.push(')');
+        Ok((text, local))
+    }
+
+    /// `animate(...)` as a statement (runs to completion) or `animate(...) |event| { ... }`
+    /// (runs the body once per event). Both lower to `while !animate(...) { ... }`.
+    fn lower_animate_stmt(
+        &mut self,
+        args: &[CallArg],
+        event: Option<&str>,
+        body: &[V2Stmt],
+    ) -> Result<()> {
+        let (prim, local) = self.format_animate(args)?;
+        self.line(format!("while !{prim} {{"));
+        self.indent += 1;
+        self.push_scope(ScopeFrame {
+            cleanups: Vec::new(),
+            is_loop_body: true,
+            is_fn_root: false,
+            is_air_while: true,
+            owner_defer_id: self.current_defer_id,
+            cancel_flag: None,
+            repeat_counter: None,
+        });
+        if let Some(name) = event {
+            let binding = match local {
+                Some(air_name) => Binding::Local {
+                    air_name,
+                    ty: ValueType::I16,
+                },
+                None => Binding::BhavParam {
+                    index: 0,
+                    ty: ValueType::I16,
+                },
+            };
+            self.bind_var(name.to_owned(), binding);
+        }
+        let res = self.lower_stmts(body);
+        let pop_res = self.pop_scope_and_run_cleanups();
+        self.indent -= 1;
+        self.line("}".to_owned());
+        res.and(pop_res)?;
+        self.emit_inline_fn_return_propagation()?;
+        self.emit_cancel_propagation()?;
+        Ok(())
+    }
+
+    /// Formats a primitive builtin (`PRIM_BUILTINS`, `OP_BUILTINS`, `animate`, `breakpoint`,
+    /// `random_into`) as `.air` primitive text usable as a statement or a condition. Returns
+    /// `None` for other names. Callers resolve user callables and helpers first.
+    fn format_prim_builtin(
+        &mut self,
+        fname: &str,
+        args: &[CallArg],
+        span: Span,
+    ) -> Result<Option<String>> {
+        if let Some(&(_, opcode)) = OP_BUILTINS.iter().find(|(n, _)| *n == fname) {
+            if !args.is_empty() {
+                return Err(Error::at(span, format!("{fname}() takes no arguments")));
+            }
+            return Ok(Some(format!("op {opcode:#06x} (0, 0, 0, 0, 0, 0, 0, 0)")));
+        }
+        match fname {
+            "animate" => return Ok(Some(self.format_animate(args)?.0)),
+            "breakpoint" => {
+                return match args {
+                    [] => Ok(Some("breakpoint()".to_owned())),
+                    [a] if a.name.is_none() => {
+                        let (v, _) = self.lower_value_expr(&a.value)?;
+                        Ok(Some(format!("breakpoint({v})")))
+                    }
+                    _ => Err(Error::at(
+                        span,
+                        "breakpoint() takes at most one positional argument",
+                    )),
+                };
+            }
+            "random_into" => {
+                let [dst, range] = args else {
+                    return Err(Error::at(
+                        span,
+                        "random_into(x, n) expects 2 positional arguments",
+                    ));
+                };
+                if dst.name.is_some() || range.name.is_some() {
+                    return Err(Error::at(
+                        span,
+                        "random_into(x, n) expects 2 positional arguments",
+                    ));
+                }
+                let (range_air, range_ty) = self.lower_value_expr(&range.value)?;
+                if range_ty != ValueType::I16 {
+                    return Err(Error::at(
+                        range.span,
+                        "random_into(x, n): 'n' must be an i16",
+                    ));
+                }
+                let lval = self.resolve_lvalue(&dst.value)?;
+                let LValue::Direct { air, ty } = lval else {
+                    return Err(Error::at(
+                        dst.span,
+                        "random_into(x, n): 'x' must be a local, attribute, or other direct i16 slot of this object",
+                    ));
+                };
+                if ty != ValueType::I16 {
+                    return Err(Error::at(
+                        dst.span,
+                        format!(
+                            "random_into(x, n): 'x' must be an i16, found '{}'",
+                            self.env.display_value_type(&ty)
+                        ),
+                    ));
+                }
+                return Ok(Some(format!("random({air}, {range_air})")));
+            }
+            _ => {}
+        }
+        let Some(spec) = PRIM_BUILTINS.iter().find(|b| b.v2 == fname) else {
+            return Ok(None);
+        };
+        let allowed: Vec<&str> = spec.keys.iter().map(|(k, _, _)| *k).collect();
+        let named = self.builtin_named_args(fname, args, &allowed)?;
+        let mut parts = Vec::new();
+        for &(key, air_key, kind) in spec.keys {
+            let Some(a) = named.get(key) else {
+                continue;
+            };
+            let what = format!("{fname} {key}");
+            let text = match kind {
+                PrimArg::Int(lo, hi) => self.eval_builtin_int(&a.value, &what, lo, hi)?.to_string(),
+                PrimArg::Bool => self.eval_const_bool_required(&a.value, a.span)?.to_string(),
+                PrimArg::Guid => format!("{:#010x}", self.resolve_guid_expr(&a.value)?),
+                PrimArg::Local => self.builtin_local_arg(&a.value, &format!("{fname}({key}:)"))?,
+                PrimArg::RefreshTarget => match &a.value {
+                    V2Expr::Ident(_, n) if self.is_self_ident(n) => "me".to_owned(),
+                    V2Expr::Ident(_, n) if n == "stack_obj" => "stack_obj".to_owned(),
+                    other => self.eval_builtin_int(other, &what, 0, 1)?.to_string(),
+                },
+            };
+            parts.push(format!("{air_key}: {text}"));
+        }
+        Ok(Some(format!("{}({})", spec.air, parts.join(", "))))
+    }
+
+    /// `x.is_type(GUID)` on an object handle: `test_object_type(guid, object: x)`.
+    fn format_is_type(
+        &mut self,
+        receiver: &V2Expr,
+        args: &[CallArg],
+        span: Span,
+    ) -> Result<String> {
+        let [a] = args else {
+            return Err(Error::at(
+                span,
+                "'.is_type(GUID)' expects exactly 1 argument",
+            ));
+        };
+        if a.name.is_some() {
+            return Err(Error::at(
+                a.span,
+                "'.is_type(GUID)' takes a positional GUID",
+            ));
+        }
+        let guid = self.resolve_guid_expr(&a.value)?;
+        let (obj, ty) = self.lower_value_expr(receiver)?;
+        if !ty.is_object_handle() {
+            return Err(Error::at(
+                receiver.span(),
+                format!(
+                    "'.is_type(...)' needs an object handle, found '{}'",
+                    self.env.display_value_type(&ty)
+                ),
+            ));
+        }
+        Ok(format!("test_object_type({guid:#010x}, object: {obj})"))
+    }
     fn emit_sleep(&mut self, args: &[CallArg], span: Span) -> Result<()> {
         if args.len() != 1 || args[0].name.is_some() {
             return Err(Error::at(
@@ -6320,6 +7044,34 @@ impl<'a> TreeLowerer<'a> {
         args: &[CallArg],
         call_span: Span,
     ) -> Result<Option<(String, ValueType)>> {
+        self.inline_helper_call_mode(fn_mod, fn_decl, is_local_fn, args, call_span, false)
+    }
+
+    /// Whether a `-> bool` helper is straight-line code ending in one `return <cond>;`, which
+    /// inlines as a branch condition without the return-flag loop wrapper.
+    fn is_tail_return_bool_helper(&self, fn_decl: &FnDecl) -> bool {
+        let Some((V2Stmt::Return { value: Some(_), .. }, prefix)) = fn_decl.body.split_last()
+        else {
+            return false;
+        };
+        fn_decl.return_type == Some(V2Type::Bool)
+            && !stmts_have_return(prefix)
+            && !prefix.iter().any(|s| matches!(s, V2Stmt::Defer { .. }))
+            && (self.in_defer() || self.enclosing_cancel_flag().is_none())
+    }
+
+    /// Inlines a helper; with `tail_cond` (only for [`Self::is_tail_return_bool_helper`]
+    /// helpers) the prefix is emitted and the returned operand is the tail condition's `.air`
+    /// text, to be used directly as the caller's branch condition.
+    fn inline_helper_call_mode(
+        &mut self,
+        fn_mod: &str,
+        fn_decl: &FnDecl,
+        is_local_fn: bool,
+        args: &[CallArg],
+        call_span: Span,
+        tail_cond: bool,
+    ) -> Result<Option<(String, ValueType)>> {
         let fqn = format!(
             "{}::{fn_mod}::{}",
             if is_local_fn { "local" } else { "mod" },
@@ -6509,6 +7261,51 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
 
+        if tail_cond {
+            let prev_vars = std::mem::replace(&mut self.var_scopes, vec![bound_params]);
+            let prev_active_fn = self.active_inline_fn.take();
+            let prev_in_obj = self.in_object_scope;
+            self.in_object_scope = is_local_fn;
+            let res = self.with_owner_module(fn_mod, |c| {
+                let Some((
+                    V2Stmt::Return {
+                        value: Some(tail), ..
+                    },
+                    prefix,
+                )) = fn_decl.body.split_last()
+                else {
+                    unreachable!("checked by is_tail_return_bool_helper");
+                };
+                c.push_scope(ScopeFrame {
+                    cleanups: Vec::new(),
+                    is_loop_body: false,
+                    is_fn_root: true,
+                    is_air_while: false,
+                    owner_defer_id: c.current_defer_id,
+                    cancel_flag: None,
+                    repeat_counter: None,
+                });
+                let r = c.lower_stmts(prefix).and_then(|()| {
+                    if let Some(text) = c.try_lower_simple_air_cond(tail)? {
+                        return Ok(text);
+                    }
+                    let cond = c.fresh("cond");
+                    c.line(format!("let {cond} = 0;"));
+                    c.emit_bool_into_local(tail, &cond)?;
+                    Ok(format!("{cond} != 0"))
+                });
+                let p = c.pop_scope_and_run_cleanups();
+                let text = r?;
+                p?;
+                Ok(text)
+            });
+            self.in_object_scope = prev_in_obj;
+            self.active_inline_fn = prev_active_fn;
+            self.var_scopes = prev_vars;
+            self.inline_call_stack.pop();
+            return Ok(Some((res?, ValueType::Bool)));
+        }
+
         let has_returns = stmts_have_return(&fn_decl.body);
         let has_enclosing_cancel = !self.in_defer() && self.enclosing_cancel_flag().is_some();
         let needs_wrapper = has_returns || has_enclosing_cancel;
@@ -6540,7 +7337,7 @@ impl<'a> TreeLowerer<'a> {
                         owner_defer_id: c.current_defer_id,
                     });
                 }
-                c.line("while 1 == 1 {".to_owned());
+                c.line("while true {".to_owned());
                 c.indent += 1;
                 c.push_scope(ScopeFrame {
                     cleanups: Vec::new(),
@@ -6620,6 +7417,10 @@ impl<'a> TreeLowerer<'a> {
                     format!("use '*{name} = ...' to assign through '&mut' parameter '{name}'"),
                 )),
                 Some(_) => Err(Error::at(*span, format!("'{name}' is not assignable"))),
+                None if name == "stack_obj" => Ok(LValue::Direct {
+                    air: "stack_obj".to_owned(),
+                    ty: ValueType::ObjectId,
+                }),
                 None => {
                     if self.env.i16_params.contains_key(name)
                         || self.env.bool_params.contains_key(name)
@@ -6704,6 +7505,10 @@ impl<'a> TreeLowerer<'a> {
                                 air: format!("{}.data[0]", self.self_prefix()),
                                 ty: ValueType::I16,
                             }),
+                            "flags" => Ok(LValue::Direct {
+                                air: format!("{}.data[8]", self.self_prefix()),
+                                ty: ValueType::Bitflags(ANY_BITFLAGS.to_owned()),
+                            }),
                             "allowed_heights" => Ok(LValue::Direct {
                                 air: format!("{}.data[4]", self.self_prefix()),
                                 ty: ValueType::Bitflags("builtin::Height".to_owned()),
@@ -6737,12 +7542,22 @@ impl<'a> TreeLowerer<'a> {
                         };
                     }
                     if self.is_sim_ident(bname) {
-                        return Err(Error::at(
-                            *span,
-                            format!(
-                                "cannot assign to '{bname}.{field}' (use '{bname}.motive.<name>' or '{bname}.skill.<name>'; use 'self.<state>' for object state)"
-                            ),
-                        ));
+                        return match field.as_str() {
+                            "hand" => Ok(LValue::Direct {
+                                air: "my.slot[0]".to_owned(),
+                                ty: ValueType::ObjectId,
+                            }),
+                            "age" => Ok(LValue::Direct {
+                                air: "my.person[58]".to_owned(),
+                                ty: ValueType::I16,
+                            }),
+                            _ => Err(Error::at(
+                                *span,
+                                format!(
+                                    "cannot assign to '{bname}.{field}' (use '{bname}.motive.<name>', '{bname}.skill.<name>', '{bname}.hand', '{bname}.age', '{bname}.slot[i]', or '{bname}.person[i]'; use 'self.<state>' for object state)"
+                                ),
+                            )),
+                        };
                     }
                     if bname == "sim" && matches!(self.tree_ctx, TreeContext::ObjectSelf) {
                         return Err(Error::at(
@@ -6851,6 +7666,38 @@ impl<'a> TreeLowerer<'a> {
                         let sk = self.resolve_skill_expr(index)?;
                         return Ok(LValue::Direct {
                             air: format!("my.person[{sk}]"),
+                            ty: ValueType::I16,
+                        });
+                    }
+                    if self.is_sim_ident(rname) && matches!(field.as_str(), "slot" | "person") {
+                        let idx = self.eval_builtin_int(
+                            index,
+                            &format!("{rname}.{field} index"),
+                            0,
+                            255,
+                        )?;
+                        return Ok(LValue::Direct {
+                            air: format!("my.{field}[{idx}]"),
+                            ty: if field == "slot" {
+                                ValueType::ObjectId
+                            } else {
+                                ValueType::I16
+                            },
+                        });
+                    }
+                    if rname == "advert"
+                        && self.lookup_var(rname).is_none()
+                        && let Some(scope) = match field.as_str() {
+                            "delta" => Some(12),
+                            "personality" => Some(28),
+                            "minimum" => Some(29),
+                            _ => None,
+                        }
+                    {
+                        // Motive indices are 0..16, which is also the advertisement range.
+                        let m = self.resolve_motive_expr(index)?;
+                        return Ok(LValue::Direct {
+                            air: format!("scope({scope}, {m})"),
                             ty: ValueType::I16,
                         });
                     }
@@ -7044,7 +7891,7 @@ impl<'a> TreeLowerer<'a> {
                     self.env
                         .lookup_bitflags(&self.owner_module, &segs[0], self.in_object_scope)
                 {
-                    if bf.canonical_key != expected_key {
+                    if bf.canonical_key != expected_key && expected_key != ANY_BITFLAGS {
                         return Err(Error::at(
                             *span,
                             format!(
@@ -7076,7 +7923,7 @@ impl<'a> TreeLowerer<'a> {
                     single_bit,
                 }) = self.lookup_var(name)
                 {
-                    if key != expected_key {
+                    if key != expected_key && expected_key != ANY_BITFLAGS {
                         return Err(Error::at(
                             *span,
                             format!(
@@ -7305,6 +8152,7 @@ impl<'a> TreeLowerer<'a> {
                         }
                         let prop_air = match field.as_str() {
                             "graphic" => format!("{}.data[0]", self.self_prefix()),
+                            "flags" => format!("{}.data[8]", self.self_prefix()),
                             "allowed_heights" => format!("{}.data[4]", self.self_prefix()),
                             "placement" => format!("{}.data[42]", self.self_prefix()),
                             "prep_score" => format!("{}.data[31]", self.self_prefix()),
@@ -7321,6 +8169,8 @@ impl<'a> TreeLowerer<'a> {
                             "id" => "my.data[11]",
                             "priority" => "my.person[33]",
                             "room" => "my.data[29]",
+                            "hand" => "my.slot[0]",
+                            "age" => "my.person[58]",
                             _ => return true,
                         };
                         return sim_air == canon_target;
@@ -7638,6 +8488,20 @@ impl<'a> TreeLowerer<'a> {
                         "'sim' is not available in init/main (object lifecycle context)",
                     ));
                 }
+                if let Some(v) = self.const_item(name) {
+                    let n = i16::try_from(v).map_err(|_| {
+                        Error::at(
+                            *span,
+                            format!(
+                                "const '{name}' ({v:#x}) does not fit in i16; use it where a GUID is expected"
+                            ),
+                        )
+                    })?;
+                    return Ok((n.to_string(), ValueType::I16));
+                }
+                if name == "stack_obj" {
+                    return Ok(("stack_obj".to_owned(), ValueType::ObjectId));
+                }
                 if self.env.i16_params.contains_key(name) {
                     return Ok((format!("bcon.{name}"), ValueType::I16));
                 }
@@ -7664,10 +8528,12 @@ impl<'a> TreeLowerer<'a> {
                             "id" => Ok(("my.id".to_owned(), ValueType::ObjectId)),
                             "priority" => Ok(("my.person.priority".to_owned(), ValueType::I16)),
                             "room" => Ok(("my.room".to_owned(), ValueType::I16)),
+                            "hand" => Ok(("my.slot[0]".to_owned(), ValueType::ObjectId)),
+                            "age" => Ok(("my.person[58]".to_owned(), ValueType::I16)),
                             other => Err(Error::at(
                                 *span,
                                 format!(
-                                    "unknown Sim property '{bname}.{other}' (expected motive, skill, id, priority, or room; use 'self.<state>' for object state)"
+                                    "unknown Sim property '{bname}.{other}' (expected motive, skill, id, priority, room, hand, age, slot[i], or person[i]; use 'self.<state>' for object state)"
                                 ),
                             )),
                         };
@@ -7813,8 +8679,22 @@ impl<'a> TreeLowerer<'a> {
                         })?;
                         return Ok((rv, vty));
                     }
+                    if is_prim_builtin_name(fname) {
+                        let tmp = self.fresh("call");
+                        self.line(format!("let {tmp} = 0;"));
+                        self.emit_bool_into_local(expr, &tmp)?;
+                        return Ok((tmp, ValueType::Bool));
+                    }
                 }
                 Err(Error::at(*span, "unsupported value call expression"))
+            }
+            V2Expr::MethodCall {
+                method, type_args, ..
+            } if method == "is_type" && type_args.is_empty() => {
+                let tmp = self.fresh("call");
+                self.line(format!("let {tmp} = 0;"));
+                self.emit_bool_into_local(expr, &tmp)?;
+                Ok((tmp, ValueType::Bool))
             }
             V2Expr::MethodCall {
                 span,
@@ -7894,6 +8774,38 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// A `const` item named `name`, unless a local binding shadows it.
+    fn const_item(&self, name: &str) -> Option<i64> {
+        if self.lookup_var(name).is_some() {
+            return None;
+        }
+        self.env
+            .lookup_const(&self.owner_module, name, self.in_object_scope)
+    }
+
+    /// A 32-bit GUID operand: an integer literal or a `const` item.
+    fn resolve_guid_expr(&self, expr: &V2Expr) -> Result<u32> {
+        let (span, value) = match expr {
+            V2Expr::Int(span, v) => (*span, *v),
+            V2Expr::Ident(span, name) => match self.const_item(name) {
+                Some(v) => (*span, v),
+                None => {
+                    return Err(Error::at(
+                        *span,
+                        format!("expected a GUID literal or const, found '{name}'"),
+                    ));
+                }
+            },
+            other => {
+                return Err(Error::at(
+                    other.span(),
+                    "expected a GUID literal (0x...) or a const",
+                ));
+            }
+        };
+        u32::try_from(value).map_err(|_| Error::at(span, format!("GUID {value} out of u32 range")))
+    }
+
     fn try_const_i16_air_operand(&self, expr: &V2Expr) -> Result<Option<(String, i16)>> {
         match expr {
             V2Expr::Int(span, v) => {
@@ -7931,6 +8843,11 @@ impl<'a> TreeLowerer<'a> {
                 {
                     return Ok(None);
                 }
+                if let Some(v) = self.const_item(name)
+                    && let Ok(v) = i16::try_from(v)
+                {
+                    return Ok(Some((v.to_string(), v)));
+                }
                 if let Some(&val) = self.env.i16_params.get(name) {
                     return Ok(Some((format!("bcon.{name}"), val)));
                 }
@@ -7953,6 +8870,110 @@ impl<'a> TreeLowerer<'a> {
     /// so untaken branches remain type- and symbol-checked.
     fn try_const_bool_arg(&self, expr: &V2Expr) -> Option<bool> {
         self.try_eval_const_bool_inner(expr, true)
+    }
+
+    /// Folds a condition built only from literal comparisons (integer literals, enum variants,
+    /// constant helper bindings), bool literals, constant helper bools, and `!`/`&&`/`||`. Object
+    /// `i16` params are excluded: they are runtime `bcon` reads.
+    fn try_fold_literal_cond(&self, expr: &V2Expr) -> Option<bool> {
+        match expr {
+            V2Expr::Bool(_, b) => Some(*b),
+            V2Expr::Ident(_, name) => match self.lookup_var(name) {
+                Some(Binding::ConstBool(b)) => Some(*b),
+                _ => None,
+            },
+            V2Expr::Unary {
+                op: V2UnaryOp::Not,
+                inner,
+                ..
+            } => self.try_fold_literal_cond(inner).map(|b| !b),
+            V2Expr::Binary {
+                lhs,
+                op: V2BinOp::And,
+                rhs,
+                ..
+            } => match (
+                self.try_fold_literal_cond(lhs),
+                self.try_fold_literal_cond(rhs),
+            ) {
+                (Some(a), Some(b)) => Some(a && b),
+                _ => None,
+            },
+            V2Expr::Binary {
+                lhs,
+                op: V2BinOp::Or,
+                rhs,
+                ..
+            } => match (
+                self.try_fold_literal_cond(lhs),
+                self.try_fold_literal_cond(rhs),
+            ) {
+                (Some(a), Some(b)) => Some(a || b),
+                _ => None,
+            },
+            V2Expr::Binary { lhs, op, rhs, .. } => {
+                let (lk, l) = self.literal_compare_operand(lhs)?;
+                let (rk, r) = self.literal_compare_operand(rhs)?;
+                // Mixed kinds (enum vs integer, two enums) take the normal, type-checked path.
+                if lk != rk {
+                    return None;
+                }
+                match op {
+                    V2BinOp::Eq => Some(l == r),
+                    V2BinOp::Ne => Some(l != r),
+                    V2BinOp::Lt => Some(l < r),
+                    V2BinOp::Le => Some(l <= r),
+                    V2BinOp::Gt => Some(l > r),
+                    V2BinOp::Ge => Some(l >= r),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `(enum key, value)` of a compile-time comparison operand (`None` key for plain integers).
+    fn literal_compare_operand(&self, expr: &V2Expr) -> Option<(Option<String>, i16)> {
+        match expr {
+            V2Expr::Path(_, segs) if segs.len() == 2 => {
+                let e = self
+                    .env
+                    .lookup_enum(&self.owner_module, &segs[0], self.in_object_scope)?;
+                let &v = e.variants.get(&segs[1])?;
+                Some((Some(e.canonical_key.clone()), v))
+            }
+            V2Expr::Ident(_, name)
+                if let Some(Binding::ConstEnum { key, value }) = self.lookup_var(name) =>
+            {
+                Some((Some(key.clone()), *value))
+            }
+            _ => {
+                let (air, v) = self.try_const_i16_air_operand(expr).ok().flatten()?;
+                air.parse::<i16>().ok().map(|_| (None, v))
+            }
+        }
+    }
+
+    /// Lowers a constant-folded-away branch into a discarded buffer so it is still type- and
+    /// symbol-checked, then restores the lowering state.
+    fn check_dead_branch(&mut self, stmts: &[V2Stmt]) -> Result<()> {
+        if stmts.is_empty() {
+            return Ok(());
+        }
+        let out_len = self.out.len();
+        let indent = self.indent;
+        let used_saved = self.used_saved_stack_obj;
+        let expansions = self.inline_expansions;
+        let strings = self.env.dialog_strings.borrow().clone();
+        self.push_scope(ScopeFrame::block());
+        let r = self.lower_stmts(stmts);
+        let p = self.pop_scope_and_run_cleanups();
+        self.out.truncate(out_len);
+        self.indent = indent;
+        self.used_saved_stack_obj = used_saved;
+        self.inline_expansions = expansions;
+        *self.env.dialog_strings.borrow_mut() = strings;
+        r.and(p)
     }
 
     fn try_eval_const_bool(&self, expr: &V2Expr) -> Option<bool> {
@@ -8050,6 +9071,14 @@ impl<'a> TreeLowerer<'a> {
                         *span,
                         format!("expected constant i16, found '{name}'"),
                     ));
+                }
+                if let Some(v) = self.const_item(name) {
+                    return i16::try_from(v).map_err(|_| {
+                        Error::at(
+                            *span,
+                            format!("const '{name}' ({v:#x}) is a GUID, not an i16"),
+                        )
+                    });
                 }
                 self.env.i16_params.get(name).copied().ok_or_else(|| {
                     Error::at(*span, format!("expected constant i16, found '{name}'"))
@@ -8312,7 +9341,9 @@ impl<'a> TreeLowerer<'a> {
             s
         };
         let (rhs_air, rhs_ty) = self.lower_value_expr(&args[0].value)?;
-        if rhs_ty != ValueType::Bitflags(key.clone()) {
+        if !types_compatible_for_assign(&ValueType::Bitflags(key.clone()), &rhs_ty)
+            || !matches!(rhs_ty, ValueType::Bitflags(_))
+        {
             return Err(Error::at(
                 args[0].span,
                 format!(
@@ -8415,12 +9446,41 @@ impl<'a> TreeLowerer<'a> {
                             return Ok(Some(self.format_slot_prim("route_to", args, *span)?));
                         }
                         "snap" => return Ok(Some(self.format_slot_prim("snap", args, *span)?)),
-                        _ => return Ok(None),
+                        _ => {}
                     }
+                    if let Some((fn_mod, fn_decl, is_local)) =
+                        self.env
+                            .lookup_fn(&self.owner_module, fname, self.in_object_scope)
+                        && self.is_tail_return_bool_helper(&fn_decl)
+                    {
+                        let (text, _) = self
+                            .inline_helper_call_mode(
+                                &fn_mod, &fn_decl, is_local, args, *span, true,
+                            )?
+                            .expect("tail bool helpers return a condition");
+                        return Ok(Some(text));
+                    }
+                    if self
+                        .env
+                        .lookup_fn(&self.owner_module, fname, self.in_object_scope)
+                        .is_none()
+                    {
+                        return self.format_prim_builtin(fname, args, *span);
+                    }
+                    return Ok(None);
                 }
                 Ok(None)
             }
             V2Expr::MethodCall { method, .. } if method == "run_functional" => Ok(None),
+            V2Expr::MethodCall {
+                span,
+                receiver,
+                method,
+                type_args,
+                args,
+            } if method == "is_type" && type_args.is_empty() => {
+                Ok(Some(self.format_is_type(receiver, args, *span)?))
+            }
             V2Expr::MethodCall {
                 span,
                 receiver,
@@ -8507,6 +9567,16 @@ impl<'a> TreeLowerer<'a> {
                 Ok(None)
             }
             V2Expr::MethodCall { method, .. } if method == "run_functional" => Ok(None),
+            V2Expr::MethodCall {
+                span,
+                receiver,
+                method,
+                type_args,
+                args,
+            } if method == "is_type" && type_args.is_empty() => Ok(Some(format!(
+                "!{}",
+                self.format_is_type(receiver, args, *span)?
+            ))),
             V2Expr::MethodCall {
                 span,
                 receiver,
@@ -8625,6 +9695,25 @@ impl<'a> TreeLowerer<'a> {
                 type_args,
                 args,
             } => {
+                if let V2Expr::Ident(_, fname) = callee.as_ref()
+                    && fname == "create_object"
+                    && self.resolve_callable(callee, *span)?.is_none()
+                {
+                    // `if create_object(...)`: success flag only; `stack_obj` is restored on
+                    // both edges (bind the new object with `let Some(x) = create_object(...)`).
+                    let (prim, _) = self.format_create_object(type_args, args, *span)?;
+                    self.line(format!("if {prim} {{"));
+                    self.indent += 1;
+                    self.line(format!("{dst_local} := 1;"));
+                    self.indent -= 1;
+                    self.line("} else {".to_owned());
+                    self.indent += 1;
+                    self.line(format!("{dst_local} := 0;"));
+                    self.indent -= 1;
+                    self.line("}".to_owned());
+                    self.emit_restore_stack_obj();
+                    return Ok(());
+                }
                 if !type_args.is_empty() {
                     return Err(Error::at(
                         *span,
@@ -9137,14 +10226,13 @@ impl<'a> TreeLowerer<'a> {
                     "create_object(guid [, mode: ..., flags: ...]) requires a GUID or type argument 'create_object::<T>(...)'",
                 ));
             }
-            let V2Expr::Int(gspan, gval) = args[0].value else {
+            if args[0].name.is_some() {
                 return Err(Error::at(
                     args[0].span,
-                    "create_object() requires an integer GUID literal or 'create_object::<ObjectType>(...)'",
+                    "create_object() requires a GUID (literal or const) or 'create_object::<ObjectType>(...)'",
                 ));
-            };
-            let guid = u32::try_from(gval)
-                .map_err(|_| Error::at(gspan, format!("GUID {gval} out of u32 range")))?;
+            }
+            let guid = self.resolve_guid_expr(&args[0].value)?;
             (guid, ValueType::ObjectId, &args[1..])
         };
         let mut mode = "here".to_owned();
@@ -9527,19 +10615,6 @@ fn canonical_air_cell(air: &str) -> String {
     air.to_owned()
 }
 
-fn person_field_by_name(name: &str) -> Option<u8> {
-    match name {
-        "cooking" => Some(9),
-        "charisma" => Some(10),
-        "mechanical" | "mechanic" => Some(11),
-        "creativity" => Some(14),
-        "body" => Some(15),
-        "logic" => Some(16),
-        "priority" => Some(33),
-        _ => None,
-    }
-}
-
 fn is_arith_or_bit_binop(op: V2BinOp) -> bool {
     matches!(
         op,
@@ -9599,6 +10674,116 @@ fn cmp_op_str(op: V2BinOp) -> &'static str {
         V2BinOp::FlagTest => "flag_test",
         _ => unreachable!("non-comparison op"),
     }
+}
+
+/// Parses a `raw { ... }` block's `.air` text the same way the lowering validates it.
+fn parse_raw_air_stmts(code: &str) -> Option<Vec<crate::ast::Stmt>> {
+    let wrapped = format!("tree 4096 \"__raw_check\" {{\n{code}\n}}\n");
+    let parsed = crate::parser::parse_module(&wrapped).ok()?;
+    match parsed.items.into_iter().next() {
+        Some(crate::ast::Item::Tree(t)) => Some(t.body),
+        _ => None,
+    }
+}
+
+/// Whether a `raw { ... }` block may overwrite the frame's `stack_obj` (or names `__self_obj`
+/// itself), which forces the `__self_obj` save in a Sim-on-object tree. Text that does not parse
+/// is assumed to clobber.
+fn raw_air_may_clobber_stack_obj(code: &str) -> bool {
+    if code.contains("__self_obj") {
+        return true;
+    }
+    match parse_raw_air_stmts(code) {
+        Some(stmts) => raw_air_stmts_clobber_stack_obj(&stmts),
+        None => true,
+    }
+}
+
+fn is_stack_obj_operand(op: &crate::ast::OperandRef) -> bool {
+    matches!(
+        op,
+        crate::ast::OperandRef::Direct(crate::ast::Operand {
+            scope: 10,
+            index: 0
+        })
+    )
+}
+
+/// Raw opcodes known not to write the caller frame's `stack_obj`: BHAV calls (`stack_obj` is per
+/// frame and never copied back) and the operand-free / read-only primitives listed here. Every
+/// other raw opcode (notably Expression `0x0002`, which can name `stack_obj` as its target) is
+/// treated as a clobber.
+fn raw_opcode_keeps_stack_obj(opcode: u16) -> bool {
+    opcode >= 0x0100
+        || matches!(
+            opcode,
+            0x0004 // grab
+                | 0x0005 // drop
+                | 0x0007 // refresh
+                | 0x000F // breakpoint
+                | 0x0019 // alter budget
+                | 0x0023 // special effect
+                | 0x002C // animate
+                | 0x0031 // notify out of idle
+        )
+}
+
+fn raw_condition_clobbers_stack_obj(cond: &crate::ast::Condition) -> bool {
+    match cond {
+        crate::ast::Condition::Compare { .. } | crate::ast::Condition::Call { .. } => false,
+        crate::ast::Condition::Primitive { prim, .. } => raw_primitive_clobbers_stack_obj(prim),
+        crate::ast::Condition::RawOp { opcode, .. } => !raw_opcode_keeps_stack_obj(*opcode),
+        crate::ast::Condition::Not(inner) => raw_condition_clobbers_stack_obj(inner),
+    }
+}
+
+fn raw_primitive_clobbers_stack_obj(prim: &crate::ast::PrimitiveCall) -> bool {
+    use crate::ast::PrimitiveCall as P;
+    match prim {
+        // These set the running frame's stack object (or may, through an autonomy choice).
+        P::FindBestInteraction
+        | P::FindBestObject { .. }
+        | P::CreateObject { .. }
+        | P::MakeNewCharacter { .. }
+        | P::GosubFoundAction => true,
+        P::SetToNext { dest, .. } => dest.as_ref().is_none_or(is_stack_obj_operand),
+        P::ExprRaw { lhs, .. } => is_stack_obj_operand(lhs),
+        P::Random { dst, .. } | P::GetDirectionTo { dst, .. } => is_stack_obj_operand(dst),
+        P::Relationship { value, .. } => is_stack_obj_operand(value),
+        _ => false,
+    }
+}
+
+fn raw_air_stmts_clobber_stack_obj(stmts: &[crate::ast::Stmt]) -> bool {
+    use crate::ast::Stmt;
+    stmts.iter().any(|s| match s {
+        Stmt::Assign { lhs, .. } => is_stack_obj_operand(lhs),
+        Stmt::RawOp { opcode, .. } | Stmt::InlineRawOp { opcode, .. } => {
+            !raw_opcode_keeps_stack_obj(*opcode)
+        }
+        Stmt::Primitive { prim, .. } => raw_primitive_clobbers_stack_obj(prim),
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            raw_condition_clobbers_stack_obj(cond)
+                || raw_air_stmts_clobber_stack_obj(then_body)
+                || raw_air_stmts_clobber_stack_obj(else_body)
+        }
+        Stmt::While { cond, body, .. } => {
+            raw_condition_clobbers_stack_obj(cond) || raw_air_stmts_clobber_stack_obj(body)
+        }
+        Stmt::Loop { body, .. } => raw_air_stmts_clobber_stack_obj(body),
+        Stmt::Label { .. }
+        | Stmt::Let { .. }
+        | Stmt::Call { .. }
+        | Stmt::Idle { .. }
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Return { .. } => false,
+    })
 }
 
 fn collect_raw_air_labels<'a>(stmts: &'a [crate::ast::Stmt], labels: &mut BTreeSet<&'a str>) {
@@ -9780,6 +10965,16 @@ fn stmts_mutate_or_borrow_ident(stmts: &[V2Stmt], target_name: &str) -> bool {
         V2Stmt::Return { value: Some(e), .. } | V2Stmt::Expr { expr: e, .. } => {
             expr_borrows_ident(e, target_name)
         }
+        V2Stmt::LetUninit { name, .. } => name == target_name,
+        V2Stmt::Animate {
+            args, event, body, ..
+        } => {
+            event.as_deref() == Some(target_name)
+                || args
+                    .iter()
+                    .any(|a| expr_borrows_ident(&a.value, target_name))
+                || stmts_mutate_or_borrow_ident(body, target_name)
+        }
         V2Stmt::Break { .. }
         | V2Stmt::Continue { .. }
         | V2Stmt::Return { value: None, .. }
@@ -9920,8 +11115,30 @@ fn stmts_unconditionally_diverge(
         Some(V2Stmt::WithLock { body, .. }) => {
             stmts_unconditionally_diverge(body, env, owner_module, allow_local)
         }
+        Some(V2Stmt::While {
+            cond: V2Expr::Bool(_, true),
+            body,
+            ..
+        }) => !loop_body_breaks(body),
         _ => false,
     }
+}
+
+/// Whether a `break` in `stmts` exits the loop whose body `stmts` is (breaks inside nested loops,
+/// including an `animate` event handler, exit those instead).
+fn loop_body_breaks(stmts: &[V2Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        V2Stmt::Break { .. } => true,
+        V2Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => loop_body_breaks(then_body) || loop_body_breaks(else_body),
+        V2Stmt::Match { arms, .. } => arms.iter().any(|a| loop_body_breaks(&a.body)),
+        V2Stmt::WithLock { body, .. } | V2Stmt::Defer { body, .. } => loop_body_breaks(body),
+        V2Stmt::LetSome { else_body, .. } => loop_body_breaks(else_body),
+        _ => false,
+    })
 }
 
 fn stmts_have_return(stmts: &[V2Stmt]) -> bool {
@@ -9932,7 +11149,8 @@ fn stmts_have_return(stmts: &[V2Stmt]) -> bool {
         | V2Stmt::Defer { body, .. }
         | V2Stmt::Repeat { body, .. }
         | V2Stmt::While { body, .. }
-        | V2Stmt::ForEach { body, .. } => stmts_have_return(body),
+        | V2Stmt::ForEach { body, .. }
+        | V2Stmt::Animate { body, .. } => stmts_have_return(body),
         V2Stmt::LetSome { else_body, .. } => stmts_have_return(else_body),
         V2Stmt::If {
             then_body,
@@ -9982,6 +11200,12 @@ fn stmts_always_return(
             {
                 return true;
             }
+            // `loop { }` / `while true { }` without a `break` never falls through.
+            V2Stmt::While {
+                cond: V2Expr::Bool(_, true),
+                body,
+                ..
+            } if !loop_body_breaks(body) => return true,
             _ => {}
         }
     }
@@ -10023,6 +11247,10 @@ fn stmts_may_clobber_stack_obj(
         V2Stmt::Let { init, .. } => {
             expr_may_clobber_stack_obj(init, env, owner_mod, allow_local_fns, sim_name, depth)
         }
+        V2Stmt::Assign {
+            target: V2Expr::Ident(_, name),
+            ..
+        } if name == "stack_obj" => true,
         V2Stmt::Assign { target, value, .. } => {
             expr_may_clobber_stack_obj(target, env, owner_mod, allow_local_fns, sim_name, depth)
                 || expr_may_clobber_stack_obj(
@@ -10072,7 +11300,43 @@ fn stmts_may_clobber_stack_obj(
                     depth,
                 )
         }
-        V2Stmt::ForEach { .. } | V2Stmt::RawAir { .. } => true,
+        V2Stmt::ForEach {
+            iter: ForEachIter::Range { start, end, .. },
+            body,
+            ..
+        } => {
+            expr_may_clobber_stack_obj(start, env, owner_mod, allow_local_fns, sim_name, depth)
+                || expr_may_clobber_stack_obj(end, env, owner_mod, allow_local_fns, sim_name, depth)
+                || stmts_may_clobber_stack_obj(
+                    body,
+                    env,
+                    owner_mod,
+                    allow_local_fns,
+                    sim_name,
+                    depth,
+                )
+        }
+        V2Stmt::ForEach { .. } => true,
+        V2Stmt::RawAir { code, .. } => raw_air_may_clobber_stack_obj(code),
+        V2Stmt::Animate { args, body, .. } => {
+            args.iter().any(|a| {
+                expr_may_clobber_stack_obj(
+                    &a.value,
+                    env,
+                    owner_mod,
+                    allow_local_fns,
+                    sim_name,
+                    depth,
+                )
+            }) || stmts_may_clobber_stack_obj(
+                body,
+                env,
+                owner_mod,
+                allow_local_fns,
+                sim_name,
+                depth,
+            )
+        }
         V2Stmt::If {
             cond,
             then_body,
@@ -10134,6 +11398,13 @@ fn expr_may_clobber_stack_obj(
         V2Expr::Call { callee, args, .. } => {
             if let V2Expr::Ident(_, fname) = callee.as_ref() {
                 if matches!(fname.as_str(), "find_best_object" | "create_object") {
+                    return true;
+                }
+                if matches!(
+                    fname.as_str(),
+                    "find_best_interaction" | "gosub_found_action"
+                ) && env.lookup_fn(owner_mod, fname, allow_local_fns).is_none()
+                {
                     return true;
                 }
                 if let Some((fmod, fdecl, is_local)) =
@@ -10344,3 +11615,41 @@ fn escape_str(s: &str) -> String {
 
 #[allow(dead_code)]
 fn _keep_furniture_shape_import(_: FurnitureShape) {}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_air_cell;
+
+    /// Pins the `person.<field>` spellings to the same indices the `.air` parser, the lifter,
+    /// and the UI use, so alias analysis treats both spellings as one VM cell.
+    #[test]
+    fn person_field_cells_match_air_indices() {
+        for (name, index) in [
+            ("cooking", 10),
+            ("charisma", 11),
+            ("mechanical", 12),
+            ("mechanic", 12),
+            ("creativity", 15),
+            ("body", 17),
+            ("logic", 18),
+            ("priority", 33),
+        ] {
+            assert_eq!(
+                canonical_air_cell(&format!("my.person.{name}")),
+                format!("my.person[{index}]"),
+                "{name}"
+            );
+            assert_eq!(
+                canonical_air_cell(&format!("my.skill.{name}")),
+                if name == "priority" {
+                    format!("my.skill.{name}")
+                } else {
+                    format!("my.person[{index}]")
+                },
+                "skill.{name}"
+            );
+        }
+        assert_eq!(canonical_air_cell("stack.priority"), "stack.person[33]");
+        assert_eq!(canonical_air_cell("my.person.unknown"), "my.person.unknown");
+    }
+}
