@@ -179,6 +179,22 @@ impl Interpreter<'_> {
         Ok(list)
     }
 
+    /// Every portal's costs become 10001, not worked out (0x46387c). The
+    /// vectors keep their columns, so every number handed out keeps its
+    /// place and the next route works its costs out again.
+    pub(crate) fn forget_portal_costs(&self, world: &mut World) -> Result<(), Trap> {
+        for portal in self.portals(world)? {
+            if let Some(costs) = world
+                .objects
+                .get_mut(&portal)
+                .and_then(|object| object.portal.as_mut())
+            {
+                costs.fill(f32::from_bits(UNKNOWN));
+            }
+        }
+        Ok(())
+    }
+
     /// The smallest positive number no person on the lot and no portal
     /// holds in data word 6, or 0 if every number below 10000 is taken
     /// (0x46381a).

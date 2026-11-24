@@ -413,7 +413,7 @@ fn find_tuning(fcns: &sims_formats::tuning::Constants, name: &str) -> Option<f32
 /// Architecture surface prices (`Build.iff` + pattern catalogs) needed by
 /// `0x47b006` (`architecture_value`).
 #[derive(Debug, Clone, Default)]
-struct LotPrices {
+pub(crate) struct LotPrices {
     styles: BTreeMap<u16, i32>,
     pool: i32,
     floors: BTreeMap<u16, i32>,
@@ -421,7 +421,7 @@ struct LotPrices {
 }
 
 impl LotPrices {
-    fn load(install: &Install, surfaces: &Surfaces) -> Self {
+    pub(crate) fn load(install: &Install, surfaces: &Surfaces) -> Self {
         let tables: BTreeMap<u16, StringTable> = install
             .file("GameData/Build.iff")
             .ok()
@@ -524,7 +524,7 @@ fn atoi(bytes: &[u8]) -> i32 {
 
 /// Computes the architecture value (`0x47b006`) over levels 1 and 2 and
 /// returns `(architecture_value, has_architecture_for_global_22)`.
-fn architecture_value_and_built(world: &World, prices: &LotPrices) -> (i32, bool) {
+pub(crate) fn architecture_value_and_built(world: &World, prices: &LotPrices) -> (i32, bool) {
     let full = FULL_SIZE as usize;
     let size = usize::try_from(world.size).unwrap_or(0).min(full);
     let array = |id: u16, stride: usize| {
@@ -2598,6 +2598,7 @@ fn boot_from_saved_lot(
         )));
     }
     let StoreRuntime {
+        install,
         index,
         catalog,
         program,
@@ -2858,6 +2859,7 @@ fn boot_from_saved_lot(
         program,
         fast,
         catalog: std::sync::Arc::new(catalog),
+        architecture_prices: LotPrices::load(&install, &surfaces),
         surfaces,
         world,
         tuning: None,
@@ -2920,6 +2922,7 @@ fn boot_from_base_house(
     enter_live: bool,
 ) -> Result<Lot, LifecycleError> {
     let StoreRuntime {
+        install,
         index,
         catalog,
         program,
@@ -3287,6 +3290,7 @@ fn boot_from_base_house(
         program,
         fast,
         catalog: std::sync::Arc::new(catalog),
+        architecture_prices: LotPrices::load(&install, &surfaces),
         surfaces,
         world,
         tuning: None,
