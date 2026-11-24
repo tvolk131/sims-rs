@@ -1807,6 +1807,21 @@ impl App {
         if let Session::Shell(shell) = &mut self.session {
             redraw |= shell.pump_coop_restage();
             redraw |= shell.poll_background_saves();
+            // A trip a script asked for leaves the lot between ticks.
+            redraw |= shell.pump_trip_request();
+        } else if let Session::Standalone { game, .. } = &mut self.session
+            && game.trip_request().is_some()
+            && game.asking().is_none()
+            && game.asking_special_panel().is_none()
+        {
+            // A house opened alone has no neighborhood to travel in.
+            game.decline_trip();
+            game.show_notice(
+                "Travel",
+                "Travel needs the neighborhood: launch in Neighborhood mode to leave the lot."
+                    .to_owned(),
+            );
+            redraw = true;
         } else if let Session::Standalone { game, .. } = &mut self.session
             && let Some((host_house, host_family)) = game.pending_coop_restage()
         {

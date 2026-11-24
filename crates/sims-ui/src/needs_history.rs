@@ -14,9 +14,31 @@
 //!   (vtable +0x8c), 0x50c66f stores the trend in its byte +0xde, with
 //!   flags +0xdc and +0xdd.
 //!
-//! **Not ported:** that wiring. The bars do not draw a trend yet, the update
-//! that gates the sample (`ebx` at 0x51d149) has not been read, and how
-//! +0xde is drawn is unknown. The history is ported so the bars can use it.
+//! **How the trend is drawn** (read, not ported). The bar keeps five
+//! arrow slots at +0xf4, 0x34 bytes each, each a colour fade (0x50c492:
+//! from, to, and a time in ms). 0x50c66f lights |trend| of them, fading
+//! over 500 ms from the panel's blue (`0x000052`) to red (`0xff0000`) when
+//! the trend is below zero or green (`0x00ff00`) otherwise, and returns
+//! the others to the blue. The bar's draw (0x50c2fa) runs while +0xdc is set:
+//!
+//! - It puts the arrows from the left anchor (+0xe0, x + 16) leftward, 4
+//!   apart, for a falling need, and from the right anchor (+0xe8)
+//!   rightward otherwise. The needs panel sets both anchors (0x50c2cd).
+//! - Each slot draws in its colour at the moment, as a 16-bit pixel
+//!   (0x50c3e6..0x50c400).
+//! - A slot that has reached full red fades on to `0xd10000`, and full
+//!   green to `0x00ca39`, both over 500 ms (0x50c3b6..0x50c3e1). So a
+//!   steady arrow is the darker colour.
+//! - The arrow (0x50c818) is a 3-wide, 5-high triangle. A falling one
+//!   points left (rows x + 2; x + 1..2; x..x + 2; x + 1..2; x + 2) and a
+//!   rising one right.
+//!
+//! **Not ported:** that wiring, so the bars draw no trend. The sample's
+//! gate is `ebx` at 0x51d149, the live panel update's flags word
+//! (`[ebp - 0x1c]`) masked with 9 (0x51d05c). Where those flags are set,
+//! and so how often a need is sampled, has not been read. The cadence
+//! decides the trend, and so how many arrows show. The history is ported
+//! so the bars can use it.
 
 /// Samples a history keeps (0x513aeb: `push 0xa`).
 pub const CAPACITY: usize = 10;

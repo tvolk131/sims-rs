@@ -432,9 +432,16 @@ pub struct Game {
     /// Lazily cached native ordered wardrobe (`ImportWardrobe`) matching
     /// `sims-vm` pet/human skin indices for special pickers (kinds 6, 9, 14).
     ordered_wardrobe: Option<sims_content::ImportWardrobe>,
-    /// Destination lot chosen via a VM special lot picker (`5, 7, 8, 11, 13`)
-    /// awaiting `NeighborhoodShell` travel transition (`depart_to_destination`).
+    /// Destination lot chosen via a VM special lot picker (`5, 7, 8, 11, 13`).
+    /// The pick does not travel: the script asks for the trip with Generic
+    /// Sims Call 17 ([`Game::trip_request`]), and the shell reads the picker
+    /// for how the trip goes.
     pending_travel_lot: Option<(SpecialPanelRequest, u32)>,
+    /// The trip a script asked for ([`sims_sim::World::trip_request`]) that
+    /// the host could not carry out ([`Game::decline_trip`]). The lot keeps
+    /// it, as `sims_vm` clears a request only on departure, so ticks go on
+    /// while the pending request is this one.
+    declined_trip: Option<sims_sim::TripRequest>,
     /// Neighborhood / destination lot metadata passed by `NeighborhoodShell`
     /// (populated lazily from `Install` on standalone launches).
     special_lot_catalog: Vec<SpecialLotEntry>,
@@ -1156,6 +1163,7 @@ impl Game {
             submitted_coop_special_panel: None,
             ordered_wardrobe: None,
             pending_travel_lot: None,
+            declined_trip: None,
             special_lot_catalog: Vec::new(),
             ui_animating_prev: false,
             voice_inputs: VecDeque::new(),
@@ -1548,6 +1556,7 @@ impl Game {
             submitted_coop_special_panel: None,
             ordered_wardrobe: None,
             pending_travel_lot: None,
+            declined_trip: None,
             special_lot_catalog: Vec::new(),
             ui_animating_prev: false,
             voice_inputs: VecDeque::new(),
@@ -1901,6 +1910,7 @@ impl Game {
             submitted_coop_special_panel: None,
             ordered_wardrobe: None,
             pending_travel_lot: None,
+            declined_trip: None,
             special_lot_catalog: Vec::new(),
             ui_animating_prev: false,
             voice_inputs: VecDeque::new(),
@@ -2110,6 +2120,7 @@ impl Game {
             submitted_coop_special_panel: None,
             ordered_wardrobe: None,
             pending_travel_lot: None,
+            declined_trip: None,
             special_lot_catalog: Vec::new(),
             ui_animating_prev: false,
             voice_inputs: VecDeque::new(),
@@ -2782,10 +2793,37 @@ impl Game {
         Outcome::redraw()
     }
 
-    /// Takes any destination lot chosen in a VM special lot picker (`5, 7, 8, 11, 13`)
-    /// so `NeighborhoodShell` can cleanly transition via `depart_to_destination`.
+    /// Takes any destination lot chosen in a VM special lot picker (`5, 7, 8,
+    /// 11, 13`) and the picker it was chosen in. The pick does not travel by
+    /// itself: the script asks for the trip ([`Game::trip_request`]), as the
+    /// original changes house only through 0x4fc713 (Generic Sims Call 17's
+    /// 0x45a22d, its one caller).
     pub fn take_pending_travel_lot(&mut self) -> Option<(SpecialPanelRequest, u32)> {
         self.pending_travel_lot.take()
+    }
+
+    /// The trip a script asked for with Generic Sims Call 17
+    /// ([`sims_sim::World::trip_request`]) that the host has to carry out
+    /// before the next tick, as the original's main loop does when it finds
+    /// the game's byte +0x1c +0xe1 set between ticks. `None` once the host
+    /// declined it ([`Game::decline_trip`]).
+    ///
+    /// While one is pending no tick runs: [`Game::advance`] and
+    /// [`Game::run`] stop after the tick that asked for it.
+    pub fn trip_request(&self) -> Option<&sims_sim::TripRequest> {
+        self.lot
+            .world()
+            .trip_request
+            .as_ref()
+            .filter(|&trip| self.declined_trip.as_ref() != Some(trip))
+    }
+
+    /// Lets the lot go on without carrying out the pending trip
+    /// ([`Game::trip_request`]): a lot without a neighborhood, or a trip the
+    /// host refused. The lot keeps the request, so a later request merges
+    /// into it and is a new one to carry out.
+    pub fn decline_trip(&mut self) {
+        self.declined_trip = self.lot.world().trip_request.clone();
     }
 
     /// Enables or disables `--debug` mode (which shows the maroon top
@@ -3762,6 +3800,7 @@ impl Game {
             || self.hud.has_ui_dialog()
             || self.lot.asking().is_some()
             || self.lot.asking_special_panel().is_some()
+            || self.trip_request().is_some()
         {
             self.pace.restart();
             return (0, false);
@@ -3824,7 +3863,8 @@ impl Game {
     }
 
     /// Runs up to `ticks` ticks, stopping at the first that fails or that
-    /// shows a dialog the player has to answer.
+    /// shows a dialog the player has to answer, and after a tick that asks
+    /// for a trip ([`Game::trip_request`]).
     pub fn run(&mut self, ticks: u32) -> u32 {
         let ran = self.run_while(ticks, false, |_| true).0;
         if ran > 0 {
@@ -3849,6 +3889,11 @@ impl Game {
         let mut ran = 0;
         let mut capped = false;
         while ran < ticks && self.stopped.is_none() {
+            // A trip a script asked for is carried out between ticks: the
+            // host leaves the lot before the next one.
+            if self.trip_request().is_some() {
+                break;
+            }
             if idle && self.idle_speed() {
                 break;
             }
@@ -6113,6 +6158,7 @@ impl Game {
         self.submitted_coop_special_panel = None;
         self.close_special_panel_ui();
         self.pending_travel_lot = None;
+        self.declined_trip = None;
         self.ui_animating_prev = false;
         self.hud.forget();
         self.hud.controls.mode = ui_mode(self.lot.mode());
@@ -12301,6 +12347,7 @@ impl Game {
         self.submitted_coop_special_panel = None;
         self.close_special_panel_ui();
         self.pending_travel_lot = None;
+        self.declined_trip = None;
         self.hud.clear_vm_dialog();
         self.sync_special_panel();
         self.hud.sync_character_names(self.lot.character_names());

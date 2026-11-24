@@ -1,5 +1,5 @@
-//! A family that arrives in Magic Town is placed by the middle ped marker
-//! once, and then left alone.
+//! The travelers who arrive in Magic Town are placed by the middle ped
+//! marker once, and then left alone.
 //!
 //! Magic Town's middle ped marker (GUID 0x12e84823, tree 0x100e "main -
 //! middle ped marker") has attribute 3 set by its init tree. Its main loop
@@ -108,6 +108,10 @@ fn the_middle_ped_marker_places_an_arriving_family_once() {
             .map(|f| f.members.clone())
             .expect("the Goth household")
     };
+    let jumper_guid = {
+        let world = game.lot().world();
+        world.objects[&world.selected().expect("selected Goth Sim")].guid
+    };
     place_and_queue_magic_hole(game);
     let mut picker = false;
     for _ in 0..800 {
@@ -132,7 +136,28 @@ fn the_middle_ped_marker_places_an_arriving_family_once() {
         .expect("a point on lot 93");
     let _ = shell.press(point);
     let _ = shell.release(point);
+    // The pick does not travel: the Magic Hole's script asks for the trip
+    // (Generic Sims Call 17) a tick later, and the shell leaves between
+    // ticks, as the window's loop does each frame.
+    for _ in 0..10 {
+        if shell.active_lot_house() != Some(5) {
+            break;
+        }
+        let game = shell.game_mut().expect("the Goth house");
+        assert!(game.stopped().is_none(), "lot halted: {:?}", game.stopped());
+        game.run(1);
+        shell.pump_trip_request();
+    }
     assert_eq!(shell.active_lot_house(), Some(93));
+    // The script asks for the jumper's trip (routine 17's mode 0): the
+    // jumper goes, with a companion if it holds one, not the household.
+    let trip = shell.active_trip().expect("a trip to lot 93").clone();
+    assert_eq!(trip.leader_guid, jumper_guid);
+    assert!(
+        trip.travelers.iter().all(|t| household.contains(&t.guid)),
+        "only the household travels: {:?}",
+        trip.travelers
+    );
 
     let game = shell.game_mut().expect("lot 93");
     let travelers: Vec<u16> = {
@@ -140,14 +165,14 @@ fn the_middle_ped_marker_places_an_arriving_family_once() {
         world
             .objects
             .values()
-            .filter(|o| o.person.is_some() && household.contains(&o.guid))
+            .filter(|o| o.person.is_some() && trip.travelers.iter().any(|t| t.guid == o.guid))
             .map(|o| o.id)
             .collect()
     };
     assert_eq!(
         travelers.len(),
-        household.len(),
-        "the whole household travels through the Magic Hole"
+        trip.travelers.len(),
+        "each of the trip's travelers arrives"
     );
     let marker = game
         .lot()

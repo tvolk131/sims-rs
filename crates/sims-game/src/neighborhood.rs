@@ -3583,12 +3583,9 @@ impl NeighborhoodShell {
         {
             self.show_notice("Photo Album", format!("The photo was not saved: {err}"));
         }
-        if let ActiveScreen::Lot(session) = &mut self.screen
-            && session.game.asking().is_none()
-            && session.game.asking_special_panel().is_none()
-            && let Some((request, dest_lot)) = session.game.take_pending_travel_lot()
-        {
-            self.handle_special_panel_travel(request, dest_lot);
+        // A lot pick does not travel by itself: the script that asked for
+        // the lot asks for the trip (Generic Sims Call 17) a tick later.
+        if self.pump_trip_request() {
             out.redraw = true;
             return out;
         }
@@ -7241,132 +7238,62 @@ impl NeighborhoodShell {
             .collect()
     }
 
-    /// Executes a destination travel transition requested by answering a VM
-    /// special lot picker (`Dialog` kinds `5, 7, 8, 11, 13`). Never halts or
-    /// strands: when departure is ineligible (e.g., co-op active, already away,
-    /// or missing destination snapshot), stays cleanly on the current lot and
-    /// surfaces a native notice dialog without overwriting active VM dialogs.
-    fn handle_special_panel_travel(
-        &mut self,
-        request: sims_vm::SpecialPanelRequest,
-        dest_house: u32,
-    ) {
-        let report_ineligible = |screen: &mut ActiveScreen, msg: String| {
-            if let ActiveScreen::Lot(session) = screen {
-                if !session.game.has_dialog() {
-                    session.game.show_notice("Travel", msg);
-                } else {
-                    session.game.set_note(msg);
-                }
-            }
+    /// Carries out the trip a script on the open lot asked for with Generic
+    /// Sims Call 17 ([`Game::trip_request`]), as the original's main loop
+    /// does when it finds the request between ticks: the phone's Go
+    /// Downtown, for one. The departure is [`vm_travel::depart_from_request`]:
+    /// routine 17 already wrote the travelers' tokens and the script paid
+    /// the fare. True if there was a request to carry out or refuse.
+    ///
+    /// The lot picker the script asked with recorded the same destination
+    /// ([`Game::take_pending_travel_lot`]); that record is dropped, so the
+    /// trip departs once. A trip the shell cannot make (co-op, already
+    /// away, editing a destination, or a house that is no destination)
+    /// shows a notice and is declined ([`Game::decline_trip`]), and the lot
+    /// goes on.
+    pub fn pump_trip_request(&mut self) -> bool {
+        let ActiveScreen::Lot(session) = &mut self.screen else {
+            return false;
         };
-        let Some(destination) = TravelDestination::classify(dest_house, &self.stored.zoning) else {
-            report_ineligible(
+        if session.game.asking().is_some() || session.game.asking_special_panel().is_some() {
+            return false;
+        }
+        let Some(trip) = session.game.trip_request().cloned() else {
+            return false;
+        };
+        // The lot pick the script asked with only says how the trip goes, for
+        // the loading screen.
+        let transport = session
+            .game
+            .take_pending_travel_lot()
+            .and_then(|(picker, _)| picker_transport(&picker));
+        let house = u32::try_from(trip.house).unwrap_or(0);
+        let refusal = if session.game.coop_active() {
+            Some("Leave the co-op session before traveling to a destination.".to_owned())
+        } else if session.active_trip.is_some() {
+            Some("Return home before starting another destination trip.".to_owned())
+        } else if session.is_destination_edit {
+            Some("Travel is unavailable while editing a destination lot.".to_owned())
+        } else if TravelDestination::classify(house, &self.stored.zoning).is_none() {
+            Some(format!("Lot {} is not a travel destination.", trip.house))
+        } else {
+            None
+        };
+        if let Some(msg) = refusal {
+            session.game.decline_trip();
+            report_travel_refusal(&mut self.screen, msg);
+            return true;
+        }
+        if let Err(err) = self.depart(Departure::Trip { house, transport })
+            && let ActiveScreen::Lot(session) = &mut self.screen
+        {
+            session.game.decline_trip();
+            report_travel_refusal(
                 &mut self.screen,
-                format!("Lot {dest_house} is not a travel destination."),
-            );
-            return;
-        };
-        let leader_guid = {
-            let ActiveScreen::Lot(session) = &self.screen else {
-                return;
-            };
-            if session.game.coop_active() {
-                report_ineligible(
-                    &mut self.screen,
-                    "Leave the co-op session before traveling to a destination.".into(),
-                );
-                return;
-            }
-            if session.active_trip.is_some() {
-                report_ineligible(
-                    &mut self.screen,
-                    "Return home before starting another destination trip.".into(),
-                );
-                return;
-            }
-            if session.is_destination_edit {
-                report_ineligible(
-                    &mut self.screen,
-                    "Travel is unavailable while editing a destination lot.".into(),
-                );
-                return;
-            }
-            let world = session.game.lot().world();
-            let home_family_id = self
-                .stored
-                .family_in(session.house)
-                .map(|(id, _)| id)
-                .or_else(|| {
-                    u16::try_from(world.globals.get(9).copied().unwrap_or(0))
-                        .ok()
-                        .filter(|&id| id != 0)
-                });
-            let Some(home_family_id) = home_family_id else {
-                report_ineligible(
-                    &mut self.screen,
-                    "No resident household is active on this lot for travel.".into(),
-                );
-                return;
-            };
-            let fam_members: Vec<u32> = self
-                .stored
-                .families
-                .get(&home_family_id)
-                .map(|f| f.members.clone())
-                .unwrap_or_default();
-            let selected_guid = world
-                .selected()
-                .and_then(|sel| world.objects.get(&sel))
-                .map(|o| o.guid)
-                .filter(|g| fam_members.contains(g));
-            let Some(guid) = selected_guid.or_else(|| fam_members.first().copied()) else {
-                report_ineligible(
-                    &mut self.screen,
-                    "No household member is available to travel.".into(),
-                );
-                return;
-            };
-            guid
-        };
-        let party = match destination {
-            TravelDestination::VacationIsland
-            | TravelDestination::OldTown
-            | TravelDestination::MagicTown => vm_travel::TravelParty::WholeFamily { leader_guid },
-            TravelDestination::Downtown | TravelDestination::StudioTown => {
-                vm_travel::TravelParty::Single {
-                    sim_guid: leader_guid,
-                }
-            }
-        };
-        let transport = match request {
-            sims_vm::SpecialPanelRequest::MagicTownLotPicker { via_blimp: false } => {
-                Some(vm_travel::TravelTransport::MagicHole)
-            }
-            sims_vm::SpecialPanelRequest::MagicTownLotPicker { via_blimp: true } => {
-                Some(vm_travel::TravelTransport::MagicBlimp)
-            }
-            sims_vm::SpecialPanelRequest::StudioTownLotPicker { star_limo: true } => {
-                Some(vm_travel::TravelTransport::StudioLimo)
-            }
-            _ => None,
-        };
-        let travel_req = TravelRequest {
-            destination_house: dest_house,
-            party,
-            transport,
-            accommodation: vm_travel::VacationAccommodation::None,
-            fare_override: None,
-            answers: self.answers.clone(),
-            frames: self.frames.clone(),
-            view_centre: None,
-        };
-        if let Err(err) = self.depart_to_destination(travel_req) {
-            report_ineligible(
-                &mut self.screen,
-                format!("Could not travel to lot {dest_house}: {err}"),
+                format!("Could not travel to lot {house}: {err}"),
             );
         }
+        true
     }
 
     /// Departs from the currently open home lot to a travel destination via
@@ -7376,6 +7303,17 @@ impl NeighborhoodShell {
         &mut self,
         request: TravelRequest,
     ) -> Result<TravelSession, String> {
+        self.depart(Departure::Request(request))
+    }
+
+    /// Departs from the open home lot ([`Departure`]), driving
+    /// [`LoadingScreen`] audio cues and wrapping the booted destination lot
+    /// into the active session.
+    fn depart(&mut self, source: Departure) -> Result<TravelSession, String> {
+        let (destination_house, transport) = match &source {
+            Departure::Request(request) => (request.destination_house, request.transport),
+            Departure::Trip { house, transport } => (*house, *transport),
+        };
         self.note = None;
         self.flush_background_saves();
         let nh_id = match &self.screen {
@@ -7393,15 +7331,15 @@ impl NeighborhoodShell {
         // Pre-validate snapshot availability BEFORE committing `TRVL` to REDB.
         let _ = self
             .store
-            .load_lot_snapshot(&nh_id, request.destination_house)
+            .load_lot_snapshot(&nh_id, destination_house)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("neighborhood {nh_id:?} not found before departure"))?;
 
         self.start_load_audio();
-        let load_kind = loading_kind_for_travel(request.destination_house, request.transport);
+        let load_kind = loading_kind_for_travel(destination_house, transport);
         self.present_loading_step(
             load_kind,
-            Some(format!("Destination Lot {}", request.destination_house)),
+            Some(format!("Destination Lot {destination_house}")),
             0.2,
         );
         let departure = {
@@ -7410,13 +7348,22 @@ impl NeighborhoodShell {
                 self.stop_load_audio(fallback);
                 return Err("no home lot is open for travel departure".into());
             };
-            match vm_travel::depart_to_destination(
-                &self.install_root,
-                &self.store,
-                &nh_id,
-                session.game.lot_mut(),
-                &request,
-            ) {
+            let departed = match &source {
+                Departure::Request(request) => vm_travel::depart_to_destination(
+                    &self.install_root,
+                    &self.store,
+                    &nh_id,
+                    session.game.lot_mut(),
+                    request,
+                ),
+                Departure::Trip { .. } => vm_travel::depart_from_request(
+                    &self.install_root,
+                    &self.store,
+                    &nh_id,
+                    session.game.lot_mut(),
+                ),
+            };
+            match departed {
                 Ok(dep) => dep,
                 Err(err) => {
                     let fallback = self.desired_music_mode();
@@ -7426,7 +7373,7 @@ impl NeighborhoodShell {
             }
         };
         self.present_loading_step(
-            loading_kind_for_travel(departure.session.destination_house, request.transport),
+            loading_kind_for_travel(departure.session.destination_house, transport),
             Some(format!(
                 "Destination Lot {}",
                 departure.session.destination_house
@@ -8112,6 +8059,52 @@ impl NeighborhoodShell {
                 ShellOutcome::redraw()
             }
             CoopCommand::SetHostOnlyTimeControl(_) => ShellOutcome::redraw(),
+        }
+    }
+}
+
+/// What a departure from the home lot carries out
+/// ([`NeighborhoodShell::depart_to_destination`],
+/// [`NeighborhoodShell::pump_trip_request`]).
+enum Departure {
+    /// A trip the shell plans: it writes the travelers' tokens and charges
+    /// the fare ([`vm_travel::depart_to_destination`]).
+    Request(TravelRequest),
+    /// The trip a script asked for with Generic Sims Call 17, to `house`,
+    /// whose tokens and fare the script already took care of
+    /// ([`vm_travel::depart_from_request`]). `transport` is the way the lot
+    /// picker showed, which only picks the loading screen.
+    Trip {
+        house: u32,
+        transport: Option<vm_travel::TravelTransport>,
+    },
+}
+
+/// How the lot picker a travel script asked with goes: the Magic Hole or
+/// the blimp to Magic Town, or the star limo to Studio Town.
+fn picker_transport(picker: &sims_vm::SpecialPanelRequest) -> Option<vm_travel::TravelTransport> {
+    match picker {
+        sims_vm::SpecialPanelRequest::MagicTownLotPicker { via_blimp: false } => {
+            Some(vm_travel::TravelTransport::MagicHole)
+        }
+        sims_vm::SpecialPanelRequest::MagicTownLotPicker { via_blimp: true } => {
+            Some(vm_travel::TravelTransport::MagicBlimp)
+        }
+        sims_vm::SpecialPanelRequest::StudioTownLotPicker { star_limo: true } => {
+            Some(vm_travel::TravelTransport::StudioLimo)
+        }
+        _ => None,
+    }
+}
+
+/// Tells the player why a trip did not depart: a notice, or the note when
+/// a dialog is already up, so it never covers the lot's own dialog.
+fn report_travel_refusal(screen: &mut ActiveScreen, msg: String) {
+    if let ActiveScreen::Lot(session) = screen {
+        if !session.game.has_dialog() {
+            session.game.show_notice("Travel", msg);
+        } else {
+            session.game.set_note(msg);
         }
     }
 }

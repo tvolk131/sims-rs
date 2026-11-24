@@ -1,0 +1,330 @@
+//! Going Downtown from the phone, through the game's own loop.
+//!
+//! A Sim picks the phone's Go Downtown (the phone's Call Plugin, tree
+//! 0x2075). The plugin pays the fare, shows its dialogs, asks for a lot on
+//! the graphical Downtown map, and runs Generic Sims Call 17, which writes
+//! the traveler's saved state and asks for the trip
+//! (`World::trip_request`). The original's main loop finds the request
+//! between ticks and leaves the house; here [`Game`] stops ticking and
+//! [`NeighborhoodShell::pump_trip_request`] departs with
+//! `travel::depart_from_request`. The trip must depart once: no second fare
+//! and no second set of saved-state tokens, which the shell's own departure
+//! for the lot pick (`depart_to_destination`) would add.
+//!
+//! Needs an install (`SIMS_INSTALL`); skipped otherwise.
+
+use sims_formats::saved_objects::Interaction;
+use sims_game::game::goth_house;
+use sims_game::neighborhood::NeighborhoodShell;
+use sims_game::{Frames, Game, Options};
+use sims_sim::neighbors::Item;
+use sims_vm::SpecialPanelResponse;
+use std::path::PathBuf;
+
+const HOME: u32 = 5;
+const DOWNTOWN_LOT: u16 = 21;
+/// The phone's Call Plugin, which dispatches to the plugin the entry names.
+const CALL_PLUGIN: u16 = 0x2075;
+/// The token kind of a traveler's saved state.
+const SAVED_STATE_TOKEN: i32 = 2;
+/// Frames the call may take: the cab comes, the dialogs, the lot picker.
+const CALL_FRAMES: u32 = 5000;
+/// Frames a phone may take to start the call before the next is tried.
+const PHONE_FRAMES: u32 = 1500;
+const SIZE: [i32; 2] = [1024, 768];
+
+struct TempDir(PathBuf);
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn install_root() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
+    dir.is_dir().then_some(dir)
+}
+
+/// The saved-state tokens in the inventory of the neighbor `guid` is.
+fn saved_state(game: &Game, guid: u32) -> Vec<Item> {
+    let world = game.lot().world();
+    let Some(record) = world.neighbors.first_of(guid) else {
+        return Vec::new();
+    };
+    world
+        .neighbors
+        .inventories
+        .iter()
+        .filter(|i| i.neighbor == record.id)
+        .flat_map(|i| i.items.iter().cloned())
+        .filter(|t| t.kind == SAVED_STATE_TOKEN)
+        .collect()
+}
+
+/// The objects (in id order) whose pie menu offers `person` Go Downtown
+/// through the phone's Call Plugin, with that entry's action.
+fn go_downtown(game: &mut Game, person: u16) -> Vec<(u16, Interaction)> {
+    let objects: Vec<u16> = game.lot().world().objects.keys().copied().collect();
+    let mut offers = Vec::new();
+    for object in objects {
+        let Ok(menu) = game.lot_mut().pie_menu(person, object) else {
+            continue;
+        };
+        if let Some(entry) = menu.entries.iter().find(|e| {
+            e.action.action == CALL_PLUGIN
+                && e.name.as_deref().is_some_and(|n| n.contains("Downtown"))
+        }) {
+            offers.push((object, entry.action.clone()));
+        }
+    }
+    offers
+}
+
+/// Answers the dialog the lot waits on with its first button by mouse,
+/// through the button's release latch (`cTSWinBtn`, 0x5e4563..0x5e4601). A
+/// button made by 0x5e3844 fires on release (+0xf4 is 0), and only while the
+/// pointer is over it (+0x169, kept by the move handler at 0x5e4644): then
+/// it is published as the button released (0x6fe9a4) and fires
+/// (0x5e45e1..0x5e45f3). A press alone does nothing, and a press dragged off
+/// the button is let go.
+fn answer_by_mouse(game: &mut Game) {
+    game.render();
+    let layout = game.dialog().expect("the call's dialog is drawn").clone();
+    let button = layout.buttons[0];
+    let inside = [button.x + button.width / 2, button.y + button.height / 2];
+    let outside = [2, 2];
+    assert!(!button.contains(outside[0], outside[1]));
+    let tick = game.lot().ticks();
+
+    let _ = game.press(inside);
+    let _ = game.hover(outside);
+    let _ = game.release(outside);
+    assert!(
+        game.asking().is_some(),
+        "a press dragged off the button answered"
+    );
+    assert_eq!(game.lot().ticks(), tick);
+
+    let _ = game.press(inside);
+    assert!(
+        game.asking().is_some(),
+        "the press answered before the release"
+    );
+    let _ = game.release(inside);
+    assert!(
+        game.lot().ticks() > tick,
+        "the release did not answer: the tick that asked never ran"
+    );
+}
+
+/// Picks Go Downtown for `caller` on each phone in turn until one asks the
+/// call's questions (the Sim cannot route to every phone in the house), and
+/// answers each dialog with its first button until the Downtown map is up.
+fn call_downtown(game: &mut Game, caller: u16) {
+    let offers = go_downtown(game, caller);
+    assert!(!offers.is_empty(), "no phone offers Go Downtown");
+    let mut dialogs = 0;
+    for (_phone, action) in offers {
+        game.lot_mut()
+            .pick(caller, action)
+            .expect("pick Go Downtown");
+        for frame in 0..CALL_FRAMES {
+            if dialogs == 0 && frame == PHONE_FRAMES {
+                break;
+            }
+            game.run(1);
+            assert!(game.stopped().is_none(), "lot halted: {:?}", game.stopped());
+            if let Some(asking) = game.asking() {
+                let object = asking.shown.object;
+                if dialogs == 0 {
+                    answer_by_mouse(game);
+                } else {
+                    game.answer(object, 0);
+                }
+                dialogs += 1;
+                continue;
+            }
+            if game.asking_special_panel().is_some() {
+                assert_eq!(dialogs, 2, "the call asks twice before the map");
+                return;
+            }
+        }
+        assert_eq!(dialogs, 0, "the call stopped between its dialogs");
+    }
+    panic!("the call never asked for a lot");
+}
+
+/// The household head's object on the lot.
+fn head(game: &Game, guid: u32) -> u16 {
+    let world = game.lot().world();
+    world
+        .people
+        .iter()
+        .copied()
+        .find(|id| world.objects[id].guid == guid)
+        .expect("the head is on the lot")
+}
+
+#[test]
+fn the_phones_go_downtown_leaves_the_lot_once_through_the_shell() {
+    let Some(root) = install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to run the phone Go Downtown test");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("sims-game-phone-downtown-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let _dir = TempDir(dir.clone());
+    let mut shell = NeighborhoodShell::open(
+        root,
+        dir.join("saves.redb"),
+        1,
+        true,
+        vec![3],
+        Frames::default(),
+    )
+    .expect("open the neighborhood");
+    shell.resize(SIZE);
+    shell.enter_lot(HOME).expect("enter the house");
+
+    // The household's head, who can reach a phone in the house.
+    let leader_guid = shell
+        .stored_neighborhood()
+        .family_in(HOME)
+        .expect("a family lives in the house")
+        .1
+        .members[0];
+    let game = shell.game_mut().expect("the house");
+    assert_eq!(game.run(5), 5);
+    let caller = head(game, leader_guid);
+    let funds_before = game.lot().world().budget.funds;
+    call_downtown(game, caller);
+    shell.render();
+    assert!(shell.destination_picker_open());
+
+    // Click lot 21 on the map. The tick the pick answers runs again at once,
+    // and the shell carries out whatever trip it asks for.
+    let point = shell
+        .game()
+        .expect("the house")
+        .destination_picker()
+        .expect("the Downtown map")
+        .hit_point_for_lot(SIZE, DOWNTOWN_LOT)
+        .expect("lot 21 on the map");
+    let _ = shell.hover(point);
+    let _ = shell.press(point);
+    let _ = shell.release(point);
+
+    // As the window does each frame: run what is owed, then let the shell
+    // carry out a trip the lot asked for.
+    let mut frames = 0;
+    let mut asked = false;
+    while shell.active_lot_house() == Some(HOME) {
+        frames += 1;
+        assert!(frames < CALL_FRAMES, "the trip never departed");
+        let game = shell.game_mut().expect("the house");
+        assert!(game.stopped().is_none(), "lot halted: {:?}", game.stopped());
+        if let Some(asking) = game.asking() {
+            let object = asking.shown.object;
+            game.answer(object, 0);
+        } else {
+            game.run(1);
+        }
+        if game.trip_request().is_some() {
+            // A pending trip stops the ticks until it is carried out.
+            assert_eq!(game.run(1), 0, "a tick ran with a trip pending");
+            assert_eq!(game.advance(1_000_000), 0, "time ran with a trip pending");
+            asked = true;
+        }
+        shell.pump_trip_request();
+    }
+    assert!(asked, "the trip departed without the script asking for it");
+    assert_eq!(shell.active_lot_house(), Some(u32::from(DOWNTOWN_LOT)));
+
+    let trip = shell.active_trip().expect("an active trip").clone();
+    assert_eq!(trip.leader_guid, leader_guid);
+    assert_eq!(
+        trip.travelers.len(),
+        1,
+        "Go Downtown takes the caller alone"
+    );
+    assert_eq!(trip.fare_paid, 0, "the plugin already paid the fare");
+    assert!(
+        trip.funds_at_arrival < funds_before,
+        "the plugin's fare was paid once: {} from {funds_before}",
+        trip.funds_at_arrival
+    );
+
+    let game = shell.game_mut().expect("the Downtown lot");
+    assert!(game.trip_request().is_none(), "the request was carried out");
+    assert!(
+        game.take_pending_travel_lot().is_none(),
+        "the lot pick departs once"
+    );
+    // Routine 17 wrote one token for each value it saves; a second
+    // departure would write them again.
+    let tokens = saved_state(game, leader_guid);
+    assert!(!tokens.is_empty(), "the saved state traveled");
+    let mut guids: Vec<u32> = tokens.iter().map(|t| t.guid).collect();
+    guids.sort_unstable();
+    let before = guids.len();
+    guids.dedup();
+    assert_eq!(guids.len(), before, "a token was written twice: {tokens:?}");
+    // The Downtown lot plays on.
+    assert_eq!(game.run(10), 10);
+}
+
+/// A house opened without its neighborhood cannot travel: the host declines
+/// the trip ([`Game::decline_trip`]) and the lot plays on.
+#[test]
+fn a_declined_trip_lets_the_lot_play_on() {
+    let Some(root) = install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to run the phone Go Downtown test");
+        return;
+    };
+    let mut game = Game::open(&Options {
+        house: goth_house(&root),
+        install: root,
+        answers: vec![3],
+        play: true,
+        frames: Frames::default(),
+    })
+    .expect("open the house");
+    game.resize(SIZE);
+    assert_eq!(game.run(5), 5);
+    let leader_guid = {
+        let world = game.lot().world();
+        let family = i32::from(world.globals[9]);
+        world
+            .families
+            .iter()
+            .find(|f| f.id == family)
+            .map(|f| f.members[0])
+            .expect("the household")
+    };
+    let caller = head(&game, leader_guid);
+    call_downtown(&mut game, caller);
+    game.render();
+    assert!(game.answer_special_panel(SpecialPanelResponse::Lot(Some(DOWNTOWN_LOT as i16))));
+    for _ in 0..10 {
+        if game.trip_request().is_some() {
+            break;
+        }
+        assert_eq!(game.run(1), 1);
+    }
+    let trip = game
+        .trip_request()
+        .expect("the script asked for the trip")
+        .clone();
+    assert_eq!(i32::from(trip.house), i32::from(DOWNTOWN_LOT));
+    assert_eq!(trip.leader_guid, leader_guid);
+    assert_eq!(game.run(1), 0, "a tick ran with a trip pending");
+
+    game.decline_trip();
+    assert!(game.trip_request().is_none());
+    assert_eq!(game.run(30), 30, "the lot plays on");
+    assert!(
+        game.trip_request().is_none(),
+        "the declined trip stays declined"
+    );
+}
