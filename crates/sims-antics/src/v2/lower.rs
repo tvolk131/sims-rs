@@ -22,6 +22,7 @@ use crate::v2::ast::{
 };
 use crate::v2::loader::{ModuleScope, ResolvedModule};
 use crate::v2::parser::snake_case_ident;
+use crate::v2::specialize;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -4850,6 +4851,9 @@ impl<'a> TreeLowerer<'a> {
     }
 
     fn lower_stmt(&mut self, stmt: &V2Stmt) -> Result<()> {
+        if let Some(split) = self.split_inline_specialization(stmt)? {
+            return self.lower_stmt(&split);
+        }
         match stmt {
             V2Stmt::Let {
                 span,
@@ -7190,6 +7194,74 @@ impl<'a> TreeLowerer<'a> {
             },
         );
         Ok(())
+    }
+
+    /// A builtin call statement with a `match` / `if` operand whose arms are compile-time
+    /// operands, as one statement per arm (see [`specialize::split_inline_operand`]): each copy
+    /// passes its own constant, which an operand that must be compile-time requires. User
+    /// functions and trees take their arguments as values, so their calls are left alone.
+    fn split_inline_specialization(&self, stmt: &V2Stmt) -> Result<Option<V2Stmt>> {
+        match stmt {
+            V2Stmt::Expr { span, expr } => {
+                let (call, tried) = match expr {
+                    V2Expr::Try { inner, .. } => (inner.as_ref(), true),
+                    other => (other, false),
+                };
+                let V2Expr::Call {
+                    span: cspan,
+                    callee,
+                    type_args,
+                    args,
+                } = call
+                else {
+                    return Ok(None);
+                };
+                if !matches!(callee.as_ref(), V2Expr::Ident(..))
+                    || self.user_callable_named(callee, *cspan)?
+                {
+                    return Ok(None);
+                }
+                let rebuild = |args: Vec<CallArg>| {
+                    let call = V2Expr::Call {
+                        span: *cspan,
+                        callee: callee.clone(),
+                        type_args: type_args.clone(),
+                        args,
+                    };
+                    V2Stmt::Expr {
+                        span: *span,
+                        expr: if tried {
+                            V2Expr::Try {
+                                span: expr.span(),
+                                inner: Box::new(call),
+                            }
+                        } else {
+                            call
+                        },
+                    }
+                };
+                Ok(specialize::split_inline_operand(*span, args, &rebuild))
+            }
+            V2Stmt::Animate {
+                span,
+                args,
+                event,
+                body,
+            } => {
+                let callee = V2Expr::Ident(*span, "animate".to_owned());
+                if self.user_callable_named(&callee, *span)? {
+                    return Ok(None);
+                }
+                let rebuild = |args: Vec<CallArg>| V2Stmt::Animate {
+                    span: *span,
+                    args,
+                    event: event.clone(),
+                    body: body.clone(),
+                };
+                Ok(specialize::split_inline_operand(*span, args, &rebuild))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn lower_expr_stmt(&mut self, expr: &V2Expr) -> Result<()> {

@@ -15,6 +15,7 @@ use crate::v2::ast::{
     V2Expr, V2File, V2Item, V2Stmt, V2Type, V2UnaryOp, VariantDecl,
 };
 use crate::v2::lexer::{Token, TokenKind, tokenize};
+use crate::v2::specialize::{self, Arm, BlockItem, ConstBinding, Selector};
 use std::collections::BTreeSet;
 
 const MAX_NESTING_DEPTH: usize = 64;
@@ -2497,21 +2498,224 @@ impl Parser {
     fn parse_block(&mut self) -> Result<Vec<V2Stmt>> {
         let span = self.expect(&TokenKind::LBrace, "'{'")?;
         self.enter_nesting(span)?;
-        let mut stmts = Vec::new();
+        let mut items = Vec::new();
+        let mut binds = false;
         let res = loop {
             if self.eat(&TokenKind::RBrace) {
-                break Ok(stmts);
+                break Ok(());
             }
             if self.peek().kind == TokenKind::Eof {
                 break Err(Error::at(span, "unterminated '{ ... }' block"));
             }
+            if self.at_const_binding() {
+                binds = true;
+                match self.parse_const_binding() {
+                    Ok(b) => items.push(BlockItem::Bind(b)),
+                    Err(e) => break Err(e),
+                }
+                continue;
+            }
             match self.parse_stmt() {
-                Ok(s) => stmts.push(s),
+                Ok(s) => items.push(BlockItem::Stmt(s)),
                 Err(e) => break Err(e),
             }
         };
         self.leave_nesting();
+        res?;
+        if !binds {
+            return Ok(items
+                .into_iter()
+                .map(|i| match i {
+                    BlockItem::Stmt(s) => s,
+                    BlockItem::Bind(_) => unreachable!("no bindings"),
+                })
+                .collect());
+        }
+        specialize::expand_block(items)
+    }
+
+    /// `const NAME = ..` or `const (A, B) = ..` inside a block.
+    fn at_const_binding(&self) -> bool {
+        self.is_ident("const")
+            && matches!(
+                (&self.peek_at(1).kind, &self.peek_at(2).kind),
+                (TokenKind::Ident(_), TokenKind::Assign) | (TokenKind::LParen, _)
+            )
+    }
+
+    /// `const NAME = <selector>;` / `const (A, B) = <selector>;`, where the selector is a
+    /// `match` or an `if` chain whose arms yield compile-time operands or leave the block (see
+    /// [`specialize`]).
+    fn parse_const_binding(&mut self) -> Result<ConstBinding> {
+        let span = self.bump().span; // 'const'
+        let (names, tuple) = if self.eat(&TokenKind::LParen) {
+            let mut names = Vec::new();
+            loop {
+                let (n, s) = self.expect_ident("bound name")?;
+                names.push((s, n));
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+                if self.peek().kind == TokenKind::RParen {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RParen, "')'")?;
+            if names.len() < 2 {
+                return Err(Error::at(
+                    span,
+                    "a tuple const binding names at least two values",
+                ));
+            }
+            (names, true)
+        } else {
+            let (n, s) = self.expect_ident("bound name")?;
+            (vec![(s, n)], false)
+        };
+        self.expect(&TokenKind::Assign, "'='")?;
+        let sel_span = self.span();
+        let selector = if self.eat_ident("match") {
+            self.parse_binding_match(sel_span)?
+        } else if self.eat_ident("if") {
+            self.parse_binding_if(sel_span)?
+        } else {
+            return Err(Error::at(
+                sel_span,
+                "a const binding inside a block chooses its value with 'match' or 'if' (a plain constant belongs at object or file scope)",
+            ));
+        };
+        self.expect(&TokenKind::Semicolon, "';'")?;
+        Ok(ConstBinding {
+            span,
+            names,
+            tuple,
+            selector,
+        })
+    }
+
+    fn parse_binding_match(&mut self, span: Span) -> Result<Selector> {
+        self.enter_nesting(span)?;
+        let res = (|| {
+            let scrutinee = self.parse_expr()?;
+            let open_span = self.expect(&TokenKind::LBrace, "'{'")?;
+            let mut arms = Vec::new();
+            loop {
+                if self.eat(&TokenKind::RBrace) {
+                    break;
+                }
+                if self.peek().kind == TokenKind::Eof {
+                    return Err(Error::at(open_span, "unterminated 'match { ... }' block"));
+                }
+                let arm_span = self.span();
+                let pattern = self.parse_match_pattern()?;
+                self.expect(&TokenKind::FatArrow, "'=>'")?;
+                let arm = self.parse_binding_arm(true)?;
+                arms.push((arm_span, pattern, arm));
+                if !self.eat(&TokenKind::Comma) {
+                    self.expect(&TokenKind::RBrace, "',' or '}'")?;
+                    break;
+                }
+            }
+            if arms.is_empty() {
+                return Err(Error::at(span, "'match' must have at least one arm"));
+            }
+            Ok(Selector::Match {
+                span,
+                scrutinee,
+                arms,
+            })
+        })();
+        self.leave_nesting();
         res
+    }
+
+    fn parse_binding_if(&mut self, span: Span) -> Result<Selector> {
+        self.enter_nesting(span)?;
+        let res = (|| {
+            let mut arms = Vec::new();
+            let mut arm_span = span;
+            loop {
+                let cond = self.parse_expr()?;
+                let arm = self.parse_binding_arm(false)?;
+                arms.push((arm_span, cond, arm));
+                if !self.eat_ident("else") {
+                    return Err(Error::at(
+                        span,
+                        "a const binding 'if' needs an 'else' (every path binds the names or leaves the block)",
+                    ));
+                }
+                if self.is_ident("if") {
+                    arm_span = self.bump().span;
+                    continue;
+                }
+                let else_arm = self.parse_binding_arm(false)?;
+                return Ok(Selector::If {
+                    arms,
+                    else_arm: Box::new(else_arm),
+                });
+            }
+        })();
+        self.leave_nesting();
+        res
+    }
+
+    /// One arm of a binding: a value or tuple (`v`, `(a, b)`; braced as `{ v }` in an `if`),
+    /// `break` / `continue` / `return ..` (in a `match`), or a block that leaves (`{ ..; return
+    /// false; }`).
+    fn parse_binding_arm(&mut self, in_match: bool) -> Result<Arm> {
+        let span = self.span();
+        if self.peek().kind == TokenKind::LBrace {
+            // `{ value }` or a block of statements.
+            let (saved_pos, saved_depth) = (self.pos, self.depth);
+            self.bump();
+            let starts_stmt = matches!(
+                &self.peek().kind,
+                TokenKind::Ident(k) if matches!(k.as_str(), "break" | "continue" | "return" | "let" | "if" | "match" | "while" | "loop" | "for" | "repeat" | "with" | "defer" | "animate")
+            ) || matches!(self.peek().kind, TokenKind::RawBlock(_));
+            if !starts_stmt
+                && let Ok(value) = self.parse_expr()
+                && self.eat(&TokenKind::RBrace)
+            {
+                return Ok(values_arm(span, value));
+            }
+            self.pos = saved_pos;
+            self.depth = saved_depth;
+            return Ok(Arm::Diverge(self.parse_block()?));
+        }
+        if !in_match {
+            return Err(Error::at(span, "expected '{' after the condition"));
+        }
+        if self.is_ident("break") || self.is_ident("continue") || self.is_ident("return") {
+            let kw_span = self.span();
+            let stmt = if self.eat_ident("break") {
+                V2Stmt::Break { span: kw_span }
+            } else if self.eat_ident("continue") {
+                V2Stmt::Continue { span: kw_span }
+            } else {
+                self.bump(); // 'return'
+                if matches!(self.peek().kind, TokenKind::Comma | TokenKind::RBrace) {
+                    V2Stmt::Return {
+                        span: kw_span,
+                        value: None,
+                    }
+                } else if self.is_ident("error")
+                    && matches!(self.peek_at(1).kind, TokenKind::Comma | TokenKind::RBrace)
+                {
+                    self.bump();
+                    V2Stmt::ReturnError {
+                        span: kw_span,
+                        from_try: false,
+                    }
+                } else {
+                    V2Stmt::Return {
+                        span: kw_span,
+                        value: Some(self.parse_expr()?),
+                    }
+                }
+            };
+            return Ok(Arm::Diverge(vec![stmt]));
+        }
+        Ok(values_arm(span, self.parse_expr()?))
     }
 
     fn parse_stmt(&mut self) -> Result<V2Stmt> {
@@ -2520,6 +2724,12 @@ impl Parser {
             let code = code.clone();
             self.bump();
             return Ok(V2Stmt::RawAir { span, code });
+        }
+        if self.at_const_binding() {
+            return Err(Error::at(
+                span,
+                "a const binding must be a statement of a '{ ... }' block (its region is the statements after it)",
+            ));
         }
         if let TokenKind::Ident(kw) = &self.peek().kind {
             match kw.as_str() {
@@ -3885,5 +4095,13 @@ pub(crate) fn parse_sound_preset(name: &str, span: Span) -> Result<SoundPreset> 
         "shower_spray" => Ok(SoundPreset::ShowerSpray),
         "wrench_clank" => Ok(SoundPreset::WrenchClank),
         other => Err(Error::at(span, format!("unknown sound preset '{other}'"))),
+    }
+}
+
+/// A binding arm's value: a tuple yields one operand per name.
+fn values_arm(span: Span, value: V2Expr) -> Arm {
+    match value {
+        V2Expr::Tuple(_, items) => Arm::Values(span, items),
+        v => Arm::Values(span, vec![v]),
     }
 }

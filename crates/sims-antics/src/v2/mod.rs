@@ -20,6 +20,7 @@ pub mod loader;
 pub mod lower;
 mod opt;
 pub mod parser;
+mod specialize;
 
 pub use decompile::{
     DecompileV2Options, DecompileV2Report, DecompiledTree, TreeCheck, TreeStyle,
