@@ -413,8 +413,9 @@ impl Reach {
 
 /// `root` and every tree a run of it may enter. `ids` is every tree either side
 /// defines; `a` and `b` are the ones that lift. Every instruction counts, reachable or
-/// not (inline call arguments included): a call enters its callee, and a primitive or
-/// a call to a tree outside `ids` may enter every tree in `ids`.
+/// not (inline call arguments included): a call enters its callee, and a primitive, a
+/// call to a tree outside `ids` or a store to the selected Sim ([`writes_selected_sim`])
+/// may enter every tree in `ids`.
 #[must_use]
 pub fn tree_reach(
     root: u16,
@@ -431,7 +432,9 @@ pub fn tree_reach(
         for bhav in [a.get(&id), b.get(&id)].into_iter().flatten() {
             for ins in &bhav.instructions {
                 match ins.opcode {
-                    2 => reach.reads_constants |= ins.operands[6] == 26 || ins.operands[7] == 26,
+                    2 if !writes_selected_sim(&ins.operands) => {
+                        reach.reads_constants |= ins.operands[6] == 26 || ins.operands[7] == 26;
+                    }
                     callee if callee >= 256 && ids.contains(&callee) => work.push(callee),
                     _ => {
                         if !reach.opaque {
@@ -444,6 +447,15 @@ pub fn tree_reach(
         }
     }
     reach
+}
+
+/// Whether an `Expression` with these operands stores to global 3, the selected Sim.
+/// In co-op that store selects the Sim, which can run object callbacks (the selection
+/// indicator's placement, `memory.rs:846`), so it runs trees like a primitive does.
+/// Comparisons and the flag test only read (`expression.rs`).
+fn writes_selected_sim(ops: &[u8; 8]) -> bool {
+    let (op, lhs_scope, lhs) = (ops[5], ops[6], i16::from_le_bytes([ops[0], ops[1]]));
+    lhs_scope == 6 && lhs == 3 && !matches!(op, 0 | 1 | 2 | 8 | 14 | 15 | 16)
 }
 
 /// Whether two trees are the same bytes where the VM reads them: header words and

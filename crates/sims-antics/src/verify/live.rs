@@ -165,6 +165,19 @@ pub struct LiveOptions {
     /// that reads it (`found_action.rs:102`, `idle.rs:187`). Two trees that return the
     /// same value from differently-worded final tests differ here.
     pub observe_last_result: bool,
+    /// Compare under the behavioral relation (`verify-equiv --behavioral`,
+    /// `docs/decisions/20261123-verifier-behavioral-mode.md`): node numbers and frame
+    /// storage are not observed. Primitives, calls, reads and writes of untracked
+    /// memory, exits, tracked cells, and whether and how a path faults still are. Implies
+    /// that frame residue is not observed.
+    pub behavioral: bool,
+}
+
+impl LiveOptions {
+    /// Whether final parameters and locals are compared.
+    fn observes_residue(&self) -> bool {
+        self.observe_frame_residue && !self.behavioral
+    }
 }
 
 impl Default for LiveOptions {
@@ -176,6 +189,7 @@ impl Default for LiveOptions {
             observe_scratch_pointer: true,
             observe_frame_residue: true,
             observe_last_result: true,
+            behavioral: false,
         }
     }
 }
@@ -219,6 +233,10 @@ enum SymKey {
     FrameMaybe(u32, u8, i16, Val),
     /// An arithmetic `Expression` operator applied to two values.
     Op(u8, Val, Val),
+    /// Equivalence class `k` of the product state that cut `prefix` starts
+    /// ([`PrefixNode::Cut`]): a frame slot or tracked cell both runs hold some value in,
+    /// the same value wherever the class is the same.
+    CutClass(u32, u16),
 }
 
 impl SymKey {
@@ -284,16 +302,26 @@ enum EventKind {
 /// A frame slot a primitive reads or writes, with what the checker knows about it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum FrameVal {
-    /// A read of `param`/`local` `idx`: its value (`None` when out of the frame), and
-    /// whether it is a local the tree may not have written yet.
-    Read(u8, i16, Option<Val>, bool),
-    /// A destination `param`/`local` `idx` and whether it is inside the frame.
-    Dst(u8, i16, bool),
+    /// A read of `param`/`local` `idx`: its value, or where it falls outside the frame
+    /// ([`Outside`]), and whether it is a local the tree may not have written yet.
+    Read(u8, i16, Result<Val, Outside>, bool),
+    /// A destination `param`/`local` `idx`: inside the frame, or where outside it.
+    Dst(u8, i16, Result<(), Outside>),
     /// Every local, and which may be unwritten (text formatting `$Local` tokens).
     AllLocals(Vec<Val>, Vec<bool>),
     /// Every parameter and local, and which locals may be unwritten (unmodeled primitive).
     WholeFrame(Vec<Val>, Vec<Val>, Vec<bool>),
 }
+
+/// How far past the end of its scope a frame operand falls (`idx - count`; negative for
+/// an index below zero).
+///
+/// Primitives check frame bounds themselves and fail differently one slot past the end
+/// than further out (Push Interaction, `push.rs`). Strict mode already observes the frame
+/// size through `caller_frame`; the behavioral relation does not, so a primitive's frame
+/// operand keeps this instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Outside(i32);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct LiveEvent {
@@ -314,6 +342,10 @@ enum PrefixNode {
     Branch(u32, bool),
     /// Names the atom "the event at this prefix faulted".
     Fault(u32),
+    /// The start of a segment of the cut-point bisimulation ([`bisimulate`]): whatever
+    /// equal history both runs had when they reached that product state. Unique per
+    /// product state.
+    Cut(u32),
 }
 
 /// Shared by both trees so identical keys get identical ids.
@@ -322,6 +354,8 @@ struct Interner {
     sym_keys: Vec<SymKey>,
     prefixes: BTreeMap<PrefixNode, u32>,
     prefix_nodes: Vec<PrefixNode>,
+    /// Cut roots handed out so far ([`Interner::fresh_cut`]).
+    cuts: u32,
 }
 
 impl Interner {
@@ -333,7 +367,14 @@ impl Interner {
             sym_keys: Vec::new(),
             prefixes,
             prefix_nodes: vec![PrefixNode::Root],
+            cuts: 0,
         }
+    }
+
+    /// A new segment root, distinct from every prefix handed out before.
+    fn fresh_cut(&mut self) -> u32 {
+        self.cuts += 1;
+        self.prefix(PrefixNode::Cut(self.cuts))
     }
 
     fn sym(&mut self, key: SymKey) -> Val {
@@ -380,18 +421,19 @@ impl Interner {
         id
     }
 
-    /// The events (with branch outcomes) leading to `prefix`, oldest first.
+    /// The events (with branch outcomes) leading to `prefix`, oldest first, back to the
+    /// entry or to the cut the segment started at.
     fn history(&self, mut prefix: u32) -> Vec<&PrefixNode> {
         let mut out = Vec::new();
         while prefix != 0 {
             let node = &self.prefix_nodes[prefix as usize];
-            out.push(node);
             prefix = match node {
-                PrefixNode::Root => 0,
+                PrefixNode::Root | PrefixNode::Cut(_) => break,
                 PrefixNode::Event(parent, _)
                 | PrefixNode::Branch(parent, _)
                 | PrefixNode::Fault(parent) => *parent,
             };
+            out.push(node);
         }
         out.reverse();
         out
@@ -414,6 +456,7 @@ impl Interner {
                 SymKey::EventValue(p) => format!("read#{p}"),
                 SymKey::StackObject(p) => format!("stack_obj@epoch{p}"),
                 SymKey::FrameMaybe(p, s, i, _) => format!("frame({s},{i})@event{p}"),
+                SymKey::CutClass(p, k) => format!("class{k}@cut{p}"),
                 SymKey::Op(..) if depth >= 3 => format!("t{id}"),
                 SymKey::Op(op, a, b) => format!(
                     "({} op{op} {})",
@@ -728,6 +771,35 @@ struct FaultPoint {
     unwritten: Vec<bool>,
 }
 
+impl FaultPoint {
+    /// A fault as the behavioral relation sees it: only the tree it happened in. The
+    /// rest of what a fault leaves that the world can see is in the path's [`Outputs`]
+    /// at the moment it faulted: the kind of fault (`exit`), the event history up to the
+    /// failing event (which names a failing primitive, call or operand, and what a
+    /// primitive did before failing), the tracked cells, the scratch pointer, and the
+    /// last result. That relies on the checker applying a node's effects on those in the
+    /// VM's order: an `Expression` sets the scratch pointer after reading its right
+    /// operand and before resolving its left one (`expression.rs:43`, `expression.rs:51`),
+    /// writes its destination last, and a node sets the last result only once it
+    /// succeeds (`interpreter.rs:1479`). The node number and the frame are not observed.
+    fn behavioral(tree: u16) -> Self {
+        Self {
+            tree,
+            node: 0,
+            instruction: None,
+            prefix: 0,
+            event: None,
+            epoch: 0,
+            store: Vec::new(),
+            scratch: Scratch::Inherited,
+            last_result: None,
+            params: Vec::new(),
+            locals: Vec::new(),
+            unwritten: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PathSummary {
     out: Outputs,
@@ -806,7 +878,26 @@ pub(super) fn frame_dims(bhav: &BhavChunk) -> (usize, usize) {
     (args, locals)
 }
 
-impl Explorer<'_> {
+impl<'a> Explorer<'a> {
+    fn new(
+        bhav: &'a BhavChunk,
+        ctx: &'a LiveContext,
+        opts: &'a LiveOptions,
+        entry: usize,
+        entry_param: Option<(i16, bool)>,
+    ) -> Self {
+        let (args, locals) = frame_dims(bhav);
+        Self {
+            bhav,
+            ctx,
+            opts,
+            args,
+            locals,
+            entry,
+            entry_param,
+        }
+    }
+
     fn initial(&self, interner: &mut Interner) -> PathState {
         let params = (0..self.args)
             .map(|i| interner.sym(SymKey::InitParam(i as u16)))
@@ -909,6 +1000,9 @@ impl Explorer<'_> {
         // in the object (`interpreter.rs:809`), so a faulting path compares the whole
         // state at the faulting node, whatever the observation policy says.
         let fault = faults.then(|| {
+            if self.opts.behavioral {
+                return FaultPoint::behavioral(self.bhav.id);
+            }
             // An entry past the last node faults before any node runs; it is never
             // compared (`check_bhav_live_equivalent`).
             state
@@ -916,13 +1010,20 @@ impl Explorer<'_> {
                 .clone()
                 .unwrap_or_else(|| self.fault_point(&state, u8::MAX, None, interner))
         });
-        let residue = (self.opts.observe_frame_residue || faults).then(|| {
-            (
-                state.params.clone(),
-                state.locals.clone(),
-                state.unwritten.clone(),
-            )
-        });
+        // The behavioral relation does not observe node numbers: a jump to a missing
+        // node is the same fault whatever its target and the tree's length.
+        let exit = match exit {
+            Exit::BadNode(..) if self.opts.behavioral => Exit::BadNode(0, 0),
+            other => other,
+        };
+        let residue =
+            (self.opts.observes_residue() || (faults && !self.opts.behavioral)).then(|| {
+                (
+                    state.params.clone(),
+                    state.locals.clone(),
+                    state.unwritten.clone(),
+                )
+            });
         let last_result = (self.opts.observe_last_result || faults).then_some(state.last_result);
         Step::Done(PathSummary {
             out: Outputs {
@@ -1356,20 +1457,22 @@ impl Explorer<'_> {
             // Resolving, reading or storing an untracked destination may fail
             // (`expression.rs:63`, `memory.rs:797`).
             self.may_fault(&mut state, prefix, &mut out, interner);
+            // The `Expression` set the scratch pointer before the store, but the store
+            // can run code (selecting a Sim runs its placement callback, `memory.rs:846`)
+            // that leaves it in another state. So it is whatever the write event left
+            // (`havoc_shared`), not `Scratch::Expression`.
             if matches!(op, 11 | 17) {
                 for value in [true, false] {
                     let mut s = state.clone();
                     s.prefix = interner.prefix(PrefixNode::Branch(prefix, value));
                     s.cond.push((Atom::Outcome(prefix), value));
                     Self::havoc_shared(&mut s);
-                    s.scratch = Scratch::Expression;
                     s.last_result = Some(value);
                     s.pc = if value { ins.on_true } else { ins.on_false };
                     out.push(Step::Continue(s));
                 }
             } else {
                 Self::havoc_shared(&mut state);
-                state.scratch = Scratch::Expression;
                 state.last_result = Some(true);
                 state.pc = ins.on_true;
                 out.push(Step::Continue(state));
@@ -1563,6 +1666,13 @@ impl Explorer<'_> {
             25 => idx >= 0 && (idx as usize) < self.locals,
             _ => false,
         };
+        let fit = |scope: u8, idx: i16| {
+            if in_frame(scope, idx) {
+                return Ok(());
+            }
+            let count = if scope == 9 { self.args } else { self.locals };
+            Err(Outside(i32::from(idx) - count as i32))
+        };
         let slot_val = |state: &PathState, scope: u8, idx: i16| match scope {
             9 => state.params[idx as usize],
             _ => state.locals[idx as usize],
@@ -1572,15 +1682,14 @@ impl Explorer<'_> {
                 FrameUse::Read(scope, idx, _) | FrameUse::Dst(scope @ 22, idx, _) => {
                     let scope = if scope == 22 { 9 } else { scope };
                     if matches!(scope, 9 | 25) {
-                        let inside = in_frame(scope, idx);
-                        let val = inside.then(|| slot_val(&state, scope, idx));
-                        let unwritten = inside && scope == 25 && state.unwritten[idx as usize];
+                        let val = fit(scope, idx).map(|()| slot_val(&state, scope, idx));
+                        let unwritten = val.is_ok() && scope == 25 && state.unwritten[idx as usize];
                         frame.push(FrameVal::Read(scope, idx, val, unwritten));
                     }
                 }
                 FrameUse::Dst(scope, idx, _) => {
                     if matches!(scope, 9 | 25) {
-                        frame.push(FrameVal::Dst(scope, idx, in_frame(scope, idx)));
+                        frame.push(FrameVal::Dst(scope, idx, fit(scope, idx)));
                         written.insert((scope, idx));
                     }
                 }
@@ -1605,14 +1714,20 @@ impl Explorer<'_> {
         let prefix = self.record(
             &state,
             EventKind::Primitive {
-                node: state.pc,
+                // The behavioral relation observes neither the node a yield leaves the
+                // frame at nor where in frame storage a callee's frame starts.
+                node: if self.opts.behavioral { 0 } else { state.pc },
                 opcode: ins.opcode,
-                operands: canonicalize_primitive_operands(ins.opcode, *ops),
+                operands: event_operands(ins.opcode, *ops),
                 inline_args,
                 unknown_arity_suffix,
                 callee_arity,
                 argless,
-                caller_frame: (self.args, self.locals),
+                caller_frame: if self.opts.behavioral {
+                    (0, 0)
+                } else {
+                    (self.args, self.locals)
+                },
             },
             frame,
             self.opts.observe_last_result.then_some(state.last_result),
@@ -1666,6 +1781,21 @@ impl Explorer<'_> {
     }
 }
 
+/// The operand bytes a primitive event compares: [`canonicalize_primitive_operands`],
+/// and also Animate's event local (byte 2), which the VM reads only with flag 0x20
+/// (`animate.rs:271`).
+///
+/// This is narrower than the canonical operands on purpose. `pad` clauses and lifting use
+/// those, and a call before the node may read byte 2 as an inline argument. The call's
+/// event records that read itself (`inline_args`).
+fn event_operands(opcode: u16, ops: [u8; 8]) -> [u8; 8] {
+    let mut out = canonicalize_primitive_operands(opcode, ops);
+    if opcode == 44 && ops[5] & 0x20 == 0 {
+        out[2] = 0;
+    }
+    out
+}
+
 /// Frame slots primitives write beyond their listed destinations (mirrors the lockstep
 /// checker's per-opcode frame updates).
 fn primitive_frame_writes(opcode: u16, ops: &[u8; 8]) -> Vec<(u8, i16)> {
@@ -1682,8 +1812,10 @@ fn primitive_frame_writes(opcode: u16, ops: &[u8; 8]) -> Vec<(u8, i16)> {
         24 => vec![(9, i16::from(ops[2] as i8))],
         26 => vec![(ops[4], word_i16(ops, 6))],
         31 if ops[4] & 0x80 != 0 => vec![(ops[5], i16::from(ops[7]))],
-        // Animate stores its event in `local[ops[2]]` (flag 0x20) or `param[0]`.
-        44 => vec![(25, i16::from(ops[2])), (9, 0)],
+        // Animate stores its event in `local[ops[2]]` (flag 0x20) or `param[0]`
+        // (`animate.rs:269`).
+        44 if ops[5] & 0x20 != 0 => vec![(25, i16::from(ops[2]))],
+        44 => vec![(9, 0)],
         _ => Vec::new(),
     }
 }
@@ -1732,6 +1864,345 @@ fn mk_op(op: u8, lhs: Val, rhs: Val, interner: &mut Interner) -> Val {
 }
 
 // ============================================================================
+// Cut-point bisimulation
+// ============================================================================
+
+/// Most product states one cut-point bisimulation explores before giving up.
+const MAX_PRODUCT_STATES: usize = 4096;
+
+/// Visits to a pair of nodes after which literals that changed between visits are
+/// widened into classes, so a counter that never bounds a loop does not unroll it.
+const WIDEN_AFTER: usize = 4;
+
+/// Where one side's segment ends ([`Explorer::segment`]).
+enum SegmentEnd {
+    Done(PathSummary),
+    /// Right after a cut node, ready to start the next segment.
+    Cut(PathState),
+}
+
+impl SegmentEnd {
+    fn cond(&self) -> &[(Atom, bool)] {
+        match self {
+            Self::Done(p) => &p.cond,
+            Self::Cut(s) => &s.cond,
+        }
+    }
+}
+
+/// A frame slot or tracked cell of a product state: a literal, or an equivalence class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Abs {
+    Const(i16),
+    Class(u16),
+}
+
+/// Both runs' state at a cut, up to which of their values are equal. Shared memory needs
+/// nothing more: both runs have the same history, so it is the same on both sides.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ProductState {
+    pc: (u8, u8),
+    /// The tracked cells either side may hold a value in that differs from the epoch's.
+    cells: Vec<Cell>,
+    /// A's parameters, locals and `cells`, then B's.
+    slots: Vec<Abs>,
+    unwritten: (Vec<bool>, Vec<bool>),
+    scratch: (Scratch, Scratch),
+    last_result: (Option<bool>, Option<bool>),
+}
+
+/// Per pair of nodes: visits so far, and each slot's literal if every visit had the same.
+type WidenTable = BTreeMap<((u8, u8), Vec<Cell>), (usize, Vec<Option<i16>>)>;
+
+impl Explorer<'_> {
+    /// Runs `start` until each path has run a cut node (a primitive or call, or with
+    /// `every_event` any node that recorded an event) or has ended.
+    fn segment(
+        &self,
+        start: PathState,
+        every_event: bool,
+        interner: &mut Interner,
+    ) -> Result<Vec<SegmentEnd>, String> {
+        let mut ends = Vec::new();
+        let mut stack = vec![start];
+        while let Some(state) = stack.pop() {
+            if ends.len() + stack.len() > self.opts.max_paths {
+                return Err(format!(
+                    "tree {} has more than {} paths between two cuts",
+                    self.bhav.id, self.opts.max_paths
+                ));
+            }
+            let primitive = usize::from(state.pc) <= LAST_NODE
+                && self
+                    .bhav
+                    .instructions
+                    .get(usize::from(state.pc))
+                    .is_some_and(|ins| ins.opcode != 2);
+            let before = state.prefix;
+            for next in self.step(state, interner)? {
+                // A branch to an exit or a missing node finishes in this segment, where
+                // strict mode still knows the node it faults at (`PathState::at`).
+                let to_node = |s: &PathState| {
+                    usize::from(s.pc) <= LAST_NODE
+                        && usize::from(s.pc) < self.bhav.instructions.len()
+                };
+                match next {
+                    Step::Done(summary) => ends.push(SegmentEnd::Done(summary)),
+                    Step::Continue(s)
+                        if s.prefix != before && (primitive || every_event) && to_node(&s) =>
+                    {
+                        ends.push(SegmentEnd::Cut(s));
+                    }
+                    Step::Continue(s) => stack.push(s),
+                }
+            }
+        }
+        Ok(ends)
+    }
+
+    /// This side's state at the start of product state `ps`'s segment: values of class
+    /// `k` become the symbol `CutClass(root, k)`, and shared memory is named by `root`.
+    fn instantiate(
+        &self,
+        ps: &ProductState,
+        side_b: bool,
+        root: u32,
+        interner: &mut Interner,
+    ) -> PathState {
+        let width = |x: &Explorer| x.args + x.locals + ps.cells.len();
+        let start = if side_b {
+            ps.slots.len() - width(self)
+        } else {
+            0
+        };
+        let mut vals = ps.slots[start..start + width(self)]
+            .iter()
+            .map(|&v| match v {
+                Abs::Const(c) => Val::Const(c),
+                Abs::Class(k) => interner.sym(SymKey::CutClass(root, k)),
+            });
+        let params = vals.by_ref().take(self.args).collect();
+        let locals = vals.by_ref().take(self.locals).collect();
+        let store = ps.cells.iter().copied().zip(vals).collect();
+        PathState {
+            pc: if side_b { ps.pc.1 } else { ps.pc.0 },
+            prefix: root,
+            epoch: root,
+            params,
+            locals,
+            store,
+            scratch: if side_b { ps.scratch.1 } else { ps.scratch.0 },
+            last_result: if side_b {
+                ps.last_result.1
+            } else {
+                ps.last_result.0
+            },
+            unwritten: if side_b {
+                ps.unwritten.1.clone()
+            } else {
+                ps.unwritten.0.clone()
+            },
+            cond: Vec::new(),
+            steps: 0,
+            nodes: Vec::new(),
+            at: None,
+        }
+    }
+}
+
+/// The product state covering the pair of states `sa` and `sb` reach after the same
+/// history. Each value becomes a literal or a class, with two values in the same class
+/// only when they are the same symbol (or, once widened, the same literal). The path
+/// condition is dropped. So the product state stands for every pair of states with those
+/// literals and equalities, which includes this one.
+fn abstraction(
+    (xa, sa): (&Explorer, &PathState),
+    (xb, sb): (&Explorer, &PathState),
+    widen: &mut WidenTable,
+    interner: &mut Interner,
+) -> ProductState {
+    let (store_a, store_b) = (
+        xa.normalized_store(sa, interner),
+        xb.normalized_store(sb, interner),
+    );
+    let cells: Vec<Cell> = store_a
+        .iter()
+        .chain(&store_b)
+        .map(|&(c, _)| c)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut raw: Vec<Val> = Vec::new();
+    for (state, store) in [(sa, &store_a), (sb, &store_b)] {
+        raw.extend(&state.params);
+        raw.extend(&state.locals);
+        for &cell in &cells {
+            let v = match store.iter().find(|&&(c, _)| c == cell) {
+                Some(&(_, v)) => v,
+                None => interner.sym(SymKey::Cell(state.epoch, cell)),
+            };
+            raw.push(v);
+        }
+    }
+    let pc = (sa.pc, sb.pc);
+    let literals: Vec<Option<i16>> = raw
+        .iter()
+        .map(|v| match *v {
+            Val::Const(c) => Some(c),
+            Val::Sym(_) => None,
+        })
+        .collect();
+    let (visits, stable) = widen
+        .entry((pc, cells.clone()))
+        .or_insert_with(|| (0, literals.clone()));
+    *visits += 1;
+    for (kept, now) in stable.iter_mut().zip(&literals) {
+        if kept != now {
+            *kept = None;
+        }
+    }
+    let widened = *visits > WIDEN_AFTER;
+    let mut classes: BTreeMap<Val, u16> = BTreeMap::new();
+    let slots = raw
+        .iter()
+        .zip(stable.iter())
+        .map(|(&v, kept)| match v {
+            Val::Const(c) if !widened || kept.is_some() => Abs::Const(c),
+            v => {
+                let next = classes.len() as u16;
+                Abs::Class(*classes.entry(v).or_insert(next))
+            }
+        })
+        .collect();
+    ProductState {
+        pc,
+        cells,
+        slots,
+        unwritten: (sa.unwritten.clone(), sb.unwritten.clone()),
+        scratch: (sa.scratch, sb.scratch),
+        last_result: (sa.last_result, sb.last_result),
+    }
+}
+
+/// Where two histories first differ.
+fn divergence(a: u32, b: u32, interner: &Interner) -> String {
+    let (ha, hb) = (interner.history(a), interner.history(b));
+    let k = ha.iter().zip(&hb).take_while(|(x, y)| x == y).count();
+    let show = |n: Option<&&PrefixNode>| n.map_or("nothing".to_owned(), |n| describe_node(n));
+    format!(
+        "event {k} after the cut: A {} vs B {}",
+        show(ha.get(k)),
+        show(hb.get(k))
+    )
+}
+
+/// Proves two runs equivalent by cutting both at primitive events
+/// (`docs/decisions/20261123-verifier-behavioral-mode.md`, Decision 3).
+///
+/// From each product state, both sides run one segment. Every pair of segment ends
+/// whose path conditions can hold together must either end with the same outputs or run
+/// the same events to the same outcome, after which the pair of states is abstracted
+/// into a product state of its own. Product states are explored once, which closes
+/// loops and merges diamonds. Induction on the number of cuts: two runs from the same
+/// inputs reach every cut with the same history and frames that the product state
+/// covers, so they end the same.
+///
+/// Returns the segments and product states explored, or why the proof failed. A
+/// failure is never a counterexample: the abstraction drops path conditions.
+fn bisimulate(
+    xa: &Explorer,
+    xb: &Explorer,
+    every_event: bool,
+    interner: &mut Interner,
+) -> Result<(usize, usize), String> {
+    let opts = xa.opts;
+    let mut seen: BTreeSet<ProductState> = BTreeSet::new();
+    let mut widen = WidenTable::new();
+    let mut work = vec![(xa.initial(interner), xb.initial(interner))];
+    let mut segments = 0usize;
+    let mut checks = 0usize;
+    while let Some((sa, sb)) = work.pop() {
+        segments += 1;
+        let ends_a = xa
+            .segment(sa, every_event, interner)
+            .map_err(|e| format!("A: {e}"))?;
+        let ends_b = xb
+            .segment(sb, every_event, interner)
+            .map_err(|e| format!("B: {e}"))?;
+        for ea in &ends_a {
+            for eb in &ends_b {
+                if let (SegmentEnd::Done(pa), SegmentEnd::Done(pb)) = (ea, eb)
+                    && pa.out == pb.out
+                {
+                    continue;
+                }
+                checks += 1;
+                if checks > opts.max_pair_checks {
+                    return Err(format!(
+                        "more than {} pairs of segment ends to check",
+                        opts.max_pair_checks
+                    ));
+                }
+                if feasibility(&[ea.cond(), eb.cond()], interner) == Feasibility::Unsat {
+                    continue;
+                }
+                match (ea, eb) {
+                    (SegmentEnd::Done(pa), SegmentEnd::Done(pb)) => {
+                        let mut cond = pa.cond.clone();
+                        cond.extend_from_slice(&pb.cond);
+                        let what = match first_difference(&pa.out, &pb.out, &cond, interner) {
+                            Difference::Definite(w) | Difference::Possible(w) => w,
+                        };
+                        return Err(format!(
+                            "segment ends may differ: {what} (A path {}, B path {})",
+                            format_nodes(pa),
+                            format_nodes(pb)
+                        ));
+                    }
+                    (SegmentEnd::Cut(sa), SegmentEnd::Cut(sb)) if sa.prefix == sb.prefix => {
+                        let ps = abstraction((xa, sa), (xb, sb), &mut widen, interner);
+                        if !seen.contains(&ps) {
+                            if seen.len() >= MAX_PRODUCT_STATES {
+                                return Err(format!(
+                                    "more than {MAX_PRODUCT_STATES} product states"
+                                ));
+                            }
+                            let root = interner.fresh_cut();
+                            work.push((
+                                xa.instantiate(&ps, false, root, interner),
+                                xb.instantiate(&ps, true, root, interner),
+                            ));
+                            seen.insert(ps);
+                        }
+                    }
+                    (SegmentEnd::Cut(sa), SegmentEnd::Cut(sb)) => {
+                        return Err(format!(
+                            "segments may run different events: {}",
+                            divergence(sa.prefix, sb.prefix, interner)
+                        ));
+                    }
+                    (SegmentEnd::Done(p), SegmentEnd::Cut(s)) => {
+                        return Err(format!(
+                            "A may end ({}) where B runs on: {}",
+                            p.out.exit,
+                            divergence(p.out.prefix, s.prefix, interner)
+                        ));
+                    }
+                    (SegmentEnd::Cut(s), SegmentEnd::Done(p)) => {
+                        return Err(format!(
+                            "B may end ({}) where A runs on: {}",
+                            p.out.exit,
+                            divergence(s.prefix, p.out.prefix, interner)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok((segments, seen.len()))
+}
+
+// ============================================================================
 // Comparison
 // ============================================================================
 
@@ -1773,6 +2244,25 @@ pub fn check_bhav_live_equivalent(
             reason: format!(
                 "the trees have different kinds ({} vs {}), which the checker does not model",
                 a.kind, b.kind
+            ),
+        };
+    }
+    // How the VM enters a tree depends on its frame's shape, whatever the relation:
+    // - a caller supplies at most so many arguments, and entry faults when the tree
+    //   wants more (`factory.rs:494`);
+    // - Create New Object Instance (flag 0x02) writes into the new object's bottom frame:
+    //   its first argument, else its first local, and fails when the frame has neither
+    //   (`create.rs:524`).
+    // The frame-residue and fault checks observe both in strict mode only when the frame
+    // is compared, so check them up front, on the counts the VM uses (the format caps
+    // them and the local count is a byte), not the header's.
+    let ((args_a, locals_a), (args_b, locals_b)) = (frame_dims(a), frame_dims(b));
+    if args_a != args_b || (locals_a == 0) != (locals_b == 0) {
+        return EquivResult::Inconclusive {
+            reason: format!(
+                "the trees' frames differ in shape ({args_a} arguments and {locals_a} locals \
+                 vs {args_b} and {locals_b}): a caller or Create New Object Instance may \
+                 write or supply a frame word only one of them has"
             ),
         };
     }
@@ -1837,32 +2327,41 @@ pub fn check_bhav_live_equivalent(
         });
         let explore =
             |bhav: &BhavChunk, ctx: &LiveContext, entry: usize, interner: &mut Interner| {
-                let (args, locals) = frame_dims(bhav);
-                Explorer {
-                    bhav,
-                    ctx,
-                    opts,
-                    args,
-                    locals,
-                    entry,
-                    entry_param,
-                }
-                .explore(interner)
+                Explorer::new(bhav, ctx, opts, entry, entry_param).explore(interner)
             };
-        let (paths_a, steps_a) = match explore(a, ctx_a, entry_a, &mut interner) {
+        let explored = explore(a, ctx_a, entry_a, &mut interner)
+            .map_err(|e| format!("A: {e}"))
+            .and_then(|pa| {
+                explore(b, ctx_b, entry_b, &mut interner)
+                    .map(|pb| (pa, pb))
+                    .map_err(|e| format!("B: {e}"))
+            });
+        let ((paths_a, steps_a), (paths_b, steps_b)) = match explored {
             Ok(r) => r,
             Err(reason) => {
-                return EquivResult::Inconclusive {
-                    reason: format!("A: {reason}"),
-                };
-            }
-        };
-        let (paths_b, steps_b) = match explore(b, ctx_b, entry_b, &mut interner) {
-            Ok(r) => r,
-            Err(reason) => {
-                return EquivResult::Inconclusive {
-                    reason: format!("B: {reason}"),
-                };
+                // Too many paths, or a loop the literals do not bound: cut both runs at
+                // their events instead (`bisimulate`).
+                let (xa, xb) = (
+                    Explorer::new(a, ctx_a, opts, entry_a, entry_param),
+                    Explorer::new(b, ctx_b, opts, entry_b, entry_param),
+                );
+                let proof = bisimulate(&xa, &xb, false, &mut interner).or_else(|first| {
+                    bisimulate(&xa, &xb, true, &mut interner).map_err(|every| {
+                        format!("cut at primitives: {first}; cut at every event: {every}")
+                    })
+                });
+                match proof {
+                    Ok((segments, states)) => {
+                        steps += segments;
+                        paths += states;
+                        continue;
+                    }
+                    Err(why) => {
+                        return EquivResult::Inconclusive {
+                            reason: format!("{reason}; cut-point bisimulation failed: {why}"),
+                        };
+                    }
+                }
             }
         };
         steps += steps_a + steps_b;
@@ -2508,7 +3007,15 @@ fn event_difference(
                     "{at}: frame operand scope {s}[{i}] may still hold what an earlier frame left on one side"
                 ))
             }
-            (FrameVal::Read(s, i, Some(x), _), FrameVal::Read(t, j, Some(y), _))
+            (FrameVal::Read(s, i, Err(_), _), FrameVal::Read(t, j, Err(_), _))
+            | (FrameVal::Dst(s, i, Err(_)), FrameVal::Dst(t, j, Err(_)))
+                if s == t && i == j =>
+            {
+                Difference::Possible(format!(
+                    "{at}: frame operand scope {s}[{i}] lies outside the frame by different amounts"
+                ))
+            }
+            (FrameVal::Read(s, i, Ok(x), _), FrameVal::Read(t, j, Ok(y), _))
                 if s == t && i == j =>
             {
                 match can_differ(*x, *y, cond, interner) {
@@ -2649,6 +3156,7 @@ fn describe_node(node: &PrefixNode) -> String {
         PrefixNode::Event(_, e) => format!("{:?}", e.kind),
         PrefixNode::Branch(_, v) => format!("branch {v}"),
         PrefixNode::Fault(_) => "fault".to_owned(),
+        PrefixNode::Cut(_) => "cut".to_owned(),
     }
 }
 
