@@ -364,7 +364,7 @@ fn stmt_span(s: &V2Stmt) -> Span {
 // ---------------------------------------------------------------------------------------------
 
 /// The expressions a statement evaluates itself (not those of nested statements).
-fn stmt_exprs(s: &V2Stmt) -> Vec<&V2Expr> {
+pub(super) fn stmt_exprs(s: &V2Stmt) -> Vec<&V2Expr> {
     match s {
         V2Stmt::Let { init, .. } | V2Stmt::LetSome { init, .. } => vec![init],
         V2Stmt::Assign { target, value, .. } => vec![target, value],
@@ -393,14 +393,18 @@ fn stmt_exprs(s: &V2Stmt) -> Vec<&V2Expr> {
 }
 
 /// The statement lists nested in a statement.
-fn stmt_bodies(s: &V2Stmt) -> Vec<&[V2Stmt]> {
+pub(super) fn stmt_bodies(s: &V2Stmt) -> Vec<&[V2Stmt]> {
     match s {
         V2Stmt::LetSome { else_body, .. } => vec![else_body],
+        V2Stmt::ForEach {
+            body, else_body, ..
+        } => std::iter::once(body.as_slice())
+            .chain(else_body.as_deref())
+            .collect(),
         V2Stmt::WithLock { body, .. }
         | V2Stmt::Defer { body, .. }
         | V2Stmt::Repeat { body, .. }
         | V2Stmt::While { body, .. }
-        | V2Stmt::ForEach { body, .. }
         | V2Stmt::Animate { body, .. } => vec![body],
         V2Stmt::If {
             then_body,
@@ -454,7 +458,7 @@ fn expr_mentions(e: &V2Expr, name: &str) -> bool {
 }
 
 /// Calls `f` on `e` and every expression inside it, except a call's callee name.
-fn visit_expr(e: &V2Expr, f: &mut dyn FnMut(&V2Expr)) {
+pub(super) fn visit_expr(e: &V2Expr, f: &mut dyn FnMut(&V2Expr)) {
     f(e);
     match e {
         V2Expr::Int(..)
@@ -672,7 +676,12 @@ fn subst_stmt(s: &mut V2Stmt, pairs: &[(String, V2Expr)]) -> Result<()> {
             subst_expr(cond, pairs)?;
             subst_stmts(body, pairs)?;
         }
-        V2Stmt::ForEach { iter, body, .. } => {
+        V2Stmt::ForEach {
+            iter,
+            body,
+            else_body,
+            ..
+        } => {
             match iter {
                 ForEachIter::ObjectsByGuid(e) => subst_expr(e, pairs)?,
                 ForEachIter::Range { start, end, .. } => {
@@ -685,6 +694,9 @@ fn subst_stmt(s: &mut V2Stmt, pairs: &[(String, V2Expr)]) -> Result<()> {
                 | ForEachIter::LotObjects => {}
             }
             subst_stmts(body, pairs)?;
+            if let Some(else_body) = else_body {
+                subst_stmts(else_body, pairs)?;
+            }
         }
         V2Stmt::If {
             cond,

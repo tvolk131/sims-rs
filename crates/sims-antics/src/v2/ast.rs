@@ -641,6 +641,8 @@ pub enum V2Stmt {
         binding: String,
         iter: ForEachIter,
         body: Vec<V2Stmt>,
+        /// Runs on iterator exhaustion, outside the scope of the loop binding.
+        else_body: Option<Vec<V2Stmt>>,
     },
     If {
         span: Span,

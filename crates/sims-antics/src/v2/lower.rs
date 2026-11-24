@@ -1697,6 +1697,10 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
     // 8c. Init tree.
     {
         let mut ctx = TreeLowerer::new(&env, TreeContext::ObjectSelf, &resolved.module_id, false);
+        let mut stack_ops = ExplicitStackOps::default();
+        ctx.explicit_stack_obj = init_blocks
+            .iter()
+            .any(|b| stack_ops.in_stmts(&b.stmts, &env, &b.owner_module, true));
         // Set functional score data words first (e.g., `my.prep_score := ...`).
         for func in &functionals {
             if let Some(score_expr) = &func.decl.score {
@@ -1797,6 +1801,9 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
     // 8d. Main tree.
     {
         let mut ctx = TreeLowerer::new(&env, TreeContext::ObjectSelf, &resolved.module_id, false);
+        ctx.explicit_stack_obj = main_block.as_ref().is_some_and(|b| {
+            ExplicitStackOps::default().in_stmts(&b.stmts, &env, &b.owner_module, true)
+        });
         if let Some(blk) = &main_block {
             ctx.with_owner_module(&blk.owner_module, |c| {
                 c.push_scope(ScopeFrame::block());
@@ -1833,6 +1840,10 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         }
         let tid = alloc_tree_id(pinned_id, None, obj.span)?;
         let mut ctx = TreeLowerer::new(&env, TreeContext::ObjectSelf, &resolved.module_id, false);
+        let mut stack_ops = ExplicitStackOps::default();
+        ctx.explicit_stack_obj = blocks
+            .iter()
+            .any(|b| stack_ops.in_stmts(&b.stmts, &env, &b.owner_module, true));
         for blk in blocks {
             ctx.with_owner_module(&blk.owner_module, |c| {
                 c.push_scope(ScopeFrame::block());
@@ -1917,6 +1928,12 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             &func.owner_module,
             needs_self_save,
         );
+        ctx.begin_body(ExplicitStackOps::default().in_stmts(
+            &func.decl.body,
+            &env,
+            &func.owner_module,
+            true,
+        ));
         ctx.value_return = func_ret_ty.map(|ty| ValueReturnAbi {
             ty,
             temp: 0,
@@ -1924,9 +1941,6 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             in_place: false,
             what: "functional",
         });
-        if needs_self_save {
-            ctx.line("let __self_obj = stack_obj;".to_owned());
-        }
         // The engine runs a functional with a full four-word argument frame, whatever it declares.
         ctx.frame_args = func.decl.params.len().max(4);
         for (pidx, fp) in func.decl.params.iter().enumerate() {
@@ -2086,9 +2100,12 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             &inter.owner_module,
             needs_self_save,
         );
-        if needs_self_save {
-            ctx.line("let __self_obj = stack_obj;".to_owned());
-        }
+        ctx.begin_body(ExplicitStackOps::default().in_stmts(
+            &effective_run_body,
+            &env,
+            &inter.owner_module,
+            true,
+        ));
         ctx.lower_stmts(&effective_run_body)?;
         if !stmts_always_return(&effective_run_body, &env, &inter.owner_module, true) {
             ctx.emit_all_cleanups()?;
@@ -2648,6 +2665,7 @@ fn is_prim_builtin_name(name: &str) -> bool {
                 | "dec_gt"
                 | "set_dynamic_sprite"
                 | "generic_call"
+                | "set_to_next"
         )
 }
 /// Allocates state attribute slots shared by object lowering and imported object schemas.
@@ -2872,6 +2890,7 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
         None => (TreeContext::ObjectSelf, false),
     };
     let mut ctx = TreeLowerer::new(env, tree_ctx, &t.owner_module, needs_self_save);
+    ctx.begin_body(ExplicitStackOps::default().in_stmts(&d.body, env, &t.owner_module, true));
     ctx.frame_locals = d.frame.and_then(|f| f.locals);
     ctx.frame_args = d.frame.and_then(|f| f.args).map_or_else(
         || {
@@ -2895,9 +2914,6 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
             });
         }
         _ => {}
-    }
-    if needs_self_save {
-        ctx.line("let __self_obj = stack_obj;".to_owned());
     }
     // Temp-bound params are snapshotted into locals at entry (temps are shared with callees).
     let mut positional = 0usize;
@@ -3464,9 +3480,11 @@ fn emit_guard_tree(
         owner_module,
         needs_self_save,
     );
-    if needs_self_save {
-        ctx.line("let __self_obj = stack_obj;".to_owned());
-    }
+    let mut stack_ops = ExplicitStackOps::default();
+    ctx.begin_body(match &guard.kind {
+        GuardBody::Expr(e) => stack_ops.in_expr(e, env, owner_module, true),
+        GuardBody::Block(stmts) => stack_ops.in_stmts(stmts, env, owner_module, true),
+    });
     if let Some(ref auto_name) = guard.autonomous_binding {
         ctx.bind_var(auto_name.clone(), Binding::AutonomousFlag);
     }
@@ -3664,6 +3682,9 @@ struct ScopeFrame {
     /// a defer-local loop from breaks attempting to escape out of a `defer` block).
     owner_defer_id: Option<usize>,
     cancel_flag: Option<String>,
+    /// A falling-through `for ... else` handles the exhaustion edge separately, so a
+    /// source `break` restores the entry stack object on its own edge.
+    restore_stack_on_break: bool,
     /// What `continue` must do before jumping back to the loop head.
     continue_step: Option<ContinueStep>,
 }
@@ -3690,6 +3711,7 @@ impl ScopeFrame {
             is_air_while: false,
             owner_defer_id: None,
             cancel_flag: None,
+            restore_stack_on_break: false,
             continue_step: None,
         }
     }
@@ -3711,6 +3733,13 @@ struct ActiveInlineFn {
     owner_defer_id: Option<usize>,
 }
 
+struct PreparedFunctional {
+    prim: String,
+    sig: Option<ResolvedFunctionalSig>,
+    kind_name: String,
+    saved_stack_obj: Option<String>,
+}
+
 struct TreeLowerer<'a> {
     env: &'a ObjectEnv<'a>,
     tree_ctx: TreeContext,
@@ -3719,6 +3748,9 @@ struct TreeLowerer<'a> {
     /// `false` inside an imported/module-level helper function.
     in_object_scope: bool,
     has_self_obj_local: bool,
+    /// This tree explicitly uses the frame's stack object as a persistent cursor. Temporary
+    /// moves must restore its pre-operation value, which may differ from the entry object.
+    explicit_stack_obj: bool,
     /// Set to `true` when an `ObjectSelf` lifecycle tree (`init`/`main`/`load`/`reset`/`cleanup`)
     /// touches `stack_obj` for a foreign object access, so `finish()` preserves the incoming
     /// `stack_obj` (e.g. the cancelling Sim in `cleanup` / OBJf 4) into `__saved_stack_obj`.
@@ -3783,6 +3815,7 @@ impl<'a> TreeLowerer<'a> {
             owner_module: owner_module.to_owned(),
             in_object_scope: true,
             has_self_obj_local,
+            explicit_stack_obj: false,
             used_saved_stack_obj: false,
             value_return: None,
             out: String::new(),
@@ -3808,16 +3841,83 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    fn begin_body(&mut self, explicit_stack_obj: bool) {
+        self.explicit_stack_obj = explicit_stack_obj;
+        self.has_self_obj_local |=
+            explicit_stack_obj && matches!(self.tree_ctx, TreeContext::SimOnObject { .. });
+        if self.has_self_obj_local {
+            self.line("let __self_obj = stack_obj;".to_owned());
+        }
+    }
+
     fn in_defer(&self) -> bool {
         self.current_defer_id.is_some()
     }
 
-    fn emit_restore_stack_obj(&mut self) {
+    fn save_stack_obj_for_move(&mut self) -> Option<String> {
+        self.explicit_stack_obj.then(|| {
+            let saved = self.fresh("pre_stack_obj");
+            self.line(format!("let {saved} = stack_obj;"));
+            saved
+        })
+    }
+
+    fn emit_restore_stack_obj(&mut self, saved: Option<&str>) {
+        if let Some(saved) = saved {
+            self.line(format!("stack_obj := {saved};"));
+        } else if !self.explicit_stack_obj {
+            self.emit_entry_stack_restore();
+        }
+    }
+
+    fn emit_entry_stack_restore(&mut self) {
         if self.has_self_obj_local {
             self.line("stack_obj := __self_obj;".to_owned());
         } else if matches!(self.tree_ctx, TreeContext::ObjectSelf) {
             self.used_saved_stack_obj = true;
             self.line("stack_obj := __saved_stack_obj;".to_owned());
+        }
+    }
+
+    /// A Sim tree's `self` is always its entry object, even when the user moves the cursor.
+    fn self_stack_target(&self) -> &'static str {
+        if self.explicit_stack_obj && matches!(self.tree_ctx, TreeContext::SimOnObject { .. }) {
+            "__self_obj"
+        } else {
+            "stack_obj"
+        }
+    }
+
+    fn self_cell(&self, field: &str, ty: ValueType) -> LValue {
+        if self.self_stack_target() == "__self_obj" {
+            LValue::ForeignCell {
+                cell: format!("stack.{field}"),
+                setup: None,
+                obj_air: "__self_obj".to_owned(),
+                ty,
+            }
+        } else {
+            LValue::Direct {
+                air: format!("{}.{field}", self.self_prefix()),
+                ty,
+            }
+        }
+    }
+
+    /// Emits a statement whose target selector is the entry object (`self`) rather than the
+    /// current cursor. In a Sim tree the primitive can only select it through `stack_obj`.
+    fn emit_on_self(&mut self, prim: String) {
+        let target = self.self_stack_target();
+        let saved = if target != "stack_obj" {
+            let saved = self.save_stack_obj_for_move();
+            self.line(format!("stack_obj := {target};"));
+            saved
+        } else {
+            None
+        };
+        self.line(format!("{prim};"));
+        if let Some(saved) = saved {
+            self.emit_restore_stack_obj(Some(&saved));
         }
     }
 
@@ -4767,8 +4867,12 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
         self.emit_cleanups_down_to(loop_idx)?;
-        if is_continue && let Some(step) = self.cleanup_scopes[loop_idx].continue_step.clone() {
-            self.emit_continue_step(&step);
+        if is_continue {
+            if let Some(step) = self.cleanup_scopes[loop_idx].continue_step.clone() {
+                self.emit_continue_step(&step);
+            }
+        } else if self.cleanup_scopes[loop_idx].restore_stack_on_break {
+            self.emit_entry_stack_restore();
         }
         Ok(())
     }
@@ -4787,7 +4891,7 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
-    fn emit_cancel_propagation(&mut self) -> Result<()> {
+    fn emit_cancel_propagation(&mut self, restore_stack: bool) -> Result<()> {
         if self.in_defer() {
             return Ok(());
         }
@@ -4800,6 +4904,9 @@ impl<'a> TreeLowerer<'a> {
         self.line(format!("if {flag} != 0 {{"));
         self.indent += 1;
         self.emit_cleanups_down_to(target_while)?;
+        if restore_stack {
+            self.emit_entry_stack_restore();
+        }
         self.line("break;".to_owned());
         self.indent -= 1;
         self.line("}".to_owned());
@@ -5102,6 +5209,7 @@ impl<'a> TreeLowerer<'a> {
                     is_air_while: false,
                     owner_defer_id: self.current_defer_id,
                     cancel_flag: None,
+                    restore_stack_on_break: false,
                     continue_step: None,
                 });
                 let res = self.lower_stmts(body);
@@ -5175,6 +5283,7 @@ impl<'a> TreeLowerer<'a> {
                     is_air_while: true,
                     owner_defer_id: self.current_defer_id,
                     cancel_flag: cancel_flag.clone(),
+                    restore_stack_on_break: false,
                     continue_step: Some(ContinueStep::Counter(counter.clone())),
                 });
                 if let Some(flag) = &cancel_flag {
@@ -5200,8 +5309,8 @@ impl<'a> TreeLowerer<'a> {
                     self.indent -= 1;
                     self.line("}".to_owned());
                 }
-                self.emit_inline_fn_return_propagation()?;
-                self.emit_cancel_propagation()?;
+                self.emit_inline_fn_return_propagation(false)?;
+                self.emit_cancel_propagation(false)?;
                 Ok(())
             }
             V2Stmt::While {
@@ -5258,6 +5367,7 @@ impl<'a> TreeLowerer<'a> {
                         is_air_while: true,
                         owner_defer_id: self.current_defer_id,
                         cancel_flag: cancel_flag.clone(),
+                        restore_stack_on_break: false,
                         continue_step: None,
                     });
                     if let Some(flag) = &cancel_flag {
@@ -5283,6 +5393,7 @@ impl<'a> TreeLowerer<'a> {
                         is_air_while: true,
                         owner_defer_id: self.current_defer_id,
                         cancel_flag: cancel_flag.clone(),
+                        restore_stack_on_break: false,
                         continue_step: None,
                     });
                     if let Some(flag) = &cancel_flag {
@@ -5330,15 +5441,16 @@ impl<'a> TreeLowerer<'a> {
                     self.indent -= 1;
                     self.line("}".to_owned());
                 }
-                self.emit_inline_fn_return_propagation()?;
-                self.emit_cancel_propagation()?;
+                self.emit_inline_fn_return_propagation(false)?;
+                self.emit_cancel_propagation(false)?;
                 Ok(())
             }
             V2Stmt::ForEach {
-                span: _,
+                span,
                 binding,
                 iter,
                 body,
+                else_body,
             } => {
                 if let ForEachIter::Range {
                     start,
@@ -5349,15 +5461,39 @@ impl<'a> TreeLowerer<'a> {
                 {
                     return self.lower_range_for(binding, start, end, *inclusive, *rev, body);
                 }
-                // `stack_obj` itself is the cursor when the body provably never reads the stack
-                // object any other way: the loop then needs no local.
+                if else_body.as_deref().is_some_and(stmts_exit_loop) {
+                    return Err(Error::at(
+                        *span,
+                        "'break' or 'continue' in 'for ... else' cannot target an enclosing loop",
+                    ));
+                }
+                let else_diverges = else_body.as_deref().is_some_and(|stmts| {
+                    stmts_always_return(stmts, self.env, &self.owner_module, self.in_object_scope)
+                });
+                // `stack_obj` itself is the cursor when the body can use it without
+                // accidentally observing or replacing the incoming frame value.
                 let stack_cursor = matches!(
                     iter,
                     ForEachIter::ObjectsByGuid(_) | ForEachIter::LotSims | ForEachIter::LotObjects
-                ) && self.active_inline_fn.is_none()
+                ) && !self.explicit_stack_obj
+                    && self.active_inline_fn.is_none()
                     && !self.in_defer()
                     && !self.has_active_cleanups()
+                    && (else_body.is_none() || else_diverges)
                     && body.iter().all(|s| self.cursor_stmt_ok(s, binding));
+                let restore_on_exhaustion = else_body.is_some()
+                    && !self.explicit_stack_obj
+                    && (stack_cursor
+                        || matches!(self.tree_ctx, TreeContext::SimOnObject { .. })
+                        || stmts_may_clobber_stack_obj(
+                            body,
+                            self.env,
+                            &self.owner_module,
+                            self.in_object_scope,
+                            None,
+                            0,
+                        ));
+                let restore_on_break = restore_on_exhaustion && !else_diverges;
                 let iter_var = if stack_cursor {
                     "stack_obj".to_owned()
                 } else {
@@ -5369,15 +5505,12 @@ impl<'a> TreeLowerer<'a> {
                     format!("let {iter_var} = 0;")
                 };
                 let mut parts_root_opt = None;
-                let binding_ty = match iter {
+                let (step, binding_ty) = match iter {
                     ForEachIter::Range { .. } => unreachable!("handled above"),
                     ForEachIter::ObjectsByGuid(guid_expr) => {
                         let guid = self.resolve_guid_expr(guid_expr)?;
                         self.line(init_line);
-                        self.line(format!(
-                            "while set_to_next(guid, {guid:#010x}, dest: {iter_var}) {{"
-                        ));
-                        ValueType::ObjectId
+                        (format!("guid, {guid:#010x}"), ValueType::ObjectId)
                     }
                     ForEachIter::LotSims | ForEachIter::LotObjects => {
                         let mode = if matches!(iter, ForEachIter::LotSims) {
@@ -5386,8 +5519,7 @@ impl<'a> TreeLowerer<'a> {
                             "all"
                         };
                         self.line(init_line);
-                        self.line(format!("while set_to_next({mode}, dest: {iter_var}) {{"));
-                        ValueType::ObjectId
+                        (mode.to_owned(), ValueType::ObjectId)
                     }
                     ForEachIter::ObjectsOf { span, object_type } => {
                         let schema = self
@@ -5408,10 +5540,7 @@ impl<'a> TreeLowerer<'a> {
                         let guid = schema.lead_guid;
                         let key = schema.canonical_key.clone();
                         self.line(format!("let {iter_var} = 0;"));
-                        self.line(format!(
-                            "while set_to_next(guid, {guid:#010x}, dest: {iter_var}) {{"
-                        ));
-                        ValueType::ObjectRef(key)
+                        (format!("guid, {guid:#010x}"), ValueType::ObjectRef(key))
                     }
                     ForEachIter::SelfParts => {
                         let root_expr = match self.tree_ctx {
@@ -5431,13 +5560,23 @@ impl<'a> TreeLowerer<'a> {
                             }
                         };
                         self.line(format!("let {iter_var} = {root_expr};"));
-                        self.line(format!("while set_to_next(part, dest: {iter_var}) {{"));
                         parts_root_opt = Some(root_expr);
-                        ValueType::ObjectRef(self.env.self_object_key.clone())
+                        (
+                            "part".to_owned(),
+                            ValueType::ObjectRef(self.env.self_object_key.clone()),
+                        )
                     }
                 };
+                let step = format!("set_to_next({step}, dest: {iter_var})");
+                if else_body.is_some() {
+                    self.line("while true {".to_owned());
+                } else {
+                    self.line(format!("while {step} {{"));
+                }
                 self.indent += 1;
-                if let Some(root_expr) = parts_root_opt {
+                if let Some(root_expr) = &parts_root_opt
+                    && else_body.is_none()
+                {
                     self.line(format!("if {iter_var} == {root_expr} {{"));
                     self.indent += 1;
                     self.line("break;".to_owned());
@@ -5451,8 +5590,19 @@ impl<'a> TreeLowerer<'a> {
                     is_air_while: true,
                     owner_defer_id: self.current_defer_id,
                     cancel_flag: None,
+                    restore_stack_on_break: restore_on_break,
                     continue_step: None,
                 });
+                if else_body.is_some() {
+                    // A successful iteration goes back to the test. Falling through the test
+                    // (or wrapping to the root part) reaches the single exhaustion block.
+                    self.line(format!("if {step} {{"));
+                    self.indent += 1;
+                    if let Some(root_expr) = &parts_root_opt {
+                        self.line(format!("if !{iter_var} == {root_expr} {{"));
+                        self.indent += 1;
+                    }
+                }
                 self.bind_var(
                     binding.clone(),
                     Binding::Local {
@@ -5462,12 +5612,36 @@ impl<'a> TreeLowerer<'a> {
                 );
                 let res = self.lower_stmts(body);
                 let pop_res = self.pop_scope_and_run_cleanups();
+                res.and(pop_res)?;
+                if let Some(else_body) = else_body {
+                    self.line("continue;".to_owned());
+                    if parts_root_opt.is_some() {
+                        self.indent -= 1;
+                        self.line("}".to_owned());
+                    }
+                    self.indent -= 1;
+                    self.line("}".to_owned());
+                    if restore_on_exhaustion {
+                        self.emit_entry_stack_restore();
+                    }
+                    // Inline returns and cancellation still use the emitted AIR loop to
+                    // propagate outwards. Source loop exits here were rejected above.
+                    self.push_scope(ScopeFrame {
+                        is_air_while: true,
+                        ..ScopeFrame::block()
+                    });
+                    let res = self.lower_stmts(else_body);
+                    let pop_res = self.pop_scope_and_run_cleanups();
+                    res.and(pop_res)?;
+                    self.line("break;".to_owned());
+                }
                 self.indent -= 1;
                 self.line("}".to_owned());
-                self.emit_restore_stack_obj();
-                res.and(pop_res)?;
-                self.emit_inline_fn_return_propagation()?;
-                self.emit_cancel_propagation()?;
+                if else_body.is_none() || (restore_on_exhaustion && else_diverges) {
+                    self.emit_restore_stack_obj(None);
+                }
+                self.emit_inline_fn_return_propagation(restore_on_break)?;
+                self.emit_cancel_propagation(restore_on_break)?;
                 Ok(())
             }
             V2Stmt::If {
@@ -5499,11 +5673,15 @@ impl<'a> TreeLowerer<'a> {
                 // `if [!]obj.run_functional(..)` branches on the primitive itself; each arm
                 // restores `stack_obj` first.
                 if let Some((negated, receiver, args, rspan)) = run_functional_test(cond) {
-                    let (prim, _, _) = self.prepare_run_functional(receiver, args, rspan)?;
+                    let PreparedFunctional {
+                        prim,
+                        saved_stack_obj,
+                        ..
+                    } = self.prepare_run_functional(receiver, args, rspan)?;
                     let bang = if negated { "!" } else { "" };
                     self.line(format!("if {bang}{prim} {{"));
                     self.indent += 1;
-                    self.emit_restore_stack_obj();
+                    self.emit_restore_stack_obj(saved_stack_obj.as_deref());
                     self.push_scope(ScopeFrame::block());
                     let r1 = self.lower_stmts(then_body);
                     let p1 = self.pop_scope_and_run_cleanups();
@@ -5512,7 +5690,7 @@ impl<'a> TreeLowerer<'a> {
                     self.line("} else {".to_owned());
                     self.indent += 1;
                     let restore_at = self.out.len();
-                    self.emit_restore_stack_obj();
+                    self.emit_restore_stack_obj(saved_stack_obj.as_deref());
                     let restored = self.out.len() != restore_at;
                     self.push_scope(ScopeFrame::block());
                     let r2 = self.lower_stmts(else_body);
@@ -5908,6 +6086,7 @@ impl<'a> TreeLowerer<'a> {
             is_air_while: true,
             owner_defer_id: self.current_defer_id,
             cancel_flag: None,
+            restore_stack_on_break: false,
             continue_step: edge_step.clone(),
         });
         self.bind_var(
@@ -5929,12 +6108,12 @@ impl<'a> TreeLowerer<'a> {
             self.line("}".to_owned());
         }
         res.and(pop_res)?;
-        self.emit_inline_fn_return_propagation()?;
-        self.emit_cancel_propagation()?;
+        self.emit_inline_fn_return_propagation(false)?;
+        self.emit_cancel_propagation(false)?;
         Ok(())
     }
 
-    fn emit_inline_fn_return_propagation(&mut self) -> Result<()> {
+    fn emit_inline_fn_return_propagation(&mut self, restore_stack: bool) -> Result<()> {
         if let Some(active) = self.active_inline_fn.as_ref() {
             let ret_flag = active.ret_flag.clone();
             // If we're still inside an outer loop inside the inline fn (Wait: the inline fn's
@@ -5942,6 +6121,9 @@ impl<'a> TreeLowerer<'a> {
             // propagate upward until we exit the wrapper loop.
             self.line(format!("if {ret_flag} != 0 {{"));
             self.indent += 1;
+            if restore_stack {
+                self.emit_entry_stack_restore();
+            }
             self.line("break;".to_owned());
             self.indent -= 1;
             self.line("}".to_owned());
@@ -6927,12 +7109,12 @@ impl<'a> TreeLowerer<'a> {
         } = init
             && method == "run_functional"
         {
-            let ret_ty = self.emit_run_functional_let_some(
+            let (ret_ty, saved_stack_obj) = self.emit_run_functional_let_some(
                 receiver, type_args, args, *mspan, name, ty_ann, else_body,
             )?;
             let air_name = self.fresh(&format!("v_{name}"));
             self.line(format!("let {air_name} = temp[0];"));
-            self.emit_restore_stack_obj();
+            self.emit_restore_stack_obj(saved_stack_obj.as_deref());
             self.bind_var(
                 name.to_owned(),
                 Binding::Local {
@@ -7008,6 +7190,7 @@ impl<'a> TreeLowerer<'a> {
                 .map_or(FunctionalGuardSummary::Complex, |s| s.guard);
             let allow_fallback = !matches!(guard_summary, FunctionalGuardSummary::Complex);
             self.line(format!("let {found_var} = 0;"));
+            let saved_stack_obj = self.save_stack_obj_for_move();
             self.line(format!("if {} {{", plan.prim_air));
             self.indent += 1;
             self.line(format!("let {raw_var} = stack_obj;"));
@@ -7120,7 +7303,7 @@ impl<'a> TreeLowerer<'a> {
 
             self.line(format!("if {found_var} == 0 {{"));
             self.indent += 1;
-            self.emit_restore_stack_obj();
+            self.emit_restore_stack_obj(saved_stack_obj.as_deref());
             self.push_scope(ScopeFrame::block());
             let r = self.lower_stmts(else_body);
             let p = self.pop_scope_and_run_cleanups();
@@ -7128,7 +7311,7 @@ impl<'a> TreeLowerer<'a> {
             self.line("}".to_owned());
             r.and(p)?;
 
-            self.emit_restore_stack_obj();
+            self.emit_restore_stack_obj(saved_stack_obj.as_deref());
             self.bind_var(
                 name.to_owned(),
                 Binding::Local {
@@ -7143,6 +7326,12 @@ impl<'a> TreeLowerer<'a> {
             "find_best_object" => {
                 let plan = self.parse_find_best_object(type_args, args, span)?;
                 (plan.prim_air, ValueType::ObjectId)
+            }
+            "create_object" if has_create_dest(args) => {
+                return Err(Error::at(
+                    span,
+                    "test create_object(dest: stack_obj) as a condition to keep its result in stack_obj",
+                ));
             }
             "create_object" => self.format_create_object(type_args, args, span)?,
             other => {
@@ -7173,9 +7362,10 @@ impl<'a> TreeLowerer<'a> {
             inferred_ty
         };
 
+        let saved_stack_obj = self.save_stack_obj_for_move();
         self.line(format!("if !{prim_air} {{"));
         self.indent += 1;
-        self.emit_restore_stack_obj();
+        self.emit_restore_stack_obj(saved_stack_obj.as_deref());
         self.push_scope(ScopeFrame::block());
         let r = self.lower_stmts(else_body);
         let p = self.pop_scope_and_run_cleanups();
@@ -7185,7 +7375,7 @@ impl<'a> TreeLowerer<'a> {
 
         let air_name = self.fresh(&format!("v_{name}"));
         self.line(format!("let {air_name} = stack_obj;"));
-        self.emit_restore_stack_obj();
+        self.emit_restore_stack_obj(saved_stack_obj.as_deref());
         self.bind_var(
             name.to_owned(),
             Binding::Local {
@@ -7309,9 +7499,12 @@ impl<'a> TreeLowerer<'a> {
                     && fname == "create_object"
                     && !self.user_callable_named(callee, *span)?
                 {
-                    // Both edges continue; the new object is dropped and `stack_obj` gets back
-                    // the value it had before the call.
                     let (prim, _) = self.format_create_object(type_args, args, *span)?;
+                    if has_create_dest(args) {
+                        self.line(format!("{prim};"));
+                        return Ok(());
+                    }
+                    // The legacy spelling restores the pre-call stack object on both edges.
                     let pre = self.fresh("pre_stack_obj");
                     self.line(format!("let {pre} = stack_obj;"));
                     self.line(format!("{prim};"));
@@ -7330,14 +7523,17 @@ impl<'a> TreeLowerer<'a> {
                 if let V2Expr::Ident(_, fname) = callee.as_ref() {
                     match fname.as_str() {
                         "sleep" | "idle" => return self.emit_sleep(args, *span),
-                        "play_sound" => {
-                            let s = self.format_play_sound(args, *span)?;
-                            self.line(format!("{s};"));
-                            return Ok(());
-                        }
-                        "stop_all_sounds" => {
-                            let s = self.format_stop_all_sounds(args, *span)?;
-                            self.line(format!("{s};"));
+                        "play_sound" | "stop_all_sounds" => {
+                            let (prim, on_self) = if fname == "play_sound" {
+                                self.format_play_sound(args, *span)?
+                            } else {
+                                self.format_stop_all_sounds(args)?
+                            };
+                            if on_self {
+                                self.emit_on_self(prim);
+                            } else {
+                                self.line(format!("{prim};"));
+                            }
                             return Ok(());
                         }
                         "debit_funds" => {
@@ -7395,11 +7591,12 @@ impl<'a> TreeLowerer<'a> {
                                 TreeContext::ObjectSelf => "me",
                                 TreeContext::SimOnObject { .. } => "stack_obj",
                             };
-                            if flags == 0 {
-                                self.line(format!("remove_object({target});"));
+                            let prim = if flags == 0 {
+                                format!("remove_object({target})")
                             } else {
-                                self.line(format!("remove_object({target}, flags: {flags});"));
-                            }
+                                format!("remove_object({target}, flags: {flags})")
+                            };
+                            self.emit_on_self(prim);
                             return Ok(());
                         }
                         "set_graphic" => {
@@ -7410,9 +7607,8 @@ impl<'a> TreeLowerer<'a> {
                                 ));
                             }
                             let (val, _) = self.lower_value_expr(&args[0].value)?;
-                            let prefix = self.self_prefix();
-                            self.line(format!("{prefix}.data[0] := {val};"));
-                            return Ok(());
+                            let cell = self.self_cell("data[0]", ValueType::I16);
+                            return self.emit_lvalue_assign(&cell, V2AssignOp::Set, &val);
                         }
                         "route_to" => {
                             let s = self.format_slot_prim("route_to", args, *span)?;
@@ -7987,6 +8183,7 @@ impl<'a> TreeLowerer<'a> {
             is_air_while: true,
             owner_defer_id: self.current_defer_id,
             cancel_flag: None,
+            restore_stack_on_break: false,
             continue_step: None,
         });
         if let Some(name) = event {
@@ -8007,8 +8204,8 @@ impl<'a> TreeLowerer<'a> {
         self.indent -= 1;
         self.line("}".to_owned());
         res.and(pop_res)?;
-        self.emit_inline_fn_return_propagation()?;
-        self.emit_cancel_propagation()?;
+        self.emit_inline_fn_return_propagation(false)?;
+        self.emit_cancel_propagation(false)?;
         Ok(())
     }
 
@@ -8079,6 +8276,7 @@ impl<'a> TreeLowerer<'a> {
         }
         match fname {
             "animate" => return Ok(Some(self.format_animate(args)?.0)),
+            "set_to_next" => return Ok(Some(self.format_set_to_next(args, span)?)),
             // `inc_lt(&mut x, n)` / `dec_gt(&mut x, n)`: the VM's increment-and-compare
             // operators (`x = x ± 1` wrapping at i16, then compare with `n` as read before the
             // store). A condition; as a statement it is an empty `if`.
@@ -8328,6 +8526,12 @@ impl<'a> TreeLowerer<'a> {
                     (V2Expr::Ident(_, n), TreeContext::SimOnObject { .. })
                         if self.is_self_ident(n) =>
                     {
+                        if self.explicit_stack_obj {
+                            return Err(Error::at(
+                                a.span,
+                                "'refresh(target: self)' cannot temporarily select self in a Sim tree using an explicit stack_obj cursor",
+                            ));
+                        }
                         "stack_obj".to_owned()
                     }
                     (V2Expr::Ident(_, n), TreeContext::SimOnObject { .. })
@@ -8423,7 +8627,7 @@ impl<'a> TreeLowerer<'a> {
         receiver: &V2Expr,
         args: &[CallArg],
         span: Span,
-    ) -> Result<(String, Option<ResolvedFunctionalSig>, String)> {
+    ) -> Result<PreparedFunctional> {
         if args.is_empty() {
             return Err(Error::at(
                 span,
@@ -8566,15 +8770,24 @@ impl<'a> TreeLowerer<'a> {
         for (i, (val, _, _)) in staged_args.iter().enumerate() {
             self.line(format!("temp[{i}] := {val};"));
         }
-        if staged_target != "stack_obj" {
+        let saved_stack_obj = if staged_target != "stack_obj" {
+            let saved = self.save_stack_obj_for_move();
             self.line(format!("stack_obj := {staged_target};"));
-        }
+            saved
+        } else {
+            None
+        };
         let prim = if change_icon {
             format!("run_functional_tree({kind_name}, change_icon: true)")
         } else {
             format!("run_functional_tree({kind_name})")
         };
-        Ok((prim, sig_opt, kind_name.clone()))
+        Ok(PreparedFunctional {
+            prim,
+            sig: sig_opt,
+            kind_name: kind_name.clone(),
+            saved_stack_obj,
+        })
     }
 
     fn emit_run_functional(
@@ -8584,7 +8797,11 @@ impl<'a> TreeLowerer<'a> {
         span: Span,
         result_local: Option<&str>,
     ) -> Result<()> {
-        let (prim, _, _) = self.prepare_run_functional(receiver, args, span)?;
+        let PreparedFunctional {
+            prim,
+            saved_stack_obj,
+            ..
+        } = self.prepare_run_functional(receiver, args, span)?;
         if let Some(dst) = result_local {
             self.line(format!("if {prim} {{"));
             self.indent += 1;
@@ -8598,7 +8815,7 @@ impl<'a> TreeLowerer<'a> {
         } else {
             self.line(format!("{prim};"));
         }
-        self.emit_restore_stack_obj();
+        self.emit_restore_stack_obj(saved_stack_obj.as_deref());
         Ok(())
     }
 
@@ -8612,14 +8829,19 @@ impl<'a> TreeLowerer<'a> {
         binding_name: &str,
         ty_ann: Option<&V2Type>,
         else_body: &[V2Stmt],
-    ) -> Result<ValueType> {
+    ) -> Result<(ValueType, Option<String>)> {
         if type_args.len() > 1 {
             return Err(Error::at(
                 span,
                 "run_functional::<T>() accepts at most 1 return type argument",
             ));
         }
-        let (prim, sig_opt, kind_name) = self.prepare_run_functional(receiver, args, span)?;
+        let PreparedFunctional {
+            prim,
+            sig: sig_opt,
+            kind_name,
+            saved_stack_obj,
+        } = self.prepare_run_functional(receiver, args, span)?;
         let is_untyped_receiver = sig_opt.is_none();
         let inferred_ty = match sig_opt {
             Some(sig) => sig.return_type.ok_or_else(|| {
@@ -8687,14 +8909,14 @@ impl<'a> TreeLowerer<'a> {
 
         self.line(format!("if !{prim} {{"));
         self.indent += 1;
-        self.emit_restore_stack_obj();
+        self.emit_restore_stack_obj(saved_stack_obj.as_deref());
         self.push_scope(ScopeFrame::block());
         let r = self.lower_stmts(else_body);
         let p = self.pop_scope_and_run_cleanups();
         self.indent -= 1;
         self.line("}".to_owned());
         r.and(p)?;
-        Ok(final_ty)
+        Ok((final_ty, saved_stack_obj))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9229,6 +9451,7 @@ impl<'a> TreeLowerer<'a> {
                     is_air_while: false,
                     owner_defer_id: c.current_defer_id,
                     cancel_flag: None,
+                    restore_stack_on_break: false,
                     continue_step: None,
                 });
                 let r = c.lower_stmts(prefix).and_then(|()| {
@@ -9292,6 +9515,7 @@ impl<'a> TreeLowerer<'a> {
                     is_air_while: true,
                     owner_defer_id: c.current_defer_id,
                     cancel_flag: None,
+                    restore_stack_on_break: false,
                     continue_step: None,
                 });
                 let r = c.lower_stmts(&fn_decl.body);
@@ -9308,6 +9532,7 @@ impl<'a> TreeLowerer<'a> {
                     is_air_while: false,
                     owner_defer_id: c.current_defer_id,
                     cancel_flag: None,
+                    restore_stack_on_break: false,
                     continue_step: None,
                 });
                 let r = c.lower_stmts(&fn_decl.body);
@@ -9322,7 +9547,7 @@ impl<'a> TreeLowerer<'a> {
         self.inline_call_stack.pop();
         res?;
         if needs_wrapper {
-            self.emit_cancel_propagation()?;
+            self.emit_cancel_propagation(false)?;
         }
         Ok(ret_val_local.map(|rv| {
             let vty = match ret_kind {
@@ -9537,40 +9762,27 @@ impl<'a> TreeLowerer<'a> {
                 if let V2Expr::Ident(bspan, bname) = base.as_ref() {
                     if self.is_self_ident(bname) {
                         if let Some(st) = self.env.states.get(field) {
-                            return Ok(LValue::Direct {
-                                air: format!("{}.attr[{}]", self.self_prefix(), st.attr_index),
-                                ty: st.ty.clone(),
-                            });
+                            return Ok(
+                                self.self_cell(&format!("attr[{}]", st.attr_index), st.ty.clone())
+                            );
                         }
                         return match field.as_str() {
-                            "graphic" => Ok(LValue::Direct {
-                                air: format!("{}.data[0]", self.self_prefix()),
-                                ty: ValueType::I16,
-                            }),
-                            "flags" => Ok(LValue::Direct {
-                                air: format!("{}.data[8]", self.self_prefix()),
-                                ty: ValueType::Bitflags(ANY_BITFLAGS.to_owned()),
-                            }),
-                            "allowed_heights" => Ok(LValue::Direct {
-                                air: format!("{}.data[4]", self.self_prefix()),
-                                ty: ValueType::Bitflags("builtin::Height".to_owned()),
-                            }),
-                            "placement" => Ok(LValue::Direct {
-                                air: format!("{}.data[42]", self.self_prefix()),
-                                ty: ValueType::Bitflags("builtin::Placement".to_owned()),
-                            }),
-                            "prep_score" => Ok(LValue::Direct {
-                                air: format!("{}.prep_score", self.self_prefix()),
-                                ty: ValueType::I16,
-                            }),
-                            "cook_score" => Ok(LValue::Direct {
-                                air: format!("{}.cook_score", self.self_prefix()),
-                                ty: ValueType::I16,
-                            }),
-                            "in_use" => Ok(LValue::Direct {
-                                air: format!("{}.in_use", self.self_prefix()),
-                                ty: ValueType::I16,
-                            }),
+                            "graphic" => Ok(self.self_cell("data[0]", ValueType::I16)),
+                            "flags" => Ok(self.self_cell(
+                                "data[8]",
+                                ValueType::Bitflags(ANY_BITFLAGS.to_owned()),
+                            )),
+                            "allowed_heights" => Ok(self.self_cell(
+                                "data[4]",
+                                ValueType::Bitflags("builtin::Height".to_owned()),
+                            )),
+                            "placement" => Ok(self.self_cell(
+                                "data[42]",
+                                ValueType::Bitflags("builtin::Placement".to_owned()),
+                            )),
+                            "prep_score" => Ok(self.self_cell("prep_score", ValueType::I16)),
+                            "cook_score" => Ok(self.self_cell("cook_score", ValueType::I16)),
+                            "in_use" => Ok(self.self_cell("in_use", ValueType::I16)),
                             "motive" | "skill" | "priority" => Err(Error::at(
                                 *span,
                                 format!(
@@ -9808,7 +10020,7 @@ impl<'a> TreeLowerer<'a> {
                         let (setup, cell) = self.sprite_flag_cell(index)?;
                         let obj_air = match self.tree_ctx {
                             TreeContext::ObjectSelf => "my.id",
-                            TreeContext::SimOnObject { .. } => "stack_obj",
+                            TreeContext::SimOnObject { .. } => self.self_stack_target(),
                         };
                         return Ok(LValue::ForeignCell {
                             obj_air: obj_air.to_owned(),
@@ -9819,10 +10031,7 @@ impl<'a> TreeLowerer<'a> {
                     }
                     if self.is_self_ident(rname) && field == "slot" {
                         let idx = self.eval_builtin_int(index, "self.slot index", 0, 255)?;
-                        return Ok(LValue::Direct {
-                            air: format!("{}.slot[{idx}]", self.self_prefix()),
-                            ty: ValueType::ObjectId,
-                        });
+                        return Ok(self.self_cell(&format!("slot[{idx}]"), ValueType::ObjectId));
                     }
                     if let Some((obj_air, maybe_sim)) = self.object_handle_air(rname)
                         && matches!(
@@ -9881,14 +10090,8 @@ impl<'a> TreeLowerer<'a> {
                     if self.is_self_ident(rname) {
                         let idx = self.eval_const_i16(index)?;
                         return match field.as_str() {
-                            "attr" => Ok(LValue::Direct {
-                                air: format!("{}.attr[{idx}]", self.self_prefix()),
-                                ty: ValueType::I16,
-                            }),
-                            "data" => Ok(LValue::Direct {
-                                air: format!("{}.data[{idx}]", self.self_prefix()),
-                                ty: ValueType::I16,
-                            }),
+                            "attr" => Ok(self.self_cell(&format!("attr[{idx}]"), ValueType::I16)),
+                            "data" => Ok(self.self_cell(&format!("data[{idx}]"), ValueType::I16)),
                             other => Err(Error::at(
                                 *span,
                                 format!("cannot index 'self.{other}[...]'"),
@@ -9986,11 +10189,12 @@ impl<'a> TreeLowerer<'a> {
                 } else {
                     rhs_air.to_owned()
                 };
+                let saved = self.save_stack_obj_for_move();
                 self.line(format!("stack_obj := {obj_air};"));
                 self.line(format!(
                     "stack.attr[{attr_index}] {op_str} {effective_rhs};"
                 ));
-                self.emit_restore_stack_obj();
+                self.emit_restore_stack_obj(saved.as_deref());
             }
             LValue::ForeignCell {
                 obj_air,
@@ -10013,12 +10217,16 @@ impl<'a> TreeLowerer<'a> {
                 if let Some(setup) = setup {
                     self.line(setup.clone());
                 }
-                if switches {
+                let saved = if switches {
+                    let saved = self.save_stack_obj_for_move();
                     self.line(format!("stack_obj := {obj_air};"));
-                }
+                    saved
+                } else {
+                    None
+                };
                 self.line(format!("{cell} {op_str} {effective_rhs};"));
                 if switches {
-                    self.emit_restore_stack_obj();
+                    self.emit_restore_stack_obj(saved.as_deref());
                 }
             }
         }
@@ -10756,16 +10964,11 @@ impl<'a> TreeLowerer<'a> {
                     if self.is_self_ident(bname) {
                         match field.as_str() {
                             "id" => {
-                                return Ok((
-                                    format!("{}.id", self.self_prefix()),
-                                    ValueType::ObjectId,
-                                ));
+                                return self
+                                    .read_lvalue(&self.self_cell("id", ValueType::ObjectId));
                             }
                             "room" => {
-                                return Ok((
-                                    format!("{}.room", self.self_prefix()),
-                                    ValueType::I16,
-                                ));
+                                return self.read_lvalue(&self.self_cell("room", ValueType::I16));
                             }
                             _ => {}
                         }
@@ -10855,6 +11058,15 @@ impl<'a> TreeLowerer<'a> {
                 type_args,
                 args,
             } => {
+                if matches!(callee.as_ref(), V2Expr::Ident(_, name) if name == "create_object")
+                    && has_create_dest(args)
+                    && !self.user_callable_named(callee, *span)?
+                {
+                    let temp = self.fresh("call");
+                    self.line(format!("let {temp} = 0;"));
+                    self.emit_bool_into_local(expr, &temp)?;
+                    return Ok((temp, ValueType::Bool));
+                }
                 if !type_args.is_empty() {
                     return Err(Error::at(
                         *span,
@@ -11099,15 +11311,19 @@ impl<'a> TreeLowerer<'a> {
                 f
             });
         }
-        if moves {
+        let saved = if moves {
+            let saved = self.save_stack_obj_for_move();
             self.line(format!("stack_obj := {target};"));
-        }
+            saved
+        } else {
+            None
+        };
         self.line(match &from {
             Some(f) => format!("get_distance_to(temp[{temp}], from: {f});"),
             None => format!("get_distance_to(temp[{temp}]);"),
         });
         if moves {
-            self.emit_restore_stack_obj();
+            self.emit_restore_stack_obj(saved.as_deref());
         }
         let tmp = self.fresh("dist");
         self.line(format!("let {tmp} = temp[{temp}];"));
@@ -11153,9 +11369,10 @@ impl<'a> TreeLowerer<'a> {
                 ty,
             } => {
                 let tmp = self.fresh("fattr");
+                let saved = self.save_stack_obj_for_move();
                 self.line(format!("stack_obj := {obj_air};"));
                 self.line(format!("let {tmp} = stack.attr[{attr_index}];"));
-                self.emit_restore_stack_obj();
+                self.emit_restore_stack_obj(saved.as_deref());
                 Ok((tmp, ty.clone()))
             }
             LValue::ForeignCell {
@@ -11171,9 +11388,10 @@ impl<'a> TreeLowerer<'a> {
                 if obj_air == "stack_obj" {
                     self.line(format!("let {tmp} = {cell};"));
                 } else {
+                    let saved = self.save_stack_obj_for_move();
                     self.line(format!("stack_obj := {obj_air};"));
                     self.line(format!("let {tmp} = {cell};"));
-                    self.emit_restore_stack_obj();
+                    self.emit_restore_stack_obj(saved.as_deref());
                 }
                 Ok((tmp, ty.clone()))
             }
@@ -11601,7 +11819,7 @@ impl<'a> TreeLowerer<'a> {
             V2Expr::Field { base, .. } => match base.as_ref() {
                 // `stack_obj.<field>` is the stack object's own cell (no switch).
                 V2Expr::Ident(_, bname) => {
-                    self.is_self_ident(bname)
+                    (self.is_self_ident(bname) && self.self_stack_target() == "stack_obj")
                         || self.is_sim_ident(bname)
                         || self.is_bcon_table_ref(bname)
                         || bname == "stack_obj"
@@ -11671,6 +11889,18 @@ impl<'a> TreeLowerer<'a> {
                 args,
                 ..
             } if method == "is_empty" && args.is_empty() => self.is_pure_single_operand(receiver),
+            // These cursor operations are a single condition node with no hoisted setup.
+            V2Expr::Call {
+                span,
+                callee,
+                type_args,
+                args,
+            } if matches!(callee.as_ref(), V2Expr::Ident(_, name)
+                    if (name == "set_to_next" && type_args.is_empty())
+                        || (name == "create_object" && has_create_dest(args))) =>
+            {
+                !self.user_callable_named(callee, *span).unwrap_or(true)
+            }
             // `inc_lt(&mut x, n)` / `dec_gt(&mut x, n)` on a direct slot is one node.
             V2Expr::Call {
                 span,
@@ -11931,6 +12161,12 @@ impl<'a> TreeLowerer<'a> {
                 type_args,
                 args,
             } => {
+                if matches!(callee.as_ref(), V2Expr::Ident(_, name) if name == "create_object")
+                    && has_create_dest(args)
+                    && !self.user_callable_named(callee, *span)?
+                {
+                    return Ok(Some(self.format_create_object(type_args, args, *span)?.0));
+                }
                 if !type_args.is_empty() {
                     return Ok(None);
                 }
@@ -12221,8 +12457,13 @@ impl<'a> TreeLowerer<'a> {
                     // pre-call value on both edges (bind the new object with
                     // `let Some(x) = create_object(...)`).
                     let (prim, _) = self.format_create_object(type_args, args, *span)?;
-                    let pre = self.fresh("pre_stack_obj");
-                    self.line(format!("let {pre} = stack_obj;"));
+                    let saved = if has_create_dest(args) {
+                        None
+                    } else {
+                        let pre = self.fresh("pre_stack_obj");
+                        self.line(format!("let {pre} = stack_obj;"));
+                        Some(pre)
+                    };
                     self.line(format!("if {prim} {{"));
                     self.indent += 1;
                     self.line(format!("{dst_local} := 1;"));
@@ -12232,7 +12473,9 @@ impl<'a> TreeLowerer<'a> {
                     self.line(format!("{dst_local} := 0;"));
                     self.indent -= 1;
                     self.line("}".to_owned());
-                    self.line(format!("stack_obj := {pre};"));
+                    if let Some(saved) = saved {
+                        self.line(format!("stack_obj := {saved};"));
+                    }
                     return Ok(());
                 }
                 if !type_args.is_empty() {
@@ -12521,15 +12764,19 @@ impl<'a> TreeLowerer<'a> {
             }
             _ => {
                 if let Some((negated, receiver, args, rspan)) = run_functional_test(expr) {
-                    let (prim, _, _) = self.prepare_run_functional(receiver, args, rspan)?;
+                    let PreparedFunctional {
+                        prim,
+                        saved_stack_obj,
+                        ..
+                    } = self.prepare_run_functional(receiver, args, rspan)?;
                     let bang = if negated { "!" } else { "" };
                     self.line(format!("if {bang}{prim} {{"));
                     self.indent += 1;
-                    self.emit_restore_stack_obj();
+                    self.emit_restore_stack_obj(saved_stack_obj.as_deref());
                     self.line("return true;".to_owned());
                     self.indent -= 1;
                     self.line("}".to_owned());
-                    self.emit_restore_stack_obj();
+                    self.emit_restore_stack_obj(saved_stack_obj.as_deref());
                     self.line("return false;".to_owned());
                     return Ok(());
                 }
@@ -12689,7 +12936,7 @@ impl<'a> TreeLowerer<'a> {
     /// `play_sound(sound [, target] [, flags: N])`. The target is `self` (the object), `sim`,
     /// `stack_obj`, or a literal `bool` (`true` = the stack object, as in `.air`); by default the
     /// object. Flag 0x02 is the target's, so `flags:` may not set it.
-    fn format_play_sound(&self, args: &[CallArg], span: Span) -> Result<String> {
+    fn format_play_sound(&self, args: &[CallArg], span: Span) -> Result<(String, bool)> {
         let bound = self.bind_builtin_args("play_sound", args, &["sound", "target"], &["flags"])?;
         let Some(sound) = bound.get("sound") else {
             return Err(Error::at(
@@ -12698,13 +12945,14 @@ impl<'a> TreeLowerer<'a> {
             ));
         };
         let sound_id = self.resolve_sound_expr(&sound.value)?;
+        let on_self = self.sound_targets_self(bound.get("target").copied());
         let on_stack = match bound.get("target") {
             Some(t) => self.sound_target_is_stack_obj("play_sound", &t.value)?,
             None => matches!(self.tree_ctx, TreeContext::SimOnObject { .. }),
         };
         let Some(f) = bound.get("flags") else {
             let target = if on_stack { "stack_obj" } else { "false" };
-            return Ok(format!("play_sound({sound_id}, {target})"));
+            return Ok((format!("play_sound({sound_id}, {target})"), on_self));
         };
         let flags = self.eval_builtin_int(&f.value, "play_sound flags", 0, 255)?;
         if flags & 0x02 != 0 {
@@ -12721,7 +12969,7 @@ impl<'a> TreeLowerer<'a> {
                 "play_sound flags 0xFD with the stack object as target encode as 0xFF, which the VM plays on the running object",
             ));
         }
-        Ok(format!("play_sound({sound_id}, flags: {flags})"))
+        Ok((format!("play_sound({sound_id}, flags: {flags})"), on_self))
     }
 
     /// Whether a sound primitive's target is the stack object (its flag) rather than `me`.
@@ -12740,13 +12988,20 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
-    fn format_stop_all_sounds(&self, args: &[CallArg], _span: Span) -> Result<String> {
+    fn sound_targets_self(&self, target: Option<&CallArg>) -> bool {
+        target.is_none_or(|arg| matches!(&arg.value, V2Expr::Ident(_, n) if self.is_self_ident(n)))
+    }
+
+    fn format_stop_all_sounds(&self, args: &[CallArg]) -> Result<(String, bool)> {
         let bound = self.bind_builtin_args("stop_all_sounds", args, &["target"], &[])?;
         let use_stack = match bound.get("target") {
             Some(t) => self.sound_target_is_stack_obj("stop_all_sounds", &t.value)?,
             None => matches!(self.tree_ctx, TreeContext::SimOnObject { .. }),
         };
-        Ok(format!("stop_all_sounds({use_stack})"))
+        Ok((
+            format!("stop_all_sounds({use_stack})"),
+            self.sound_targets_self(bound.get("target").copied()),
+        ))
     }
 
     fn format_alter_budget(
@@ -12865,6 +13120,78 @@ impl<'a> TreeLowerer<'a> {
         })
     }
 
+    fn require_stack_obj_dest(prim: &str, arg: &CallArg) -> Result<()> {
+        if matches!(&arg.value, V2Expr::Ident(_, name) if name == "stack_obj") {
+            Ok(())
+        } else {
+            Err(Error::at(
+                arg.span,
+                format!("{prim}(dest:) expects stack_obj"),
+            ))
+        }
+    }
+
+    /// Steps the current stack object without initializing or restoring it. The explicit
+    /// destination spelling preserves the AIR primitive's destination flag in the operand.
+    fn format_set_to_next(&self, args: &[CallArg], span: Span) -> Result<String> {
+        let bound =
+            self.bind_builtin_args("set_to_next", args, &["mode", "guid"], &["dest", "local"])?;
+        let mode_arg = bound
+            .get("mode")
+            .ok_or_else(|| Error::at(span, "set_to_next() requires a mode"))?;
+        let mode = match &mode_arg.value {
+            V2Expr::Ident(_, name) => match name.as_str() {
+                "all" => 0,
+                "person" => 1,
+                "non_person" => 2,
+                "part" | "tile" => 3,
+                "guid" => 4,
+                "neighbor" => 5,
+                "category" => 6,
+                "neighbor_guid" => 7,
+                "on_tile" => 8,
+                "beside" => 9,
+                "career" => 10,
+                "family" => 12,
+                _ => self.eval_builtin_int(&mode_arg.value, "set_to_next mode", 0, 12)?,
+            },
+            expr => self.eval_builtin_int(expr, "set_to_next mode", 0, 12)?,
+        };
+        let mut air = format!("set_to_next({mode}");
+        if let Some(arg) = bound.get("guid") {
+            let guid = self.resolve_guid_expr(&arg.value)?;
+            let _ = write!(air, ", guid: {guid:#010x}");
+        }
+        if let Some(arg) = bound.get("dest") {
+            Self::require_stack_obj_dest("set_to_next", arg)?;
+            air.push_str(", dest: stack_obj");
+        }
+        match (mode, bound.get("local")) {
+            (9, Some(arg)) => {
+                let local = match &arg.value {
+                    V2Expr::Ident(_, name) => match self.lookup_var(name) {
+                        Some(Binding::Local { air_name, ty }) if ty.is_object_handle() => {
+                            air_name.clone()
+                        }
+                        _ => self.builtin_local_arg(&arg.value, "set_to_next(local:)")?,
+                    },
+                    _ => self.builtin_local_arg(&arg.value, "set_to_next(local:)")?,
+                };
+                let _ = write!(air, ", local: {local}");
+            }
+            (9, None) => return Err(Error::at(span, "set_to_next(beside) requires 'local:'")),
+            (_, Some(arg)) => {
+                return Err(Error::at(
+                    arg.span,
+                    "only set_to_next(beside) reads 'local:'",
+                ));
+            }
+            _ => {}
+        }
+        air.push(')');
+        Ok(air)
+    }
+
     fn format_create_object(
         &self,
         type_args: &[V2Type],
@@ -12931,6 +13258,7 @@ impl<'a> TreeLowerer<'a> {
                 ));
             }
             match arg.name.as_deref() {
+                Some("dest") => Self::require_stack_obj_dest("create_object", arg)?,
                 Some("local") => {
                     local = Some((
                         arg.span,
@@ -12961,7 +13289,7 @@ impl<'a> TreeLowerer<'a> {
                 None => {
                     return Err(Error::at(
                         arg.span,
-                        "extra create_object arguments must be named ('mode:', 'flags:', 'local:')",
+                        "extra create_object arguments must be named ('mode:', 'flags:', 'local:', 'dest:')",
                     ));
                 }
             }
@@ -13896,6 +14224,7 @@ fn stmts_mutate_or_borrow_ident_in(stmts: &[V2Stmt], target_name: &str, w: &[&st
             binding,
             iter,
             body,
+            else_body,
             ..
         } => {
             binding == target_name
@@ -13908,6 +14237,9 @@ fn stmts_mutate_or_borrow_ident_in(stmts: &[V2Stmt], target_name: &str, w: &[&st
                     _ => false,
                 }
                 || stmts_mutate_or_borrow_ident_in(body, target_name, w)
+                || else_body
+                    .as_deref()
+                    .is_some_and(|body| stmts_mutate_or_borrow_ident_in(body, target_name, w))
         }
         V2Stmt::If {
             cond,
@@ -14153,6 +14485,7 @@ fn loop_body_breaks(stmts: &[V2Stmt]) -> bool {
         V2Stmt::Match { arms, .. } => arms.iter().any(|a| loop_body_breaks(&a.body)),
         V2Stmt::WithLock { body, .. } | V2Stmt::Defer { body, .. } => loop_body_breaks(body),
         V2Stmt::LetSome { else_body, .. } => loop_body_breaks(else_body),
+        V2Stmt::ForEach { else_body, .. } => else_body.as_deref().is_some_and(loop_body_breaks),
         _ => false,
     })
 }
@@ -14169,6 +14502,7 @@ fn stmts_exit_loop(stmts: &[V2Stmt]) -> bool {
         V2Stmt::Match { arms, .. } => arms.iter().any(|a| stmts_exit_loop(&a.body)),
         V2Stmt::WithLock { body, .. } | V2Stmt::Defer { body, .. } => stmts_exit_loop(body),
         V2Stmt::LetSome { else_body, .. } => stmts_exit_loop(else_body),
+        V2Stmt::ForEach { else_body, .. } => else_body.as_deref().is_some_and(stmts_exit_loop),
         V2Stmt::RawAir { code, .. } => code.contains("break") || code.contains("continue"),
         _ => false,
     })
@@ -14203,8 +14537,10 @@ fn stmts_have_return(stmts: &[V2Stmt]) -> bool {
         | V2Stmt::Defer { body, .. }
         | V2Stmt::Repeat { body, .. }
         | V2Stmt::While { body, .. }
-        | V2Stmt::ForEach { body, .. }
         | V2Stmt::Animate { body, .. } => stmts_have_return(body),
+        V2Stmt::ForEach {
+            body, else_body, ..
+        } => stmts_have_return(body) || else_body.as_deref().is_some_and(stmts_have_return),
         V2Stmt::LetSome { else_body, .. } => stmts_have_return(else_body),
         V2Stmt::If {
             then_body,
@@ -14251,6 +14587,15 @@ fn stmts_always_return(
             }
             V2Stmt::WithLock { body, .. }
                 if stmts_always_return(body, env, owner_module, allow_local) =>
+            {
+                return true;
+            }
+            V2Stmt::ForEach {
+                body,
+                else_body: Some(else_body),
+                ..
+            } if !stmts_exit_loop(body)
+                && stmts_always_return(else_body, env, owner_module, allow_local) =>
             {
                 return true;
             }
@@ -14454,7 +14799,10 @@ fn expr_may_clobber_stack_obj(
     match expr {
         V2Expr::Call { callee, args, .. } => {
             if let V2Expr::Ident(_, fname) = callee.as_ref() {
-                if matches!(fname.as_str(), "find_best_object" | "create_object") {
+                if matches!(
+                    fname.as_str(),
+                    "find_best_object" | "create_object" | "set_to_next"
+                ) {
                     return true;
                 }
                 // `distance_to` points `stack_obj` at its target unless that already is it.
@@ -14632,6 +14980,74 @@ fn expr_may_clobber_stack_obj(
         }),
         _ => false,
     }
+}
+
+/// Look through inline helpers as well as the tree body. The cursor may be displaced at a
+/// control-flow join or on a loop back edge, so use the same storage rules throughout the tree.
+#[derive(Default)]
+struct ExplicitStackOps {
+    visited: BTreeSet<(String, String, bool)>,
+}
+
+impl ExplicitStackOps {
+    fn in_stmts(
+        &mut self,
+        stmts: &[V2Stmt],
+        env: &ObjectEnv<'_>,
+        owner: &str,
+        local: bool,
+    ) -> bool {
+        stmts.iter().any(|stmt| {
+            super::specialize::stmt_exprs(stmt)
+                .into_iter()
+                .any(|expr| self.in_expr(expr, env, owner, local))
+                || matches!(stmt, V2Stmt::Animate { .. } if self.in_call("animate", &[], env, owner, local))
+                || super::specialize::stmt_bodies(stmt)
+                    .into_iter()
+                    .any(|body| self.in_stmts(body, env, owner, local))
+        })
+    }
+
+    fn in_expr(&mut self, expr: &V2Expr, env: &ObjectEnv<'_>, owner: &str, local: bool) -> bool {
+        let mut found = false;
+        super::specialize::visit_expr(expr, &mut |expr| {
+            if !found
+                && let V2Expr::Call { callee, args, .. } = expr
+                && let V2Expr::Ident(_, name) = callee.as_ref()
+            {
+                found = self.in_call(name, args, env, owner, local);
+            }
+        });
+        found
+    }
+
+    fn in_call(
+        &mut self,
+        name: &str,
+        args: &[CallArg],
+        env: &ObjectEnv<'_>,
+        owner: &str,
+        local: bool,
+    ) -> bool {
+        if local && env.trees.contains_key(name) {
+            return false; // A separate BHAV frame has its own stack object.
+        }
+        if let Some((module, decl, is_local)) = env.lookup_fn(owner, name, local) {
+            self.visited.insert((module.clone(), decl.name, is_local))
+                && (self.in_stmts(&decl.body, env, &module, is_local)
+                    || decl
+                        .params
+                        .iter()
+                        .filter_map(|p| p.default.as_ref())
+                        .any(|expr| self.in_expr(expr, env, &module, is_local)))
+        } else {
+            name == "set_to_next" || (name == "create_object" && has_create_dest(args))
+        }
+    }
+}
+
+fn has_create_dest(args: &[CallArg]) -> bool {
+    args.iter().any(|arg| arg.name.as_deref() == Some("dest"))
 }
 
 fn make_slug(name: &str) -> String {
