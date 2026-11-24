@@ -7,7 +7,7 @@
 //! (`World::trip_request`). The original's main loop finds the request
 //! between ticks and leaves the house; here [`Game`] stops ticking and
 //! [`NeighborhoodShell::pump_trip_request`] departs with
-//! `travel::depart_from_request`. The trip must depart once: no second fare
+//! `travel::depart_from_request_with`. The trip must depart once: no second fare
 //! and no second set of saved-state tokens, which the shell's own departure
 //! for the lot pick (`depart_to_destination`) would add.
 //!
@@ -289,7 +289,9 @@ fn the_phones_go_downtown_leaves_the_lot_once_through_the_shell() {
 }
 
 /// A house opened without its neighborhood cannot travel: the host declines
-/// the trip ([`Game::decline_trip`]) and the lot plays on.
+/// the trip ([`Game::decline_trip`]) and the lot plays on. The lot drops the
+/// request (`Lot::cancel_trip_request`) with the saved state routine 17
+/// wrote for it, so the script's tail restores nothing from it.
 #[test]
 fn a_declined_trip_lets_the_lot_play_on() {
     let Some(root) = install_root() else {
@@ -334,11 +336,25 @@ fn a_declined_trip_lets_the_lot_play_on() {
     assert_eq!(trip.leader_guid, leader_guid);
     assert_eq!(game.run(1), 0, "a tick ran with a trip pending");
 
-    game.decline_trip();
+    assert!(
+        !tokens_of(&game, leader_guid).is_empty(),
+        "routine 17 saved the caller's state"
+    );
+    let dropped = game.decline_trip().expect("the request is dropped");
+    assert_eq!(dropped, trip);
     assert!(game.trip_request().is_none());
+    assert!(
+        game.lot().world().trip_request.is_none(),
+        "the lot dropped the request"
+    );
+    assert_eq!(
+        tokens_of(&game, leader_guid),
+        [],
+        "the saved state routine 17 wrote was taken back"
+    );
     assert_eq!(game.run(30), 30, "the lot plays on");
     assert!(
         game.trip_request().is_none(),
-        "the declined trip stays declined"
+        "the dropped trip is not asked for again"
     );
 }

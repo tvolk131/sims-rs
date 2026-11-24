@@ -567,6 +567,10 @@ pub struct NeighborhoodShell {
     migration_report: Option<StoreMigrationReport>,
     migration_error: Option<String>,
     options_file: PathBuf,
+    /// The neighborhood record ([`StoredNeighborhood::instance_id`] and
+    /// [`StoredNeighborhood::revision`]) last written as `Neighborhood.iff`
+    /// ([`NeighborhoodShell::neighborhood_iff_path`]), or the one opened.
+    neighborhood_iff_synced: Option<(String, u128, u64)>,
     options_state: OptionsState,
     saved_optn: Vec<u8>,
     play: bool,
@@ -961,6 +965,11 @@ impl NeighborhoodShell {
             migration_report,
             migration_error,
             options_file,
+            neighborhood_iff_synced: Some((
+                neighborhood_id.clone(),
+                stored.instance_id,
+                stored.revision,
+            )),
             options_state,
             saved_optn,
             play,
@@ -4225,6 +4234,7 @@ impl NeighborhoodShell {
 
         // Replace live session only after the reconciled boot succeeded.
         self.stored = snapshot.neighborhood;
+        self.sync_neighborhood_iff();
         self.screen = ActiveScreen::Lot(Box::new(LotSession {
             game,
             neighborhood_id: self.neighborhood_id.clone(),
@@ -4340,6 +4350,7 @@ impl NeighborhoodShell {
         } else {
             self.stored.revision = report.revision;
         }
+        self.sync_neighborhood_iff();
         // Mirror the exact committed `Saved` bytes into the crash-safe manual slot
         // on the background worker so F9 and Save Manager share one source of truth.
         if let Err(err) = self.autosave_worker.enqueue_saved_lot_bytes(
@@ -4560,6 +4571,11 @@ impl NeighborhoodShell {
         self.neighborhood_id = id;
         self.kind = kind;
         self.map = map;
+        self.neighborhood_iff_synced = Some((
+            self.neighborhood_id.clone(),
+            stored.instance_id,
+            stored.revision,
+        ));
         self.stored = stored;
         self.family_names = family_names;
         self.street_names = street_names;
@@ -5129,7 +5145,57 @@ impl NeighborhoodShell {
         self.refresh_importable_families();
         self.sync_travel_state();
         self.refresh_hovered_lot();
+        self.sync_neighborhood_iff();
         Ok(())
+    }
+
+    /// Where the shell keeps the open neighborhood's `Neighborhood.iff`:
+    /// `<saves>.userdata/<neighborhood id>/Neighborhood.iff`, beside the
+    /// saves file, never in the install. The original saves it to its
+    /// `UserData` folder whenever the neighborhood changes
+    /// (cTSNeighborhood::Save, 0x4252cc).
+    pub fn neighborhood_iff_path(&self) -> PathBuf {
+        self.neighborhood_iff_dir().join("Neighborhood.iff")
+    }
+
+    fn neighborhood_iff_dir(&self) -> PathBuf {
+        self.saves_path
+            .with_extension("userdata")
+            .join(&self.neighborhood_id)
+    }
+
+    /// Writes the open neighborhood's committed record as `Neighborhood.iff`
+    /// ([`NeighborhoodStore::save_neighborhood_iff`]) once a commit has
+    /// changed it: a lot save, a trip, a family moved or evicted. The
+    /// original saves it at those points (0x4252cc's callers: the lot save
+    /// 0x428687 at 0x428819, the eviction 0x42737e at 0x4273e2, the trip at
+    /// 0x45a818, the family screens). REDB stays the store: a write that
+    /// fails is reported and does not undo the commit, and the next commit
+    /// tries again.
+    fn sync_neighborhood_iff(&mut self) {
+        let key = (
+            self.neighborhood_id.clone(),
+            self.stored.instance_id,
+            self.stored.revision,
+        );
+        if self.neighborhood_iff_synced.as_ref() == Some(&key) {
+            return;
+        }
+        let dir = self.neighborhood_iff_dir();
+        let written = std::fs::create_dir_all(&dir)
+            .map_err(|e| e.to_string())
+            .and_then(|()| {
+                self.store
+                    .save_neighborhood_iff(&self.neighborhood_id, &dir)
+                    .map_err(|e| e.to_string())
+            });
+        if let Err(err) = written {
+            eprintln!(
+                "sims-game: could not write {}: {err}",
+                dir.join("Neighborhood.iff").display()
+            );
+        }
+        self.neighborhood_iff_synced = Some(key);
     }
 
     fn refresh_hovered_lot(&mut self) {
@@ -6962,6 +7028,7 @@ impl NeighborhoodShell {
         let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
         let next_music = sound::lot_music_mode(game.mode(), game.lot().lot_id());
         self.stored = snapshot.neighborhood;
+        self.sync_neighborhood_iff();
         self.screen = ActiveScreen::Lot(Box::new(LotSession {
             game,
             neighborhood_id: self.neighborhood_id.clone(),
@@ -7273,17 +7340,25 @@ impl NeighborhoodShell {
 
     /// Carries out the trip a script on the open lot asked for with Generic
     /// Sims Call 17 ([`Game::trip_request`]), as the original's main loop
-    /// does when it finds the request between ticks: the phone's Go
-    /// Downtown, for one. The departure is [`vm_travel::depart_from_request`]:
-    /// routine 17 already wrote the travelers' tokens and the script paid
-    /// the fare. True if there was a request to carry out or refuse.
+    /// does when it finds the request between ticks. True if there was a
+    /// request to carry out or refuse.
     ///
-    /// The lot picker the script asked with recorded the same destination
-    /// ([`Game::take_pending_travel_lot`]); that record is dropped, so the
-    /// trip departs once. A trip the shell cannot make (co-op, already
-    /// away, editing a destination, or a house that is no destination)
-    /// shows a notice and is declined ([`Game::decline_trip`]), and the lot
-    /// goes on.
+    /// - **From home** (the phone's Go Downtown, the Magic Hole...): the
+    ///   departure is [`vm_travel::depart_from_request_with`]. Routine 17
+    ///   already wrote the travelers' tokens and the script paid the fare.
+    ///   The lot picker the script asked with recorded the same destination
+    ///   ([`Game::take_pending_travel_lot`]) and gives the transport
+    ///   ([`picker_transport`]), which the arrival places the travelers by.
+    ///   The shell's answers and frames boot the destination, as for a trip
+    ///   it plans itself.
+    /// - **Home from a destination** (a destination script's Go Home, which
+    ///   asks for house -1, resolved by 0x45a22d to the family's house): the
+    ///   return is [`vm_travel::return_from_request`].
+    ///
+    /// A trip the shell cannot make (co-op, a trip from a destination to
+    /// another, editing a destination, a house that is no destination, or a
+    /// departure or return the VM refuses) shows a notice and is declined
+    /// ([`Game::decline_trip`]): the lot drops the request and goes on.
     pub fn pump_trip_request(&mut self) -> bool {
         let ActiveScreen::Lot(session) = &mut self.screen else {
             return false;
@@ -7295,22 +7370,24 @@ impl NeighborhoodShell {
             return false;
         };
         let house = u32::try_from(trip.house).unwrap_or(0);
-        // The lot pick the script asked with only says how the trip goes, for
-        // the loading screen, and only when the trip goes to the lot picked.
-        // The pick is dropped either way, so a stale one never colours a
-        // later trip.
+        // The lot pick the script asked with only says how the trip goes, and
+        // only when the trip goes to the lot picked. The pick is dropped
+        // either way, so a stale one never colours a later trip.
         let transport = session
             .game
             .take_pending_travel_lot()
             .filter(|&(_, lot)| lot == house)
             .and_then(|(picker, _)| picker_transport(&picker));
+        let home = session.active_trip.as_ref().map(|t| t.home_house);
         let refusal = if session.game.coop_active() {
             Some("Leave the co-op session before traveling to a destination.".to_owned())
-        } else if session.active_trip.is_some() {
+        } else if home.is_some_and(|home| home != house) {
             Some("Return home before starting another destination trip.".to_owned())
         } else if session.is_destination_edit {
             Some("Travel is unavailable while editing a destination lot.".to_owned())
-        } else if TravelDestination::classify(house, &self.stored.zoning).is_none() {
+        } else if home.is_none()
+            && TravelDestination::classify(house, &self.stored.zoning).is_none()
+        {
             Some(format!("Lot {} is not a travel destination.", trip.house))
         } else {
             None
@@ -7320,14 +7397,20 @@ impl NeighborhoodShell {
             report_travel_refusal(&mut self.screen, msg);
             return true;
         }
-        if let Err(err) = self.depart(Departure::Trip { house, transport })
+        let failed = if home.is_some() {
+            self.return_home(true)
+                .err()
+                .map(|err| format!("Could not return home to lot {house}: {err}"))
+        } else {
+            self.depart(Departure::Trip { house, transport })
+                .err()
+                .map(|err| format!("Could not travel to lot {house}: {err}"))
+        };
+        if let Some(msg) = failed
             && let ActiveScreen::Lot(session) = &mut self.screen
         {
             session.game.decline_trip();
-            report_travel_refusal(
-                &mut self.screen,
-                format!("Could not travel to lot {house}: {err}"),
-            );
+            report_travel_refusal(&mut self.screen, msg);
         }
         true
     }
@@ -7392,11 +7475,17 @@ impl NeighborhoodShell {
                     session.game.lot_mut(),
                     request,
                 ),
-                Departure::Trip { .. } => vm_travel::depart_from_request(
+                Departure::Trip { transport, .. } => vm_travel::depart_from_request_with(
                     &self.install_root,
                     &self.store,
                     &nh_id,
                     session.game.lot_mut(),
+                    &vm_travel::TripDeparture {
+                        transport: *transport,
+                        answers: self.answers.clone(),
+                        frames: self.frames.clone(),
+                        view_centre: None,
+                    },
                 ),
             };
             match departed {
@@ -7481,6 +7570,7 @@ impl NeighborhoodShell {
         let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
         let next_music = sound::lot_music_mode(game.mode(), game.lot().lot_id());
         self.stored = next_stored;
+        self.sync_neighborhood_iff();
         self.screen = ActiveScreen::Lot(Box::new(LotSession {
             game,
             neighborhood_id: nh_id,
@@ -7508,6 +7598,14 @@ impl NeighborhoodShell {
     /// Returns the traveling household from the active destination lot back to
     /// their reconciled home lot via [`vm_travel::return_from_destination`].
     pub fn return_from_destination(&mut self) -> Result<ReturnReport, String> {
+        self.return_home(false)
+    }
+
+    /// Returns home from the active destination lot: through the trip home
+    /// a script asked for ([`vm_travel::return_from_request`]) when
+    /// `requested`, else as the shell's own Go Home
+    /// ([`vm_travel::return_from_destination`]).
+    fn return_home(&mut self, requested: bool) -> Result<ReturnReport, String> {
         self.note = None;
         let (nh_id, trip) = match &self.screen {
             ActiveScreen::Lot(session) => {
@@ -7537,14 +7635,26 @@ impl NeighborhoodShell {
                 self.stop_load_audio(fallback);
                 return Err("no active travel destination lot is open".into());
             };
-            match vm_travel::return_from_destination(
-                &self.install_root,
-                &self.store,
-                &trip,
-                session.game.lot_mut(),
-                &self.answers,
-                self.frames.clone(),
-            ) {
+            let returned = if requested {
+                vm_travel::return_from_request(
+                    &self.install_root,
+                    &self.store,
+                    &trip,
+                    session.game.lot_mut(),
+                    &self.answers,
+                    self.frames.clone(),
+                )
+            } else {
+                vm_travel::return_from_destination(
+                    &self.install_root,
+                    &self.store,
+                    &trip,
+                    session.game.lot_mut(),
+                    &self.answers,
+                    self.frames.clone(),
+                )
+            };
+            match returned {
                 Ok(ret) => ret,
                 Err(err) => {
                     let fallback = self.desired_music_mode();
@@ -7617,6 +7727,7 @@ impl NeighborhoodShell {
         let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
         let next_music = sound::lot_music_mode(game.mode(), game.lot().lot_id());
         self.stored = next_stored;
+        self.sync_neighborhood_iff();
         self.screen = ActiveScreen::Lot(Box::new(LotSession {
             game,
             neighborhood_id: nh_id,
@@ -7741,6 +7852,7 @@ impl NeighborhoodShell {
         let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
         let next_music = sound::lot_music_mode(game.mode(), game.lot().lot_id());
         self.stored = snapshot.neighborhood;
+        self.sync_neighborhood_iff();
         self.screen = ActiveScreen::Lot(Box::new(LotSession {
             game,
             neighborhood_id: self.neighborhood_id.clone(),
@@ -8108,8 +8220,9 @@ enum Departure {
     Request(TravelRequest),
     /// The trip a script asked for with Generic Sims Call 17, to `house`,
     /// whose tokens and fare the script already took care of
-    /// ([`vm_travel::depart_from_request`]). `transport` is the way the lot
-    /// picker showed, which only picks the loading screen.
+    /// ([`vm_travel::depart_from_request_with`]). `transport` is the way the
+    /// lot picker showed: the arrival places the travelers by it, and it
+    /// picks the loading screen.
     Trip {
         house: u32,
         transport: Option<vm_travel::TravelTransport>,

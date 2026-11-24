@@ -438,9 +438,9 @@ pub struct Game {
     /// for how the trip goes.
     pending_travel_lot: Option<(SpecialPanelRequest, u32)>,
     /// The trip a script asked for ([`sims_sim::World::trip_request`]) that
-    /// the host could not carry out ([`Game::decline_trip`]). The lot keeps
-    /// it, as `sims_vm` clears a request only on departure, so ticks go on
-    /// while the pending request is this one.
+    /// the host declined in co-op ([`Game::decline_trip`]). Co-op cannot drop
+    /// the request from one peer's world without the lockstep, so the lot
+    /// keeps it and ticks go on while the pending request is this one.
     declined_trip: Option<sims_sim::TripRequest>,
     /// Neighborhood / destination lot metadata passed by `NeighborhoodShell`
     /// (populated lazily from `Install` on standalone launches).
@@ -2821,16 +2821,26 @@ impl Game {
 
     /// Lets the lot go on without carrying out the pending trip
     /// ([`Game::trip_request`]): a lot without a neighborhood, or a trip the
-    /// host refused.
+    /// host refused. Returns the request dropped, if any.
     ///
-    /// The lot keeps the request: `sims_vm` clears it only on departure. A
-    /// later Generic Sims Call 17 does not replace a pending request; it only
-    /// adds the neighbors it saved (`saved`). So the trip stays declined,
-    /// whatever later calls add, until the lot is left or reloaded. A retry
-    /// needs the VM to drop the request (a `Lot::cancel_trip_request`, not
-    /// yet in sims-vm).
-    pub fn decline_trip(&mut self) {
-        self.declined_trip = self.lot.world().trip_request.clone();
+    /// The lot drops the request ([`Lot::cancel_trip_request`]) and takes
+    /// back the saved-state tokens routine 17 wrote for it, so the script's
+    /// tail on this lot restores nothing from them and a later Generic Sims
+    /// Call 17 asks again. The original has no refusal: its main loop always
+    /// leaves the house (0x4fc713).
+    ///
+    /// In co-op the world changes only through the lockstep, so the request
+    /// stays in the lot and is only marked declined here. A later Generic
+    /// Sims Call 17 does not replace a pending request; it only adds the
+    /// neighbors it saved (`saved`). So the trip stays declined, whatever
+    /// later calls add, until the lot is left or reloaded.
+    pub fn decline_trip(&mut self) -> Option<sims_sim::TripRequest> {
+        if self.coop.is_active_or_starting() {
+            self.declined_trip = self.lot.world().trip_request.clone();
+            return self.declined_trip.clone();
+        }
+        self.declined_trip = None;
+        self.lot.cancel_trip_request()
     }
 
     /// Enables or disables `--debug` mode (which shows the maroon top

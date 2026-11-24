@@ -3720,8 +3720,8 @@ fn run_still(game: &mut Game, ticks: u32) -> u32 {
             "sims-game: tick {ran}: a script asked to travel to house {} (caller {}); a headless still stays on the lot",
             trip.house, trip.caller
         );
-        // Once declined the trip is not reported again. Another needs a
-        // tick to ask for it, so the loop ends when no tick runs.
+        // Declining drops the request. Another needs a tick to ask for
+        // it, so the loop ends when no tick runs.
         game.decline_trip();
         if ran == ticks {
             break;
