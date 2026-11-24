@@ -276,6 +276,7 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
                 .map(|e| crate::v2::compile_expanded_v2_object(e).ok())
                 .collect()
         });
+        let frames = frames.map(|f| verified_frames(f, compiled.as_deref()));
         let mut cx = FileLinter {
             file: &input.name,
             lines: input.source.lines().collect(),
@@ -285,6 +286,7 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             frames,
             object: None,
             strings: BTreeMap::new(),
+            dialog_strings: Vec::new(),
             tree: None,
             self_handles: BTreeSet::new(),
             diags: Vec::new(),
@@ -493,18 +495,32 @@ fn block_end_line(tokens: &[crate::v2::lexer::Token], line: usize) -> Option<usi
     if tokens[open].kind != TokenKind::LBrace {
         return None;
     }
+    // Through the matching `}`, and on through an `else` / `else if` chain.
     let mut depth = 0usize;
-    for t in &tokens[open..] {
-        match t.kind {
+    let mut i = open;
+    while i < tokens.len() {
+        match tokens[i].kind {
             TokenKind::LBrace => depth += 1,
             TokenKind::RBrace => {
-                depth -= 1;
+                depth = depth.checked_sub(1)?;
                 if depth == 0 {
-                    return Some(t.span.line);
+                    let is_else = tokens
+                        .get(i + 1)
+                        .is_some_and(|t| matches!(&t.kind, TokenKind::Ident(w) if w == "else"));
+                    if !is_else {
+                        return Some(tokens[i].span.line);
+                    }
+                    // Skip to the next arm's `{`.
+                    i += 1;
+                    while i < tokens.len() && tokens[i].kind != TokenKind::LBrace {
+                        i += 1;
+                    }
+                    continue;
                 }
             }
             _ => {}
         }
+        i += 1;
     }
     None
 }
@@ -616,7 +632,7 @@ impl Symbols {
                             self.raw_words.insert(w.to_owned());
                         }
                     }
-                    for (word, n) in raw_index_words(code) {
+                    for (word, n) in raw_index_words(&strip_air_comments(code)) {
                         if !matches!(word, "local" | "temp" | "param") {
                             self.raw_index_literals.insert(n);
                         }
@@ -1050,6 +1066,8 @@ struct FileLinter<'a> {
     object: Option<String>,
     /// The linted object's `strings` entries: name -> text.
     strings: BTreeMap<String, String>,
+    /// Its dialog strings (`STR#` 301), in order: a dialog's numeric string is 1-based.
+    dialog_strings: Vec<String>,
     /// The tree being linted.
     tree: Option<TreeCx>,
     /// Locals holding this object's own handle (`let saved = stack_obj;` before any
@@ -1378,9 +1396,20 @@ impl FileLinter<'_> {
                         .flatten()
                         .map(|(_, name, text)| (name.clone(), text.clone()))
                         .collect();
+                    self.dialog_strings = o
+                        .members
+                        .iter()
+                        .find_map(|m| match m {
+                            ObjectMember::Strings(s) if s.id == 301 => {
+                                Some(s.entries.iter().map(|(_, _, t)| t.clone()).collect())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
                     self.lint_members(&o.members, false);
                     self.object = None;
                     self.strings.clear();
+                    self.dialog_strings.clear();
                 }
                 V2Item::Template(t) => self.lint_members(&t.members, true),
                 _ => {}
@@ -1503,7 +1532,7 @@ impl FileLinter<'_> {
     }
 
     fn lint_body(&mut self, body: &[V2Stmt], cx: BodyCx) {
-        self.lint_list(body, false);
+        self.lint_list(body, false, false);
         if cx.sim {
             self.self_handles.clear();
             self.clobber_walk(body, None);
@@ -1532,6 +1561,7 @@ impl FileLinter<'_> {
         let mut tokens: BTreeMap<usize, Vec<(Span, String, String)>> = BTreeMap::new();
         let mut lets = BTreeSet::new();
         let strings = &self.strings;
+        let dialog_strings = &self.dialog_strings;
         let mut note = |span: Span, text: &str, from: String| {
             for (token, slot) in local_tokens(text) {
                 tokens
@@ -1549,13 +1579,31 @@ impl FileLinter<'_> {
                 }
                 _ => {}
             }
+            // Strings reach a primitive as call arguments: a literal, a `strings`
+            // entry's name, or (for a dialog) its 1-based number in `STR#` 301.
+            let mut args: Vec<(&str, &CallArg)> = Vec::new();
+            if let V2Stmt::Animate { args: a, .. } = s {
+                args.extend(a.iter().map(|a| ("animate", a)));
+            }
             for e in stmt_exprs(s) {
                 walk_expr(e, &mut |x| match x {
+                    V2Expr::Call {
+                        callee, args: a, ..
+                    } => {
+                        let name = match callee.as_ref() {
+                            V2Expr::Ident(_, n) => n.as_str(),
+                            _ => "",
+                        };
+                        args.extend(a.iter().map(|a| (name, a)));
+                    }
+                    V2Expr::MethodCall { args: a, .. } => args.extend(a.iter().map(|a| ("", a))),
+                    _ => {}
+                });
+            }
+            for (callee, a) in args {
+                match &a.value {
                     V2Expr::Str(span, text) => note(*span, text, "this string".to_owned()),
-                    V2Expr::Ident(span, name)
-                    | V2Expr::Field {
-                        span, field: name, ..
-                    } if strings.contains_key(name) => {
+                    V2Expr::Ident(span, name) if strings.contains_key(name) => {
                         note(*span, &strings[name], format!("string `{name}`"));
                     }
                     V2Expr::Path(span, segments) => {
@@ -1565,8 +1613,16 @@ impl FileLinter<'_> {
                             note(*span, text, format!("string `{name}`"));
                         }
                     }
+                    V2Expr::Int(span, n) if callee == "dialog" && *n > 0 => {
+                        if let Some(text) = usize::try_from(*n - 1)
+                            .ok()
+                            .and_then(|i| dialog_strings.get(i))
+                        {
+                            note(*span, text, format!("dialog string {n}"));
+                        }
+                    }
                     _ => {}
-                });
+                }
             }
         });
         self.tree = Some(TreeCx {
@@ -1677,7 +1733,11 @@ impl FileLinter<'_> {
         if t.sim_binding.is_none() || !t.params.is_empty() {
             return;
         }
-        let args = t.frame.as_ref().and_then(|f| f.args).map_or(0, usize::from);
+        // A pinned `@frame(args:)` declares the frame (a read past it does not compile).
+        if t.frame.as_ref().is_some_and(|f| f.args.is_some()) {
+            return;
+        }
+        let args = 0usize;
         let mut hit: Option<(Span, i64)> = None;
         walk_stmts(&t.body, &mut |s| {
             if let V2Stmt::RawAir { span, code } = s {
@@ -1698,19 +1758,20 @@ impl FileLinter<'_> {
             MISSING_SIM_FRAME_ARGS,
             at,
             format!(
-                "this Sim tree's `raw` block reads `param[{n}]`, but the tree has {args} argument word(s)"
+                "this Sim tree's `raw` block reads `param[{n}]`, but the tree declares no argument words"
             ),
             Some(format!(
-                "pin `@frame(args: {})` on the tree: `(sim: Sim)` is the frame's Sim, not an argument word",
+                "declare its arguments: pin `@frame(args: {})` (or the original's count), or declare the parameters; `(sim: Sim)` is the frame's Sim, not an argument word",
                 n + 1
             )),
             None,
-            Some("`raw` is not checked against the frame, so this compiles; the tree's header then declares fewer arguments than its caller passes (a lifted tree keeps the original's `@frame(args:)` for this)".to_owned()),
+            Some("the compiled header takes its argument count from the raw read alone, and v2 callers pass no argument words; a lifted tree keeps the original's `@frame(args:)` so the count matches".to_owned()),
         );
     }
 
-    /// Lints one statement list. `elif` marks the `else if` tail of a chain checked above.
-    fn lint_list(&mut self, list: &[V2Stmt], elif: bool) {
+    /// Lints one statement list. `elif` marks the `else if` tail of a chain checked above. `follows`: whether code runs after the list ends (it
+    /// is nested in a list that goes on, or is a loop body).
+    fn lint_list(&mut self, list: &[V2Stmt], elif: bool, follows: bool) {
         for (i, s) in list.iter().enumerate() {
             if !(elif && i == 0) {
                 self.collapsible_chain(s);
@@ -1718,8 +1779,9 @@ impl FileLinter<'_> {
             self.lint_stmt(s);
             self.redundant_bool_return(list, i);
             self.negated_comparison(list, i);
+            let after = i + 1 < list.len() || follows;
             if let V2Stmt::RawAir { span, code } = s
-                && i + 1 < list.len()
+                && after
             {
                 self.raw_bare_call(*span, code);
             }
@@ -1730,13 +1792,18 @@ impl FileLinter<'_> {
                     else_body,
                     ..
                 } => {
-                    self.lint_list(then_body, false);
+                    self.lint_list(then_body, false, after);
                     let is_elif = matches!(else_body.as_slice(), [V2Stmt::If { .. }]);
-                    self.lint_list(else_body, is_elif);
+                    self.lint_list(else_body, is_elif, after);
                 }
                 other => {
+                    // A loop body goes back to its test.
+                    let looped = matches!(
+                        other,
+                        V2Stmt::While { .. } | V2Stmt::Repeat { .. } | V2Stmt::ForEach { .. }
+                    );
                     for b in stmt_blocks(other) {
-                        self.lint_list(b, false);
+                        self.lint_list(b, false, after || looped);
                     }
                 }
             }
@@ -1969,7 +2036,15 @@ impl FileLinter<'_> {
     /// Reports the first `self` after `stack_obj` is reassigned, once per reassignment.
     /// Returns whether `list` ends the clobbered state (a `stack_obj = self` restore, or a
     /// report) anywhere.
-    fn clobber_walk(&mut self, list: &[V2Stmt], mut clobbered: Option<Span>) -> bool {
+    fn clobber_walk(&mut self, list: &[V2Stmt], clobbered: Option<Span>) -> bool {
+        // Handles saved in this list are its own: a nested block's do not leak out.
+        let outer = self.self_handles.clone();
+        let ended = self.clobber_walk_list(list, clobbered);
+        self.self_handles = outer;
+        ended
+    }
+
+    fn clobber_walk_list(&mut self, list: &[V2Stmt], mut clobbered: Option<Span>) -> bool {
         let finds_best = |e: &V2Expr| {
             let mut found = false;
             walk_expr(e, &mut |x| {
@@ -2304,7 +2379,8 @@ impl FileLinter<'_> {
             let Some(rest) = t.strip_prefix("call") else {
                 return;
             };
-            if !rest.starts_with(char::is_whitespace) {
+            // `call N(..) -> true: @a, false: @b;` names its own edges.
+            if !rest.starts_with(char::is_whitespace) || rest.contains("->") {
                 return;
             }
             let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2687,45 +2763,61 @@ fn hex_guid(v: i64) -> String {
     format!("0x{:04X}_{:04X}", (v >> 16) & 0xFFFF, v & 0xFFFF)
 }
 
-/// The builtins whose arguments can name a local they write (as v2 lowering's list).
-const LOCAL_WRITING_BUILTINS: &[&str] =
-    &["random_into", "animate", "set_headline", "push_interaction"];
+/// The builtins with an argument naming a local the VM writes.
+const LOCAL_WRITING_BUILTINS: &[&str] = &["random_into", "animate"];
 
-/// Whether argument `k` of a call to the builtin `callee` is a local it writes:
-/// `random_into`'s first positional argument, the others' `local:` / `icon:`.
+/// Whether argument `k` of a call to the builtin `callee` is a local the VM writes:
+/// `random_into`'s first positional argument, `animate`'s event `local:`.
+/// (`set_headline(local:)` and `push_interaction(icon:)` read theirs.)
 fn writes_arg(callee: &str, args: &[CallArg], k: usize) -> bool {
     match callee {
         "random_into" => args.iter().position(|a| a.name.is_none()) == Some(k),
-        "animate" | "set_headline" | "push_interaction" => {
-            matches!(args[k].name.as_deref(), Some("local" | "icon"))
-        }
+        "animate" => args[k].name.as_deref() == Some("local"),
         _ => false,
     }
 }
 
-/// Whether a statement runs at least one node before control can leave it (so the
-/// node before it is not the tree's last result). Conservative: a `let` or a store to a
-/// plain local may be optimized away.
+/// Whether a statement surely runs at least one node before control can leave it (so
+/// the node before it is not the tree's last result). Conservative: anything the
+/// optimizer might fold or drop (a `let`, a store to a local, a test of constants)
+/// does not count.
 fn runs_a_node(s: &V2Stmt) -> bool {
+    // A call or a read of a place (`self.level`, `temp[0]`) cannot be folded away.
+    let live = |e: &V2Expr| {
+        let mut found = false;
+        walk_expr(e, &mut |x| {
+            found |= matches!(
+                x,
+                V2Expr::Call { .. }
+                    | V2Expr::MethodCall { .. }
+                    | V2Expr::Field { .. }
+                    | V2Expr::Index { .. }
+            );
+        });
+        found
+    };
     match s {
-        V2Stmt::Return { value, .. } => !matches!(value, None | Some(V2Expr::Bool(..))),
+        V2Stmt::Return { value, .. } => value.as_ref().is_some_and(live),
+        V2Stmt::Assign { target, value, .. } => {
+            !matches!(target, V2Expr::Ident(..))
+                && print_expr(target).is_none_or(|t| print_expr(value).is_none_or(|v| t != v))
+        }
+        V2Stmt::If { cond, .. } | V2Stmt::While { cond, .. } => live(cond),
+        V2Stmt::Match { scrutinee, .. } => live(scrutinee),
+        V2Stmt::Expr { expr, .. } => matches!(
+            expr,
+            V2Expr::Call { .. } | V2Expr::MethodCall { .. } | V2Expr::Try { .. }
+        ),
+        V2Stmt::LetSome { .. } | V2Stmt::WithLock { .. } | V2Stmt::Animate { .. } => true,
         V2Stmt::ReturnError { .. }
         | V2Stmt::Break { .. }
         | V2Stmt::Continue { .. }
         | V2Stmt::Let { .. }
         | V2Stmt::LetUninit { .. }
         | V2Stmt::Defer { .. }
-        | V2Stmt::RawAir { .. } => false,
-        V2Stmt::Assign { target, .. } => !matches!(target, V2Expr::Ident(..)),
-        V2Stmt::LetSome { .. }
-        | V2Stmt::WithLock { .. }
+        | V2Stmt::RawAir { .. }
         | V2Stmt::Repeat { .. }
-        | V2Stmt::While { .. }
-        | V2Stmt::ForEach { .. }
-        | V2Stmt::If { .. }
-        | V2Stmt::Match { .. }
-        | V2Stmt::Expr { .. }
-        | V2Stmt::Animate { .. } => true,
+        | V2Stmt::ForEach { .. } => false,
     }
 }
 
@@ -2733,28 +2825,31 @@ fn runs_a_node(s: &V2Stmt) -> bool {
 fn raw_index_words(code: &str) -> Vec<(&str, i64)> {
     let mut out = Vec::new();
     for (pos, _) in code.match_indices('[') {
-        let word_start = code[..pos]
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        // Identifier bytes are ASCII, so the byte after the last other byte starts a char.
+        let word_start = code.as_bytes()[..pos]
+            .iter()
+            .rposition(|&b| !(b.is_ascii_alphanumeric() || b == b'_'))
             .map_or(0, |n| n + 1);
         let word = &code[word_start..pos];
         let Some(len) = code[pos + 1..].find(']') else {
             continue;
         };
-        let inner = code[pos + 1..pos + 1 + len].trim();
-        let n = match inner
-            .strip_prefix("0x")
-            .or_else(|| inner.strip_prefix("0X"))
-        {
-            Some(hex) => i64::from_str_radix(&hex.replace('_', ""), 16).ok(),
-            None => inner.replace('_', "").parse().ok(),
-        };
-        if let Some(n) = n
+        if let Some(n) = parse_air_int(code[pos + 1..pos + 1 + len].trim())
             && !word.is_empty()
         {
             out.push((word, n));
         }
     }
     out
+}
+
+/// An `.air` integer literal: decimal or `0x` hex, `_` separators allowed.
+fn parse_air_int(text: &str) -> Option<i64> {
+    let text = text.replace('_', "");
+    match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        Some(hex) => i64::from_str_radix(hex, 16).ok(),
+        None => text.parse().ok(),
+    }
 }
 
 /// The `$Local:N` / `$TimeLocal:N` tokens of a string: `(token, N)`.
@@ -2818,7 +2913,9 @@ fn local_culprits(frame: &AirFrame) -> Option<String> {
 }
 
 /// The frames of a lowered `.air` file's trees. Named locals take slots in declaration
-/// order after the highest explicit `local[N]` (`.air` lowering's rule).
+/// order after the highest explicit `local[N]` (`.air` lowering's rule). Other forms can
+/// reserve slots too (numeric primitive locals), so the caller keeps a frame only when
+/// the compiled tree has exactly as many locals ([`verified_frames`]).
 fn parse_air_frames(air: &str) -> Vec<AirFrame> {
     fn header(line: &str) -> Option<(u16, String)> {
         let mut parts = line.splitn(3, ' ');
@@ -2832,7 +2929,7 @@ fn parse_air_frames(air: &str) -> Vec<AirFrame> {
         let label = &label[..label.find('"')?];
         Some((id, label.to_owned()))
     }
-    fn frame(id: u16, label: String, body: &str) -> AirFrame {
+    fn frame(id: u16, label: String, body: &str) -> Option<AirFrame> {
         let code = strip_air_comments(body);
         let mut lets = Vec::new();
         let mut explicit: Option<usize> = None;
@@ -2857,14 +2954,13 @@ fn parse_air_frames(air: &str) -> Vec<AirFrame> {
                 }
                 let word = &code[start..i];
                 if word == "local" && code[i..].trim_start().starts_with('[') {
-                    let rest = code[i..].trim_start();
-                    let digits: String = rest[1..]
-                        .trim_start()
-                        .chars()
-                        .take_while(char::is_ascii_digit)
-                        .collect();
-                    if let Ok(n) = digits.parse::<usize>() {
-                        explicit = Some(explicit.map_or(n, |m| m.max(n)));
+                    let rest = &code[i..].trim_start()[1..];
+                    let inner = rest.split(']').next().unwrap_or("").trim();
+                    match parse_air_int(inner).map(usize::try_from) {
+                        // A frame holds at most 255 locals; anything else is the
+                        // compiler's to reject.
+                        Some(Ok(n)) if n < 256 => explicit = Some(explicit.map_or(n, |m| m.max(n))),
+                        _ => return None,
                     }
                     prev = None;
                     continue;
@@ -2887,12 +2983,12 @@ fn parse_air_frames(air: &str) -> Vec<AirFrame> {
             .map(|n| format!("local[{n}]"))
             .chain(lets)
             .collect();
-        AirFrame {
+        Some(AirFrame {
             id,
             label,
             slots,
             raw_slots,
-        }
+        })
     }
     let mut out = Vec::new();
     let mut current: Option<(u16, String, String)> = None;
@@ -2900,7 +2996,7 @@ fn parse_air_frames(air: &str) -> Vec<AirFrame> {
         if let Some((_, _, body)) = &mut current {
             if line == "}" {
                 let (id, label, body) = current.take().expect("open tree");
-                out.push(frame(id, label, &body));
+                out.extend(frame(id, label, &body));
             } else {
                 body.push_str(line);
                 body.push('\n');
@@ -2910,6 +3006,38 @@ fn parse_air_frames(air: &str) -> Vec<AirFrame> {
         }
     }
     out
+}
+
+/// Keeps the frames whose slot count is the compiled tree's local count, so a slot
+/// layout the scan got wrong (a reserved slot it does not see, `@frame(locals:)`) is
+/// dropped rather than trusted.
+fn verified_frames(
+    frames: BTreeMap<String, Vec<AirFrame>>,
+    compiled: Option<&[crate::compile::CompiledObject]>,
+) -> BTreeMap<String, Vec<AirFrame>> {
+    let single = frames.len() == 1;
+    frames
+        .into_iter()
+        .map(|(name, list)| {
+            let obj = compiled.and_then(|objects| {
+                objects
+                    .iter()
+                    .find(|o| o.name == name)
+                    .or_else(|| objects.first().filter(|_| single && objects.len() == 1))
+            });
+            let kept = list
+                .into_iter()
+                .filter(|f| {
+                    obj.is_some_and(|o| {
+                        o.behaviors
+                            .values()
+                            .any(|b| b.id == f.id && usize::from(b.locals) == f.slots.len())
+                    })
+                })
+                .collect();
+            (name, kept)
+        })
+        .collect()
 }
 
 /// Expands a lint input's objects, or `None` when it does not expand on its own.

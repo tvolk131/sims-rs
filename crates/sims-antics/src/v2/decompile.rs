@@ -368,6 +368,8 @@ struct Model {
     original_sounds: BTreeMap<u16, String>,
     /// Behaviour-relevant non-code chunks of the original, as the VM reads them.
     original_resources: BTreeMap<([u8; 4], u16), Vec<u8>>,
+    /// The original's string tables, as the VM reads their text.
+    original_strings: BTreeMap<u16, Option<StringTexts>>,
     library_arities: BTreeMap<u16, usize>,
 }
 
@@ -774,6 +776,7 @@ impl Model {
             ctx_original,
             original_sounds,
             original_resources: resource_chunks(iff),
+            original_strings: string_texts(iff),
             library_arities: options.library_arities.clone(),
         })
     }
@@ -819,6 +822,7 @@ impl Model {
             ctx,
             sounds: fwav_sounds(&iff),
             resources: resource_chunks(&iff),
+            strings: string_texts(&iff),
             attributes: objd_attributes(&iff),
         })
     }
@@ -837,6 +841,11 @@ impl Model {
         // The checker does not model sounds: a tree that plays one whose event the
         // decompiled object names differently cannot be proven.
         if let Some(gap) = self.sound_gap(&t.original, recompiled) {
+            return TreeCheck::Inconclusive(gap);
+        }
+        // Nor does it read string tables: a tree that shows one the decompiled object
+        // does not reproduce byte for byte is not proven by its code alone.
+        if let Some(gap) = self.string_gap(&t.original, recompiled) {
             return TreeCheck::Inconclusive(gap);
         }
         // Byte comparisons prove nothing when the tree runs against different constants
@@ -893,6 +902,21 @@ impl Model {
                 .iter()
                 .filter(|i| i.opcode >= 0x100)
                 .all(|i| callee(a, i.opcode) == callee(b, i.opcode))
+    }
+
+    /// Why `tree`'s strings may differ: a Show String (21) or Set Action String (50)
+    /// naming a `STR#` table, or a private Dialog (36, `STR#` 301), whose table the
+    /// recompiled object does not reproduce (its texts, per language, in order).
+    fn string_gap(&self, tree: &BhavChunk, recompiled: &RecompiledFile) -> Option<String> {
+        tree.instructions
+            .iter()
+            .filter_map(|i| match i.opcode {
+                21 | 50 => Some(u16::from_le_bytes([i.operands[0], i.operands[1]])),
+                36 => Some(301),
+                _ => None,
+            })
+            .find(|id| self.original_strings.get(id) != recompiled.strings.get(id))
+            .map(|id| format!("reads STR# {id}, which the decompiled object does not reproduce"))
     }
 
     /// Why `tree`'s sounds may differ: a Play Sound Event (primitive 23) naming an FWAV
@@ -1125,7 +1149,31 @@ struct RecompiledFile {
     ctx: LiveContext,
     sounds: BTreeMap<u16, String>,
     resources: BTreeMap<([u8; 4], u16), Vec<u8>>,
+    strings: BTreeMap<u16, Option<StringTexts>>,
     attributes: Option<u16>,
+}
+
+/// A string table's entries as the VM reads them: language and text bytes (comments
+/// and the table's encoding are not observable).
+type StringTexts = Vec<(u8, Vec<u8>)>;
+
+/// Each `STR#` chunk's texts (`None`: it does not parse), the last chunk of an id winning.
+fn string_texts(iff: &Iff) -> BTreeMap<u16, Option<StringTexts>> {
+    iff.chunks
+        .iter()
+        .filter(|c| &c.tag == b"STR#")
+        .map(|c| {
+            let texts = StringTable::parse_chunk(iff.data(c), c.flags)
+                .ok()
+                .map(|t| {
+                    t.entries
+                        .into_iter()
+                        .map(|e| (e.language, e.raw_text))
+                        .collect()
+                });
+            (c.id, texts)
+        })
+        .collect()
 }
 
 /// Removes bytes that these v2 spellings drop and the VM never reads. Leave the

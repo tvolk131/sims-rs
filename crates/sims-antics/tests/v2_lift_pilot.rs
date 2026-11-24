@@ -313,3 +313,46 @@ object "Fable Remote" {
     assert!(lifted.contains("fn dial_adjust() -> bool;"), "{lifted}");
     assert!(lifted.contains("globals::dial_adjust()"), "{lifted}");
 }
+
+#[test]
+fn trees_showing_text_the_lift_does_not_write_are_inconclusive() {
+    // The lift writes no `strings`, so a tree reading a table the original has cannot
+    // prove: the rebuilt object shows different (no) text.
+    let iff = compile(
+        r#"object "Fable Sign" {
+    guid: 0x7E00_00A4;
+    strings 301 "Dialog prim string set" { ask = "Go on?", head = "Sign" }
+    strings 431 "Action labels" { a = "Read", b = "Wave" }
+    @id(4300) tree confirm {
+        dialog(kind: yes_no, message: ask, title: head)?;
+    }
+    @id(4301) tree label {
+        action_label(table: 431, index: 2);
+    }
+    @id(4302) tree plain {
+        temp[0] = 1;
+    }
+}"#,
+    );
+    let report = decompile_iff_to_v2_report(&iff, &DecompileV2Options::default()).expect("lift");
+    let check = |id: u16| {
+        &report
+            .trees
+            .iter()
+            .find(|t| t.id == id)
+            .unwrap_or_else(|| panic!("tree {id} in {:?}", report.trees))
+            .check
+    };
+    for (id, table) in [(4300, 301), (4301, 431)] {
+        match check(id) {
+            TreeCheck::Inconclusive(why) => {
+                assert!(why.contains(&format!("STR# {table}")), "{why}");
+            }
+            other => panic!("tree {id}: {other:?}"),
+        }
+    }
+    assert!(matches!(
+        check(4302),
+        TreeCheck::Identical | TreeCheck::Equivalent
+    ));
+}

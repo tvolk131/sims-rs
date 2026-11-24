@@ -467,6 +467,13 @@ fn restored_or_object_context_self_is_fine() {
         d.help.as_deref().unwrap().contains("stack_obj.<field>"),
         "{d:?}"
     );
+    // A handle saved in a nested block does not outlive it: the outer `saved` is the Sim.
+    one(
+        &sim_tree(
+            "        let saved = sim;\n        if self.level > 0 {\n            let saved = stack_obj;\n            sleep(1);\n        }\n        stack_obj = sim;\n        stack_obj = saved;\n        self.level = 1;",
+        ),
+        "stack_obj_clobber_after_self",
+    );
     // A restore inside a nested block ends the clobber.
     none(
         &sim_tree(
@@ -585,6 +592,13 @@ fn builtins_that_write_a_local_assign_it() {
     );
     none(&source, "uninitialized_local_read");
     none(&source, "unused_decl");
+    // `set_headline(local:)` reads its local.
+    one(
+        &sim_tree(
+            "        let x: i16;\n        set_headline(kind: 1, index: 0, duration: 5, options: 0, local: x);\n        self.level = x;",
+        ),
+        "uninitialized_local_read",
+    );
     // A read in another argument of the same call still counts as a read.
     let source = tree(
         "        let roll: i16;\n        random_into(roll, roll)?;\n        self.level = roll;",
@@ -645,6 +659,34 @@ fn a_string_token_past_the_frame_is_flagged() {
     );
 }
 
+#[test]
+fn string_tokens_follow_hex_raw_locals_and_numeric_dialog_strings() {
+    // `local[0x2]` reserves slots 0..=2; the `random` temporary is 3, `shown` 4.
+    let hex = |token: &str| {
+        dialog_tree(
+            &format!("you got $Local:{token}"),
+            "        raw { local[0x2] := 3; }\n        let shown = random(7);",
+        )
+    };
+    none(&hex("4"), "unused_decl");
+    none(&hex("4"), "dialog_local_slot_mismatch");
+    let d = one(&hex("3"), "dialog_local_slot_mismatch");
+    assert!(d.message.contains("compiler temporary"), "{d:?}");
+    // A dialog's numeric string is 1-based into `STR#` 301.
+    let numeric = obj(
+        "    strings 301 \"Dialog prim string set\" { hi = \"you got $Local:4\" }\n    tree probe \"Probe\" (sim: Sim) {\n        self.level = 0;\n        self.mode = Mode::Off;\n        let shown = random(7);\n        dialog(kind: 0, message: 1, title: 1)?;\n    }",
+    );
+    let d = one(&numeric, "dialog_local_slot_mismatch");
+    assert!(d.message.contains("dialog string 1"), "{d:?}");
+    // A state with a string's name is not the string.
+    none(
+        &obj(
+            "    strings 301 \"Dialog prim string set\" { hi = \"you got $Local:4\" }\n    state hi: i16;\n    tree probe \"Probe\" {\n        self.level = 0;\n        self.mode = Mode::Off;\n        self.hi = 1;\n    }",
+        ),
+        "dialog_local_slot_mismatch",
+    );
+}
+
 // --- raw_bare_call_false_exit -------------------------------------------------------------
 
 #[test]
@@ -683,6 +725,37 @@ fn guarded_or_final_raw_calls_are_fine() {
     }
 }
 
+#[test]
+fn raw_calls_with_their_own_edges_or_nested_in_an_arm() {
+    let wrap = |body: &str| {
+        obj(&format!(
+            "    @id(4300) tree probe \"Probe\" {{\n        self.mode = Mode::Off;\n{body}\n    }}\n    @id(4301) tree other \"Other\" {{ return true; }}"
+        ))
+    };
+    // The call names both edges.
+    none(
+        &wrap(
+            "        raw { call 4301(temps) -> true: true, false: true; }\n        self.level = 1;",
+        ),
+        "raw_bare_call_false_exit",
+    );
+    // Last in an `if` arm, but the code after the `if` follows it.
+    let source = wrap(
+        "        if self.level > 0 {\n            raw { call 4301(temps); }\n        }\n        self.level = 1;",
+    );
+    one(&source, "raw_bare_call_false_exit");
+    // Last in a loop body: the loop's test follows it.
+    one(
+        &wrap("        while self.level > 0 {\n            raw { call 4301(temps); }\n        }"),
+        "raw_bare_call_false_exit",
+    );
+    // Last in an arm that is last in the tree: the false exit is the tree's own.
+    none(
+        &wrap("        if self.level > 0 {\n            raw { call 4301(temps); }\n        }"),
+        "raw_bare_call_false_exit",
+    );
+}
+
 // --- missing_sim_frame_args ---------------------------------------------------------------
 
 #[test]
@@ -690,11 +763,19 @@ fn a_sim_tree_reading_param_in_raw_without_frame_args_is_flagged() {
     let source = sim_tree("        raw { temp[0] := param[1]; }\n        sim.motive[1] = 1;");
     let d = one(&source, "missing_sim_frame_args");
     assert!(d.message.contains("`param[1]`"), "{d:?}");
+    assert!(d.message.contains("declares no argument words"), "{d:?}");
     assert!(
         d.help.as_deref().unwrap().contains("@frame(args: 2)"),
         "{d:?}"
     );
-    // Pinned arguments, an object-context tree, or declared parameters: fine.
+    // Pinned arguments (any count: the frame is declared), an object-context tree, or
+    // declared parameters: fine.
+    none(
+        &obj(
+            "    @frame(args: 1) tree probe \"Probe\" (sim: Sim) {\n        self.level = 0;\n        self.mode = Mode::Off;\n        raw { temp[0] := param[1]; }\n        sim.motive[1] = 1;\n    }",
+        ),
+        "missing_sim_frame_args",
+    );
     none(
         &obj(
             "    @frame(args: 2) tree probe \"Probe\" (sim: Sim) {\n        self.level = 0;\n        self.mode = Mode::Off;\n        raw { temp[0] := param[1]; }\n        sim.motive[1] = 1;\n    }",
@@ -723,6 +804,18 @@ fn a_const_written_as_its_value_in_raw_is_used() {
         ),
         "unused_decl",
     );
+}
+
+#[test]
+fn odd_raw_text_does_not_crash_the_linter() {
+    // A non-ASCII comment before `[`, and an index no frame can hold.
+    for raw in [
+        "        raw { # caf\u{e9}[2]\n            temp[0] := 1; }",
+        "        raw { local[9223372036854775807] := 1; }",
+        "        raw { local[0x7FFF_FFFF_FFFF_FFFF] := 1; }",
+    ] {
+        let _ = lint_v2_source(&tree(raw), "probe.antics");
+    }
 }
 
 #[test]
@@ -1008,6 +1101,8 @@ fn negated_comparisons_a_branch_may_end_on_are_fine() {
         "        if !(self.level == 3) { return true; }\n        sleep(1);",
         "        if !(self.level == 3) { sleep(1); }\n        return false;",
         "        while !(self.level > 3) { self.level += 1; }",
+        // A test of constants folds away: the `return` right after is the next node.
+        "        if !(self.level == 3) {\n            if true { return true; }\n        }\n        sleep(1);",
     ] {
         none(&tree(body), "negated_comparison");
     }

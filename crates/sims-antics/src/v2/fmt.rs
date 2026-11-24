@@ -154,6 +154,8 @@ struct Tok {
     class: Class,
     /// For `Raw`: trivia (comments) between `raw` and `{`, verbatim.
     raw_prefix: Vec<(String, bool)>,
+    /// For `Raw`: line breaks from `raw` to its closing `}`.
+    raw_lines: usize,
     leading: Vec<Comment>,
     /// Line breaks between the previous item (token or comment) and this token.
     newlines_before: usize,
@@ -194,6 +196,7 @@ fn scan(source: &str) -> Result<Scanned> {
             text: source[start..end].to_owned(),
             class,
             raw_prefix: Vec::new(),
+            raw_lines: 0,
             leading: comments,
             newlines_before: newlines,
         };
@@ -212,6 +215,7 @@ fn scan(source: &str) -> Result<Scanned> {
                         .map(|c| (c.text.trim_end().to_owned(), c.is_line))
                         .collect();
                     tok.text = source[brace + 1..body_end].to_owned();
+                    tok.raw_lines = source[pos..body_end].matches('\n').count();
                     pos = body_end + 1;
                 }
             }
@@ -237,21 +241,17 @@ fn reattach_end_of_line_comments(s: &mut Scanned) {
     if n == 0 {
         return;
     }
-    // Source line of each token (a raw block's own lines are not tracked: `None` after one).
+    // Source line of each token (a raw block's: the line of its closing `}`).
     let mut line = Vec::with_capacity(n);
-    let mut at = Some(0usize);
+    let mut at = 0usize;
     for t in toks {
-        at = at.map(|l| {
-            l + t.newlines_before
-                + t.leading
-                    .iter()
-                    .map(|c| c.newlines_before + c.text.matches('\n').count())
-                    .sum::<usize>()
-        });
-        line.push(at);
-        if t.class == Class::Raw {
-            at = None;
-        }
+        at += t.newlines_before
+            + t.leading
+                .iter()
+                .map(|c| c.newlines_before + c.text.matches('\n').count())
+                .sum::<usize>()
+            + t.raw_lines;
+        line.push(Some(at));
     }
     let a = analyze(toks);
     let mut moves: Vec<(usize, usize)> = Vec::new(); // (from token j, to token o + 1)
