@@ -571,3 +571,81 @@ fn what_the_import_path_does_not_port_fails_loudly() {
         "0x425244",
     );
 }
+
+/// A `Patch` file of a houseless family `id` whose `FAMI` lists `members`
+/// and which exports nobody (`EXPi` names no member).
+fn patch_listing(name: &str, id: u16, members: &[u32]) -> Patch {
+    fn header(tag: &[u8; 4], version: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(0u32.to_le_bytes());
+        bytes.extend(version.to_le_bytes());
+        bytes.extend(tag);
+        bytes
+    }
+    fn chunk(file: &mut Vec<u8>, tag: &[u8; 4], id: u16, data: &[u8]) {
+        file.extend(tag);
+        file.extend(((76 + data.len()) as u32).to_be_bytes());
+        file.extend(id.to_be_bytes());
+        file.extend([0; 66]);
+        file.extend(data);
+    }
+    let mut iff = vec![0; 64];
+    iff[..13].copy_from_slice(b"IFF FILE 2.5:");
+    let mut family = header(b"IMAF", 7);
+    for word in [0, 0, 0, 0, 0, 0, members.len() as u32] {
+        family.extend(word.to_le_bytes());
+    }
+    for guid in members {
+        family.extend(guid.to_le_bytes());
+    }
+    chunk(&mut iff, b"FAMI", id, &family);
+    let mut name_table = Vec::new();
+    name_table.extend((-3_i16).to_le_bytes());
+    name_table.extend(1u16.to_le_bytes());
+    name_table.push(1);
+    name_table.extend(b"Name\0\0");
+    chunk(&mut iff, b"FAMs", id, &name_table);
+    let mut export = header(b"iPXE", 0x3f);
+    for word in [id, 0, 0, 0, 0, 0, 0, 0, 0] {
+        export.extend(word.to_le_bytes());
+    }
+    export.push(1);
+    chunk(&mut iff, b"EXPi", 0, &export);
+    let mut neighbors = header(b"SRBN", 63);
+    neighbors.extend(0u32.to_le_bytes());
+    chunk(&mut iff, b"NBRS", 1, &neighbors);
+    Patch {
+        name: name.to_owned(),
+        file: FamilyFile::parse(&iff).unwrap(),
+    }
+}
+
+#[test]
+fn the_preview_gets_an_inventory_for_a_member_who_has_a_record() {
+    // The preview (0x4e29f5) counts the file's family's MagiCoins in the
+    // open neighborhood (0x4e1b93 → 0x410282): Bob has a record (3) and no
+    // inventory, so he gets an empty one at the end of the vector. The
+    // member with no record is skipped.
+    let catalog = catalog();
+    let registry = [registered(ANNE, 2), registered(BOB, 2), registered(PET, 2)];
+    let mut neighborhood = small();
+    neighborhood.families.remove(&4000);
+    neighborhood.families.insert(8, family(1, &[ANNE]));
+    let patch = patch_listing("Visitor_9.FAM", 9, &[0x0bad_0001, BOB]);
+    let result = open(
+        &mut neighborhood,
+        std::slice::from_ref(&patch),
+        &small_context(&catalog, &registry, PETS),
+        &mut no_draws,
+    );
+    let inventories: Vec<(i16, usize)> = neighborhood
+        .inventories
+        .iter()
+        .map(|inventory| {
+            let inventory = inventory.as_ref().unwrap();
+            (inventory.neighbor, inventory.items.len())
+        })
+        .collect();
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(inventories, [(3, 0)]);
+}
