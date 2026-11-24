@@ -5805,14 +5805,19 @@ fn lockstep_suffices(
         .any(|ins| arity(ctx_a, ins.opcode) != arity(ctx_b, ins.opcode))
 }
 
-/// The callees both sides' files say read no call operand bytes
-/// ([`LiveContext::argless_callees`]).
+/// The callees both sides say read no call operand bytes
+/// ([`LiveContext::call_reads_no_operands`]).
 fn shared_argless(ctx_a: &LiveContext, ctx_b: &LiveContext) -> Option<BTreeSet<u16>> {
     let (a, b) = (
         ctx_a.argless_callees.as_ref()?,
         ctx_b.argless_callees.as_ref()?,
     );
-    Some(a.intersection(b).copied().collect())
+    Some(
+        a.intersection(b)
+            .copied()
+            .filter(|&id| ctx_a.call_reads_no_operands(id) && ctx_b.call_reads_no_operands(id))
+            .collect(),
+    )
 }
 
 /// Checks two trees with the lockstep checker first and, when it cannot prove them

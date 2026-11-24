@@ -50,6 +50,12 @@ if `canonicalize_primitive_operands` gives the same answer for it as for the pla
 encoding (`verify::apply_operand_pad`). A clause that changes nothing is refused, as
 is one that touches a byte the VM reads.
 
+That guarantee covers running the padded primitive itself. An instruction placed
+right after a call with more than four arguments also supplies that call's later
+arguments, and a hand-written `pad` there changes them. The checkers compare such
+spilled bytes raw, and strict lifting rebuilds them exactly, so this cannot hide a
+difference. It is still the author's business when writing `pad` by hand.
+
 Strict lifting runs the same function in reverse (`verify::operand_pad_for`). When
 the raw bytes do not decode, it decodes their canonical form and adds the clause that
 rebuilds the raw bytes. It prefers `pad 0xNN`.
@@ -68,6 +74,8 @@ live checkers, and relaxed lifting, already use, and each of its arms cites its
   bits, but the dialog record left in the world copies all eight operand bytes
   (`dialog.rs`), and the world comparison includes those records. The earlier mask
   let the lockstep checker equate two dialogs that leave different records.
+  Relaxed lifting no longer drops the bit either: a dialog with it set stays a raw
+  `op` in both modes.
 
 Because it is generic, the clause also spells padding on opcodes outside the five
 above. The install round trip checks every such instruction byte for byte.
@@ -108,7 +116,10 @@ bytes. `LiveContext::argless_callees` lists such trees. Both checkers compare a 
 to one of them as `[0xff; 8]`, in events, in fault points, and in node-for-node
 lockstep pairing.
 
-The list is the intersection of the two sides' lists. For a whole file
+A context's listing counts only when its own `callee_arities` gives that tree 0
+arguments (`LiveContext::call_reads_no_operands`), so a caller of the public API
+cannot pair the listing with a contradicting count. The list is the intersection of
+the two sides' lists. For a whole file
 (`check_iff_equivalent`), it holds:
 
 - the file's own private trees that the VM keeps (the last copy wins);

@@ -1286,7 +1286,9 @@ fn decode_named(
             Some(DecodedIns::always_true(head))
         }
         36 => {
-            if strict && ops[5] & 0x80 != 0 {
+            // `.air` cannot spell bit 7 of byte 5, and the VM keeps it: the dialog record
+            // copies every operand byte (`dialog.rs`), so neither mode drops it.
+            if ops[5] & 0x80 != 0 {
                 return None;
             }
             let kind = ops[5] & 0x7F;

@@ -2848,3 +2848,46 @@ fn last_result_is_kept_for_trees_outside_any_interaction_table() {
     let report = check_iff_equivalent(&file(0), &file(1), &opts).expect("check");
     assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
 }
+
+/// A context that lists a tree as argument-free while giving it arguments is not
+/// trusted: the operands are compared.
+#[test]
+fn argless_listing_needs_a_zero_argument_count() {
+    let call = |ops| tree(4096, 0, 0, vec![prim(0x1000, ops, T, F)]);
+    let (a, b) = (call([0; 8]), call([1, 0, 0, 0, 0, 0, 0, 0]));
+    let ctx = |arity: Option<usize>| LiveContext {
+        callee_arities: arity.map(|n| [(0x1000, n)].into_iter().collect()),
+        argless_callees: Some([0x1000].into_iter().collect()),
+        ..LiveContext::default()
+    };
+    for arity in [None, Some(1)] {
+        let ctx = ctx(arity);
+        assert!(
+            !matches!(
+                check_bhav_live_equivalent(&a, &ctx, &b, &ctx, &LiveOptions::default()),
+                EquivResult::Equivalent { .. }
+            ),
+            "{arity:?}"
+        );
+        let (_, combined) = check_bhav_equivalent_combined(
+            &a,
+            &ctx,
+            &b,
+            &ctx,
+            &EquivOptions::default(),
+            &LiveOptions::default(),
+        );
+        assert!(
+            !matches!(combined, EquivResult::Equivalent { .. }),
+            "{arity:?}"
+        );
+    }
+    let ctx = ctx(Some(0));
+    assert_equivalent(&check_bhav_live_equivalent(
+        &a,
+        &ctx,
+        &b,
+        &ctx,
+        &LiveOptions::default(),
+    ));
+}

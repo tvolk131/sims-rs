@@ -220,3 +220,20 @@ fn raw_op_spelling_still_compiles() {
         assert_eq!(operands_of(&line), bytes, "{line}");
     }
 }
+
+/// Dialog byte 5 bit 7 is copied into the dialog record the VM keeps, so neither
+/// lifting mode drops it and `pad` cannot set it.
+#[test]
+fn dialog_kind_bit_7_stays_raw() {
+    let bhav = tree(vec![ins(36, [0, 0, 0, 0, 0, 0x85, 0, 1], T, F)]);
+    for strict_padding in [true, false] {
+        let opts = LiftOptions {
+            strict_padding,
+            annotate_comments: false,
+        };
+        let labeled = format_bhav_labeled_air(&bhav, opts);
+        assert!(labeled.contains("op 0x0024"), "{labeled}");
+        let rebuilt = &compile_air(&labeled).expect("labeled compiles").behaviors[&4096];
+        assert_eq!(encode_bhav(rebuilt).unwrap(), encode_bhav(&bhav).unwrap());
+    }
+}

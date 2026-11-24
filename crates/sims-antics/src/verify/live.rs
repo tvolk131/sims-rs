@@ -60,9 +60,8 @@
 
 use super::replay::{self, Witness};
 use super::{
-    EquivResult, FrameUse, TraceStep, call_operands, canonicalize_primitive_operands,
-    collect_inline_call_arg_bytes, is_always_true_instruction, is_argless_call,
-    primitive_frame_uses, word_i16,
+    EquivResult, FrameUse, TraceStep, canonicalize_primitive_operands,
+    collect_inline_call_arg_bytes, is_always_true_instruction, primitive_frame_uses, word_i16,
 };
 use crate::ir::BhavChunk;
 use crate::lower::{TARGET_ERROR, TARGET_FALSE, TARGET_TRUE};
@@ -108,8 +107,27 @@ pub struct LiveContext {
     /// Trees a call can name that take no arguments and are not indexed (kind 4). A
     /// call to one reads none of its operand bytes (`interpreter.rs:1539`: no argument
     /// words, and `entry_node` ignores the entry for other kinds), so the checker
-    /// compares any spelling of them as `[0xFF; 8]` ([`call_operands`]).
+    /// compares any spelling of them as `[0xFF; 8]`, when `callee_arities` agrees
+    /// ([`LiveContext::call_reads_no_operands`]).
     pub argless_callees: Option<BTreeSet<u16>>,
+}
+
+impl LiveContext {
+    /// Whether a call to tree `id` reads none of its operand bytes: `argless_callees`
+    /// lists it and `callee_arities` agrees it takes no arguments. A context that lists
+    /// a tree with no count, or with a count above 0, gets its operands compared.
+    pub(crate) fn call_reads_no_operands(&self, id: u16) -> bool {
+        id >= 256
+            && self
+                .argless_callees
+                .as_ref()
+                .is_some_and(|set| set.contains(&id))
+            && self
+                .callee_arities
+                .as_ref()
+                .and_then(|arities| arities.get(&id))
+                == Some(&0)
+    }
 }
 
 impl Default for LiveContext {
@@ -852,9 +870,14 @@ impl Explorer<'_> {
         }
     }
 
-    /// `ins`'s operands as the VM uses them ([`call_operands`]).
+    /// `ins`'s operands as the VM uses them: `[0xFF; 8]` for a call that reads none
+    /// ([`LiveContext::call_reads_no_operands`]).
     fn operands(&self, ins: &Instruction) -> [u8; 8] {
-        call_operands(ins, self.ctx.argless_callees.as_ref())
+        if self.ctx.call_reads_no_operands(ins.opcode) {
+            [0xFF; 8]
+        } else {
+            ins.operands
+        }
     }
 
     fn explore(&self, interner: &mut Interner) -> Result<(Vec<PathSummary>, usize), String> {
@@ -1469,7 +1492,7 @@ impl Explorer<'_> {
         ins: &Instruction,
         interner: &mut Interner,
     ) -> Result<Vec<Step>, String> {
-        let argless = is_argless_call(ins, self.ctx.argless_callees.as_ref());
+        let argless = self.ctx.call_reads_no_operands(ins.opcode);
         let ops = &self.operands(ins);
         let pc = usize::from(state.pc);
         match ins.opcode {
