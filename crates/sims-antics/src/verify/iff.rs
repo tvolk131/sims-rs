@@ -12,7 +12,7 @@
 
 use super::{
     EquivMethod, EquivOptions, EquivResult, LiveContext, LiveOptions, bhav_param_limit,
-    check_bhav_equivalent_combined, context_mismatch,
+    check_bhav_equivalent_combined, context_mismatch, reads_no_call_operands,
 };
 use crate::arity_catalog::vm_kept_bhavs;
 use crate::error::{Error, Result};
@@ -39,6 +39,10 @@ pub struct IffEquivOptions {
     /// game loads, by tree ID, so calls into them with more than four inline arguments
     /// compare exactly. Entries for private IDs are ignored: those come from the file.
     pub extra_arities: BTreeMap<u16, usize>,
+    /// Trees of those libraries that take no arguments and are not indexed
+    /// ([`library_argless_from_iff`], [`LiveContext::argless_callees`]). Private IDs are
+    /// ignored here too.
+    pub extra_argless: BTreeSet<u16>,
 }
 
 impl Default for IffEquivOptions {
@@ -49,6 +53,7 @@ impl Default for IffEquivOptions {
             my_attribute_count: super::GUARANTEED_ATTRIBUTES,
             tree: None,
             extra_arities: BTreeMap::new(),
+            extra_argless: BTreeSet::new(),
         }
     }
 }
@@ -198,6 +203,7 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
         callee_arities: Some(arities(iff, &opts.extra_arities)),
         my_attribute_count: opts.my_attribute_count,
         local_bcons: Some(bcons(iff)),
+        argless_callees: Some(argless(iff, &opts.extra_argless)),
     };
     let (ctx_a, ctx_b) = (ctx(&iff_a), ctx(&iff_b));
     // The structure check leaves the same chunks, in the same order, on both sides.
@@ -488,9 +494,24 @@ pub fn check_tree_with_callees(
     // Constant tables only when both sides have a file; a run that may read them then
     // needs the two files to match outside BHAV bodies (below).
     let both = iff_a.is_some() && iff_b.is_some();
-    let ctx = |arities: &BTreeMap<u16, usize>, iff: &Option<Iff>| LiveContext {
+    // A private callee reads no operand bytes when this side's argument count for it
+    // is 0 and this side's tree is not indexed. Library trees are not known here.
+    let ctx = |arities: &BTreeMap<u16, usize>,
+               trees: &BTreeMap<u16, BhavChunk>,
+               iff: &Option<Iff>| LiveContext {
         callee_arities: Some(arities.clone()),
         local_bcons: iff.as_ref().filter(|_| both).map(bcons),
+        argless_callees: Some(
+            arities
+                .iter()
+                .filter(|&(id, &n)| {
+                    n == 0
+                        && runs_from_own_file(*id)
+                        && trees.get(id).is_some_and(|t| t.kind != 4)
+                })
+                .map(|(&id, _)| id)
+                .collect(),
+        ),
         ..LiveContext::default()
     };
     if let Some(why) = not_run_from_file(root) {
@@ -504,7 +525,7 @@ pub fn check_tree_with_callees(
             .collect()
     };
     let (arities_a, arities_b) = (private(arities.0), private(arities.1));
-    let (ctx_a, ctx_b) = (ctx(&arities_a, &iff_a), ctx(&arities_b, &iff_b));
+    let (ctx_a, ctx_b) = (ctx(&arities_a, a, &iff_a), ctx(&arities_b, b, &iff_b));
     let (Some(ra), Some(rb)) = (a.get(&root), b.get(&root)) else {
         return inconclusive(format!("tree #{root} is not defined on both sides"));
     };
@@ -615,6 +636,50 @@ fn loaded_arities(iff: &Iff) -> BTreeMap<u16, Option<usize>> {
             )
         })
         .collect()
+}
+
+/// The trees of a file, as the VM's loader keeps them ([`loaded_arities`]), that a
+/// call runs the same with any operand bytes: no arguments, not indexed
+/// ([`LiveContext::argless_callees`]).
+fn loaded_argless(iff: &Iff) -> BTreeSet<u16> {
+    // The last copy of an ID is the one the loader keeps, as in [`loaded_arities`].
+    let kept: BTreeMap<u16, bool> = vm_kept_bhavs(iff)
+        .chunks
+        .into_iter()
+        .map(|c| {
+            let reads_none = Behavior::parse(iff.data(c)).is_ok_and(|b| reads_no_call_operands(&b));
+            (c.id, reads_none)
+        })
+        .collect();
+    kept.into_iter()
+        .filter_map(|(id, reads_none)| reads_none.then_some(id))
+        .collect()
+}
+
+/// The callees of a file's trees that read no call operand bytes: its own private
+/// trees, and the libraries' from `extra`.
+fn argless(iff: &Iff, extra: &BTreeSet<u16>) -> BTreeSet<u16> {
+    let mut set: BTreeSet<u16> = extra
+        .iter()
+        .copied()
+        .filter(|&id| !runs_from_own_file(id))
+        .collect();
+    set.extend(
+        loaded_argless(iff)
+            .into_iter()
+            .filter(|&id| runs_from_own_file(id)),
+    );
+    set
+}
+
+/// [`loaded_argless`] of a library file (`--global`, `--semi-global`), for
+/// [`IffEquivOptions::extra_argless`].
+///
+/// # Errors
+///
+/// When the file is not an IFF.
+pub fn library_argless_from_iff(iff_bytes: &[u8]) -> Result<BTreeSet<u16>> {
+    Ok(loaded_argless(&Iff::parse(iff_bytes.to_vec())?))
 }
 
 /// [`loaded_arities`] of a library file (`--global`, `--semi-global`, or the file a

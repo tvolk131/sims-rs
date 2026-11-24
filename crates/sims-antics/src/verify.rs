@@ -21,7 +21,8 @@ mod live;
 mod replay;
 pub use iff::{
     IffEquivOptions, IffEquivReport, IffVerdict, Reach, ResourceReport, ResourceVerdict,
-    check_iff_equivalent, check_tree_with_callees, library_arities_from_iff, not_run_from_file,
+    check_iff_equivalent, check_tree_with_callees, library_argless_from_iff, library_arities_from_iff,
+    not_run_from_file,
     runs_from_own_file, same_tree_bytes, single_file_problem, tree_reach,
 };
 pub use live::{GUARANTEED_ATTRIBUTES, LiveContext, LiveOptions, check_bhav_live_equivalent};
@@ -571,6 +572,32 @@ fn verify_resource_links(model: &ObjectModel, violations: &mut Vec<SafetyViolati
             }
         }
     }
+}
+
+/// Whether `ins` calls a tree in `argless`: one that takes no arguments and is not
+/// indexed (kind 4). Such a call reads none of its operand bytes: it copies no
+/// argument words, and only an indexed tree enters at the node its first word (or
+/// `temp[0]`, for `[0xFF; 8]`) names (`interpreter.rs:1539`, `entry_node`). Every
+/// object has eight temps, so the pass-temps form cannot fail where another cannot.
+pub(crate) fn is_argless_call(ins: &Instruction, argless: Option<&BTreeSet<u16>>) -> bool {
+    ins.opcode >= 256 && argless.is_some_and(|set| set.contains(&ins.opcode))
+}
+
+/// `ins`'s operand bytes as the VM uses them: `[0xFF; 8]` for any spelling of a call to
+/// a tree that reads none of them ([`is_argless_call`]), else the bytes as they are.
+/// Bytes a call with more than four inline arguments reads past its own node stay
+/// compared raw (`collect_inline_call_arg_bytes`).
+pub(crate) fn call_operands(ins: &Instruction, argless: Option<&BTreeSet<u16>>) -> [u8; 8] {
+    if is_argless_call(ins, argless) {
+        [0xFF; 8]
+    } else {
+        ins.operands
+    }
+}
+
+/// Whether the VM calls `bhav` the same with any operand bytes ([`is_argless_call`]).
+pub(crate) fn reads_no_call_operands(bhav: &Behavior) -> bool {
+    bhav.kind != 4 && bhav_param_limit(bhav) == 0
 }
 
 pub(crate) fn bhav_param_limit(bhav: &Behavior) -> usize {
@@ -4348,7 +4375,14 @@ pub fn check_bhav_equivalent_with_arities(
     opts: &EquivOptions,
     callee_arities: Option<&BTreeMap<u16, usize>>,
 ) -> EquivResult {
-    lockstep_traced(a, b, opts, callee_arities, &mut LockstepTrace::default())
+    lockstep_traced(
+        a,
+        b,
+        opts,
+        callee_arities,
+        None,
+        &mut LockstepTrace::default(),
+    )
 }
 
 /// Which node pairs a lockstep run visited.
@@ -4365,6 +4399,7 @@ fn lockstep_traced(
     b: &BhavChunk,
     opts: &EquivOptions,
     callee_arities: Option<&BTreeMap<u16, usize>>,
+    argless: Option<&BTreeSet<u16>>,
     trace: &mut LockstepTrace,
 ) -> EquivResult {
     if a.kind != b.kind {
@@ -4787,23 +4822,22 @@ fn lockstep_traced(
         }
 
         // Case 3: World-interacting primitives and subroutine calls.
+        let ops_a = canonicalize_primitive_operands(ins_a.opcode, call_operands(ins_a, argless));
+        let ops_b = canonicalize_primitive_operands(ins_b.opcode, call_operands(ins_b, argless));
         let ev_a = CanonEvent::Primitive {
             opcode: ins_a.opcode,
-            operands: canonicalize_primitive_operands(ins_a.opcode, ins_a.operands),
+            operands: ops_a,
         };
         let ev_b = CanonEvent::Primitive {
             opcode: ins_b.opcode,
-            operands: canonicalize_primitive_operands(ins_b.opcode, ins_b.operands),
+            operands: ops_b,
         };
         if ev_a != ev_b {
             return EquivResult::Counterexample {
                 path,
                 divergence: format!(
-                    "trace event divergence at A@n{pc_a} vs B@n{pc_b}: A=op {:#06x} {:?} vs B=op {:#06x} {:?}",
-                    ins_a.opcode,
-                    canonicalize_primitive_operands(ins_a.opcode, ins_a.operands),
-                    ins_b.opcode,
-                    canonicalize_primitive_operands(ins_b.opcode, ins_b.operands),
+                    "trace event divergence at A@n{pc_a} vs B@n{pc_b}: A=op {:#06x} {ops_a:?} vs B=op {:#06x} {ops_b:?}",
+                    ins_a.opcode, ins_b.opcode,
                 ),
             };
         }
@@ -4820,7 +4854,7 @@ fn lockstep_traced(
 
         // Verify layout-dependent inline subroutine calls (`opcode >= 256` with non-0xFF operands).
         // Callees with >4 args read bytes from instructions following the call (`interpreter.rs:1542`).
-        if ins_a.opcode >= 256 && ins_a.operands != [0xFF; 8] {
+        if ins_a.opcode >= 256 && ops_a != [0xFF; 8] {
             match callee_arities.and_then(|m| m.get(&ins_a.opcode).copied()) {
                 Some(arity) if arity <= 4 => {}
                 Some(arity) => {
@@ -5626,15 +5660,24 @@ fn lockstep_suffices(
     // state when they fault (`expression.rs:69`). So every node it ran must be the same
     // bytes on both sides, and a call the same inline arguments after it too. Then the
     // two runs are the same run.
+    // A call to a tree that reads none of its operand bytes is the same run with any of
+    // them ([`call_operands`]), and has no inline arguments after it.
+    let argless = shared_argless(ctx_a, ctx_b);
+    let argless = argless.as_ref();
     let bytes = |ins: &Instruction| (ins.opcode, ins.on_true, ins.on_false, ins.operands);
+    let used = |ins: &Instruction| {
+        let ops = call_operands(ins, argless);
+        (ins.opcode, ins.on_true, ins.on_false, ops)
+    };
     for p in trace.pairs.iter().map(|&(p, _)| usize::from(p)) {
         let (Some(ia), Some(ib)) = (a.instructions.get(p), b.instructions.get(p)) else {
             return false;
         };
-        if bytes(ia) != bytes(ib) {
+        if used(ia) != used(ib) {
             return false;
         }
         if ia.opcode >= 256
+            && !is_argless_call(ia, argless)
             && !a.instructions[p..]
                 .iter()
                 .map(bytes)
@@ -5686,6 +5729,13 @@ fn lockstep_suffices(
         .any(|ins| arity(ctx_a, ins.opcode) != arity(ctx_b, ins.opcode))
 }
 
+/// The callees both sides' files say read no call operand bytes
+/// ([`LiveContext::argless_callees`]).
+fn shared_argless(ctx_a: &LiveContext, ctx_b: &LiveContext) -> Option<BTreeSet<u16>> {
+    let (a, b) = (ctx_a.argless_callees.as_ref()?, ctx_b.argless_callees.as_ref()?);
+    Some(a.intersection(b).copied().collect())
+}
+
 /// Checks two trees with the lockstep checker first and, when it cannot prove them
 /// equivalent, with the live-output checker, which also accepts trees that differ by
 /// pure reads and dummy nodes (and dead frame writes, with frame residue ignored).
@@ -5720,7 +5770,15 @@ pub fn check_bhav_equivalent_combined(
         ..*lockstep
     };
     let mut trace = LockstepTrace::default();
-    let first = lockstep_traced(a, b, &strict, arities.as_ref(), &mut trace);
+    let argless = shared_argless(ctx_a, ctx_b);
+    let first = lockstep_traced(
+        a,
+        b,
+        &strict,
+        arities.as_ref(),
+        argless.as_ref(),
+        &mut trace,
+    );
     if matches!(first, EquivResult::Equivalent { .. })
         && lockstep_suffices(a, ctx_a, b, ctx_b, live, &trace)
     {
