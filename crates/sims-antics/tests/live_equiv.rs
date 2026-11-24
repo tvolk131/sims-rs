@@ -2515,3 +2515,379 @@ fn recursive_call_graphs() {
         );
     }
 }
+
+// ---- Argument-free calls, stack object reads, node numbering, last result ----
+
+const STACK_OBJ: u8 = 10;
+
+/// Private tree 4096 (the callee, with the given header and two entry nodes) and a
+/// caller 4097 whose nodes are `caller`; tree 4098 takes seven arguments.
+fn call_file(callee_args: u8, callee_kind: u8, caller: Vec<Instruction>) -> Vec<u8> {
+    let callee = BhavChunk {
+        kind: callee_kind,
+        ..tree(
+            4096,
+            callee_args,
+            0,
+            vec![
+                expr((LIT, 0), EQ, (LIT, 0), T, T),
+                expr((LIT, 0), EQ, (LIT, 0), F, F),
+            ],
+        )
+    };
+    let seven = tree(4098, 7, 0, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]);
+    write_iff(&[
+        bhav_chunk(&callee, "Callee"),
+        bhav_chunk(&tree(4097, 0, 0, caller), "Caller"),
+        bhav_chunk(&seven, "Seven"),
+    ])
+    .expect("write")
+}
+
+fn call_verdict(
+    callee_args: u8,
+    callee_kind: u8,
+    a: Vec<Instruction>,
+    b: Vec<Instruction>,
+    opts: &IffEquivOptions,
+) -> IffVerdict {
+    let a = call_file(callee_args, callee_kind, a);
+    let b = call_file(callee_args, callee_kind, b);
+    check_iff_equivalent(&a, &b, opts).expect("check").verdict()
+}
+
+/// A call to a tree that takes no arguments and is not indexed reads none of its
+/// operand bytes (`interpreter.rs`, `call`: no argument words, and the entry word only
+/// picks the node of a kind-4 tree), so every spelling of it is the same call.
+#[test]
+fn argless_calls_ignore_their_operand_bytes() {
+    let opts = IffEquivOptions::default();
+    let call = |ops| vec![prim(4096, ops, T, F)];
+    for ops in [
+        [0; 8],
+        [1, 2, 3, 4, 5, 6, 7, 8],
+        [0xFF, 0xFF, 0, 0, 0, 0, 0, 0],
+    ] {
+        assert_eq!(
+            call_verdict(0, 0, call([0xFF; 8]), call(ops), &opts),
+            IffVerdict::Equivalent,
+            "{ops:?}"
+        );
+    }
+}
+
+/// The operand bytes are read when the callee takes arguments, when it is indexed
+/// (the entry word picks the node), and when the callee is unknown.
+#[test]
+fn calls_that_read_operands_keep_them() {
+    let opts = IffEquivOptions::default();
+    let call = |ops| vec![prim(4096, ops, T, F)];
+    // One argument: word 0.
+    assert_ne!(
+        call_verdict(1, 0, call([0; 8]), call([1, 0, 0, 0, 0, 0, 0, 0]), &opts),
+        IffVerdict::Equivalent
+    );
+    // Indexed: word 0 is the entry, and the two entries return differently.
+    assert_ne!(
+        call_verdict(0, 4, call([0; 8]), call([1, 0, 0, 0, 0, 0, 0, 0]), &opts),
+        IffVerdict::Equivalent
+    );
+    // A tree the file does not hold (here global 256): its arity is unknown.
+    let global = |ops| vec![prim(256, ops, T, F)];
+    assert_ne!(
+        call_verdict(0, 0, global([0xFF; 8]), global([0; 8]), &opts),
+        IffVerdict::Equivalent
+    );
+    // ... unless the caller states the library tree takes no arguments, in both the
+    // argument counts and the argument-free set.
+    let library = |argless: &[u16], arity: Option<usize>| IffEquivOptions {
+        extra_argless: argless.iter().copied().collect(),
+        extra_arities: arity.map(|n| (256, n)).into_iter().collect(),
+        ..IffEquivOptions::default()
+    };
+    assert_eq!(
+        call_verdict(
+            0,
+            0,
+            global([0xFF; 8]),
+            global([0; 8]),
+            &library(&[256], Some(0))
+        ),
+        IffVerdict::Equivalent
+    );
+    // A tree listed as argument-free but with no stated count, or a count that
+    // contradicts it, still reads its operands.
+    for arity in [None, Some(1)] {
+        assert_ne!(
+            call_verdict(
+                0,
+                0,
+                global([0xFF; 8]),
+                global([0; 8]),
+                &library(&[256], arity)
+            ),
+            IffVerdict::Equivalent,
+            "{arity:?}"
+        );
+    }
+}
+
+/// A library supplies only its own range of tree IDs: the global file 256 to 4095, a
+/// semi-global file 8192 and up. A tree in the other range is not the one a call runs.
+#[test]
+fn library_argless_trees_come_from_their_own_range() {
+    let none = |id| tree(id, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]);
+    let file = write_iff(&[
+        bhav_chunk(&none(256), "Low"),
+        bhav_chunk(&none(8192), "High"),
+    ])
+    .expect("write");
+    let global = sims_antics::verify::library_argless_from_iff(&file, false).expect("global");
+    assert_eq!(global, [256].into_iter().collect());
+    let semi = sims_antics::verify::library_argless_from_iff(&file, true).expect("semi");
+    assert_eq!(semi, [8192].into_iter().collect());
+}
+
+/// A local named like the `invalid_scope:` keyword stays an ordinary operand.
+#[test]
+fn breakpoint_on_a_local_named_invalid_scope() {
+    let named = air(
+        "tree 4096 \"Named\" {\n    let invalid_scope = 0;\n    breakpoint(invalid_scope);\n    return true;\n}\n",
+        4096,
+    );
+    let breakpoint = named
+        .instructions
+        .iter()
+        .find(|i| i.opcode == 15)
+        .expect("a breakpoint node");
+    // Local 0 (scope 25), not a scope word.
+    assert_eq!(breakpoint.operands, [0, 0, 25, 0, 0, 0, 0, 0]);
+}
+
+/// A call with more than four arguments reads the instructions after it as
+/// arguments, so the bytes of an argument-free call there still count.
+#[test]
+fn spilled_arguments_keep_argless_call_bytes() {
+    let opts = IffEquivOptions::default();
+    // Seven arguments are 14 bytes: 8 operands, then the next node's opcode, branches
+    // and first operand word.
+    let caller = |ops| vec![prim(4098, [0; 8], 1, F), prim(4096, ops, T, F)];
+    assert_ne!(
+        call_verdict(
+            0,
+            0,
+            caller([0; 8]),
+            caller([9, 0, 0, 0, 0, 0, 0, 0]),
+            &opts
+        ),
+        IffVerdict::Equivalent
+    );
+    // The bytes past the spilled word are not arguments of either call.
+    assert_eq!(
+        call_verdict(
+            0,
+            0,
+            caller([0; 8]),
+            caller([0, 0, 9, 9, 9, 9, 9, 9]),
+            &opts
+        ),
+        IffVerdict::Equivalent
+    );
+}
+
+/// The stack object is a field of the running frame (`memory.rs`): reading it cannot
+/// fail and changes nothing, so an unused read is dead.
+#[test]
+fn stack_object_reads_are_pure() {
+    let reads = tree(
+        4096,
+        0,
+        0,
+        vec![expr((STACK_OBJ, 0), EQ, (STACK_OBJ, 0), T, T)],
+    );
+    let plain = tree(4096, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]);
+    assert_equivalent(&live(&reads, &plain));
+    let copy = tree(
+        4096,
+        0,
+        0,
+        vec![
+            expr((TEMP, 0), SET, (STACK_OBJ, 0), 1, F),
+            expr((TEMP, 0), SET, (LIT, 0), T, T),
+        ],
+    );
+    let zero = tree(4096, 0, 0, vec![expr((TEMP, 0), SET, (LIT, 0), T, T)]);
+    assert_equivalent(&live(&copy, &zero));
+}
+
+/// Scope 10 has one entry: index 1 faults (native error 0xf).
+#[test]
+fn stack_object_reads_past_index_0_are_not_dead() {
+    let reads = tree(
+        4096,
+        0,
+        0,
+        vec![expr((STACK_OBJ, 1), EQ, (STACK_OBJ, 1), T, T)],
+    );
+    let plain = tree(4096, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]);
+    assert!(!matches!(
+        live(&reads, &plain),
+        EquivResult::Equivalent { .. }
+    ));
+}
+
+/// Two reads of the stack object agree only while nothing can change it: a write
+/// and a primitive in between both separate them.
+#[test]
+fn stack_object_reads_follow_writes_and_primitives() {
+    let saved_equals_now = |between: Instruction| {
+        tree(
+            4096,
+            0,
+            0,
+            vec![
+                expr((TEMP, 0), SET, (STACK_OBJ, 0), 1, F),
+                between,
+                expr((TEMP, 0), EQ, (STACK_OBJ, 0), T, F),
+            ],
+        )
+    };
+    let always_true = |between: Instruction| {
+        tree(
+            4096,
+            0,
+            0,
+            vec![
+                expr((TEMP, 0), SET, (STACK_OBJ, 0), 1, F),
+                between,
+                expr((TEMP, 0), EQ, (TEMP, 0), T, F),
+            ],
+        )
+    };
+    let write = expr((STACK_OBJ, 0), SET, (LIT, 7), 2, F);
+    assert!(!matches!(
+        live(&saved_equals_now(write.clone()), &always_true(write)),
+        EquivResult::Equivalent { .. }
+    ));
+    // Set To Next (opcode 31) may move the stack object.
+    let next = prim(31, [0; 8], 2, 2);
+    assert!(!matches!(
+        live(&saved_equals_now(next.clone()), &always_true(next)),
+        EquivResult::Equivalent { .. }
+    ));
+    // With nothing in between, the two reads agree.
+    let nothing = expr((TEMP, 1), SET, (LIT, 0), 2, F);
+    assert_equivalent(&live(
+        &saved_equals_now(nothing.clone()),
+        &always_true(nothing),
+    ));
+}
+
+/// Constant branches and unreachable nodes need no node-for-node pairing when no
+/// node can fault or yield.
+#[test]
+fn constant_branches_and_unreachable_nodes_are_equivalent() {
+    let a = tree(
+        4096,
+        0,
+        0,
+        vec![
+            expr((LIT, 1), EQ, (LIT, 1), 1, 2),
+            expr((TEMP, 0), SET, (LIT, 1), T, F),
+            expr((TEMP, 0), SET, (LIT, 2), T, F),
+        ],
+    );
+    let b = tree(4096, 0, 0, vec![expr((TEMP, 0), SET, (LIT, 1), T, F)]);
+    assert_equivalent(&live(&a, &b));
+}
+
+/// The frame records the node it is at, and a reset or a save while a tree sleeps
+/// keeps it (`interpreter.rs`, `write_frame_to_storage`): moving a sleep to another
+/// node number is not equivalent, however the rest lines up.
+#[test]
+fn renumbered_yields_are_not_equivalent() {
+    let sleep = |next| prim(0, [0; 8], next, next);
+    let a = tree(
+        4096,
+        1,
+        0,
+        vec![expr((LIT, 0), EQ, (LIT, 0), 1, 1), sleep(T)],
+    );
+    let b = tree(4096, 1, 0, vec![sleep(T)]);
+    assert!(!matches!(live(&a, &b), EquivResult::Equivalent { .. }));
+    let (_, combined) = check_bhav_equivalent_combined(
+        &a,
+        &LiveContext::default(),
+        &b,
+        &LiveContext::default(),
+        &EquivOptions::default(),
+        &LiveOptions::default(),
+    );
+    assert!(!matches!(combined, EquivResult::Equivalent { .. }));
+}
+
+/// Any tree's last branch result can be read when its frame is popped, not only an
+/// action's: trees run by name, functional trees, and routing trees enter through
+/// the same counted use. So a whole file with no interaction table still keeps it.
+#[test]
+fn last_result_is_kept_for_trees_outside_any_interaction_table() {
+    let file = |test| {
+        write_iff(&[bhav_chunk(
+            &tree(4096, 0, 0, vec![expr((LIT, 0), EQ, (LIT, test), F, F)]),
+            "Returns false",
+        )])
+        .expect("write")
+    };
+    let report =
+        check_iff_equivalent(&file(0), &file(1), &IffEquivOptions::default()).expect("check");
+    assert_ne!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
+    let opts = IffEquivOptions {
+        live: ignoring_last_result(),
+        ..IffEquivOptions::default()
+    };
+    let report = check_iff_equivalent(&file(0), &file(1), &opts).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
+}
+
+/// A context that lists a tree as argument-free while giving it arguments is not
+/// trusted: the operands are compared.
+#[test]
+fn argless_listing_needs_a_zero_argument_count() {
+    let call = |ops| tree(4096, 0, 0, vec![prim(0x1000, ops, T, F)]);
+    let (a, b) = (call([0; 8]), call([1, 0, 0, 0, 0, 0, 0, 0]));
+    let ctx = |arity: Option<usize>| LiveContext {
+        callee_arities: arity.map(|n| [(0x1000, n)].into_iter().collect()),
+        argless_callees: Some([0x1000].into_iter().collect()),
+        ..LiveContext::default()
+    };
+    for arity in [None, Some(1)] {
+        let ctx = ctx(arity);
+        assert!(
+            !matches!(
+                check_bhav_live_equivalent(&a, &ctx, &b, &ctx, &LiveOptions::default()),
+                EquivResult::Equivalent { .. }
+            ),
+            "{arity:?}"
+        );
+        let (_, combined) = check_bhav_equivalent_combined(
+            &a,
+            &ctx,
+            &b,
+            &ctx,
+            &EquivOptions::default(),
+            &LiveOptions::default(),
+        );
+        assert!(
+            !matches!(combined, EquivResult::Equivalent { .. }),
+            "{arity:?}"
+        );
+    }
+    let ctx = ctx(Some(0));
+    assert_equivalent(&check_bhav_live_equivalent(
+        &a,
+        &ctx,
+        &b,
+        &ctx,
+        &LiveOptions::default(),
+    ));
+}

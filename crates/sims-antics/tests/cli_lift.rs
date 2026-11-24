@@ -1544,7 +1544,8 @@ fn lift_verify_equiv_ignores_stray_global_id_arity_in_object_iff() {
     );
     let ext_stdout = String::from_utf8_lossy(&ext_out.stdout);
     assert!(
-        ext_stdout.contains("structured lift fallback") && ext_stdout.contains("op 0x0031 (0x99"),
+        ext_stdout.contains("structured lift fallback")
+            && ext_stdout.contains("notify_idle() pad(0: 0x99)"),
         "expected labeled-CFG fallback preserving arg-7 byte 0x99:\n{ext_stdout}"
     );
     assert!(
@@ -1611,7 +1612,7 @@ fn lift_relax_padding_cli_flag_and_raw_conflict() {
     let iff_path = tmp.path().join("dirty.iff");
     std::fs::write(&iff_path, synthetic_bhav_iff(&[dirty])).expect("write iff");
 
-    // Default (strict_padding: true): preserves dirty padding via inline `op 0x0031`.
+    // Default (strict_padding: true): preserves dirty padding with a `pad` clause.
     let strict_out = Command::new(cli_bin())
         .args(["lift"])
         .arg(&iff_path)
@@ -1620,7 +1621,10 @@ fn lift_relax_padding_cli_flag_and_raw_conflict() {
         .expect("run strict lift");
     assert!(strict_out.status.success());
     let strict_stdout = String::from_utf8_lossy(&strict_out.stdout);
-    assert!(strict_stdout.contains("op 0x0031"), "{strict_stdout}");
+    assert!(
+        strict_stdout.contains("notify_idle() pad(3: 0x42);"),
+        "{strict_stdout}"
+    );
     assert!(
         strict_stdout.contains("// verify-equiv: Equivalent"),
         "{strict_stdout}"

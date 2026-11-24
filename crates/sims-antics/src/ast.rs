@@ -261,6 +261,16 @@ pub enum Condition {
     Not(Box<Condition>),
 }
 
+/// Operand bytes a primitive carries that its named form does not spell, limited to
+/// bytes `verify::canonicalize_primitive_operands` says the VM reads no differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperandPad {
+    /// `pad 0xNN`: every byte the VM never reads, whatever its value, holds `NN`.
+    Fill(u8),
+    /// `pad(i: 0xNN, ...)`: operand byte `i` holds `NN` (ascending, each once).
+    Bytes(Vec<(u8, u8)>),
+}
+
 /// Readable SimAntics primitive invocations (usable both low-level with explicit
 /// `-> true/false` branches and high-level in structured control flow).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,6 +333,18 @@ pub enum PrimitiveCall {
     },
     Breakpoint {
         cond: OperandRef,
+    },
+    /// `breakpoint(invalid_scope: S, index: I)`: a scope word above 255, which the VM
+    /// rejects before reading (native error 9, `debug.rs`).
+    BreakpointInvalidScope {
+        scope: u16,
+        index: i16,
+    },
+    /// `prim(...) pad ...`: the named primitive with operand bytes the VM reads the
+    /// same way as its plain encoding (see [`OperandPad`]).
+    Padded {
+        call: Box<PrimitiveCall>,
+        pad: OperandPad,
     },
     FindLocation {
         mode: u8,

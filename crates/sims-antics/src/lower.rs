@@ -7,6 +7,7 @@ use crate::ast::{
 };
 use crate::error::{Error, Result, Span};
 use crate::ir::{BconChunk, BhavChunk, StringEntry, StringFormat, StringTableChunk};
+use crate::verify::apply_operand_pad;
 use sims_formats::behavior::Instruction;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -285,6 +286,7 @@ fn scan_primitive(prim: &PrimitiveCall, usage: &mut TreeUsage) {
         PrimitiveCall::Breakpoint { cond } => {
             scan_operand(cond, usage);
         }
+        PrimitiveCall::Padded { call, .. } => scan_primitive(call, usage),
         PrimitiveCall::MakeNewCharacter { skin, age, sex, .. } => {
             scan_local_ref(skin, usage);
             scan_local_ref(age, usage);
@@ -845,6 +847,29 @@ impl<'a> TreeBuilder<'a> {
                 let [i0, i1] = cond.index.to_le_bytes();
                 let [s0, s1] = u16::from(cond.scope).to_le_bytes();
                 Ok((15, [i0, i1, s0, s1, 0, 0, 0, 0]))
+            }
+            PrimitiveCall::BreakpointInvalidScope { scope, index } => {
+                // Scopes 0..=255 are operands, spelled `breakpoint(scope(N, I))`.
+                if *scope <= 255 {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "breakpoint scope word {scope} is a valid scope; write breakpoint(scope({scope}, {index}))"
+                        ),
+                    ));
+                }
+                let [i0, i1] = index.to_le_bytes();
+                let [s0, s1] = scope.to_le_bytes();
+                Ok((15, [i0, i1, s0, s1, 0, 0, 0, 0]))
+            }
+            PrimitiveCall::Padded { call, pad } => {
+                if matches!(**call, PrimitiveCall::Padded { .. }) {
+                    return Err(Error::at(span, "a primitive takes one pad clause"));
+                }
+                let (opcode, base) = self.encode_primitive(call, span)?;
+                let operands = apply_operand_pad(opcode, base, pad)
+                    .map_err(|message| Error::at(span, message))?;
+                Ok((opcode, operands))
             }
             PrimitiveCall::MakeNewCharacter {
                 skin,
