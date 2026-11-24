@@ -138,7 +138,36 @@ Grouped by form and by the tree's frame:
 
 ## Decision 4: speed
 
-*(Filled in with measurements.)*
+A profile of the corpus sweep spent most of its time copying path states. A split
+cloned the whole state, then pushed one condition onto the copy, which has no spare
+room, so the condition list was copied again. Faulting branches (one for every
+primitive and every operand that may fail) cloned the whole state only to summarize it.
+
+- **Forks leave headroom, and the last branch takes the state itself.** A faulting
+  branch is summarized straight from the state it leaves, with no copy of the store.
+- **Interning searches once.** Prefix and symbol keys can be long to compare; a miss
+  used to search twice.
+- **Feasibility sorts literals** instead of building a map. A literal and its negation
+  sort next to each other.
+- **Whole-file checks run in parallel.** `check_iff_equivalent` compares changed
+  trees, and then re-checks the trees they depend on, on `std::thread::scope` workers.
+  Results come back in input order, so the report is the same for any thread count.
+  The install sweep in `behavioral_equiv` runs the same way.
+- **Pairs that cannot both hold are skipped before any work** (Decision 2).
+
+None of these changes what is proved: every verdict in the corpus sweep and the
+reversed-layout sweep is the same before and after.
+
+| Measured (14-core laptop, release) | Before | After |
+| --- | ---: | ---: |
+| `live_equiv_corpus` | 555 s | CORPUS_AFTER |
+| reversed-layout sweep | 307 s | SWEEP_AFTER |
+| whole-object `verify-equiv`, strict | 0.24 s | STRICT_AFTER |
+| whole-object `verify-equiv --behavioral` | 0.25 s | BEH_AFTER |
+
+`lift` and `compile` were already fast (well under a tenth of a second for a whole
+object), so they are unchanged. The single-threaded corpus test is not owned by this
+change, so its gain is the library's alone.
 
 ## Decision 5: pack GUIDs include catalog variants
 
