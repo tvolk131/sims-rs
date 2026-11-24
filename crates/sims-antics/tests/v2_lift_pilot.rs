@@ -735,3 +735,30 @@ fn lifts_handle_flags_and_preserves_numeric_flag_operations() {
     }
     assert!(!lifted.contains("raw {"), "{lifted}");
 }
+
+#[test]
+fn comparisons_returned_whole_lift_as_return() {
+    let iff = compile(
+        r#"object "Fable Gauge" {
+    guid: 0x7E00_00B1;
+    state level @ 2: i16;
+    @id(4300) tree full "Full" { return self.level > 3; }
+    @id(4301) tree empty "Empty" { return !(self.level == 0); }
+    @id(4302) tree low "Low" { if self.level > 3 { return false; } else { return true; } }
+    @id(4303) tree rich "Rich" { return can_afford(5, category: 0); }
+    @id(4304) tree poor "Poor" { if can_afford(5, category: 0) { return false; } return true; }
+}"#,
+    );
+    let lifted = round_trip(&iff, &DecompileV2Options::default());
+    // `return !(c);` is the `if` returning false then true: the same node and exits.
+    for spelling in [
+        "return self.attr_2 > 3;",
+        "return !(self.attr_2 == 0);",
+        "return !(self.attr_2 > 3);",
+        "return can_afford(5, category: 0);",
+    ] {
+        assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
+    }
+    // A primitive's test in the other polarity keeps its `if`.
+    assert!(!lifted.contains("return !(can_afford"), "{lifted}");
+}

@@ -1194,12 +1194,7 @@ fn strings_models(iff: &Iff, trees: &[TreeModel]) -> Vec<StringsModel> {
     let mut used = BTreeSet::new();
     let mut out = Vec::new();
     for id in ids {
-        let Some(chunk) = iff
-            .chunks
-            .iter()
-            .filter(|c| &c.tag == b"STR#" && c.id == id)
-            .last()
-        else {
+        let Some(chunk) = iff.chunks.iter().rfind(|c| &c.tag == b"STR#" && c.id == id) else {
             continue;
         };
         let Ok(table) = StringTable::parse_chunk(iff.data(chunk), chunk.flags) else {
@@ -2795,6 +2790,9 @@ impl Translator<'_> {
                 if self.match_chain(id, s, out) {
                     return;
                 }
+                if self.return_compare(id, cond, then_body, else_body, out) {
+                    return;
+                }
                 let Some(c) = self.cond(cond) else {
                     self.emit_raw(s);
                     skip_children(self);
@@ -2864,6 +2862,70 @@ impl Translator<'_> {
                 None => self.emit_raw(s),
             },
         }
+    }
+
+    /// `if a op b { return true; } else { return false; }` as `return a op b;`, and the
+    /// other polarity as `return !(a op b);`: each lowers to the same compare node with
+    /// the same exits (so the same last result). Also a primitive test returned whole
+    /// (`return can_afford(..);`), in that polarity only. No tree calls.
+    fn return_compare(
+        &mut self,
+        id: usize,
+        cond: &Condition,
+        then_body: &[Stmt],
+        else_body: &[Stmt],
+        out: &mut Out,
+    ) -> bool {
+        let (cond, negated) = match cond {
+            Condition::Not(inner) => (inner.as_ref(), true),
+            c => (c, false),
+        };
+        let compare = matches!(
+            cond,
+            Condition::Compare {
+                op: CompareOp::Gt
+                    | CompareOp::Lt
+                    | CompareOp::Eq
+                    | CompareOp::Ge
+                    | CompareOp::Le
+                    | CompareOp::Ne,
+                ..
+            }
+        );
+        if !compare && !matches!(cond, Condition::Primitive { .. }) {
+            return false;
+        }
+        let returns = |body: &[Stmt]| match body {
+            [Stmt::Return { target, .. }] => match target {
+                Target::ReturnTrue => Some(true),
+                Target::ReturnFalse => Some(false),
+                _ => None,
+            },
+            _ => None,
+        };
+        let (Some(on_true), Some(on_false)) = (returns(then_body), returns(else_body)) else {
+            return false;
+        };
+        if on_true == on_false
+            || (!compare && on_true == negated)
+            || self.forced_raw(id + 1)
+            || self.forced_raw(id + 2)
+        {
+            return false;
+        }
+        let Some(c) = self.cond(cond) else {
+            return false;
+        };
+        self.flush_raw(out);
+        let start = out.lines.len();
+        if on_true != negated {
+            out.line(format!("return {c};"));
+        } else {
+            out.line(format!("return !({c});"));
+        }
+        self.record(id, start, out);
+        self.next_id = id + 3;
+        true
     }
 
     fn try_dialog(

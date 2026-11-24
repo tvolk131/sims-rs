@@ -675,6 +675,41 @@ object "Synth Dimmer" {
 "#;
 
 #[test]
+fn formatter_keeps_empty_frames() {
+    let source = r#"object "Synth Empty" {
+    guid: 0x7E00_0008; price: 1;
+    sprite: Sprite::procedural("floor_lamp", primary: #504030, accent: #A09080, trim: #201810);
+    @id(4300)   @frame( empty ) tree a "A" {   }
+    @id(4301) @frame(args:4,empty) tree b "B" {
+    }
+}
+"#;
+    let formatted = format_v2_source(source).expect("format");
+    assert!(is_v2_formatted(&formatted).expect("check"), "{formatted}");
+    assert_eq!(
+        format_v2_source(&formatted).expect("reformat"),
+        formatted,
+        "idempotent"
+    );
+    for expected in [
+        "    @id(4300) @frame(empty) tree a \"A\" {}\n",
+        "    @id(4301) @frame(args: 4, empty) tree b \"B\" {}\n",
+    ] {
+        assert!(
+            formatted.contains(expected),
+            "missing {expected:?} in:\n{formatted}"
+        );
+    }
+    // Formatting keeps the 0-node trees.
+    let iff = |s: &str| {
+        compile_v2_source("empty.antics", s, &PackResolverConfig::default())
+            .expect("compile")
+            .iff_bytes
+    };
+    assert_eq!(iff(source), iff(&formatted));
+}
+
+#[test]
 fn formatter_handles_match_expressions_and_variants() {
     let formatted = format_v2_source(MATCH_AND_VARIANTS).expect("format");
     assert!(is_v2_formatted(&formatted).expect("check"), "{formatted}");

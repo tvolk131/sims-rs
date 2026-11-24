@@ -360,8 +360,8 @@ impl Directives {
         let line_starts: Vec<usize> = std::iter::once(0)
             .chain(source.match_indices('\n').map(|(i, _)| i + 1))
             .collect();
-        // `raw { }` bodies follow `.air` comment and string rules, so they are skipped
-        // whole: byte offset of each `raw` keyword -> one past its closing `}`.
+        // `raw { }` bodies follow `.air` comment and string rules, so they are scanned
+        // apart (`scan_raw`): byte offset of each `raw` keyword -> one past its closing `}`.
         let raw_ends: BTreeMap<usize, usize> = tokens
             .iter()
             .filter_map(|t| {
@@ -392,7 +392,6 @@ impl Directives {
             while i < b.len() {
                 let offset = line_starts[n] + i;
                 if offset < skip_until {
-                    code[n] |= !b[i].is_ascii_whitespace();
                     i += 1;
                     continue;
                 }
@@ -430,6 +429,7 @@ impl Directives {
                 }
                 if let Some(&end) = raw_ends.get(&offset) {
                     skip_until = end;
+                    scan_raw(source, offset..end, &line_starts, &mut code, &mut comments);
                     continue;
                 }
                 if b[i] == b'"' {
@@ -487,6 +487,84 @@ impl Directives {
             }
         }
         out
+    }
+}
+
+/// Marks the lines of the `raw { }` block at `range` of `source` that hold `.air` code,
+/// and records each of its line comments (`// ...` or `# ...`) as [`Directives::scan`]
+/// does, so `// antics-lint: allow(..)` works on a `raw` line as on any other.
+fn scan_raw(
+    source: &str,
+    range: std::ops::Range<usize>,
+    line_starts: &[usize],
+    code: &mut [bool],
+    comments: &mut [Option<(usize, String)>],
+) {
+    let line_of = |offset: usize| line_starts.partition_point(|&s| s <= offset) - 1;
+    let Some(text) = source.get(range.clone()) else {
+        return;
+    };
+    let b = text.as_bytes();
+    let mut i = 0;
+    let mut in_str = false;
+    let mut block_depth = 0usize;
+    while i < b.len() {
+        let at = range.start + i;
+        if block_depth > 0 {
+            if b[i..].starts_with(b"*/") {
+                block_depth -= 1;
+                i += 2;
+            } else if b[i..].starts_with(b"/*") {
+                block_depth += 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if in_str {
+            match b[i] {
+                b'\\' => i += 2,
+                b'"' => {
+                    in_str = false;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        let comment = if b[i..].starts_with(b"//") {
+            Some(2)
+        } else if b[i] == b'#' {
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(skip) = comment {
+            let end = text[i..].find('\n').map_or(text.len(), |e| i + e);
+            let n = line_of(at);
+            // Never a file-level `//!` directive: it covers its line, like any other.
+            let body = text[i + skip..end].trim_start_matches(['!', '/']);
+            if let Some(slot) = comments.get_mut(n) {
+                *slot = Some((at - line_starts[n] + 1, body.to_owned()));
+            }
+            i = end;
+            continue;
+        }
+        if b[i..].starts_with(b"/*") {
+            block_depth += 1;
+            i += 2;
+            continue;
+        }
+        if b[i] == b'"' {
+            in_str = true;
+        }
+        if !b[i].is_ascii_whitespace()
+            && let Some(c) = code.get_mut(line_of(at))
+        {
+            *c = true;
+        }
+        i += 1;
     }
 }
 
@@ -1099,6 +1177,10 @@ struct TreeCx {
     tokens: BTreeMap<usize, Vec<(Span, String, String)>>,
     /// Names of the `let`s its body declares.
     lets: BTreeSet<String>,
+    /// It shows strings by number from a table this file does not declare (a dialog's
+    /// `STR#` 301 entry past the file's own, `show_string`, `action_string`): their
+    /// `$Local:N` tokens are unknown, so any of its locals may be read by one.
+    unknown_strings: bool,
 }
 
 /// A file's object and template states by name, with their type (`None` when two
@@ -1522,7 +1604,10 @@ impl FileLinter<'_> {
                 format!("constant `{}` is only named inside `raw {{ }}`", c.name),
                 Some(format!("write its value, {}, in the `raw` body", c.value)),
                 None,
-                Some("`raw` does not resolve `const` names: the build rejects the name there".to_owned()),
+                Some(
+                    "`raw` does not resolve `const` names: the build rejects the name there"
+                        .to_owned(),
+                ),
             );
         } else if !self.symbols.raw_index_literals.contains(&c.value) {
             self.emit(
@@ -1574,6 +1659,7 @@ impl FileLinter<'_> {
         });
         let mut tokens: BTreeMap<usize, Vec<(Span, String, String)>> = BTreeMap::new();
         let mut lets = BTreeSet::new();
+        let mut unknown_strings = false;
         let strings = &self.strings;
         let dialog_strings = &self.dialog_strings;
         let mut note = |span: Span, text: &str, from: String| {
@@ -1608,6 +1694,11 @@ impl FileLinter<'_> {
                             V2Expr::Ident(_, n) => n.as_str(),
                             _ => "",
                         };
+                        if matches!(name, "show_string" | "action_string") {
+                            // A table and index by number: text this file may not hold.
+                            unknown_strings = true;
+                            return;
+                        }
                         if name != "dialog" {
                             args.extend(a.iter().map(|a| (name, &a.value)));
                             return;
@@ -1650,11 +1741,14 @@ impl FileLinter<'_> {
                         }
                     }
                     V2Expr::Int(span, n) if callee == "dialog" && *n > 0 => {
-                        if let Some(text) = usize::try_from(*n - 1)
+                        match usize::try_from(*n - 1)
                             .ok()
                             .and_then(|i| dialog_strings.get(i))
                         {
-                            note(*span, text, format!("dialog string {n}"));
+                            Some(text) => note(*span, text, format!("dialog string {n}")),
+                            // The object's own `STR#` 301 (a spliced resource), not this
+                            // file's: its tokens are unknown.
+                            None => unknown_strings = true,
                         }
                     }
                     _ => {}
@@ -1665,15 +1759,20 @@ impl FileLinter<'_> {
             frame,
             tokens,
             lets,
+            unknown_strings,
         });
     }
 
     /// Whether a `$Local:N` token of the current tree's strings reads `name`'s slot (or,
-    /// with no frame to check, whether the tree's strings have any such token).
+    /// with no frame to check, whether the tree's strings have any such token). Always,
+    /// when the tree shows strings by number that this file does not hold.
     fn read_by_string_token(&self, name: &str) -> bool {
         let Some(t) = &self.tree else {
             return false;
         };
+        if t.unknown_strings {
+            return true;
+        }
         if t.tokens.is_empty() {
             return false;
         }
@@ -2876,7 +2975,10 @@ fn runs_a_quiet_node(s: &V2Stmt, sim: bool) -> bool {
     }
     match s {
         V2Stmt::Assign {
-            target, op, value: v, ..
+            target,
+            op,
+            value: v,
+            ..
         } => {
             place(target)
                 && !matches!(op, V2AssignOp::Div | V2AssignOp::Mod)

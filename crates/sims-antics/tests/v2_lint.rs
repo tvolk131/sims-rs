@@ -647,6 +647,30 @@ fn dialog_tree(text: &str, body: &str) -> String {
 }
 
 #[test]
+fn locals_of_trees_showing_strings_the_file_does_not_hold_may_be_read() {
+    // A dialog's `STR#` 301 number past the file's own entries (the object's spliced
+    // table), or `show_string` by number: the text, and its `$Local:N` tokens, are
+    // unknown, so no local is reported unread.
+    let unread = "        let shown = random(7);";
+    for (members, call) in [
+        ("", "dialog(kind: 0, message: 3, title: 3)?;"),
+        (
+            "    strings 301 \"Dialog prim string set\" { hi = \"Hi\" }\n",
+            "dialog(kind: 0, message: 2, title: hi)?;",
+        ),
+        ("", "show_string(table: 301, index: 2);"),
+    ] {
+        let source = obj(&format!(
+            "{members}    tree probe \"Probe\" (sim: Sim) {{\n        self.level = 0;\n        self.mode = Mode::Off;\n{unread}\n        {call}\n    }}"
+        ));
+        none(&source, "unused_decl");
+    }
+    // The file's own entry without a token leaves it unread.
+    let source = dialog_tree("Hi", unread);
+    one(&source, "unused_decl");
+}
+
+#[test]
 fn a_local_read_only_by_a_string_token_is_used() {
     let body = "        let first = random(5);\n        self.level = first;\n        let shown = random(7);";
     // Lowered: the `random` temporary is slot 0 (`first` folds into it), `shown` slot 1.
@@ -747,6 +771,41 @@ fn a_raw_block_ending_in_a_bare_call_before_more_code_is_flagged() {
             .unwrap()
             .contains("if call 4301(temps) {}"),
         "{d:?}"
+    );
+}
+
+#[test]
+fn allow_directives_work_inside_raw() {
+    let wrap = |raw: &str| {
+        obj(&format!(
+            "    @id(4300) tree probe \"Probe\" {{\n        self.mode = Mode::Off;\n        raw {{\n            temp[0] := 1;\n{raw}\n        }}\n        self.level = 1;\n    }}\n    @id(4301) tree other \"Other\" {{ return true; }}"
+        ))
+    };
+    // Trailing the call's line, in `.air`'s `//` or `#` comment form.
+    for raw in [
+        "            call 4301(temps); // antics-lint: allow(raw_bare_call_false_exit)",
+        "            call 4301(temps); # antics-lint: allow(raw_bare_call_false_exit)",
+        // On its own line: covers the next line of code.
+        "            # antics-lint: allow(raw_bare_call_false_exit)\n\n            call 4301(temps);",
+    ] {
+        let source = wrap(raw);
+        none(&source, "raw_bare_call_false_exit");
+        none(&source, "unknown_lint_rule");
+    }
+    // On another line, for another rule, or as `//!`: the call is still reported.
+    for raw in [
+        "            call 4301(temps);\n            # antics-lint: allow(raw_bare_call_false_exit)",
+        "            call 4301(temps); # antics-lint: allow(while_true)",
+        "            //! antics-lint: allow(raw_bare_call_false_exit)\n            temp[1] := 2;\n            call 4301(temps);",
+    ] {
+        one(&wrap(raw), "raw_bare_call_false_exit");
+    }
+    // A `#` inside an `.air` string is not a comment.
+    one(
+        &wrap(
+            "            temp[1] := \"# antics-lint: allow(raw_bare_call_false_exit)\";\n            call 4301(temps);",
+        ),
+        "raw_bare_call_false_exit",
     );
 }
 
@@ -866,8 +925,17 @@ fn a_const_named_only_in_raw_is_not_used() {
         "unused_decl",
     );
     assert!(d.message.contains("only named inside `raw"), "{d:?}");
-    assert!(d.note.as_deref().unwrap().contains("does not resolve `const`"), "{d:?}");
-    assert_eq!(d.help.as_deref(), Some("write its value, 7, in the `raw` body"));
+    assert!(
+        d.note
+            .as_deref()
+            .unwrap()
+            .contains("does not resolve `const`"),
+        "{d:?}"
+    );
+    assert_eq!(
+        d.help.as_deref(),
+        Some("write its value, 7, in the `raw` body")
+    );
 }
 
 #[test]
@@ -1172,7 +1240,9 @@ fn negated_comparisons_are_flagged_with_a_polarity_note() {
     assert!(found[0].note.as_deref().unwrap().contains("polarity"));
     // Both branches go on to a test of places that cannot fault.
     one(
-        &tree("        while !(self.level > 3) { self.level += 1; }\n        if temp[0] == 2 { sleep(1); }"),
+        &tree(
+            "        while !(self.level > 3) { self.level += 1; }\n        if temp[0] == 2 { sleep(1); }",
+        ),
         "negated_comparison",
     );
 }
