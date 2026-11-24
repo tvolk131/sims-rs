@@ -1075,7 +1075,8 @@ fn forward_save_block(nodes: &mut [Node], map: &BTreeMap<String, String>) -> boo
 }
 
 /// Primitive arguments `.air` parses as a local slot rather than a value.
-const LOCAL_SLOT_ARGS: &[&str] = &["icon", "skin", "age", "sex", "local", "dest"];
+/// (`value:` is Relationship's, which the primitive may write.)
+const LOCAL_SLOT_ARGS: &[&str] = &["icon", "skin", "age", "sex", "local", "dest", "value"];
 
 /// Whether every mention of a `map` key in `text` is a plain value read: the text runs no
 /// primitive, or each mention is a labelled primitive argument (`label: name`) whose label

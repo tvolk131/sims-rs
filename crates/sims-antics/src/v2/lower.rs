@@ -2536,6 +2536,65 @@ const PRIM_BUILTINS: &[PrimBuiltin] = &[
             ("str_index", "str_index", U8),
         ],
     },
+    PrimBuiltin {
+        v2: "change_suit",
+        air: "change_suit",
+        keys: &[
+            ("index", "index", U8),
+            ("scope", "scope", U8),
+            ("remove", "remove", PrimArg::Bool),
+        ],
+    },
+    PrimBuiltin {
+        v2: "burn",
+        air: "burn",
+        keys: &[("mode", "mode", U8), ("flags", "flags", U8)],
+    },
+    PrimBuiltin {
+        v2: "look_towards",
+        air: "look_towards",
+        keys: &[("mode", "mode", I16)],
+    },
+    PrimBuiltin {
+        v2: "drop_onto",
+        air: "drop_onto",
+        keys: &[("src", "src", I16), ("dst", "dst", I16)],
+    },
+    // `find_location(local:)` reads the target position from the local.
+    PrimBuiltin {
+        v2: "find_location",
+        air: "find_location",
+        keys: &[
+            ("mode", "mode", U8),
+            ("flags", "flags", U8),
+            ("local", "local", PrimArg::Local),
+        ],
+    },
+    // Relationship (opcode 26): `value:` is the local the number is read into or written from
+    // (flag 4 writes); `local:` holds the other person for directions 2 and 3.
+    PrimBuiltin {
+        v2: "relationship",
+        air: "relationship",
+        keys: &[
+            ("column", "column", U8),
+            ("dir", "dir", U8),
+            ("flags", "flags", U8),
+            ("local", "local", PrimArg::Local),
+            ("value", "value", PrimArg::Local),
+        ],
+    },
+    // Old Relationship (opcode 24): the number goes through parameter `param`.
+    PrimBuiltin {
+        v2: "old_relationship",
+        air: "old_relationship",
+        keys: &[
+            ("write", "write", PrimArg::Bool),
+            ("column", "column", U8),
+            ("param", "param", PrimArg::Int(-128, 127)),
+            ("dir", "dir", U8),
+            ("flags", "flags", U8),
+        ],
+    },
 ];
 
 /// Argless low-level opcodes exposed as `name()`; each lowers to `op 0xNNNN (0, ..., 0)` and
@@ -2559,7 +2618,13 @@ fn is_prim_builtin_name(name: &str) -> bool {
         || OP_BUILTINS.iter().any(|(n, _)| *n == name)
         || matches!(
             name,
-            "animate" | "breakpoint" | "random_into" | "inc_lt" | "dec_gt" | "set_dynamic_sprite"
+            "animate"
+                | "breakpoint"
+                | "random_into"
+                | "inc_lt"
+                | "dec_gt"
+                | "set_dynamic_sprite"
+                | "generic_call"
         )
 }
 /// Allocates state attribute slots shared by object lowering and imported object schemas.
@@ -7939,11 +8004,30 @@ impl<'a> TreeLowerer<'a> {
             }
             _ => {}
         }
+        if fname == "generic_call" {
+            // Generic Sims Call: the routine number is the whole operand.
+            let bound = self.bind_builtin_args(fname, args, &["routine"], &[])?;
+            let Some(r) = bound.get("routine") else {
+                return Err(Error::at(
+                    span,
+                    "generic_call(routine) requires a routine number",
+                ));
+            };
+            let routine = self.eval_builtin_int(&r.value, "generic_call routine", 0, 65535)?;
+            return Ok(Some(format!("generic_call({routine})")));
+        }
         let Some(spec) = PRIM_BUILTINS.iter().find(|b| b.v2 == fname) else {
             return Ok(None);
         };
         let allowed: Vec<&str> = spec.keys.iter().map(|(k, _, _)| *k).collect();
         let named = self.builtin_named_args(fname, args, &allowed)?;
+        let required: &[&str] = match fname {
+            "relationship" => &["value"],
+            _ => &[],
+        };
+        if let Some(missing) = required.iter().find(|k| !named.contains_key(**k)) {
+            return Err(Error::at(span, format!("{fname}() requires '{missing}:'")));
+        }
         // `push_interaction(object: <handle>)`: the VM reads the object from a local slot
         // (flag 0x02), so the handle is copied into the tree's pinned slot first.
         let pinned_object = match named.get("object") {
@@ -12175,15 +12259,21 @@ impl<'a> TreeLowerer<'a> {
                 if let Some(Binding::Sound(id)) = self.lookup_var(name) {
                     return Ok(*id);
                 }
-                self.env
-                    .sounds
-                    .get(name)
-                    .map(|s| s.id)
-                    .ok_or_else(|| Error::at(*span, format!("unknown sound '{name}'")))
+                if let Some(s) = self.env.sounds.get(name) {
+                    return Ok(s.id);
+                }
+                if self.const_item(name).is_some() {
+                    return u16::try_from(self.eval_builtin_int(expr, "sound id", 0, 65535)?)
+                        .map_err(|_| Error::at(*span, "sound id out of range"));
+                }
+                Err(Error::at(*span, format!("unknown sound '{name}'")))
             }
+            // A library (global) sound by FWAV id, as a literal or `const`.
+            V2Expr::Int(..) => u16::try_from(self.eval_builtin_int(expr, "sound id", 0, 65535)?)
+                .map_err(|_| Error::at(expr.span(), "sound id out of range")),
             other => Err(Error::at(
                 other.span(),
-                "expected typed sound identifier (declared with 'sound name = preset(...);')",
+                "expected typed sound identifier (declared with 'sound name = preset(...);') or an FWAV id",
             )),
         }
     }
@@ -12211,62 +12301,58 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// `play_sound(sound [, target] [, flags: N])`. The target is `self` (the object), `sim`,
+    /// `stack_obj`, or a literal `bool` (`true` = the stack object, as in `.air`); by default the
+    /// object. Flag 0x02 is the target's, so `flags:` may not set it.
     fn format_play_sound(&self, args: &[CallArg], span: Span) -> Result<String> {
-        if args.is_empty() || args.len() > 2 || args.iter().any(|a| a.name.is_some()) {
+        let bound = self.bind_builtin_args("play_sound", args, &["sound", "target"], &["flags"])?;
+        let Some(sound) = bound.get("sound") else {
             return Err(Error::at(
                 span,
-                "play_sound(sound [, target]) expects 1 or 2 positional arguments",
+                "play_sound(sound [, target] [, flags: N]) requires a sound",
+            ));
+        };
+        let sound_id = self.resolve_sound_expr(&sound.value)?;
+        let on_stack = match bound.get("target") {
+            Some(t) => self.sound_target_is_stack_obj("play_sound", &t.value)?,
+            None => matches!(self.tree_ctx, TreeContext::SimOnObject { .. }),
+        };
+        let Some(f) = bound.get("flags") else {
+            let target = if on_stack { "stack_obj" } else { "false" };
+            return Ok(format!("play_sound({sound_id}, {target})"));
+        };
+        let flags = self.eval_builtin_int(&f.value, "play_sound flags", 0, 255)?;
+        if flags & 0x02 != 0 {
+            return Err(Error::at(
+                f.span,
+                "play_sound flags 0x02 selects the stack object; pass 'stack_obj' as the target instead",
             ));
         }
-        let sound_id = self.resolve_sound_expr(&args[0].value)?;
-        let use_stack_obj = if let Some(target_arg) = args.get(1) {
-            match &target_arg.value {
-                V2Expr::Ident(tspan, name) => {
-                    if self.is_self_ident(name) {
-                        matches!(self.tree_ctx, TreeContext::SimOnObject { .. })
-                    } else if self.is_sim_ident(name) {
-                        false
-                    } else {
-                        return Err(Error::at(
-                            *tspan,
-                            format!("play_sound target must be 'self' or 'sim', found '{name}'"),
-                        ));
-                    }
-                }
-                other => {
-                    return Err(Error::at(
-                        other.span(),
-                        "play_sound target must be 'self' or 'sim'",
-                    ));
-                }
+        let flags = flags | if on_stack { 0x02 } else { 0 };
+        Ok(format!("play_sound({sound_id}, flags: {flags})"))
+    }
+
+    /// Whether a sound primitive's target is the stack object (its flag) rather than `me`.
+    fn sound_target_is_stack_obj(&self, prim: &str, target: &V2Expr) -> Result<bool> {
+        match target {
+            V2Expr::Bool(_, b) => Ok(*b),
+            V2Expr::Ident(_, n) if n == "stack_obj" => Ok(true),
+            V2Expr::Ident(_, n) if self.is_self_ident(n) => {
+                Ok(matches!(self.tree_ctx, TreeContext::SimOnObject { .. }))
             }
-        } else {
-            matches!(self.tree_ctx, TreeContext::SimOnObject { .. })
-        };
-        if use_stack_obj {
-            Ok(format!("play_sound({sound_id}, stack_obj)"))
-        } else {
-            Ok(format!("play_sound({sound_id}, false)"))
+            V2Expr::Ident(_, n) if self.is_sim_ident(n) => Ok(false),
+            other => Err(Error::at(
+                other.span(),
+                format!("{prim} target must be 'self', 'sim', 'stack_obj', or a literal bool"),
+            )),
         }
     }
 
-    fn format_stop_all_sounds(&self, args: &[CallArg], span: Span) -> Result<String> {
+    fn format_stop_all_sounds(&self, args: &[CallArg], _span: Span) -> Result<String> {
         let bound = self.bind_builtin_args("stop_all_sounds", args, &["target"], &[])?;
-        let use_stack = if let Some(arg) = bound.get("target") {
-            match &arg.value {
-                V2Expr::Ident(_, n) if self.is_self_ident(n) => {
-                    matches!(self.tree_ctx, TreeContext::SimOnObject { .. })
-                }
-                V2Expr::Ident(_, n) if self.is_sim_ident(n) => false,
-                _ => {
-                    return Err(Error::at(
-                        span,
-                        "stop_all_sounds target must be 'self' or 'sim'",
-                    ));
-                }
-            }
-        } else {
-            matches!(self.tree_ctx, TreeContext::SimOnObject { .. })
+        let use_stack = match bound.get("target") {
+            Some(t) => self.sound_target_is_stack_obj("stop_all_sounds", &t.value)?,
+            None => matches!(self.tree_ctx, TreeContext::SimOnObject { .. }),
         };
         Ok(format!("stop_all_sounds({use_stack})"))
     }

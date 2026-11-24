@@ -253,3 +253,103 @@ fn empty_frame_tree_has_zero_nodes_and_plain_braces_still_return_true() {
         &obj("    @frame(empty) tree t -> bool {}"),
     );
 }
+
+#[test]
+fn tier2_primitives_lower_to_their_opcodes() {
+    let cfg = PackResolverConfig::default();
+    let src = obj(r#"    const LIBRARY_SOUND = 0x0123;
+    sound chime = preset("chime");
+    @id(4210) tree prims "Prims" (sim: Sim) {
+        let other = 0;
+        let score = 0;
+        change_suit(index: 2, scope: 1, remove: true);
+        burn(mode: 1, flags: 1);
+        look_towards(mode: 2);
+        drop_onto(src: 0, dst: 1);
+        if !find_location(mode: 3, flags: 1, local: other) { return false; }
+        relationship(column: 0, dir: 2, flags: 0, local: other, value: score);
+        old_relationship(write: true, column: 1, param: 0, dir: 0, flags: 0);
+        generic_call(17);
+        play_sound(chime, stack_obj, flags: 1);
+        play_sound(LIBRARY_SOUND, self);
+        play_sound(0x0042, false);
+        stop_all_sounds(stack_obj);
+        self.n = score;
+    }
+    @id(4211) tree object_side "Object Side" {
+        play_sound(chime, stack_obj);
+        play_sound(chime);
+    }"#);
+    let air = expand("tier2.antics", &src);
+    for needle in [
+        "change_suit(index: 2, scope: 1, remove: true);",
+        "burn(mode: 1, flags: 1);",
+        "look_towards(mode: 2);",
+        "drop_onto(src: 0, dst: 1);",
+        "find_location(mode: 3, flags: 1, local: __v_other_0)",
+        "relationship(column: 0, dir: 2, flags: 0, local: __v_other_0, value: __v_score_1);",
+        "old_relationship(write: true, column: 1, param: 0, dir: 0, flags: 0);",
+        "generic_call(17);",
+        "flags: 3);",
+        "play_sound(291, stack_obj);",
+        "play_sound(66, false);",
+        "stop_all_sounds(true);",
+    ] {
+        assert!(air.contains(needle), "missing '{needle}':\n{air}");
+    }
+    // An object tree can play on its stack object; by default it plays on itself.
+    let object_side = &air[air.find("\"Object Side\"").expect("object tree")..];
+    assert!(
+        object_side.contains("stack_obj);\n    play_sound("),
+        "{object_side}"
+    );
+    assert!(object_side.contains(", false);"), "{object_side}");
+
+    let compiled = compile_v2_source("tier2.antics", &src, &cfg).expect("compile");
+    let opcodes: Vec<u16> = compiled.behaviors[&4210]
+        .instructions
+        .iter()
+        .map(|i| i.opcode)
+        .collect();
+    for opcode in [6, 9, 22, 43, 16, 26, 24, 1, 23, 48] {
+        assert!(opcodes.contains(&opcode), "opcode {opcode} in {opcodes:?}");
+    }
+    // The relationship read lands in `score`, which the tree then stores: the optimizer may
+    // not forward `score`'s initial 0 past the primitive.
+    assert!(air.contains("stack.attr[0] := __v_score_1;\n"), "{air}");
+
+    for (name, body, needle) in [
+        (
+            "rel_value.antics",
+            "let o = 0; relationship(column: 0, local: o);",
+            "relationship() requires 'value:'",
+        ),
+        (
+            "rel_value_type.antics",
+            "relationship(column: 0, value: self.n);",
+            "relationship(value:) must name an i16 local variable",
+        ),
+        (
+            "suit_unknown.antics",
+            "change_suit(index: 1, off: true);",
+            "unknown change_suit() argument 'off'",
+        ),
+        (
+            "generic_named.antics",
+            "generic_call(id: 4);",
+            "unknown generic_call() argument 'id'",
+        ),
+        (
+            "sound_flag_two.antics",
+            "play_sound(0x0042, flags: 2);",
+            "play_sound flags 0x02 selects the stack object",
+        ),
+        (
+            "sound_target.antics",
+            "play_sound(0x0042, 3);",
+            "play_sound target must be 'self', 'sim', 'stack_obj', or a literal bool",
+        ),
+    ] {
+        expect_err(name, &sim_tree(body), needle);
+    }
+}
