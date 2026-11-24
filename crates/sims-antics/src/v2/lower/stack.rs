@@ -4,6 +4,11 @@
 use super::*;
 
 impl<'a> TreeLowerer<'a> {
+    /// Emits one typed `stack_obj` operation.
+    pub(super) fn stack_op(&mut self, op: mir::StackObjOp<'_>) {
+        self.line(op.text());
+    }
+
     pub(super) fn track_stack_obj(&mut self, explicit_stack_obj: bool) {
         self.explicit_stack_obj = explicit_stack_obj;
         self.has_self_obj_local |=
@@ -13,14 +18,14 @@ impl<'a> TreeLowerer<'a> {
     pub(super) fn save_stack_obj_for_move(&mut self) -> Option<String> {
         self.explicit_stack_obj.then(|| {
             let saved = self.fresh("pre_stack_obj");
-            self.line(format!("let {saved} = stack_obj;"));
+            self.stack_op(mir::StackObjOp::Save(&saved));
             saved
         })
     }
 
     pub(super) fn emit_restore_stack_obj(&mut self, saved: Option<&str>) {
         if let Some(saved) = saved {
-            self.line(format!("stack_obj := {saved};"));
+            self.stack_op(mir::StackObjOp::Set(saved));
         } else if !self.explicit_stack_obj {
             self.emit_entry_stack_restore();
         }
@@ -28,10 +33,10 @@ impl<'a> TreeLowerer<'a> {
 
     pub(super) fn emit_entry_stack_restore(&mut self) {
         if self.has_self_obj_local {
-            self.line("stack_obj := __self_obj;".to_owned());
+            self.stack_op(mir::StackObjOp::Set(mir::SELF_OBJ));
         } else if matches!(self.tree_ctx, TreeContext::ObjectSelf) {
             self.used_saved_stack_obj = true;
-            self.line("stack_obj := __saved_stack_obj;".to_owned());
+            self.stack_op(mir::StackObjOp::Set(mir::SAVED_STACK_OBJ));
         }
     }
 
@@ -66,7 +71,7 @@ impl<'a> TreeLowerer<'a> {
         let target = self.self_stack_target();
         let saved = if target != "stack_obj" {
             let saved = self.save_stack_obj_for_move();
-            self.line(format!("stack_obj := {target};"));
+            self.stack_op(mir::StackObjOp::Set(target));
             saved
         } else {
             None

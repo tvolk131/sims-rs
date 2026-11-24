@@ -569,7 +569,7 @@ impl<'a> TreeLowerer<'a> {
                     self.fresh(&format!("v_{binding}"))
                 };
                 let init_line = if stack_cursor {
-                    "stack_obj := 0;".to_owned()
+                    mir::StackObjOp::Set("0").text()
                 } else {
                     format!("let {iter_var} = 0;")
                 };
@@ -623,7 +623,7 @@ impl<'a> TreeLowerer<'a> {
                                     "__self_obj".to_owned()
                                 } else {
                                     let root_loc = self.fresh("parts_root");
-                                    self.line(format!("let {root_loc} = stack_obj;"));
+                                    self.stack_op(mir::StackObjOp::Save(&root_loc));
                                     root_loc
                                 }
                             }
@@ -686,16 +686,17 @@ impl<'a> TreeLowerer<'a> {
                 // The exhaustion block sees the iterator's false result, which a restore store
                 // would replace: restore only if an iteration may leave the stack object moved
                 // (a field read through `item` moves it back itself).
-                let restore_line = if self.has_self_obj_local {
-                    "stack_obj := __self_obj;"
+                let restore_line = mir::StackObjOp::Set(if self.has_self_obj_local {
+                    mir::SELF_OBJ
                 } else {
-                    "stack_obj := __saved_stack_obj;"
-                };
+                    mir::SAVED_STACK_OBJ
+                })
+                .text();
                 let restore_on_exhaustion = restore_on_exhaustion
                     && (stack_cursor
                         || super::mir::body_may_leave_stack_obj_moved(
                             self.em.since(body_start),
-                            restore_line,
+                            &restore_line,
                         ));
                 if let Some(else_body) = else_body {
                     self.line("continue;".to_owned());
@@ -1393,7 +1394,7 @@ impl<'a> TreeLowerer<'a> {
             let saved_stack_obj = self.save_stack_obj_for_move();
             self.line(format!("if {} {{", plan.prim_air));
             self.em.indent();
-            self.line(format!("let {raw_var} = stack_obj;"));
+            self.stack_op(mir::StackObjOp::Save(&raw_var));
             self.line(format!("let {cand_var} = 0;"));
             let best_var = if allow_fallback && score_field.is_some() {
                 let b = self.fresh("fbo_best");
@@ -1414,7 +1415,7 @@ impl<'a> TreeLowerer<'a> {
             self.em.dedent();
             self.line("}".to_owned());
             if allow_fallback {
-                self.line(format!("stack_obj := {cand_var};"));
+                self.stack_op(mir::StackObjOp::Set(&cand_var));
                 self.line("if stack.in_use == 0 {".to_owned());
                 self.em.indent();
                 self.line("if !stack.data[8] flag_test 10 {".to_owned());
@@ -1574,7 +1575,7 @@ impl<'a> TreeLowerer<'a> {
         r.and(p)?;
 
         let air_name = self.fresh(&format!("v_{name}"));
-        self.line(format!("let {air_name} = stack_obj;"));
+        self.stack_op(mir::StackObjOp::Save(&air_name));
         self.emit_restore_stack_obj(saved_stack_obj.as_deref());
         self.bind_var(
             name.to_owned(),
@@ -1638,9 +1639,9 @@ impl<'a> TreeLowerer<'a> {
                     }
                     // The legacy spelling restores the pre-call stack object on both edges.
                     let pre = self.fresh("pre_stack_obj");
-                    self.line(format!("let {pre} = stack_obj;"));
+                    self.stack_op(mir::StackObjOp::Save(&pre));
                     self.line(format!("{prim};"));
-                    self.line(format!("stack_obj := {pre};"));
+                    self.stack_op(mir::StackObjOp::Set(&pre));
                     return Ok(());
                 }
                 if !type_args.is_empty() {

@@ -639,7 +639,7 @@ impl<'a> TreeLowerer<'a> {
                     rhs_air.to_owned()
                 };
                 let saved = self.save_stack_obj_for_move();
-                self.line(format!("stack_obj := {obj_air};"));
+                self.stack_op(mir::StackObjOp::Set(obj_air));
                 self.line(format!(
                     "stack.attr[{attr_index}] {op_str} {effective_rhs};"
                 ));
@@ -668,7 +668,7 @@ impl<'a> TreeLowerer<'a> {
                 }
                 let saved = if switches {
                     let saved = self.save_stack_obj_for_move();
-                    self.line(format!("stack_obj := {obj_air};"));
+                    self.stack_op(mir::StackObjOp::Set(obj_air));
                     saved
                 } else {
                     None
@@ -712,7 +712,7 @@ impl<'a> TreeLowerer<'a> {
             } => {
                 let tmp = self.fresh("fattr");
                 let saved = self.save_stack_obj_for_move();
-                self.line(format!("stack_obj := {obj_air};"));
+                self.stack_op(mir::StackObjOp::Set(obj_air));
                 self.line(format!("let {tmp} = stack.attr[{attr_index}];"));
                 self.emit_restore_stack_obj(saved.as_deref());
                 Ok((tmp, ty.clone()))
@@ -731,7 +731,7 @@ impl<'a> TreeLowerer<'a> {
                     self.line(format!("let {tmp} = {cell};"));
                 } else {
                     let saved = self.save_stack_obj_for_move();
-                    self.line(format!("stack_obj := {obj_air};"));
+                    self.stack_op(mir::StackObjOp::Set(obj_air));
                     self.line(format!("let {tmp} = {cell};"));
                     self.emit_restore_stack_obj(saved.as_deref());
                 }

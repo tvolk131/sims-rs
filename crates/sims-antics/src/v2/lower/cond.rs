@@ -692,7 +692,7 @@ impl<'a> TreeLowerer<'a> {
                         None
                     } else {
                         let pre = self.fresh("pre_stack_obj");
-                        self.line(format!("let {pre} = stack_obj;"));
+                        self.stack_op(mir::StackObjOp::Save(&pre));
                         Some(pre)
                     };
                     self.line(format!("if {prim} {{"));
@@ -705,7 +705,7 @@ impl<'a> TreeLowerer<'a> {
                     self.em.dedent();
                     self.line("}".to_owned());
                     if let Some(saved) = saved {
-                        self.line(format!("stack_obj := {saved};"));
+                        self.stack_op(mir::StackObjOp::Set(&saved));
                     }
                     return Ok(());
                 }

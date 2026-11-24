@@ -154,7 +154,7 @@ impl<'a> TreeLowerer<'a> {
         }
         let saved_stack_obj = if staged_target != "stack_obj" {
             let saved = self.save_stack_obj_for_move();
-            self.line(format!("stack_obj := {staged_target};"));
+            self.stack_op(mir::StackObjOp::Set(&staged_target));
             saved
         } else {
             None

@@ -904,7 +904,7 @@ impl<'a> TreeLowerer<'a> {
         }
         let saved = if moves {
             let saved = self.save_stack_obj_for_move();
-            self.line(format!("stack_obj := {target};"));
+            self.stack_op(mir::StackObjOp::Set(&target));
             saved
         } else {
             None

@@ -89,3 +89,29 @@ impl Emitter {
         self.text
     }
 }
+
+/// The Sim-tree entry save's local: the object the tree was entered with.
+pub(crate) const SELF_OBJ: &str = "__self_obj";
+/// An object tree's saved entry `stack_obj` (written first when a foreign access moves it).
+pub(crate) const SAVED_STACK_OBJ: &str = "__saved_stack_obj";
+
+/// A typed operation on the frame's stack object (`stack_obj`, the cursor most primitives
+/// address through `stack.*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StackObjOp<'a> {
+    /// `let NAME = stack_obj;`: keeps the cursor in a local (the entry save, a save before a
+    /// temporary move, or a binding of the object the cursor holds).
+    Save(&'a str),
+    /// `stack_obj := VALUE;`: moves the cursor, or restores a saved one.
+    Set(&'a str),
+}
+
+impl StackObjOp<'_> {
+    /// The `.air` statement.
+    pub(crate) fn text(&self) -> String {
+        match self {
+            StackObjOp::Save(name) => format!("let {name} = stack_obj;"),
+            StackObjOp::Set(value) => format!("stack_obj := {value};"),
+        }
+    }
+}

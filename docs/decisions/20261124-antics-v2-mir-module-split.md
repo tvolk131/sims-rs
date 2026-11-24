@@ -1,0 +1,134 @@
+# `.antics` v2 Lowering: Module Split and MIR Layer
+
+*Decided 2026-11-24.*
+
+**Branch:** `t3/antics-v2-mir-refactor`  
+**Track:** Track 8 (`.antics` v2, Wave A)
+
+## Context
+
+`v2/lower.rs` had grown to 16,470 lines in one file. It held:
+
+- AST lowering;
+- frame and slot bookkeeping;
+- `stack_obj` save planning;
+- specialization hooks;
+- `.air` text emission.
+
+`v2/opt.rs` (2,723 lines) held two things in one file:
+
+- its own parsed form of a lowered body;
+- the analyses and passes over that form, including the frame-allocation and entry-save passes.
+
+PR H took nine review rounds, largely because a change to one concern meant reading all of them.
+
+## Decision
+
+The work is a refactor that is strictly behaviour-preserving. It adds no syntax and changes nothing in the parser or AST. It also makes no intended change to the output. The equivalence bar is **byte-identical** output.
+
+### Changes
+
+- **`v2/lower.rs` becomes `v2/lower/`**, with 24 child modules plus `mod.rs`.
+  - Every item moved verbatim.
+  - The only edits are a `pub(super)` on moved items that had no visibility, and the module headers.
+  - Types, structs and enums stay in `lower/mod.rs`, so their private fields stay visible to every child.
+- **A new `v2/mir/` layer** takes what was mixed into `opt.rs`. See the module map below.
+- **`opt.rs`** keeps only the optimizer passes over the MIR. It went from 2,723 lines to 810.
+- **`mir::Emitter`** replaces `TreeLowerer`'s `out` / `indent` fields. It writes lines at a depth and gives the marks that trial lowering uses: `mark`, `truncate`, `split_off`, `since`, `take_text` / `set_text` / `append`.
+- **`mir::StackObjOp`** types the `stack_obj` cursor operations. Every `let X = stack_obj;` and `stack_obj := X;` the lowering writes now goes through `TreeLowerer::stack_op`.
+- **`mir::finish_body` with `FrameFacts`** is the per-tree backend pipeline. It takes over what `TreeLowerer::finish` ran inline:
+  - the entry-save drop or the optimizer;
+  - the pinned slot;
+  - the raw constants;
+  - `@slot(N)` placement.
+
+### Module map
+
+**`v2/lower/`**
+
+| Module | Contents |
+| --- | --- |
+| `mod.rs` | All types, plus `lower_resolved_module` |
+| `env.rs` | Dialog string table, enum/bitflags resolution, `ObjectEnv` |
+| `object.rs` | `lower_object`, `resolve_variants` |
+| `schema.rs` | State slots, BCON tables, tree signatures, object schema, guards |
+| `trees.rs` | Standalone and guard trees, `.air` header, framed tree writer |
+| `prim_table.rs` | `PRIM_BUILTINS`, `OP_BUILTINS`, builtin-name lookups |
+| `tree.rs` | `TreeLowerer` core: `new`, `finish`, `line`, `fresh`, bindings |
+| `stack.rs` | `stack_obj` tracking, saves and restores, `stack_op`, cursor checks |
+| `scope.rs` | Scopes and cleanups: `defer`, locks, loop exits, cancel |
+| `callable.rs` | Calls to user callables, value returns |
+| `stmt.rs` | Statement dispatcher, range `for`, `let Some`, expression statements |
+| `raw_consts.rs` | Raw-block constant ownership and collection |
+| `raw.rs` | Raw `.air` parsing, validation, clobber facts |
+| `match_lower.rs` | `match` lowering |
+| `matching.rs` | Match arm and pattern helpers |
+| `dialog.rs` | Dialogs |
+| `builtins.rs` | Builtin arguments, primitive formatting, animation, `sleep` |
+| `actions.rs` | Functionals, sounds, budget, find-best-object, create, slots, motives |
+| `inline.rs` | Helper inlining |
+| `lvalue.rs` | Places: l-value resolution, assignment, reads |
+| `consteval.rs` | Compile-time evaluation and dead-branch checks |
+| `expr.rs` | Value expressions |
+| `cond.rs` | Conditions, `if`, short circuits, boolean returns |
+| `ast_facts.rs` | Syntactic AST facts: writes, borrows, divergence, returns, `stack_obj` clobbering |
+| `air_text.rs` | Small `.air` text helpers |
+
+**`v2/mir/`**
+
+| Module | Contents |
+| --- | --- |
+| `body.rs` | `Stmt` tree (`Inst` / `If` / `While`), block walkers |
+| `text.rs` | `parse_body` / `print_nodes` |
+| `inst.rs` | `InstKind` (the typed view of an instruction) and operand facts |
+| `effects.rs` | `stack_obj` and last-result effects |
+| `liveness.rs` | Local liveness |
+| `frame.rs` | Pinned slot, `@slot(N)` placement, local renaming |
+| `entry_save.rs` | Sim-tree entry save: forwarding and dropping it |
+| `emit.rs` | `Emitter`, `StackObjOp` |
+| `pipeline.rs` | `FrameFacts`, `finish_body` |
+| `tests.rs` | Unit tests |
+
+### Verification
+
+**Differential harness.** It runs the base binary (b3758a7c) and the new one over the same corpus, and compares every observable output byte for byte. The corpus is:
+
+- 1,341 `.antics` files:
+  - every `.antics` in the repository;
+  - every pilot and scratch object under `cache/scratch`, which includes the 13 Round 3 pilot objects;
+  - 642 synthetic probes from earlier review rounds.
+- 163 packs, including `open-pack`.
+
+The outputs compared are:
+
+- `expand`;
+- `check`;
+- `lint --json`;
+- the sha256 of the `.iff` built from each file;
+- the sha256 of every file each pack builds.
+
+Two base runs agree with each other (0 differences). Every stage of this change also gives 0 differences.
+
+### Staging
+
+Turning the 395 emission sites into fully typed instructions, and moving the passes from text heuristics to typed effects, is left out of this PR. Doing it in one change would not keep the output byte-identical at a reviewable size. It is the next PR, done one family of instructions at a time.
+
+That PR starts from the seams added here:
+
+- **`Emitter`.** It builds `mir::Stmt` directly instead of text.
+- **`InstKind`.** It becomes a stored typed instruction instead of a view over the text.
+- **`StackObjOp`.** It is already typed at every emission site.
+- **`FrameFacts`.** It carries the frame metadata.
+
+The Round 3 fixes each become a local change:
+
+- **Unread entry-save drop for dialog trees.** One condition in `mir/entry_save.rs`, using `FrameFacts::formats_text`.
+- **Hidden `local: 0` slot accounting.** `FrameFacts::pinned` / `pinned_locals` in `mir/pipeline.rs`.
+- **Inline-helper slot sharing.** `lower/inline.rs`, which no longer shares a file with the statement dispatcher.
+
+The canonical `@context(inherit)` equivalence check is in the verifier. That is outside this change's files.
+
+## What would reopen this
+
+- A behaviour change found that traces to this refactor. The harness and tests say there is none.
+- If moving items between modules makes rebases of in-flight v2 PRs costly enough that the split should have waited.

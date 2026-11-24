@@ -58,7 +58,7 @@ impl<'a> TreeLowerer<'a> {
     pub(super) fn begin_body(&mut self, explicit_stack_obj: bool) {
         self.track_stack_obj(explicit_stack_obj);
         if self.has_self_obj_local {
-            self.line("let __self_obj = stack_obj;".to_owned());
+            self.stack_op(mir::StackObjOp::Save(mir::SELF_OBJ));
         }
     }
 
@@ -92,7 +92,8 @@ impl<'a> TreeLowerer<'a> {
         };
         let body = self.em.into_text();
         let mut out = if self.used_saved_stack_obj {
-            format!("    let __saved_stack_obj = stack_obj;\n{body}")
+            let save = mir::StackObjOp::Save(mir::SAVED_STACK_OBJ).text();
+            format!("    {save}\n{body}")
         } else {
             body
         };
