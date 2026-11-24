@@ -222,8 +222,28 @@ struct TreeUsage {
     has_raw_ops: bool,
     uses_idle: bool,
     uses_param0: bool,
-    max_explicit_local: Option<usize>,
+    /// Every local slot the tree names explicitly (`local[N]`, numeric local arguments).
+    explicit_locals: BTreeSet<usize>,
     let_decls: Vec<(Span, String)>,
+}
+
+/// The local-slot facts `.air` allocation works from: the explicitly named slots, the `let`
+/// names in declaration order, and whether raw `op` bytes may name slots no scan can see.
+#[derive(Debug)]
+pub(crate) struct AirLocalUsage {
+    pub(crate) explicit: BTreeSet<usize>,
+    pub(crate) lets: Vec<String>,
+    pub(crate) has_raw_ops: bool,
+}
+
+/// [`AirLocalUsage`] of a parsed tree body.
+pub(crate) fn air_local_usage(stmts: &[Stmt]) -> AirLocalUsage {
+    let usage = scan_tree_usage(stmts);
+    AirLocalUsage {
+        explicit: usage.explicit_locals,
+        lets: usage.let_decls.into_iter().map(|(_, name)| name).collect(),
+        has_raw_ops: usage.has_raw_ops,
+    }
 }
 
 fn scan_tree_usage(stmts: &[Stmt]) -> TreeUsage {
@@ -241,7 +261,7 @@ fn scan_operand(op: &OperandRef, usage: &mut TreeUsage) {
             usage.uses_param0 = true;
         } else if direct.scope == 25 && direct.index >= 0 {
             let idx = direct.index as usize;
-            usage.max_explicit_local = Some(usage.max_explicit_local.map_or(idx, |m| m.max(idx)));
+            usage.explicit_locals.insert(idx);
         }
     }
 }
@@ -249,7 +269,7 @@ fn scan_operand(op: &OperandRef, usage: &mut TreeUsage) {
 fn scan_local_ref(local: &LocalRef, usage: &mut TreeUsage) {
     if let LocalRef::Index(idx) = local {
         let idx = usize::from(*idx);
-        usage.max_explicit_local = Some(usage.max_explicit_local.map_or(idx, |m| m.max(idx)));
+        usage.explicit_locals.insert(idx);
     }
 }
 
@@ -311,8 +331,7 @@ fn scan_primitive(prim: &PrimitiveCall, usage: &mut TreeUsage) {
         } => {
             if flags & 0x20 != 0 && *duration >= 0 {
                 let idx = *duration as usize;
-                usage.max_explicit_local =
-                    Some(usage.max_explicit_local.map_or(idx, |m| m.max(idx)));
+                usage.explicit_locals.insert(idx);
             }
         }
         PrimitiveCall::Reach {
@@ -330,8 +349,7 @@ fn scan_primitive(prim: &PrimitiveCall, usage: &mut TreeUsage) {
         } => {
             if flags & 2 != 0 {
                 let idx = usize::from(*object_slot);
-                usage.max_explicit_local =
-                    Some(usage.max_explicit_local.map_or(idx, |m| m.max(idx)));
+                usage.explicit_locals.insert(idx);
             } else if *object_slot == 0 {
                 usage.uses_param0 = true;
             }
@@ -2039,9 +2057,25 @@ fn lower_tree(tree: &TreeDecl, symbols: &ModuleSymbols) -> Result<BhavChunk> {
         ));
     }
 
-    // Deterministically assign named `let`/`local` variables after any explicit `local[N]`.
+    // Deterministically assign named `let`/`local` variables after any explicit `local[N]` and
+    // the header's `min_locals`.
     let mut named_locals = BTreeMap::new();
-    let mut next_local = usage.max_explicit_local.map_or(0, |m| m + 1);
+    let min_locals = usize::from(tree.header.min_locals);
+    if min_locals > max_allowed_locals {
+        return Err(Error::at(
+            tree.span,
+            format!(
+                "tree '{}' asks for min_locals {min_locals}, exceeding format {:#06x}'s limit of \
+                 {max_allowed_locals}",
+                tree.label, tree.header.format
+            ),
+        ));
+    }
+    let mut next_local = usage
+        .explicit_locals
+        .last()
+        .map_or(0, |m| m + 1)
+        .max(min_locals);
     for (span, name) in &usage.let_decls {
         if named_locals.contains_key(name) {
             return Err(Error::at(

@@ -10,6 +10,19 @@
 //!   `param`/`state`/`sound`/`slot` declarations, `self`/`sim` context safety, `with lock(...)`,
 //!   `defer { ... }`, `repeat N cancel_on_abort { ... }`, and short-circuit boolean expressions,
 //!   lowering cleanly to `.air` + IFF metadata.
+//!
+//! Object `for` loops accept an `else { ... }` block on exhaustion, including when
+//! `self.parts()` wraps to its starting part. A `break` in the loop bypasses the block.
+//! The block can fall through and cannot access the iteration binding or use `break` or
+//! `continue` to target an enclosing loop. Range loops do not accept `else`.
+//!
+//! `set_to_next(part, dest: stack_obj)` steps the current stack object in place. The caller
+//! initializes the cursor when needed. `set_to_next(category, dest: stack_obj)` uses
+//! `param[0]` as the category, and `set_to_next(on_tile, dest: stack_obj)` uses mode 8
+//! to step through the current object's tile. An explicit `dest:` preserves the destination
+//! flag in the operand bytes. `create_object(GUID, dest: stack_obj)` leaves the primitive's
+//! result in the cursor. In Sim trees that use these operations, `self` still names the entry
+//! object and temporary cursor moves preserve the current value.
 
 pub mod ast;
 pub mod decompile;
@@ -20,6 +33,8 @@ pub mod loader;
 pub mod lower;
 mod opt;
 pub mod parser;
+mod raw_facts;
+mod specialize;
 
 pub use decompile::{
     DecompileV2Options, DecompileV2Report, DecompiledTree, TreeCheck, TreeStyle,

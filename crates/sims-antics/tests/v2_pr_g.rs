@@ -325,9 +325,9 @@ fn tier2_primitives_lower_to_their_opcodes() {
             "relationship() requires 'value:'",
         ),
         (
-            "rel_value_type.antics",
-            "relationship(column: 0, value: self.n);",
-            "relationship(value:) must name an i16 local variable",
+            "rel_value_const.antics",
+            "relationship(column: 0, value: 3);",
+            "so a constant is not allowed",
         ),
         (
             "suit_unknown.antics",

@@ -142,6 +142,8 @@ pub struct TreeMemberDecl {
     pub label: String,
     /// `Some(name)` when the first parameter is `name: Sim` (Sim-on-object context).
     pub sim_binding: Option<String>,
+    /// `@context(inherit)` lets callers supply either frame context unchanged.
+    pub inherit_context: bool,
     pub params: Vec<AbiParam>,
     pub ret: ReturnAbi,
     pub body: Vec<V2Stmt>,
@@ -210,6 +212,7 @@ pub enum V2Type {
     Skill,
     Sound,
     Slot,
+    Guid,
     Named(String),
     MutRef(Box<V2Type>),
 }
@@ -227,6 +230,7 @@ impl V2Type {
             Self::Skill => "Skill".to_owned(),
             Self::Sound => "Sound".to_owned(),
             Self::Slot => "Slot".to_owned(),
+            Self::Guid => "Guid".to_owned(),
             Self::Named(name) => name.clone(),
             Self::MutRef(inner) => format!("&mut {}", inner.display_name()),
         }
@@ -242,7 +246,7 @@ pub struct FnParam {
     pub default: Option<V2Expr>,
 }
 
-/// Reusable helper function declaration (`[pub] fn name(...) [-> bool | -> i16] { ... }`).
+/// Reusable helper function declaration (`[pub] fn name(...) [-> bool | -> Result | -> i16] { ... }`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnDecl {
     pub span: Span,
@@ -475,6 +479,8 @@ pub struct StringsDecl {
 pub struct LifecycleBlock {
     pub span: Span,
     pub pinned_id: Option<u16>,
+    /// `@frame(...)`: the lifecycle tree's BHAV header, as on a standalone `tree`.
+    pub frame: Option<TreeFrame>,
     pub body: Vec<V2Stmt>,
 }
 
@@ -601,6 +607,8 @@ pub enum V2Stmt {
         name: String,
         ty: Option<V2Type>,
         init: V2Expr,
+        /// `@slot(N) let ..`: the frame word (`local[N]`) the variable lives in.
+        slot: Option<u8>,
     },
     LetSome {
         span: Span,
@@ -641,6 +649,8 @@ pub enum V2Stmt {
         binding: String,
         iter: ForEachIter,
         body: Vec<V2Stmt>,
+        /// Runs on iterator exhaustion, outside the scope of the loop binding.
+        else_body: Option<Vec<V2Stmt>>,
     },
     If {
         span: Span,
@@ -683,6 +693,8 @@ pub enum V2Stmt {
         span: Span,
         name: String,
         ty: V2Type,
+        /// `@slot(N) let ..`: the frame word (`local[N]`) the variable lives in.
+        slot: Option<u8>,
     },
     /// `animate(...);` (play to completion) or `animate(...) |event| { ... }` (run the body
     /// once per animation event, with `event` bound to the event number).
@@ -893,6 +905,7 @@ pub(crate) fn is_reserved_type_name(name: &str) -> bool {
             | "Skill"
             | "Sound"
             | "Slot"
+            | "Guid"
             | "Height"
             | "Placement"
             | "Self"

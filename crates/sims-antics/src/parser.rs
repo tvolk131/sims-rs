@@ -13,11 +13,25 @@ const MAX_NESTING_DEPTH: usize = 64;
 
 /// Parses a `.antics` source string into a [`Module`] AST.
 pub fn parse_module(source: &str) -> Result<Module> {
+    parse_module_with(source, false)
+}
+
+/// Parses `.air` code whose named constants are declared elsewhere: a name where an integer
+/// belongs parses as 0. The values are wrong, so this is only for reading the code's shape
+/// (statements, labels, branch targets, opcodes).
+pub fn parse_module_lenient(source: &str) -> Result<Module> {
+    parse_module_with(source, true)
+}
+
+fn parse_module_with(source: &str, lenient: bool) -> Result<Module> {
     let tokens = tokenize(source)?;
     let mut parser = Parser {
         tokens,
         pos: 0,
         depth: 0,
+        consts: std::collections::BTreeMap::new(),
+        tree_locals: std::collections::BTreeSet::new(),
+        lenient,
     };
     parser.parse_module()
 }
@@ -26,6 +40,23 @@ struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     depth: usize,
+    /// The current tree's named constants (`const NAME = value;`), in scope from their
+    /// declaration to the end of the tree.
+    consts: std::collections::BTreeMap<String, ConstValue>,
+    /// Every name the current tree declares as a local (`let x`, `local x`). `.air` locals are
+    /// tree-wide, so such a name is a local everywhere in the tree, never a constant.
+    tree_locals: std::collections::BTreeSet<String>,
+    /// See [`parse_module_lenient`].
+    lenient: bool,
+}
+
+/// The value of a tree-level named constant.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConstValue {
+    /// An integer: usable wherever `.air` takes an integer literal, and as a literal operand.
+    Int(i64),
+    /// An operand (`bcon[t:e]`, ..): usable as an operand only.
+    Operand(Operand),
 }
 
 impl Parser {
@@ -101,6 +132,16 @@ impl Parser {
         let tok = self.bump();
         match tok.kind {
             TokenKind::Int(v) => Ok((v, tok.span)),
+            TokenKind::Ident(ref name) if !self.tree_locals.contains(name) => {
+                match self.consts.get(name) {
+                    Some(&ConstValue::Int(v)) => Ok((v, tok.span)),
+                    None if self.lenient => Ok((0, tok.span)),
+                    _ => Err(Error::at(
+                        tok.span,
+                        format!("expected {description}, found {:?}", tok.kind),
+                    )),
+                }
+            }
             other => Err(Error::at(
                 tok.span,
                 format!("expected {description}, found {other:?}"),
@@ -300,6 +341,7 @@ impl Parser {
                     "kind" => header.kind = self.expect_u8("BHAV kind")?,
                     "args" => header.args = Some(self.expect_u8("BHAV args")?),
                     "locals" => header.locals = Some(self.expect_u16("BHAV locals")?),
+                    "min_locals" => header.min_locals = self.expect_u16("BHAV min_locals")?,
                     "flags" => header.flags = self.expect_u16("BHAV flags")?,
                     "revision" => header.revision = self.expect_u32("BHAV revision")?,
                     "trailing" => {
@@ -336,7 +378,11 @@ impl Parser {
                 }
             }
         }
+        self.consts.clear();
+        self.tree_locals = self.scan_tree_locals();
         let body = self.parse_block()?;
+        self.consts.clear();
+        self.tree_locals.clear();
         Ok(TreeDecl {
             span,
             is_interaction,
@@ -345,6 +391,85 @@ impl Parser {
             header,
             body,
         })
+    }
+
+    /// The names the tree body starting at the current `{` declares as locals (`let x`,
+    /// `local x`), found by scanning its tokens up to the matching `}`.
+    fn scan_tree_locals(&self) -> std::collections::BTreeSet<String> {
+        let mut names = std::collections::BTreeSet::new();
+        let mut depth = 0usize;
+        for (i, tok) in self.tokens.iter().enumerate().skip(self.pos) {
+            match &tok.kind {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                TokenKind::Ident(kw) if kw == "let" || kw == "local" => {
+                    if let Some(Token {
+                        kind: TokenKind::Ident(name),
+                        ..
+                    }) = self.tokens.get(i + 1)
+                    {
+                        names.insert(name.clone());
+                    }
+                }
+                TokenKind::Eof => break,
+                _ => {}
+            }
+        }
+        names
+    }
+
+    /// `const NAME = value;`: a named constant for the rest of the tree, where `value` is an
+    /// integer or a read-only operand. It emits no node.
+    fn parse_const_decl(&mut self) -> Result<()> {
+        self.expect_ident("'const'")?;
+        let (name, nspan) = self.expect_ident("constant name")?;
+        if is_reserved_ident(&name) {
+            return Err(Error::at(
+                nspan,
+                format!("cannot use reserved keyword '{name}' as a constant name"),
+            ));
+        }
+        // `Table.entry`: a tuning entry spelled as in the source.
+        let name = if self.eat(&TokenKind::Dot) {
+            let (entry, _) = self.expect_ident("constant entry name")?;
+            format!("{name}.{entry}")
+        } else {
+            name
+        };
+        self.expect(&TokenKind::Assign, "'='")?;
+        let value = if let TokenKind::Int(v) = self.peek().kind {
+            self.bump();
+            ConstValue::Int(v)
+        } else {
+            // Read-only operands only (a literal or a `bcon[..]` entry): a constant naming a
+            // cell would let an out-operand or a dotted assignment write through it.
+            match self.parse_operand()? {
+                OperandRef::Direct(op) if matches!(op.scope, 7 | 26) => ConstValue::Operand(op),
+                _ => {
+                    return Err(Error::at(
+                        nspan,
+                        format!(
+                            "constant '{name}' must be an integer, a literal or a bcon[..] entry"
+                        ),
+                    ));
+                }
+            }
+        };
+        self.expect(&TokenKind::Semicolon, "';'")?;
+        // Declaring a name again with the same value (a raw block inlined twice) is harmless.
+        if self
+            .consts
+            .insert(name.clone(), value)
+            .is_some_and(|old| old != value)
+        {
+            return Err(Error::at(nspan, format!("duplicate constant '{name}'")));
+        }
+        Ok(())
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>> {
@@ -361,6 +486,15 @@ impl Parser {
             if self.peek().kind == TokenKind::Eof {
                 self.depth -= 1;
                 return Err(Error::at(self.span(), "unexpected EOF inside block"));
+            }
+            if matches!(&self.peek().kind, TokenKind::Ident(kw) if kw == "const")
+                && matches!(self.peek_at(1).kind, TokenKind::Ident(_))
+            {
+                if let Err(err) = self.parse_const_decl() {
+                    self.depth -= 1;
+                    return Err(err);
+                }
+                continue;
             }
             match self.parse_stmt() {
                 Ok(stmt) => stmts.push(stmt),
@@ -813,6 +947,23 @@ impl Parser {
                 let (name, _) = self.expect_ident("string entry name")?;
                 Ok(StringRef::Named(name))
             }
+            // A named integer constant (`K`, `Table.entry`) is the index; a tree local is none.
+            TokenKind::Ident(_) if self.peek_const_name().is_some() => {
+                let name = self.peek_const_name().expect("checked");
+                let span = self.span();
+                for _ in 0..if name.contains('.') { 3 } else { 1 } {
+                    self.bump();
+                }
+                match self.consts.get(&name) {
+                    Some(&ConstValue::Int(v)) => u8::try_from(v)
+                        .map(StringRef::Index)
+                        .map_err(|_| Error::at(span, format!("{description} {v} out of u8 range"))),
+                    _ => Err(Error::at(
+                        span,
+                        format!("expected {description}: constant '{name}' is not an integer"),
+                    )),
+                }
+            }
             other => Err(Error::at(
                 self.span(),
                 format!("expected {description} (u8 or str.<name>), found {other:?}"),
@@ -831,7 +982,15 @@ impl Parser {
                 Ok(LocalRef::Index(idx))
             }
             TokenKind::Ident(_) => {
-                let (name, _) = self.expect_ident(description)?;
+                let (name, span) = self.expect_ident(description)?;
+                // A named integer constant is the local's index; a tree local wins.
+                if !self.tree_locals.contains(&name)
+                    && let Some(&ConstValue::Int(v)) = self.consts.get(&name)
+                {
+                    return u8::try_from(v).map(LocalRef::Index).map_err(|_| {
+                        Error::at(span, format!("{description} {v} out of 0..=255 range"))
+                    });
+                }
                 Ok(LocalRef::Named(name))
             }
             other => Err(Error::at(
@@ -1031,8 +1190,18 @@ impl Parser {
                 PrimitiveCall::GenericCall { routine }
             }
             "expr" => {
+                let lhs_const = self.peek_const_name();
                 let lhs = self.parse_operand()?;
                 let operator = self.parse_any_expr_op()?;
+                // Comparisons and `flag_test` read the left side; every other operator writes it.
+                if let Some(name) = lhs_const
+                    && !matches!(operator, 0 | 1 | 2 | 8 | 14 | 15 | 16)
+                {
+                    return Err(Error::at(
+                        span,
+                        format!("'{name}' is a constant, so it cannot be assigned"),
+                    ));
+                }
                 let rhs = self.parse_operand()?;
                 PrimitiveCall::ExprRaw { lhs, operator, rhs }
             }
@@ -1072,7 +1241,7 @@ impl Parser {
                 PrimitiveCall::Refresh { target, mode }
             }
             "random" => {
-                let dst = self.parse_operand()?;
+                let dst = self.parse_target_operand()?;
                 self.expect(&TokenKind::Comma, "','")?;
                 let range = self.parse_operand()?;
                 PrimitiveCall::Random { dst, range }
@@ -1170,7 +1339,7 @@ impl Parser {
                 PrimitiveCall::GetDistanceTo { temp, flags, from }
             }
             "get_direction_to" => {
-                let dst = self.parse_operand()?;
+                let dst = self.parse_target_operand()?;
                 let mut flags = 0u8;
                 let mut from = None;
                 let mut saw_named = false;
@@ -1684,6 +1853,7 @@ impl Parser {
                 let mut flags = 0u8;
                 let mut local = LocalRef::Index(0);
                 let mut value: Option<OperandRef> = None;
+                let mut value_const: Option<String> = None;
                 self.parse_args(
                     "relationship",
                     &["column", "dir", "flags", "value", "local"],
@@ -1695,7 +1865,10 @@ impl Parser {
                             }
                             "flags" => flags = p.expect_u8("relationship flags")?,
                             "local" => local = p.parse_local_ref("relationship local")?,
-                            "value" => value = Some(p.parse_operand()?),
+                            "value" => {
+                                value_const = p.peek_const_name();
+                                value = Some(p.parse_operand()?);
+                            }
                             _ => return Ok(false),
                         }
                         Ok(true)
@@ -1703,6 +1876,15 @@ impl Parser {
                 )?;
                 let value = value
                     .ok_or_else(|| Error::at(span, "relationship() requires a 'value' operand"))?;
+                // Without flag 4 the primitive stores the number into `value:`.
+                if let Some(name) = value_const
+                    && flags & 4 == 0
+                {
+                    return Err(Error::at(
+                        span,
+                        format!("'{name}' is a constant, so it cannot be assigned"),
+                    ));
+                }
                 PrimitiveCall::Relationship {
                     column,
                     direction,
@@ -1798,7 +1980,7 @@ impl Parser {
                         self.expect(&TokenKind::Colon, "':'")?;
                         match k.as_str() {
                             "guid" => guid = self.expect_u32("GUID")?,
-                            "dest" | "into" => dest = Some(self.parse_operand()?),
+                            "dest" | "into" => dest = Some(self.parse_target_operand()?),
                             "local" => local = self.parse_local_ref("set_to_next local")?,
                             other => {
                                 return Err(Error::at(
@@ -2428,9 +2610,42 @@ impl Parser {
         }
     }
 
+    /// The named constant (`NAME` or `Table.entry`) the next operand spells, if any.
+    fn peek_const_name(&self) -> Option<String> {
+        let TokenKind::Ident(name) = &self.peek().kind else {
+            return None;
+        };
+        if self.tree_locals.contains(name) {
+            return None;
+        }
+        if self.peek_at(1).kind == TokenKind::Dot
+            && let TokenKind::Ident(entry) = &self.peek_at(2).kind
+            && self.consts.contains_key(&format!("{name}.{entry}"))
+        {
+            return Some(format!("{name}.{entry}"));
+        }
+        self.consts.contains_key(name).then(|| name.clone())
+    }
+
+    fn const_target_error(&self, name: &str) -> Error {
+        Error::at(
+            self.span(),
+            format!("'{name}' is a constant, so it cannot be assigned"),
+        )
+    }
+
+    /// An operand the primitive writes (an assignment's or `expr`'s left side, a destination):
+    /// a named constant there is an error, since constants are read-only.
+    fn parse_target_operand(&mut self) -> Result<OperandRef> {
+        if let Some(name) = self.peek_const_name() {
+            return Err(self.const_target_error(&name));
+        }
+        self.parse_operand()
+    }
+
     fn parse_assign_stmt(&mut self) -> Result<Stmt> {
         let span = self.span();
-        let lhs = self.parse_operand()?;
+        let lhs = self.parse_target_operand()?;
         let op_tok = self.bump();
         let op = match op_tok.kind {
             TokenKind::Assign => AssignOp::Set,
@@ -2553,8 +2768,18 @@ impl Parser {
     }
 
     fn parse_compare_condition(&mut self, span: Span) -> Result<Condition> {
+        let lhs_const = self.peek_const_name();
         let lhs = self.parse_operand()?;
         let op_tok = self.bump();
+        // `inc_lt` and `dec_gt` write their left side.
+        if let Some(name) = lhs_const
+            && matches!(&op_tok.kind, TokenKind::Ident(s) if s == "inc_lt" || s == "dec_gt")
+        {
+            return Err(Error::at(
+                span,
+                format!("'{name}' is a constant, so it cannot be assigned"),
+            ));
+        }
         let op = match op_tok.kind {
             TokenKind::Gt => CompareOp::Gt,
             TokenKind::Lt => CompareOp::Lt,
@@ -2671,6 +2896,21 @@ impl Parser {
                     other if is_reserved_ident(other) => {
                         Err(Error::at(span, format!("unexpected keyword '{other}'")))
                     }
+                    other if !self.tree_locals.contains(other) => {
+                        // A named constant: `Table.entry` first, then a bare name.
+                        if self.peek().kind == TokenKind::Dot
+                            && let TokenKind::Ident(entry) = &self.peek_at(1).kind
+                            && let Some(&value) = self.consts.get(&format!("{other}.{entry}"))
+                        {
+                            self.bump();
+                            self.bump();
+                            return const_operand(value, span);
+                        }
+                        match self.consts.get(other) {
+                            Some(&value) => const_operand(value, span),
+                            None => Ok(OperandRef::NamedLocal(other.to_owned())),
+                        }
+                    }
                     other => Ok(OperandRef::NamedLocal(other.to_owned())),
                 }
             }
@@ -2748,7 +2988,17 @@ impl Parser {
     }
 }
 
-fn is_reserved_ident(name: &str) -> bool {
+/// A named constant used as an operand: an integer is a literal (it must fit i16).
+fn const_operand(value: ConstValue, span: Span) -> Result<OperandRef> {
+    match value {
+        ConstValue::Int(v) => i16::try_from(v)
+            .map(|v| OperandRef::Direct(Operand::literal(v)))
+            .map_err(|_| Error::at(span, format!("constant {v} out of i16 operand range"))),
+        ConstValue::Operand(op) => Ok(OperandRef::Direct(op)),
+    }
+}
+
+pub(crate) fn is_reserved_ident(name: &str) -> bool {
     matches!(
         name,
         "tree"
