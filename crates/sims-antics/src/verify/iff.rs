@@ -505,9 +505,7 @@ pub fn check_tree_with_callees(
             arities
                 .iter()
                 .filter(|&(id, &n)| {
-                    n == 0
-                        && runs_from_own_file(*id)
-                        && trees.get(id).is_some_and(|t| t.kind != 4)
+                    n == 0 && runs_from_own_file(*id) && trees.get(id).is_some_and(|t| t.kind != 4)
                 })
                 .map(|(&id, _)| id)
                 .collect(),

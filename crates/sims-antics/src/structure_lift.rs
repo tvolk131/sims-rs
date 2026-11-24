@@ -6,9 +6,10 @@
 //!
 //! Strictly in-memory: never writes any lifted representation to disk.
 
+use crate::ast::OperandPad;
 use crate::ir::BhavChunk;
 use crate::lower::{TARGET_ERROR, TARGET_FALSE, TARGET_TRUE};
-use crate::verify::{canonicalize_primitive_operands, is_always_true_instruction};
+use crate::verify::{canonicalize_primitive_operands, is_always_true_instruction, operand_pad_for};
 use sims_formats::behavior::Instruction;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write;
@@ -600,6 +601,31 @@ impl DecodedIns {
             is_call: false,
         }
     }
+
+    /// The same primitive with a `pad` clause. The labeled head is always the
+    /// primitive-call spelling (`expr(...)` for an Expression), which takes the clause.
+    fn padded(self, pad: &OperandPad) -> Self {
+        let pad = format_operand_pad(pad);
+        match self {
+            Self::AlwaysTrue { labeled_head, .. } => {
+                Self::always_true(format!("{labeled_head} {pad}"))
+            }
+            Self::Branching {
+                labeled_head,
+                stmt_form,
+                is_call,
+                ..
+            } => {
+                let head = format!("{labeled_head} {pad}");
+                Self::Branching {
+                    stmt_form: stmt_form.map(|_| format!("{head};")),
+                    labeled_head: head.clone(),
+                    cond_text: head,
+                    is_call,
+                }
+            }
+        }
+    }
 }
 
 fn format_raw_op(ins: &Instruction) -> String {
@@ -611,6 +637,43 @@ fn format_raw_op(ins: &Instruction) -> String {
 }
 
 fn try_decode_instruction(
+    ins: &Instruction,
+    max_args: usize,
+    max_locals: usize,
+    opts: LiftOptions,
+) -> Option<DecodedIns> {
+    if let Some(decoded) = decode_named(ins, max_args, max_locals, opts) {
+        return Some(decoded);
+    }
+    // Strict lifting spells bytes the VM ignores with a `pad` clause on the named form
+    // of the canonical operands: `apply_operand_pad` (which the compiler runs) rebuilds
+    // exactly these bytes, and only when they read the same as the canonical ones.
+    if !opts.strict_padding || ins.opcode >= 256 {
+        return None;
+    }
+    let canon = canonicalize_primitive_operands(ins.opcode, ins.operands);
+    let pad = operand_pad_for(ins.opcode, canon, ins.operands)?;
+    let named = Instruction {
+        operands: canon,
+        ..ins.clone()
+    };
+    Some(decode_named(&named, max_args, max_locals, opts)?.padded(&pad))
+}
+
+fn format_operand_pad(pad: &OperandPad) -> String {
+    match pad {
+        OperandPad::Fill(value) => format!("pad {value:#04x}"),
+        OperandPad::Bytes(bytes) => {
+            let list: Vec<String> = bytes
+                .iter()
+                .map(|(index, value)| format!("{index}: {value:#04x}"))
+                .collect();
+            format!("pad({})", list.join(", "))
+        }
+    }
+}
+
+fn decode_named(
     ins: &Instruction,
     max_args: usize,
     max_locals: usize,
@@ -882,11 +945,17 @@ fn try_decode_instruction(
                 return None;
             }
             let scope = word_i16(ops, 2);
-            if !(0..=255).contains(&scope) {
-                return None;
-            }
-            let cond = format_operand(scope as u8, word_i16(ops, 0), max_args, max_locals)?;
-            let head = format!("breakpoint({cond})");
+            let index = word_i16(ops, 0);
+            let head = if (0..=255).contains(&scope) {
+                let cond = format_operand(scope as u8, index, max_args, max_locals)?;
+                format!("breakpoint({cond})")
+            } else {
+                // The VM rejects the scope word before reading (`debug.rs`).
+                format!(
+                    "breakpoint(invalid_scope: {:#06x}, index: {index})",
+                    scope as u16
+                )
+            };
             Some(DecodedIns::always_true(head))
         }
         16 => {
@@ -2806,7 +2875,7 @@ mod tests {
             trailing: Vec::new(),
         };
 
-        // Strict padding: preserves dirty bytes via inline `op` while keeping structured `if`!
+        // Strict padding: preserves dirty bytes with `pad` clauses while keeping structured `if`.
         let strict_src = match lift_bhav_structured_with_options(
             &orig,
             LiftOptions {
@@ -2818,11 +2887,25 @@ mod tests {
             other => panic!("expected Lifted, got {other:?}"),
         };
         assert!(
-            strict_src.contains("if op 0x0004") || strict_src.contains("if !op 0x0004"),
+            strict_src.contains("if grab() pad(7: 0x99)")
+                || strict_src.contains("if !grab() pad(7: 0x99)"),
             "{strict_src}"
         );
-        assert!(strict_src.contains("op 0x0007"), "{strict_src}");
-        assert!(strict_src.contains("op 0x0002"), "{strict_src}");
+        assert!(
+            strict_src.contains("refresh(target: 0, mode: 1) pad(5: 0x55);"),
+            "{strict_src}"
+        );
+        assert!(
+            strict_src.contains("expr(my.attr[0] := 3) pad 0x77;"),
+            "{strict_src}"
+        );
+        assert!(!strict_src.contains("op 0x"), "{strict_src}");
+        let re_strict = &compile_antics(&strict_src).unwrap().behaviors[&4096];
+        let equiv = check_bhav_equivalent(&orig, re_strict, &EquivOptions::default());
+        assert!(
+            matches!(equiv, EquivResult::Equivalent { .. }),
+            "{equiv:?}\n{strict_src}"
+        );
 
         // Labeled CFG under strict padding must round-trip 100% byte-for-byte!
         let strict_labeled = format_bhav_labeled_air(
@@ -3169,10 +3252,17 @@ mod tests {
             StructuredLiftOutcome::Lifted(s) => s,
             other => panic!("expected Lifted, got {other:?}"),
         };
-        assert!(strict_dirty.contains("op 0x0009"), "{strict_dirty}");
-        assert!(strict_dirty.contains("op 0x000b"), "{strict_dirty}");
-        assert!(strict_dirty.contains("op 0x0021"), "{strict_dirty}");
-        assert!(strict_dirty.contains("op 0x002f"), "{strict_dirty}");
+        // Strict lifting spells every dirty byte with a `pad` clause, byte for byte.
+        assert!(!strict_dirty.contains("op 0x"), "{strict_dirty}");
+        assert_eq!(strict_dirty.matches(" pad").count(), 4, "{strict_dirty}");
+        let labeled_dirty = crate::lift::format_bhav_labeled_air(&dirty, LiftOptions::default());
+        assert!(!labeled_dirty.contains("op 0x"), "{labeled_dirty}");
+        let re_labeled_dirty = &compile_antics(&labeled_dirty).unwrap().behaviors[&4096];
+        assert_eq!(
+            crate::encode::encode_bhav(re_labeled_dirty).unwrap(),
+            crate::encode::encode_bhav(&dirty).unwrap(),
+            "{labeled_dirty}"
+        );
 
         let relaxed = LiftOptions {
             strict_padding: false,

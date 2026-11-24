@@ -61,7 +61,8 @@
 use super::replay::{self, Witness};
 use super::{
     EquivResult, FrameUse, TraceStep, call_operands, canonicalize_primitive_operands,
-    collect_inline_call_arg_bytes, is_argless_call, is_always_true_instruction, primitive_frame_uses, word_i16,
+    collect_inline_call_arg_bytes, is_always_true_instruction, is_argless_call,
+    primitive_frame_uses, word_i16,
 };
 use crate::ir::BhavChunk;
 use crate::lower::{TARGET_ERROR, TARGET_FALSE, TARGET_TRUE};

@@ -4,6 +4,7 @@
 //! Pure deterministic safe Rust (`unsafe_code = "forbid"`, zero external solver
 //! dependencies, `BTreeMap`/`BTreeSet` exclusively).
 
+use crate::ast::OperandPad;
 use crate::compile::{CompiledObject, CompiledPack};
 use crate::error::{Error, Result};
 use crate::ir::{BhavChunk, ObjdChunk};
@@ -21,9 +22,9 @@ mod live;
 mod replay;
 pub use iff::{
     IffEquivOptions, IffEquivReport, IffVerdict, Reach, ResourceReport, ResourceVerdict,
-    check_iff_equivalent, check_tree_with_callees, library_argless_from_iff, library_arities_from_iff,
-    not_run_from_file,
-    runs_from_own_file, same_tree_bytes, single_file_problem, tree_reach,
+    check_iff_equivalent, check_tree_with_callees, library_argless_from_iff,
+    library_arities_from_iff, not_run_from_file, runs_from_own_file, same_tree_bytes,
+    single_file_problem, tree_reach,
 };
 pub use live::{GUARANTEED_ATTRIBUTES, LiveContext, LiveOptions, check_bhav_live_equivalent};
 
@@ -3868,6 +3869,9 @@ pub(crate) fn canonicalize_primitive_operands(opcode: u16, ops: [u8; 8]) -> [u8;
         0 => [ops[0], ops[1], 0, 0, 0, 0, 0, 0],
         // GenericCall: word 0 (routine) only.
         1 => [ops[0], ops[1], 0, 0, 0, 0, 0, 0],
+        // Expression: words 0 and 1 (indices), bytes 5..8 (operator, scopes); byte 4 is
+        // never read (`expression.rs:26-27`).
+        2 => [ops[0], ops[1], ops[2], ops[3], 0, ops[5], ops[6], ops[7]],
         // FindBestInteraction / Grab / Drop / GosubFoundAction: operands ignored.
         3 | 4 | 5 | 30 => [0; 8],
         // ChangeSuit: index, scope, bit 0 of flags (`change_suit.rs:49-50`).
@@ -4087,6 +4091,85 @@ pub(crate) fn canonicalize_primitive_operands(opcode: u16, ops: [u8; 8]) -> [u8;
         51 => ops,
         _ => ops,
     }
+}
+
+/// Byte `i` is free when no value of it changes what the VM reads from `ops`.
+fn free_operand_bytes(opcode: u16, ops: [u8; 8]) -> [bool; 8] {
+    let canon = canonicalize_primitive_operands(opcode, ops);
+    std::array::from_fn(|i| {
+        (0..=u8::MAX).all(|x| {
+            let mut probe = ops;
+            probe[i] = x;
+            canonicalize_primitive_operands(opcode, probe) == canon
+        })
+    })
+}
+
+/// Applies an `.air` `pad` clause to `base`, the plain encoding of a named primitive.
+///
+/// The result must differ from `base` and read the same in the VM (equal
+/// [`canonicalize_primitive_operands`]), so a pad never changes behaviour and every
+/// operand string has one spelling.
+pub(crate) fn apply_operand_pad(
+    opcode: u16,
+    base: [u8; 8],
+    pad: &OperandPad,
+) -> std::result::Result<[u8; 8], String> {
+    let mut out = base;
+    match pad {
+        OperandPad::Fill(value) => {
+            let free = free_operand_bytes(opcode, base);
+            for (byte, free) in out.iter_mut().zip(free) {
+                if free {
+                    *byte = *value;
+                }
+            }
+        }
+        OperandPad::Bytes(bytes) => {
+            let mut previous = None;
+            for &(index, value) in bytes {
+                let i = usize::from(index);
+                if i >= 8 {
+                    return Err(format!("pad byte {index} is not an operand byte (0..=7)"));
+                }
+                if previous.is_some_and(|p| p >= index) {
+                    return Err("pad bytes must be listed in ascending order, each once".into());
+                }
+                previous = Some(index);
+                if base[i] == value {
+                    return Err(format!("pad byte {index} already holds {value:#04x}"));
+                }
+                out[i] = value;
+            }
+        }
+    }
+    if out == base {
+        return Err("pad changes no operand byte".into());
+    }
+    if canonicalize_primitive_operands(opcode, out) != canonicalize_primitive_operands(opcode, base)
+    {
+        return Err(format!(
+            "pad changes operand bytes primitive {opcode} reads (only bytes the VM ignores can be padded)"
+        ));
+    }
+    Ok(out)
+}
+
+/// The `pad` clause that turns `canon` (an encoding the named form spells) into `raw`,
+/// preferring `pad 0xNN`. `None` when `raw` reads differently or equals `canon`.
+pub(crate) fn operand_pad_for(opcode: u16, canon: [u8; 8], raw: [u8; 8]) -> Option<OperandPad> {
+    let first = (0..8).find(|&i| raw[i] != canon[i])?;
+    let fill = OperandPad::Fill(raw[first]);
+    if apply_operand_pad(opcode, canon, &fill).ok() == Some(raw) {
+        return Some(fill);
+    }
+    let bytes = OperandPad::Bytes(
+        (0..8u8)
+            .filter(|&i| raw[usize::from(i)] != canon[usize::from(i)])
+            .map(|i| (i, raw[usize::from(i)]))
+            .collect(),
+    );
+    (apply_operand_pad(opcode, canon, &bytes).ok() == Some(raw)).then_some(bytes)
 }
 
 /// Frame-private symbolic environment for one BHAV during equivalence checking.
@@ -5732,7 +5815,10 @@ fn lockstep_suffices(
 /// The callees both sides' files say read no call operand bytes
 /// ([`LiveContext::argless_callees`]).
 fn shared_argless(ctx_a: &LiveContext, ctx_b: &LiveContext) -> Option<BTreeSet<u16>> {
-    let (a, b) = (ctx_a.argless_callees.as_ref()?, ctx_b.argless_callees.as_ref()?);
+    let (a, b) = (
+        ctx_a.argless_callees.as_ref()?,
+        ctx_b.argless_callees.as_ref()?,
+    );
     Some(a.intersection(b).copied().collect())
 }
 
