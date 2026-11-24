@@ -601,6 +601,8 @@ pub enum V2Stmt {
         name: String,
         ty: Option<V2Type>,
         init: V2Expr,
+        /// `@slot(N) let ..`: the frame word (`local[N]`) the variable lives in.
+        slot: Option<u8>,
     },
     LetSome {
         span: Span,
@@ -683,6 +685,8 @@ pub enum V2Stmt {
         span: Span,
         name: String,
         ty: V2Type,
+        /// `@slot(N) let ..`: the frame word (`local[N]`) the variable lives in.
+        slot: Option<u8>,
     },
     /// `animate(...);` (play to completion) or `animate(...) |event| { ... }` (run the body
     /// once per animation event, with `event` bound to the event number).

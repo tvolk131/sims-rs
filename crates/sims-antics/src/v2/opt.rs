@@ -267,6 +267,130 @@ pub(crate) fn pin_in_place(body: &str) -> String {
     out
 }
 
+/// Places a tree's `@slot(N) let` locals (named `__slot<N>_<name>_<k>`) in `local[N]` and every
+/// other generated local (`__..`) in the lowest frame word nothing else names, in declaration
+/// order. `.air` alone would put the named locals after the highest explicit slot, so pinning
+/// a high word would grow the frame by that many words.
+///
+/// The explicit slots come from the `.air` compiler's own scan of the tree, so no word an
+/// operand, a numeric local argument or another pinned local names is shared. Locals a `raw`
+/// block declares under its own name keep `.air`'s placement (after every explicit slot), as do
+/// all unpinned locals of a tree with raw `op` bytes, whose operands no scan can read. A body
+/// `.air` cannot parse is left alone: compiling it reports the error.
+pub(crate) fn assign_frame_slots(body: &str) -> String {
+    let wrapped = format!("tree 4096 \"__slots\" {{\n{body}\n}}\n");
+    let Some(usage) =
+        crate::parser::parse_module(&wrapped)
+            .ok()
+            .and_then(|m| match m.items.first() {
+                Some(crate::ast::Item::Tree(t)) => Some(crate::lower::air_local_usage(&t.body)),
+                _ => None,
+            })
+    else {
+        return body.to_owned();
+    };
+    let pinned_slot = |name: &str| -> Option<usize> {
+        let rest = name.strip_prefix("__slot")?;
+        let (digits, _) = rest.split_once('_')?;
+        digits.parse().ok()
+    };
+    let mut used = usage.explicit.clone();
+    let mut slots: BTreeMap<String, usize> = BTreeMap::new();
+    for name in &usage.lets {
+        if let Some(n) = pinned_slot(name) {
+            used.insert(n);
+            slots.insert(name.clone(), n);
+        }
+    }
+    if !usage.has_raw_ops {
+        for name in &usage.lets {
+            if name.starts_with("__") && !slots.contains_key(name) {
+                let k = (0..).find(|k| !used.contains(k)).expect("a free slot");
+                used.insert(k);
+                slots.insert(name.clone(), k);
+            }
+        }
+    }
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        let rewritten = place_locals_in_line(line, &slots);
+        if rewritten.trim().is_empty() && !line.trim().is_empty() {
+            continue;
+        }
+        out.push_str(&rewritten);
+        out.push('\n');
+    }
+    out
+}
+
+/// `line` with each local of `slots` written as `local[K]`: `let x;` goes, `let x = v;` becomes
+/// `local[K] := v;`, and every other use of `x` outside strings and comments becomes `local[K]`.
+fn place_locals_in_line(line: &str, slots: &BTreeMap<String, usize>) -> String {
+    let bytes = line.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let skip_spaces = |mut j: usize| {
+        while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
+            j += 1;
+        }
+        j
+    };
+    let word_at = |j: usize| {
+        let mut e = j;
+        while e < bytes.len() && is_ident(bytes[e]) {
+            e += 1;
+        }
+        (&line[j..e], e)
+    };
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += if bytes[i] == b'\\' { 2 } else { 1 };
+            }
+            i = (i + 1).min(bytes.len());
+            out.push_str(&line[start..i]);
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            out.push_str(&line[i..]);
+            break;
+        }
+        if !(b.is_ascii_alphabetic() || b == b'_') || (i > 0 && is_ident(bytes[i - 1])) {
+            let len = line[i..].chars().next().map_or(1, char::len_utf8);
+            out.push_str(&line[i..i + len]);
+            i += len;
+            continue;
+        }
+        let (word, end) = word_at(i);
+        if word == "let" {
+            let name_at = skip_spaces(end);
+            let (name, name_end) = word_at(name_at);
+            if let Some(k) = slots.get(name) {
+                let after = skip_spaces(name_end);
+                if bytes.get(after) == Some(&b';') {
+                    i = skip_spaces(after + 1);
+                    continue;
+                }
+                if bytes.get(after) == Some(&b'=') && bytes.get(after + 1) != Some(&b'=') {
+                    out.push_str(&format!("local[{k}] :="));
+                    i = after + 1;
+                    continue;
+                }
+            }
+        }
+        match slots.get(word) {
+            Some(k) if !(i > 0 && bytes[i - 1] == b'.') => out.push_str(&format!("local[{k}]")),
+            _ => out.push_str(word),
+        }
+        i = end;
+    }
+    out
+}
+
 /// Collects the sources of `local[0] := s;` copies; clears `ok` if `local[0]` is named in any
 /// other way, or if a copy is not directly followed by a `push_interaction`.
 fn check_pins(nodes: &[Node], copied: &mut BTreeSet<String>, ok: &mut bool) {
@@ -1820,6 +1944,11 @@ fn next_is_plain_expression(rest: &[Node]) -> bool {
         && !text.contains("global")
 }
 
+/// A local the source names (`let x`, `@slot(N) let x`), as opposed to a compiler temporary.
+fn is_user_local(name: &str) -> bool {
+    name.starts_with("__v_") || name.starts_with("__slot")
+}
+
 /// Drops `let x;` declarations of names nothing else mentions.
 fn drop_unused_decls(nodes: &mut Vec<Node>) {
     // A tree that formats text may read a user local's frame word by number, so its user
@@ -1831,7 +1960,7 @@ fn drop_unused_decls(nodes: &mut Vec<Node>) {
         mention_counts(nodes, &mut counts);
         counts
             .into_iter()
-            .filter(|&(name, _)| !(keep_user && name.starts_with("__v_")))
+            .filter(|&(name, _)| !(keep_user && is_user_local(name)))
             .filter(|&(_, (reads, writes))| reads == 0 && writes <= 1)
             .map(|(name, _)| name.to_owned())
             .collect()
@@ -1959,12 +2088,7 @@ impl Liveness<'_> {
             .map(str::to_owned)
             .collect();
         if self.text_reads_locals && formats_text(text) {
-            out.extend(
-                self.locals
-                    .iter()
-                    .filter(|l| l.starts_with("__v_"))
-                    .cloned(),
-            );
+            out.extend(self.locals.iter().filter(|l| is_user_local(l)).cloned());
         }
         out
     }
@@ -2073,7 +2197,8 @@ impl Liveness<'_> {
 
 /// The coalescing class of a local, or `None` when it must keep its own slot.
 fn merge_group(name: &str) -> Option<String> {
-    if matches!(name, "__self_obj" | "__saved_stack_obj") {
+    // `@slot(N)` locals (`__slot<N>_..`) are frame words of their own: never merged.
+    if matches!(name, "__self_obj" | "__saved_stack_obj") || name.starts_with("__slot") {
         return None;
     }
     let (stem, digits) = name.rsplit_once('_')?;

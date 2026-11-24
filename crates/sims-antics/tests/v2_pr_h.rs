@@ -698,3 +698,159 @@ fn raw_locals_shadow_consts_tree_wide() {
         "which an earlier raw block of this tree read as a const",
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Tier 2: `@slot(N) let`
+// ---------------------------------------------------------------------------------------------
+
+/// The local count of BHAV `id` in the compiled object.
+fn bhav_locals(name: &str, src: &str, id: u16) -> u16 {
+    use sims_formats::behavior::Behavior;
+    use sims_formats::iff::Iff;
+    let obj = compile_v2_source(name, src, &PackResolverConfig::default())
+        .unwrap_or_else(|e| panic!("{name} must compile: {e}"));
+    let iff = Iff::parse(obj.iff_bytes.clone()).expect("IFF parse");
+    let chunk = iff.get(b"BHAV", id).expect("BHAV present");
+    Behavior::parse(iff.data(chunk)).expect("BHAV parse").locals
+}
+
+/// A pinned variable lives in `local[N]`, and the tree's other locals take the lowest words
+/// around it (not the words after it), so the frame stays as small as the pin allows.
+#[test]
+fn slot_lets_pin_their_word_and_pack_the_rest() {
+    let src = obj(r#"    tree t (sim: Sim) {
+        @slot(3) let ev: i16;
+        let a = sim.attr[2];
+        let b = sim.attr[3] + a;
+        while !animate(clip: 1, table: 0, events: 0, local: ev) {
+            sim.attr[1] = ev;
+        }
+        self.n = a + b;
+    }
+"#);
+    let air = expand("slot.antics", &src);
+    let t = tree(&air, "t");
+    for want in [
+        "local[0] := my.attr[2];",
+        "local[1] := my.attr[3];",
+        "local[1] += local[0];",
+        "events: 0, local: local[3])",
+        "my.attr[1] := local[3];",
+    ] {
+        assert!(t.contains(want), "missing `{want}` in:\n{t}");
+    }
+    assert!(!t.contains("let "), "every local is placed:\n{t}");
+    assert_eq!(bhav_locals("slot.antics", &src, 4098), 4);
+}
+
+/// A pinned word can be shared with a `raw` block on purpose (a value only some paths write),
+/// and a tree that formats text keeps a pinned store its `$Local:N` string reads.
+#[test]
+fn slot_lets_share_words_with_raw_and_text() {
+    let air = expand(
+        "slotraw.antics",
+        &obj(r#"    strings 301 "Notes" {
+        title = "Count",
+        msg = "Left $Local:2",
+    }
+    tree u (sim: Sim) {
+        @slot(5) let pref: i16;
+        if sim.attr[0] == 1 {
+            pref = sim.data[9];
+        }
+        sim.data[9] = pref;
+        raw { temp[0] := local[5]; }
+    }
+    tree v {
+        @slot(2) let left = self.n + 4;
+        dialog(kind: ok, title: title, message: msg);
+    }
+"#),
+    );
+    let u = tree(&air, "u");
+    for want in [
+        "local[5] := my.data[9];",
+        "my.data[9] := local[5];",
+        "temp[0] := local[5];",
+    ] {
+        assert!(u.contains(want), "missing `{want}` in:\n{u}");
+    }
+    let v = tree(&air, "v");
+    assert!(
+        v.contains("local[2] := my.attr[0];") && v.contains("local[2] += 4;"),
+        "{v}"
+    );
+}
+
+#[test]
+fn slot_lets_reject_unsound_pins() {
+    expect_err(
+        "slot_twice.antics",
+        &obj(r#"    tree t {
+        @slot(1) let a = 1;
+        @slot(1) let b = 2;
+        self.n = a + b;
+    }
+"#),
+        "local slot 1 already holds 'a'",
+    );
+    expect_err(
+        "slot_inline.antics",
+        &obj(r#"    fn helper() -> i16 {
+        @slot(1) let a = 1;
+        return a;
+    }
+    tree t { self.n = helper(); }
+"#),
+        "not allowed in an inlined helper",
+    );
+    expect_err(
+        "slot_push.antics",
+        &obj(r#"    tree go_run (sim: Sim) {
+        @slot(1) let a = 1;
+        let o = stack_obj;
+        stack_obj = sim;
+        push_interaction(object: o, menu: 0, priority: 2, icon: o);
+        self.n = a;
+    }
+"#),
+        "cannot share a tree with '@slot(N) let'",
+    );
+    expect_err(
+        "slot_range.antics",
+        &obj("    tree t { @slot(300) let a = 1; self.n = a; }\n"),
+        "out of range",
+    );
+    expect_err(
+        "slot_some.antics",
+        &obj("    tree t { @slot(1) let Some(x) = find(PROBE) else { return; } }\n"),
+        "applies to 'let x = ..;'",
+    );
+}
+
+/// Disjoint scopes may reuse a slot, and `@slot` survives `fmt` and `lint`.
+#[test]
+fn slot_lets_reuse_across_scopes_and_survive_fmt() {
+    let src = obj(r#"    tree t {
+        if self.n == 1 {
+            @slot(2) let a = 1;
+            self.n = a;
+        } else {
+            @slot(2) let b: i16;
+            self.n = b;
+        }
+    }
+"#);
+    // `fmt` (owned by the lint track) does not know the attribute yet and writes `@ slot(2)`,
+    // which parses the same.
+    let formatted = sims_antics::v2::format_v2_source(&src).expect("fmt");
+    assert!(formatted.contains("slot(2) let a = 1;"), "{formatted}");
+    assert_eq!(
+        sims_antics::v2::format_v2_source(&formatted).expect("fmt again"),
+        formatted
+    );
+    sims_antics::v2::lint_v2_source(&formatted, "slot_fmt.antics").expect("lint");
+    let air = expand("slot_fmt.antics", &formatted);
+    let t = tree(&air, "t");
+    assert!(t.contains("my.attr[0] := local[2];"), "{t}");
+}

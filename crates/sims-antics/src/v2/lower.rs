@@ -3753,6 +3753,9 @@ struct TreeLowerer<'a> {
     /// resolved: one name cannot be both (see `resolve_raw_consts`).
     raw_declared: BTreeSet<String>,
     raw_resolved: BTreeSet<String>,
+    /// The tree's first `@slot(N) let`: its pinned locals are named `__slot<N>_..` through the
+    /// optimizer and placed by `opt::assign_frame_slots` when the tree is finished.
+    slot_span: Option<Span>,
     /// Set when the tree's bytes after some node matter beyond `.air` semantics, so the backend
     /// pass must leave the tree alone: a `raw` block (its literal calls and ops may read the
     /// following instruction's bytes), or a literal-argument call whose callee frame may read
@@ -3806,6 +3809,7 @@ impl<'a> TreeLowerer<'a> {
             raw_span: None,
             raw_declared: BTreeSet::new(),
             raw_resolved: BTreeSet::new(),
+            slot_span: None,
             keep_layout: false,
             param_words_used: 0,
             frame_locals: None,
@@ -3839,13 +3843,14 @@ impl<'a> TreeLowerer<'a> {
             // the named locals after it.
             out = replace_outside_strings(&out, PIN_SLOT, "0");
         }
-        if self.keep_layout {
+        let out = if self.keep_layout {
             if self.has_self_obj_local
                 && let Some(trimmed) = super::opt::drop_unread_entry_save(&out)
             {
-                return trimmed;
+                trimmed
+            } else {
+                out
             }
-            out
         } else {
             let out = super::opt::optimize_tree_body(&out);
             if self.pin_span.is_some() {
@@ -3853,6 +3858,11 @@ impl<'a> TreeLowerer<'a> {
             } else {
                 out
             }
+        };
+        if self.slot_span.is_some() {
+            super::opt::assign_frame_slots(&out)
+        } else {
+            out
         }
     }
 
@@ -4866,8 +4876,9 @@ impl<'a> TreeLowerer<'a> {
                 name,
                 ty,
                 init,
+                slot,
             } => {
-                let air_name = self.fresh(&format!("v_{name}"));
+                let air_name = self.local_air_name(name, *slot, *span)?;
                 let inferred_ty = if let V2Expr::Match {
                     span: mspan,
                     scrutinee,
@@ -4936,14 +4947,19 @@ impl<'a> TreeLowerer<'a> {
                 init,
                 else_body,
             } => self.lower_let_some(*span, name, ty.as_ref(), init, else_body),
-            V2Stmt::LetUninit { span, name, ty } => {
+            V2Stmt::LetUninit {
+                span,
+                name,
+                ty,
+                slot,
+            } => {
                 let resolved = self.env.resolve_value_type(
                     ty,
                     &self.owner_module,
                     self.in_object_scope,
                     *span,
                 )?;
-                let air_name = self.fresh(&format!("v_{name}"));
+                let air_name = self.local_air_name(name, *slot, *span)?;
                 self.line(format!("let {air_name};"));
                 self.bind_var(
                     name.clone(),
@@ -5780,6 +5796,45 @@ impl<'a> TreeLowerer<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// The `.air` name of a new `let` variable: `__v_<name>_<n>`, or `__slot<N>_<name>_<n>` for
+    /// `@slot(N) let`, which the optimizer never merges and `opt::assign_frame_slots` turns into
+    /// `local[N]`. A slot belongs to the tree's frame, so `@slot` is refused in an inline helper
+    /// (each caller's frame differs), next to a pinned `push_interaction` object slot, and while
+    /// another `@slot` variable of the same slot is in scope.
+    fn local_air_name(&mut self, name: &str, slot: Option<u8>, span: Span) -> Result<String> {
+        let Some(n) = slot else {
+            return Ok(self.fresh(&format!("v_{name}")));
+        };
+        if !self.inline_call_stack.is_empty() || self.active_inline_fn.is_some() {
+            return Err(Error::at(
+                span,
+                "'@slot(N) let' names a frame word of the tree, so it is not allowed in an inlined helper",
+            ));
+        }
+        let prefix = format!("__slot{n}_");
+        if let Some(other) = self
+            .var_scopes
+            .iter()
+            .flat_map(|s| s.iter())
+            .find_map(|(k, b)| {
+                matches!(b, Binding::Local { air_name, .. } if air_name.starts_with(&prefix))
+                    .then_some(k)
+            })
+        {
+            return Err(Error::at(
+                span,
+                format!("local slot {n} already holds '{other}', which is still in scope"),
+            ));
+        }
+        if self.checking_discarded == 0 {
+            self.slot_span.get_or_insert(span);
+            if self.pin_span.is_some() {
+                return Err(Error::at(span, SLOT_WITH_PIN));
+            }
+        }
+        Ok(self.fresh(&format!("slot{n}_{name}")))
     }
 
     /// `raw { }` code with the v2 names it uses replaced by their values: a `const` name by its
@@ -8414,6 +8469,9 @@ impl<'a> TreeLowerer<'a> {
                     self.pin_span.get_or_insert(a.span);
                     if self.raw_span.is_some() {
                         return Err(Error::at(a.span, RAW_WITH_PIN));
+                    }
+                    if self.slot_span.is_some() {
+                        return Err(Error::at(a.span, SLOT_WITH_PIN));
                     }
                 }
                 let (obj, ty) = self.lower_value_expr(&a.value)?;
@@ -13992,6 +14050,7 @@ fn is_int_literal_expr(e: &V2Expr) -> bool {
     }
 }
 
+const SLOT_WITH_PIN: &str = "push_interaction(object: <handle>) cannot share a tree with '@slot(N) let': the pinned object slot is local[0], which the frame layout around '@slot' locals does not reserve; pass a constant parameter index or move one of them to its own tree";
 const RAW_WITH_PIN: &str = "push_interaction(object: <handle>) cannot share a tree with 'raw { ... }' or a 'local[N]' read: they may name local slots the pinned object slot could collide with; pass a constant parameter index or move the raw block to its own tree";
 
 /// Placeholder for the per-tree pinned local slot of `push_interaction(object: <handle>)`,

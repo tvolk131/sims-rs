@@ -2731,6 +2731,11 @@ impl Parser {
                 "a const binding must be a statement of a '{ ... }' block (its region is the statements after it)",
             ));
         }
+        if self.peek().kind == TokenKind::At
+            && matches!(&self.peek_at(1).kind, TokenKind::Ident(a) if a == "slot")
+        {
+            return self.parse_slot_let_stmt(span);
+        }
         if let TokenKind::Ident(kw) = &self.peek().kind {
             match kw.as_str() {
                 "let" => return self.parse_let_stmt(span),
@@ -2913,7 +2918,12 @@ impl Parser {
                 ));
             };
             self.bump();
-            return Ok(V2Stmt::LetUninit { span, name, ty });
+            return Ok(V2Stmt::LetUninit {
+                span,
+                name,
+                ty,
+                slot: None,
+            });
         }
         self.expect(&TokenKind::Assign, "'='")?;
         let init = self.parse_expr()?;
@@ -2923,7 +2933,57 @@ impl Parser {
             name,
             ty,
             init,
+            slot: None,
         })
+    }
+
+    /// `@slot(N) let x ..;`: a `let` whose variable lives in frame word `local[N]`.
+    fn parse_slot_let_stmt(&mut self, span: Span) -> Result<V2Stmt> {
+        self.bump(); // '@'
+        self.bump(); // 'slot'
+        self.expect(&TokenKind::LParen, "'('")?;
+        let slot_span = self.span();
+        let n = self.expect_u16("local slot")?;
+        let n = u8::try_from(n)
+            .map_err(|_| Error::at(slot_span, format!("local slot {n} is out of range 0..=255")))?;
+        self.expect(&TokenKind::RParen, "')'")?;
+        if !matches!(&self.peek().kind, TokenKind::Ident(kw) if kw == "let") {
+            return Err(Error::at(
+                self.span(),
+                "'@slot(N)' must be followed by a 'let' statement",
+            ));
+        }
+        let let_span = self.span();
+        match self.parse_let_stmt(let_span)? {
+            V2Stmt::Let {
+                span: _,
+                name,
+                ty,
+                init,
+                slot: _,
+            } => Ok(V2Stmt::Let {
+                span,
+                name,
+                ty,
+                init,
+                slot: Some(n),
+            }),
+            V2Stmt::LetUninit {
+                span: _,
+                name,
+                ty,
+                slot: _,
+            } => Ok(V2Stmt::LetUninit {
+                span,
+                name,
+                ty,
+                slot: Some(n),
+            }),
+            _ => Err(Error::at(
+                let_span,
+                "'@slot(N)' applies to 'let x = ..;' and 'let x: T;', not 'let Some(..)'",
+            )),
+        }
     }
 
     fn parse_with_lock_stmt(&mut self, span: Span) -> Result<V2Stmt> {
