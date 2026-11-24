@@ -1,0 +1,126 @@
+# `.antics` v2 PR G: Pilot Bugfixes, Missing Builtins, and Cheap Lowering Wins
+
+*Decided 2026-11-24.*
+
+**Branch:** `antics/v2-pr-g-pilot-fixes-and-features`  
+**Track:** Track 8 (`.antics` v2, PR G)
+
+## Context
+
+Four multi-object behavioural-equivalence pilots and a fourth Fridges round rewrote commercial objects against PR F. They ran locally, and nothing from them is in the repository. Their reports list three kinds of gaps:
+
+- **Bugs.** Silent mis-binding of builtin arguments, an entry save the source never needed, an inverted return polarity, and no way to write a BHAV with zero nodes.
+- **Missing builtins and fields.** These forced `raw { }` blocks.
+- **Lowering costs.** Locals and nodes the original frames do not have.
+
+Constraints:
+
+- **Same as PR F.** Everything lowers onto existing `.air`, and only `src/v2/{ast,parser,lower,opt}.rs` and the v2 tests change.
+- **One new field.** `TreeFrame` gains `empty`, which needs no new match arms elsewhere.
+- **Synthetic tests.** Every test is synthetic.
+
+## Decisions
+
+### 1. Correctness
+
+- **V-1: builtin arguments bind strictly.**
+  - One binder (`bind_builtin_args`) now serves the slot and route primitives, `set_motive_change`, `stop_all_sounds`, the budget calls, `find_best_object`, `create_object`, `generic_call`, `play_sound`, `job_data`, and `distance_to`.
+  - Positional arguments fill the documented order.
+  - The binder rejects four mistakes, each with an error naming the primitive:
+    - an unknown name;
+    - a duplicate;
+    - a positional argument after a named one;
+    - too many positional arguments.
+  - Before this, `route_to(front, source: 0)` silently took `source` as the flags.
+  - `route_to` gains `source:`, which takes a param, an object or slot, or a global (0–2).
+  - `snap` gains `mode:`, which takes a param, an object or container, the front, a slot, or a global (0–4).
+  - Both also accept a number or a `const`.
+- **N2: the entry save is bookkeeping, not program.**
+  - A Sim tree's `let __self_obj = stack_obj;` is dropped whenever nothing reads it. This holds even before a node that observes the last result: that node then sees the frame's entry state, as the source says.
+  - **This reverses PR F's `next_ignores_last_result` guard** for the save only (`20261124-antics-v2-pr-f-zero-raw-and-sugar.md` §1, L7). Other dead stores keep that guard.
+  - **Guard.** Dropping the save moves every later named local down one frame word, and a frame word keeps whatever an earlier frame left there. So every named local must be written before it is read:
+    - When the structured pass parses the body, the flow analysis checks this.
+    - When it cannot (a raw block with several statements on one line), the save is dropped only if no statement on any line declares a local without a value (`let x;`).
+    - A raw `local x;` declaration, which neither check models, always keeps the save.
+  - **Not covered: other frames.** A shorter frame also changes which leftover words later frames start on: a callee, or a sibling the parent calls next, that reads a local before writing it can see a different value. The Sol re-check built one: a caller padded to 16 words shrinks to 12, and its callee's unwritten local reads 11 instead of 22.
+    - This is deliberately not fixed. Frame words no tree wrote are not part of v2 semantics.
+    - Local coalescing and unused-declaration removal (PR E/F) already shrink frames the same way, and fail the same construction.
+    - The compiler cannot see every caller anyway, since global and semi-global trees live in other files.
+    - `--behavioral` treats frame storage as unobservable, so v2 assumes no tree reads an unwritten local. A whole-program check for that is the fix if a real object turns out to depend on it.
+- **Raw clobber analysis decodes operands like the VM.** It replaces an opcode allow-list.
+  - These primitives write the caller's `stack_obj`, and so need the save:
+    - Expression into scope 10;
+    - Random and Get Direction To with a scope-10 destination;
+    - Relationship with a scope-10 value;
+    - Set To Next without a separate destination;
+    - Find Best Interaction, Find Best Object, Make New Character, Gosub Found Action, and Create Object.
+  - Calls and the other primitives do not.
+- **L2.** `return <simple compare>` keeps its polarity.
+- **G-S13: `@frame(empty)`.**
+  - A tree with this frame emits zero nodes, which the original has for unused BHAVs. Its body must be `{}`, and it need not return a value.
+  - A plain `{}` body still emits one `return true;` node.
+- **Known semantics, unchanged.** A `raw { }` block never restores `stack_obj`. After a raw block that moves it, `self.n = 1` writes `stack.attr[0]` on the moved object. The tests now state this.
+
+### 2. New builtins (Tier 2)
+
+| Builtin | Opcode | Notes |
+|---|---|---|
+| `change_suit(index:, scope:, remove:)` | 6 | |
+| `burn(mode:, flags:)` | 9 | |
+| `look_towards(mode:)` | 22 | |
+| `drop_onto(src:, dst:)` | 43 | |
+| `find_location(mode:, flags:, local:)` | 16 | |
+| `relationship(column:, dir:, flags:, local:, value:)` | 26 | `value:` is required and must be an `i16` local, which the optimizer treats as written. |
+| `old_relationship(write:, column:, param:, dir:, flags:)` | 24 | |
+| `generic_call(routine)` | 1 | |
+| `play_sound(sound, target, flags:)` | 23 | Takes an FWAV id or `const` as well as a `sound` binding. `flags: 0x02` (stack object) is rejected in favour of `target`, and so are flags that would encode as `0xFF`, which the VM plays on the running object whatever bit `0x02` says. |
+| `stop_all_sounds(target)` | 48 | Its target is checked like `play_sound`'s: `self`, `sim`, `stack_obj`, or a literal bool. |
+| `job_data(career, level, field)` | — (scope 33) | Stages `temp[0]` / `temp[1]`. Operands are evaluated in source order, as for a call. An operand is copied first when one evaluated after it may write anything (a call, a nested `job_data`), when it is an `extern bcon` read, or when it is a level that reads `temp[0]`. As with call arguments, a plain cell read that faults may follow the career's staging. |
+| `distance_to(target, from:, temp:)` | 11 | Points `stack_obj` at the target around the primitive, so the save analysis counts it unless the target is `stack_obj`. A `from:` that names the stack object (`stack_obj`, `stack.id`) is copied before the move. The target is copied when `from:` may write anything, and that includes a `stack_obj` target, which a nested `distance_to` leaves restored elsewhere. |
+
+### 3. New fields (Tier 2)
+
+- **Sim fields:**
+  - `sim.attr[i]` and `sim.data[i]`, readable and writable.
+  - `sim.container`, which is object data word 2 and read-only.
+  - Writable `sim.priority`.
+  - `sim.personality.{nice, active, playful, outgoing, neat}`. These are person words 2, 3, 5, 6, and 7, as the character-file writer and the structure lifter label them. Foreign Sims have them too.
+- **Handle flags.** `handle.flags` (object data word 8, any bitflags) on every handle, including `stack_obj.flags`.
+- **Already on main.** Mutable `param[n]` needed no change.
+
+### 4. Lowering wins (Tier 3)
+
+- **`while` conditions.** `while f()` and `while !f()` test a call condition directly at the top of the pass, with no `__wcond` local. The exit test swaps the condition's branches (`if !x > 0 { break; }`) instead of inverting the comparison, so the body starts after the test came out as the source wrote it.
+- **Identity stores.** The optimizer drops `temp[i] := temp[i]` for temps 0 to 7. Forwarding a staged argument copy leaves these behind.
+  - Other cells keep the store, because their read can fault: an out-of-range temp, a parameter past the frame's arguments, or a local holding half of a stale pointer.
+  - Every Expression node also sets the object's scratch pointer, and a later Expression that reads global 34 depends on it. So the store is dropped only when the next node is a call-free Expression that names no global: that node ignores the last result and sets the scratch pointer the same way.
+  - The pass runs once, after the others reach a fixed point, so no later pass rewrites that next node.
+- **`local[N]` reads.** A read pins the layout like a raw block: `.air` puts named locals after every explicit slot, and the optimizer skips the tree. It cannot share a tree with a pinned `push_interaction` object, and writes are rejected.
+- **Const patterns.** A `const` name in a `match` arm matches its value, with the usual duplicate and range checks.
+- **Brace-free arms.** `0 => f(), 1 => x = 2, 2 => x += 1` parse. A full statement (`3 => return;`) still works.
+
+### 5. Deferred, with reasons
+
+- **In-place `stack_obj` stepping, `create_object` into `stack_obj`, and the `set_to_next` category / any modes.**
+  - Today v2 restores `stack_obj` at statement granularity. Leaving it moved needs a flow-sensitive "stack object displaced" state, because every later `self.` access would have to restore or go through a foreign cell. Without that state, a moved `stack_obj` would repeat the raw-block hazard above.
+  - That state touches every self access, so it gets its own PR.
+  - Fridges 4112 now stops exactly here: Maxis steps `stack_obj` in place, and v2 emits `dest: stack_obj`.
+- **Tier 3, needing AST or formatter changes Track 9 owns:**
+  - labeled `break 'l` / `continue 'l`;
+  - `@slot(N) let x;`;
+  - `@frame` on `main` / `init`, and no phantom Init/Main stubs;
+  - context polymorphism (Sim↔object helper calls, `me.person[i]`);
+  - zero-cost inline helpers (no `__arg_` copies, `Guid` params, `fn -> Result`).
+
+  Each needs `fmt` / `lift` support to round-trip, or changes the helper ABI, so each is a follow-up.
+- **Zero-local `||` outside `if`.** Short-circuit lowering uses single-pass loops, so a `break` arm cannot reuse it in a `while` condition.
+
+## Validation
+
+- `cargo test -p sims-antics`, `cargo clippy -p sims-antics --all-targets -D warnings`, and `cheats_cache_and_open_pack` all pass. `open-pack` builds unchanged.
+- The local Fridges pilot stays at 50 of 51 trees equivalent and 1 inconclusive (4112, above) under `--behavioral`, and the whole-file run is unchanged.
+
+## What would reopen this
+
+- **Entry-save policy.** A verifier result showing a tree whose behaviour depends on the dropped save's frame word or node.
+- **Personality words.** A sim trace contradicting the person-word numbering for the traits. `sims-sim`'s motive decay names word 3 `NEAT`, against the character-file writer's 7, and Track 1 should check this.

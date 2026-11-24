@@ -46,6 +46,8 @@ pub(crate) fn optimize_tree_body(body: &str) -> String {
             break;
         }
     }
+    // Last, so no later pass rewrites the node an identity store was checked against.
+    drop_identity_stores(&mut nodes);
     if nodes == before {
         return body.to_owned();
     }
@@ -56,8 +58,11 @@ pub(crate) fn optimize_tree_body(body: &str) -> String {
 
 /// Drops the Sim-tree entry save `let __self_obj = stack_obj;` when nothing else names
 /// `__self_obj`. This works line by line, so it also applies to trees the full pass leaves alone
-/// (`raw` blocks): a raw block that reads the save names it. The save is an expression node,
-/// so it goes only when the node after it cannot observe the last result.
+/// (`raw` blocks): a raw block that reads the save names it.
+///
+/// The save is the lowering's own bookkeeping, not part of the program: an unread save is one the
+/// lowering never needed, so it goes even before a node that observes the last result (which
+/// then sees the frame's entry state, as the source says).
 pub(crate) fn drop_unread_entry_save(body: &str) -> Option<String> {
     const SAVE: &str = "let __self_obj = stack_obj;";
     // Deleting the node would shift numeric branch targets (`-> true: 3`), and deleting the
@@ -85,19 +90,36 @@ pub(crate) fn drop_unread_entry_save(body: &str) -> Option<String> {
     if mentions != 1 {
         return None;
     }
-    let next = lines
-        .map(|(_, l)| l.trim())
-        .find(|l| !matches!(classify(l), Kind::Let { init: None, .. }))?;
-    let stripped = strip_strings(next);
-    let ignores = match classify(next) {
-        Kind::Assign { .. } | Kind::Let { init: Some(_), .. } | Kind::Return => {
-            !names_local_slot(&stripped) && !stripped.contains('{')
-        }
-        _ => ["if ", "while "]
-            .iter()
-            .any(|kw| header(&stripped, next, kw).is_some_and(|c| !c.contains('(') && c != "true")),
+    // Every named local after the save moves down one frame word, which keeps whatever an
+    // earlier frame left there: none may be read before it is written. A body the structured
+    // pass cannot parse (a raw block with several statements on a line) is checked by its
+    // lines: every local the lowering declares without a value (`let x;`) might be read first,
+    // while `let x = e;` writes it where it comes into scope. Each statement of a line counts.
+    // A raw block may also spell a declaration `local x;`, which neither check models: any such
+    // statement keeps the save.
+    let statements = || {
+        body.lines()
+            .flat_map(|l| {
+                strip_strings(l)
+                    .split([';', '{', '}'])
+                    .map(|stmt| stmt.trim().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
     };
-    if !ignores {
+    if statements().iter().any(|stmt| {
+        stmt.strip_prefix("local")
+            .is_some_and(|r| r.starts_with(char::is_whitespace))
+    }) {
+        return None;
+    }
+    let defined = match parse_body(body) {
+        Some(nodes) => locals_defined_before_reads(&nodes),
+        None => !statements()
+            .iter()
+            .any(|stmt| matches!(classify(stmt), Kind::Let { init: None, .. })),
+    };
+    if !defined {
         return None;
     }
     let mut out = String::with_capacity(body.len());
@@ -1081,7 +1103,8 @@ fn forward_save_block(nodes: &mut [Node], map: &BTreeMap<String, String>) -> boo
 }
 
 /// Primitive arguments `.air` parses as a local slot rather than a value.
-const LOCAL_SLOT_ARGS: &[&str] = &["icon", "skin", "age", "sex", "local", "dest"];
+/// (`value:` is Relationship's, which the primitive may write.)
+const LOCAL_SLOT_ARGS: &[&str] = &["icon", "skin", "age", "sex", "local", "dest", "value"];
 
 /// Whether every mention of a `map` key in `text` is a plain value read: the text runs no
 /// primitive, or each mention is a labelled primitive argument (`label: name`) whose label
@@ -1129,15 +1152,23 @@ fn value_operands_only(text: &str, map: &BTreeMap<String, String>) -> bool {
     true
 }
 
-/// Drops an entry save nothing else names, when the node after it cannot observe the last
-/// result the save sets (a primitive such as `idle_for_input` may read it).
+/// Drops an entry save nothing else names (see `drop_unread_entry_save`), when no named local
+/// that moves down a frame word is read before it is written.
 fn drop_unread_entry_save_node(nodes: &mut Vec<Node>) {
     let Some(name) = entry_save(nodes) else {
         return;
     };
-    if !mentions(&nodes[1..], name) && next_ignores_last_result(&nodes[1..]) {
+    if !mentions(&nodes[1..], name) && locals_defined_before_reads(&nodes[1..]) {
         nodes.remove(0);
     }
+}
+
+/// Whether every named local in `nodes` is written before anything reads it.
+fn locals_defined_before_reads(nodes: &[Node]) -> bool {
+    let mut lets = Vec::new();
+    collect_lets(nodes, &mut lets);
+    lets.iter()
+        .all(|name| defined_before_reads(nodes, name, &mut false))
 }
 
 /// What happens to the stack object after a point, scanning forward in one block.
@@ -1462,6 +1493,51 @@ fn forward_copies(nodes: &mut Vec<Node>) {
     });
 }
 
+/// Drops `temp[i] := temp[i];` for a temp the VM always has (0 to 7), which forwarding a staged
+/// argument copy leaves behind: the store changes no cell and cannot fault. Other cells stay: an
+/// out-of-range temp, a parameter past the frame's arguments, or a local holding half of a stale
+/// pointer faults on the read.
+///
+/// Every Expression node also sets the object's scratch pointer (`[object + 0x128]`), which a
+/// later Expression reading global 34 depends on (`sims-vm` `primitives/expression.rs`). So the
+/// store is only dropped when the next node is itself a call-free Expression that does not touch
+/// a global or raw scope: that node ignores the last result and leaves the scratch pointer
+/// exactly as the dropped store would have.
+fn drop_identity_stores(nodes: &mut Vec<Node>) {
+    for_each_block(nodes, &mut |block| {
+        for i in (0..block.len()).rev() {
+            let Node::Line(l) = &block[i] else {
+                continue;
+            };
+            let Kind::Assign { lhs, op: ":=", rhs } = classify(l) else {
+                continue;
+            };
+            let in_range_temp = lhs
+                .strip_prefix("temp[")
+                .and_then(|r| r.strip_suffix(']'))
+                .and_then(|n| n.parse::<u8>().ok())
+                .is_some_and(|n| n < 8);
+            if lhs == rhs && in_range_temp && next_is_plain_expression(&block[i + 1..]) {
+                block.remove(i);
+            }
+        }
+    });
+}
+
+/// The next node (skipping declarations) is an Expression assignment or initializer whose text
+/// names no call, raw scope, or global.
+fn next_is_plain_expression(rest: &[Node]) -> bool {
+    let Some(Node::Line(l)) = rest.iter().find(|n| !is_decl(n)) else {
+        return false;
+    };
+    let text = strip_strings(l);
+    matches!(
+        classify(l),
+        Kind::Assign { .. } | Kind::Let { init: Some(_), .. }
+    ) && !text.contains('(')
+        && !text.contains("global")
+}
+
 /// Drops `let x;` declarations of names nothing else mentions.
 fn drop_unused_decls(nodes: &mut Vec<Node>) {
     // Only the names to drop are copied out of the borrowed counts.
@@ -1775,7 +1851,7 @@ fn rewrite(nodes: &mut Vec<Node>, rename: &BTreeMap<String, String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{drop_unread_entry_save, optimize_tree_body, pin_in_place};
+    use super::{drop_unread_entry_save, optimize_tree_body, parse_body, pin_in_place};
 
     #[test]
     fn dead_stores_unread_self_obj_and_coalescing() {
@@ -1903,10 +1979,30 @@ mod tests {
 
     #[test]
     fn review_regressions_keep_observers() {
-        // A primitive may read the last result the save sets, so the save stays before it.
+        // An unread save goes even before a primitive that reads the last result: that
+        // primitive then sees the frame's entry state, as in the source.
         let body =
             "    let __self_obj = stack_obj;\n    idle_for_input(param[0], 1);\n    return true;\n";
-        assert_eq!(optimize_tree_body(body), body);
+        assert_eq!(
+            optimize_tree_body(body),
+            "    idle_for_input(param[0], 1);\n    return true;\n"
+        );
+        // Not when a local read before it is written would move to another frame word.
+        let body = "    let __self_obj = stack_obj;\n    let __v_x_0;\n    temp[0] := __v_x_0;\n    call 300(temps);\n    return true;\n";
+        assert_eq!(drop_unread_entry_save(body), None);
+        // A raw line the structured pass cannot parse falls back to the declarations: written
+        // where they come into scope, the save goes; declared without a value, it stays.
+        let raw_line = "    if !call 281(0, 0) {\n    if push_interaction(menu: 2, object: 0, priority: 0, flags: 7) { return true; }\n    }\n";
+        let body = format!(
+            "    let __self_obj = stack_obj;\n    let __v_x_0 = 1;\n    local[0] := stack_obj;\n    stack_obj := my.id;\n{raw_line}    stack_obj := local[0];\n    temp[0] := __v_x_0;\n    return true;\n"
+        );
+        assert!(parse_body(&body).is_none());
+        assert_eq!(
+            drop_unread_entry_save(&body).as_deref(),
+            Some(&body["    let __self_obj = stack_obj;\n".len()..])
+        );
+        let body = body.replace("let __v_x_0 = 1;", "let __v_x_0;");
+        assert_eq!(drop_unread_entry_save(&body), None);
         // Scope 27 (sprite flags) reads the stack object, so the switch before it stays.
         let body = "    stack_obj := my.id;\n    temp[0] := 0;\n    scope(27, 0) := 1;\n    return true;\n";
         assert_eq!(optimize_tree_body(body), body);

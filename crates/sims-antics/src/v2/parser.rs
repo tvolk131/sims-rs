@@ -964,7 +964,17 @@ impl Parser {
         };
         while !self.eat(&TokenKind::RParen) {
             let (key, kspan) =
-                self.expect_ident("'args', 'locals', 'format', 'revision', or 'kind'")?;
+                self.expect_ident("'args', 'locals', 'format', 'revision', 'kind', or 'empty'")?;
+            if key == "empty" && self.peek().kind != TokenKind::Colon {
+                if std::mem::replace(&mut frame.empty, true) {
+                    return Err(Error::at(kspan, "duplicate @frame field 'empty'"));
+                }
+                if !self.eat(&TokenKind::Comma) {
+                    self.expect(&TokenKind::RParen, "')'")?;
+                    break;
+                }
+                continue;
+            }
             self.expect(&TokenKind::Colon, "':'")?;
             let dup = match key.as_str() {
                 "args" => frame
@@ -995,7 +1005,7 @@ impl Parser {
                     return Err(Error::at(
                         kspan,
                         format!(
-                            "unknown @frame field '{other}' (expected args, locals, format, revision, or kind)"
+                            "unknown @frame field '{other}' (expected args, locals, format, revision, kind, or empty)"
                         ),
                     ));
                 }
@@ -2945,6 +2955,46 @@ impl Parser {
         })
     }
 
+    /// A match arm's body without braces: a statement (`return x;`), or an expression or
+    /// assignment ended by `,` or by the match's closing `}` (`0 => f(),`, `1 => x = 2,`).
+    fn parse_arm_stmt(&mut self) -> Result<V2Stmt> {
+        let (saved_pos, saved_depth) = (self.pos, self.depth);
+        let stmt_err = match self.parse_stmt() {
+            Ok(s) => {
+                let _ = self.eat(&TokenKind::Comma);
+                return Ok(s);
+            }
+            Err(e) => e,
+        };
+        self.pos = saved_pos;
+        self.depth = saved_depth;
+        let span = self.span();
+        let short = (|| {
+            let lhs = self.parse_expr()?;
+            let stmt = if let Some(op) = self.try_eat_assign_op() {
+                let value = self.parse_expr()?;
+                V2Stmt::Assign {
+                    span,
+                    target: lhs,
+                    op,
+                    value,
+                }
+            } else {
+                V2Stmt::Expr { span, expr: lhs }
+            };
+            if self.eat(&TokenKind::Comma) || self.peek().kind == TokenKind::RBrace {
+                Ok(stmt)
+            } else {
+                Err(Error::at(
+                    self.span(),
+                    "expected ',' or '}' after a match arm",
+                ))
+            }
+        })();
+        // Neither form fits: the statement's diagnostic is the one to report.
+        short.map_err(|_| stmt_err)
+    }
+
     fn parse_match_stmt(&mut self, span: Span) -> Result<V2Stmt> {
         self.bump(); // 'match'
         let scrutinee = self.parse_expr()?;
@@ -2975,11 +3025,8 @@ impl Parser {
                     Err(e) => break Err(e),
                 }
             } else {
-                match self.parse_stmt() {
-                    Ok(s) => {
-                        let _ = self.eat(&TokenKind::Comma);
-                        vec![s]
-                    }
+                match self.parse_arm_stmt() {
+                    Ok(s) => vec![s],
                     Err(e) => break Err(e),
                 }
             };
