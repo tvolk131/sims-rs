@@ -24,7 +24,8 @@ use crate::error::{Error, Result};
 /// output is checked to lex to the same token sequence as the input.
 pub fn format_v2_source(source: &str) -> Result<String> {
     parse_v2_file(source)?;
-    let scanned = scan(source)?;
+    let mut scanned = scan(source)?;
+    reattach_end_of_line_comments(&mut scanned);
     let out = Printer::new(&scanned).print();
 
     // Self-checks: identical tokens (modulo raw-body indentation) and identical comments.
@@ -219,6 +220,85 @@ fn scan(source: &str) -> Result<Scanned> {
             c.text = c.text.trim_end().to_owned();
         }
         tokens.push(tok);
+    }
+}
+
+/// Moves a line comment at the end of a one-line statement that the printer will break up
+/// (`if c { return false; } // note`) to the end of the line holding the statement's first
+/// non-empty `{` (`if c { // note`). Left after the closing `}`, it would describe, and an
+/// `antics-lint: allow(..)` in it would cover, a different line than in the source.
+///
+/// The comment moves only past tokens without comments of their own, so the comment order
+/// is unchanged; once moved it follows a `{` whose block spans lines, so a second pass
+/// leaves it alone.
+fn reattach_end_of_line_comments(s: &mut Scanned) {
+    let toks = &s.tokens;
+    let n = toks.len();
+    if n == 0 {
+        return;
+    }
+    // Source line of each token (a raw block's own lines are not tracked: `None` after one).
+    let mut line = Vec::with_capacity(n);
+    let mut at = Some(0usize);
+    for t in toks {
+        at = at.map(|l| {
+            l + t.newlines_before
+                + t.leading
+                    .iter()
+                    .map(|c| c.newlines_before + c.text.matches('\n').count())
+                    .sum::<usize>()
+        });
+        line.push(at);
+        if t.class == Class::Raw {
+            at = None;
+        }
+    }
+    let a = analyze(toks);
+    let mut moves: Vec<(usize, usize)> = Vec::new(); // (from token j, to token o + 1)
+    for j in 1..=n {
+        let first_comment = if j == n {
+            s.trailing.first()
+        } else {
+            toks[j].leading.first()
+        };
+        let Some(c) = first_comment else {
+            continue;
+        };
+        if !c.is_line || c.newlines_before != 0 {
+            continue;
+        }
+        let p = j - 1;
+        let Some(l) = line[p] else {
+            continue;
+        };
+        let mut first = p;
+        while first > 0 && line[first - 1] == Some(l) {
+            first -= 1;
+        }
+        if toks[first..=p].iter().any(|t| t.class == Class::Raw) {
+            continue;
+        }
+        let opener = (first..p).find(|&o| {
+            toks[o].class == Class::Punct
+                && toks[o].text == "{"
+                && a.frame[o] == Some(Frame::Block)
+                && a.partner[o].is_some_and(|c| c > o + 1 && c <= p)
+        });
+        let Some(o) = opener else {
+            continue;
+        };
+        if toks[o + 1..=p].iter().any(|t| !t.leading.is_empty()) {
+            continue;
+        }
+        moves.push((j, o + 1));
+    }
+    for (j, to) in moves {
+        let c = if j == n {
+            s.trailing.remove(0)
+        } else {
+            s.tokens[j].leading.remove(0)
+        };
+        s.tokens[to].leading.insert(0, c);
     }
 }
 

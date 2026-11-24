@@ -73,7 +73,7 @@ fn line_of(source: &str, needle: &str) -> usize {
 }
 
 #[test]
-fn the_rule_table_lists_all_thirteen_rules() {
+fn the_rule_table_lists_every_rule() {
     let names: Vec<&str> = LINT_RULES.iter().map(|r| r.name).collect();
     for expected in [
         "enum_wildcard_single_variant",
@@ -89,6 +89,10 @@ fn the_rule_table_lists_all_thirteen_rules() {
         "manual_raw_has_builtin",
         "magic_guid_literal",
         "negated_comparison",
+        "uninitialized_local_read",
+        "dialog_local_slot_mismatch",
+        "raw_bare_call_false_exit",
+        "missing_sim_frame_args",
     ] {
         assert!(names.contains(&expected), "{expected} missing");
     }
@@ -447,6 +451,19 @@ fn restored_or_object_context_self_is_fine() {
         &tree("        stack_obj = 0;\n        self.level = 1;"),
         "stack_obj_clobber_after_self",
     );
+    // A handle saved before the swap restores it too.
+    none(
+        &sim_tree(
+            "        let saved = stack_obj;\n        stack_obj = sim;\n        stack_obj = saved;\n        self.level = 1;",
+        ),
+        "stack_obj_clobber_after_self",
+    );
+    // A local saved after the swap holds the other object: assigning it back is no restore.
+    let late = sim_tree(
+        "        stack_obj = sim;\n        let other = stack_obj;\n        stack_obj = other;\n        self.level = 1;",
+    );
+    let d = one(&late, "stack_obj_clobber_after_self");
+    assert!(d.help.as_deref().unwrap().contains("stack_obj.<field>"), "{d:?}");
     // A restore inside a nested block ends the clobber.
     none(
         &sim_tree(
@@ -539,17 +556,149 @@ fn uninitialized_local_read_before_assignment_is_flagged() {
     let source = tree(
         "        let x: i16;\n        self.level = x;\n        x = 3;\n        self.level += x;",
     );
-    let d = one(&source, "unused_decl");
+    let d = one(&source, "uninitialized_local_read");
     assert_eq!(d.line, line_of(&source, "self.level = x;"));
     assert!(d.message.contains("before anything assigns it"), "{d:?}");
+    none(&source, "unused_decl");
     // Assigned on some path first, or through `&mut`: not flagged.
     none(
         &tree("        let x: i16;\n        if self.level > 1 { x = 1; }\n        self.level = x;"),
-        "unused_decl",
+        "uninitialized_local_read",
     );
     none(
         &obj(
             "    fn put(v: &mut i16) { *v = 2; }\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        let x: i16;\n        put(&mut x);\n        self.level = x;\n    }",
+        ),
+        "uninitialized_local_read",
+    );
+}
+
+#[test]
+fn builtins_that_write_a_local_assign_it() {
+    // `animate(local:)` and `random_into(x, n)` write their target: no read-before-assign,
+    // and the target is not unused.
+    let source = sim_tree(
+        "        let event: i16;\n        animate(clip: 1, table: 0, events: 2, local: event) |_e| {\n            if event == 0 { sim.person[1] = 1; }\n        }\n        let roll: i16;\n        random_into(roll, 5)?;\n        self.level = roll;",
+    );
+    none(&source, "uninitialized_local_read");
+    none(&source, "unused_decl");
+    // A read in another argument of the same call still counts as a read.
+    let source = tree("        let roll: i16;\n        random_into(roll, roll)?;\n        self.level = roll;");
+    one(&source, "uninitialized_local_read");
+}
+
+// --- $Local:N string tokens -------------------------------------------------------------
+
+/// A Sim tree whose dialog shows the string `hi`.
+fn dialog_tree(text: &str, body: &str) -> String {
+    obj(&format!(
+        "    strings 301 \"Dialog prim string set\" {{ hi = \"{text}\" }}\n    tree probe \"Probe\" (sim: Sim) {{\n        self.level = 0;\n        self.mode = Mode::Off;\n{body}\n        dialog(kind: 0, message: hi, title: hi)?;\n    }}"
+    ))
+}
+
+#[test]
+fn a_local_read_only_by_a_string_token_is_used() {
+    let body = "        let first = random(5);\n        self.level = first;\n        let shown = random(7);";
+    // Lowered: the `random` temporary is slot 0 (`first` folds into it), `shown` slot 1.
+    let source = dialog_tree("you got $Local:1", body);
+    none(&source, "unused_decl");
+    none(&source, "dialog_local_slot_mismatch");
+    let source = dialog_tree("you got $TimeLocal:1", body);
+    none(&source, "unused_decl");
+    // A token reading another slot leaves `shown` unread, and says where it is.
+    let source = dialog_tree("you got $Local:0", body);
+    let d = one(&source, "unused_decl");
+    assert!(d.message.contains("`shown`"), "{d:?}");
+    assert!(d.note.as_deref().unwrap().contains("`shown` is on slot 1"), "{d:?}");
+}
+
+#[test]
+fn a_string_token_past_the_frame_is_flagged() {
+    let source = dialog_tree("you got $Local:4", "        let shown = random(7);");
+    let d = one(&source, "dialog_local_slot_mismatch");
+    assert_eq!(d.line, line_of(&source, "dialog("));
+    assert!(d.message.contains("`$Local:4` in string `hi` reads local slot 4"), "{d:?}");
+    assert!(d.note.as_deref().unwrap().contains("1 `shown`"), "{d:?}");
+    // Slot 0 holds the `random` temporary, not a `let`.
+    let source = dialog_tree("you got $Local:0", "        let shown = random(7);");
+    let d = one(&source, "dialog_local_slot_mismatch");
+    assert!(d.message.contains("compiler temporary"), "{d:?}");
+    // A raw `local[N]` slot is the raw code's business.
+    none(
+        &dialog_tree(
+            "you got $Local:0",
+            "        raw { local[0] := 3; }\n        self.level = 1;",
+        ),
+        "dialog_local_slot_mismatch",
+    );
+}
+
+// --- raw_bare_call_false_exit -------------------------------------------------------------
+
+#[test]
+fn a_raw_block_ending_in_a_bare_call_before_more_code_is_flagged() {
+    let source = obj(
+        "    @id(4300) tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        raw {\n            temp[0] := 1;\n            call 4301(temps); // why\n        }\n        self.level = 1;\n    }\n    @id(4301) tree other \"Other\" { return true; }",
+    );
+    let d = one(&source, "raw_bare_call_false_exit");
+    assert_eq!(d.line, line_of(&source, "call 4301(temps);"));
+    assert!(d.help.as_deref().unwrap().contains("if call 4301(temps) {}"), "{d:?}");
+}
+
+#[test]
+fn guarded_or_final_raw_calls_are_fine() {
+    let other = "\n    @id(4301) tree other \"Other\" { return true; }";
+    for body in [
+        // Both results go on.
+        "        raw { if call 4301(temps) {} }\n        self.level = 1;",
+        // Nothing follows the block in its list: the false exit is the tree's own.
+        "        self.level = 1;\n        raw { call 4301(temps); }",
+        // The call is not the block's last statement.
+        "        raw { call 4301(temps); temp[0] := 1; }\n        self.level = 1;",
+    ] {
+        none(
+            &obj(&format!(
+                "    @id(4300) tree probe \"Probe\" {{\n        self.mode = Mode::Off;\n{body}\n    }}{other}"
+            )),
+            "raw_bare_call_false_exit",
+        );
+    }
+}
+
+// --- missing_sim_frame_args ---------------------------------------------------------------
+
+#[test]
+fn a_sim_tree_reading_param_in_raw_without_frame_args_is_flagged() {
+    let source = sim_tree("        raw { temp[0] := param[1]; }\n        sim.motive[1] = 1;");
+    let d = one(&source, "missing_sim_frame_args");
+    assert!(d.message.contains("`param[1]`"), "{d:?}");
+    assert!(d.help.as_deref().unwrap().contains("@frame(args: 2)"), "{d:?}");
+    // Pinned arguments, an object-context tree, or declared parameters: fine.
+    none(
+        &obj(
+            "    @frame(args: 2) tree probe \"Probe\" (sim: Sim) {\n        self.level = 0;\n        self.mode = Mode::Off;\n        raw { temp[0] := param[1]; }\n        sim.motive[1] = 1;\n    }",
+        ),
+        "missing_sim_frame_args",
+    );
+    none(
+        &tree("        raw { temp[0] := param[1]; }"),
+        "missing_sim_frame_args",
+    );
+}
+
+#[test]
+fn a_const_written_as_its_value_in_raw_is_used() {
+    // `raw` does not resolve const names, so the value stands in for the name.
+    none(
+        &obj(
+            "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { attr[7] := 1; }\n    }",
+        ),
+        "unused_decl",
+    );
+    // A frame word (`temp[7]`) is not one.
+    one(
+        &obj(
+            "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { temp[7] := 1; }\n    }",
         ),
         "unused_decl",
     );
@@ -609,6 +758,16 @@ fn big_trees_and_many_locals_are_flagged() {
     ));
     let d = one(&source, "frame_headroom");
     assert!(d.message.contains("locals"), "{d:?}");
+
+    // Raw slots push the named locals up: the message says so.
+    let source = obj(
+        "    tree wide \"Wide Tree\" {\n        self.mode = Mode::Off;\n        raw { local[11] := temp[0]; temp[1] := local[11]; }\n        let a = random(9);\n        self.level = a;\n    }",
+    );
+    let d = one(&source, "frame_headroom");
+    assert!(
+        d.message.contains("12 raw slot(s) up to `local[11]`"),
+        "{d:?}"
+    );
 }
 
 #[test]
@@ -644,19 +803,42 @@ fn small_trees_have_headroom() {
 #[test]
 fn if_returning_bool_literals_is_flagged() {
     let source = obj(
-        "    fn high() -> bool {\n        if self.level > 3 { return true; }\n        return false;\n    }",
+        "    state on: bool;\n    fn high() -> bool {\n        if self.on { return true; }\n        return false;\n    }",
     );
     let d = one(&source, "redundant_bool_return");
-    assert_eq!(d.suggestion.as_deref(), Some("return self.level > 3;"));
+    assert_eq!(d.suggestion.as_deref(), Some("return self.on;"));
     let inverted = obj(
-        "    fn low() -> bool {\n        if self.level > 3 { return false; } else { return true; }\n    }",
+        "    state on: bool;\n    fn low() -> bool {\n        if self.on { return false; } else { return true; }\n    }",
     );
     assert_eq!(
         one(&inverted, "redundant_bool_return")
             .suggestion
             .as_deref(),
-        Some("return !(self.level > 3);")
+        Some("return !self.on;")
     );
+    // A negated condition returning false is the operand, not `!!`.
+    let negated = obj(
+        "    state on: bool;\n    fn on() -> bool {\n        if !self.on { return false; }\n        return true;\n    }",
+    );
+    assert_eq!(
+        one(&negated, "redundant_bool_return")
+            .suggestion
+            .as_deref(),
+        Some("return self.on;")
+    );
+}
+
+#[test]
+fn if_returning_a_comparison_keeps_its_last_result() {
+    // `return a op b;` lowers with the opposite last result: not reported.
+    for cond in ["self.level > 3", "!(self.level > 3)", "self.on && self.level == 2"] {
+        none(
+            &obj(&format!(
+                "    state on: bool;\n    fn high() -> bool {{\n        if {cond} {{ return true; }}\n        return false;\n    }}"
+            )),
+            "redundant_bool_return",
+        );
+    }
 }
 
 #[test]
@@ -783,7 +965,7 @@ fn inline_guid_literals_in_bodies_are_flagged() {
 #[test]
 fn negated_comparisons_are_flagged_with_a_polarity_note() {
     let source = tree(
-        "        if !(self.level == 3) { sleep(1); }\n        if !(self.level < temp[0]) { sleep(1); }",
+        "        if !(self.level == 3) { sleep(1); }\n        if !(self.level < temp[0]) { sleep(1); }\n        sleep(2);",
     );
     let found = of(&source, "negated_comparison");
     let suggestions: Vec<&str> = found
@@ -792,6 +974,25 @@ fn negated_comparisons_are_flagged_with_a_polarity_note() {
         .collect();
     assert_eq!(suggestions, ["self.level != 3", "self.level >= temp[0]"]);
     assert!(found[0].note.as_deref().unwrap().contains("polarity"));
+}
+
+#[test]
+fn negated_comparisons_a_branch_may_end_on_are_fine() {
+    // A branch that can end the tree right after the compare leaves its result as the
+    // tree's last result: flipping it would change that.
+    for body in [
+        "        if !(self.level == 3) { sleep(1); }",
+        "        if !(self.level == 3) { return true; }\n        sleep(1);",
+        "        if !(self.level == 3) { sleep(1); }\n        return false;",
+        "        while !(self.level > 3) { self.level += 1; }",
+    ] {
+        none(&tree(body), "negated_comparison");
+    }
+    // Both branches run a node first.
+    one(
+        &tree("        while !(self.level > 3) { self.level += 1; }\n        sleep(1);"),
+        "negated_comparison",
+    );
 }
 
 #[test]
@@ -827,6 +1028,14 @@ fn allow_directives_suppress_by_line_and_file() {
     none(
         &format!("//! antics-lint: allow(while_true)\n{}", tree(flagged)),
         "while_true",
+    );
+    // Trailing a block's opening line: covers the whole block (what `fmt` leaves of an
+    // end-of-line directive on a one-line `if`).
+    none(
+        &obj(
+            "    state on: bool;\n    fn on() -> bool {\n        if !self.on { // antics-lint: allow(redundant_bool_return)\n            return false;\n        }\n        return true;\n    }",
+        ),
+        "redundant_bool_return",
     );
     // A directive for another rule, or another line, does not.
     one(
