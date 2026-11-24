@@ -717,7 +717,7 @@ pub enum MatchPattern {
     /// `lo..hi` / `lo..=hi` on an `i16` scrutinee (stored inclusive: `lo..=hi`).
     Range(Span, i16, i16),
     /// `A | B | ..`: matches when any alternative does. Flat (no nested `Or`), at least two
-    /// alternatives, none of them `_` or an identifier.
+    /// alternatives, none of them `_`.
     Or(Span, Vec<MatchPattern>),
 }
 

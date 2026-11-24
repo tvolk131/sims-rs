@@ -1446,13 +1446,13 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
     // 5. Assign FWAV sound IDs (`1..`, honoring explicit IDs).
     let mut used_sound_ids: BTreeSet<u16> = BTreeSet::new();
     for sname in &sound_order {
-        if let Some(eid) = raw_sounds[sname].explicit_id {
-            if !used_sound_ids.insert(eid) {
-                return Err(Error::at(
-                    raw_sounds[sname].span,
-                    format!("duplicate sound id {eid}"),
-                ));
-            }
+        if let Some(eid) = raw_sounds[sname].explicit_id
+            && !used_sound_ids.insert(eid)
+        {
+            return Err(Error::at(
+                raw_sounds[sname].span,
+                format!("duplicate sound id {eid}"),
+            ));
         }
     }
     let mut next_sound_id = 1u16;
@@ -4330,9 +4330,7 @@ impl<'a> TreeLowerer<'a> {
                 .as_ref()
                 .is_none_or(|v| self.cursor_expr_ok(v, cursor)),
             V2Stmt::Break { .. } | V2Stmt::Continue { .. } | V2Stmt::ReturnError { .. } => true,
-            V2Stmt::Let { name, init, .. } => {
-                name != cursor && self.cursor_expr_ok(init, cursor)
-            }
+            V2Stmt::Let { name, init, .. } => name != cursor && self.cursor_expr_ok(init, cursor),
             V2Stmt::LetUninit { name, .. } => name != cursor,
             V2Stmt::Assign { target, value, .. } => {
                 let target_ok = match target {
@@ -4369,8 +4367,7 @@ impl<'a> TreeLowerer<'a> {
             V2Expr::Index { base, index, .. } => {
                 let base_ok = match base.as_ref() {
                     V2Expr::Ident(_, name) => {
-                        matches!(name.as_str(), "temp" | "param")
-                            && self.lookup_var(name).is_none()
+                        matches!(name.as_str(), "temp" | "param") && self.lookup_var(name).is_none()
                     }
                     V2Expr::Field { base: root, .. } => {
                         matches!(root.as_ref(), V2Expr::Ident(_, r) if self.cursor_cell_root_ok(r, cursor))
@@ -4412,9 +4409,12 @@ impl<'a> TreeLowerer<'a> {
                 method == "is_type"
                     && type_args.is_empty()
                     && matches!(receiver.as_ref(), V2Expr::Ident(_, r) if r == cursor)
-                    && args
-                        .iter()
-                        .all(|a| matches!(a.value, V2Expr::Int(..) | V2Expr::Ident(..) | V2Expr::Path(..)))
+                    && args.iter().all(|a| {
+                        matches!(
+                            a.value,
+                            V2Expr::Int(..) | V2Expr::Ident(..) | V2Expr::Path(..)
+                        )
+                    })
             }
             _ => false,
         }
@@ -10991,10 +10991,12 @@ impl<'a> TreeLowerer<'a> {
                 }
             }
             V2Expr::Field { base, .. } => match base.as_ref() {
+                // `stack_obj.<field>` is the stack object's own cell (no switch).
                 V2Expr::Ident(_, bname) => {
                     self.is_self_ident(bname)
                         || self.is_sim_ident(bname)
                         || self.is_bcon_table_ref(bname)
+                        || bname == "stack_obj"
                 }
                 V2Expr::Field { base: root, .. } => {
                     matches!(root.as_ref(), V2Expr::Ident(_, rname) if self.is_sim_ident(rname))
@@ -11016,7 +11018,9 @@ impl<'a> TreeLowerer<'a> {
                         field != "sprite_flags"
                             && matches!(
                                 root.as_ref(),
-                                V2Expr::Ident(_, rname) if self.is_self_ident(rname) || self.is_sim_ident(rname)
+                                V2Expr::Ident(_, rname) if self.is_self_ident(rname)
+                                    || self.is_sim_ident(rname)
+                                    || rname == "stack_obj"
                             )
                     }
                     _ => false,
@@ -13475,7 +13479,9 @@ fn stmts_exit_loop(stmts: &[V2Stmt]) -> bool {
 /// The operands of a flat `a op b op ..` chain (`op` is `&&` or `||`), in evaluation order.
 fn flatten_logic_chain<'e>(expr: &'e V2Expr, op: V2BinOp, out: &mut Vec<&'e V2Expr>) {
     match expr {
-        V2Expr::Binary { lhs, op: o, rhs, .. } if *o == op => {
+        V2Expr::Binary {
+            lhs, op: o, rhs, ..
+        } if *o == op => {
             flatten_logic_chain(lhs, op, out);
             flatten_logic_chain(rhs, op, out);
         }

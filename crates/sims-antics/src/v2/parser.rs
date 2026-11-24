@@ -2162,7 +2162,8 @@ impl Parser {
         if self.eat(&TokenKind::LParen) && !self.eat(&TokenKind::RParen) {
             sim_binding = self.expect_binding_ident("guard sim parameter")?.0;
             if self.eat(&TokenKind::Comma) && self.peek().kind != TokenKind::RParen {
-                let (auto_name, aspan) = self.expect_binding_ident("guard is_autonomous parameter")?;
+                let (auto_name, aspan) =
+                    self.expect_binding_ident("guard is_autonomous parameter")?;
                 if !allow_autonomous {
                     return Err(Error::at(
                         aspan,
@@ -3120,24 +3121,14 @@ impl Parser {
         while self.eat(&TokenKind::Pipe) {
             alts.push(self.parse_single_match_pattern()?);
         }
-        for alt in &alts {
-            match alt {
-                MatchPattern::Wildcard(s) => {
-                    return Err(Error::at(
-                        *s,
-                        "'_' cannot be an alternative of an OR-pattern (it would match everything)",
-                    ));
-                }
-                MatchPattern::Ident(s, name) => {
-                    return Err(Error::at(
-                        *s,
-                        format!(
-                            "'{name}' cannot be an alternative of an OR-pattern: alternatives are values, ranges, or 'Enum::Variant' paths"
-                        ),
-                    ));
-                }
-                _ => {}
-            }
+        // Identifiers stay: `match dialog(..)` names its buttons (`Yes | Cancel`).
+        if let Some(MatchPattern::Wildcard(s)) =
+            alts.iter().find(|a| matches!(a, MatchPattern::Wildcard(_)))
+        {
+            return Err(Error::at(
+                *s,
+                "'_' cannot be an alternative of an OR-pattern (it would match everything)",
+            ));
         }
         Ok(MatchPattern::Or(span, alts))
     }

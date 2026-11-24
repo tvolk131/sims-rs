@@ -155,7 +155,8 @@ pub fn compile_expanded_v2_object(expanded: ExpandedV2Object) -> Result<Compiled
             append_variants(&compiled.iff_bytes, objd_id, ctss_id, &expanded.variants)?;
     }
     if !expanded.shared_sound_names.is_empty() {
-        compiled.iff_bytes = rename_shared_sounds(&compiled.iff_bytes, &expanded.shared_sound_names)?;
+        compiled.iff_bytes =
+            rename_shared_sounds(&compiled.iff_bytes, &expanded.shared_sound_names)?;
         for (_, placeholder, _) in &expanded.shared_sound_names {
             compiled.sounds_wav.remove(placeholder);
         }

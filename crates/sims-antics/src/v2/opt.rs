@@ -63,7 +63,10 @@ pub(crate) fn drop_unread_entry_save(body: &str) -> Option<String> {
     if body.contains("/*") {
         return None;
     }
-    let mut lines = body.lines().enumerate().filter(|(_, l)| !l.trim().is_empty());
+    let mut lines = body
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty());
     let (save_at, first) = lines.next()?;
     if first.trim() != SAVE {
         return None;
@@ -83,9 +86,9 @@ pub(crate) fn drop_unread_entry_save(body: &str) -> Option<String> {
         Kind::Assign { .. } | Kind::Let { init: Some(_), .. } | Kind::Return => {
             !names_local_slot(&stripped) && !stripped.contains('{')
         }
-        _ => ["if ", "while "].iter().any(|kw| {
-            header(&stripped, next, kw).is_some_and(|c| !c.contains('(') && c != "true")
-        }),
+        _ => ["if ", "while "]
+            .iter()
+            .any(|kw| header(&stripped, next, kw).is_some_and(|c| !c.contains('(') && c != "true")),
     };
     if !ignores {
         return None;
@@ -823,10 +826,23 @@ fn may_read_stack_obj(text: &str) -> bool {
 /// Whether a statement or condition may write the stack object. Subroutine calls cannot (the
 /// callee's frame has its own copy).
 fn may_write_stack_obj(text: &str) -> bool {
-    if matches!(classify(text), Kind::Assign { lhs: "stack_obj", op: ":=", rhs: "stack_obj" }) {
+    if matches!(
+        classify(text),
+        Kind::Assign {
+            lhs: "stack_obj",
+            op: ":=",
+            rhs: "stack_obj"
+        }
+    ) {
         return false;
     }
-    if matches!(classify(text), Kind::Assign { lhs: "stack_obj", .. }) {
+    if matches!(
+        classify(text),
+        Kind::Assign {
+            lhs: "stack_obj",
+            ..
+        }
+    ) {
         return true;
     }
     let stripped = strip_strings(text);
@@ -913,9 +929,8 @@ fn forward_save_block(nodes: &mut [Node], map: &BTreeMap<String, String>) -> boo
                     }
                     kept &= forward_save_block(body, map);
                 }
-                match else_body {
-                    Some(body) => kept &= forward_save_block(body, map),
-                    None => {}
+                if let Some(body) = else_body {
+                    kept &= forward_save_block(body, map);
                 }
                 if !kept {
                     return false;
@@ -945,9 +960,7 @@ fn drop_unread_entry_save_node(nodes: &mut Vec<Node>) {
     let Some(name) = entry_save(nodes) else {
         return;
     };
-    let mut counts = BTreeMap::new();
-    mention_counts(&nodes[1..], &mut counts);
-    if !counts.contains_key(name) {
+    if !mentions(&nodes[1..], name) {
         nodes.remove(0);
     }
 }
@@ -1051,24 +1064,37 @@ fn drop_stack_obj_stores_before_exit(nodes: &mut Vec<Node>, tail_returns: bool) 
     }
 }
 
+/// Whether any line or condition in `nodes` names `name`.
+fn mentions(nodes: &[Node], name: &str) -> bool {
+    let named = |text: &str| text.contains(name) && idents(text).contains(&name);
+    nodes.iter().any(|n| match n {
+        Node::Line(l) => named(l),
+        Node::If { arms, else_body } => {
+            arms.iter().any(|(c, b)| named(c) || mentions(b, name))
+                || else_body.as_deref().is_some_and(|b| mentions(b, name))
+        }
+        Node::While { cond, body } => cond.as_deref().is_some_and(named) || mentions(body, name),
+    })
+}
+
 /// Every mention of each identifier: `(reads, writes-only lines)`.
-fn mention_counts(nodes: &[Node], counts: &mut BTreeMap<String, (usize, usize)>) {
-    let add_text = |text: &str, counts: &mut BTreeMap<String, (usize, usize)>| {
+fn mention_counts<'a>(nodes: &'a [Node], counts: &mut BTreeMap<&'a str, (usize, usize)>) {
+    let add_text = |text: &'a str, counts: &mut BTreeMap<&'a str, (usize, usize)>| {
         for id in idents(text) {
-            counts.entry(id.to_owned()).or_default().0 += 1;
+            counts.entry(id).or_default().0 += 1;
         }
     };
     for n in nodes {
         match n {
             Node::Line(l) => match classify(l) {
                 Kind::Let { name, init } => {
-                    counts.entry(name.to_owned()).or_default().1 += 1;
+                    counts.entry(name).or_default().1 += 1;
                     if let Some(init) = init {
                         add_text(init, counts);
                     }
                 }
                 Kind::Assign { lhs, op: ":=", rhs } if is_ident(lhs) => {
-                    counts.entry(lhs.to_owned()).or_default().1 += 1;
+                    counts.entry(lhs).or_default().1 += 1;
                     add_text(rhs, counts);
                 }
                 _ => add_text(l, counts),
@@ -1263,19 +1289,26 @@ fn forward_copies(nodes: &mut Vec<Node>) {
 
 /// Drops `let x;` declarations of names nothing else mentions.
 fn drop_unused_decls(nodes: &mut Vec<Node>) {
-    let mut counts = BTreeMap::new();
-    mention_counts(nodes, &mut counts);
+    // Only the names to drop are copied out of the borrowed counts.
+    let unused: BTreeSet<String> = {
+        let mut counts = BTreeMap::new();
+        mention_counts(nodes, &mut counts);
+        counts
+            .into_iter()
+            .filter(|&(_, (reads, writes))| reads == 0 && writes <= 1)
+            .map(|(name, _)| name.to_owned())
+            .collect()
+    };
     for_each_block(nodes, &mut |block| {
-        block.retain(|n| match n {
-            Node::Line(l) => match classify(l) {
-                Kind::Let { name, init: None } => {
-                    let (reads, writes) = counts.get(name).copied().unwrap_or_default();
-                    reads > 0 || writes > 1
-                }
+        if !unused.is_empty() {
+            block.retain(|n| match n {
+                Node::Line(l) => match classify(l) {
+                    Kind::Let { name, init: None } => !unused.contains(name),
+                    _ => true,
+                },
                 _ => true,
-            },
-            _ => true,
-        });
+            });
+        }
         // `let x;` right before `x := e;` is spelled `let x = e;` (the same node).
         let mut i = 0;
         while i + 1 < block.len() {
@@ -1690,6 +1723,41 @@ mod tests {
         ] {
             let body = format!("{dead}    {line}\n    return true;\n");
             assert_ne!(optimize_tree_body(&body), body, "{line}");
+        }
+    }
+
+    #[test]
+    fn entry_save_forwards_until_a_write_and_then_goes() {
+        // Nothing changes the stack object before the restore, which becomes a no-op.
+        let body = "    let __self_obj = stack_obj;\n    my.attr[0] := stack.attr[1];\n    stack_obj := __self_obj;\n    my.attr[2] := 1;\n    return true;\n";
+        assert_eq!(
+            optimize_tree_body(body),
+            "    my.attr[0] := stack.attr[1];\n    my.attr[2] := 1;\n    return true;\n"
+        );
+        // After a write the restore is real, and so is the save.
+        let body = "    let __self_obj = stack_obj;\n    stack_obj := my.id;\n    my.attr[0] := stack.attr[1];\n    stack_obj := __self_obj;\n    my.attr[1] := stack.attr[2];\n    return true;\n";
+        assert_eq!(optimize_tree_body(body), body);
+        // A primitive may write it too.
+        let body = "    let __self_obj = stack_obj;\n    set_to_next(all);\n    stack_obj := __self_obj;\n    my.attr[1] := stack.attr[2];\n    return true;\n";
+        assert_eq!(optimize_tree_body(body), body);
+    }
+
+    #[test]
+    fn unread_stack_obj_stores_drop() {
+        // Nothing reads the store before the frame returns.
+        let body = "    let __o_1 = my.id;\n    stack_obj := __o_1;\n    my.attr[0] := 1;\n    return true;\n";
+        assert_eq!(
+            optimize_tree_body(body),
+            "    my.attr[0] := 1;\n    return true;\n"
+        );
+        // A read on one path keeps it; so does a loop.
+        for tail in [
+            "    if my.attr[0] == 1 {\n        my.attr[1] := stack.attr[0];\n    }\n    return true;\n",
+            "    while my.attr[0] < 3 {\n        my.attr[0] += 1;\n    }\n    return true;\n",
+        ] {
+            let body = format!("    let __o_1 = my.id;\n    stack_obj := __o_1;\n{tail}");
+            let out = optimize_tree_body(&body);
+            assert!(out.starts_with("    stack_obj := my.id;\n"), "{out}");
         }
     }
 
