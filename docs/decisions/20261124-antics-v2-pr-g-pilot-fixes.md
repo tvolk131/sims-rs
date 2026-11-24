@@ -40,7 +40,8 @@ Constraints:
   - **This reverses PR F's `next_ignores_last_result` guard** for the save only (`20261124-antics-v2-pr-f-zero-raw-and-sugar.md` §1, L7). Other dead stores keep that guard.
   - **Guard.** Dropping the save moves every later named local down one frame word, and a frame word keeps whatever an earlier frame left there. So every named local must be written before it is read:
     - When the structured pass parses the body, the flow analysis checks this.
-    - When it cannot (a raw block with several statements on one line), the save is dropped only if no local is declared without a value (`let x;`).
+    - When it cannot (a raw block with several statements on one line), the save is dropped only if no statement on any line declares a local without a value (`let x;`).
+  - **Not covered: callee frames.** A shorter frame also moves where callees' frames start, so a callee that reads a local before writing it sees a different leftover word. Local coalescing and unused-declaration removal (PR E/F) already shrink frames the same way. `--behavioral` treats frame storage as unobservable, so v2 assumes no tree reads an unwritten local of its own frame.
 - **Raw clobber analysis decodes operands like the VM.** It replaces an opcode allow-list.
   - These primitives write the caller's `stack_obj`, and so need the save:
     - Expression into scope 10;
@@ -67,10 +68,10 @@ Constraints:
 | `relationship(column:, dir:, flags:, local:, value:)` | 26 | `value:` is required and must be an `i16` local, which the optimizer treats as written. |
 | `old_relationship(write:, column:, param:, dir:, flags:)` | 24 | |
 | `generic_call(routine)` | 1 | |
-| `play_sound(sound, target, flags:)` | 23 | Takes an FWAV id or `const` as well as a `sound` binding. `flags: 0x02` (stack object) is rejected in favour of `target`. |
+| `play_sound(sound, target, flags:)` | 23 | Takes an FWAV id or `const` as well as a `sound` binding. `flags: 0x02` (stack object) is rejected in favour of `target`, and so are flags that would encode as `0xFF`, which the VM plays on the running object whatever bit `0x02` says. |
 | `stop_all_sounds(target)` | 48 | Its target is checked like `play_sound`'s: `self`, `sim`, `stack_obj`, or a literal bool. |
-| `job_data(career, level, field)` | — (scope 33) | Stages `temp[0]` / `temp[1]`. A level read from `temp[0]` is copied first, and call arguments are lowered before any staging. |
-| `distance_to(target, from:, temp:)` | 11 | Points `stack_obj` at the target around the primitive, so the save analysis counts it unless the target is `stack_obj`. A `from: stack_obj` is copied before the move. |
+| `job_data(career, level, field)` | — (scope 33) | Stages `temp[0]` / `temp[1]`. A level read from `temp[0]` is copied first, and so is the career when the level may write anything (a call, a nested `job_data`). Call arguments are lowered before any staging. |
+| `distance_to(target, from:, temp:)` | 11 | Points `stack_obj` at the target around the primitive, so the save analysis counts it unless the target is `stack_obj`. A `from:` that names the stack object (`stack_obj`, `stack.id`) is copied before the move, and so is the target when `from:` may write anything. |
 
 ### 3. New fields (Tier 2)
 
@@ -84,8 +85,8 @@ Constraints:
 
 ### 4. Lowering wins (Tier 3)
 
-- **`while` conditions.** `while f()` and `while !f()` test a call condition directly at the top of the pass, with no `__wcond` local.
-- **Identity stores.** The optimizer drops `x := x` for temps, params, `local[N]`, and locals when the next node ignores the last result. This removes the `temp[i] := temp[i]` that forwarding a staged argument copy leaves.
+- **`while` conditions.** `while f()` and `while !f()` test a call condition directly at the top of the pass, with no `__wcond` local. The exit test swaps the condition's branches (`if !x > 0 { break; }`) instead of inverting the comparison, so the body starts after the test came out as the source wrote it.
+- **Identity stores.** The optimizer drops `temp[i] := temp[i]` for temps 0 to 7 when the next node ignores the last result. Forwarding a staged argument copy leaves these behind. Other cells keep the store, because their read can fault: an out-of-range temp, a parameter past the frame's arguments, or a local holding half of a stale pointer.
 - **`local[N]` reads.** A read pins the layout like a raw block: `.air` puts named locals after every explicit slot, and the optimizer skips the tree. It cannot share a tree with a pinned `push_interaction` object, and writes are rejected.
 - **Const patterns.** A `const` name in a `match` arm matches its value, with the usual duplicate and range checks.
 - **Brace-free arms.** `0 => f(), 1 => x = 2, 2 => x += 1` parse. A full statement (`3 => return;`) still works.

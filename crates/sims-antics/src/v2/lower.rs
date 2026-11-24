@@ -5286,10 +5286,12 @@ impl<'a> TreeLowerer<'a> {
                         self.line("}".to_owned());
                     }
                     // The condition is tested at the top of every pass. One that lowers to a
-                    // single `.air` condition (a call, `!f()`) needs no local to hold it.
-                    let cond_res = match self.try_lower_negated_simple_air_cond(cond) {
-                        Ok(Some(exit)) => {
-                            self.line(format!("if {exit} {{"));
+                    // single `.air` condition (a call, `!f()`) needs no local to hold it. The
+                    // exit swaps the test's exits rather than inverting it, so the body starts
+                    // after the test came out as the source wrote it.
+                    let cond_res = match self.try_lower_simple_air_cond(cond) {
+                        Ok(Some(test)) => {
+                            self.line(format!("if {} {{", swap_exits(&test)));
                             Ok(())
                         }
                         Ok(None) => {
@@ -10867,32 +10869,24 @@ impl<'a> TreeLowerer<'a> {
     /// taken from `temp[0]` and the level from `temp[1]`. Both temps are overwritten.
     fn lower_job_data(&mut self, args: &[CallArg], span: Span) -> Result<(String, ValueType)> {
         let bound = self.bind_builtin_args("job_data", args, &["career", "level", "field"], &[])?;
-        let mut operand = |key: &str| -> Result<(String, Span)> {
-            let arg = bound
+        let get = |key: &str| {
+            bound
                 .get(key)
-                .ok_or_else(|| Error::at(span, format!("job_data() requires '{key}'")))?;
-            let (air, ty) = self.lower_value_expr(&arg.value)?;
-            if ty != ValueType::I16 {
-                return Err(Error::at(
-                    arg.span,
-                    format!("job_data {key} must be an i16"),
-                ));
-            }
-            Ok((air, arg.span))
+                .copied()
+                .ok_or_else(|| Error::at(span, format!("job_data() requires '{key}'")))
         };
-        let (career, _) = operand("career")?;
-        let (mut level, _) = operand("level")?;
-        let field = {
-            let arg = bound
-                .get("field")
-                .ok_or_else(|| Error::at(span, "job_data() requires 'field'"))?;
-            self.eval_builtin_int(&arg.value, "job_data field", 0, 32767)?
-        };
+        let (career_arg, level_arg, field_arg) = (get("career")?, get("level")?, get("field")?);
+        let mut career = self.lower_job_operand("career", career_arg)?;
+        // The career is read when it is staged, after the level is lowered: a level that may
+        // write anything (a call, a nested `job_data`) gets a copy of the career first.
+        if !self.is_pure_single_operand(&level_arg.value) {
+            career = self.snapshot_operand(career, "job_career");
+        }
+        let mut level = self.lower_job_operand("level", level_arg)?;
+        let field = self.eval_builtin_int(&field_arg.value, "job_data field", 0, 32767)?;
         // `temp[0]` is written first: a level read from it is copied before that store.
         if level.contains("temp[0]") {
-            let copy = self.fresh("job_level");
-            self.line(format!("let {copy} = {level};"));
-            level = copy;
+            level = self.snapshot_operand(level, "job_level");
         }
         self.line(format!("temp[0] := {career};"));
         self.line(format!("temp[1] := {level};"));
@@ -10901,30 +10895,45 @@ impl<'a> TreeLowerer<'a> {
         Ok((tmp, ValueType::I16))
     }
 
+    fn lower_job_operand(&mut self, key: &str, arg: &CallArg) -> Result<String> {
+        let (air, ty) = self.lower_value_expr(&arg.value)?;
+        if ty != ValueType::I16 {
+            return Err(Error::at(
+                arg.span,
+                format!("job_data {key} must be an i16"),
+            ));
+        }
+        Ok(air)
+    }
+
+    /// `air` copied into a fresh local, unless it is a literal (which nothing can change).
+    fn snapshot_operand(&mut self, air: String, prefix: &str) -> String {
+        if air.parse::<i64>().is_ok() {
+            return air;
+        }
+        let copy = self.fresh(prefix);
+        self.line(format!("let {copy} = {air};"));
+        copy
+    }
+
     /// `distance_to(target, from: obj, temp: n)`: Get Distance To measures from `from` (the
     /// running object by default) to the stack object, so `stack_obj` points at `target` around
     /// it. The result lands in `temp[n]` (0 by default).
     fn lower_distance_to(&mut self, args: &[CallArg], span: Span) -> Result<(String, ValueType)> {
         let bound = self.bind_builtin_args("distance_to", args, &["target"], &["from", "temp"])?;
-        let target_arg = bound
+        let target_arg = *bound
             .get("target")
             .ok_or_else(|| Error::at(span, "distance_to() requires a target object"))?;
-        let mut handle = |key: &str, arg: &CallArg| -> Result<String> {
-            let (air, ty) = self.lower_value_expr(&arg.value)?;
-            if !ty.is_object_handle() {
-                return Err(Error::at(
-                    arg.span,
-                    format!(
-                        "distance_to {key} must be an object, found '{}'",
-                        self.env.display_value_type(&ty)
-                    ),
-                ));
-            }
-            Ok(air)
-        };
-        let target = handle("target", target_arg)?;
-        let mut from = match bound.get("from") {
-            Some(arg) => Some(handle("from", arg)?),
+        let from_arg = bound.get("from").copied();
+        let mut target = self.lower_distance_handle("target", target_arg)?;
+        // The target is read when `stack_obj` moves, after `from` is lowered: a `from` that may
+        // write anything gets a copy of the target first.
+        if from_arg.is_some_and(|a| !self.is_pure_single_operand(&a.value)) && target != "stack_obj"
+        {
+            target = self.snapshot_operand(target, "dist_target");
+        }
+        let mut from = match from_arg {
+            Some(arg) => Some(self.lower_distance_handle("from", arg)?),
             None => None,
         };
         let temp = match bound.get("temp") {
@@ -10932,11 +10941,15 @@ impl<'a> TreeLowerer<'a> {
             None => 0,
         };
         let moves = target != "stack_obj";
-        // `from` is read after `stack_obj` moves to the target.
-        if moves && from.as_deref() == Some("stack_obj") {
-            let copy = self.fresh("dist_from");
-            self.line(format!("let {copy} = stack_obj;"));
-            from = Some(copy);
+        // `from` is read after `stack_obj` moves to the target: one that names the stack object
+        // (`stack_obj`, or a `stack.` cell such as `stack.id`) is copied before the move.
+        if moves && let Some(f) = from.take() {
+            let stack_relative = f == "stack_obj" || f.contains("stack.");
+            from = Some(if stack_relative {
+                self.snapshot_operand(f, "dist_from")
+            } else {
+                f
+            });
         }
         if moves {
             self.line(format!("stack_obj := {target};"));
@@ -10951,6 +10964,20 @@ impl<'a> TreeLowerer<'a> {
         let tmp = self.fresh("dist");
         self.line(format!("let {tmp} = temp[{temp}];"));
         Ok((tmp, ValueType::I16))
+    }
+
+    fn lower_distance_handle(&mut self, key: &str, arg: &CallArg) -> Result<String> {
+        let (air, ty) = self.lower_value_expr(&arg.value)?;
+        if !ty.is_object_handle() {
+            return Err(Error::at(
+                arg.span,
+                format!(
+                    "distance_to {key} must be an object, found '{}'",
+                    self.env.display_value_type(&ty)
+                ),
+            ));
+        }
+        Ok(air)
     }
 
     /// `local[N]` read: frame word N as a raw block wrote it. Like a raw block, naming a slot
@@ -12539,6 +12566,13 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
         let flags = flags | if on_stack { 0x02 } else { 0 };
+        // The VM plays on `me` whenever the flags byte is 0xFF, whatever bit 0x02 says.
+        if flags == 0xFF {
+            return Err(Error::at(
+                f.span,
+                "play_sound flags 0xFD with the stack object as target encode as 0xFF, which the VM plays on the running object",
+            ));
+        }
         Ok(format!("play_sound({sound_id}, flags: {flags})"))
     }
 

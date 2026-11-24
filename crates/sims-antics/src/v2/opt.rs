@@ -93,12 +93,14 @@ pub(crate) fn drop_unread_entry_save(body: &str) -> Option<String> {
     // earlier frame left there: none may be read before it is written. A body the structured
     // pass cannot parse (a raw block with several statements on a line) is checked by its
     // lines: every local the lowering declares without a value (`let x;`) might be read first,
-    // while `let x = e;` writes it where it comes into scope.
+    // while `let x = e;` writes it where it comes into scope. Each statement of a line counts.
     let defined = match parse_body(body) {
         Some(nodes) => locals_defined_before_reads(&nodes),
-        None => !body
-            .lines()
-            .any(|l| matches!(classify(l.trim()), Kind::Let { init: None, .. })),
+        None => !body.lines().any(|l| {
+            strip_strings(l)
+                .split([';', '{', '}'])
+                .any(|stmt| matches!(classify(stmt.trim()), Kind::Let { init: None, .. }))
+        }),
     };
     if !defined {
         return None;
@@ -1474,8 +1476,10 @@ fn forward_copies(nodes: &mut Vec<Node>) {
     });
 }
 
-/// Drops `x := x;` for a temp, a call-frame word, or a local (what forwarding a staged argument
-/// copy leaves behind): the store changes nothing, and the next node does not read its result.
+/// Drops `temp[i] := temp[i];` for a temp the VM always has (0 to 7), which forwarding a staged
+/// argument copy leaves behind: the store changes nothing and cannot fault, and the next node
+/// does not read its result. Other cells stay: an out-of-range temp, a parameter past the frame's
+/// arguments, or a local holding half of a stale pointer faults on the read.
 fn drop_identity_stores(nodes: &mut Vec<Node>) {
     for_each_block(nodes, &mut |block| {
         for i in (0..block.len()).rev() {
@@ -1485,15 +1489,12 @@ fn drop_identity_stores(nodes: &mut Vec<Node>) {
             let Kind::Assign { lhs, op: ":=", rhs } = classify(l) else {
                 continue;
             };
-            let plain = lhs.starts_with("temp[")
-                || lhs.starts_with("param[")
-                || lhs.starts_with("local[")
-                || is_ident(lhs);
-            if lhs == rhs
-                && plain
-                && lhs != "stack_obj"
-                && next_ignores_last_result(&block[i + 1..])
-            {
+            let in_range_temp = lhs
+                .strip_prefix("temp[")
+                .and_then(|r| r.strip_suffix(']'))
+                .and_then(|n| n.parse::<u8>().ok())
+                .is_some_and(|n| n < 8);
+            if lhs == rhs && in_range_temp && next_ignores_last_result(&block[i + 1..]) {
                 block.remove(i);
             }
         }

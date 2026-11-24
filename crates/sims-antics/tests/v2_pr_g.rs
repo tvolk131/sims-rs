@@ -582,3 +582,60 @@ fn tier3_match_arms_without_braces() {
         "expected ';'",
     );
 }
+
+#[test]
+fn review_operands_are_read_where_the_source_reads_them() {
+    // `from:` names the stack object (`self` in a Sim tree): it is copied before the move.
+    let air = expand(
+        "dist_from_self.antics",
+        &sim_tree("self.n = distance_to(sim, from: self.id);"),
+    );
+    let body = &air[air.find("\"t\" {").expect("tree")..];
+    let mv = body.find("stack_obj := my.id;").expect("move to the Sim");
+    let get = body.find("get_distance_to(").expect("primitive");
+    let from = &body[get..body[get..].find(';').map(|e| get + e).expect("end")];
+    assert!(!from.contains("stack"), "{body}");
+    assert!(body[..mv].contains("= stack."), "{body}");
+
+    // A nested `job_data` writes the temps the outer career reads: the career is copied first.
+    let air = expand(
+        "job_nested.antics",
+        &sim_tree("temp[0] = 6; self.n = job_data(temp[0], job_data(1, 0, 0), 0);"),
+    );
+    let body = &air[air.find("\"t\" {").expect("tree")..];
+    let copy = body.find("= temp[0];").expect("career copied");
+    let inner = body.find("temp[0] := 1;").expect("inner career");
+    assert!(copy < inner, "{body}");
+
+    // An out-of-range temp faults on the read, so its identity store stays.
+    let air = expand("temp8.antics", &sim_tree("temp[8] = temp[8]; self.n = 1;"));
+    assert!(air.contains("temp[8] := temp[8];"), "{air}");
+
+    // A `while` test keeps its own polarity: the exit swaps the branches.
+    let air = expand(
+        "while_cmp.antics",
+        &sim_tree("while distance_to(stack_obj) > 0 { self.n += 1; }"),
+    );
+    assert!(air.contains("if !") && air.contains(" > 0 {"), "{air}");
+    assert!(!air.contains("<= 0"), "{air}");
+
+    expect_err(
+        "sound_ff.antics",
+        &sim_tree("play_sound(66, stack_obj, flags: 0xfd);"),
+        "encode as 0xFF",
+    );
+}
+
+#[test]
+fn review_raw_declarations_keep_the_entry_save() {
+    // A raw line with two statements defeats the structured pass; its `let dangling;` would
+    // move to the save's word if the save went.
+    let air = expand(
+        "raw_dangling.antics",
+        &sim_tree(
+            "raw { let dangling; temp[0] := dangling; stack_obj := my.id; } self.n = sim.data[0];",
+        ),
+    );
+    assert!(air.contains("let dangling; temp[0] := dangling;"), "{air}");
+    assert!(air.contains("let __self_obj = stack_obj;"), "{air}");
+}
