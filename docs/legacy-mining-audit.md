@@ -47,7 +47,7 @@ knowledge.
 | sims-formats (leftovers) | 2.1k | **removed** | 0 | [sims-formats](#sims-formats-leftovers--removed) |
 | sims-runtime | 129k | stays | 2 | [sims-runtime](#sims-runtime--stays) |
 | sims-app | 88k | stays | 5 | [sims-app](#sims-app--stays) |
-| sims-content | 98k | stays | 13 | [sims-content](#sims-content--stays) |
+| sims-content | 98k | stays | 10 (3 ported) | [sims-content](#sims-content--stays) |
 | sims-render | 55k | stays | 5 | [sims-render](#sims-render--stays) |
 | sims-vm | 100k | stays | 3 (5 ported) | [sims-vm](#sims-vm--stays) |
 | sims-sim | 187k | stays | ~20 | [sims-sim](#sims-sim--stays) |
@@ -80,9 +80,9 @@ cited reason.
 5. Downgrade or port the two remaining PORT verdicts: `owned_worker.rs` and `bin/inspector.rs`.
 
 **sims-content**
-1. Buy eligibility from the real TTAB (`0x457cb0`).
-2. Catalog-name fallback (`0x457d3b`, `*` + OBJD label).
-3. Buy category labels (STR# 150, 200–207 and 210; catalog-6 remap; column order).
+1. ~~Buy eligibility from the real TTAB (`0x457cb0`).~~ Ported to `crates/sims-content/src/buy_catalog.rs` ([ADR](decisions/20261124-buy-catalog-famh-move-in-fuzzer-and-skn.md)).
+2. ~~Catalog-name fallback (`0x457d3b`, `*` + OBJD label).~~ Ported there too; the legacy CATS order and language fallback were wrong.
+3. ~~Buy category labels (STR# 150, 200–207 and 210; catalog-6 remap; column order).~~ Ported there too.
 4. Built-in avatar materials (`0x5d41db`).
 5. Footstep floor material (`0x5890a8`) [also sims-sim #2].
 6. Censor appearance (`<profile>-needs` in `adult.cmx.bcf`, person word 30) [also sims-render #1].
@@ -431,7 +431,7 @@ Until these are ported, or written into `docs/`, the crate stays. The `legacy-fi
 | `compatibility.rs` | Corpus opcode census | ported (core) | `crates/sims-cli/src/census.rs`. The legacy extras (operand-variant, expression-byte and semi-global call-resolution histograms) are tooling, not game rules |
 | `avatar_installation.rs` (+`objects.rs`), `avatar_mount.rs`, `avatar_mount_tests.rs`, `avatar_catalog.rs` (+`startup/`) | Mount order (0x43ae81); avatar search paths (0x5835ed); texture paths (0x414633); download providers (0x43bdc5); file-table hash order; loose file over archive member; cmx before bcf before ndx | ported | Compared line by line with legacy `sims-sim catalog_paths::initial_mounts`: `crates/sims-content/src/import_wardrobe.rs:23-60,740-797`, `people.rs:1076-1082`, `install.rs:121-148`, `file_table.rs`, `tests/install.rs`. Lines 56-77 of `avatar_installation.rs` are only this project's cabinet-extraction bindings (the salvage audit calls for that to be REWRITTEN; done by `Install::detect`). **Gap:** numbered-catalog open order (§3 item 9) |
 | `object_catalog.rs`, `object_catalog/{household,portraits,saved_types,retained/*}` | Registration order; `filter_flagged`; type attributes (word 90, reset-per-lot bit word 91&2); global controllers (type 7/12, word 42 ≠ 0); latest-registration GUID lookup | ported | `crates/sims-vm/src/program.rs:1194-1225`; `crates/sims-vm/src/load.rs:350-380`; `crates/sims-content/src/catalog.rs`. `retained/*` and `saved_types` are retention/checkpoint infra (dropped, vision) |
-| `object_catalog/products.rs`, `products/labels.rs` | Buy membership; CATS before CTSS; name fallback; TTAB eligibility (0x457cb0); category labels UIText STR#150/200-207/210 | **partly — still to mine** | CATS before CTSS, sort and sort-word eligibility are ported in `crates/sims-ui/src/buy.rs:690-790,1584-1630`. Missing: §3 items 1-3 |
+| `object_catalog/products.rs`, `products/labels.rs` | Buy membership; CATS before CTSS; name fallback; TTAB eligibility (0x457cb0); category labels UIText STR#150/200-207/210 | ported | Sort and sort-word eligibility in `crates/sims-ui/src/buy.rs:690-790,1584-1630`; §3 items 1-3 in `crates/sims-content/src/buy_catalog.rs` (`Catalog::buy_entries`, `CatalogText`, `BuyLabels`). `sims-ui` does not use them yet |
 | `object_catalog/thumbnail.rs` | 0x4ccaa0 composition (halve width over 45, centre with truncation) | ported | `crates/sims-ui/src/thumbnail.rs:193-200` |
 | `save_storage.rs` | Save-to-world order: SIMI/context before controllers; action serial raised by 0x41f1c5; NBRS defaults (0x430ad6); family word rebuilt from FAMI (0x425244); 0x43fe0a bit7; secondary append order (0x4228a9); room pass before function 7 (0x442659); calendar statistics order; TATT overlay (0x43a516) | ported | Sampled about 20 addresses, all present: `crates/sims-vm/src/load.rs`, `objects.rs:473-486`, `crates/sims-sim/src/neighbors.rs:71-73,281,376`, `crates/sims-sim/src/world.rs:1114-1128`, `crates/sims-vm/src/daily.rs:209-216` |
 | `house_loading.rs` | Post-load visit order (0x415eff F0, then 0x442659, 0x428041/0x428679, 0x43fc94 visits); person tail (0x5893a9, 0x459d23) | ported | `crates/sims-vm/src/visits.rs`, `load.rs`, `removal.rs`; `crates/sims-sim/src/load.rs`. Every address checked is cited |
@@ -465,20 +465,20 @@ Until these are ported, or written into `docs/`, the crate stays. The `legacy-fi
 
 Items 1-8 and 13 exist only in this crate (some also have a kernel in legacy `sims-sim`). Item 9's source is in legacy `sims-sim`; it is listed because a test here pins it.
 
-1. **Buy eligibility needs the actual TTAB (0x457cb0).**
+1. ~~**Buy eligibility needs the actual TTAB (0x457cb0).**~~ **Ported:** `BuyDefinition::eligibility`, `interaction_table`, `master_of` and `has_interactions` in `crates/sims-content/src/buy_catalog.rs`, checked against 0x4cd83b–0x4cd86b, 0x45726a, 0x43ae0a and 0x457cb0. Switching `sims-ui` over is left to its track.
    - Rule: an object with no master and no graphic is listed only if its TTAB loads and has at least one entry.
    - The TTAB is looked up in the object's own file, then in its semi-global. A loaded empty table hides the fallback, and Global.iff is never read.
    - A TTAB id of -1 means the master's.
    - Current code checks only `ttab <= 0`.
    - Source: `legacy/crates/sims-content/src/object_catalog/products.rs:85-116`, kernel in `legacy/crates/sims-sim/src/object_catalog/products.rs:48-55`. Test: `tests/object_resources.rs::buy_product_table_fallback_and_legacy_names_use_actual_resource_precedence`.
    - Destination: `crates/sims-ui/src/buy.rs:1586` `is_buy_catalog_eligible`.
-2. **Catalog name fallback (0x4061e3, then 0x457d3b).**
+2. ~~**Catalog name fallback (0x4061e3, then 0x457d3b).**~~ **Ported:** `CatalogText::read`. The disassembly corrects two of the rules below: a `CATS` holds the description *then* the name (0x40631f), and a `CTSS` is read in the game's language only, with no per-entry fallback to language 1 (0x470ca7 with 0, 0). The `*` is at 0x6c12fc.
    - Rule: an empty CATS/CTSS name becomes `'*'` plus the OBJD label.
    - CTSS entries use the requested language, falling back to language 1, and are C-string-truncated by 0x5d4cf9.
    - Current code: `buy.rs:712-716` uses the label without `*`, and `crates/sims-vm/src/primitives/dialog.rs:1549-1552` says this fallback is not ported.
    - Source: `products.rs:34-76`.
    - Destination: `sims-ui` buy and `sims-vm` `catalog_name`. Verify the `*` against the exe.
-3. **Buy category labels.**
+3. ~~**Buy category labels.**~~ **Ported:** `BuyLabels` (0x5057a2–0x5058cb, 0x506765). Each table falls back to US English only when it has no string in the game's language (0x46feac with 0, 1). Catalogs 2–6 hide root buttons 4–6 (`BuyLabels::shown`).
    - Source tables: UIText STR#150 (7×8 roots), STR#200-207 (functions) and STR#210 (special columns 4-7 read entries 4, 5, 2, 3).
    - Catalog 6 rows 2 and 3 remap to `roots[5][4]` and `roots[4][2]`.
    - Source: `legacy/crates/sims-content/src/object_catalog/products/labels.rs`.
