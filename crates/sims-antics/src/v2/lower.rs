@@ -7504,6 +7504,70 @@ impl<'a> TreeLowerer<'a> {
         ))
     }
 
+    /// Binds a builtin's arguments to its parameter names. Positional arguments fill
+    /// `positional` in order; a named argument must name one of `positional` or `named_only`.
+    /// Unknown names, a parameter given twice, too many positional arguments, and a
+    /// positional argument after a named one are errors.
+    fn bind_builtin_args<'e>(
+        &self,
+        prim: &str,
+        args: &'e [CallArg],
+        positional: &[&str],
+        named_only: &[&str],
+    ) -> Result<BTreeMap<String, &'e CallArg>> {
+        let mut out = BTreeMap::new();
+        let mut next = 0usize;
+        let mut saw_named = false;
+        for a in args {
+            let key = match &a.name {
+                Some(key) => {
+                    saw_named = true;
+                    if !positional.contains(&key.as_str()) && !named_only.contains(&key.as_str()) {
+                        return Err(Error::at(
+                            a.span,
+                            format!(
+                                "unknown {prim}() argument '{key}' (expected one of: {})",
+                                positional
+                                    .iter()
+                                    .chain(named_only)
+                                    .copied()
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        ));
+                    }
+                    key.clone()
+                }
+                None if saw_named => {
+                    return Err(Error::at(
+                        a.span,
+                        format!("positional argument cannot follow a named argument in {prim}()"),
+                    ));
+                }
+                None => {
+                    let Some(&key) = positional.get(next) else {
+                        return Err(Error::at(
+                            a.span,
+                            format!(
+                                "too many positional arguments to {prim}() (it takes at most {})",
+                                positional.len()
+                            ),
+                        ));
+                    };
+                    next += 1;
+                    key.to_owned()
+                }
+            };
+            if out.insert(key.clone(), a).is_some() {
+                return Err(Error::at(
+                    a.span,
+                    format!("duplicate {prim}() argument '{key}'"),
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     /// Collects `name: value` arguments, rejecting positional, unknown, and repeated keys.
     fn builtin_named_args<'e>(
         &self,
@@ -12172,7 +12236,8 @@ impl<'a> TreeLowerer<'a> {
     }
 
     fn format_stop_all_sounds(&self, args: &[CallArg], span: Span) -> Result<String> {
-        let use_stack = if let Some(arg) = args.first() {
+        let bound = self.bind_builtin_args("stop_all_sounds", args, &["target"], &[])?;
+        let use_stack = if let Some(arg) = bound.get("target") {
             match &arg.value {
                 V2Expr::Ident(_, n) if self.is_self_ident(n) => {
                     matches!(self.tree_ctx, TreeContext::SimOnObject { .. })
@@ -12198,33 +12263,20 @@ impl<'a> TreeLowerer<'a> {
         test_only: bool,
         income: bool,
     ) -> Result<String> {
-        if args.is_empty() {
+        let prim = match (test_only, income) {
+            (true, _) => "can_afford",
+            (false, true) => "credit_funds",
+            (false, false) => "debit_funds",
+        };
+        let bound = self.bind_builtin_args(prim, args, &["amount"], &["category"])?;
+        let Some(amount) = bound.get("amount") else {
             return Err(Error::at(span, "budget call requires an amount argument"));
-        }
-        let (amount_air, _) = self.lower_value_expr(&args[0].value)?;
-        let mut category = 0u8;
-        for arg in &args[1..] {
-            match arg.name.as_deref() {
-                Some("category") => {
-                    let c = self.eval_const_i16(&arg.value)?;
-                    category = u8::try_from(c).map_err(|_| {
-                        Error::at(arg.span, format!("budget category {c} out of u8 range"))
-                    })?;
-                }
-                Some(other) => {
-                    return Err(Error::at(
-                        arg.span,
-                        format!("unknown budget option '{other}'"),
-                    ));
-                }
-                None => {
-                    return Err(Error::at(
-                        arg.span,
-                        "extra budget arguments must be named (e.g. category: 5)",
-                    ));
-                }
-            }
-        }
+        };
+        let (amount_air, _) = self.lower_value_expr(&amount.value)?;
+        let category = match bound.get("category") {
+            Some(a) => self.eval_builtin_int(&a.value, &format!("{prim} category"), 0, 255)?,
+            None => 0,
+        };
         let mut out = format!("alter_budget({amount_air}, category: {category}");
         if test_only {
             out.push_str(", test_only: true");
@@ -12242,15 +12294,16 @@ impl<'a> TreeLowerer<'a> {
         args: &[CallArg],
         span: Span,
     ) -> Result<FindBestObjectPlan> {
-        if args.is_empty() {
+        let bound = self.bind_builtin_args("find_best_object", args, &["kind", "flags"], &[])?;
+        let Some(kind_arg) = bound.get("kind") else {
             return Err(Error::at(
                 span,
                 "find_best_object(kind [, flags: N]) requires a functional kind",
             ));
-        }
-        let V2Expr::Ident(kspan, kind_name) = &args[0].value else {
+        };
+        let V2Expr::Ident(kspan, kind_name) = &kind_arg.value else {
             return Err(Error::at(
-                args[0].span,
+                kind_arg.span,
                 "find_best_object() expects a functional kind identifier (e.g. prep, cook)",
             ));
         };
@@ -12291,24 +12344,13 @@ impl<'a> TreeLowerer<'a> {
                 "find_best_object::<T>() accepts at most 1 type argument",
             ));
         };
-        let mut flags_opt: Option<u8> = None;
-        for arg in &args[1..] {
-            if arg.name.as_deref() == Some("flags") || arg.name.is_none() {
-                let f = self.eval_const_i16(&arg.value)?;
-                flags_opt = Some(
-                    u8::try_from(f)
-                        .map_err(|_| Error::at(arg.span, format!("flags {f} out of u8 range")))?,
-                );
-            } else {
-                return Err(Error::at(
-                    arg.span,
-                    format!(
-                        "unknown find_best_object option '{}'",
-                        arg.name.as_deref().unwrap_or("")
-                    ),
-                ));
-            }
-        }
+        let flags_opt = match bound.get("flags") {
+            Some(a) => Some(
+                u8::try_from(self.eval_builtin_int(&a.value, "find_best_object flags", 0, 255)?)
+                    .expect("checked range"),
+            ),
+            None => None,
+        };
         let flags = flags_opt.unwrap_or(0);
         if typed_schema.is_some() && (flags & 0x0b) != 0 {
             return Err(Error::at(
@@ -12385,7 +12427,16 @@ impl<'a> TreeLowerer<'a> {
         let mut mode = "here".to_owned();
         let mut flags = 0u8;
         let mut local = None;
+        let mut seen = BTreeSet::new();
         for arg in opt_args {
+            if let Some(key) = &arg.name
+                && !seen.insert(key.as_str())
+            {
+                return Err(Error::at(
+                    arg.span,
+                    format!("duplicate create_object() argument '{key}'"),
+                ));
+            }
             match arg.name.as_deref() {
                 Some("local") => {
                     local = Some((
@@ -12452,44 +12503,106 @@ impl<'a> TreeLowerer<'a> {
         ))
     }
 
+    /// `route_to(slot [, flags] [, source: ...])` / `snap(slot [, flags] [, mode: ...])`.
+    /// Each operand is bound by name or position (`slot`, then `flags`); the routing source
+    /// and snap mode are named only.
     fn format_slot_prim(&self, prim: &str, args: &[CallArg], span: Span) -> Result<String> {
-        if args.is_empty() {
+        let (extra_key, extra_default) = if prim == "snap" {
+            ("mode", 3)
+        } else {
+            ("source", 1)
+        };
+        let bound = self.bind_builtin_args(prim, args, &["slot", "flags"], &[extra_key])?;
+        let Some(slot_arg) = bound.get("slot") else {
             return Err(Error::at(
                 span,
-                format!("{prim}(slot [, flags: N]) requires a slot"),
+                format!("{prim}(slot [, flags: N] [, {extra_key}: ...]) requires a slot"),
             ));
+        };
+        let slot_idx = self.resolve_slot_expr(&slot_arg.value)?;
+        let flags = match bound.get("flags") {
+            Some(a) => self.eval_builtin_int(&a.value, &format!("{prim} flags"), 0, 255)?,
+            None => 0,
+        };
+        let extra = match bound.get(extra_key) {
+            Some(a) => self.slot_prim_mode(prim, extra_key, a)?,
+            None => extra_default,
+        };
+        let mut out = format!("{prim}({slot_idx}");
+        if flags != 0 {
+            out.push_str(&format!(", flags: {flags}"));
         }
-        let slot_idx = self.resolve_slot_expr(&args[0].value)?;
-        let mut flags = 0u8;
-        if let Some(farg) = args.get(1) {
-            let f = self.eval_const_i16(&farg.value)?;
-            flags = u8::try_from(f)
-                .map_err(|_| Error::at(farg.span, format!("flags {f} out of u8 range")))?;
+        if extra != extra_default {
+            out.push_str(&format!(", {extra_key}: {extra}"));
         }
-        if flags == 0 {
-            Ok(format!("{prim}({slot_idx})"))
+        out.push(')');
+        Ok(out)
+    }
+
+    /// The routing source (`param`, `object`, `global`, or `0..=2`) or snap mode (`param`,
+    /// `object`, `front`, `slot`, `global`, or `0..=4`) of a slot primitive.
+    fn slot_prim_mode(&self, prim: &str, key: &str, arg: &CallArg) -> Result<i64> {
+        let names: &[(&str, i64)] = if key == "mode" {
+            &[
+                ("param", 0),
+                ("object", 1),
+                ("container", 1),
+                ("front", 2),
+                ("slot", 3),
+                ("global", 4),
+            ]
         } else {
-            Ok(format!("{prim}({slot_idx}, {flags})"))
+            &[("param", 0), ("object", 1), ("slot", 1), ("global", 2)]
+        };
+        if let V2Expr::Ident(ispan, name) = &arg.value
+            && self.lookup_var(name).is_none()
+            && self.const_item(name).is_none()
+        {
+            return names
+                .iter()
+                .find(|(n, _)| *n == name.as_str())
+                .map(|(_, v)| *v)
+                .ok_or_else(|| {
+                    Error::at(
+                        *ispan,
+                        format!(
+                            "unknown {prim} {key} '{name}' (expected {} or an integer)",
+                            names.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+                        ),
+                    )
+                });
         }
+        let hi = names.iter().map(|(_, v)| *v).max().unwrap_or(0);
+        self.eval_builtin_int(&arg.value, &format!("{prim} {key}"), 0, hi)
     }
 
     fn format_set_motive_change(&mut self, args: &[CallArg], span: Span) -> Result<String> {
-        if args.len() != 3 {
+        let bound = self.bind_builtin_args(
+            "set_motive_change",
+            args,
+            &["motive", "delta_per_hour", "stop_at"],
+            &[],
+        )?;
+        let (Some(motive), Some(delta), Some(stop_at)) = (
+            bound.get("motive"),
+            bound.get("delta_per_hour"),
+            bound.get("stop_at"),
+        ) else {
             return Err(Error::at(
                 span,
                 "set_motive_change(motive, delta_per_hour, stop_at) expects 3 arguments",
             ));
-        }
-        let m = self.resolve_motive_expr(&args[0].value)?;
-        let (delta, _) = self.lower_value_expr(&args[1].value)?;
-        let delta_arg = if self.is_pure_single_operand(&args[2].value) {
+        };
+        let m = self.resolve_motive_expr(&motive.value)?;
+        let (delta, _) = self.lower_value_expr(&delta.value)?;
+        let delta_arg = if self.is_pure_single_operand(&stop_at.value) {
             delta
         } else {
             let snap = self.fresh("mc_d");
             self.line(format!("let {snap} = {delta};"));
             snap
         };
-        let (stop, _) = self.lower_value_expr(&args[2].value)?;
+        let (stop, _) = self.lower_value_expr(&stop_at.value)?;
         Ok(format!("set_motive_change({m}, {delta_arg}, {stop})"))
     }
 
