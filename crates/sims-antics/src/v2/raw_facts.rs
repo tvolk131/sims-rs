@@ -63,7 +63,7 @@ pub(crate) fn raw_facts(code: &str, prelude: Option<&str>) -> RawFacts {
         Some(Item::Tree(t)) => {
             let mut facts = RawFacts::default();
             scan(&t.body, 0, &mut facts);
-            facts.formats_text |= !exact && opcode_by_name(code);
+            facts.formats_text |= !exact && opcode_by_name(prelude.unwrap_or(""), code);
             facts
         }
         _ => {
@@ -86,13 +86,25 @@ pub(crate) fn raw_facts(code: &str, prelude: Option<&str>) -> RawFacts {
     }
 }
 
-/// A raw opcode spelled by a name (`op K (..)`), or code that does not lex.
-fn opcode_by_name(code: &str) -> bool {
+/// A raw opcode spelled by a name that neither the prelude nor the block declares as a constant
+/// (`op K (..)`, which the shape-only parse reads as 0), or code that does not lex.
+fn opcode_by_name(prelude: &str, code: &str) -> bool {
     use crate::lexer::TokenKind as T;
-    crate::lexer::tokenize(code).map_or(true, |tokens| {
-        tokens.windows(2).any(|w| {
-            matches!(&w[0].kind, T::Ident(op) if op == "op") && matches!(w[1].kind, T::Ident(_))
+    let (Ok(declared), Ok(tokens)) = (
+        crate::lexer::tokenize(&format!("{prelude}\n{code}")),
+        crate::lexer::tokenize(code),
+    ) else {
+        return true;
+    };
+    let is_const = |name: &str| {
+        declared.windows(2).any(|w| {
+            matches!(&w[0].kind, T::Ident(kw) if kw == "const")
+                && matches!(&w[1].kind, T::Ident(n) if n == name)
         })
+    };
+    tokens.windows(2).any(|w| {
+        matches!(&w[0].kind, T::Ident(op) if op == "op")
+            && matches!(&w[1].kind, T::Ident(name) if !is_const(name))
     })
 }
 
@@ -207,5 +219,13 @@ mod tests {
             Some("const TextOp = 45;\n"),
         );
         assert!(!f.formats_text, "a declared opcode is read");
+        let f = raw_facts(
+            "op TextOp (45, 1, 0, 0, 1, 0, 0, 0); temp[0] := bcon[Missing:0];",
+            Some("const TextOp = 45;\n"),
+        );
+        assert!(
+            !f.formats_text,
+            "a declared opcode is read by the shape-only parse too"
+        );
     }
 }

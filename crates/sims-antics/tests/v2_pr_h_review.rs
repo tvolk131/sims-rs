@@ -1121,23 +1121,34 @@ fn air_constants_follow_each_operands_direction() {
 }
 
 /// A raw `.air` constant belongs to the raw block that declares it, and its declaration ends
-/// there: another raw block that names it or declares it again is an error, so each block is
-/// analysed on its own. Copies of one block (a helper inlined twice) are that block, a label or
-/// argument key named like a constant is no use of it, and a block that names no raw constant of
-/// another changes nothing.
+/// there: its name appearing in another raw block, in any role, is an error, so each block is
+/// analysed on its own. Copies of one block (a helper inlined twice) are that block, and a block
+/// that names no raw constant of another changes nothing. A word before `:` is a name too
+/// (`bcon[K:0]` reads a constant), and `const:` is a label, not a declaration.
 #[test]
 fn raw_constants_belong_to_one_block() {
-    const SHARED: &str = "a raw constant belongs to its own block";
+    const SHARED: &str = "a raw constant's name appears only in its own block";
+    expect_err(
+        "label_shared.antics",
+        &obj("    tree a { raw { const K = 2; temp[0] := K; } raw { K: temp[1] := 3; } }"),
+        SHARED,
+    );
+    expect_err(
+        "pad_shared.antics",
+        &obj("    tree a { raw { const K = 0; } raw { pad(K: 0xA0); } }"),
+        SHARED,
+    );
     assert_eq!(
-        nodes(&obj(r#"    const K = 1;
-    @id(4300) tree a {
-        raw { const K = 2; temp[0] := K; }
-        raw { K: temp[1] := 3; }
-    }"#)),
         nodes(&obj(
-            "    @id(4300) tree a { raw { temp[0] := 2; } raw { K: temp[1] := 3; } }"
+            "    const K = 0;\n    @id(4300) tree a { raw { temp[0] := bcon[K:0]; } }"
+        )),
+        nodes(&obj(
+            "    @id(4300) tree a { raw { temp[0] := bcon[0:0]; } }"
         )),
     );
+    nodes(&obj(
+        "    @id(4300) tree a { raw { const: temp[0] := 1; } }",
+    ));
     expect_err(
         "dotted_shared.antics",
         &obj(r#"    bcon 4097 "Tuning" { valid = 25 }

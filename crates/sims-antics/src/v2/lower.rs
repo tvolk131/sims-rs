@@ -3898,8 +3898,8 @@ enum HelperCell {
 /// it, the defer instance, and its (line, column) (see `TreeLowerer::seen_decls`).
 type DeclInstance = (Vec<(usize, usize)>, Option<usize>, (usize, usize));
 
-/// A raw block: its source line, column and code (see `TreeLowerer::own_raw_consts`).
-type RawBlockKey = (usize, usize, String);
+/// A raw block: its module, source line, column and code (see `TreeLowerer::own_raw_consts`).
+type RawBlockKey = (String, usize, usize, String);
 
 #[derive(Clone)]
 struct TreeLowerer<'a> {
@@ -3948,8 +3948,8 @@ struct TreeLowerer<'a> {
     raw_declared: BTreeSet<String>,
     raw_consts: BTreeMap<String, String>,
     /// The raw block that declares each raw `.air` constant, and the raw blocks that name each
-    /// word (see `own_raw_consts`). A block is its source position and code, so the copies of one
-    /// block (an inlined helper, a specialized region) are one block.
+    /// word (see `own_raw_consts`). A block is its module, source position and code, so the
+    /// copies of one block (an inlined helper, a specialized region) are one block.
     raw_const_owner: BTreeMap<String, RawBlockKey>,
     raw_names: BTreeMap<String, BTreeSet<RawBlockKey>>,
     /// A raw block of the tree formats text (see `raw_facts`), however it is spelled.
@@ -6414,10 +6414,12 @@ impl<'a> TreeLowerer<'a> {
     }
 
     /// A raw `.air` constant belongs to the raw block that declares it, and its declaration ends
-    /// in that block: no other raw block of the tree may name it or declare it again (a value
-    /// several blocks share is a v2 `const`). Each block is then analysed on its own, with the
-    /// constants it declares and the v2 constants it names, exactly as the `.air` compiler reads
-    /// it. Argument keys and labels (a word before `:`) and fields (after `.`) are not names.
+    /// in that block: its name (by full name, `K` or `T.e`) appears in no other raw block of the
+    /// tree, in any role, and is declared in no other (a value several blocks share is a v2
+    /// `const`). Each block is then analysed on its own, with the constants it declares and the
+    /// v2 constants it names, exactly as the `.air` compiler reads it. Only a field (a word after
+    /// `.`) is no name. The rule is lexical on purpose: a label, branch target or local named
+    /// like another block's constant is rejected too, which a rename fixes.
     fn own_raw_consts(
         &mut self,
         tokens: &[crate::lexer::Token],
@@ -6426,9 +6428,18 @@ impl<'a> TreeLowerer<'a> {
         span: Span,
     ) -> Result<()> {
         use crate::lexer::TokenKind;
-        let key: RawBlockKey = (span.line, span.column, code.to_owned());
+        let key: RawBlockKey = (
+            self.owner_module.clone(),
+            span.line,
+            span.column,
+            code.to_owned(),
+        );
         for (i, t) in tokens.iter().enumerate() {
             if matches!(&t.kind, TokenKind::Ident(kw) if kw == "const")
+                && matches!(
+                    tokens.get(i + 1).map(|t| &t.kind),
+                    Some(TokenKind::Ident(_))
+                )
                 && !tokens[i..].iter().any(|t| t.kind == TokenKind::Semicolon)
             {
                 return Err(Error::at(
@@ -6443,8 +6454,7 @@ impl<'a> TreeLowerer<'a> {
                 continue;
             };
             let kind = |k: usize| tokens.get(i + k).map(|t| &t.kind);
-            if (i > 0 && tokens[i - 1].kind == TokenKind::Dot) || kind(1) == Some(&TokenKind::Colon)
-            {
+            if i > 0 && tokens[i - 1].kind == TokenKind::Dot {
                 continue;
             }
             match (kind(1), kind(2)) {
@@ -6460,9 +6470,9 @@ impl<'a> TreeLowerer<'a> {
             Err(Error::at(
                 span,
                 format!(
-                    "'{name}' is a raw '.air' constant another raw block of this tree declares or \
-                     names; a raw constant belongs to its own block (share a value with a v2 \
-                     'const')"
+                    "'{name}' is a raw '.air' constant of one raw block of this tree and appears \
+                     in another; a raw constant's name appears only in its own block (share a \
+                     value with a v2 'const', or rename)"
                 ),
             ))
         };
@@ -6547,8 +6557,7 @@ impl<'a> TreeLowerer<'a> {
                 continue;
             }
             // An `.air` keyword (`temp`, `my`, ..) keeps its meaning: no constant can name it.
-            // Nor does a label or an argument key (a word before `:`).
-            if crate::parser::is_reserved_ident(word) || next(1) == Some(&TokenKind::Colon) {
+            if crate::parser::is_reserved_ident(word) {
                 continue;
             }
             if next(1) == Some(&TokenKind::Dot)
