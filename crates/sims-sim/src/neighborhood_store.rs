@@ -981,30 +981,23 @@ fn purge_removed_family_albums_in_txn(
     Ok(())
 }
 
-/// Forgets the FAMh, name and name byte kept for each family that is in
-/// one of `previous` and `next` but not the other: a removed family's are
-/// stale, and so are any left under the ID of a family new in `next`,
-/// which a family deleted earlier may have held. A new family's own FAMh
-/// (one moved in from a `.FAM` file) is stored after its commit
-/// ([`NeighborhoodStore::save_save_inputs`]).
+/// Forgets the FAMh, name and name byte kept for each family in
+/// `previous` that is not in `next`, so a family that later takes its ID
+/// gets none of them. Those of a family new in `next` stay: a caller may
+/// store a moved-in family's FAMh before committing the family
+/// ([`NeighborhoodStore::save_save_inputs`]), and the import keeps only
+/// the families it imports.
 fn forget_family_save_inputs_in_txn(
     txn: &redb::WriteTransaction,
     id: &str,
     previous: &StoredNeighborhood,
     next: &StoredNeighborhood,
 ) -> Result<()> {
-    let changed: Vec<u16> = previous
+    if previous
         .families
         .keys()
-        .filter(|family| !next.families.contains_key(family))
-        .chain(
-            next.families
-                .keys()
-                .filter(|family| !previous.families.contains_key(family)),
-        )
-        .copied()
-        .collect();
-    if changed.is_empty() {
+        .all(|family| next.families.contains_key(family))
+    {
         return Ok(());
     }
     let mut table = txn.open_table(NEIGHBORHOOD_SAVE_INPUTS).map_err(store)?;
@@ -1016,14 +1009,15 @@ fn forget_family_save_inputs_in_txn(
     else {
         return Ok(());
     };
-    for family in changed {
-        inputs.histories.remove(&family);
-        inputs.family_names.remove(&family);
-        inputs.uninitialized.family_names.remove(&family);
+    let kept = inputs.clone();
+    inputs.retain_families(|family| {
+        next.families.contains_key(&family) || !previous.families.contains_key(&family)
+    });
+    if inputs != kept {
+        table
+            .insert(id, inputs.encode().as_slice())
+            .map_err(store)?;
     }
-    table
-        .insert(id, inputs.encode().as_slice())
-        .map_err(store)?;
     Ok(())
 }
 
@@ -1595,18 +1589,9 @@ pub(crate) fn neighborhood_iff_path(directory: &Path) -> Option<PathBuf> {
 /// every family present in `families`. Missing or unreadable `FAMs` chunks are
 /// skipped non-fatally so synthetic or minimal neighborhood fixtures still
 /// import cleanly.
-fn read_family_surnames(
-    directory: &Path,
-    families: &BTreeMap<u16, Family>,
-) -> BTreeMap<u16, String> {
+fn read_family_surnames(file: &[u8], families: &BTreeMap<u16, Family>) -> BTreeMap<u16, String> {
     let mut surnames = BTreeMap::new();
-    let Some(path) = neighborhood_iff_path(directory) else {
-        return surnames;
-    };
-    let Ok(bytes) = std::fs::read(&path) else {
-        return surnames;
-    };
-    let Ok(iff) = Iff::parse(bytes) else {
+    let Ok(iff) = Iff::parse(file.to_vec()) else {
         return surnames;
     };
     for chunk in iff.all(b"FAMs") {
@@ -2028,7 +2013,9 @@ impl NeighborhoodStore {
         if id.is_empty() {
             return Err(Error::Store("neighborhood id must not be empty".into()));
         }
-        let neighborhood = Neighborhood::open(directory).map_err(store)?;
+        // One read of `Neighborhood.iff` gives the record, the save inputs
+        // and the surnames, so they come from the same file.
+        let (neighborhood, file) = Neighborhood::open_with_file(directory).map_err(store)?;
         let zoning = neighborhood.zoning(expansions).map_err(store)?;
         let lot_rows = neighborhood.lot_rows().map_err(store)?;
 
@@ -2050,11 +2037,13 @@ impl NeighborhoodStore {
             houses.insert(number, bytes);
         }
 
-        let save_inputs = SaveInputs::from_directory(directory)?.encode();
         let families = neighborhood.families;
+        let mut save_inputs = SaveInputs::from_file(&file)?;
+        save_inputs.retain_families(|family| families.contains_key(&family));
+        let save_inputs = save_inputs.encode();
         let mut stored = StoredNeighborhood {
             name: id.to_owned(),
-            family_surnames: read_family_surnames(directory, &families),
+            family_surnames: read_family_surnames(&file, &families),
             families,
             neighbors: neighborhood.neighbors,
             inventories: neighborhood.inventories,

@@ -38,7 +38,10 @@ of it, including those in sims-vm. A separate table changes neither, so
 `NEIGHBORHOOD_FORMAT` stays 6 and `SNAPSHOT_FORMAT` is untouched.
 
 - **Import** fills the table from the folder's `Neighborhood.iff`
-  (`SaveInputs::from_directory`). A file the save wrote gives every input
+  (`SaveInputs::from_file`). It reads the file once
+  (`Neighborhood::open_with_file`), so the record, the inputs and the
+  surnames come from the same file even if a save replaces it during the
+  import. Only the imported families' entries are kept. A file the save wrote gives every input
   (`from_saved`). Any other file, such as a shipped one at an older NGBH
   version, gives what reads: FAMh, one-entry FAMs names with their last
   byte, and the option bytes.
@@ -51,7 +54,9 @@ of it, including those in sims-vm. A separate table changes neither, so
   otherwise does 0x4107cf test the stored history (+0x144).
 - When a commit drops a family, its entries go too: its FAMh, its name
   and its name's stray byte. A family that later takes the same ID then
-  gets none of the old family's.
+  gets none of the old family's. A commit that adds a family leaves its
+  entries alone, so a caller may store a moved-in family's FAMh before
+  or after committing the family.
 
 ## Saving to a folder
 
@@ -72,7 +77,9 @@ same with the stored record and inputs. Both follow the end of 0x4252cc:
 The port renames `NTemp.iff` over `Neighborhood.iff` in one step. That
 leaves the same files, and the folder is never without a
 `Neighborhood.iff`. An existing file whose name differs only in case is
-replaced under its own name. A failed write or rename deletes
+replaced under its own name. A `NTemp.iff` left by an earlier save is
+deleted first and the new one is created exclusively, so a link under
+that name is never written through. A failed write or rename deletes
 `NTemp.iff`. `NeighborhoodStore::save_neighborhood_iff` reads the record
 and the inputs in one read transaction. Like the original's fixed
 `NTemp.iff`, the save assumes one writer per folder.

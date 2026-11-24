@@ -535,3 +535,49 @@ fn a_failed_save_leaves_no_temporary_file() {
     assert!(!out.0.join(TEMPORARY_FILE).exists());
     assert!(out.0.join("Neighborhood.iff").is_dir());
 }
+
+/// A moved-in family's FAMh may be stored before the family is committed:
+/// the commit that adds the family keeps it.
+#[test]
+fn a_history_stored_before_its_family_is_kept() {
+    let bytes = sample().neighborhood_iff(&SaveInputs::default()).unwrap();
+    let folder = TempDir::new("staged");
+    std::fs::write(folder.0.join("Neighborhood.iff"), &bytes).unwrap();
+    let db = TempDb::new("staged");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store.import_directory("Hood", &folder.0, 0xff).unwrap();
+
+    let mut inputs = store.load_save_inputs("Hood").unwrap();
+    inputs.histories.insert(7, vec![7; 5]);
+    store.save_save_inputs("Hood", &inputs).unwrap();
+    let mut state = store.load_neighborhood("Hood").unwrap().unwrap();
+    state.families.insert(7, family(0, 2, vec![0x1000_0007]));
+    store.save_neighborhood("Hood", &state).unwrap();
+    assert_eq!(
+        store.load_save_inputs("Hood").unwrap().histories[&7],
+        [7; 5]
+    );
+}
+
+/// A `NTemp.iff` left as a link to `Neighborhood.iff` is replaced, not
+/// written through.
+#[cfg(unix)]
+#[test]
+fn a_linked_temporary_file_is_not_written_through() {
+    let out = TempDir::new("linked");
+    let target = out.0.join("Neighborhood.iff");
+    std::fs::write(&target, b"old").unwrap();
+    let elsewhere = out.0.join("Other.iff");
+    std::fs::write(&elsewhere, b"other").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, out.0.join(TEMPORARY_FILE)).unwrap();
+    let inputs = SaveInputs::default();
+    let path = sample().save_neighborhood_iff(&out.0, &inputs).unwrap();
+    assert_eq!(path, target);
+    assert_eq!(std::fs::read(&elsewhere).unwrap(), b"other");
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        sample().neighborhood_iff(&inputs).unwrap()
+    );
+    assert!(!std::fs::symlink_metadata(&target).unwrap().is_symlink());
+    assert!(std::fs::symlink_metadata(out.0.join(TEMPORARY_FILE)).is_err());
+}

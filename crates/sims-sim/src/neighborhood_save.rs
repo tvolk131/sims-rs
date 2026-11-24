@@ -127,6 +127,15 @@ impl SaveInputs {
         Self::from_file(&bytes)
     }
 
+    /// Keeps the FAMh, name and name byte of the families `keep` accepts.
+    pub fn retain_families(&mut self, mut keep: impl FnMut(u16) -> bool) {
+        self.histories.retain(|&family, _| keep(family));
+        self.family_names.retain(|&family, _| keep(family));
+        self.uninitialized
+            .family_names
+            .retain(|&family, _| keep(family));
+    }
+
     /// [`SAVE_INPUTS_FORMAT`] (little-endian), then the inputs (postcard).
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -247,8 +256,10 @@ impl StoredNeighborhood {
     /// Otherwise it deletes `NTemp.iff` (0x4254bd). The port renames over
     /// the old file in one step, which leaves the same files and never
     /// leaves the folder without one; a `Neighborhood.iff` of another case
-    /// is replaced under its own name. If the write or the rename fails,
-    /// `NTemp.iff` is deleted.
+    /// is replaced under its own name. A `NTemp.iff` left by an earlier
+    /// save is deleted first and the file is created anew, so a link
+    /// under that name is never written through. If the write or the
+    /// rename fails, `NTemp.iff` is deleted.
     ///
     /// Like the original, one save at a time writes a folder: two at once
     /// share `NTemp.iff`.
@@ -257,7 +268,21 @@ impl StoredNeighborhood {
         let temporary = directory.join(TEMPORARY_FILE);
         let target =
             neighborhood_iff_path(directory).unwrap_or_else(|| directory.join("Neighborhood.iff"));
-        let saved = std::fs::write(&temporary, &bytes)
+        match std::fs::remove_file(&temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Error::Store(format!("{}: {error}", temporary.display())));
+            }
+        }
+        let saved = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .and_then(|mut file| {
+                std::io::Write::write_all(&mut file, &bytes)?;
+                file.sync_all()
+            })
             .map_err(|error| format!("{}: {error}", temporary.display()))
             .and_then(|()| {
                 std::fs::rename(&temporary, &target)
