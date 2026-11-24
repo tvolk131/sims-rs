@@ -870,3 +870,75 @@ fn redundant_bool_return_suggestions_prove_equivalent() {
     let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
     assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
 }
+
+#[test]
+fn an_empty_string_table_lifts_empty() {
+    let iff = compile(
+        r#"object "Fable Sign" {
+    guid: 0x7E00_00B3;
+    strings 431 "Empty" {}
+    @id(4300) tree label { action_label(table: 431, index: 1); }
+}"#,
+    );
+    let lifted = round_trip(&iff, &DecompileV2Options::default());
+    assert!(lifted.contains("strings 431 \"Empty\" {}"), "{lifted}");
+}
+
+#[test]
+fn picker_dialogs_read_no_strings() {
+    // A lot picker (kind 5) returns before formatting any text: an unliftable `STR#` 301
+    // does not make its tree inconclusive.
+    let source = r#"object "Fable Map" {
+    guid: 0x7E00_00B4;
+    strings 301 "Dialog prim string set" { ask = "Alpha" }
+    @id(4300) tree pick { dialog(kind: 5, message: 1)?; }
+}"#;
+    let mut table = vec![0xFD, 0xFF, 2, 0];
+    for (language, text) in [(1u8, "Alpha"), (2, "Alphe")] {
+        table.push(language);
+        table.extend_from_slice(text.as_bytes());
+        table.extend_from_slice(&[0, 0]);
+    }
+    // Not plain: a second, deleted chunk of the ID.
+    let iff = with_chunks(
+        &compile(source),
+        vec![ChunkData {
+            tag: *b"STR#",
+            id: 301,
+            flags: 0x10 | sims_formats::iff::DELETED,
+            label: "Dialog prim string set".to_owned(),
+            data: table,
+        }],
+    );
+    let (check, source) = check_of(&iff, 4300);
+    assert!(
+        matches!(check, TreeCheck::Identical | TreeCheck::Equivalent),
+        "{check:?}\n{source}"
+    );
+}
+
+#[test]
+fn a_lifecycle_tree_written_plain_says_so() {
+    // An empty tree as the object's main: no `main` block holds it.
+    let iff = compile(
+        r#"object "Fable Plinth" {
+    guid: 0x7E00_00B5;
+    @id(4300) @frame(empty) tree rest "Rest" {}
+}"#,
+    );
+    let objd = iff.chunks.iter().find(|c| &c.tag == b"OBJD").unwrap();
+    let mut data = iff.data(objd).to_vec();
+    // Word 3 (main), after the 4-byte header.
+    data[10..12].copy_from_slice(&4300u16.to_le_bytes());
+    let iff = with_data(&iff, (*b"OBJD", objd.id), data);
+    let report = decompile_iff_to_v2_report(&iff, &DecompileV2Options::default()).expect("lift");
+    let tree = report.trees.iter().find(|t| t.id == 4300).unwrap();
+    assert!(tree.standalone_lifecycle, "{:?}", report.trees);
+    assert!(
+        report.source.contains(
+            "// The object's main tree, written as a plain tree: the build gives the object its own `main` tree at a new ID."
+        ),
+        "{}",
+        report.source
+    );
+}

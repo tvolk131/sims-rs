@@ -1178,12 +1178,18 @@ struct RecompiledFile {
 type StringTexts = std::result::Result<Vec<Vec<u8>>, Vec<(u16, Vec<u8>)>>;
 
 /// The string table instruction `i` shows text from: Show String (21) and Set Action
-/// String (50) name one; a private Dialog (36) reads `STR#` 301 for its nonzero string
-/// operands (0 to 4, 6), and one that names none (a lot picker) reads no table.
+/// String (50) name one; a private Dialog (36) of an ordinary kind (0 to 4, operand 5's
+/// low 7 bits) reads `STR#` 301 for its nonzero string operands (0 to 4, 6). One that
+/// names none reads no table, and the other kinds (pickers and panels, `sims-vm`
+/// `primitives/dialog.rs`) return before any text is formatted.
 fn string_table_read(i: &sims_formats::behavior::Instruction) -> Option<u16> {
     match i.opcode {
         21 | 50 => Some(u16::from_le_bytes([i.operands[0], i.operands[1]])),
-        36 if [0, 1, 2, 3, 4, 6].iter().any(|&k| i.operands[k] != 0) => Some(301),
+        36 if i.operands[5] & 0x7f <= 4
+            && [0, 1, 2, 3, 4, 6].iter().any(|&k| i.operands[k] != 0) =>
+        {
+            Some(301)
+        }
         _ => None,
     }
 }
@@ -1219,10 +1225,8 @@ fn strings_models(iff: &Iff, trees: &[TreeModel]) -> (Vec<StringsModel>, Vec<(u1
             !t.chars()
                 .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
         };
-        if texts.is_empty() {
-            skipped.push((id, "it has no US English entries".to_owned()));
-            continue;
-        }
+        // A table with no entries at all is written empty (one with entries and none
+        // in US English is not plain).
         if !texts.iter().all(spellable) {
             skipped.push((
                 id,
@@ -2527,6 +2531,12 @@ impl Model {
                     out.line(format!("@id({}) {} {{", t.id, kind.keyword()));
                 }
                 None => {
+                    if let Some(kind) = t.lifecycle {
+                        out.line(format!(
+                            "// The object's {0} tree, written as a plain tree: the build gives the object its own `{0}` tree at a new ID.",
+                            kind.keyword()
+                        ));
+                    }
                     let b = &t.original;
                     let mut params = Vec::new();
                     if sim {
