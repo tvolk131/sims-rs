@@ -133,7 +133,7 @@ fn calling_a_cab_on_the_phone_goes_downtown_with_the_saved_state() {
                 panic!("the call stopped: {error}");
             }
         }
-        if let Some(request) = home.world().trip_request {
+        if let Some(request) = home.world().trip_request.clone() {
             asked = Some(request);
             break;
         }
@@ -147,6 +147,7 @@ fn calling_a_cab_on_the_phone_goes_downtown_with_the_saved_state() {
             leader_guid: mortimer_guid,
             family: 0,
             caller: mortimer,
+            saved: vec![home.world().neighbors.first_of(mortimer_guid).unwrap().id],
         }
     );
     // The plugin paid the fare itself, with Alter Budget.

@@ -601,7 +601,7 @@ pub struct World {
 /// passes GUID 0 and the family's id (the whole family travels). Routine 17
 /// then sets the game's byte +0x1c +0xe1, which the main loop reads to
 /// leave the house.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TripRequest {
     /// The house to load: a destination lot, or the home house on return.
     pub house: i16,
@@ -611,6 +611,11 @@ pub struct TripRequest {
     pub family: i16,
     /// The object id of the person that ran routine 17.
     pub caller: u16,
+    /// The neighbor ids whose inventories 0x45a22d wrote saved-state
+    /// tokens into, in the order written (not a field of the original's
+    /// request: the trip's return takes back only these). A request made
+    /// while one is pending adds its own to the pending one's.
+    pub saved: Vec<i16>,
 }
 
 /// The people whose indicators the interface will refresh when it next

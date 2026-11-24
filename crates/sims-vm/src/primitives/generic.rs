@@ -667,7 +667,18 @@ impl Machine<'_, '_> {
         let temp = |index: usize| me.temps.get(index).copied().unwrap_or(0);
         let (house, hour, minute, mode) = (temp(0), temp(1), temp(2), temp(3));
         if let Some(request) = self.request_trip(house, hour, minute, mode)? {
-            self.world.trip_request.get_or_insert(request);
+            match &mut self.world.trip_request {
+                // The pending request stands; the inventories this call
+                // wrote are the trip's to take back too.
+                Some(pending) => {
+                    for neighbor in request.saved {
+                        if !pending.saved.contains(&neighbor) {
+                            pending.saved.push(neighbor);
+                        }
+                    }
+                }
+                none => *none = Some(request),
+            }
         }
         Ok(())
     }

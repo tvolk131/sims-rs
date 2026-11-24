@@ -148,16 +148,22 @@ Generic Sims Call's table is at 0x45143a and its true branch at 0x44f7f0.
   - If the trip goes home before the marker makes the companion, the
     companion comes home as it left (its departure snapshot), and the
     leader's kind-1 token goes back with the trip, as an abort's does.
-  - A version 1 trip's departure wrote no kind-1 token. When the leader
-    holds none for the companion, the companion is made on arrival with
-    the mutual date links, as that build did.
+    Only a companion that never arrived (destination object 0) uses the
+    departure snapshot; a traveler removed after arriving keeps what its
+    record holds, as before.
+  - A version 1 trip's departure wrote no kind-1 token, and any token the
+    leader holds was its own. So a version 1 companion is made on arrival
+    with the mutual date links, as that build did, and the trip home
+    leaves the leader's token.
 - **The envelope moves to version 5** (`TRIP_TOKEN_ENVELOPE_VERSION`).
-  After the arrival family it records whether the departure left kind-2
-  tokens: the API Downtown departure and `depart_from_request` do, other
-  API departures do not. Only such a trip's return or abort takes kind-2
-  tokens out (the stand-in for the plugin tail, below), so a trip that
-  wrote none leaves the ones the travelers held. Versions 1 to 4 still
-  decode, and their departures wrote none.
+  After the arrival family it records the neighbor ids whose inventories
+  routine 17 saved (`TripRequest::saved`): the API Downtown departure and
+  `depart_from_request` save some, other API departures none, and a
+  companion not on the lot is never saved. The return or abort takes
+  kind-2 tokens out of those inventories only (the stand-in for the plugin
+  tail, below), so every other traveler keeps the ones it held. The same
+  list picks the travelers whose motives routine 21 restores. Versions 1
+  to 4 still decode, and their departures saved none.
 - **Routine 24 is a follow-up.** It needs the outfit editor's accessors
   and commit.
 

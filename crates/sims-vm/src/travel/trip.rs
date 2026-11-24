@@ -255,7 +255,6 @@ impl Machine<'_, '_> {
         let Some(leader_record) = self.world.neighbors.first_of(leader_guid).map(|n| n.id) else {
             return Ok(None);
         };
-        let leader_inventory = self.inventory_slot(leader_record);
         let family_id = self.trip_person_word(leader, PERSON_FAMILY)?;
 
         let (destination, companion_kind) = if house == -1 {
@@ -265,74 +264,69 @@ impl Machine<'_, '_> {
             (house, OUTBOUND_COMPANION_KIND)
         };
 
-        let mut companion = None;
-        let mut family = None;
-        match mode {
-            0 => {
-                let items = &self.world.neighbors.inventories[leader_inventory].items;
-                let place = token_place(items, companion_kind, 0);
-                if place != -1 {
-                    let guid = read_token(items, place).guid;
-                    if let Some(person) = self.portrait_person(guid)? {
-                        let person_guid = self.world.objects[&person].guid;
-                        let record = self
-                            .world
-                            .neighbors
-                            .first_of(person_guid)
-                            .map(|n| n.id)
-                            .ok_or_else(|| {
-                                Trap::Invalid(format!(
-                                    "the companion 0x{person_guid:08X} has no neighbor record \
-                                     (0x45a3c3 reads through a null record)"
-                                ))
-                            })?;
-                        companion = Some((person, self.inventory_slot(record)));
-                    }
-                }
-            }
-            // 0x45a3ef: a missing family is null, and 0x45a4fc then writes
-            // the leader alone.
-            1 => {
-                family = self
+        // Mode 1: the family's members on the lot and their records (0x45a3ef;
+        // a missing family is null, and 0x45a4fc then writes the leader
+        // alone). They are found before anything is added or written: the
+        // original reads through a missing record (0x45a662) and crashes, so
+        // a trap here must leave the world as it was.
+        let mut members = None;
+        if mode == 1
+            && let Some(family) = self
+                .world
+                .families
+                .iter()
+                .find(|f| f.id == i32::from(family_id))
+        {
+            let mut found = Vec::new();
+            for (index, &guid) in family.members.iter().enumerate() {
+                let Some(person) = self.first_person_of_type(guid) else {
+                    continue;
+                };
+                let record = self
                     .world
-                    .families
-                    .iter()
-                    .find(|f| f.id == i32::from(family_id))
-                    .map(|f| f.members.clone());
+                    .neighbors
+                    .first_of(guid)
+                    .map(|n| n.id)
+                    .ok_or_else(|| {
+                        Trap::Invalid(format!(
+                            "family member 0x{guid:08X} has no neighbor record \
+                             (0x45a662 reads through a null record)"
+                        ))
+                    })?;
+                found.push((index, person, record));
             }
-            _ => {}
+            members = Some(found);
         }
 
-        // The members on the lot and their records, found before anything is
-        // written: the original reads through a missing record (0x45a662)
-        // and crashes, so a trap here must leave the world as it was.
-        let members = match family {
-            Some(members) => {
-                let mut found = Vec::new();
-                for (index, &guid) in members.iter().enumerate() {
-                    let Some(person) = self.first_person_of_type(guid) else {
-                        continue;
-                    };
+        let leader_inventory = self.inventory_slot(leader_record);
+        let mut companion = None;
+        if mode == 0 {
+            let items = &self.world.neighbors.inventories[leader_inventory].items;
+            let place = token_place(items, companion_kind, 0);
+            if place != -1 {
+                let guid = read_token(items, place).guid;
+                if let Some(person) = self.portrait_person(guid)? {
+                    let person_guid = self.world.objects[&person].guid;
                     let record = self
                         .world
                         .neighbors
-                        .first_of(guid)
+                        .first_of(person_guid)
                         .map(|n| n.id)
                         .ok_or_else(|| {
                             Trap::Invalid(format!(
-                                "family member 0x{guid:08X} has no neighbor record \
-                                 (0x45a662 reads through a null record)"
+                                "the companion 0x{person_guid:08X} has no neighbor record \
+                                 (0x45a3c3 reads through a null record)"
                             ))
                         })?;
-                    found.push((index, person, record));
+                    companion = Some((person, self.inventory_slot(record)));
                 }
-                Some(found)
             }
-            None => None,
-        };
+        }
 
+        // The neighbor ids whose inventories get the saved state.
+        let mut saved = Vec::new();
         if let Some((person, inventory)) = companion {
-            self.write_saved_state(person, inventory)?;
+            saved.push(self.write_saved_state(person, inventory)?);
         }
         let clock_inventory = if let Some(members) = members {
             let mut first = leader_inventory;
@@ -342,11 +336,11 @@ impl Machine<'_, '_> {
                 if index == 0 {
                     first = inventory;
                 }
-                self.write_saved_state(person, inventory)?;
+                saved.push(self.write_saved_state(person, inventory)?);
             }
             first
         } else {
-            self.write_saved_state(leader, leader_inventory)?;
+            saved.push(self.write_saved_state(leader, leader_inventory)?);
             leader_inventory
         };
 
@@ -372,20 +366,23 @@ impl Machine<'_, '_> {
                 leader_guid,
                 family: 0,
                 caller: leader,
+                saved,
             }),
             1 => Some(TripRequest {
                 house: destination,
                 leader_guid: 0,
                 family: family_id,
                 caller: leader,
+                saved,
             }),
             _ => None,
         })
     }
 
     /// Erases every saved-state token of `inventory` (0x41f4e5(2)), then
-    /// writes `person`'s, in [`SAVED_STATE`]'s order (0x41f38d).
-    fn write_saved_state(&mut self, person: u16, inventory: usize) -> Result<(), Trap> {
+    /// writes `person`'s, in [`SAVED_STATE`]'s order (0x41f38d). Returns the
+    /// inventory's neighbor id.
+    fn write_saved_state(&mut self, person: u16, inventory: usize) -> Result<i16, Trap> {
         let data = self
             .world
             .objects
@@ -407,12 +404,12 @@ impl Machine<'_, '_> {
                 };
             *slot = (guid, count);
         }
-        let items = &mut self.world.neighbors.inventories[inventory].items;
-        items.retain(|i| i.kind != SAVED_STATE_KIND);
+        let inventory = &mut self.world.neighbors.inventories[inventory];
+        inventory.items.retain(|i| i.kind != SAVED_STATE_KIND);
         for (guid, count) in counts {
-            add_token(items, SAVED_STATE_KIND, guid, count);
+            add_token(&mut inventory.items, SAVED_STATE_KIND, guid, count);
         }
-        Ok(())
+        Ok(inventory.neighbor)
     }
 
     /// A person's data word.
@@ -764,6 +761,7 @@ mod live_tests {
                 leader_guid: mortimer_guid,
                 family: 0,
                 caller: mortimer,
+                saved: vec![goth.record(mortimer_guid)],
             })
         );
         let person = goth.lot.world.objects[&mortimer].person.clone().unwrap();
@@ -821,6 +819,7 @@ mod live_tests {
                 leader_guid: 0,
                 family,
                 caller: leader,
+                saved: goth.members.iter().map(|&g| goth.record(g)).collect(),
             })
         );
         // Each member on the lot was saved to its record (0x425a69).
@@ -857,8 +856,9 @@ mod live_tests {
             leader_guid: 0,
             family: 1,
             caller: 3,
+            saved: vec![-7],
         };
-        goth.lot.world.trip_request = Some(pending);
+        goth.lot.world.trip_request = Some(pending.clone());
         goth.lot.world.globals[0] = 9;
         goth.lot.world.globals[5] = 10;
         // 0x42b9e3 gives lot 0 zoning 1: leaving for 40..49 is absolute.
@@ -867,8 +867,11 @@ mod live_tests {
         assert_eq!(goth.call(mortimer, 17), Ok(true));
         assert_eq!(
             goth.lot.world.trip_request,
-            Some(pending),
-            "0x4fc713 ignores a request while one is pending"
+            Some(TripRequest {
+                saved: vec![-7, goth.record(mortimer_guid)],
+                ..pending
+            }),
+            "0x4fc713 ignores a request while one is pending; its tokens are the trip's"
         );
         let clock = |tokens: &[(u32, i16)]| -> Vec<(u32, i16)> {
             tokens
@@ -890,7 +893,10 @@ mod live_tests {
         goth.lot.world.globals[10] = 0x7f00;
         assert!(!goth.lot.program.zoning.contains_key(&0x7f00));
         assert_eq!(goth.call(mortimer, 17), Ok(true));
-        assert_eq!(goth.lot.world.trip_request.map(|r| r.house), Some(40));
+        assert_eq!(
+            goth.lot.world.trip_request.as_ref().map(|r| r.house),
+            Some(40)
+        );
         let tokens = saved(&goth.tokens(mortimer_guid));
         // The leader's saved state erased the old kind-2 tokens first
         // (0x41f4e5(2)), the clock with them.
@@ -920,6 +926,7 @@ mod live_tests {
                 leader_guid: 0,
                 family: 0x7ff0,
                 caller: leader,
+                saved: vec![goth.record(members[1])],
             })
         );
         for (index, &guid) in members.iter().enumerate() {
@@ -961,9 +968,14 @@ mod live_tests {
         goth.lot.world.globals[5] = 10;
         goth.set_temps(mortimer, &[-1, 0, 30, 0]);
         assert_eq!(goth.call(mortimer, 17), Ok(true));
-        let request = goth.lot.world.trip_request.unwrap();
+        let request = goth.lot.world.trip_request.clone().unwrap();
         assert_eq!(request.house, 5, "house -1 is the leader's family's house");
         assert_eq!(request.leader_guid, mortimer_guid);
+        assert_eq!(
+            request.saved,
+            [goth.record(companion_guid), goth.record(mortimer_guid)],
+            "the companion is saved first"
+        );
         assert!(
             saved(&goth.tokens(companion_guid))
                 .iter()
