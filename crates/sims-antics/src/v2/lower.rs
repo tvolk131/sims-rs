@@ -15,10 +15,10 @@ use crate::parser::{motive_by_name, person_field_by_name, skill_by_name};
 use crate::v2::ast::{
     AbiParam, AbiParamSlot, BconTableDecl, BitflagsDecl, CallArg, ConstIntExpr, EnumDecl,
     ExternBconDecl, ExternModDecl, FnDecl, ForEachIter, FunctionalDecl, GuardBody, GuardDecl,
-    InteractionDecl, MatchArm, MatchPattern, MetaField, MetaFieldKind, ObjectDecl, ObjectMember,
-    ParamType, ParamValue, ReturnAbi, SlotDecl, SoundDecl, SpriteDecl, StateDecl, StateInitValue,
-    StateType, StringsDecl, TemplateDecl, TileDecl, TreeMemberDecl, V2AssignOp, V2BinOp, V2Expr,
-    V2Stmt, V2Type, V2UnaryOp, object_type_ident,
+    InteractionDecl, MatchArm, MatchExprArm, MatchPattern, MetaField, MetaFieldKind, ObjectDecl,
+    ObjectMember, ParamType, ParamValue, ReturnAbi, SlotDecl, SoundDecl, SpriteDecl, StateDecl,
+    StateInitValue, StateType, StringsDecl, TemplateDecl, TileDecl, TreeMemberDecl, V2AssignOp,
+    V2BinOp, V2Expr, V2Stmt, V2Type, V2UnaryOp, VariantDecl, object_type_ident,
 };
 use crate::v2::loader::{ModuleScope, ResolvedModule};
 use crate::v2::parser::snake_case_ident;
@@ -38,6 +38,21 @@ pub struct ExpandedV2Object {
     pub manifest: ObjectManifest,
     /// Complete lowered `.air` (Antics IR) source text ready for `compile_air` / `sims-antics expand`.
     pub air_source: String,
+    /// Extra catalog variants (`variant "Name" { ... }`), each one more OBJD/OBJf/CTSS in the
+    /// same IFF sharing the object's resources. Empty for single-variant objects.
+    pub variants: Vec<VariantSpec>,
+}
+
+/// One extra catalog variant of an object: the primary OBJD with these words replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariantSpec {
+    pub name: String,
+    pub guid: u32,
+    pub price: u16,
+    pub description: String,
+    /// BHAV ids of the variant's init / main trees (the primary's when not overridden).
+    pub init_id: u16,
+    pub main_id: u16,
 }
 
 /// Lowers every concrete `object` in a [`ResolvedModule`] into `.air` + [`ObjectManifest`].
@@ -786,6 +801,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
     let mut local_consts: BTreeMap<String, i64> = BTreeMap::new();
     let mut bcon_decls: Vec<BconTableDecl> = Vec::new();
     let mut tree_members: Vec<OwnedTree> = Vec::new();
+    let mut variant_decls: Vec<VariantDecl> = Vec::new();
     // Every module that contributes members (templates + the object): helper-fn lookups from any
     // of their code must not be shadowed by an (inherited) tree ident.
     let mut member_modules: BTreeSet<String> = BTreeSet::new();
@@ -1138,6 +1154,12 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
                     } else {
                         bcon_decls.push(t.clone());
                     }
+                }
+                ObjectMember::Variant(v) => {
+                    if variant_decls.iter().any(|x| x.name == v.name) {
+                        return Err(Error::at(v.span, format!("duplicate variant '{}'", v.name)));
+                    }
+                    variant_decls.push(v.clone());
                 }
                 ObjectMember::Tree(t) => {
                     if !seen_trees_here.insert(t.ident.clone()) {
@@ -1861,6 +1883,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         if needs_self_save {
             ctx.line("let __self_obj = stack_obj;".to_owned());
         }
+        ctx.frame_args = func.decl.params.len();
         for (pidx, fp) in func.decl.params.iter().enumerate() {
             ctx.bind_func_param(&fp.name, pidx, &fp.ty, fp.span)?;
         }
@@ -2227,13 +2250,83 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         string_tables: Vec::new(),
     };
 
+    let variants = resolve_variants(
+        &variant_decls,
+        &manifest,
+        &tree_ids,
+        !manifest.tiles.is_empty(),
+    )?;
+
     Ok(ExpandedV2Object {
         name: env.name,
         slug,
         guid,
         manifest,
         air_source: air,
+        variants,
     })
+}
+
+/// Resolves `variant` declarations against the primary manifest and the standalone tree ids.
+fn resolve_variants(
+    decls: &[VariantDecl],
+    manifest: &ObjectManifest,
+    tree_ids: &BTreeMap<String, u16>,
+    multi_tile: bool,
+) -> Result<Vec<VariantSpec>> {
+    let mut out: Vec<VariantSpec> = Vec::with_capacity(decls.len());
+    for d in decls {
+        if multi_tile {
+            return Err(Error::at(
+                d.span,
+                "'variant' is not supported on multi-tile objects (their tiles own the OBJD group)",
+            ));
+        }
+        let (gspan, guid) = d
+            .guid
+            .ok_or_else(|| Error::at(d.span, format!("variant '{}' needs a 'guid:'", d.name)))?;
+        if guid == manifest.guid || out.iter().any(|v| v.guid == guid) {
+            return Err(Error::at(
+                gspan,
+                format!("variant '{}' reuses GUID {guid:#010x}", d.name),
+            ));
+        }
+        let price = match d.price {
+            Some((pspan, p)) => u16::try_from(p).map_err(|_| {
+                Error::at(pspan, format!("variant price {p} out of range (0..=65535)"))
+            })?,
+            None => manifest.price,
+        };
+        let tree = |r: &Option<(Span, String)>, default: Option<&TreeRef>| -> Result<u16> {
+            match r {
+                Some((tspan, ident)) => tree_ids.get(ident).copied().ok_or_else(|| {
+                    Error::at(
+                        *tspan,
+                        format!("variant tree '{ident}' is not a standalone 'tree' of this object"),
+                    )
+                }),
+                None => match default {
+                    Some(TreeRef::Id(id)) => Ok(*id),
+                    _ => Err(Error::at(
+                        d.span,
+                        "variant needs the primary's init/main tree ids",
+                    )),
+                },
+            }
+        };
+        out.push(VariantSpec {
+            name: d.name.clone(),
+            guid,
+            price,
+            description: d
+                .description
+                .clone()
+                .unwrap_or_else(|| manifest.description.clone()),
+            init_id: tree(&d.init, manifest.init.as_ref())?,
+            main_id: tree(&d.main, manifest.main.as_ref())?,
+        });
+    }
+    Ok(out)
 }
 
 /// Built-in v2 call names a standalone `tree` identifier may not shadow.
@@ -2390,7 +2483,10 @@ const ANY_BITFLAGS: &str = "builtin::AnyFlags";
 fn is_prim_builtin_name(name: &str) -> bool {
     PRIM_BUILTINS.iter().any(|b| b.v2 == name)
         || OP_BUILTINS.iter().any(|(n, _)| *n == name)
-        || matches!(name, "animate" | "breakpoint" | "random_into")
+        || matches!(
+            name,
+            "animate" | "breakpoint" | "random_into" | "inc_lt" | "dec_gt" | "set_dynamic_sprite"
+        )
 }
 /// Allocates state attribute slots shared by object lowering and imported object schemas.
 ///
@@ -2597,6 +2693,15 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
         None => (TreeContext::ObjectSelf, false),
     };
     let mut ctx = TreeLowerer::new(env, tree_ctx, &t.owner_module, needs_self_save);
+    ctx.frame_args = d.frame.and_then(|f| f.args).map_or_else(
+        || {
+            sig.params
+                .iter()
+                .filter(|p| matches!(p.slot, AbiParamSlot::Positional))
+                .count()
+        },
+        usize::from,
+    );
     match &sig.ret {
         ResolvedReturnAbi::Value { ty, temp } | ResolvedReturnAbi::ResultValue { ty, temp } => {
             ctx.value_return = Some(ValueReturnAbi {
@@ -3113,6 +3218,11 @@ fn emit_guard_tree(
     if let Some(ref auto_name) = guard.autonomous_binding {
         ctx.bind_var(auto_name.clone(), Binding::AutonomousFlag);
     }
+    ctx.frame_args = if guard.autonomous_binding.is_some() {
+        1
+    } else {
+        func_params.len()
+    };
     for (pidx, fp) in func_params.iter().enumerate() {
         ctx.bind_func_param(&fp.name, pidx, &fp.ty, fp.span)?;
     }
@@ -3257,10 +3367,13 @@ enum LValue {
         attr_index: i16,
         ty: ValueType,
     },
-    /// Object data word on a foreign `ObjectId` local.
-    ForeignData {
+    /// Any other `stack.` cell of a foreign object or Sim (`stack.data[i]`, `stack.person[i]`,
+    /// `stack.slot[i]`, `scope(27, 0)`, ...). `setup` runs before `stack_obj` is switched (the
+    /// dynamic-sprite index into `temp[0]`); `obj_air == "stack_obj"` means no switch at all.
+    ForeignCell {
         obj_air: String,
-        data_index: i16,
+        cell: String,
+        setup: Option<String>,
         ty: ValueType,
     },
 }
@@ -3270,7 +3383,7 @@ impl LValue {
         match self {
             LValue::Direct { ty, .. }
             | LValue::ForeignAttr { ty, .. }
-            | LValue::ForeignData { ty, .. } => ty,
+            | LValue::ForeignCell { ty, .. } => ty,
         }
     }
 }
@@ -3377,6 +3490,8 @@ struct TreeLowerer<'a> {
     /// Nonzero while lowering code that is only checked and then discarded (a folded-away
     /// branch or loop body); `raw` blocks are syntax-checked there.
     checking_discarded: usize,
+    /// Arguments in this tree's call frame (`param[0..frame_args]` are addressable).
+    frame_args: usize,
 }
 
 impl<'a> TreeLowerer<'a> {
@@ -3410,6 +3525,7 @@ impl<'a> TreeLowerer<'a> {
             inline_expansions: 0,
             active_inline_fn: None,
             checking_discarded: 0,
+            frame_args: 0,
         }
     }
 
@@ -3427,11 +3543,18 @@ impl<'a> TreeLowerer<'a> {
     }
 
     fn finish(self) -> String {
-        if self.used_saved_stack_obj {
+        let mut out = if self.used_saved_stack_obj {
             format!("    let __saved_stack_obj = stack_obj;\n{}", self.out)
         } else {
             self.out
+        };
+        if out.contains(PIN_SLOT) {
+            // The pinned `push_interaction` slot sits one past every explicit `local[N]` the
+            // tree spells (raw blocks); `.air` allocates named locals after it.
+            let next = explicit_local_slots(&out).max().map_or(0, |m| m + 1);
+            out = out.replace(PIN_SLOT, &next.to_string());
         }
+        super::opt::optimize_tree_body(&out)
     }
 
     fn fresh(&mut self, prefix: &str) -> String {
@@ -4040,6 +4163,62 @@ impl<'a> TreeLowerer<'a> {
         name == "self"
     }
 
+    /// The `.air` operand holding an object-handle binding (`ObjectId`/typed locals, params, and
+    /// `Object` helper params), plus whether it may be a Sim (only untyped handles may).
+    fn object_handle_air(&self, name: &str) -> Option<(String, bool)> {
+        match self.lookup_var(name)? {
+            Binding::Local { air_name, ty } if ty.is_object_handle() => {
+                Some((air_name.clone(), *ty == ValueType::ObjectId))
+            }
+            Binding::BhavParam { index, ty } if ty.is_object_handle() => {
+                Some((format!("param[{index}]"), *ty == ValueType::ObjectId))
+            }
+            Binding::ForeignObject { air_name } => Some((air_name.clone(), true)),
+            _ => None,
+        }
+    }
+
+    /// The object or Sim cell behind `handle.<field>` that every handle shares: `hand`, `room`,
+    /// and (untyped handles only) the person words `age`, `priority`, `is_visitor`, and `kind`.
+    fn handle_field_cell(field: &str, maybe_sim: bool) -> Option<(&'static str, ValueType)> {
+        match field {
+            "hand" => Some(("stack.slot[0]", ValueType::ObjectId)),
+            "room" => Some(("stack.room", ValueType::I16)),
+            _ if !maybe_sim => None,
+            "age" => Some(("stack.person[58]", ValueType::I16)),
+            "priority" => Some(("stack.person.priority", ValueType::I16)),
+            "is_visitor" => Some(("stack.person[32]", ValueType::Bool)),
+            "kind" => Some(("stack.person[65]", ValueType::I16)),
+            _ => None,
+        }
+    }
+
+    /// `obj.sprite_flags[i]`: scope 27 reads the stack object's dynamic-sprite flag whose index
+    /// is in `temp[0]`. Returns the setup line and the cell.
+    fn sprite_flag_cell(&mut self, index: &V2Expr) -> Result<(String, String)> {
+        let idx_air = if let Ok(v) = self.eval_const_i16(index) {
+            v.to_string()
+        } else if self.is_pure_single_operand(index) {
+            let (air, ty) = self.lower_value_expr(index)?;
+            if ty != ValueType::I16 {
+                return Err(Error::at(
+                    index.span(),
+                    format!(
+                        "sprite_flags index must be i16 (found '{}')",
+                        self.env.display_value_type(&ty)
+                    ),
+                ));
+            }
+            air
+        } else {
+            return Err(Error::at(
+                index.span(),
+                "sprite_flags index must be a constant or a plain variable",
+            ));
+        };
+        Ok((format!("temp[0] := {idx_air};"), "scope(27, 0)".to_owned()))
+    }
+
     fn self_prefix(&self) -> &'static str {
         match self.tree_ctx {
             TreeContext::ObjectSelf => "my",
@@ -4247,7 +4426,17 @@ impl<'a> TreeLowerer<'a> {
                 init,
             } => {
                 let air_name = self.fresh(&format!("v_{name}"));
-                let inferred_ty = if is_compound_arith_or_neg(init) {
+                let inferred_ty = if let V2Expr::Match {
+                    span: mspan,
+                    scrutinee,
+                    arms,
+                } = init
+                {
+                    // The arms write the binding directly (`let x;` emits no node).
+                    self.line(format!("let {air_name};"));
+                    self.lower_match_expr(*mspan, scrutinee, arms, Some(&air_name))?
+                        .1
+                } else if is_compound_arith_or_neg(init) {
                     self.lower_arith_into_dest(init, &air_name, true)?
                 } else if let Some((val_air, inferred)) = self.try_lower_callable_value_raw(init)? {
                     self.line(format!("let {air_name} = {val_air};"));
@@ -5542,7 +5731,168 @@ impl<'a> TreeLowerer<'a> {
         scrutinee: &V2Expr,
         arms: &[MatchArm],
     ) -> Result<()> {
-        let (val_air, val_ty) = self.lower_value_expr(scrutinee)?;
+        let arms: Vec<(Span, &MatchPattern, ArmBody<'_>)> = arms
+            .iter()
+            .map(|a| (a.span, &a.pattern, ArmBody::Stmts(a.body.as_slice())))
+            .collect();
+        self.lower_match_core(span, scrutinee, &arms, None)
+    }
+
+    /// Expression `match` into `dest` (a declared local), or into a fresh local that is returned.
+    fn lower_match_expr(
+        &mut self,
+        span: Span,
+        scrutinee: &V2Expr,
+        arms: &[MatchExprArm],
+        dest: Option<&str>,
+    ) -> Result<(String, ValueType)> {
+        let dest = match dest {
+            Some(d) => d.to_owned(),
+            None => {
+                let d = self.fresh("mval");
+                self.line(format!("let {d};"));
+                d
+            }
+        };
+        let arms: Vec<(Span, &MatchPattern, ArmBody<'_>)> = arms
+            .iter()
+            .map(|a| (a.span, &a.pattern, ArmBody::Value(&a.value)))
+            .collect();
+        let mut result = MatchResult {
+            dest: dest.clone(),
+            ty: None,
+        };
+        self.lower_match_core(span, scrutinee, &arms, Some(&mut result))?;
+        let ty = result
+            .ty
+            .ok_or_else(|| Error::at(span, "'match' expression has no arms"))?;
+        Ok((dest, ty))
+    }
+
+    /// A compile-time scrutinee (literal, `const`, constant parameter, enum variant), if any.
+    fn const_match_scrutinee(&self, scrutinee: &V2Expr) -> Option<(i16, ValueType)> {
+        match scrutinee {
+            V2Expr::Path(_, segs) if segs.len() == 2 => {
+                let e = self
+                    .env
+                    .lookup_enum(&self.owner_module, &segs[0], self.in_object_scope)?;
+                let v = *e.variants.get(&segs[1])?;
+                Some((v, ValueType::Enum(e.canonical_key.clone())))
+            }
+            V2Expr::Ident(_, name) => match self.lookup_var(name) {
+                Some(Binding::ConstEnum { key, value }) => {
+                    Some((*value, ValueType::Enum(key.clone())))
+                }
+                Some(Binding::ConstI16 { value, .. }) => Some((*value, ValueType::I16)),
+                Some(_) => None,
+                None => self
+                    .eval_const_i16(scrutinee)
+                    .ok()
+                    .map(|v| (v, ValueType::I16)),
+            },
+            V2Expr::Int(..) | V2Expr::Unary { .. } => self
+                .eval_const_i16(scrutinee)
+                .ok()
+                .map(|v| (v, ValueType::I16)),
+            _ => None,
+        }
+    }
+
+    /// Lowers one arm body in its own block scope.
+    fn lower_match_arm(
+        &mut self,
+        body: ArmBody<'_>,
+        result: Option<&mut MatchResult>,
+    ) -> Result<()> {
+        match body {
+            ArmBody::Stmts(stmts) => {
+                self.push_scope(ScopeFrame::block());
+                let r = self.lower_stmts(stmts);
+                let p = if stmts_always_return(
+                    stmts,
+                    self.env,
+                    &self.owner_module,
+                    self.in_object_scope,
+                ) {
+                    self.pop_scope_discard_cleanups();
+                    Ok(())
+                } else {
+                    self.pop_scope_and_run_cleanups()
+                };
+                r.and(p)
+            }
+            ArmBody::Value(expr) => {
+                let result = result.expect("value arms always have a result");
+                let dest = result.dest.clone();
+                let is_bool_shape = matches!(
+                    expr,
+                    V2Expr::Binary {
+                        op: V2BinOp::And
+                            | V2BinOp::Or
+                            | V2BinOp::Eq
+                            | V2BinOp::Ne
+                            | V2BinOp::Lt
+                            | V2BinOp::Le
+                            | V2BinOp::Gt
+                            | V2BinOp::Ge
+                            | V2BinOp::FlagTest,
+                        ..
+                    } | V2Expr::Unary {
+                        op: V2UnaryOp::Not,
+                        ..
+                    }
+                );
+                let ty = if is_bool_shape {
+                    self.emit_bool_into_local(expr, &dest)?;
+                    ValueType::Bool
+                } else if is_compound_arith_or_neg(expr) {
+                    self.lower_arith_into_dest(expr, &dest, false)?
+                } else if let V2Expr::Match {
+                    span,
+                    scrutinee,
+                    arms,
+                } = expr
+                {
+                    self.lower_match_expr(*span, scrutinee, arms, Some(&dest))?
+                        .1
+                } else {
+                    let (air, ty) = self.lower_value_expr(expr)?;
+                    self.line(format!("{dest} := {air};"));
+                    ty
+                };
+                match &result.ty {
+                    None => result.ty = Some(ty),
+                    Some(first) => {
+                        if !types_compatible_for_assign(first, &ty) {
+                            return Err(Error::at(
+                                expr.span(),
+                                format!(
+                                    "'match' arms have different types: '{}' and '{}'",
+                                    self.env.display_value_type(first),
+                                    self.env.display_value_type(&ty)
+                                ),
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn lower_match_core(
+        &mut self,
+        span: Span,
+        scrutinee: &V2Expr,
+        arms: &[(Span, &MatchPattern, ArmBody<'_>)],
+        mut result: Option<&mut MatchResult>,
+    ) -> Result<()> {
+        let is_expr = result.is_some();
+        let folded = self.const_match_scrutinee(scrutinee);
+        let (val_air, val_ty) = match &folded {
+            Some((v, ty)) => (v.to_string(), ty.clone()),
+            None => self.lower_value_expr(scrutinee)?,
+        };
         if !matches!(val_ty, ValueType::I16 | ValueType::Enum(_)) {
             return Err(Error::at(
                 span,
@@ -5552,24 +5902,22 @@ impl<'a> TreeLowerer<'a> {
                 ),
             ));
         }
-        let scrut_local = self.fresh("match");
-        self.line(format!("let {scrut_local} = {val_air};"));
 
         // Arms as inclusive ranges (`lo == hi` for a single value).
-        let mut cases: Vec<(i16, i16, &[V2Stmt])> = Vec::new();
-        let mut wildcard: Option<&[V2Stmt]> = None;
+        let mut cases: Vec<(i16, i16, ArmBody<'_>)> = Vec::new();
+        let mut wildcard: Option<ArmBody<'_>> = None;
         let mut seen_vals = BTreeSet::new();
 
-        for arm in arms {
+        for &(arm_span, pattern, body) in arms {
             if wildcard.is_some() {
                 return Err(Error::at(
-                    arm.span,
+                    arm_span,
                     "unreachable match arm after '_' wildcard",
                 ));
             }
-            match &arm.pattern {
+            match pattern {
                 MatchPattern::Wildcard(_) => {
-                    wildcard = Some(arm.body.as_slice());
+                    wildcard = Some(body);
                 }
                 MatchPattern::Int(pspan, v) => {
                     if val_ty != ValueType::I16 {
@@ -5589,7 +5937,7 @@ impl<'a> TreeLowerer<'a> {
                             format!("duplicate match arm for value {v}"),
                         ));
                     }
-                    cases.push((*v, *v, arm.body.as_slice()));
+                    cases.push((*v, *v, body));
                 }
                 MatchPattern::Range(pspan, lo, hi) => {
                     if val_ty != ValueType::I16 {
@@ -5607,7 +5955,7 @@ impl<'a> TreeLowerer<'a> {
                             format!("range pattern {lo}..={hi} overlaps an earlier match arm"),
                         ));
                     }
-                    cases.push((*lo, *hi, arm.body.as_slice()));
+                    cases.push((*lo, *hi, body));
                 }
                 MatchPattern::Path(pspan, segs) => {
                     let ValueType::Enum(ref expected_key) = val_ty else {
@@ -5655,7 +6003,7 @@ impl<'a> TreeLowerer<'a> {
                             format!("duplicate match arm for '{}::{}'", e.display_name, segs[1]),
                         ));
                     }
-                    cases.push((v, v, arm.body.as_slice()));
+                    cases.push((v, v, body));
                 }
                 MatchPattern::Ident(pspan, name) => {
                     return Err(Error::at(
@@ -5669,7 +6017,7 @@ impl<'a> TreeLowerer<'a> {
         }
 
         // Enforce exhaustiveness for enum matches when no `_` fallback is provided.
-        let mut exhaustive_enum_without_wildcard = false;
+        let mut exhaustive_without_wildcard = false;
         if let ValueType::Enum(ref key) = val_ty
             && wildcard.is_none()
             && let Some(e) = self.env.all_enums.get(key)
@@ -5685,36 +6033,72 @@ impl<'a> TreeLowerer<'a> {
                     ));
                 }
             }
-            exhaustive_enum_without_wildcard = true;
+            exhaustive_without_wildcard = true;
+        }
+        if val_ty == ValueType::I16 && wildcard.is_none() {
+            let mut ranges: Vec<(i32, i32)> = cases
+                .iter()
+                .map(|&(lo, hi, _)| (i32::from(lo), i32::from(hi)))
+                .collect();
+            ranges.sort_unstable();
+            let mut next = i32::from(i16::MIN);
+            for (lo, hi) in ranges {
+                if lo > next {
+                    break;
+                }
+                next = next.max(hi + 1);
+            }
+            if next > i32::from(i16::MAX) {
+                exhaustive_without_wildcard = true;
+            } else if is_expr {
+                return Err(Error::at(
+                    span,
+                    format!(
+                        "non-exhaustive 'match' expression on 'i16': {next} is not covered (add a '_' arm)"
+                    ),
+                ));
+            }
+        }
+
+        // A constant scrutinee selects one arm; the others are only checked.
+        if let Some((v, _)) = folded {
+            let selected = cases.iter().position(|&(lo, hi, _)| (lo..=hi).contains(&v));
+            for (idx, &(_, _, body)) in cases.iter().enumerate() {
+                if Some(idx) == selected {
+                    self.lower_match_arm(body, result.as_deref_mut())?;
+                } else {
+                    self.check_match_arm(body, result.as_deref_mut())?;
+                }
+            }
+            if let Some(wc) = wildcard {
+                if selected.is_none() {
+                    self.lower_match_arm(wc, result.as_deref_mut())?;
+                } else {
+                    self.check_match_arm(wc, result.as_deref_mut())?;
+                }
+            }
+            return Ok(());
         }
 
         if let Some(wc) = wildcard
             && cases.is_empty()
         {
-            self.push_scope(ScopeFrame::block());
-            let r = self.lower_stmts(wc);
-            let p = if stmts_always_return(wc, self.env, &self.owner_module, self.in_object_scope) {
-                self.pop_scope_discard_cleanups();
-                Ok(())
-            } else {
-                self.pop_scope_and_run_cleanups()
-            };
-            return r.and(p);
+            return self.lower_match_arm(wc, result);
         }
 
-        if exhaustive_enum_without_wildcard && cases.len() == 1 {
-            let body = cases[0].2;
-            self.push_scope(ScopeFrame::block());
-            let r = self.lower_stmts(body);
-            let p = if stmts_always_return(body, self.env, &self.owner_module, self.in_object_scope)
-            {
-                self.pop_scope_discard_cleanups();
-                Ok(())
-            } else {
-                self.pop_scope_and_run_cleanups()
-            };
-            return r.and(p);
+        if exhaustive_without_wildcard && cases.len() == 1 {
+            return self.lower_match_arm(cases[0].2, result);
         }
+
+        // Every test runs before any arm body, and an operand read has no side effects, so a
+        // plain operand scrutinee is tested in place instead of copied.
+        let scrut_local = if self.is_pure_single_operand(scrutinee) {
+            val_air
+        } else {
+            let l = self.fresh("match");
+            self.line(format!("let {l} = {val_air};"));
+            l
+        };
 
         let last_idx = cases.len().saturating_sub(1);
         // A bounded range needs two compares: its test is computed into a flag inside the
@@ -5730,11 +6114,12 @@ impl<'a> TreeLowerer<'a> {
             } else {
                 None
             };
+            let is_last_exhaustive = exhaustive_without_wildcard && idx == last_idx && idx > 0;
             match single {
-                Some(cond) if idx == 0 => self.line(format!("if {cond} {{")),
-                Some(_) if exhaustive_enum_without_wildcard && idx == last_idx => {
+                _ if is_last_exhaustive => {
                     self.line("} else {".to_owned());
                 }
+                Some(cond) if idx == 0 => self.line(format!("if {cond} {{")),
                 Some(cond) => self.line(format!("}} else if {cond} {{")),
                 None => {
                     if idx > 0 {
@@ -5757,37 +6142,45 @@ impl<'a> TreeLowerer<'a> {
                 }
             }
             self.indent += 1;
-            self.push_scope(ScopeFrame::block());
-            let r = self.lower_stmts(body);
-            let p = if stmts_always_return(body, self.env, &self.owner_module, self.in_object_scope)
-            {
-                self.pop_scope_discard_cleanups();
-                Ok(())
-            } else {
-                self.pop_scope_and_run_cleanups()
-            };
+            let r = self.lower_match_arm(body, result.as_deref_mut());
             self.indent -= 1;
-            r.and(p)?;
+            r?;
         }
         if let Some(wc) = wildcard {
             self.line("} else {".to_owned());
             self.indent += 1;
-            self.push_scope(ScopeFrame::block());
-            let r = self.lower_stmts(wc);
-            let p = if stmts_always_return(wc, self.env, &self.owner_module, self.in_object_scope) {
-                self.pop_scope_discard_cleanups();
-                Ok(())
-            } else {
-                self.pop_scope_and_run_cleanups()
-            };
+            let r = self.lower_match_arm(wc, result);
             self.indent -= 1;
             self.line("}".to_owned());
             self.close_match_chain(extra_closes);
-            r.and(p)
+            r
         } else {
             self.line("}".to_owned());
             self.close_match_chain(extra_closes);
             Ok(())
+        }
+    }
+
+    /// Checks an arm that a constant scrutinee never selects (lowered, then discarded).
+    fn check_match_arm(
+        &mut self,
+        body: ArmBody<'_>,
+        result: Option<&mut MatchResult>,
+    ) -> Result<()> {
+        match body {
+            ArmBody::Stmts(stmts) => self.check_dead_branch(stmts),
+            ArmBody::Value(_) => {
+                let result = result.expect("value arms always have a result");
+                let mut scratch = MatchResult {
+                    dest: result.dest.clone(),
+                    ty: result.ty.clone(),
+                };
+                self.check_discarded(|c| c.lower_match_arm(body, Some(&mut scratch)))?;
+                if result.ty.is_none() {
+                    result.ty = scratch.ty;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -6288,8 +6681,16 @@ impl<'a> TreeLowerer<'a> {
                                     .inline_helper_call(&fn_mod, &fn_decl, is_local, args, *span)?;
                                 return Ok(());
                             }
+                            if fname == "set_dynamic_sprite" {
+                                return self.lower_set_dynamic_sprite(args, *span);
+                            }
                             if let Some(prim) = self.format_prim_builtin(fname, args, *span)? {
-                                self.line(format!("{prim};"));
+                                if matches!(fname.as_str(), "inc_lt" | "dec_gt") {
+                                    self.line(format!("if {prim} {{"));
+                                    self.line("}".to_owned());
+                                } else {
+                                    self.line(format!("{prim};"));
+                                }
                                 return Ok(());
                             }
                             return Err(Error::at(*span, format!("unknown function '{fname}'")));
@@ -6329,6 +6730,35 @@ impl<'a> TreeLowerer<'a> {
                         ));
                     }
                     self.emit_bitflag_mutate(receiver, args, *span, false)
+                }
+                // `x.push_interaction(menu: ...)`: `push_interaction(object: x, menu: ...)`.
+                "push_interaction" => {
+                    if !type_args.is_empty() {
+                        return Err(Error::at(
+                            *span,
+                            "'.push_interaction()' does not accept type arguments",
+                        ));
+                    }
+                    if let Some(a) = args
+                        .iter()
+                        .find(|a| a.name.is_none() || a.name.as_deref() == Some("object"))
+                    {
+                        return Err(Error::at(
+                            a.span,
+                            "'.push_interaction()' takes named arguments; the receiver is the object",
+                        ));
+                    }
+                    let mut full = vec![CallArg {
+                        span: receiver.span(),
+                        name: Some("object".to_owned()),
+                        value: (**receiver).clone(),
+                    }];
+                    full.extend(args.iter().cloned());
+                    let prim = self
+                        .format_prim_builtin("push_interaction", &full, *span)?
+                        .expect("push_interaction is a primitive builtin");
+                    self.line(format!("{prim};"));
+                    Ok(())
                 }
                 _ => Err(Error::at(*span, format!("unknown method '.{method}(...)'"))),
             },
@@ -6611,6 +7041,51 @@ impl<'a> TreeLowerer<'a> {
         Ok(())
     }
 
+    /// `set_dynamic_sprite(index: i, value: v)`: `self.sprite_flags[i] = v`.
+    fn lower_set_dynamic_sprite(&mut self, args: &[CallArg], span: Span) -> Result<()> {
+        let mut index = None;
+        let mut value = None;
+        for a in args {
+            match a.name.as_deref() {
+                Some("index") if index.is_none() => index = Some(&a.value),
+                Some("value") if value.is_none() => value = Some(&a.value),
+                _ => {
+                    return Err(Error::at(
+                        a.span,
+                        "set_dynamic_sprite takes exactly 'index:' and 'value:'",
+                    ));
+                }
+            }
+        }
+        let (Some(index), Some(value)) = (index, value) else {
+            return Err(Error::at(
+                span,
+                "set_dynamic_sprite takes exactly 'index:' and 'value:'",
+            ));
+        };
+        let target = V2Expr::Index {
+            span,
+            base: Box::new(V2Expr::Field {
+                span,
+                base: Box::new(V2Expr::Ident(span, "self".to_owned())),
+                field: "sprite_flags".to_owned(),
+            }),
+            index: Box::new(index.clone()),
+        };
+        let (rhs, rty) = self.lower_value_expr(value)?;
+        if !matches!(rty, ValueType::I16 | ValueType::Bool) {
+            return Err(Error::at(
+                value.span(),
+                format!(
+                    "set_dynamic_sprite value must be i16 or bool (found '{}')",
+                    self.env.display_value_type(&rty)
+                ),
+            ));
+        }
+        let lval = self.resolve_lvalue(&target)?;
+        self.emit_lvalue_assign(&lval, V2AssignOp::Set, &rhs)
+    }
+
     /// Formats a primitive builtin (`PRIM_BUILTINS`, `OP_BUILTINS`, `animate`, `breakpoint`,
     /// `random_into`) as `.air` primitive text usable as a statement or a condition. Returns
     /// `None` for other names. Callers resolve user callables and helpers first.
@@ -6624,10 +7099,65 @@ impl<'a> TreeLowerer<'a> {
             if !args.is_empty() {
                 return Err(Error::at(span, format!("{fname}() takes no arguments")));
             }
+            // The VM ignores Notify Stack Object out of Idle's operand; the original fills it
+            // with 0xFF, and a faulting primitive's operand bytes are observable.
+            if opcode == 0x0031 {
+                return Ok(Some("notify_idle() pad 0xff".to_owned()));
+            }
             return Ok(Some(format!("op {opcode:#06x} (0, 0, 0, 0, 0, 0, 0, 0)")));
         }
         match fname {
             "animate" => return Ok(Some(self.format_animate(args)?.0)),
+            // `inc_lt(&mut x, n)` / `dec_gt(&mut x, n)`: the VM's increment-and-compare
+            // operators (`x = x ± 1` wrapping at i16, then compare with `n` as read before the
+            // store). A condition; as a statement it is an empty `if`.
+            "inc_lt" | "dec_gt" => {
+                let [place, bound] = args else {
+                    return Err(Error::at(
+                        span,
+                        format!("{fname}(&mut x, n) expects 2 positional arguments"),
+                    ));
+                };
+                if place.name.is_some() || bound.name.is_some() {
+                    return Err(Error::at(
+                        span,
+                        format!("{fname}(&mut x, n) expects 2 positional arguments"),
+                    ));
+                }
+                let V2Expr::MutRef { inner, .. } = &place.value else {
+                    return Err(Error::at(
+                        place.span,
+                        format!("{fname}() steps its first argument in place; pass it as '&mut x'"),
+                    ));
+                };
+                self.reject_read_only_sim_slot(inner)?;
+                let lval = self.resolve_lvalue(inner)?;
+                let LValue::Direct { air, ty } = lval else {
+                    return Err(Error::at(
+                        place.span,
+                        format!(
+                            "{fname}(&mut x, n): 'x' must be a local, field, or other direct i16 slot of this object"
+                        ),
+                    ));
+                };
+                if ty != ValueType::I16 {
+                    return Err(Error::at(
+                        place.span,
+                        format!(
+                            "{fname}(&mut x, n): 'x' must be an i16, found '{}'",
+                            self.env.display_value_type(&ty)
+                        ),
+                    ));
+                }
+                let (n, n_ty) = self.lower_value_expr(&bound.value)?;
+                if n_ty != ValueType::I16 {
+                    return Err(Error::at(
+                        bound.span,
+                        format!("{fname}(&mut x, n): 'n' must be an i16"),
+                    ));
+                }
+                return Ok(Some(format!("{air} {fname} {n}")));
+            }
             "breakpoint" => {
                 return match args {
                     [] => Ok(Some("breakpoint()".to_owned())),
@@ -6694,6 +7224,40 @@ impl<'a> TreeLowerer<'a> {
         };
         let allowed: Vec<&str> = spec.keys.iter().map(|(k, _, _)| *k).collect();
         let named = self.builtin_named_args(fname, args, &allowed)?;
+        // `push_interaction(object: <handle>)`: the VM reads the object from a local slot
+        // (flag 0x02), so the handle is copied into the tree's pinned slot first.
+        let pinned_object = match named.get("object") {
+            Some(a)
+                if fname == "push_interaction"
+                    && self
+                        .eval_builtin_int(&a.value, "push_interaction object", 0, 255)
+                        .is_err() =>
+            {
+                let (obj, ty) = self.lower_value_expr(&a.value)?;
+                if !ty.is_object_handle() {
+                    return Err(Error::at(
+                        a.span,
+                        format!(
+                            "push_interaction object: expects an object handle or a constant parameter index, found '{}'",
+                            self.env.display_value_type(&ty)
+                        ),
+                    ));
+                }
+                if let Some(f) = named.get("flags") {
+                    let flags =
+                        self.eval_builtin_int(&f.value, "push_interaction flags", 0, 255)?;
+                    if flags & 0x02 != 0 {
+                        return Err(Error::at(
+                            f.span,
+                            "push_interaction flags 0x02 is implied by an object handle; leave it out",
+                        ));
+                    }
+                }
+                self.line(format!("local[{PIN_SLOT}] := {obj};"));
+                true
+            }
+            _ => false,
+        };
         // Flag bits that make the VM read an operand as a local slot index. `icon:` names its
         // local by variable and sets its bit; operand forms v2 cannot spell by name are rejected.
         let (local_bits, implied_bits): (&[(i64, &str)], i64) = match fname {
@@ -6708,7 +7272,8 @@ impl<'a> TreeLowerer<'a> {
                         "reads the object from a local slot, which v2 cannot name; 'object:' is a parameter index",
                     ),
                 ],
-                if named.contains_key("icon") { 0x01 } else { 0 },
+                (if named.contains_key("icon") { 0x01 } else { 0 })
+                    | (if pinned_object { 0x02 } else { 0 }),
             ),
             "special_effect" => (
                 &[(
@@ -6736,6 +7301,10 @@ impl<'a> TreeLowerer<'a> {
                 continue;
             };
             let what = format!("{fname} {key}");
+            if key == "object" && pinned_object {
+                parts.push(format!("{air_key}: {PIN_SLOT}"));
+                continue;
+            }
             let text = match kind {
                 PrimArg::Int(lo, hi) if key == "flags" && implied_bits != 0 => {
                     (self.eval_builtin_int(&a.value, &what, lo, hi)? | implied_bits).to_string()
@@ -6854,13 +7423,31 @@ impl<'a> TreeLowerer<'a> {
                 "run_functional(kind [, args...]) requires a functional kind",
             ));
         }
-        let V2Expr::Ident(kspan, kind_name) = &args[0].value else {
-            return Err(Error::at(
-                args[0].span,
-                "first argument to run_functional() must be a functional kind identifier (e.g. prep, cook)",
-            ));
+        // A kind name (`prep`, `cook`, ...) or a raw function-table index (`run_functional(4)`),
+        // which is always untyped.
+        let (kspan, kind_name, numeric) = match &args[0].value {
+            V2Expr::Ident(kspan, kind_name) if args[0].name.is_none() => {
+                let _ = functional_kind_info(kind_name, *kspan)?;
+                (*kspan, kind_name.clone(), false)
+            }
+            V2Expr::Int(kspan, v) if args[0].name.is_none() => {
+                if !(0..=255).contains(v) {
+                    return Err(Error::at(
+                        *kspan,
+                        format!("run_functional() function index {v} is outside 0..=255"),
+                    ));
+                }
+                (*kspan, v.to_string(), true)
+            }
+            _ => {
+                return Err(Error::at(
+                    args[0].span,
+                    "first argument to run_functional() must be a functional kind identifier (e.g. prep, cook) or a function index (0..=255)",
+                ));
+            }
         };
-        let _ = functional_kind_info(kind_name, *kspan)?;
+        let kind_name = &kind_name;
+        let kspan = &kspan;
         let (target_air, target_ty) = self.lower_value_expr(receiver)?;
         if !matches!(
             target_ty,
@@ -6874,7 +7461,9 @@ impl<'a> TreeLowerer<'a> {
                 ),
             ));
         }
-        let sig_opt = if let ValueType::ObjectRef(ref schema_key) = target_ty {
+        let sig_opt = if numeric {
+            None
+        } else if let ValueType::ObjectRef(ref schema_key) = target_ty {
             let schema = self
                 .env
                 .object_schemas
@@ -6893,10 +7482,21 @@ impl<'a> TreeLowerer<'a> {
         } else {
             None
         };
-        let staged_target = self.fresh("rf_obj");
-        self.line(format!("let {staged_target} = {target_air};"));
+        // Operands that later argument code cannot change (literals, BCON entries, `my.id`)
+        // are used in place; anything else is staged when argument code follows it.
+        let is_fixed =
+            |air: &str| air.parse::<i16>().is_ok() || air.starts_with("bcon.") || air == "my.id";
+        let positional = args[1..].iter().filter(|a| a.name.is_none()).count();
+        let staged_target = if positional == 0 || is_fixed(&target_air) {
+            target_air
+        } else {
+            let staged = self.fresh("rf_obj");
+            self.line(format!("let {staged} = {target_air};"));
+            staged
+        };
         let mut change_icon = false;
         let mut staged_args: Vec<(String, ValueType, Span)> = Vec::new();
+        let mut seen_positional = 0usize;
         for arg in &args[1..] {
             if let Some(aname) = &arg.name {
                 if aname == "change_icon" {
@@ -6908,9 +7508,18 @@ impl<'a> TreeLowerer<'a> {
                     ));
                 }
             } else {
+                seen_positional += 1;
                 let (val, val_ty) = self.lower_value_expr(&arg.value)?;
-                let staged = self.fresh("rf_arg");
-                self.line(format!("let {staged} = {val};"));
+                // The last argument is followed only by the temp copies, so it stays in place
+                // unless it reads a temp those copies overwrite.
+                let last = seen_positional == positional;
+                let staged = if is_fixed(&val) || (last && !val.starts_with("temp[")) {
+                    val
+                } else {
+                    let staged = self.fresh("rf_arg");
+                    self.line(format!("let {staged} = {val};"));
+                    staged
+                };
                 staged_args.push((staged, val_ty, arg.span));
             }
         }
@@ -6950,7 +7559,9 @@ impl<'a> TreeLowerer<'a> {
         for (i, (val, _, _)) in staged_args.iter().enumerate() {
             self.line(format!("temp[{i}] := {val};"));
         }
-        self.line(format!("stack_obj := {staged_target};"));
+        if staged_target != "stack_obj" {
+            self.line(format!("stack_obj := {staged_target};"));
+        }
         let prim = if change_icon {
             format!("run_functional_tree({kind_name}, change_icon: true)")
         } else {
@@ -7079,6 +7690,7 @@ impl<'a> TreeLowerer<'a> {
         Ok(final_ty)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn bind_helper_arg(
         &mut self,
         fn_mod: &str,
@@ -7087,7 +7699,34 @@ impl<'a> TreeLowerer<'a> {
         param: &crate::v2::ast::FnParam,
         arg_expr: &V2Expr,
         arg_span: Span,
+        call_args: &[&V2Expr],
     ) -> Result<Binding> {
+        // A caller local passed by value needs no `__arg_*` copy when nothing can change it
+        // while the helper runs: the helper never mutates or borrows the parameter, and no
+        // argument of this call borrows the local (`&mut x`, or a local-writing builtin).
+        let elide_local = match arg_expr {
+            V2Expr::Ident(_, n)
+                if !matches!(param.ty, V2Type::MutRef(_))
+                    && !stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name)
+                    && !call_args
+                        .iter()
+                        .any(|a| expr_borrows_ident_in(a, n, LOCAL_WRITING_BUILTINS)) =>
+            {
+                match self.lookup_var(n) {
+                    Some(Binding::Local { air_name, .. }) => Some(air_name.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let arg_local = |c: &mut Self, air: String| -> String {
+            if elide_local.as_deref() == Some(air.as_str()) {
+                return air;
+            }
+            let loc = c.fresh(&format!("arg_{}", param.name));
+            c.line(format!("let {loc} = {air};"));
+            loc
+        };
         let binding = match &param.ty {
             V2Type::I16 => {
                 if !stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name)
@@ -7110,8 +7749,7 @@ impl<'a> TreeLowerer<'a> {
                             ),
                         ));
                     }
-                    let loc = self.fresh(&format!("arg_{}", param.name));
-                    self.line(format!("let {loc} = {air};"));
+                    let loc = arg_local(self, air);
                     Binding::Local {
                         air_name: loc,
                         ty: ValueType::I16,
@@ -7131,8 +7769,7 @@ impl<'a> TreeLowerer<'a> {
                             format!("parameter '{}' expects bool", param.name),
                         ));
                     }
-                    let loc = self.fresh(&format!("arg_{}", param.name));
-                    self.line(format!("let {loc} = {air};"));
+                    let loc = arg_local(self, air);
                     Binding::Local {
                         air_name: loc,
                         ty: ValueType::Bool,
@@ -7152,8 +7789,7 @@ impl<'a> TreeLowerer<'a> {
                         ),
                     ));
                 }
-                let loc = self.fresh(&format!("arg_{}", param.name));
-                self.line(format!("let {loc} = {air};"));
+                let loc = arg_local(self, air);
                 Binding::Local {
                     air_name: loc,
                     ty: ValueType::ObjectId,
@@ -7195,8 +7831,7 @@ impl<'a> TreeLowerer<'a> {
                         ),
                     ));
                 }
-                let loc = self.fresh(&format!("arg_{}", param.name));
-                self.line(format!("let {loc} = {air};"));
+                let loc = arg_local(self, air);
                 Binding::Local {
                     air_name: loc,
                     ty: expected,
@@ -7248,7 +7883,7 @@ impl<'a> TreeLowerer<'a> {
                 }
                 // Snapshot foreign object handle so later reassignment of caller local cannot alias.
                 match &mut lval {
-                    LValue::ForeignAttr { obj_air, .. } | LValue::ForeignData { obj_air, .. } => {
+                    LValue::ForeignAttr { obj_air, .. } | LValue::ForeignCell { obj_air, .. } => {
                         let snap = self.fresh(&format!("ref_obj_{}", param.name));
                         self.line(format!("let {snap} = {obj_air};"));
                         *obj_air = snap;
@@ -7456,10 +8091,18 @@ impl<'a> TreeLowerer<'a> {
         // Evaluate caller-supplied arguments in call-site order BEFORE registering `fqn` on
         // `inline_call_stack` (so finite explicit nesting like `f(f(1))` succeeds).
         let mut bound_params: BTreeMap<String, Binding> = BTreeMap::new();
+        let arg_values: Vec<&V2Expr> = args.iter().map(|a| &a.value).collect();
         for (param_idx, arg) in call_order {
             let param = &fn_decl.params[param_idx];
-            let binding =
-                self.bind_helper_arg(fn_mod, is_local_fn, fn_decl, param, &arg.value, arg.span)?;
+            let binding = self.bind_helper_arg(
+                fn_mod,
+                is_local_fn,
+                fn_decl,
+                param,
+                &arg.value,
+                arg.span,
+                &arg_values,
+            )?;
             bound_params.insert(param.name.clone(), binding);
         }
 
@@ -7487,6 +8130,7 @@ impl<'a> TreeLowerer<'a> {
                             param,
                             def_expr,
                             param.span,
+                            &[],
                         )?;
                         bound_params.insert(param.name.clone(), binding);
                     }
@@ -7669,14 +8313,16 @@ impl<'a> TreeLowerer<'a> {
         }))
     }
 
-    /// A Sim's slots (`sim.hand`, `sim.slot[i]`) can be read but not written: the VM's slot
-    /// scope has no write path.
+    /// Slots (`x.hand`, `x.slot[i]`) and rooms (`x.room`) of Sims, `self`, and object handles
+    /// can be read but not written: the VM's slot and room scopes have no write path.
     fn reject_read_only_sim_slot(&self, target: &V2Expr) -> Result<()> {
         let (span, name, what) = match target {
-            V2Expr::Field { span, base, field } if field == "hand" => match base.as_ref() {
-                V2Expr::Ident(_, n) => (*span, n, "hand"),
-                _ => return Ok(()),
-            },
+            V2Expr::Field { span, base, field } if field == "hand" || field == "room" => {
+                match base.as_ref() {
+                    V2Expr::Ident(_, n) => (*span, n, field.as_str()),
+                    _ => return Ok(()),
+                }
+            }
             V2Expr::Index { span, base, .. } => match base.as_ref() {
                 V2Expr::Field { base, field, .. } if field == "slot" => match base.as_ref() {
                     V2Expr::Ident(_, n) => (*span, n, "slot[i]"),
@@ -7686,10 +8332,13 @@ impl<'a> TreeLowerer<'a> {
             },
             _ => return Ok(()),
         };
-        if self.is_sim_ident(name) {
+        if self.is_sim_ident(name)
+            || self.is_self_ident(name)
+            || self.object_handle_air(name).is_some()
+        {
             return Err(Error::at(
                 span,
-                format!("'{name}.{what}' is read-only (a Sim's slots cannot be written)"),
+                format!("'{name}.{what}' is read-only (slots and rooms cannot be written)"),
             ));
         }
         Ok(())
@@ -7797,6 +8446,42 @@ impl<'a> TreeLowerer<'a> {
                             ),
                         ));
                     }
+                    if let Some((obj_air, maybe_sim)) = self.object_handle_air(rname) {
+                        if !maybe_sim {
+                            return Err(Error::at(
+                                *span,
+                                format!(
+                                    "'{rname}' is a typed object handle, not a Sim (cannot access '{rname}.{group}.{field}')"
+                                ),
+                            ));
+                        }
+                        let cell = match group.as_str() {
+                            "motive" => {
+                                let _ = motive_by_name(field).ok_or_else(|| {
+                                    Error::at(*span, format!("unknown motive '{field}'"))
+                                })?;
+                                format!("stack.motive.{field}")
+                            }
+                            "skill" => {
+                                let _ = skill_by_name(field).ok_or_else(|| {
+                                    Error::at(*span, format!("unknown skill '{field}'"))
+                                })?;
+                                format!("stack.skill.{field}")
+                            }
+                            other => {
+                                return Err(Error::at(
+                                    *span,
+                                    format!("unknown Sim member '{rname}.{other}.{field}'"),
+                                ));
+                            }
+                        };
+                        return Ok(LValue::ForeignCell {
+                            obj_air,
+                            cell,
+                            setup: None,
+                            ty: ValueType::I16,
+                        });
+                    }
                 }
 
                 if let V2Expr::Ident(bspan, bname) = base.as_ref() {
@@ -7899,30 +8584,60 @@ impl<'a> TreeLowerer<'a> {
                                 });
                             }
                             return match field.as_str() {
-                                "graphic" => Ok(LValue::ForeignData {
+                                "graphic" => Ok(LValue::ForeignCell {
+                                    cell: "stack.data[0]".to_owned(),
+                                    setup: None,
                                     obj_air,
-                                    data_index: 0,
                                     ty: ValueType::I16,
                                 }),
-                                "allowed_heights" => Ok(LValue::ForeignData {
+                                "allowed_heights" => Ok(LValue::ForeignCell {
+                                    cell: "stack.data[4]".to_owned(),
+                                    setup: None,
                                     obj_air,
-                                    data_index: 4,
                                     ty: ValueType::Bitflags("builtin::Height".to_owned()),
                                 }),
-                                "placement" => Ok(LValue::ForeignData {
+                                "placement" => Ok(LValue::ForeignCell {
+                                    cell: "stack.data[42]".to_owned(),
+                                    setup: None,
                                     obj_air,
-                                    data_index: 42,
                                     ty: ValueType::Bitflags("builtin::Placement".to_owned()),
                                 }),
-                                other => Err(Error::at(
-                                    *span,
-                                    format!(
-                                        "object '{}' has no state field '{other}'",
-                                        schema.display_name
-                                    ),
-                                )),
+                                other => match Self::handle_field_cell(other, false) {
+                                    Some((cell, ty)) => Ok(LValue::ForeignCell {
+                                        obj_air,
+                                        cell: cell.to_owned(),
+                                        setup: None,
+                                        ty,
+                                    }),
+                                    None => Err(Error::at(
+                                        *span,
+                                        format!(
+                                            "object '{}' has no state field '{other}'",
+                                            schema.display_name
+                                        ),
+                                    )),
+                                },
                             };
                         }
+                    }
+                    if let Some((obj_air, maybe_sim)) = self.object_handle_air(bname) {
+                        let (cell, ty) = match field.as_str() {
+                            "graphic" => ("stack.data[0]", ValueType::I16),
+                            other => Self::handle_field_cell(other, maybe_sim).ok_or_else(|| {
+                                Error::at(
+                                    *span,
+                                    format!(
+                                        "unknown field '{bname}.{other}' on an object handle (expected graphic, hand, room, age, priority, is_visitor, kind, motive.<name>, skill.<name>, attr[i], data[i], person[i], motive[m], slot[i], or sprite_flags[i])"
+                                    ),
+                                )
+                            })?,
+                        };
+                        return Ok(LValue::ForeignCell {
+                            obj_air,
+                            cell: cell.to_owned(),
+                            setup: None,
+                            ty,
+                        });
                     }
                 }
                 Err(Error::at(
@@ -7945,6 +8660,24 @@ impl<'a> TreeLowerer<'a> {
                             let idx = self.eval_const_i16(index)?;
                             return Ok(LValue::Direct {
                                 air: format!("global[{idx}]"),
+                                ty: ValueType::I16,
+                            });
+                        }
+                        // `param[n]`: the call frame's argument word, readable and assignable
+                        // inside the frame (positional params, `@frame(args:)`, functionals).
+                        "param" if self.lookup_var("param").is_none() => {
+                            let idx = self.eval_builtin_int(index, "param index", 0, 255)?;
+                            if idx as usize >= self.frame_args {
+                                return Err(Error::at(
+                                    *span,
+                                    format!(
+                                        "param[{idx}] is outside this tree's {} argument(s) (declare the parameter or pin '@frame(args: N)')",
+                                        self.frame_args
+                                    ),
+                                ));
+                            }
+                            return Ok(LValue::Direct {
+                                air: format!("param[{idx}]"),
                                 ty: ValueType::I16,
                             });
                         }
@@ -8008,6 +8741,80 @@ impl<'a> TreeLowerer<'a> {
                             ty: ValueType::I16,
                         });
                     }
+                    if self.is_self_ident(rname) && field == "sprite_flags" {
+                        let (setup, cell) = self.sprite_flag_cell(index)?;
+                        let obj_air = match self.tree_ctx {
+                            TreeContext::ObjectSelf => "my.id",
+                            TreeContext::SimOnObject { .. } => "stack_obj",
+                        };
+                        return Ok(LValue::ForeignCell {
+                            obj_air: obj_air.to_owned(),
+                            cell,
+                            setup: Some(setup),
+                            ty: ValueType::I16,
+                        });
+                    }
+                    if self.is_self_ident(rname) && field == "slot" {
+                        let idx = self.eval_builtin_int(index, "self.slot index", 0, 255)?;
+                        return Ok(LValue::Direct {
+                            air: format!("{}.slot[{idx}]", self.self_prefix()),
+                            ty: ValueType::ObjectId,
+                        });
+                    }
+                    if let Some((obj_air, maybe_sim)) = self.object_handle_air(rname)
+                        && matches!(
+                            field.as_str(),
+                            "person" | "motive" | "skill" | "slot" | "sprite_flags"
+                        )
+                    {
+                        if field == "sprite_flags" {
+                            let (setup, cell) = self.sprite_flag_cell(index)?;
+                            return Ok(LValue::ForeignCell {
+                                obj_air,
+                                cell,
+                                setup: Some(setup),
+                                ty: ValueType::I16,
+                            });
+                        }
+                        if !maybe_sim && field != "slot" {
+                            return Err(Error::at(
+                                *span,
+                                format!(
+                                    "'{rname}' is a typed object handle, not a Sim (cannot index '{rname}.{field}[...]')"
+                                ),
+                            ));
+                        }
+                        let (cell, ty) = match field.as_str() {
+                            "motive" => (
+                                format!("stack.motive[{}]", self.resolve_motive_expr(index)?),
+                                ValueType::I16,
+                            ),
+                            "skill" => (
+                                format!("stack.person[{}]", self.resolve_skill_expr(index)?),
+                                ValueType::I16,
+                            ),
+                            other => {
+                                let idx = self.eval_builtin_int(
+                                    index,
+                                    &format!("{rname}.{other} index"),
+                                    0,
+                                    255,
+                                )?;
+                                let ty = if other == "slot" {
+                                    ValueType::ObjectId
+                                } else {
+                                    ValueType::I16
+                                };
+                                (format!("stack.{other}[{idx}]"), ty)
+                            }
+                        };
+                        return Ok(LValue::ForeignCell {
+                            obj_air,
+                            cell,
+                            setup: None,
+                            ty,
+                        });
+                    }
                     if self.is_self_ident(rname) {
                         let idx = self.eval_const_i16(index)?;
                         return match field.as_str() {
@@ -8056,9 +8863,10 @@ impl<'a> TreeLowerer<'a> {
                                 attr_index: idx,
                                 ty: ValueType::I16,
                             }),
-                            "data" => Ok(LValue::ForeignData {
+                            "data" => Ok(LValue::ForeignCell {
+                                cell: format!("stack.data[{idx}]"),
+                                setup: None,
                                 obj_air,
-                                data_index: idx,
                                 ty: ValueType::I16,
                             }),
                             other => Err(Error::at(
@@ -8113,23 +8921,34 @@ impl<'a> TreeLowerer<'a> {
                 ));
                 self.emit_restore_stack_obj();
             }
-            LValue::ForeignData {
+            LValue::ForeignCell {
                 obj_air,
-                data_index,
+                cell,
+                setup,
                 ..
             } => {
-                let effective_rhs = if rhs_air.starts_with("stack.") || rhs_air == "stack_obj" {
+                let switches = obj_air != "stack_obj";
+                let clobbers_temp0 = setup.is_some() && rhs_air.contains("temp[0]");
+                let effective_rhs = if (switches
+                    && (rhs_air.starts_with("stack.") || rhs_air == "stack_obj"))
+                    || clobbers_temp0
+                {
                     let snap = self.fresh("frhs");
                     self.line(format!("let {snap} = {rhs_air};"));
                     snap
                 } else {
                     rhs_air.to_owned()
                 };
-                self.line(format!("stack_obj := {obj_air};"));
-                self.line(format!(
-                    "stack.data[{data_index}] {op_str} {effective_rhs};"
-                ));
-                self.emit_restore_stack_obj();
+                if let Some(setup) = setup {
+                    self.line(setup.clone());
+                }
+                if switches {
+                    self.line(format!("stack_obj := {obj_air};"));
+                }
+                self.line(format!("{cell} {op_str} {effective_rhs};"));
+                if switches {
+                    self.emit_restore_stack_obj();
+                }
             }
         }
         Ok(())
@@ -8358,7 +9177,10 @@ impl<'a> TreeLowerer<'a> {
                 None => self.expr_may_trap_arith(base),
             },
             V2Expr::Tuple(_, elems) => elems.iter().any(|e| self.expr_may_trap_arith(e)),
-            V2Expr::Call { .. } | V2Expr::MethodCall { .. } | V2Expr::Try { .. } => true,
+            V2Expr::Call { .. }
+            | V2Expr::MethodCall { .. }
+            | V2Expr::Try { .. }
+            | V2Expr::Match { .. } => true,
             V2Expr::Int(..)
             | V2Expr::Bool(..)
             | V2Expr::Str(..)
@@ -8546,7 +9368,10 @@ impl<'a> TreeLowerer<'a> {
                 .iter()
                 .any(|e| self.expr_may_read_or_clobber_air(e, canon_target)),
             // Calls/method calls (and `?`-propagated calls) may have arbitrary side effects.
-            V2Expr::Call { .. } | V2Expr::MethodCall { .. } | V2Expr::Try { .. } => true,
+            V2Expr::Call { .. }
+            | V2Expr::MethodCall { .. }
+            | V2Expr::Try { .. }
+            | V2Expr::Match { .. } => true,
         }
     }
 
@@ -8876,6 +9701,11 @@ impl<'a> TreeLowerer<'a> {
                 let lval = self.resolve_lvalue(expr)?;
                 self.read_lvalue(&lval)
             }
+            V2Expr::Match {
+                span,
+                scrutinee,
+                arms,
+            } => self.lower_match_expr(*span, scrutinee, arms, None),
             V2Expr::Unary { span, op, inner } => match op {
                 V2UnaryOp::Not => {
                     let tmp = self.fresh("not");
@@ -9074,15 +9904,23 @@ impl<'a> TreeLowerer<'a> {
                 self.emit_restore_stack_obj();
                 Ok((tmp, ty.clone()))
             }
-            LValue::ForeignData {
+            LValue::ForeignCell {
                 obj_air,
-                data_index,
+                cell,
+                setup,
                 ty,
             } => {
                 let tmp = self.fresh("fdata");
-                self.line(format!("stack_obj := {obj_air};"));
-                self.line(format!("let {tmp} = stack.data[{data_index}];"));
-                self.emit_restore_stack_obj();
+                if let Some(setup) = setup {
+                    self.line(setup.clone());
+                }
+                if obj_air == "stack_obj" {
+                    self.line(format!("let {tmp} = {cell};"));
+                } else {
+                    self.line(format!("stack_obj := {obj_air};"));
+                    self.line(format!("let {tmp} = {cell};"));
+                    self.emit_restore_stack_obj();
+                }
                 Ok((tmp, ty.clone()))
             }
         }
@@ -9483,7 +10321,7 @@ impl<'a> TreeLowerer<'a> {
                 Some(
                     Binding::AutonomousFlag
                         | Binding::MutRef {
-                            target: LValue::ForeignAttr { .. } | LValue::ForeignData { .. }
+                            target: LValue::ForeignAttr { .. } | LValue::ForeignCell { .. }
                         }
                 )
             ),
@@ -9520,12 +10358,18 @@ impl<'a> TreeLowerer<'a> {
                     return false;
                 }
                 match base.as_ref() {
-                    V2Expr::Ident(_, bname) => matches!(bname.as_str(), "temp" | "global"),
-                    V2Expr::Field { base: root, .. } => {
-                        matches!(
-                            root.as_ref(),
-                            V2Expr::Ident(_, rname) if self.is_self_ident(rname) || self.is_sim_ident(rname)
-                        )
+                    V2Expr::Ident(_, bname) => {
+                        matches!(bname.as_str(), "temp" | "global")
+                            || (bname == "param" && self.lookup_var("param").is_none())
+                    }
+                    V2Expr::Field {
+                        base: root, field, ..
+                    } => {
+                        field != "sprite_flags"
+                            && matches!(
+                                root.as_ref(),
+                                V2Expr::Ident(_, rname) if self.is_self_ident(rname) || self.is_sim_ident(rname)
+                            )
                     }
                     _ => false,
                 }
@@ -9567,6 +10411,24 @@ impl<'a> TreeLowerer<'a> {
                 args,
                 ..
             } if method == "is_empty" && args.is_empty() => self.is_pure_single_operand(receiver),
+            // `inc_lt(&mut x, n)` / `dec_gt(&mut x, n)` on a direct slot is one node.
+            V2Expr::Call {
+                span,
+                callee,
+                type_args,
+                args,
+            } if type_args.is_empty()
+                && matches!(callee.as_ref(), V2Expr::Ident(_, f) if matches!(f.as_str(), "inc_lt" | "dec_gt"))
+                && !self.user_callable_named(callee, *span).unwrap_or(true) =>
+            {
+                matches!(
+                    args.as_slice(),
+                    [place, bound] if place.name.is_none()
+                        && bound.name.is_none()
+                        && matches!(&place.value, V2Expr::MutRef { inner, .. } if self.is_pure_single_operand(inner))
+                        && self.is_pure_single_operand(&bound.value)
+                )
+            }
             V2Expr::Call { .. } | V2Expr::MethodCall { .. } => false,
             _ => self.is_pure_single_operand(expr),
         }
@@ -9761,6 +10623,25 @@ impl<'a> TreeLowerer<'a> {
                 inner,
                 ..
             } => {
+                // A written `!(a > b)` keeps its compare: `.air` `!a > b` is the same compare
+                // node with its exits swapped, so the node's own result (the thread's last
+                // result) matches the source, where `a <= b` would invert it.
+                if let V2Expr::Binary {
+                    span: ispan,
+                    lhs,
+                    op:
+                        op @ (V2BinOp::Eq
+                        | V2BinOp::Ne
+                        | V2BinOp::Lt
+                        | V2BinOp::Le
+                        | V2BinOp::Gt
+                        | V2BinOp::Ge),
+                    rhs,
+                } = inner.as_ref()
+                {
+                    let (l, r) = self.lower_cmp_operands(lhs, *op, rhs, *ispan)?;
+                    return Ok(Some(format!("!{l} {} {r}", cmp_op_str(*op))));
+                }
                 if let Some(neg) = self.try_lower_negated_simple_air_cond(inner)? {
                     return Ok(Some(neg));
                 }
@@ -11318,6 +12199,40 @@ fn expr_starts_with_not_self_field(expr: &V2Expr, field_name: &str) -> bool {
     }
 }
 
+/// One `match` arm's body: statements (statement form) or a value (expression form).
+#[derive(Clone, Copy)]
+enum ArmBody<'a> {
+    Stmts(&'a [V2Stmt]),
+    Value(&'a V2Expr),
+}
+
+/// Where an expression `match` writes its arms' values, and their common type.
+struct MatchResult {
+    dest: String,
+    ty: Option<ValueType>,
+}
+
+/// Placeholder for the per-tree pinned local slot of `push_interaction(object: <handle>)`,
+/// replaced in `TreeLowerer::finish` (not an identifier character, so no name contains it).
+const PIN_SLOT: &str = "@pin@";
+
+/// The `N` of every `local[N]` spelled in `.air` text.
+fn explicit_local_slots(air: &str) -> impl Iterator<Item = u32> + '_ {
+    air.match_indices("local[").filter_map(|(i, m)| {
+        let rest = &air[i + m.len()..];
+        let end = rest.find(']')?;
+        let prev_ok = air[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        if prev_ok {
+            rest[..end].trim().parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
 /// The builtins whose arguments can name a local they write (see [`builtin_args_write_ident`]).
 const LOCAL_WRITING_BUILTINS: &[&str] =
     &["random_into", "animate", "set_headline", "push_interaction"];
@@ -11463,6 +12378,14 @@ fn expr_borrows_ident_in(expr: &V2Expr, target_name: &str, w: &[&str]) -> bool {
         V2Expr::Tuple(_, elems) => elems
             .iter()
             .any(|e| expr_borrows_ident_in(e, target_name, w)),
+        V2Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            expr_borrows_ident_in(scrutinee, target_name, w)
+                || arms
+                    .iter()
+                    .any(|a| expr_borrows_ident_in(&a.value, target_name, w))
+        }
         V2Expr::Call { callee, args, .. } => {
             expr_borrows_ident_in(callee, target_name, w)
                 || matches!(callee.as_ref(), V2Expr::Ident(_, f) if builtin_args_write_ident(f, args, target_name, w))
@@ -11996,6 +12919,13 @@ fn expr_may_clobber_stack_obj(
         V2Expr::Tuple(_, elems) => elems.iter().any(|e| {
             expr_may_clobber_stack_obj(e, env, owner_mod, allow_local_fns, sim_name, depth)
         }),
+        V2Expr::Match {
+            scrutinee, arms, ..
+        } => std::iter::once(scrutinee.as_ref())
+            .chain(arms.iter().map(|a| &a.value))
+            .any(|e| {
+                expr_may_clobber_stack_obj(e, env, owner_mod, allow_local_fns, sim_name, depth)
+            }),
         _ => false,
     }
 }

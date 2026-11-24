@@ -8,11 +8,11 @@ use crate::v2::ast::{
     AbiParam, AbiParamSlot, AdvertiseDecl, BconTableDecl, BitflagVariant, BitflagsDecl, CallArg,
     ConstDecl, ConstIntExpr, EnumDecl, EnumVariant, ExternBconDecl, ExternBconEntry, ExternFnDecl,
     ExternModDecl, FnDecl, FnParam, ForEachIter, FunctionalDecl, GuardBody, GuardDecl,
-    InteractionDecl, LifecycleBlock, MatchArm, MatchPattern, MetaField, MetaFieldKind, ObjectDecl,
-    ObjectMember, ParamAssignDecl, ParamDecl, ParamType, ParamValue, ReturnAbi, SlotDecl,
-    SoundDecl, SpriteDecl, StateDecl, StateInitValue, StateType, StringsDecl, TemplateDecl,
-    TileDecl, TreeFrame, TreeMemberDecl, UseDecl, UseItem, V2AssignOp, V2BinOp, V2Expr, V2File,
-    V2Item, V2Stmt, V2Type, V2UnaryOp,
+    InteractionDecl, LifecycleBlock, MatchArm, MatchExprArm, MatchPattern, MetaField,
+    MetaFieldKind, ObjectDecl, ObjectMember, ParamAssignDecl, ParamDecl, ParamType, ParamValue,
+    ReturnAbi, SlotDecl, SoundDecl, SpriteDecl, StateDecl, StateInitValue, StateType, StringsDecl,
+    TemplateDecl, TileDecl, TreeFrame, TreeMemberDecl, UseDecl, UseItem, V2AssignOp, V2BinOp,
+    V2Expr, V2File, V2Item, V2Stmt, V2Type, V2UnaryOp, VariantDecl,
 };
 use crate::v2::lexer::{Token, TokenKind, tokenize};
 use std::collections::BTreeSet;
@@ -1239,6 +1239,9 @@ impl Parser {
                 "multi_tile" => {
                     self.parse_multi_tile_block(kw_span, &mut members)?;
                 }
+                "variant" if matches!(self.peek().kind, TokenKind::Str(_)) => {
+                    members.push(ObjectMember::Variant(self.parse_variant_decl(kw_span)?));
+                }
                 meta_key if is_meta_field_name(meta_key) => {
                     members.push(ObjectMember::Meta(
                         self.parse_meta_field(meta_key, kw_span)?,
@@ -1265,6 +1268,65 @@ impl Parser {
             }
         }
         Ok(members)
+    }
+
+    /// `variant "Name" { guid: ..., price: ..., init: tree, main: tree, description: "..." }`
+    fn parse_variant_decl(&mut self, span: Span) -> Result<VariantDecl> {
+        let (name, _) = self.expect_string("variant catalog name")?;
+        self.expect(&TokenKind::LBrace, "'{'")?;
+        let mut decl = VariantDecl {
+            span,
+            name,
+            guid: None,
+            price: None,
+            description: None,
+            init: None,
+            main: None,
+        };
+        while !self.eat(&TokenKind::RBrace) {
+            let (key, kspan) = self.expect_ident("variant field")?;
+            self.expect(&TokenKind::Colon, "':'")?;
+            let dup = match key.as_str() {
+                "guid" => decl
+                    .guid
+                    .replace((kspan, self.expect_u32("variant guid")?))
+                    .is_some(),
+                "price" => {
+                    let (v, vspan) = self.parse_signed_int("variant price")?;
+                    decl.price.replace((vspan, v)).is_some()
+                }
+                "description" => decl
+                    .description
+                    .replace(self.expect_string("variant description")?.0)
+                    .is_some(),
+                "init" | "main" => {
+                    let (ident, ispan) = self.expect_ident("standalone tree name")?;
+                    let slot = if key == "init" {
+                        &mut decl.init
+                    } else {
+                        &mut decl.main
+                    };
+                    slot.replace((ispan, ident)).is_some()
+                }
+                other => {
+                    return Err(Error::at(
+                        kspan,
+                        format!(
+                            "unknown variant field '{other}' (expected guid, price, description, init, or main)"
+                        ),
+                    ));
+                }
+            };
+            if dup {
+                return Err(Error::at(kspan, format!("duplicate variant field '{key}'")));
+            }
+            if !self.eat(&TokenKind::Comma) && !self.eat(&TokenKind::Semicolon) {
+                self.expect(&TokenKind::RBrace, "'}'")?;
+                break;
+            }
+        }
+        self.eat_member_terminator();
+        Ok(decl)
     }
 
     fn eat_member_terminator(&mut self) {
@@ -2918,6 +2980,56 @@ impl Parser {
         })
     }
 
+    /// Expression `match s { P => value, ... }` (the `match` keyword is already consumed).
+    fn parse_match_expr(&mut self, span: Span) -> Result<V2Expr> {
+        let scrutinee = self.parse_expr()?;
+        let open_span = self.expect(&TokenKind::LBrace, "'{'")?;
+        self.enter_nesting(open_span)?;
+        let mut arms = Vec::new();
+        let res = (|| {
+            loop {
+                if self.eat(&TokenKind::RBrace) {
+                    return Ok(());
+                }
+                if self.peek().kind == TokenKind::Eof {
+                    return Err(Error::at(
+                        open_span,
+                        "unterminated 'match { ... }' expression",
+                    ));
+                }
+                let arm_span = self.span();
+                let pattern = self.parse_match_pattern()?;
+                self.expect(&TokenKind::FatArrow, "'=>'")?;
+                if self.peek().kind == TokenKind::LBrace {
+                    return Err(Error::at(
+                        self.span(),
+                        "a 'match' expression arm is a value ('Pattern => expr'), not a block",
+                    ));
+                }
+                let value = self.parse_expr()?;
+                arms.push(MatchExprArm {
+                    span: arm_span,
+                    pattern,
+                    value,
+                });
+                if !self.eat(&TokenKind::Comma) {
+                    self.expect(&TokenKind::RBrace, "',' or '}'")?;
+                    return Ok(());
+                }
+            }
+        })();
+        self.leave_nesting();
+        res?;
+        if arms.is_empty() {
+            return Err(Error::at(span, "'match' must have at least one arm"));
+        }
+        Ok(V2Expr::Match {
+            span,
+            scrutinee: Box::new(scrutinee),
+            arms,
+        })
+    }
+
     fn parse_match_pattern(&mut self) -> Result<MatchPattern> {
         let span = self.span();
         match &self.peek().kind {
@@ -3425,6 +3537,7 @@ impl Parser {
                 match s.as_str() {
                     "true" => Ok(V2Expr::Bool(tok.span, true)),
                     "false" => Ok(V2Expr::Bool(tok.span, false)),
+                    "match" => self.parse_match_expr(tok.span),
                     _ => {
                         if self.peek().kind == TokenKind::ColonColon
                             && self.peek_at(1).kind != TokenKind::Lt

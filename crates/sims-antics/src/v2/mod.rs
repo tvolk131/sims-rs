@@ -15,10 +15,11 @@ pub mod ast;
 pub mod lexer;
 pub mod loader;
 pub mod lower;
+mod opt;
 pub mod parser;
 
 pub use loader::{PackResolverConfig, ResolvedModule, resolve_v2_file, resolve_v2_source};
-pub use lower::{ExpandedV2Object, lower_resolved_module};
+pub use lower::{ExpandedV2Object, VariantSpec, lower_resolved_module};
 pub use parser::parse_v2_file;
 
 use crate::compile::{
@@ -138,7 +139,165 @@ pub fn compile_v2_object_file(file_path: &Path, pack_dir: Option<&Path>) -> Resu
 /// Compiles an already-expanded [`ExpandedV2Object`] through the `.air` compiler and IFF encoder.
 pub fn compile_expanded_v2_object(expanded: ExpandedV2Object) -> Result<CompiledObject> {
     let air_label = format!("{}.air", expanded.slug);
-    compile_object_from_manifest(expanded.manifest, &[(&air_label, &expanded.air_source)])
+    let objd_id = expanded.manifest.objd_id;
+    let ctss_id = expanded.manifest.ctss_id;
+    let mut compiled =
+        compile_object_from_manifest(expanded.manifest, &[(&air_label, &expanded.air_source)])?;
+    if !expanded.variants.is_empty() {
+        compiled.iff_bytes =
+            append_variants(&compiled.iff_bytes, objd_id, ctss_id, &expanded.variants)?;
+    }
+    Ok(compiled)
+}
+
+/// OBJD words a catalog variant replaces (word index into the chunk, version words included).
+const OBJD_MAIN_ID: usize = 5;
+const OBJD_GUID_LO: usize = 14;
+const OBJD_GUID_HI: usize = 15;
+const OBJD_PRICE: usize = 18;
+const OBJD_CATALOG_STRINGS_ID: usize = 41;
+const OBJD_INIT_ID: usize = 43;
+
+/// Appends one OBJD + OBJf + CTSS per catalog variant to a compiled single-tile IFF. Each is
+/// the primary's chunk with the variant's words replaced, so every other definition word (and
+/// the whole BHAV/BCON/STR#/TTAB/SLOT/graphics pool) is shared. Ids follow the primary's.
+fn append_variants(
+    iff_bytes: &[u8],
+    objd_id: u16,
+    ctss_id: u16,
+    variants: &[VariantSpec],
+) -> Result<Vec<u8>> {
+    use crate::encode::{encode_iff_with_rsmp, encode_string_table};
+    use crate::ir::{StringEntry, StringFormat, StringTableChunk};
+    use sims_formats::iff::{ChunkData, Iff};
+
+    let iff = Iff::parse(iff_bytes.to_vec())
+        .map_err(|e| Error::new(format!("re-reading compiled IFF for variants: {e}")))?;
+    let mut chunks: Vec<ChunkData> = iff
+        .chunks
+        .iter()
+        .filter(|c| &c.tag != b"rsmp")
+        .map(|c| ChunkData {
+            tag: c.tag,
+            id: c.id,
+            flags: c.flags,
+            label: c.label.clone(),
+            data: iff.data(c).to_vec(),
+        })
+        .collect();
+    let find = |chunks: &[ChunkData], tag: &[u8; 4], id: u16| {
+        chunks.iter().position(|c| &c.tag == tag && c.id == id)
+    };
+    let objd_pos = find(&chunks, b"OBJD", objd_id)
+        .ok_or_else(|| Error::new("compiled IFF has no primary OBJD"))?;
+    let objf_pos = find(&chunks, b"OBJf", objd_id)
+        .ok_or_else(|| Error::new("compiled IFF has no primary OBJf"))?;
+    let ctss_pos = find(&chunks, b"CTSS", ctss_id)
+        .ok_or_else(|| Error::new("compiled IFF has no primary CTSS"))?;
+    let objd = chunks[objd_pos].clone();
+    let objf = chunks[objf_pos].clone();
+    let ctss_flags = chunks[ctss_pos].flags;
+    if objd.data.len() < 2 * (OBJD_INIT_ID + 1) {
+        return Err(Error::new("primary OBJD is too short for catalog variants"));
+    }
+    if objf.data.len() < 16 + 2 * 4 {
+        return Err(Error::new("primary OBJf has fewer than 2 entries"));
+    }
+
+    let mut defs = Vec::new();
+    let mut strings = Vec::new();
+    for (k, v) in variants.iter().enumerate() {
+        let offset = u16::try_from(k + 1).map_err(|_| Error::new("too many variants"))?;
+        let (Some(vid), Some(vctss)) = (objd_id.checked_add(offset), ctss_id.checked_add(offset))
+        else {
+            return Err(Error::new(format!(
+                "variant '{}' runs past the last OBJD/CTSS id",
+                v.name
+            )));
+        };
+        for (tag, id) in [(b"OBJD", vid), (b"OBJf", vid), (b"CTSS", vctss)] {
+            if find(&chunks, tag, id).is_some() {
+                return Err(Error::new(format!(
+                    "variant '{}' needs {} id {id}, which the object already uses",
+                    v.name,
+                    String::from_utf8_lossy(tag)
+                )));
+            }
+        }
+        let mut def = objd.data.clone();
+        let mut put = |word: usize, value: u16| {
+            def[2 * word..2 * word + 2].copy_from_slice(&value.to_le_bytes());
+        };
+        put(OBJD_GUID_LO, (v.guid & 0xFFFF) as u16);
+        put(OBJD_GUID_HI, (v.guid >> 16) as u16);
+        put(OBJD_PRICE, v.price);
+        put(OBJD_CATALOG_STRINGS_ID, vctss);
+        put(OBJD_INIT_ID, v.init_id);
+        put(OBJD_MAIN_ID, v.main_id);
+        defs.push(ChunkData {
+            tag: *b"OBJD",
+            id: vid,
+            flags: objd.flags,
+            label: v.name.clone(),
+            data: def,
+        });
+        let mut funcs = objf.data.clone();
+        funcs[18..20].copy_from_slice(&v.init_id.to_le_bytes());
+        funcs[22..24].copy_from_slice(&v.main_id.to_le_bytes());
+        defs.push(ChunkData {
+            tag: *b"OBJf",
+            id: vid,
+            flags: objf.flags,
+            label: format!("{} Functions", v.name),
+            data: funcs,
+        });
+        let table = StringTableChunk::new(
+            *b"CTSS",
+            vctss,
+            format!("{} Catalog", v.name),
+            StringFormat::Localized,
+            vec![
+                StringEntry::english(&v.name),
+                StringEntry::english(&v.description),
+            ],
+        );
+        strings.push(ChunkData {
+            tag: *b"CTSS",
+            id: vctss,
+            flags: ctss_flags,
+            label: table.label.clone(),
+            data: encode_string_table(&table)?,
+        });
+    }
+    // Definitions go right after the primary's OBJf, catalog strings after its CTSS.
+    let (first, second) = if objf_pos < ctss_pos {
+        ((objf_pos, defs), (ctss_pos, strings))
+    } else {
+        ((ctss_pos, strings), (objf_pos, defs))
+    };
+    chunks.splice(second.0 + 1..second.0 + 1, second.1);
+    chunks.splice(first.0 + 1..first.0 + 1, first.1);
+    encode_iff_with_rsmp(&chunks)
+}
+
+/// Every GUID an IFF's OBJD chunks define (primary, tiles, and catalog variants).
+fn iff_objd_guids(iff_bytes: &[u8]) -> Result<Vec<u32>> {
+    use sims_formats::iff::Iff;
+    let iff = Iff::parse(iff_bytes.to_vec())
+        .map_err(|e| Error::new(format!("re-reading compiled IFF: {e}")))?;
+    Ok(iff
+        .chunks
+        .iter()
+        .filter(|c| &c.tag == b"OBJD")
+        .filter_map(|c| {
+            let d = iff.data(c);
+            let word = |w: usize| {
+                d.get(2 * w..2 * w + 2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            };
+            Some(u32::from(word(OBJD_GUID_LO)?) | (u32::from(word(OBJD_GUID_HI)?) << 16))
+        })
+        .collect())
 }
 
 /// Compiles a `.antics` v2 pack directory containing `pack.toml` and v2 object `.antics` files
@@ -180,7 +339,10 @@ pub fn compile_v2_pack_dir(dir: &Path) -> Result<CompiledPack> {
         let compiled = compile_v2_object_file(&v2_path, Some(&root_canon))
             .map_err(|e| e.with_context(format!("object '{slug}'")))?;
 
-        for guid in std::iter::once(compiled.guid).chain(compiled.tile_guids.iter().copied()) {
+        let mut guids: BTreeSet<u32> = iff_objd_guids(&compiled.iff_bytes)?.into_iter().collect();
+        guids.insert(compiled.guid);
+        guids.extend(compiled.tile_guids.iter().copied());
+        for guid in guids {
             if let Some(prev_slug) = seen_guids.insert(guid, slug.clone()) {
                 return Err(Error::new(format!(
                     "duplicate GUID {guid:#010x} between objects '{prev_slug}' and '{slug}'"
