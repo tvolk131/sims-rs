@@ -325,11 +325,27 @@ impl<'a, 'b> Fills<'a, 'b> {
                 pool.worker, people.len()
             ).into()),
         }
+        let existing = family.map_or(0, |family| family.members.len());
+        // The Townie worker's specialty templates: every registered
+        // definition of kind 0x400, in the registry's order, duplicates
+        // included (0x42a9e8 to 0x42aa2f). A new family takes them first
+        // (0x42ac74 to 0x42acc1).
+        let mut townies = (pool.done == TOWNIES.done).then(|| Specialties {
+            remaining: self
+                .context
+                .registry
+                .iter()
+                .filter(|entry| entry.kind == 0x400)
+                .map(|entry| entry.guid)
+                .collect(),
+            new_family: family.is_none(),
+        });
         let mut members = Vec::with_capacity(people.len());
         let mut adults = Vec::new();
         let mut children = 0;
-        for person in people {
-            let (guid, age, gender) = self.make_person(pool, person)?;
+        for (index, person) in people.iter().enumerate() {
+            let ordinal = existing + index;
+            let (guid, age, gender) = self.make_person(pool, person, ordinal, townies.as_mut())?;
             match age {
                 27 if children == 0 => adults.push(gender),
                 9 if count.is_none() => children += 1,
@@ -367,10 +383,15 @@ impl<'a, 'b> Fills<'a, 'b> {
         Ok(())
     }
 
+    /// Makes the pool person `person`, the family's member number
+    /// `ordinal` (counting from 0). `townies` is the Townie worker's
+    /// specialty templates not yet used.
     fn make_person(
         &mut self,
         pool: &Pool,
         person: &'a PoolPerson,
+        ordinal: usize,
+        townies: Option<&mut Specialties>,
     ) -> Result<(u32, i16, i16), BootError> {
         let iff = &person.character;
         let mut objects = iff.all(b"OBJD");
@@ -398,18 +419,21 @@ impl<'a, 'b> Fills<'a, 'b> {
             .iter()
             .find(|entry| entry.kind == pool.template_kind);
         let matches_generic = generic.is_some_and(|entry| entry.guid == source && entry.resolves);
-        let townie_specialty = pool.done == TOWNIES.done
-            && self
-                .context
-                .registry
-                .iter()
-                .any(|entry| entry.guid == source && entry.kind == 0x400 && entry.resolves);
-        if !matches_generic && !townie_specialty {
-            return Err(format!(
-                "{}: unexpected captured template {source:#010x}",
-                pool.worker
-            )
-            .into());
+        match townies {
+            Some(townies) => townies.take(
+                source,
+                ordinal,
+                matches_generic,
+                self.context.registry.iter().any(|entry| entry.guid == source && entry.resolves),
+            )?,
+            None if matches_generic => {}
+            None => {
+                return Err(format!(
+                    "{}: unexpected captured template {source:#010x}",
+                    pool.worker
+                )
+                .into());
+            }
         }
 
         let file = reserve_character_file(&mut self.next_file, &mut self.files)
@@ -491,6 +515,20 @@ impl<'a, 'b> Fills<'a, 'b> {
             copies.push(scales);
         }
         let (age, gender) = (data[field::AGE], data[field::GENDER]);
+        // A celebrity's sex follows its place in the family (0x42c6d7): the
+        // first seven are women, named from table 0xa6 ("Nora" by
+        // default), the rest men, from table 0xa5 ("Nomad"); the editor
+        // sets it (0x42cf5d → 0x4eaaba).
+        if pool.done == CELEBRITIES.done {
+            let female = i16::from(ordinal <= 6);
+            if gender != female {
+                return Err(format!(
+                    "0x42c6d7: celebrity {ordinal} (User{file:05}) has sex {gender}; its place \
+                     makes it {female}"
+                )
+                .into());
+            }
+        }
         let editor_words = match pool.done {
             done if done == CELEBRITIES.done => CELEBRITY_WORDS,
             done if done == TOURISTS.done && age == 9 => TOURIST_CHILD_WORDS,
@@ -535,6 +573,53 @@ impl<'a, 'b> Fills<'a, 'b> {
         )?;
         self.made.push((file, iff));
         Ok((guid, age, gender))
+    }
+}
+
+/// The Townie worker's specialty templates (kind 0x400) not yet used.
+struct Specialties {
+    remaining: Vec<u32>,
+    /// Whether the worker made the family (0x42aab1): only then does it
+    /// take specialties before anything else.
+    new_family: bool,
+}
+
+impl Specialties {
+    /// Checks that a Townie, the family's member `ordinal`, could be made
+    /// from `source`, and uses up that specialty.
+    ///
+    /// While a new family has fewer than ten members and specialties
+    /// remain, each person is a specialty the bounded draw picks
+    /// (0x42ac96), which leaves the list once made (0x42acc1). Then, up
+    /// to the target, a person is a remaining specialty when a draw of
+    /// five gives 3 (0x42ae75, 0x42ae8f, 0x42aebe) and the generic
+    /// template otherwise (0x42aecf). The draws are on the game stream,
+    /// which is not ported, so only whether the template could be the
+    /// pick is checked.
+    fn take(
+        &mut self,
+        source: u32,
+        ordinal: usize,
+        generic: bool,
+        resolves: bool,
+    ) -> Result<(), BootError> {
+        let first = self.new_family && ordinal < 10 && !self.remaining.is_empty();
+        if let Some(at) = self.remaining.iter().position(|&guid| guid == source)
+            && resolves
+        {
+            self.remaining.remove(at);
+            return Ok(());
+        }
+        if generic && !first {
+            return Ok(());
+        }
+        let address = if first { "0x42ac96" } else { "0x42ae8f" };
+        Err(format!(
+            "{address}: Townie {ordinal}'s template {source:#010x} is not a specialty the draw \
+             could still pick{}",
+            if first { " (a new family takes specialties first)" } else { " nor the generic one" }
+        )
+        .into())
     }
 }
 

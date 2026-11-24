@@ -11,10 +11,15 @@
 //! the recorded pool characters go into `output`, the caller's copy
 //! of the neighborhood.
 //!
+//! Each imported `*.FAM` file is then used up (0x429947 to 0x429a82): a
+//! housed family's is moved onto its `HouseNN.iff` (the old house file
+//! goes to `.tmp`, the family file takes its name, and the `.tmp` is
+//! deleted), and a houseless family's is deleted. So the output's
+//! `Patch` folder loses every file the open imported.
+//!
 //! **Not ported:**
 //! - the save of `Neighborhood.iff` (0x4252cc), so the opened neighborhood
 //!   is returned in memory, for [`crate::boot::Lot::load_in`];
-//! - removing the imported `*.FAM` files (0x429a75 to 0x429a82);
 //! - the portraits (BMP_ 2002 to 2007, 0x4e8c5d).
 
 mod pools;
@@ -59,7 +64,8 @@ pub struct Opened {
 /// Opens the neighborhood at `directory` of the install at `root`, as the
 /// original does before its view first shows and, if `pools.transition`
 /// is supplied, before entering a lot. Writes new characters and houses
-/// into `output` (its `Characters` and `Houses` folders must exist).
+/// into `output` (its `Characters` and `Houses` folders must exist), and
+/// removes the imported files from its `Patch` folder.
 /// `new_guid` supplies the Patch import's GUIDs in draw order (0x4725ff).
 /// `crt` starts at the first pool boundary, after any draws made by the
 /// original's startup, navigation and Patch import. The open advances
@@ -113,6 +119,7 @@ pub fn open_neighborhood(
     };
     // The scan reads the files only when an import is pending (0x42c1d5).
     let mut patches = Vec::new();
+    let mut patch_paths = Vec::new();
     let scanned = if pending(&neighborhood, install.expansions.0)? {
         neighborhood.patches()?
     } else {
@@ -131,6 +138,11 @@ pub fn open_neighborhood(
             name: name.to_owned(),
             file: FamilyFile::parse(&bytes)?,
         });
+        // Where the output copy has the file.
+        let relative = path
+            .strip_prefix(directory)
+            .map_err(|_| format!("{}: a Patch file outside the neighborhood", path.display()))?;
+        patch_paths.push(output.join(relative));
     }
     let patch = open(&mut neighborhood, &patches, &context, new_guid)?;
     let mut pool_crt = *crt;
@@ -169,6 +181,9 @@ pub fn open_neighborhood(
             return Err(message.into());
         }
     }
+    // Last, once every file is written, so a failure above leaves the
+    // copy's `Patch` folder as it was.
+    use_up_imported(&patch, &patches, &patch_paths)?;
     neighborhood.directory = output.to_path_buf();
     *crt = pool_crt;
     Ok((
@@ -236,6 +251,32 @@ fn write_imports(
             )?;
             let path = output.join(format!("Houses/House{:02}.iff", lot.house));
             std::fs::write(&path, bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Uses up each imported `*.FAM` file in the output copy (0x429947 to
+/// 0x429a82). A housed family's file was moved onto its house file, which
+/// [`write_imports`] has written in its place; a houseless family's was
+/// deleted (0x429a75 → 0x5b98d5). Either way the file is gone from
+/// `Patch`. A file the copy lacks is left alone: the deletion's result is
+/// not checked (0x429a87).
+fn use_up_imported(
+    opened: &patch_import::Opened,
+    patches: &[Patch],
+    paths: &[std::path::PathBuf],
+) -> Result<(), BootError> {
+    for (name, _) in &opened.imports {
+        let at = patches
+            .iter()
+            .position(|patch| &patch.name == name)
+            .ok_or("an import names no Patch file")?;
+        let path = &paths[at];
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("0x429a82: {}: {error}", path.display()).into()),
         }
     }
     Ok(())

@@ -632,6 +632,10 @@ fn an_opened_neighborhood_matches_the_originals_import() {
             "{name} differs"
         );
     }
+    // Each imported family file is used up: the housed ones became their
+    // house files and the houseless one was deleted, so the copy's `Patch`
+    // folder is empty, as the original left it.
+    assert_eq!(std::fs::read_dir(output.join("Patch")).unwrap().count(), 0);
     // The inventories the view's set-up and each housed import made, which
     // the pools leave alone.
     assert_eq!(
