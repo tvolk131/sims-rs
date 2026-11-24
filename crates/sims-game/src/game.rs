@@ -3785,7 +3785,7 @@ impl Game {
             self.blink_dirty = true;
         }
         let ui_anim_now = self.hud.is_ui_animating(self.clock_us);
-        if ui_anim_now || self.ui_animating_prev {
+        if ui_anim_now || self.ui_animating_prev || self.hud.needs_sample_due(self.clock_us) {
             self.blink_dirty = true;
         }
         self.ui_animating_prev = ui_anim_now;

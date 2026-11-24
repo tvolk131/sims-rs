@@ -1394,6 +1394,10 @@ pub const FACES: u16 = 2002;
 /// side by side, on red through green, for the lifetime relationship
 /// (0x4e94a4 asks for 2003).
 pub const MOODS: u16 = 2003;
+/// A person's 25 by 25 thumbnail, framed in blue on black: `BMP_` 2004,
+/// which the neighborhood's lot card draws for each member (`0x4e9556`
+/// reads it through `0x4e9260(person, 0x7d4)`).
+pub const THUMBNAIL: u16 = 2004;
 /// The portrait frame the face is drawn on (kPeopleTemplate): four 45 by
 /// 45 cells.
 pub const TEMPLATE: i32 = 4600;
@@ -1413,6 +1417,7 @@ const CATALOG_STRINGS: usize = 41;
 pub struct Faces {
     faces: BTreeMap<u32, Image>,
     moods: BTreeMap<u32, Image>,
+    thumbnails: BTreeMap<u32, Image>,
     names: BTreeMap<u32, String>,
 }
 
@@ -1433,7 +1438,15 @@ impl Faces {
         guids: &[u32],
         pool: &ArchivePool,
     ) -> Result<Self> {
-        type FaceRow = Result<Option<(u32, Option<String>, Option<Image>, Option<Image>)>>;
+        type FaceRow = Result<
+            Option<(
+                u32,
+                Option<String>,
+                Option<Image>,
+                Option<Image>,
+                Option<Image>,
+            )>,
+        >;
         let decode_one = |&guid: &u32| -> FaceRow {
             let Some(object) = catalog.object(guid) else {
                 return Ok(None);
@@ -1448,6 +1461,11 @@ impl Faces {
                 Some(chunk) => Some(bitmap::bmp(iff.data(chunk)).map_err(Error::Format)?),
                 None => None,
             };
+            // The thumbnail only serves the lot card, which falls back to
+            // the face: one that does not decode is taken as missing.
+            let thumbnail = iff
+                .get(b"BMP_", THUMBNAIL)
+                .and_then(|chunk| bitmap::bmp(iff.data(chunk)).ok());
             let face = match iff.get(b"BMP_", FACES) {
                 Some(chunk) => {
                     let image = bitmap::bmp(iff.data(chunk)).map_err(Error::Format)?;
@@ -1460,7 +1478,7 @@ impl Faces {
                 }
                 None => None,
             };
-            Ok(Some((guid, name, mood, face)))
+            Ok(Some((guid, name, mood, face, thumbnail)))
         };
         let workers = if guids.len() <= 2 {
             1
@@ -1491,11 +1509,15 @@ impl Faces {
         };
         let mut faces = BTreeMap::new();
         let mut moods = BTreeMap::new();
+        let mut thumbnails = BTreeMap::new();
         let mut names = BTreeMap::new();
         for row in rows {
-            let Some((guid, name, mood, face)) = row? else {
+            let Some((guid, name, mood, face, thumbnail)) = row? else {
                 continue;
             };
+            if let Some(thumbnail) = thumbnail {
+                thumbnails.insert(guid, thumbnail);
+            }
             if let Some(name) = name {
                 names.insert(guid, name);
             }
@@ -1509,6 +1531,7 @@ impl Faces {
         Ok(Self {
             faces,
             moods,
+            thumbnails,
             names,
         })
     }
@@ -1537,6 +1560,15 @@ impl Faces {
     /// The relationship panel's five faces of `guid` ([`MOODS`]).
     pub fn moods(&self, guid: u32) -> Option<&Image> {
         self.moods.get(&guid)
+    }
+
+    pub fn insert_thumbnail(&mut self, guid: u32, thumbnail: Image) {
+        self.thumbnails.insert(guid, thumbnail);
+    }
+
+    /// The framed 25 by 25 thumbnail of `guid` ([`THUMBNAIL`]).
+    pub fn thumbnail(&self, guid: u32) -> Option<&Image> {
+        self.thumbnails.get(&guid)
     }
 
     /// The 45 by 45 portrait of `guid` on cell `cell` of the template.

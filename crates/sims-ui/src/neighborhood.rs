@@ -218,9 +218,65 @@ pub struct LotInfo {
     pub magic_cost: i32,
     /// Occupying family, if any.
     pub occupant: Option<LotOccupant>,
-    /// Screen-space anchor near the hovered lot; the popup positions itself
-    /// beside this point while clamping inside the viewport below the top bar.
+    /// Screen-space anchor near the hovered lot; without [`Self::tooltip`]
+    /// the popup positions itself beside this point while clamping inside
+    /// the viewport below the top bar.
     pub anchor: [i32; 2],
+    /// The lot window the card hangs from as the original's tooltip
+    /// (`0x5ddbda`, `0x5da2b0`); when set, it places the card instead of
+    /// [`Self::anchor`].
+    pub tooltip: Option<TooltipOwner>,
+    /// What the card's paint adds to the frame tiler's alpha
+    /// ([`popup_alpha_shift`], `0x54f939`); when set, the whole card is
+    /// blended over the map through that alpha. `None` draws it opaque.
+    pub alpha_shift: Option<i32>,
+}
+
+/// The hovered lot window (`cWinLot`) a lot card hangs from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooltipOwner {
+    /// The lot window's screen rectangle: its map cell.
+    pub rect: Rect,
+    /// The cursor's x when the card was shown (`0x5d9a2f` at `0x5ddc3a`).
+    pub cursor_x: i32,
+}
+
+/// The shift the lot card's paint (`0x54f939..0x54f9d2`) adds to every
+/// alpha of its frame tiler before blending it over the map (`0x4ba004`):
+/// `ftol(fade * 255.0f + 0.5f) - 325`, clamped to `-255..=255`. `fade` is
+/// the hovered lot's 300 ms roof ramp (`cWinLot + 0x21c`, read through
+/// `0x473390`), so a settled card's opaque middle blends at 255 - 70 = 185.
+pub fn popup_alpha_shift(fade: f32) -> i32 {
+    let level = (f64::from(fade.clamp(0.0, 1.0)) * 255.0 + 0.5) as i32;
+    (level - 0x145).clamp(-255, 255)
+}
+
+/// Where the original's tooltip puts a `size` card hanging from `owner`
+/// inside a `screen` root window. `0x5ddbda` takes the cursor's x clamped to
+/// the window's columns, and the row `size[1] + 1` above the window's top,
+/// or 2 below its bottom when that row is above 3. `0x5da2b0..0x5da31b`
+/// then moves a card crossing the screen's left or top edge back to 0, and
+/// one reaching its right or bottom edge back to end a pixel short of it.
+/// A card as wide or tall as the screen (only a compact window, smaller
+/// than the original's 800 by 600, allows one) is kept at 0, not -1.
+pub fn tooltip_origin(owner: TooltipOwner, size: [i32; 2], screen: [i32; 2]) -> [i32; 2] {
+    let r = owner.rect;
+    let mut x = owner.cursor_x.max(r.x).min(r.x + r.width - 1);
+    let mut y = r.y - size[1] - 1;
+    if y < 3 {
+        y = r.y + r.height + 2;
+    }
+    if x < 0 {
+        x = 0;
+    } else if x + size[0] >= screen[0] {
+        x = (screen[0] - size[0] - 1).max(0);
+    }
+    if y < 0 {
+        y = 0;
+    } else if y + size[1] >= screen[1] {
+        y = (screen[1] - size[1] - 1).max(0);
+    }
+    [x, y]
 }
 
 /// Read-only view state rendered by [`NeighborhoodChrome`].
@@ -777,17 +833,24 @@ impl LotPopupLayout {
         }
 
         let clamped_w = total_w.min(fw);
-        let clamped_h = total_h.min(avail_h);
-
-        // Position beside the lot anchor, clamping cleanly inside viewport and
-        // below the top bar so it never occludes chrome buttons.
-        let max_x = (fw - clamped_w).max(0);
-        let max_y = (fh - clamped_h).max(top_limit);
-        let x = lot.anchor[0].clamp(0, max_x);
-        let y = lot.anchor[1].clamp(top_limit, max_y);
-        let rect = Rect::new(x, y, clamped_w, clamped_h);
+        let rect = if let Some(owner) = lot.tooltip {
+            // The original sizes the card (`0x550876`) and leaves its
+            // placement to the tooltip ([`tooltip_origin`]).
+            let clamped_h = total_h.min(fh);
+            let [x, y] = tooltip_origin(owner, [clamped_w, clamped_h], [fw, fh]);
+            Rect::new(x, y, clamped_w, clamped_h)
+        } else {
+            // Position beside the lot anchor, clamping cleanly inside viewport
+            // and below the top bar so it never occludes chrome buttons.
+            let clamped_h = total_h.min(avail_h);
+            let max_x = (fw - clamped_w).max(0);
+            let max_y = (fh - clamped_h).max(top_limit);
+            let x = lot.anchor[0].clamp(0, max_x);
+            let y = lot.anchor[1].clamp(top_limit, max_y);
+            Rect::new(x, y, clamped_w, clamped_h)
+        };
         let pad_x = POPUP_PAD.min(clamped_w / 4);
-        let pad_y = POPUP_PAD.min(clamped_h / 4);
+        let pad_y = POPUP_PAD.min(rect.height / 4);
         let inner_w = (rect.width - pad_x * 2).max(0);
         if inner_w > 0 && inner_w < text_w {
             lines = break_popup_lines(&text, inner_w, font);
@@ -1179,23 +1242,91 @@ fn draw_scaled_region(frame: &mut Frame, image: &Image, src: Rect, dest: Rect) {
 
 /// Draws the 1.91 9-slice alpha popup (`HotspotPopupTiler.TGA`, 111×111 ->
 /// 3×3 tiles of 37×37, `0x5509cf..0x550c62`) plus formatted lines and portraits.
+///
+/// With [`LotInfo::alpha_shift`] it composes the card as the original does:
+/// `0x550a1a` copies the tiler into one surface (`+0xd8`), `0x550a9b` copies
+/// that into a second (`+0xd4`) that takes the text and portraits, and the
+/// paint (`0x54f939`) blends the second over the map through the first's
+/// alpha plus the shift (`0x4ba004` -> `0x498b41`: at most 7 skips, at least
+/// 248 copies).
 fn draw_lot_popup(frame: &mut Frame, popup: &LotPopupLayout, lot: &LotInfo, art: &Art) {
     if popup.rect.width <= 0 || popup.rect.height <= 0 {
         return;
     }
-    if let Some(tiler) = art.image(art_id::POPUP_TILER)
-        && tiler.width >= 3
-        && tiler.height >= 3
-    {
-        draw_nine_slice(frame, tiler, popup.rect);
-    } else {
-        for y in popup.rect.y..popup.rect.y.saturating_add(popup.rect.height) {
-            for x in popup.rect.x..popup.rect.x.saturating_add(popup.rect.width) {
-                frame.blend(x, y, POPUP_FALLBACK_BG, 210);
+    let tiler = art
+        .image(art_id::POPUP_TILER)
+        .filter(|tiler| tiler.width >= 3 && tiler.height >= 3);
+    let Some(shift) = lot.alpha_shift else {
+        if let Some(tiler) = tiler {
+            draw_nine_slice(frame, tiler, popup.rect);
+        } else {
+            for y in popup.rect.y..popup.rect.y.saturating_add(popup.rect.height) {
+                for x in popup.rect.x..popup.rect.x.saturating_add(popup.rect.width) {
+                    frame.blend(x, y, POPUP_FALLBACK_BG, 210);
+                }
             }
         }
-    }
+        draw_popup_contents(frame, popup, lot, art, [0, 0], true);
+        return;
+    };
 
+    let size = [popup.rect.width as u32, popup.rect.height as u32];
+    let local = Rect::new(0, 0, popup.rect.width, popup.rect.height);
+    let mut card = Frame::new(size[0], size[1], POPUP_FALLBACK_BG);
+    let mut alpha = Frame::new(size[0], size[1], [210, 210, 210]);
+    if let Some(tiler) = tiler {
+        let (colour, coverage) = split_alpha(tiler);
+        draw_nine_slice(&mut card, &colour, local);
+        alpha = Frame::new(size[0], size[1], [0, 0, 0]);
+        draw_nine_slice(&mut alpha, &coverage, local);
+    }
+    draw_popup_contents(
+        &mut card,
+        popup,
+        lot,
+        art,
+        [-popup.rect.x, -popup.rect.y],
+        false,
+    );
+    for y in 0..popup.rect.height {
+        for x in 0..popup.rect.width {
+            let (Some(rgb), Some([a, _, _])) = (card.pixel(x, y), alpha.pixel(x, y)) else {
+                continue;
+            };
+            let level = (i32::from(a) + shift).clamp(0, 255) as u8;
+            frame.blend(popup.rect.x + x, popup.rect.y + y, rgb, level);
+        }
+    }
+}
+
+/// Splits `image` into an opaque copy of its colour and an opaque grey
+/// image of its alpha, so a nine-slice draw copies each.
+fn split_alpha(image: &Image) -> (Image, Image) {
+    let mut colour = image.clone();
+    let mut coverage = image.clone();
+    for (c, a) in colour
+        .rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(coverage.rgba.as_chunks_mut::<4>().0)
+    {
+        let alpha = c[3];
+        c[3] = 255;
+        *a = [alpha, alpha, alpha, 255];
+    }
+    (colour, coverage)
+}
+
+/// Draws the card's text lines and portraits, moved by `offset`.
+fn draw_popup_contents(
+    frame: &mut Frame,
+    popup: &LotPopupLayout,
+    lot: &LotInfo,
+    art: &Art,
+    offset: [i32; 2],
+    outline: bool,
+) {
     if let Some(font) = art.font(10).or_else(|| art.font(12)) {
         let lh = font.line_height.max(1);
         let max_y = popup.text_rect.y.saturating_add(popup.text_rect.height);
@@ -1207,19 +1338,32 @@ fn draw_lot_popup(frame: &mut Frame, popup: &LotPopupLayout, lot: &LotInfo, art:
             if y.saturating_add(lh) > max_y {
                 break;
             }
-            font.draw(frame, line, [popup.text_rect.x, y], TEXT_NORMAL);
+            font.draw(
+                frame,
+                line,
+                [popup.text_rect.x + offset[0], y + offset[1]],
+                TEXT_NORMAL,
+            );
         }
     }
 
     if let Some(occ) = &lot.occupant {
         for (img, &rect) in occ.portraits.iter().zip(&popup.portrait_rects) {
+            let rect = Rect::new(
+                rect.x + offset[0],
+                rect.y + offset[1],
+                rect.width,
+                rect.height,
+            );
             draw_scaled_region(
                 frame,
                 img,
                 Rect::new(0, 0, img.width as i32, img.height as i32),
                 rect,
             );
-            draw_outline(frame, rect, PORTRAIT_BORDER);
+            if outline {
+                draw_outline(frame, rect, PORTRAIT_BORDER);
+            }
         }
     }
 }
