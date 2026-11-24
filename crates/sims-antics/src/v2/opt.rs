@@ -56,8 +56,11 @@ pub(crate) fn optimize_tree_body(body: &str) -> String {
 
 /// Drops the Sim-tree entry save `let __self_obj = stack_obj;` when nothing else names
 /// `__self_obj`. This works line by line, so it also applies to trees the full pass leaves alone
-/// (`raw` blocks): a raw block that reads the save names it. The save is an expression node,
-/// so it goes only when the node after it cannot observe the last result.
+/// (`raw` blocks): a raw block that reads the save names it.
+///
+/// The save is the lowering's own bookkeeping, not part of the program: an unread save is one the
+/// lowering never needed, so it goes even before a node that observes the last result (which
+/// then sees the frame's entry state, as the source says).
 pub(crate) fn drop_unread_entry_save(body: &str) -> Option<String> {
     const SAVE: &str = "let __self_obj = stack_obj;";
     // Deleting the node would shift numeric branch targets (`-> true: 3`), and deleting the
@@ -85,19 +88,10 @@ pub(crate) fn drop_unread_entry_save(body: &str) -> Option<String> {
     if mentions != 1 {
         return None;
     }
-    let next = lines
-        .map(|(_, l)| l.trim())
-        .find(|l| !matches!(classify(l), Kind::Let { init: None, .. }))?;
-    let stripped = strip_strings(next);
-    let ignores = match classify(next) {
-        Kind::Assign { .. } | Kind::Let { init: Some(_), .. } | Kind::Return => {
-            !names_local_slot(&stripped) && !stripped.contains('{')
-        }
-        _ => ["if ", "while "]
-            .iter()
-            .any(|kw| header(&stripped, next, kw).is_some_and(|c| !c.contains('(') && c != "true")),
-    };
-    if !ignores {
+    // Every named local after the save moves down one frame word, which keeps whatever an
+    // earlier frame left there: none may be read before it is written.
+    let nodes = parse_body(body)?;
+    if !locals_defined_before_reads(&nodes) {
         return None;
     }
     let mut out = String::with_capacity(body.len());
@@ -1129,15 +1123,23 @@ fn value_operands_only(text: &str, map: &BTreeMap<String, String>) -> bool {
     true
 }
 
-/// Drops an entry save nothing else names, when the node after it cannot observe the last
-/// result the save sets (a primitive such as `idle_for_input` may read it).
+/// Drops an entry save nothing else names (see `drop_unread_entry_save`), when no named local
+/// that moves down a frame word is read before it is written.
 fn drop_unread_entry_save_node(nodes: &mut Vec<Node>) {
     let Some(name) = entry_save(nodes) else {
         return;
     };
-    if !mentions(&nodes[1..], name) && next_ignores_last_result(&nodes[1..]) {
+    if !mentions(&nodes[1..], name) && locals_defined_before_reads(&nodes[1..]) {
         nodes.remove(0);
     }
+}
+
+/// Whether every named local in `nodes` is written before anything reads it.
+fn locals_defined_before_reads(nodes: &[Node]) -> bool {
+    let mut lets = Vec::new();
+    collect_lets(nodes, &mut lets);
+    lets.iter()
+        .all(|name| defined_before_reads(nodes, name, &mut false))
 }
 
 /// What happens to the stack object after a point, scanning forward in one block.
@@ -1903,10 +1905,17 @@ mod tests {
 
     #[test]
     fn review_regressions_keep_observers() {
-        // A primitive may read the last result the save sets, so the save stays before it.
+        // An unread save goes even before a primitive that reads the last result: that
+        // primitive then sees the frame's entry state, as in the source.
         let body =
             "    let __self_obj = stack_obj;\n    idle_for_input(param[0], 1);\n    return true;\n";
-        assert_eq!(optimize_tree_body(body), body);
+        assert_eq!(
+            optimize_tree_body(body),
+            "    idle_for_input(param[0], 1);\n    return true;\n"
+        );
+        // Not when a local read before it is written would move to another frame word.
+        let body = "    let __self_obj = stack_obj;\n    let __v_x_0;\n    temp[0] := __v_x_0;\n    call 300(temps);\n    return true;\n";
+        assert_eq!(drop_unread_entry_save(body), None);
         // Scope 27 (sprite flags) reads the stack object, so the switch before it stays.
         let body = "    stack_obj := my.id;\n    temp[0] := 0;\n    scope(27, 0) := 1;\n    return true;\n";
         assert_eq!(optimize_tree_body(body), body);

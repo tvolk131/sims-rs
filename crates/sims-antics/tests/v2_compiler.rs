@@ -7805,7 +7805,9 @@ fn readability_builtins_animate_frame_and_raw_lower_exactly() {
         "my.person[40] := 3;",
         // A raw block that only writes attributes and calls a BHAV keeps no dead self save.
         "tree 4201 \"Raw Safe\" {\n    my.attr[0] := 1; call 256(temps);\n    stack.attr[0] := 1;",
-        "tree 4202 \"Raw Clobber\" {\n    let __self_obj = stack_obj;",
+        // A raw block leaves `stack_obj` where it put it (no restore), so nothing reads the
+        // entry save and it is never emitted.
+        "tree 4202 \"Raw Clobber\" {\n    set_to_next(all);\n    stack.attr[0] := 1;",
         // Switching away and straight back is dropped by the backend pass, with the saves.
         "tree 4203 \"Manual Stack\" {\n    stack.attr[0] := 2;\n    return true;",
     ] {

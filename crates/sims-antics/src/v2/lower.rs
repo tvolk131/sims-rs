@@ -13003,23 +13003,29 @@ fn is_stack_obj_operand(op: &crate::ast::OperandRef) -> bool {
     )
 }
 
-/// Raw opcodes known not to write the caller frame's `stack_obj`: BHAV calls (`stack_obj` is per
-/// frame and never copied back) and the operand-free / read-only primitives listed here. Every
-/// other raw opcode (notably Expression `0x0002`, which can name `stack_obj` as its target) is
-/// treated as a clobber.
-fn raw_opcode_keeps_stack_obj(opcode: u16) -> bool {
-    opcode >= 0x0100
-        || matches!(
-            opcode,
-            0x0004 // grab
-                | 0x0005 // drop
-                | 0x0007 // refresh
-                | 0x000F // breakpoint
-                | 0x0019 // alter budget
-                | 0x0023 // special effect
-                | 0x002C // animate
-                | 0x0031 // notify out of idle
-        )
+/// Whether a raw `op <opcode> (bytes)` may write the running frame's `stack_obj`, decoded the
+/// way `sims-vm` runs it. BHAV calls never do (`stack_obj` is per frame and never copied back).
+/// Of the primitives, only these write it: the ones that store into an operand the bytes name
+/// (Expression, Random Number, Get Direction To, Relationship, Set To Next) when that operand is
+/// the stack object (scope 10), and the ones that set it outright (Find Best Interaction, Find
+/// Best Object, Make New Character, Gosub Found Action, Create Object). Unknown opcodes may.
+fn raw_op_may_write_stack_obj(opcode: u16, ops: &[u8; 8]) -> bool {
+    const STACK_OBJ_SCOPE: u16 = 10;
+    let word = |i: usize| u16::from_le_bytes([ops[i], ops[i + 1]]);
+    match opcode {
+        0x0100.. => false,
+        // Expression: left operand scope byte 6.
+        0x0002 => u16::from(ops[6]) == STACK_OBJ_SCOPE,
+        // Random Number / Get Direction To: destination scope word 2.
+        0x0008 | 0x000C => word(2) == STACK_OBJ_SCOPE,
+        // Relationship: value operand scope byte 4 (it is stored when reading).
+        0x001A => u16::from(ops[4]) == STACK_OBJ_SCOPE,
+        // Set To Next: the stack object unless flag 0x80 names a destination (scope byte 5).
+        0x001F => ops[4] & 0x80 == 0 || u16::from(ops[5]) == STACK_OBJ_SCOPE,
+        0x0003 | 0x000E | 0x0013 | 0x001E | 0x002A => true,
+        0x0000..=0x0033 => false,
+        _ => true,
+    }
 }
 
 fn raw_condition_clobbers_stack_obj(cond: &crate::ast::Condition) -> bool {
@@ -13033,7 +13039,9 @@ fn raw_condition_clobbers_stack_obj(cond: &crate::ast::Condition) -> bool {
         }
         crate::ast::Condition::Call { .. } => false,
         crate::ast::Condition::Primitive { prim, .. } => raw_primitive_clobbers_stack_obj(prim),
-        crate::ast::Condition::RawOp { opcode, .. } => !raw_opcode_keeps_stack_obj(*opcode),
+        crate::ast::Condition::RawOp {
+            opcode, operands, ..
+        } => raw_op_may_write_stack_obj(*opcode, operands),
         crate::ast::Condition::Not(inner) => raw_condition_clobbers_stack_obj(inner),
     }
 }
@@ -13059,9 +13067,12 @@ fn raw_air_stmts_clobber_stack_obj(stmts: &[crate::ast::Stmt]) -> bool {
     use crate::ast::Stmt;
     stmts.iter().any(|s| match s {
         Stmt::Assign { lhs, .. } => is_stack_obj_operand(lhs),
-        Stmt::RawOp { opcode, .. } | Stmt::InlineRawOp { opcode, .. } => {
-            !raw_opcode_keeps_stack_obj(*opcode)
+        Stmt::RawOp {
+            opcode, operands, ..
         }
+        | Stmt::InlineRawOp {
+            opcode, operands, ..
+        } => raw_op_may_write_stack_obj(*opcode, operands),
         Stmt::Primitive { prim, .. } => raw_primitive_clobbers_stack_obj(prim),
         Stmt::If {
             cond,
@@ -14197,7 +14208,61 @@ fn _keep_furniture_shape_import(_: FurnitureShape) {}
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_air_cell;
+    use super::{canonical_air_cell, raw_op_may_write_stack_obj};
+
+    /// The raw clobber check follows the VM: operand stores only through scope 10, and the
+    /// primitives that set the stack object outright.
+    #[test]
+    fn raw_ops_that_write_the_stack_object() {
+        let none = [0u8; 8];
+        for opcode in [
+            0x0001, 0x0006, 0x0009, 0x000B, 0x0010, 0x0017, 0x002B, 0x002D, 0x0100,
+        ] {
+            assert!(!raw_op_may_write_stack_obj(opcode, &none), "{opcode:#06x}");
+        }
+        for opcode in [0x0003, 0x000E, 0x0013, 0x001E, 0x002A, 0x0034, 0x00FF] {
+            assert!(raw_op_may_write_stack_obj(opcode, &none), "{opcode:#06x}");
+        }
+        // Expression: left scope byte 6.
+        assert!(raw_op_may_write_stack_obj(
+            0x0002,
+            &[0, 0, 0, 0, 0, 5, 10, 7]
+        ));
+        assert!(!raw_op_may_write_stack_obj(
+            0x0002,
+            &[0, 0, 0, 0, 0, 5, 8, 10]
+        ));
+        // Random Number / Get Direction To: destination scope word 2.
+        for opcode in [0x0008, 0x000C] {
+            assert!(raw_op_may_write_stack_obj(
+                opcode,
+                &[0, 0, 10, 0, 0, 0, 0, 0]
+            ));
+            assert!(!raw_op_may_write_stack_obj(
+                opcode,
+                &[10, 0, 8, 0, 0, 0, 0, 0]
+            ));
+        }
+        // Relationship: value scope byte 4.
+        assert!(raw_op_may_write_stack_obj(
+            0x001A,
+            &[0, 0, 0, 0, 10, 0, 0, 0]
+        ));
+        assert!(!raw_op_may_write_stack_obj(
+            0x001A,
+            &[0, 0, 0, 0, 25, 0, 0, 0]
+        ));
+        // Set To Next: the stack object unless flag 0x80 names another destination.
+        assert!(raw_op_may_write_stack_obj(0x001F, &none));
+        assert!(!raw_op_may_write_stack_obj(
+            0x001F,
+            &[0, 0, 0, 0, 0x80, 25, 0, 1]
+        ));
+        assert!(raw_op_may_write_stack_obj(
+            0x001F,
+            &[0, 0, 0, 0, 0x80, 10, 0, 0]
+        ));
+    }
 
     /// Pins the `person.<field>` spellings to the same indices the `.air` parser, the lifter,
     /// and the UI use, so alias analysis treats both spellings as one VM cell.

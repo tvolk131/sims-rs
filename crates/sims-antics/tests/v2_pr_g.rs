@@ -151,3 +151,57 @@ fn v1_builtin_arguments_are_strict() {
         expect_err(name, &sim_tree(body), needle);
     }
 }
+
+#[test]
+fn n2_entry_save_only_when_the_entry_stack_object_is_read_after_a_move() {
+    let tree = |body: &str| {
+        obj(&format!(
+            "    extern mod g {{ @id(300) fn probe() -> bool; }}\n    tree t (sim: Sim) -> bool {{ {body} }}"
+        ))
+    };
+    // A call comes first and the loop moves `stack_obj`, but nothing reads the entry stack
+    // object afterwards: no save, so the call sees the frame's entry state.
+    let air = expand(
+        "n2_unread.antics",
+        &tree(
+            "if g::probe() { return false; } \
+             let count = 0; \
+             for p in lot.sims() { if p.kind < 2 { count += 1; } } \
+             if count > 2 { return true; } \
+             return false;",
+        ),
+    );
+    assert!(!air.contains("__self_obj"), "{air}");
+    assert!(air.contains("\"t\" {\n    if call 300(temps) {"), "{air}");
+
+    // Reading `self` after the loop needs the save and the restore.
+    let air = expand(
+        "n2_read.antics",
+        &tree(
+            "if g::probe() { return false; } \
+             for p in lot.sims() { } \
+             self.n = 1; \
+             return true;",
+        ),
+    );
+    assert!(air.contains("let __self_obj = stack_obj;"), "{air}");
+    assert!(air.contains("stack_obj := __self_obj;"), "{air}");
+
+    // A raw primitive that cannot write the stack object (Change Suit) needs no save before a
+    // later read of `self`; an Expression storing into scope 10 does.
+    let raw_then_self = |op: &str| {
+        tree(&format!(
+            "raw {{ {op} }} let o = self; if o == sim {{ return true; }} return false;"
+        ))
+    };
+    let air = expand(
+        "n2_raw_keeps.antics",
+        &raw_then_self("op 0x0006 (1, 0, 1, 0, 0, 0, 0, 0);"),
+    );
+    assert!(!air.contains("__self_obj"), "{air}");
+    let air = expand(
+        "n2_raw_writes.antics",
+        &raw_then_self("op 0x0002 (0, 0, 0, 0, 0, 5, 10, 7);"),
+    );
+    assert!(air.contains("let __self_obj = stack_obj;"), "{air}");
+}
