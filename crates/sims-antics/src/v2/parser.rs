@@ -951,6 +951,7 @@ impl Parser {
             ident,
             label,
             sim_binding,
+            inherit_context: false,
             params,
             ret,
             body,
@@ -1075,19 +1076,31 @@ impl Parser {
         self.expect(&TokenKind::LBrace, "'{'")?;
         let mut members = Vec::new();
         while !self.eat(&TokenKind::RBrace) {
-            // Parse optional `@id(N)` / `@guard_id(N)` annotations.
+            // Parse optional member annotations.
             let mut pinned_id: Option<u16> = None;
             let mut pinned_guard_id: Option<u16> = None;
             let mut frame: Option<TreeFrame> = None;
+            let mut inherit_context = None;
             while self.eat(&TokenKind::At) {
                 let (attr, aspan) =
-                    self.expect_ident("attribute name ('id', 'guard_id', or 'frame')")?;
+                    self.expect_ident("attribute name ('id', 'guard_id', 'frame', or 'context')")?;
                 self.expect(&TokenKind::LParen, "'('")?;
                 if attr == "frame" {
                     if frame.is_some() {
                         return Err(Error::at(aspan, "duplicate @frame annotation"));
                     }
                     frame = Some(self.parse_frame_fields(aspan)?);
+                    continue;
+                }
+                if attr == "context" {
+                    if inherit_context.replace(aspan).is_some() {
+                        return Err(Error::at(aspan, "duplicate @context annotation"));
+                    }
+                    let (mode, span) = self.expect_ident("'inherit'")?;
+                    if mode != "inherit" {
+                        return Err(Error::at(span, "expected '@context(inherit)'"));
+                    }
+                    self.expect(&TokenKind::RParen, "')'")?;
                     continue;
                 }
                 let id = self.expect_u16("BHAV tree id")?;
@@ -1138,6 +1151,14 @@ impl Parser {
                 return Err(Error::at(
                     f.span,
                     "@frame(...) is only allowed on a standalone 'tree' or on init, main, load, reset, or cleanup",
+                ));
+            }
+            if let Some(span) = inherit_context
+                && kw != "tree"
+            {
+                return Err(Error::at(
+                    span,
+                    "@context(inherit) is only allowed on a standalone 'tree'",
                 ));
             }
             if pinned_guard_id.is_some() && !matches!(kw.as_str(), "functional" | "interaction") {
@@ -1243,6 +1264,15 @@ impl Parser {
                 }
                 "tree" => {
                     let mut tree = self.parse_tree_member(kw_span, pinned_id)?;
+                    if let Some(span) = inherit_context {
+                        if tree.sim_binding.is_some() {
+                            return Err(Error::at(
+                                span,
+                                "@context(inherit) cannot declare a Sim parameter",
+                            ));
+                        }
+                        tree.inherit_context = true;
+                    }
                     tree.frame = frame;
                     members.push(ObjectMember::Tree(tree));
                 }

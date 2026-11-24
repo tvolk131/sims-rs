@@ -142,6 +142,8 @@ pub struct TreeMemberDecl {
     pub label: String,
     /// `Some(name)` when the first parameter is `name: Sim` (Sim-on-object context).
     pub sim_binding: Option<String>,
+    /// `@context(inherit)` lets callers supply either frame context unchanged.
+    pub inherit_context: bool,
     pub params: Vec<AbiParam>,
     pub ret: ReturnAbi,
     pub body: Vec<V2Stmt>,
