@@ -3374,6 +3374,9 @@ struct TreeLowerer<'a> {
     inline_call_stack: Vec<String>,
     inline_expansions: usize,
     active_inline_fn: Option<ActiveInlineFn>,
+    /// Nonzero while lowering code that is only checked and then discarded (a folded-away
+    /// branch or loop body); `raw` blocks are syntax-checked there.
+    checking_discarded: usize,
 }
 
 impl<'a> TreeLowerer<'a> {
@@ -3406,6 +3409,7 @@ impl<'a> TreeLowerer<'a> {
             inline_call_stack: Vec::new(),
             inline_expansions: 0,
             active_inline_fn: None,
+            checking_discarded: 0,
         }
     }
 
@@ -3456,6 +3460,19 @@ impl<'a> TreeLowerer<'a> {
     }
 
     /// Resolves a `tree_ident(...)` / `extern_mod::fn_name(...)` call target, if `callee` is one.
+    /// Whether `name` is read-only in `stmts`: assigned, borrowed `&mut`, or handed to an
+    /// unshadowed builtin that writes a named local.
+    fn stmts_write_ident(&self, stmts: &[V2Stmt], name: &str) -> Result<bool> {
+        let mut active = Vec::new();
+        for b in LOCAL_WRITING_BUILTINS {
+            let callee = V2Expr::Ident(Span::default(), (*b).to_owned());
+            if !self.user_callable_named(&callee, Span::default())? {
+                active.push(*b);
+            }
+        }
+        Ok(stmts_mutate_or_borrow_ident_in(stmts, name, &active))
+    }
+
     /// Whether a user `fn`, `tree`, or `extern` answers to `callee` (it then wins over a builtin
     /// of the same name).
     fn user_callable_named(&self, callee: &V2Expr, span: Span) -> Result<bool> {
@@ -4572,6 +4589,9 @@ impl<'a> TreeLowerer<'a> {
                 let folded = self
                     .try_eval_const_bool_inner(cond, true)
                     .or_else(|| self.try_fold_literal_cond(cond));
+                if folded.is_some() {
+                    self.check_folded_cond(cond)?;
+                }
                 // A constant-false loop never runs: its body is only checked.
                 if folded == Some(false) {
                     return self.check_dead_branch_as(body, true);
@@ -4795,6 +4815,7 @@ impl<'a> TreeLowerer<'a> {
                     .try_eval_const_bool(cond)
                     .or_else(|| self.try_fold_literal_cond(cond))
                 {
+                    self.check_folded_cond(cond)?;
                     let (chosen, dead) = if const_b {
                         (then_body, else_body)
                     } else {
@@ -5018,6 +5039,15 @@ impl<'a> TreeLowerer<'a> {
                     let mut defined_labels = BTreeSet::new();
                     collect_raw_air_labels(stmts, &mut defined_labels);
                     validate_raw_air_stmts(stmts, false, &defined_labels, *span)?;
+                } else if self.checking_discarded > 0 {
+                    // Discarded code is never parsed by the `.air` compiler, so check it here.
+                    let wrapped = format!("tree 4096 \"__raw_check\" {{\n{code}\n}}\n");
+                    crate::parser::parse_module(&wrapped).map_err(|e| {
+                        Error::at(
+                            *span,
+                            format!("invalid .air syntax in raw block: {}", e.message),
+                        )
+                    })?;
                 }
                 for raw_line in code.lines() {
                     let trimmed = raw_line.trim();
@@ -5051,7 +5081,7 @@ impl<'a> TreeLowerer<'a> {
         rev: bool,
         body: &[V2Stmt],
     ) -> Result<()> {
-        if stmts_mutate_or_borrow_ident(body, binding) {
+        if self.stmts_write_ident(body, binding)? {
             return Err(Error::at(
                 start.span(),
                 format!("the range loop variable '{binding}' is read-only"),
@@ -6424,9 +6454,20 @@ impl<'a> TreeLowerer<'a> {
 
     /// `.air` local name of a v2 `i16` local variable used as a primitive's local slot.
     fn builtin_local_arg(&self, expr: &V2Expr, what: &str) -> Result<String> {
+        self.builtin_local_arg_typed(expr, what, true)
+    }
+
+    /// [`Self::builtin_local_arg`]; an `enum` local is accepted only with `allow_enum` (a slot
+    /// the VM writes arbitrary codes into must be a plain `i16`).
+    fn builtin_local_arg_typed(
+        &self,
+        expr: &V2Expr,
+        what: &str,
+        allow_enum: bool,
+    ) -> Result<String> {
         if let V2Expr::Ident(_, name) = expr
             && let Some(Binding::Local { air_name, ty }) = self.lookup_var(name)
-            && matches!(ty, ValueType::I16 | ValueType::Enum(_))
+            && (*ty == ValueType::I16 || (allow_enum && matches!(ty, ValueType::Enum(_))))
         {
             return Ok(air_name.clone());
         }
@@ -6498,7 +6539,7 @@ impl<'a> TreeLowerer<'a> {
         let local = match named.get("local") {
             Some(a) => {
                 flags |= 0x20;
-                Some(self.builtin_local_arg(&a.value, "animate(local:)")?)
+                Some(self.builtin_local_arg_typed(&a.value, "animate(local:)", false)?)
             }
             None if flags & 0x20 != 0 => {
                 let a = named.get("flags").expect("flags were given");
@@ -6528,7 +6569,7 @@ impl<'a> TreeLowerer<'a> {
         body: &[V2Stmt],
     ) -> Result<()> {
         if let Some(name) = event
-            && stmts_mutate_or_borrow_ident(body, name)
+            && self.stmts_write_ident(body, name)?
         {
             return Err(Error::at(
                 span,
@@ -8930,8 +8971,9 @@ impl<'a> TreeLowerer<'a> {
                             | "route_to"
                             | "snap"
                             | "find_best_object"
-                            | "create_object"
-                    ) {
+                    ) || (fname == "create_object"
+                        && !self.user_callable_named(callee, *span)?)
+                    {
                         let tmp = self.fresh("call");
                         self.line(format!("let {tmp} = 0;"));
                         self.emit_bool_into_local(expr, &tmp)?;
@@ -9242,29 +9284,73 @@ impl<'a> TreeLowerer<'a> {
         if stmts.is_empty() {
             return Ok(());
         }
+        self.check_discarded(|c| {
+            c.push_scope(if loop_body {
+                ScopeFrame {
+                    is_loop_body: true,
+                    is_air_while: true,
+                    owner_defer_id: c.current_defer_id,
+                    ..ScopeFrame::block()
+                }
+            } else {
+                ScopeFrame::block()
+            });
+            let r = c.lower_stmts(stmts);
+            let p = c.pop_scope_and_run_cleanups();
+            r.and(p)
+        })
+    }
+
+    /// Checks a folded condition in full, including operands that short-circuiting skipped.
+    fn check_folded_cond(&mut self, cond: &V2Expr) -> Result<()> {
+        self.check_discarded(|c| c.check_cond_operands(cond))
+    }
+
+    fn check_cond_operands(&mut self, cond: &V2Expr) -> Result<()> {
+        match cond {
+            V2Expr::Binary {
+                lhs,
+                op: V2BinOp::And | V2BinOp::Or,
+                rhs,
+                ..
+            } => {
+                self.check_cond_operands(lhs)?;
+                self.check_cond_operands(rhs)
+            }
+            V2Expr::Unary {
+                op: V2UnaryOp::Not,
+                inner,
+                ..
+            } => self.check_cond_operands(inner),
+            _ if self.try_eval_const_bool(cond).is_some() => Ok(()),
+            _ => {
+                let tmp = self.fresh("folded");
+                self.emit_bool_into_local(cond, &tmp)
+            }
+        }
+    }
+
+    /// Runs `f`, then throws away everything it emitted or allocated (output, fresh names,
+    /// dialog strings, defer ids), keeping only its result.
+    fn check_discarded(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
         let out_len = self.out.len();
         let indent = self.indent;
         let used_saved = self.used_saved_stack_obj;
         let expansions = self.inline_expansions;
+        let next_id = self.next_id;
+        let defer_generation = self.defer_generation;
         let strings = self.env.dialog_strings.borrow().clone();
-        self.push_scope(if loop_body {
-            ScopeFrame {
-                is_loop_body: true,
-                is_air_while: true,
-                owner_defer_id: self.current_defer_id,
-                ..ScopeFrame::block()
-            }
-        } else {
-            ScopeFrame::block()
-        });
-        let r = self.lower_stmts(stmts);
-        let p = self.pop_scope_and_run_cleanups();
+        self.checking_discarded += 1;
+        let r = f(self);
+        self.checking_discarded -= 1;
         self.out.truncate(out_len);
         self.indent = indent;
         self.used_saved_stack_obj = used_saved;
         self.inline_expansions = expansions;
+        self.next_id = next_id;
+        self.defer_generation = defer_generation;
         *self.env.dialog_strings.borrow_mut() = strings;
-        r.and(p)
+        r
     }
 
     fn try_eval_const_bool(&self, expr: &V2Expr) -> Option<bool> {
@@ -10531,8 +10617,15 @@ impl<'a> TreeLowerer<'a> {
         };
         let mut mode = "here".to_owned();
         let mut flags = 0u8;
+        let mut local = None;
         for arg in opt_args {
             match arg.name.as_deref() {
+                Some("local") => {
+                    local = Some((
+                        arg.span,
+                        self.builtin_local_arg(&arg.value, "create_object(local:)")?,
+                    ));
+                }
                 Some("mode") => match &arg.value {
                     V2Expr::Ident(_, m) => mode = m.clone(),
                     V2Expr::Int(_, n) => mode = n.to_string(),
@@ -10557,11 +10650,29 @@ impl<'a> TreeLowerer<'a> {
                 None => {
                     return Err(Error::at(
                         arg.span,
-                        "extra create_object arguments must be named ('mode:', 'flags:')",
+                        "extra create_object arguments must be named ('mode:', 'flags:', 'local:')",
                     ));
                 }
             }
         }
+        // Modes `local_pos` (8) and `turned` (9) read a local slot: it must be named.
+        let reads_local = matches!(mode.as_str(), "local_pos" | "turned" | "8" | "9");
+        let local_text = match (reads_local, local) {
+            (true, Some((_, air))) => format!(", local: {air}"),
+            (true, None) => {
+                return Err(Error::at(
+                    span,
+                    format!("create_object mode '{mode}' reads a local; name it with 'local:'"),
+                ));
+            }
+            (false, Some((lspan, _))) => {
+                return Err(Error::at(
+                    lspan,
+                    format!("create_object mode '{mode}' does not read 'local:'"),
+                ));
+            }
+            (false, None) => String::new(),
+        };
         if is_typed && (flags & 0x04) != 0 {
             return Err(Error::at(
                 span,
@@ -10569,7 +10680,7 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
         Ok((
-            format!("create_object({guid:#010x}, mode: {mode}, flags: {flags:#04x})"),
+            format!("create_object({guid:#010x}, mode: {mode}, flags: {flags:#04x}{local_text})"),
             result_ty,
         ))
     }
@@ -11207,10 +11318,18 @@ fn expr_starts_with_not_self_field(expr: &V2Expr, field_name: &str) -> bool {
     }
 }
 
+/// The builtins whose arguments can name a local they write (see [`builtin_args_write_ident`]).
+const LOCAL_WRITING_BUILTINS: &[&str] =
+    &["random_into", "animate", "set_headline", "push_interaction"];
+
 fn stmts_mutate_or_borrow_ident(stmts: &[V2Stmt], target_name: &str) -> bool {
+    stmts_mutate_or_borrow_ident_in(stmts, target_name, LOCAL_WRITING_BUILTINS)
+}
+
+fn stmts_mutate_or_borrow_ident_in(stmts: &[V2Stmt], target_name: &str, w: &[&str]) -> bool {
     stmts.iter().any(|s| match s {
         V2Stmt::Let { name, init, .. } => {
-            name == target_name || expr_borrows_ident(init, target_name)
+            name == target_name || expr_borrows_ident_in(init, target_name, w)
         }
         V2Stmt::LetSome {
             name,
@@ -11219,28 +11338,29 @@ fn stmts_mutate_or_borrow_ident(stmts: &[V2Stmt], target_name: &str) -> bool {
             ..
         } => {
             name == target_name
-                || expr_borrows_ident(init, target_name)
-                || stmts_mutate_or_borrow_ident(else_body, target_name)
+                || expr_borrows_ident_in(init, target_name, w)
+                || stmts_mutate_or_borrow_ident_in(else_body, target_name, w)
         }
         V2Stmt::Assign { target, value, .. } => {
             matches!(target, V2Expr::Ident(_, n) if n == target_name)
-                || expr_borrows_ident(target, target_name)
-                || expr_borrows_ident(value, target_name)
+                || expr_borrows_ident_in(target, target_name, w)
+                || expr_borrows_ident_in(value, target_name, w)
         }
         V2Stmt::WithLock {
             lock_expr, body, ..
         } => {
             matches!(lock_expr, V2Expr::Ident(_, n) if n == target_name)
-                || expr_borrows_ident(lock_expr, target_name)
-                || stmts_mutate_or_borrow_ident(body, target_name)
+                || expr_borrows_ident_in(lock_expr, target_name, w)
+                || stmts_mutate_or_borrow_ident_in(body, target_name, w)
         }
-        V2Stmt::Defer { body, .. } => stmts_mutate_or_borrow_ident(body, target_name),
+        V2Stmt::Defer { body, .. } => stmts_mutate_or_borrow_ident_in(body, target_name, w),
         V2Stmt::Repeat { count, body, .. } => {
-            expr_borrows_ident(count, target_name)
-                || stmts_mutate_or_borrow_ident(body, target_name)
+            expr_borrows_ident_in(count, target_name, w)
+                || stmts_mutate_or_borrow_ident_in(body, target_name, w)
         }
         V2Stmt::While { cond, body, .. } => {
-            expr_borrows_ident(cond, target_name) || stmts_mutate_or_borrow_ident(body, target_name)
+            expr_borrows_ident_in(cond, target_name, w)
+                || stmts_mutate_or_borrow_ident_in(body, target_name, w)
         }
         V2Stmt::ForEach {
             binding,
@@ -11251,13 +11371,13 @@ fn stmts_mutate_or_borrow_ident(stmts: &[V2Stmt], target_name: &str) -> bool {
             binding == target_name
                 || match iter {
                     ForEachIter::Range { start, end, .. } => {
-                        expr_borrows_ident(start, target_name)
-                            || expr_borrows_ident(end, target_name)
+                        expr_borrows_ident_in(start, target_name, w)
+                            || expr_borrows_ident_in(end, target_name, w)
                     }
-                    ForEachIter::ObjectsByGuid(e) => expr_borrows_ident(e, target_name),
+                    ForEachIter::ObjectsByGuid(e) => expr_borrows_ident_in(e, target_name, w),
                     _ => false,
                 }
-                || stmts_mutate_or_borrow_ident(body, target_name)
+                || stmts_mutate_or_borrow_ident_in(body, target_name, w)
         }
         V2Stmt::If {
             cond,
@@ -11265,31 +11385,31 @@ fn stmts_mutate_or_borrow_ident(stmts: &[V2Stmt], target_name: &str) -> bool {
             else_body,
             ..
         } => {
-            expr_borrows_ident(cond, target_name)
-                || stmts_mutate_or_borrow_ident(then_body, target_name)
-                || stmts_mutate_or_borrow_ident(else_body, target_name)
+            expr_borrows_ident_in(cond, target_name, w)
+                || stmts_mutate_or_borrow_ident_in(then_body, target_name, w)
+                || stmts_mutate_or_borrow_ident_in(else_body, target_name, w)
         }
         V2Stmt::Match {
             scrutinee, arms, ..
         } => {
-            expr_borrows_ident(scrutinee, target_name)
+            expr_borrows_ident_in(scrutinee, target_name, w)
                 || arms
                     .iter()
-                    .any(|a| stmts_mutate_or_borrow_ident(&a.body, target_name))
+                    .any(|a| stmts_mutate_or_borrow_ident_in(&a.body, target_name, w))
         }
         V2Stmt::Return { value: Some(e), .. } | V2Stmt::Expr { expr: e, .. } => {
-            expr_borrows_ident(e, target_name)
+            expr_borrows_ident_in(e, target_name, w)
         }
         V2Stmt::LetUninit { name, .. } => name == target_name,
         V2Stmt::Animate {
             args, event, body, ..
         } => {
             event.as_deref() == Some(target_name)
-                || builtin_args_write_ident("animate", args, target_name)
+                || builtin_args_write_ident("animate", args, target_name, w)
                 || args
                     .iter()
-                    .any(|a| expr_borrows_ident(&a.value, target_name))
-                || stmts_mutate_or_borrow_ident(body, target_name)
+                    .any(|a| expr_borrows_ident_in(&a.value, target_name, w))
+                || stmts_mutate_or_borrow_ident_in(body, target_name, w)
         }
         V2Stmt::Break { .. }
         | V2Stmt::Continue { .. }
@@ -11300,9 +11420,17 @@ fn stmts_mutate_or_borrow_ident(stmts: &[V2Stmt], target_name: &str) -> bool {
 }
 
 /// Whether a call to the builtin `fname` names `target_name` as a local it may write (or, for the
-/// local-slot arguments of `set_headline`/`push_interaction`, hand to the VM by slot). This is
-/// conservative: a user function with the same name is treated the same way.
-fn builtin_args_write_ident(fname: &str, args: &[CallArg], target_name: &str) -> bool {
+/// local-slot arguments of `set_headline`/`push_interaction`, hand to the VM by slot). Only
+/// names in `builtins` (the ones no user callable shadows) count.
+fn builtin_args_write_ident(
+    fname: &str,
+    args: &[CallArg],
+    target_name: &str,
+    builtins: &[&str],
+) -> bool {
+    if !builtins.contains(&fname) {
+        return false;
+    }
     let is_target = |e: &V2Expr| matches!(e, V2Expr::Ident(_, n) if n == target_name);
     match fname {
         "random_into" => args
@@ -11315,29 +11443,32 @@ fn builtin_args_write_ident(fname: &str, args: &[CallArg], target_name: &str) ->
     }
 }
 
-fn expr_borrows_ident(expr: &V2Expr, target_name: &str) -> bool {
+fn expr_borrows_ident_in(expr: &V2Expr, target_name: &str, w: &[&str]) -> bool {
     match expr {
         V2Expr::MutRef { inner, .. } => {
             matches!(inner.as_ref(), V2Expr::Ident(_, n) if n == target_name)
-                || expr_borrows_ident(inner, target_name)
+                || expr_borrows_ident_in(inner, target_name, w)
         }
         V2Expr::Field { base, .. }
         | V2Expr::Deref { inner: base, .. }
         | V2Expr::Unary { inner: base, .. }
-        | V2Expr::Try { inner: base, .. } => expr_borrows_ident(base, target_name),
+        | V2Expr::Try { inner: base, .. } => expr_borrows_ident_in(base, target_name, w),
         V2Expr::Index { base, index, .. } => {
-            expr_borrows_ident(base, target_name) || expr_borrows_ident(index, target_name)
+            expr_borrows_ident_in(base, target_name, w)
+                || expr_borrows_ident_in(index, target_name, w)
         }
         V2Expr::Binary { lhs, rhs, .. } => {
-            expr_borrows_ident(lhs, target_name) || expr_borrows_ident(rhs, target_name)
+            expr_borrows_ident_in(lhs, target_name, w) || expr_borrows_ident_in(rhs, target_name, w)
         }
-        V2Expr::Tuple(_, elems) => elems.iter().any(|e| expr_borrows_ident(e, target_name)),
+        V2Expr::Tuple(_, elems) => elems
+            .iter()
+            .any(|e| expr_borrows_ident_in(e, target_name, w)),
         V2Expr::Call { callee, args, .. } => {
-            expr_borrows_ident(callee, target_name)
-                || matches!(callee.as_ref(), V2Expr::Ident(_, f) if builtin_args_write_ident(f, args, target_name))
+            expr_borrows_ident_in(callee, target_name, w)
+                || matches!(callee.as_ref(), V2Expr::Ident(_, f) if builtin_args_write_ident(f, args, target_name, w))
                 || args
                     .iter()
-                    .any(|a| expr_borrows_ident(&a.value, target_name))
+                    .any(|a| expr_borrows_ident_in(&a.value, target_name, w))
         }
         V2Expr::MethodCall {
             receiver,
@@ -11347,10 +11478,10 @@ fn expr_borrows_ident(expr: &V2Expr, target_name: &str) -> bool {
         } => {
             (matches!(method.as_str(), "set" | "clear")
                 && matches!(receiver.as_ref(), V2Expr::Ident(_, n) if n == target_name))
-                || expr_borrows_ident(receiver, target_name)
+                || expr_borrows_ident_in(receiver, target_name, w)
                 || args
                     .iter()
-                    .any(|a| expr_borrows_ident(&a.value, target_name))
+                    .any(|a| expr_borrows_ident_in(&a.value, target_name, w))
         }
         V2Expr::Int(..)
         | V2Expr::Bool(..)
@@ -11655,24 +11786,25 @@ fn stmts_may_clobber_stack_obj(
         }
         V2Stmt::ForEach { .. } => true,
         V2Stmt::RawAir { code, .. } => raw_air_may_clobber_stack_obj(code),
-        V2Stmt::Animate { args, body, .. } => {
-            args.iter().any(|a| {
-                expr_may_clobber_stack_obj(
-                    &a.value,
+        V2Stmt::Animate {
+            span, args, body, ..
+        } => {
+            // Analysed as a call, so a user `fn animate` that shadows the builtin is followed.
+            let call = V2Expr::Call {
+                span: *span,
+                callee: Box::new(V2Expr::Ident(*span, "animate".to_owned())),
+                type_args: Vec::new(),
+                args: args.clone(),
+            };
+            expr_may_clobber_stack_obj(&call, env, owner_mod, allow_local_fns, sim_name, depth)
+                || stmts_may_clobber_stack_obj(
+                    body,
                     env,
                     owner_mod,
                     allow_local_fns,
                     sim_name,
                     depth,
                 )
-            }) || stmts_may_clobber_stack_obj(
-                body,
-                env,
-                owner_mod,
-                allow_local_fns,
-                sim_name,
-                depth,
-            )
         }
         V2Stmt::If {
             cond,

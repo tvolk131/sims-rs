@@ -52,12 +52,12 @@ Constraints:
   - `const` items;
   - constant helper bindings (`ConstEnum`, `ConstBool`, literal `ConstI16`).
 
-  For example, `kind == Menu::Meal` inside an inlined `publish_menu(Menu::Meal)` folds away. The untaken branch (or the body of a constant-false loop) is still lowered into a discarded buffer, so it stays type- and symbol-checked. This now also applies to plain `bool` constants (`if true { } else { ... }`). Enum values fold only for `==`/`!=`; an ordering compare takes the checked path and its error. Object `i16` params stay runtime `bcon.x` reads.
+  For example, `kind == Menu::Meal` inside an inlined `publish_menu(Menu::Meal)` folds away. The untaken branch (or the body of a constant-false loop), and every operand of the folded condition (including ones `&&`/`||` short-circuit), are still lowered into a discarded buffer, so they stay type- and symbol-checked. `raw` blocks there are syntax-checked by the `.air` parser. The discarded pass leaves fresh-name counters, `defer` ids and dialog strings untouched. This now also applies to plain `bool` constants (`if true { } else { ... }`). Enum values fold only for `==`/`!=`; an ordering compare takes the checked path and its error. Object `i16` params stay runtime `bcon.x` reads.
 - **Tail-return bool helpers.** Some `fn -> bool` helpers are used as a condition with a body of *straight-line statements followed by one `return <cond>;`*. The body may contain loops, but no other `return` and no top-level `defer`. Such a helper is inlined without the `__fn_ret`/`__ret`/`__cond` loop wrapper, and its condition becomes the caller's branch.
 - **`init`/`main` ID allocation.** This needed no change. Explicitly pinned private tree IDs are reserved first, and `init`/`main` take the lowest free private IDs. A test pins `@id(4096) tree` with `init` = 4097 and `main` = 4098.
 
 ### 3. Language features (no `raw`)
-- **`loop { ... }`** is an infinite loop, like Rust's. It supports `break`/`continue`/`return`. `while true` behaves the same. Return analysis treats one without a `break` as never falling through, unless it is `cancel_on_abort` (a cancel leaves it, so a following `defer` still runs).
+- **`loop { ... }`** is an infinite loop, like Rust's. It supports `break`/`continue`/`return`. `while true` behaves the same. Return analysis treats one without a `break` as never falling through, unless it is `cancel_on_abort` (a cancel leaves it, so a following `defer` still runs). That analysis is syntactic, like Rust's (which accepts `loop { }` but not `while 1 == 1 { }` as diverging). Only the literal `true` spelling counts, even though `while 1 == 1` folds to the same `.air`.
 - **Counted loops.** Bounds are any `i16` expressions; non-literal ones are snapshotted once into fresh locals (start first, then end), as in Rust. The VM's `inc_lt`/`dec_gt` step the cursor with i16 wrap-around and then compare, which gives two forms:
   - **One node per iteration** whenever the adjusted bounds stay inside i16:
     - `a..b` → `i := a - 1; while i inc_lt b { ... }`, always (a wrapped `-32768 - 1` steps back to `-32768`);
@@ -65,8 +65,8 @@ Constraints:
     - `(a..b).rev()` → `i := b; while i dec_gt a - 1 { ... }`, for literal bounds above `-32768`;
     - `(a..=b).rev()` → the same with `b + 1`, for literal `a > -32768` and `b < 32767`.
   - **Edge-safe form** for every other range (a run-time inclusive or reversed bound, or a literal at the edge): `if a < b { i := first; while true { ...; if i == last { break; } i ±= 1; } }` (`<=` for `..=`). It never steps past the last value, so `0..=32767` runs 32768 times and `(0..-32768).rev()` runs zero times. `continue` runs the same step-or-leave check first.
-  - `i` is read-only: assigning it, borrowing it as `&mut` (including inside a nested range's bounds), or naming it as a builtin's written local (`random_into`'s target, `animate(local:)`, and conservatively the local-slot arguments of `set_headline`/`push_interaction`) is an error.
-  - The parser takes any start expression: `self.count..3` and `(n + 1)..m` are ranges; only `(a..b).rev()` is the reversed form.
+  - `i` is read-only: assigning it, borrowing it as `&mut` (including inside a nested range's bounds), or naming it as a builtin's written local (`random_into`'s target, `animate(local:)`, and conservatively the local-slot arguments of `set_headline`/`push_interaction`) is an error. A user function that shadows one of those builtins is an ordinary call.
+  - The parser takes any start expression: `self.count..3`, `(n + 1)..m`, and a local named like a builtin iterator are ranges. Iterators are recognised by their call syntax (`objects_by_guid(`, `objects_of::`, `lot.x(`, `self.x(`). A parenthesized range followed by `..` is committed to the `(a..b).rev()` form, so its errors point at the range.
 - **Range patterns** in `match` on `i16`: `lo..hi` and `lo..=hi`, with literal bounds (negatives allowed).
   - Overlapping arms and empty ranges are errors.
   - Range patterns are rejected on `dialog(...)` and enum matches.
@@ -77,7 +77,7 @@ Constraints:
   - As a condition (`if animate(...)`), it takes one step: true means the clip finished, false means an event fired.
   - `animate(...) |event| { ... }` runs the body once per event, also as `while !animate(...) { ... }`. `break`, `continue`, and `return` work in the body.
   - `event` is read-only (writing or borrowing it is an error) and reads `param[0]`, where the VM stores events by default.
-  - With `local: x` (an `i16` local), the VM stores events in `x` instead (flag `0x20` is set), and `event` names that local. Use `local:` in a tree whose `param[0]` is a real parameter. Flag `0x20` without `local:` is an error, since the events would land in an unnamed local.
+  - With `local: x` (a plain `i16` local, not an `enum` one, since any event code can land there), the VM stores events in `x` instead (flag `0x20` is set), and `event` names that local. Use `local:` in a tree whose `param[0]` is a real parameter. Flag `0x20` without `local:` is an error, since the events would land in an unnamed local.
 - **`const NAME = <int>;`** works at module level (with `pub` + `use`) and as an object/template member. A constant is an `i16` when it fits. Otherwise it is a 32-bit GUID, usable only where a GUID is expected; using it as a value is an error.
 - **`x.is_type(GUID)`** works on an object handle (`self`, a Sim, `stack_obj`, or an `ObjectId`/typed object). It lowers to `test_object_type(guid, object: ...)` and is usable directly as a condition, negated, or as a `bool` value.
 - **Lot iterators.**
@@ -94,6 +94,7 @@ Constraints:
   | `go_to_relative(location:, facing:, options:)` | `go_to_relative` |
   | `manage_inventory(op:, kind:, flags:, guid:)` | `manage_inventory` |
   | `refresh(target: self \| sim \| stack_obj, mode:)` | `refresh` (`self` is `stack_obj` in a Sim-on-object tree and `me` in `init`/`main`; `sim` is `me`) |
+  | `create_object(GUID, mode: local_pos \| turned, local: x)` | `create_object(..., local: x)`: the modes that read a local slot (8, 9) must name it, and other modes reject `local:` |
   | `action_label(table:, index:)` | `action_string` |
   | `show_string(table:, index:)` | `show_string` |
   | `set_headline(kind:, index:, duration:, options:, stack_obj:, local:)` | `set_headline` |
@@ -109,13 +110,13 @@ Constraints:
   - Positional, unknown, and duplicate keys are errors.
   - Flag bits that make the VM read an operand as a local slot index are handled explicitly. `push_interaction(icon: x)` sets flag `0x01`, and `0x01` without `icon:` is an error. `push_interaction` flag `0x02` (object from a local) and `special_effect` flag `0x20` (duration from a local) are rejected, because those operands are raw slot indices that v2 cannot name.
   - `random_into` writes a direct `i16` slot: a local, attribute, or field of this object. A global range is copied into a fresh local first, because the VM's Random Number writes the draw into a global range operand (the original's pointer aliasing). The existing `random(n)` gets the same copy.
-- **Name precedence.** The new builtin names (and the op wrappers below) were never reserved. A user `fn`, `tree`, or `extern` with the same name keeps winning, in statements, conditions, and values, so existing code is unaffected. `animate(...);` then calls the user function, and the `|event|` handler form is an error.
+- **Name precedence.** The new builtin names (and the op wrappers below) were never reserved. A user `fn`, `tree`, or `extern` with the same name keeps winning, in statements, conditions, and values, so existing code is unaffected. `animate(...);` then calls the user function, and the `|event|` handler form is an error. The `stack_obj` clobber analysis and the read-only checks follow the user function, not the builtin.
 - **Fields.**
   - `sim.hand` is `my.slot[0]` (an `ObjectId`); `sim.slot[i]` is `my.slot[i]`. Both are read-only: the VM's slot scope has no write path.
   - `sim.age` is `my.person[58]`; `sim.person[i]` is `my.person[i]`.
   - `self.flags` is `data[8]`, an untyped bitfield that accepts any `bitflags` value in `.contains/.set/.clear`. Typed bitflags stay strictly typed.
   - `advert.delta[m]`, `advert.personality[m]`, and `advert.minimum[m]` are the advertisement scopes `scope(12, m)`, `scope(28, m)`, and `scope(29, m)`. `m` is a motive (name, `Motive::X`, or `0..16`).
-  - `stack_obj` can be read (`ObjectId`) and assigned. Assigning it counts as a clobber, so the self save is kept. Restore with `stack_obj = self`.
+  - `stack_obj` can be read (`ObjectId`) and assigned. Assigning it counts as a clobber, so the self save is kept. Restore with `stack_obj = self`. In a Sim-on-object tree, everything that means "this object" (`self.field`, `self.is_type`, `refresh(target: self)`) is the current stack object. After you reassign it (or after `find_best_interaction()`), those refer to the new object until you restore it. That is deliberate: it is how the original authoring model works, and a raw-level author relies on it. Builtins that change it as a side effect (`create_object`, foreign field reads, run-functional calls) put it back themselves.
   - `let x: T;` declares a variable without initializing it. It reads whatever the local slot holds (0 at tree entry); there is no definite-assignment check.
 - **Low-level opcodes as `op` builtins.**
   - `find_best_interaction()` (0x0003), `grab()` (0x0004), `drop()` (0x0005), `gosub_found_action()` (0x001E), and `notify_out_of_idle()` (0x0031) lower to `op 0xNNNN (0, ..., 0)`.
@@ -126,7 +127,7 @@ Constraints:
 
 - Most pilot raw sites and shims now have a v2 spelling. The remaining exits from inlined helpers are covered by `return error;` and tail-return bool helpers.
 - The output is closer to what the original authoring tools produced: no dead save, `[0xFF;8]` argless calls, pinned headers, and fewer always-true and wrapper nodes. The aligner prototype from the pilot is not upstreamed; that stays future work.
-- **Review hardening.** A first review round found the range edge cases, extra `stack_obj` writers, the cancel/`defer` path, and the builtin argument holes above. Each fix has a synthetic regression test; the range edges and folded loops run live in the VM.
+- **Review hardening.** Two review rounds found the range edge cases, extra `stack_obj` writers, the cancel/`defer` path, builtin shadowing gaps, unchecked folded code, and the builtin argument holes above. Each fix has a synthetic regression test; the range edges and folded loops run live in the VM. Two items were declined, as recorded above: `refresh(target: self)` follows the current stack object, like every other `self` access, and return analysis stays syntactic.
 - **Open-pack parity.** All 20 objects still compile, and the behavioural tests pass. The expanded `.air` changes in 8 objects, all intentionally:
   - `while 1 == 1` became `while true`: bookshelf, cot, dining chair, sofa, wall phone, shower, toilet.
   - The floor lamp's compile-time `bool` param branch (`if 1 != 0 { ... } else { ... }`) folds to the taken branch.

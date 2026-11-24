@@ -2756,10 +2756,21 @@ impl Parser {
     fn try_parse_range_iter(&mut self) -> Result<Option<ForEachIter>> {
         if self.peek().kind == TokenKind::LParen {
             // `(a..b).rev()`, or a range whose start is parenthesized (`(n + 1)..m`).
+            // Once the start is followed by `..`/`..=` inside the parentheses, this is the
+            // reversed form and its errors are reported as such.
             let (saved_pos, saved_depth) = (self.pos, self.depth);
             self.bump();
-            let rev = match self.parse_range_bounds() {
-                Ok(bounds) if self.peek().kind == TokenKind::RParen => Some(bounds),
+            let rev = match self.parse_expr() {
+                Ok(start)
+                    if matches!(self.peek().kind, TokenKind::DotDot | TokenKind::DotDotEq) =>
+                {
+                    let inclusive = self.eat(&TokenKind::DotDotEq);
+                    if !inclusive {
+                        self.bump();
+                    }
+                    let end = self.parse_expr()?;
+                    Some((start, end, inclusive))
+                }
                 _ => None,
             };
             if let Some((start, end, inclusive)) = rev {
@@ -2784,9 +2795,10 @@ impl Parser {
             self.pos = saved_pos;
             self.depth = saved_depth;
         }
-        // The builtin iterators: `objects_by_guid(...)`, `objects_of::<T>()`, and the method
-        // forms `lot.sims()`, `lot.objects()`, `self.parts()` (another `lot.x()`/`self.x()` gets
-        // the iterator diagnostic). Anything else, such as `self.count..3`, is a range start.
+        // The builtin iterators, by their call syntax: `objects_by_guid(...)`, `objects_of::<T>()`,
+        // and the method forms `lot.sims()`, `lot.objects()`, `self.parts()` (another `lot.x()`
+        // or `self.x()` gets the iterator diagnostic). Anything else, such as `self.count..3` or
+        // a local named `objects_by_guid`, is a range start.
         let is_method_call = |p: &Self| {
             p.peek_at(1).kind == TokenKind::Dot
                 && matches!(p.peek_at(2).kind, TokenKind::Ident(_))
@@ -2794,7 +2806,8 @@ impl Parser {
         };
         let builtin = match &self.peek().kind {
             TokenKind::Ident(s) => match s.as_str() {
-                "objects_by_guid" | "objects_of" => true,
+                "objects_by_guid" => self.peek_at(1).kind == TokenKind::LParen,
+                "objects_of" => self.peek_at(1).kind == TokenKind::ColonColon,
                 "lot" | "self" => is_method_call(self),
                 _ => false,
             },

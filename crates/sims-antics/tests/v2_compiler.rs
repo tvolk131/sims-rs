@@ -8278,3 +8278,120 @@ object "Shadow Two" {
     assert!(!air.contains("animate("), "{air}");
     assert!(!air.contains("create_object("), "{air}");
 }
+
+#[test]
+fn shadowed_builtins_folded_checks_and_local_slots() {
+    let cfg = PackResolverConfig::default();
+    let obj = |members: &str| {
+        format!(
+            "object \"Round Two\" {{\n    guid: 0x7F40_0040;\n    state n: i16;\n{members}\n}}\n"
+        )
+    };
+    let expand = |name: &str, src: &str| {
+        compile_v2_source(name, src, &cfg).unwrap_or_else(|e| panic!("{name}: {e}"));
+        sims_antics::v2::expand_v2_source_to_objects(name, src, &cfg)
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .remove(0)
+            .air_source
+    };
+    let expect_err = |name: &str, src: &str, needle: &str| {
+        let err = compile_v2_source(name, src, &cfg).expect_err(&format!("{name} must fail"));
+        assert!(
+            err.message.contains(needle),
+            "{name}: expected '{needle}' in: {err}"
+        );
+    };
+
+    // A user `fn animate` that writes stack_obj is followed by the clobber analysis.
+    let air = expand(
+        "shadow_clobber.antics",
+        &obj(
+            "    fn animate() { stack_obj = 0; }\n    tree t (sim: Sim) { animate(); self.n = 1; }",
+        ),
+    );
+    assert!(air.contains("let __self_obj = stack_obj;"), "{air}");
+
+    // User functions win in value position and are not treated as local-writing builtins.
+    let air = expand(
+        "shadow_value.antics",
+        &obj(
+            "    fn create_object(x: i16) -> i16 { return x; }\n    init { let n: i16 = create_object(4); self.n = n; }",
+        ),
+    );
+    assert!(!air.contains("create_object("), "{air}");
+    expand(
+        "shadow_local.antics",
+        &obj(
+            "    fn animate(local: i16) { self.n = local; }\n    init { for i in 0..3 { animate(local: i); } }",
+        ),
+    );
+
+    // Builtin iterator names are only iterators in their call syntax.
+    expand(
+        "iter_name.antics",
+        &obj(
+            "    init { let objects_by_guid: i16 = 1; for i in objects_by_guid..3 { self.n += i; } }",
+        ),
+    );
+
+    // Discarded code does not shift later generated names.
+    let air = expand(
+        "dead_names.antics",
+        &obj("    init { while false { let dead = 1; } let live = 1; self.n = live; }"),
+    );
+    assert!(air.contains("let __v_live_0 = 1;"), "{air}");
+
+    // Modes that read a local name it.
+    let air = expand(
+        "create_local.antics",
+        &obj(
+            "    tree t (sim: Sim) { let o: i16 = 0; create_object(0x7F40_0041, mode: local_pos, local: o); }",
+        ),
+    );
+    assert!(
+        air.contains("mode: local_pos, flags: 0x00, local: __v_o_0);"),
+        "{air}"
+    );
+    expect_err(
+        "create_local_missing.antics",
+        &obj("    tree t (sim: Sim) { create_object(0x7F40_0041, mode: local_pos); }"),
+        "reads a local; name it with 'local:'",
+    );
+    expect_err(
+        "create_local_unused.antics",
+        &obj(
+            "    tree t (sim: Sim) { let o: i16 = 0; create_object(0x7F40_0041, mode: here, local: o); }",
+        ),
+        "does not read 'local:'",
+    );
+    expect_err(
+        "animate_enum_local.antics",
+        &format!(
+            "enum Ev {{ Z = 0 }}\n{}",
+            obj("    tree t (sim: Sim) { let e: Ev = Ev::Z; animate(clip: 1, local: e); }")
+        ),
+        "animate(local:) must name an i16 local variable",
+    );
+
+    // Folded conditions and bodies are still fully checked.
+    expect_err(
+        "dead_raw.antics",
+        &obj("    init { while false { raw { nonexistent; } } }"),
+        "invalid .air syntax in raw block",
+    );
+    expect_err(
+        "dead_operand.antics",
+        &obj("    init { while false && missing() { } }"),
+        "unsupported boolean call expression",
+    );
+    expect_err(
+        "dead_if_operand.antics",
+        &obj("    init { if false && missing() { } }"),
+        "unsupported boolean call expression",
+    );
+    expect_err(
+        "rev_missing_end.antics",
+        &obj("    init { for i in (1..).rev() { } }"),
+        "expected expression",
+    );
+}
