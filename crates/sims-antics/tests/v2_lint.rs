@@ -173,6 +173,57 @@ fn wildcard_rules_cover_match_expressions() {
 }
 
 #[test]
+fn wildcard_rules_count_every_alternative_of_an_or_pattern() {
+    let single = tree(
+        "        match self.mode {\n            Mode::Off | Mode::Low => { self.level = 1; }\n            _ => { self.level = 3; }\n        }",
+    );
+    assert_eq!(
+        one(&single, "enum_wildcard_single_variant")
+            .suggestion
+            .as_deref(),
+        Some("Mode::High")
+    );
+    let all = tree(
+        "        self.level = match self.mode { Mode::Off | Mode::Low => 1, Mode::High => 2, _ => 4 };",
+    );
+    one(&all, "enum_wildcard_all_covered");
+    none(&all, "enum_wildcard_single_variant");
+    // Alternatives from another enum, or ints, leave the arm alone.
+    for arm in ["Mode::Off | Other::Low", "Mode::Off | 2"] {
+        let source = tree(&format!(
+            "        match self.mode {{\n            {arm} => {{ self.level = 1; }}\n            Mode::Low => {{ self.level = 2; }}\n            _ => {{ self.level = 3; }}\n        }}"
+        ));
+        let found = lint(&source);
+        assert!(
+            !found.iter().any(|d| d.rule.starts_with("enum_wildcard")),
+            "{source}\n{found:#?}"
+        );
+    }
+}
+
+#[test]
+fn if_expressions_are_walked_like_other_expressions() {
+    // A local read only inside an if-expression is used.
+    none(
+        &tree("        let x = random(5);\n        self.level = if x > 2 { 1 } else { 2 };"),
+        "unused_decl",
+    );
+    none(
+        &tree(
+            "        let x = random(5);\n        self.level = if self.level > 2 { 1 } else if self.level > 1 { x } else { 3 };",
+        ),
+        "unused_decl",
+    );
+    // A match nested in an if-expression is still checked.
+    one(
+        &tree(
+            "        self.level = if self.level > 0 { match self.mode { Mode::Off => 1, Mode::Low => 2, _ => 3 } } else { 0 };",
+        ),
+        "enum_wildcard_single_variant",
+    );
+}
+
+#[test]
 fn wildcard_rules_resolve_the_enum_through_imports() {
     // `Mode` here is `Wider` imported under another name; an unrelated two-variant `Mode`
     // elsewhere in the set must not make the `_` arm look redundant.

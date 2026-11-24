@@ -711,6 +711,12 @@ fn subexprs(e: &V2Expr) -> Vec<&V2Expr> {
         } => std::iter::once(scrutinee.as_ref())
             .chain(arms.iter().map(|a| &a.value))
             .collect(),
+        V2Expr::If {
+            cond,
+            then_value,
+            else_value,
+            ..
+        } => vec![cond, then_value, else_value],
         _ => Vec::new(),
     }
 }
@@ -760,7 +766,7 @@ fn mentions_ident(e: &V2Expr, name: &str) -> Option<Span> {
 fn print_expr(e: &V2Expr) -> Option<String> {
     let child = |c: &V2Expr| -> Option<String> {
         let s = print_expr(c)?;
-        Some(if matches!(c, V2Expr::Binary { .. }) {
+        Some(if matches!(c, V2Expr::Binary { .. } | V2Expr::If { .. }) {
             format!("({s})")
         } else {
             s
@@ -813,6 +819,22 @@ fn print_expr(e: &V2Expr) -> Option<String> {
             ..
         } if type_args.is_empty() => format!("{}.{method}({})", child(receiver)?, args(a)?),
         V2Expr::Try { inner, .. } => format!("{}?", child(inner)?),
+        V2Expr::If {
+            cond,
+            then_value,
+            else_value,
+            ..
+        } => {
+            let tail = match else_value.as_ref() {
+                V2Expr::If { .. } => print_expr(else_value)?,
+                other => format!("{{ {} }}", print_expr(other)?),
+            };
+            format!(
+                "if {} {{ {} }} else {tail}",
+                print_expr(cond)?,
+                print_expr(then_value)?
+            )
+        }
         _ => return None,
     })
 }
@@ -1477,11 +1499,24 @@ impl FileLinter<'_> {
         }) else {
             return;
         };
-        let mut enum_name: Option<&str> = None;
-        let mut named = BTreeSet::new();
+        // Every alternative of an OR-pattern (`Mode::Low | Mode::High`) names its variant.
+        fn alternatives<'p>(p: &'p MatchPattern, out: &mut Vec<&'p MatchPattern>) {
+            match p {
+                MatchPattern::Or(_, alts) => alts.iter().for_each(|a| alternatives(a, out)),
+                other => out.push(other),
+            }
+        }
+        let mut flat = Vec::new();
         for p in pats {
             match p {
                 MatchPattern::Wildcard(_) => {}
+                other => alternatives(other, &mut flat),
+            }
+        }
+        let mut enum_name: Option<&str> = None;
+        let mut named = BTreeSet::new();
+        for p in flat {
+            match p {
                 MatchPattern::Path(_, segs) if segs.len() == 2 => {
                     if enum_name.is_some_and(|e| e != segs[0]) {
                         return;

@@ -221,14 +221,138 @@ fn synthetic_counter_round_trips() {
     assert!(source.contains("while self.attr_3 > 0"), "{source}");
     assert!(source.contains("state attr_3 @ 3: i16;"), "{source}");
     assert!(source.contains("Limits.e1"), "{source}");
-    // The census loop's cursor is `stack_obj` itself since PR F; the decompiler lifts that
-    // shape as the `set_to_next` loop until it learns the `for` form.
+    // The census loop's cursor is `stack_obj` itself (no loop local) since v2 PR F.
+    assert!(source.contains("for o in lot.objects() {"), "{source}");
+    assert!(!source.contains("set_to_next"), "{source}");
+    assert!(source.contains("@id(4096) init {"), "{source}");
+}
+
+/// v2 PR F shapes: `for` loops whose cursor is `stack_obj` itself, sound ID 0, two FWAVs
+/// naming one event, and a tree frame's kind byte.
+const CURSOR: &str = r#"object "Synth Cursor" {
+    guid: 0x7E00_0003;
+    price: 25;
+    sprite: Sprite::procedural("floor_lamp", primary: #6A5A48, accent: #CFC2A8, trim: #3A2E22);
+
+    sound chime = preset("ui_click", wav: "synth_chime", id: 0);
+    sound chime_again = preset("ui_click", wav: "synth_chime", id: 7);
+
+    @id(4302) tree census "Census" {
+        temp[0] = 0;
+        for o in lot.objects() {
+            if o.data[3] > 0 {
+                temp[0] += o.attr[1];
+            }
+        }
+        return true;
+    }
+
+    @id(4303) tree people "People" {
+        temp[1] = 0;
+        for p in lot.sims() {
+            if p.kind == 0 {
+                temp[1] += p.person[5];
+            }
+        }
+        return true;
+    }
+
+    @id(4304) @frame(kind: 3) tree kinded "Kinded" {
+        play_sound(chime);
+        play_sound(chime_again);
+        return true;
+    }
+
+    @id(4305) tree chime_for "Chime For" (sim: Sim) {
+        sim.motive[13] += 1;
+        play_sound(chime);
+        play_sound(chime, sim);
+        return true;
+    }
+
+    main {
+        loop {
+            sleep(10);
+            census();
+            people();
+            kinded();
+        }
+    }
+}
+"#;
+
+#[test]
+fn zero_local_loops_sounds_and_frame_kinds_round_trip() {
+    let source = assert_round_trip("synth-cursor.antics", CURSOR);
+    for idiom in [
+        "for o in lot.objects() {",
+        "if o.data[3] > 0 {",
+        "temp[0] += o.attr[1];",
+        "for p in lot.sims() {",
+        "if p.kind == 0 {",
+        "temp[1] += p.person[5];",
+        "@id(4304) @frame(args: 0, locals: 0, format: 0x8002, revision: 0, kind: 3) tree",
+        "sound sound_0 = preset(\"ui_click\", wav: \"synth_chime\", id: 0);",
+        "sound sound_7 = preset(\"ui_click\", wav: \"synth_chime\", id: 7);",
+        "play_sound(sound_0);",
+        "play_sound(sound_7);",
+        // In an interaction the default target is the object, `sim` the other one.
+        "        play_sound(sound_0);\n        play_sound(sound_0, sim);\n",
+    ] {
+        assert!(source.contains(idiom), "missing `{idiom}` in:\n{source}");
+    }
+    assert!(!source.contains("set_to_next"), "{source}");
+    // Trees without a kind keep the plain frame.
     assert!(
-        source.contains("for o in lot.objects() {")
-            || source.contains("while set_to_next(0, guid: 0x00000000, dest: stack_obj)"),
+        source.contains("@id(4302) @frame(args: 0, locals: 0, format: 0x8002, revision: 0) tree"),
         "{source}"
     );
-    assert!(source.contains("@id(4096) init {"), "{source}");
+}
+
+const PR_F_SUGAR: &str = r#"enum Mode { Off, Low, High }
+object "Synth Picker" {
+    guid: 0x7E00_0007; price: 40;
+    sprite: Sprite::procedural("floor_lamp", primary: #504030, accent: #A09080, trim: #201810);
+    state mode: Mode;
+    state level @ 2: i16;
+    @id(4200)   @frame( kind:3 ) tree pick "Pick" {
+        self.level = if self.level>3 {1} else if self.level > 1 { 2 }   else {3};
+        self.level = match self.mode { Mode::Off|Mode::Low => 1,
+            Mode::High => 2 };
+        match self.mode {
+            Mode::Off |   Mode::Low => { self.level += 1; }
+            _ => {}
+        }
+        return true;
+    }
+}
+"#;
+
+#[test]
+fn formatter_handles_if_expressions_or_patterns_and_frame_kinds() {
+    let formatted = format_v2_source(PR_F_SUGAR).expect("format");
+    assert!(is_v2_formatted(&formatted).expect("check"), "{formatted}");
+    assert_eq!(
+        format_v2_source(&formatted).expect("reformat"),
+        formatted,
+        "idempotent"
+    );
+    for expected in [
+        "    @id(4200) @frame(kind: 3) tree pick \"Pick\" {\n",
+        "        self.level = if self.level > 3 {\n            1\n        } else if self.level > 1 {\n            2\n        } else {\n            3\n        };\n",
+        "            Mode::Off | Mode::Low => 1,\n",
+        "            Mode::Off | Mode::Low => {\n                self.level += 1;\n            }\n",
+    ] {
+        assert!(
+            formatted.contains(expected),
+            "missing {expected:?} in\n{formatted}"
+        );
+    }
+    // Formatting changes no compiled byte.
+    assert_eq!(
+        compile("picker.antics", PR_F_SUGAR).iff_bytes,
+        compile("picker.antics", &formatted).iff_bytes
+    );
 }
 
 /// Re-encodes `iff` with `extra` chunks appended after its own.

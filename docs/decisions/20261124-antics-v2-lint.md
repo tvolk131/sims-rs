@@ -50,7 +50,7 @@ All rules are warnings except `enum_wildcard_all_covered`, which is an error tha
 
 | Rule | Fires on |
 | --- | --- |
-| `enum_wildcard_single_variant` | A `match` (statement or expression) whose arms are all `Enum::Variant` paths of one known enum, with a `_` arm standing for exactly one variant. Suggests naming it. The enum is resolved in the match's file: its own declarations, then its `use` imports under their alias, as the module loader resolves them (so only when the file is in a pack on disk). A name that resolves to no single declaration is skipped. |
+| `enum_wildcard_single_variant` | A `match` (statement or expression) whose arms are all `Enum::Variant` paths of one known enum (every alternative of an OR-pattern `A \| B` counts), with a `_` arm standing for exactly one variant. Suggests naming it. The enum is resolved in the match's file: its own declarations, then its `use` imports under their alias, as the module loader resolves them (so only when the file is in a pack on disk). A name that resolves to no single declaration is skipped. |
 | `enum_wildcard_all_covered` | Same shape, with every variant already named. **Not suppressible.** An `allow` for it is ignored, and the diagnostic gets a note: to handle out-of-range raw values, type the value `i16` instead of the enum. |
 | `dropped_bool_call` | An expression statement that is just a call whose result is a `bool` or `Result`, so the result is thrown away. The call may be a user `fn ... -> bool`, a `tree` or `extern` fn `-> Result` (a `-> bool` tree is often run for what it does, so it is not flagged), or a pure builtin (`can_afford`, `x.is_type(..)`); `debit_funds(n);` after a `can_afford` check is the usual spelling, so it is not flagged. A user definition shadows a builtin of the same name. A name with conflicting definitions is skipped, and so is a call passing a `&mut` argument (made for its out-parameters). |
 | `unbounded_loop_without_yield` | A `loop` / `while true` whose body has no exit (`break` of this loop, `return`, `?`) and nothing that may yield (`sleep`, `idle`, `animate`, any call that is not a known non-yielding builtin, a `raw` block). |
@@ -84,6 +84,15 @@ The decompiler's translator learns more of the spellings PR E added:
 - `push_interaction(.., object: x)`;
 - `stack_obj.run_functional(n)`;
 - `notify_out_of_idle()`.
+
+After v2 PR F (#427) it also writes PR F's shapes:
+
+- `stack_obj := 0; while set_to_next(person|all, dest: stack_obj) { .. }`, the zero-local loop PR F compiles a `for` body into when the body passes its cursor whitelist, as `for p in lot.sims()` / `for o in lot.objects()`. Inside it the stack object's cells are the binding's: `o.attr[i]`, `o.data[i]`, `o.slot[i]`, `p.person[i]`, `p.kind`, and `stack_obj` read as a value is the binding. A body that stores to `stack_obj`, or reads a stack cell the binding cannot name (`stack.motive`, `stack.temp`, sprite flags), keeps the loop raw.
+- `@frame(.., kind: N)` for a tree whose kind byte is not 0. Before PR F such a tree could not be written in v2 and stayed unproven.
+- Sound ID 0, and several FWAVs naming one event (only when spelled with the same letter case).
+- `play_sound(sound_N)` for a declared sound, with `, sim` where the target is the other one than the context's default.
+
+The formatter needed no change for PR F's if-expressions, OR-patterns and `kind:`, which the tests now cover. The linter walks if-expressions like other expressions.
 
 Several of these lower to a different instruction sequence than the original (an extra `local[0]` write, a `stack_obj` restore). Each is still proven by the validation loop (compile, then check every tree).
 

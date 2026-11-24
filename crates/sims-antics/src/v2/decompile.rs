@@ -662,16 +662,19 @@ impl Model {
         let original_sounds = fwav_sounds(iff);
         let mut sounds = BTreeMap::new();
         let mut sounds_skipped = BTreeMap::new();
-        let mut sound_names = BTreeSet::new();
+        // Several FWAVs may share one event name (v2 PR F), but only spelled the same way.
+        let mut sound_names: BTreeMap<String, &str> = BTreeMap::new();
         for (&id, name) in &original_sounds {
-            let why = if id == 0 {
-                "v2 cannot declare it (FWAV IDs start at 1)"
-            } else if crate::manifest::validate_relative_filename(name, "sound").is_err() {
+            let why = if crate::manifest::validate_relative_filename(name, "sound").is_err() {
                 "v2 cannot spell its event name (a plain file name)"
             } else if name.len() > MAX_CHUNK_LABEL {
                 "its event name is longer than a chunk label, which v2 uses it as"
-            } else if !sound_names.insert(name.to_ascii_lowercase()) {
-                "another FWAV names the same event, which v2 does not allow"
+            } else if *sound_names
+                .entry(name.to_ascii_lowercase())
+                .or_insert(name.as_str())
+                != name.as_str()
+            {
+                "another FWAV names the same event with other letter case, which v2 does not allow"
             } else {
                 sounds.insert(id, name.clone());
                 continue;
@@ -1289,6 +1292,8 @@ struct ForEachParts<'a> {
     saved: i16,
     /// `set_to_next` mode: 1 = people, 0 = all objects.
     mode: u8,
+    /// Whether `stack_obj` itself is the cursor (no loop local).
+    stack_cursor: bool,
     body: &'a [Stmt],
 }
 
@@ -1306,7 +1311,12 @@ fn for_each_parts<'a>(init: &Stmt, w: &'a Stmt, restore: &Stmt) -> Option<ForEac
     if !is_operand(rl, 10, 0) {
         return None;
     }
-    for_each_core(init, w, Some(saved)).map(|(mode, body)| ForEachParts { saved, mode, body })
+    for_each_core(init, w, Some(saved)).map(|(mode, stack_cursor, body)| ForEachParts {
+        saved,
+        mode,
+        stack_cursor,
+        body,
+    })
 }
 
 fn direct_local(r: &OperandRef) -> Option<i16> {
@@ -1320,9 +1330,15 @@ fn is_operand(r: &OperandRef, scope: u8, index: i16) -> bool {
     matches!(r, OperandRef::Direct(o) if o.scope == scope && o.index == index)
 }
 
-/// `local[v] := 0; while set_to_next(mode, dest: local[v]) { body }`: the mode and body,
-/// when the body names neither `local[v]` nor the local `stack_obj` is saved in.
-fn for_each_core<'a>(init: &Stmt, w: &'a Stmt, saved: Option<i16>) -> Option<(u8, &'a [Stmt])> {
+/// `local[v] := 0; while set_to_next(mode, dest: local[v]) { body }`: the mode, whether the
+/// cursor is `stack_obj` itself (v2 PR F's zero-local form, `stack_obj := 0; while
+/// set_to_next(mode, dest: stack_obj)`), and the body, when the body names neither `local[v]`
+/// nor the local `stack_obj` is saved in.
+fn for_each_core<'a>(
+    init: &Stmt,
+    w: &'a Stmt,
+    saved: Option<i16>,
+) -> Option<(u8, bool, &'a [Stmt])> {
     let local = direct_local;
     let Stmt::Assign {
         lhs: il,
@@ -1336,8 +1352,13 @@ fn for_each_core<'a>(init: &Stmt, w: &'a Stmt, saved: Option<i16>) -> Option<(u8
     let Stmt::While { cond, body, .. } = w else {
         return None;
     };
-    let var = local(il)?;
-    if !is_operand(ir, 7, 0) || saved == Some(var) {
+    // `None`: v2 PR F's zero-local form, with `stack_obj` itself as the cursor.
+    let var = if is_operand(il, 10, 0) {
+        None
+    } else {
+        Some(local(il)?)
+    };
+    if !is_operand(ir, 7, 0) || (var.is_some() && saved == var) {
         return None;
     }
     let Condition::Primitive {
@@ -1353,17 +1374,27 @@ fn for_each_core<'a>(init: &Stmt, w: &'a Stmt, saved: Option<i16>) -> Option<(u8
     else {
         return None;
     };
-    if local(dest)? != var || !matches!(mode, 0 | 1) {
+    let dest_ok = match var {
+        Some(v) => local(dest) == Some(v),
+        None => is_operand(dest, 10, 0),
+    };
+    if !dest_ok || !matches!(mode, 0 | 1) {
         return None;
     }
-    // The body must not name either local: v2 gives the loop its own slots.
+    // The body must not name either local: v2 gives the loop its own slots. A
+    // `stack_obj` cursor must not be written by a plain store either.
     let mut names_local = false;
     walk_stmts(body, &mut |s| {
         names_local |= stmt_operands(s)
             .iter()
-            .any(|r| local(r).is_some_and(|l| l == var || Some(l) == saved));
+            .any(|r| local(r).is_some_and(|l| Some(l) == var || Some(l) == saved));
+        if var.is_none()
+            && let Stmt::Assign { lhs, .. } = s
+        {
+            names_local |= is_operand(lhs, 10, 0);
+        }
     });
-    (!names_local).then_some((*mode, body.as_slice()))
+    (!names_local).then_some((*mode, var.is_none(), body.as_slice()))
 }
 
 /// The local a tree's first statement saves `stack_obj` into, when nothing but the
@@ -1617,7 +1648,9 @@ impl Plan {
         let standalone = model
             .trees
             .iter()
-            .filter(|t| t.lifecycle.is_some() && t.original.format != 0x8002)
+            .filter(|t| {
+                t.lifecycle.is_some() && (t.original.format != 0x8002 || t.original.kind != 0)
+            })
             .map(|t| t.id)
             .collect();
         Self {
@@ -1928,8 +1961,13 @@ impl Model {
                 None => {
                     let b = &t.original;
                     let ctx = if sim { " (sim: Sim)" } else { "" };
+                    let kind = if b.kind == 0 {
+                        String::new()
+                    } else {
+                        format!(", kind: {}", b.kind)
+                    };
                     out.line(format!(
-                        "@id({}) @frame(args: {}, locals: {}, format: {:#06x}, revision: {}) tree {} \"{}\"{ctx} {{",
+                        "@id({}) @frame(args: {}, locals: {}, format: {:#06x}, revision: {}{kind}) tree {} \"{}\"{ctx} {{",
                         t.id, b.args, b.locals, b.format, b.revision, t.ident, t.label
                     ));
                 }
@@ -1951,6 +1989,7 @@ impl Model {
                         in_handler: false,
                         hoisted_save: hoisted_self_save(body, &t.lifted),
                         sims_loop: None,
+                        cursor: None,
                         extras: std::cell::Cell::new(false),
                     };
                     let body = match tr.hoisted_save {
@@ -2097,6 +2136,9 @@ struct Translator<'a> {
     /// The binding of the innermost `for p in lot.sims()` (`None` outside one, or inside
     /// a `lot.objects()` loop nested in it).
     sims_loop: Option<String>,
+    /// The binding of the innermost `for` loop whose cursor is `stack_obj` itself: inside it,
+    /// the stack object's cells are the binding's (`o.data[i]`, `p.person[i]`).
+    cursor: Option<String>,
     /// Whether an extra idiom was written (see [`Translator::extra`]).
     extras: std::cell::Cell<bool>,
 }
@@ -2506,16 +2548,28 @@ impl Translator<'_> {
         // (statements before the body, whether a restore follows it, mode, body)
         let with_save = |save: &Stmt, init, w, restore| {
             let p = for_each_parts(init, w, restore)?;
-            (self_save_local(save) == Some(p.saved)).then_some((3, true, p.mode, p.body))
+            (self_save_local(save) == Some(p.saved)).then_some((
+                3,
+                true,
+                p.mode,
+                p.stack_cursor,
+                p.body,
+            ))
         };
         let hoisted = |init, w, restore| {
             let p = for_each_parts(init, w, restore)?;
-            (self.hoisted_save == Some(p.saved)).then_some((2, true, p.mode, p.body))
+            (self.hoisted_save == Some(p.saved)).then_some((
+                2,
+                true,
+                p.mode,
+                p.stack_cursor,
+                p.body,
+            ))
         };
         // v2's optimizer drops a save and restore nothing reads (a restore just before
         // `return`), leaving the bare loop.
-        let bare = |init, w| for_each_core(init, w, None).map(|(m, b)| (2, false, m, b));
-        let (head, restores, mode, body) = match rest {
+        let bare = |init, w| for_each_core(init, w, None).map(|(m, c, b)| (2, false, m, c, b));
+        let (head, restores, mode, stack_cursor, body) = match rest {
             [save, init, w, restore, ..] if self_save_local(save).is_some() => {
                 with_save(save, init, w, restore)
             }
@@ -2523,6 +2577,10 @@ impl Translator<'_> {
             [init, w, ..] => bare(init, w),
             _ => None,
         }?;
+        // The zero-local form is v2 PR F's: a tree that does not prove keeps it raw.
+        if stack_cursor && !self.extra() {
+            return None;
+        }
         let used = head + usize::from(restores);
         let id = self.next_id;
         // The save (if any), the init and the `while` come first in pre-order; the restore
@@ -2551,7 +2609,12 @@ impl Translator<'_> {
             &mut self.sims_loop,
             (mode == 1).then(|| format!("{var_name}{suffix}")),
         );
+        let outer_cursor = std::mem::replace(
+            &mut self.cursor,
+            stack_cursor.then(|| format!("{var_name}{suffix}")),
+        );
         self.block(body, out);
+        self.cursor = outer_cursor;
         self.sims_loop = outer_sims;
         self.loop_depth -= 1;
         self.flush_raw(out);
@@ -2755,6 +2818,19 @@ impl Translator<'_> {
                     self.rvalue(amount)?
                 ))
             }
+            // `play_sound(sound)` targets the Sim in an object's own tree and the stack object
+            // (`self`) in an interaction; `sim` names the other target there.
+            PrimitiveCall::PlaySound { sound_id, flags }
+                if self.model.sounds.contains_key(sound_id) =>
+            {
+                let target = match (self.sim, flags) {
+                    (false, 0) | (true, 2) => "",
+                    (true, 0) => ", sim",
+                    _ => return None,
+                };
+                self.extra()
+                    .then(|| format!("play_sound(sound_{sound_id}{target})"))
+            }
             PrimitiveCall::StopAllSounds { use_stack_object } => {
                 match (self.sim, use_stack_object) {
                     (false, false) | (true, true) => Some("stop_all_sounds()".to_owned()),
@@ -2902,6 +2978,7 @@ impl Translator<'_> {
                     Some(format!("library_consts.{name}"))
                 }
             }
+            10 if o.index == 0 && self.cursor.is_some() => self.cursor.clone(),
             9 if o.index == 0 && self.in_handler => Some("event".to_owned()),
             20 if !self.sim && o.index >= 0 && self.extra() => {
                 Some(format!("self.slot[{}]", o.index))
@@ -2931,6 +3008,19 @@ impl Translator<'_> {
         let i = o.index;
         if i < 0 {
             return None;
+        }
+        if let Some(c) = &self.cursor {
+            // Inside a `stack_obj`-cursor loop the stack object is the binding, and
+            // `stack_obj` itself may not be written.
+            match o.scope {
+                1 => return Some(format!("{c}.attr[{i}]")),
+                4 => return Some(format!("{c}.data[{i}]")),
+                16 => return Some(format!("{c}.slot[{i}]")),
+                19 if i == 65 => return Some(format!("{c}.kind")),
+                19 => return Some(format!("{c}.person[{i}]")),
+                10 | 13 | 15 | 27 => return None,
+                _ => {}
+            }
         }
         Some(match (o.scope, self.sim) {
             (8, _) => format!("temp[{i}]"),
