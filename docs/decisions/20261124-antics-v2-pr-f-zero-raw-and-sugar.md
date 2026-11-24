@@ -40,6 +40,9 @@ Constraints:
     - `advert.delta | personality | minimum[m]`. These are scope 12 / 28 / 29, never an object access.
     - `stack_obj.<field>`. This is a direct `stack.` cell; see G1.
   - So that the analysis can trust the name, binding `stack_obj` as a variable, parameter, loop variable, or event name is now a parse error.
+  - The optimizer forwards the entry save: until the first node that may write `stack_obj` (an assignment to it, or any primitive except `test_object_type`, `action_string`, and `alter_budget`; subroutine calls cannot), a read of `__self_obj` / `__saved_stack_obj` is `stack_obj` itself. A restore there becomes `stack_obj := stack_obj` and goes.
+  - A save that nothing then names is dropped. It is the compiler's node, not the source's, so the tree's first statement runs on entry as written.
+  - A `stack_obj := x` store goes when nothing can read the stack object before it is overwritten or the frame returns, on every path (a loop, a call, or a `stack.` read counts as a read), and the next node ignores the last result.
   - A tree that keeps its layout (`raw`) skips the optimizer. Even there, `finish()` drops the entry save when nothing else names `__self_obj` and the next node ignores the last result.
 - **L8: `run_functional` branches directly.**
   - `if [!]obj.run_functional(..) { A } else { B }` lowers to `if [!]run_functional_tree(..) { restore; A } else { restore; B }`.
@@ -72,17 +75,17 @@ Constraints:
   - `stack_obj.data[i]`, `stack_obj.attr[i]`, `stack_obj.graphic`, and the handle fields (`hand`, `room`, `person[i]`, ...);
   - there is no `stack_obj` switch around them.
 
-  These cells, and `self.graphic`, are direct places for `inc_lt` / `dec_gt` / `random_into`. A foreign cell read on `stack_obj` is now the cell itself rather than a copy.
-- **G2.** `push_interaction(icon:)` also takes an object handle.
+  These cells, and `self.graphic`, are direct places for `inc_lt` / `dec_gt` / `random_into`. A foreign cell read on `stack_obj` is now the cell itself rather than a copy, and is a plain operand, so `while inc_lt(&mut stack_obj.attr[i], n)` is one node.
+- **G2.** `push_interaction(icon:)` also takes an object handle or `self`, besides an `i16` local.
   - When it is the same handle as `object:`, the icon reads the pinned `local[0]` (flags `0x01 | 0x02`), so one handle supplies both.
   - Another handle must be a plain local.
-- **G3.** `animate(.., event_local: N)` sends events to slot `N` (flag `0x20`) without binding them. It needs `@frame(locals: K)` with `N >= K`, so the slot is outside the frame and no binding can be there. It lowers to the primitive's raw `op 0x002c (..)` form, because `.air`'s `animate(local: N)` would grow the frame to `N + 1`. It cannot be combined with `local:` or an `|event|` body.
+- **G3.** `animate(.., event_local: N)` sends events to slot `N` (flag `0x20`) without binding them. It needs `@frame(locals: K)` with `N >= K`, so the slot is outside the frame and no binding can be there. After lowering, the tree's own locals are counted too: if they need more than `N` slots, it is an error. It lowers to the primitive's raw `op 0x002c (..)` form, because `.air`'s `animate(local: N)` would grow the frame to `N + 1`. It cannot be combined with `local:` or an `|event|` body.
 
 ### 3. Decompiler gaps
 
 - **`sound x = preset(.., id: 0)`** is accepted.
 - **Shared sound names.** Several `sound` declarations with distinct explicit ids may share one `wav:` / `name:` string; their presets must match.
-  - `compile.rs` rejects duplicate manifest names, so v2 gives each extra declaration a unique placeholder name.
+  - `compile.rs` rejects duplicate manifest names, so v2 gives each extra declaration a unique placeholder name, `v2-shared-sound-{id}`. A sound may not use that name itself.
   - After compiling, it rewrites that FWAV chunk's sound name and label back to the shared name and drops the placeholder's synthesized WAV.
 - **`@frame(kind: N)`** sets the BHAV header's kind byte (`.air` `kind:`).
 - **`p.visitor_kind`** (and `sim.visitor_kind`) reads person word 32 as `i16`, so it compares with BCON kinds. `p.is_visitor` stays `bool`.
@@ -98,13 +101,18 @@ Constraints:
   - Conditions lower through the same simple, short-circuit, or `__cond` path as the `if` statement.
 - **OR-patterns.**
   - Syntax: `A | B => ..` and `0 | 1 | 5..=9 => ..` in statement and expression `match`.
-  - New AST variant: `MatchPattern::Or(Span, Vec<MatchPattern>)`. Nested ORs are flattened, and `_` or an identifier inside one is an error.
+  - New AST variant: `MatchPattern::Or(Span, Vec<MatchPattern>)`. It is flat, and `_` inside one is an error. Identifiers stay, because `match dialog(..)` names its buttons (`Yes | Cancel`). On an `i16` or enum scrutinee an identifier is the usual error.
   - Every alternative takes part in duplicate and overlap checks, enum and `i16` exhaustiveness, and constant folding.
-  - An arm whose alternatives are single compares (values, or `..=hi` / `lo..=` ranges) lowers with the single-pass-loop form, when its body and every later arm cannot `break` or `continue`. Otherwise one flag local is set by the alternatives' tests (all are pure: the scrutinee is a plain operand or a snapshot).
-- **Allocation trims** in `lower.rs` and `opt.rs`: optimizer passes reuse scratch buffers, and identifier scans borrow the text instead of collecting `String`s.
+  - An arm whose alternatives are single compares (values, or `..=hi` / `lo..=` ranges) lowers with the single-pass-loop form, when its body and every later arm cannot `break` or `continue`: `while true { if !a { if !b { <later arms>; break; } } <body>; break; }`. Otherwise one flag local is set by the alternatives' tests (all are pure: the scrutinee is a plain operand or a snapshot), as a bounded range already was.
+- **Allocation trims** in `lower.rs` and `opt.rs`:
+  - the optimizer's identifier counts borrow the tree text instead of copying each name into a `String`;
+  - "is this name mentioned" is a scan, not a count map;
+  - the match chain reuses one buffer for each arm's tests.
 
 ## Consequences
 
 - **Track 9 sees new AST variants:** `V2Expr::If`, `MatchPattern::Or`, and `TreeFrame::kind`.
 - **Track 9's decompiler can now print:** `kind:`, sound id 0, shared sound names, `visitor_kind`, `stack_obj.<field>`, `push_interaction(object: x, icon: x)`, and `animate(event_local:)`.
 - **Binding `stack_obj` as a name is now an error.** No in-tree source does it.
+- **Zero-local loops change what the decompiler sees.** A synthetic `for o in lot.objects()` whose body passes the whitelist now compiles to the `dest: stack_obj` cursor. Track 9's decompiler prints it back as `stack_obj = 0; while set_to_next(..)`, which still proves equivalent. Lifting that shape to `for` is a decompiler follow-up; originals use it too.
+- **Verifier gap (Track 7).** `set_to_next(.., dest: stack_obj)` and the default form (no destination, which is the stack object) behave the same but encode differently, and `verify-equiv` treats them as different primitives. Originals use both encodings for the same loop shape, so v2 keeps the explicit form. The verifier should treat them as one primitive.
