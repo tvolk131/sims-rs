@@ -585,3 +585,113 @@ fn a_linked_temporary_file_is_not_written_through() {
     assert!(!std::fs::symlink_metadata(&target).unwrap().is_symlink());
     assert!(std::fs::symlink_metadata(out.0.join(TEMPORARY_FILE)).is_err());
 }
+
+/// A family that moves in from a `.FAM` file is committed with its file's
+/// FAMh in one transaction (0x4291e6, 0x4107a8), and the store's save
+/// writes it under the family's ID byte for byte. A file with no FAMh
+/// leaves the ID none, whatever an earlier family left there. A commit
+/// that loses the race changes nothing.
+#[test]
+fn a_moved_in_family_is_saved_with_its_files_history() {
+    let mut inputs = SaveInputs::default();
+    inputs.histories.insert(1, vec![1, 1]);
+    inputs.histories.insert(3, vec![3, 3, 3]);
+    let bytes = sample().neighborhood_iff(&inputs).unwrap();
+    let folder = TempDir::new("moved-in");
+    std::fs::write(folder.0.join("Neighborhood.iff"), &bytes).unwrap();
+    let db = TempDb::new("moved-in");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store.import_directory("Hood", &folder.0, 0xff).unwrap();
+
+    let history: Vec<u8> = (0..=255).collect();
+    let current = store.load_neighborhood("Hood").unwrap().unwrap();
+    let mut state = current.clone();
+    state.families.insert(9, family(0, 5, vec![0x1000_0009]));
+    let stale = store
+        .save_characters_neighborhood_and_save_inputs_checked(
+            "Hood",
+            current.instance_id,
+            current.revision + 1,
+            [("User00009.iff", b"x".as_slice())],
+            &state,
+            |inputs| inputs.move_in_family(9, Some(history.clone())),
+        )
+        .unwrap();
+    assert!(stale.is_err());
+    assert!(
+        !store
+            .load_save_inputs("Hood")
+            .unwrap()
+            .histories
+            .contains_key(&9)
+    );
+
+    store
+        .save_characters_neighborhood_and_save_inputs_checked(
+            "Hood",
+            current.instance_id,
+            current.revision,
+            [("User00009.iff", b"x".as_slice())],
+            &state,
+            |inputs| inputs.move_in_family(9, Some(history.clone())),
+        )
+        .unwrap()
+        .unwrap();
+    let kept = store.load_save_inputs("Hood").unwrap();
+    assert_eq!(kept.histories[&9], history);
+    let out = TempDir::new("moved-in-out");
+    let path = store.save_neighborhood_iff("Hood", &out.0).unwrap();
+    let saved = std::fs::read(&path).unwrap();
+    let committed = store.load_neighborhood("Hood").unwrap().unwrap();
+    assert_eq!(saved, committed.neighborhood_iff(&kept).unwrap());
+    let iff = Iff::parse(saved).unwrap();
+    assert_eq!(iff.data(iff.get(b"FAMh", 9).unwrap()), history);
+    assert_eq!(iff.data(iff.get(b"FAMh", 3).unwrap()), [3, 3, 3]);
+
+    // Family 3 moves out and a file with no FAMh moves in under its ID.
+    let current = committed;
+    let mut state = current.clone();
+    state.families.insert(3, family(0, 6, vec![0x1000_000a]));
+    store
+        .save_characters_neighborhood_and_save_inputs_checked(
+            "Hood",
+            current.instance_id,
+            current.revision,
+            [],
+            &state,
+            |inputs| inputs.move_in_family(3, None),
+        )
+        .unwrap()
+        .unwrap();
+    store.save_neighborhood_iff("Hood", &out.0).unwrap();
+    let iff = Iff::parse(std::fs::read(&path).unwrap()).unwrap();
+    assert!(iff.get(b"FAMh", 3).is_none());
+    assert_eq!(iff.data(iff.get(b"FAMh", 9).unwrap()), history);
+}
+
+/// Renumbering carries a family's entries to its new ID and drops what
+/// the new ID had; a move-in replaces the ID's FAMh and forgets its name.
+#[test]
+fn renumbering_and_moving_in_change_only_the_families_named() {
+    let mut inputs = SaveInputs::default();
+    inputs.histories.insert(4000, vec![4]);
+    inputs.family_names.insert(4000, "S".to_owned());
+    inputs.histories.insert(4001, vec![0xee]);
+    inputs.family_names.insert(4001, "Old".to_owned());
+    inputs.uninitialized.family_names.insert(4001, 0x22);
+    inputs.histories.insert(2, vec![2]);
+    let before = inputs.clone();
+    inputs.renumber_family(5, 5);
+    assert_eq!(inputs, before);
+    inputs.renumber_family(4000, 4001);
+    assert_eq!(inputs.histories.get(&4000), None);
+    assert_eq!(inputs.histories[&4001], [4]);
+    assert_eq!(inputs.family_names[&4001], "S");
+    assert_eq!(inputs.uninitialized.family_names.get(&4001), None);
+    inputs.move_in_family(2, Some(vec![0x20, 0x21]));
+    inputs.family_names.insert(6, "Six".to_owned());
+    inputs.move_in_family(6, None);
+    assert_eq!(inputs.histories[&2], [0x20, 0x21]);
+    assert_eq!(inputs.histories.get(&6), None);
+    assert_eq!(inputs.family_names.get(&6), None);
+}

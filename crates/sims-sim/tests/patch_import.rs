@@ -8,6 +8,7 @@ use sims_formats::family_file::FamilyFile;
 use sims_formats::iff::Iff;
 use sims_formats::lot::GuidTable;
 use sims_formats::neighborhood::{Family, Neighbor};
+use sims_sim::neighborhood_save::SaveInputs;
 use sims_sim::neighbors::{Registered, registry};
 use sims_sim::patch_import::{Context, PETS, Patch, open};
 use std::collections::{BTreeMap, BTreeSet};
@@ -575,6 +576,11 @@ fn what_the_import_path_does_not_port_fails_loudly() {
 /// A `Patch` file of a houseless family `id` whose `FAMI` lists `members`
 /// and which exports nobody (`EXPi` names no member).
 fn patch_listing(name: &str, id: u16, members: &[u32]) -> Patch {
+    patch_file(name, id, members, None)
+}
+
+/// [`patch_listing`] with a FAMh, when `history` is given.
+fn patch_file(name: &str, id: u16, members: &[u32], history: Option<&[u8]>) -> Patch {
     fn header(tag: &[u8; 4], version: u32) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend(0u32.to_le_bytes());
@@ -605,6 +611,9 @@ fn patch_listing(name: &str, id: u16, members: &[u32]) -> Patch {
     name_table.push(1);
     name_table.extend(b"Name\0\0");
     chunk(&mut iff, b"FAMs", id, &name_table);
+    if let Some(history) = history {
+        chunk(&mut iff, b"FAMh", id, history);
+    }
     let mut export = header(b"iPXE", 0x3f);
     for word in [id, 0, 0, 0, 0, 0, 0, 0, 0] {
         export.extend(word.to_le_bytes());
@@ -648,4 +657,52 @@ fn the_preview_gets_an_inventory_for_a_member_who_has_a_record() {
         .collect();
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(inventories, [(3, 0)]);
+}
+
+/// The save after the import (0x4252cc) copies each imported family's
+/// FAMh from its file (0x4291e6, 0x4107a8), with no fallback to a stored
+/// history when the file has none, and the renumbered family 4000 keeps
+/// its own under its new ID.
+#[test]
+fn imported_families_take_their_files_histories_and_family_4000_keeps_its_own() {
+    let catalog = catalog();
+    let registry = [registered(ANNE, 2), registered(BOB, 2), registered(PET, 2)];
+    let mut neighborhood = small();
+    let patches = [
+        patch_file("Visitor_9.FAM", 9, &[0x0bad_0001], Some(&[9, 8, 7, 6])),
+        patch_file("Other_5.FAM", 5, &[0x0bad_0002], None),
+    ];
+    let opened = open(
+        &mut neighborhood,
+        &patches,
+        &small_context(&catalog, &registry, PETS),
+        &mut no_draws,
+    )
+    .unwrap();
+    assert_eq!(opened.renumbered, Some((4000, 4001)));
+    let [(_, first), (_, second)] = &opened.imports[..] else {
+        panic!("two imports: {:?}", opened.imports.len());
+    };
+    assert_ne!(first.family_id, second.family_id);
+
+    let mut inputs = SaveInputs::default();
+    inputs.histories.insert(4000, vec![0x40; 3]);
+    inputs.family_names.insert(4000, "Strays ".to_owned());
+    inputs.uninitialized.family_names.insert(4000, 0x11);
+    inputs.histories.insert(7, vec![7]);
+    // Left under the second import's ID by an earlier family.
+    inputs.histories.insert(second.family_id, vec![0xee; 2]);
+    inputs
+        .family_names
+        .insert(second.family_id, "Old".to_owned());
+    opened.update_save_inputs(&mut inputs);
+
+    assert_eq!(inputs.histories.get(&4000), None);
+    assert_eq!(inputs.histories[&4001], [0x40; 3]);
+    assert_eq!(inputs.family_names[&4001], "Strays ");
+    assert_eq!(inputs.uninitialized.family_names[&4001], 0x11);
+    assert_eq!(inputs.histories[&7], [7]);
+    assert_eq!(inputs.histories[&first.family_id], [9, 8, 7, 6]);
+    assert_eq!(inputs.histories.get(&second.family_id), None);
+    assert_eq!(inputs.family_names.get(&second.family_id), None);
 }

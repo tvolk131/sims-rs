@@ -136,6 +136,51 @@ impl SaveInputs {
             .retain(|&family, _| keep(family));
     }
 
+    /// A family that moves in from a `.FAM` file as `family`: the import
+    /// hands the file to the family (+0x140, 0x4291e6), and the save copies
+    /// its FAMh from that file (0x4107a8). Only a family with no file
+    /// falls back to its stored history (+0x144, 0x4107c7 to 0x4107cf),
+    /// so a file without one leaves the family no FAMh. `history` is the
+    /// file's ([`sims_formats::family_file::FamilyFile::history`]). The
+    /// name read for the ID, and its stray byte, belonged to whoever had
+    /// the ID before, so they go: the family's FAMs is written from its
+    /// stored name.
+    pub fn move_in_family(&mut self, family: u16, history: Option<Vec<u8>>) {
+        match history {
+            Some(history) => {
+                self.histories.insert(family, history);
+            }
+            None => {
+                self.histories.remove(&family);
+            }
+        }
+        self.family_names.remove(&family);
+        self.uninitialized.family_names.remove(&family);
+    }
+
+    /// Moves family `from`'s entries to `to`, as a family renumbered in
+    /// memory keeps its file and record (0x42c1ad renumbers family 4000):
+    /// its FAMh, its name as read and its name's stray byte. `to`'s own
+    /// entries are replaced.
+    pub fn renumber_family(&mut self, from: u16, to: u16) {
+        fn carry<T>(map: &mut BTreeMap<u16, T>, from: u16, to: u16) {
+            match map.remove(&from) {
+                Some(value) => {
+                    map.insert(to, value);
+                }
+                None => {
+                    map.remove(&to);
+                }
+            }
+        }
+        if from == to {
+            return;
+        }
+        carry(&mut self.histories, from, to);
+        carry(&mut self.family_names, from, to);
+        carry(&mut self.uninitialized.family_names, from, to);
+    }
+
     /// [`SAVE_INPUTS_FORMAT`] (little-endian), then the inputs (postcard).
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
