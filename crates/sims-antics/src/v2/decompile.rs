@@ -188,11 +188,13 @@ pub fn decompile_iff_to_v2_report(
         let generated = model.generate(&plan);
         match model.compile(&generated.text) {
             Err(Failure::V2 { line, message })
-                if plan.drop_variants(&model, &generated, line, &message) => {}
+                if plan.drop_strings(&model, &generated, line, &message)
+                    || plan.drop_variants(&model, &generated, line, &message) => {}
             Err(Failure::Air {
                 tree: None,
                 message,
-            }) if plan.drop_variants(&model, &generated, None, &message) => {}
+            }) if plan.drop_strings(&model, &generated, None, &message)
+                || plan.drop_variants(&model, &generated, None, &message) => {}
             Err(Failure::V2 { line, message }) => {
                 let tree = line.and_then(|l| generated.tree_at_line(l.saturating_sub(1)));
                 // An extra idiom is turned off before anything is lowered: it may be what
@@ -324,6 +326,14 @@ struct BconModel {
     entries: Vec<(String, i16)>,
 }
 
+/// A `STR#` table some tree shows text from, written as a `strings` member.
+struct StringsModel {
+    id: u16,
+    label: String,
+    /// Entry name -> text (the table's US English entries, in order).
+    entries: Vec<(String, String)>,
+}
+
 struct SoundModel {
     ident: String,
     wav: String,
@@ -342,6 +352,8 @@ struct Model {
     primary_init: u16,
     primary_main: u16,
     bcons: Vec<BconModel>,
+    /// String tables the trees read, by ID.
+    strings: Vec<StringsModel>,
     /// Library constant operand address -> entry name in `extern bcon library_consts`.
     extern_bcons: BTreeMap<u16, String>,
     /// Attribute slots referenced as `my.attr` / `stack.attr`.
@@ -761,6 +773,7 @@ impl Model {
             variants,
             primary_init,
             primary_main,
+            strings: strings_models(iff, &trees),
             bcons,
             extern_bcons,
             states,
@@ -910,13 +923,7 @@ impl Model {
     fn string_gap(&self, tree: &BhavChunk, recompiled: &RecompiledFile) -> Option<String> {
         tree.instructions
             .iter()
-            .filter_map(|i| match i.opcode {
-                21 | 50 => Some(u16::from_le_bytes([i.operands[0], i.operands[1]])),
-                // A dialog reads STR# 301 for its nonzero string operands (0 to 4, 6);
-                // a dialog that names none (a lot picker) reads no table.
-                36 if [0, 1, 2, 3, 4, 6].iter().any(|&k| i.operands[k] != 0) => Some(301),
-                _ => None,
-            })
+            .filter_map(string_table_read)
             .find(|&id| {
                 STRING_TAGS.iter().any(|tag| {
                     let key = (**tag, id);
@@ -1160,9 +1167,144 @@ struct RecompiledFile {
     attributes: Option<u16>,
 }
 
-/// A string table's entries as the VM reads them: language and text bytes (comments
-/// and the table's encoding are not observable), or its bytes when it does not parse.
+/// A string table's entries as the VM reads them, or its bytes when it does not parse.
+/// The port reads US English (language 1, `sims-vm` `dialog.rs` `dialog_strings`), so a
+/// table with language 1 entries is their texts in order; a table without is every
+/// entry's language and text. Comments and the table's encoding are not observable.
 type StringTexts = std::result::Result<Vec<(u8, Vec<u8>)>, Vec<u8>>;
+
+/// The string table instruction `i` shows text from: Show String (21) and Set Action
+/// String (50) name one; a private Dialog (36) reads `STR#` 301 for its nonzero string
+/// operands (0 to 4, 6), and one that names none (a lot picker) reads no table.
+fn string_table_read(i: &sims_formats::behavior::Instruction) -> Option<u16> {
+    match i.opcode {
+        21 | 50 => Some(u16::from_le_bytes([i.operands[0], i.operands[1]])),
+        36 if [0, 1, 2, 3, 4, 6].iter().any(|&k| i.operands[k] != 0) => Some(301),
+        _ => None,
+    }
+}
+
+/// The `STR#` tables the trees show text from that a v2 `strings` member can write: the
+/// table's US English entries, each text one a v2 string literal spells.
+fn strings_models(iff: &Iff, trees: &[TreeModel]) -> Vec<StringsModel> {
+    let ids: BTreeSet<u16> = trees
+        .iter()
+        .flat_map(|t| t.original.instructions.iter().filter_map(string_table_read))
+        .collect();
+    let mut used = BTreeSet::new();
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(chunk) = iff
+            .chunks
+            .iter()
+            .filter(|c| &c.tag == b"STR#" && c.id == id)
+            .last()
+        else {
+            continue;
+        };
+        let Ok(table) = StringTable::parse_chunk(iff.data(chunk), chunk.flags) else {
+            continue;
+        };
+        let texts: Vec<String> = table
+            .entries
+            .iter()
+            .filter(|e| e.language == 1)
+            .map(|e| e.text.clone())
+            .collect();
+        // A v2 literal spells no other control character, and the table encoder takes no NUL.
+        let spellable = |t: &String| {
+            !t.chars()
+                .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        };
+        if texts.is_empty() || !texts.iter().all(spellable) {
+            continue;
+        }
+        let entries = texts
+            .into_iter()
+            .enumerate()
+            .map(|(n, text)| (string_entry_name(&text, n + 1, &mut used), text))
+            .collect();
+        out.push(StringsModel {
+            id,
+            label: chunk.label.trim().to_owned(),
+            entries,
+        });
+    }
+    out
+}
+
+/// A `strings` entry name from its text: its first words in snake case, else `s<N>`
+/// (`n` is the entry's number from 1), unique within the object.
+fn string_entry_name(text: &str, n: usize, used: &mut BTreeSet<String>) -> String {
+    const RESERVED: &[&str] = &[
+        "if",
+        "else",
+        "let",
+        "return",
+        "true",
+        "false",
+        "self",
+        "sim",
+        "while",
+        "loop",
+        "match",
+        "fn",
+        "tree",
+        "const",
+        "state",
+        "strings",
+        "for",
+        "in",
+        "break",
+        "continue",
+        "raw",
+        "defer",
+        "repeat",
+        "sound",
+        "object",
+        "mod",
+        "use",
+        "pub",
+        "enum",
+        "struct",
+        "stack_obj",
+        "temp",
+        "param",
+        "local",
+        "none",
+        "some",
+    ];
+    let words: Vec<String> = text
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '$' && c != ':')
+        .filter(|w| {
+            !w.is_empty() && !w.contains('$') && w.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+        .take(4)
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let mut name = words.join("_");
+    name.truncate(32);
+    let name = name.trim_end_matches('_').to_owned();
+    let base = if name.is_empty()
+        || name.starts_with(|c: char| c.is_ascii_digit())
+        || RESERVED.contains(&name.as_str())
+    {
+        format!("s{n}")
+    } else {
+        name
+    };
+    let mut candidate = base.clone();
+    if used.contains(&candidate) {
+        candidate = format!("{base}_{n}");
+    }
+    let mut k = 2;
+    while used.contains(&candidate) {
+        candidate = format!("{base}_{n}_{k}");
+        k += 1;
+    }
+    used.insert(candidate.clone());
+    candidate
+}
 
 /// The chunks a text read can resolve: `STR#`, the catalog's `CTSS`, and the legacy
 /// `CST` the loader falls back on when a file has no `STR#` of the id.
@@ -1176,8 +1318,10 @@ fn string_texts(iff: &Iff) -> BTreeMap<([u8; 4], u16), StringTexts> {
         .map(|c| {
             let texts = StringTable::parse_chunk(iff.data(c), c.flags)
                 .map(|t| {
+                    let english = t.entries.iter().any(|e| e.language == 1);
                     t.entries
                         .into_iter()
+                        .filter(|e| !english || e.language == 1)
                         .map(|e| (e.language, e.raw_text))
                         .collect()
                 })
@@ -1877,6 +2021,8 @@ struct Plan {
     standalone: BTreeSet<u16>,
     /// Why the catalog variants are left out (the compiler rejected them).
     variants_off: Option<String>,
+    /// Why the `strings` members are left out (the compiler rejected them).
+    strings_off: Option<String>,
     /// Trees written without the extra idioms (see [`Translator::extra`]), after a round
     /// that used them was not proven.
     plain: BTreeSet<u16>,
@@ -1910,6 +2056,7 @@ impl Plan {
             raw_stmts: BTreeMap::new(),
             standalone,
             variants_off: None,
+            strings_off: None,
             plain: BTreeSet::new(),
         }
     }
@@ -2008,6 +2155,25 @@ impl Plan {
         true
     }
 
+    /// Leaves the `strings` members out when the compiler rejects one of them. `false` when
+    /// that cannot help.
+    fn drop_strings(
+        &mut self,
+        model: &Model,
+        generated: &Generated,
+        line: Option<usize>,
+        message: &str,
+    ) -> bool {
+        let at_strings = line
+            .is_some_and(|l| generated.strings_lines.contains(&l.saturating_sub(1)))
+            || (line.is_none() && message.contains("STR#"));
+        if self.strings_off.is_some() || model.strings.is_empty() || !at_strings {
+            return false;
+        }
+        self.strings_off = Some(message.lines().next().unwrap_or_default().to_owned());
+        true
+    }
+
     fn lower_at_line(&mut self, model: &Model, generated: &Generated, line: Option<usize>) -> bool {
         let Some(line) = line else {
             return self.lower_all(model);
@@ -2068,6 +2234,8 @@ struct Generated {
     extras: BTreeSet<u16>,
     /// 0-based lines holding the `variant` members.
     variant_lines: std::ops::Range<usize>,
+    /// 0-based lines holding the `strings` members.
+    strings_lines: std::ops::Range<usize>,
 }
 
 struct Out {
@@ -2184,6 +2352,29 @@ impl Model {
             out.line("}");
             out.line("");
         }
+        let strings_start = out.lines.len();
+        if let Some(why) = &plan.strings_off {
+            if !self.strings.is_empty() {
+                out.line(format!("// strings are not written: {why}."));
+                out.line("");
+            }
+        } else {
+            for st in &self.strings {
+                out.line(format!(
+                    "strings {} \"{}\" {{",
+                    st.id,
+                    v2_string_literal(&st.label)
+                ));
+                out.indent += 1;
+                for (name, text) in &st.entries {
+                    out.line(format!("{name} = \"{}\",", v2_string_literal(text)));
+                }
+                out.indent -= 1;
+                out.line("}");
+                out.line("");
+            }
+        }
+        let strings_lines = strings_start..out.lines.len();
         for s in &self.states {
             out.line(format!("state attr_{s} @ {s}: i16;"));
         }
@@ -2231,11 +2422,15 @@ impl Model {
                     } else {
                         format!(" ({})", params.join(", "))
                     };
-                    let kind = if b.kind == 0 {
+                    let mut kind = if b.kind == 0 {
                         String::new()
                     } else {
                         format!(", kind: {}", b.kind)
                     };
+                    // A 0-node tree (entering it faults) is `@frame(empty)` with a `{}` body.
+                    if b.instructions.is_empty() {
+                        kind.push_str(", empty");
+                    }
                     out.line(format!(
                         "@id({}) @frame(args: {}, locals: {}, format: {:#06x}, revision: {}{kind}) tree {} \"{}\"{ctx} {{",
                         t.id, b.args, b.locals, b.format, b.revision, t.ident, t.label
@@ -2364,8 +2559,25 @@ impl Model {
             raw_counts,
             extras,
             variant_lines,
+            strings_lines,
         }
     }
+}
+
+/// `text` as the inside of a v2 string literal.
+fn v2_string_literal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn hex_u32(v: u32) -> String {

@@ -315,13 +315,11 @@ object "Fable Remote" {
 }
 
 #[test]
-fn trees_showing_text_the_lift_does_not_write_are_inconclusive() {
-    // The lift writes no `strings`, so a tree reading a table the original has cannot
-    // prove: the rebuilt object shows different (no) text.
-    let iff = compile(
-        r#"object "Fable Sign" {
+fn trees_showing_text_prove_through_lifted_strings() {
+    // The lift writes the tables the trees show text from as `strings` members.
+    let source = r#"object "Fable Sign" {
     guid: 0x7E00_00A4;
-    strings 301 "Dialog prim string set" { ask = "Go on?", head = "Sign" }
+    strings 301 "Dialog prim string set" { ask = "Go on? $Local:0", head = "Sign \"A\"" }
     strings 431 "Action labels" { a = "Read", b = "Wave" }
     @id(4300) tree confirm {
         dialog(kind: yes_no, message: ask, title: head)?;
@@ -332,7 +330,27 @@ fn trees_showing_text_the_lift_does_not_write_are_inconclusive() {
     @id(4302) tree plain {
         temp[0] = 1;
     }
-}"#,
+}"#;
+    let iff = compile(source);
+    let lifted = round_trip(&iff, &DecompileV2Options::default());
+    for line in [
+        "strings 301 \"Dialog prim string set\" {",
+        "go_on = \"Go on? $Local:0\",",
+        "sign_a = \"Sign \\\"A\\\"\",",
+        "strings 431 \"Action labels\" {",
+        "wave = \"Wave\",",
+    ] {
+        assert!(lifted.contains(line), "missing {line}\n{lifted}");
+    }
+
+    // A table v2 cannot spell (a control character) is not written: the tree that shows
+    // it cannot prove.
+    let iff = with_data(
+        &compile(source),
+        (*b"STR#", 431),
+        vec![
+            0xFF, 0xFF, 2, 0, b'R', b'e', b'a', b'd', 0, b'W', 0x01, b'v', b'e', 0,
+        ],
     );
     let report = decompile_iff_to_v2_report(&iff, &DecompileV2Options::default()).expect("lift");
     let check = |id: u16| {
@@ -343,18 +361,38 @@ fn trees_showing_text_the_lift_does_not_write_are_inconclusive() {
             .unwrap_or_else(|| panic!("tree {id} in {:?}", report.trees))
             .check
     };
-    for (id, table) in [(4300, 301), (4301, 431)] {
-        match check(id) {
-            TreeCheck::Inconclusive(why) => {
-                assert!(why.contains(&format!("STR# {table}")), "{why}");
-            }
-            other => panic!("tree {id}: {other:?}"),
-        }
+    match check(4301) {
+        TreeCheck::Inconclusive(why) => assert!(why.contains("STR# 431"), "{why}"),
+        other => panic!("tree 4301: {other:?}"),
     }
-    assert!(matches!(
-        check(4302),
-        TreeCheck::Identical | TreeCheck::Equivalent
-    ));
+    for id in [4300, 4302] {
+        assert!(
+            matches!(check(id), TreeCheck::Identical | TreeCheck::Equivalent),
+            "tree {id}: {:?}",
+            check(id)
+        );
+    }
+}
+
+/// `iff` with chunk `key`'s bytes replaced.
+fn with_data(iff: &Iff, key: ([u8; 4], u16), data: Vec<u8>) -> Iff {
+    let chunks: Vec<_> = iff
+        .chunks
+        .iter()
+        .filter(|c| &c.tag != b"rsmp")
+        .map(|c| ChunkData {
+            tag: c.tag,
+            id: c.id,
+            flags: c.flags,
+            label: c.label.clone(),
+            data: if (c.tag, c.id) == key {
+                data.clone()
+            } else {
+                iff.data(c).to_vec()
+            },
+        })
+        .collect();
+    Iff::parse(sims_formats::iff::write(&chunks).expect("write IFF")).expect("parse IFF")
 }
 
 /// `iff` with chunk `from` retagged `to` (same id and bytes).
@@ -416,5 +454,21 @@ fn fallback_text_tables_and_tableless_dialogs() {
         !matches!(check(4302), TreeCheck::Inconclusive(why) if why.contains("STR#")),
         "{:?}",
         check(4302)
+    );
+}
+
+#[test]
+fn zero_node_trees_lift_as_frame_empty() {
+    let iff = compile(
+        r#"object "Fable Empty" {
+    guid: 0x7E00_00B0;
+    @id(4300) @frame(args: 4, empty) tree start_fire "start fire" {}
+    @id(4301) tree other "Other" { temp[0] = 1; }
+}"#,
+    );
+    let lifted = round_trip(&iff, &DecompileV2Options::default());
+    assert!(
+        lifted.contains("revision: 0, empty) tree start_fire_4300 \"start fire\" {}"),
+        "{lifted}"
     );
 }
