@@ -613,6 +613,30 @@ fn builtins_that_write_a_local_assign_it() {
     one(&source, "uninitialized_local_read");
 }
 
+#[test]
+fn relationship_reads_into_its_value_local() {
+    // Without flag 4 `relationship(value:)` reads the number into the local.
+    for flags in ["0", "1", "SOME_FLAGS"] {
+        let source = sim_tree(&format!(
+            "        let n: i16;\n        relationship(column: 0, dir: 0, flags: {flags}, local: 0, value: n);\n        self.level = n;"
+        ));
+        let source = if flags == "SOME_FLAGS" {
+            source.replace("object \"", "const SOME_FLAGS = 0;\nobject \"")
+        } else {
+            source
+        };
+        none(&source, "uninitialized_local_read");
+        none(&source, "unused_decl");
+    }
+    // With flag 4 it writes the relationship from the local: a read.
+    one(
+        &sim_tree(
+            "        let n: i16;\n        relationship(column: 0, dir: 0, flags: 4, local: 0, value: n);\n        self.level = n;",
+        ),
+        "uninitialized_local_read",
+    );
+}
+
 // --- $Local:N string tokens -------------------------------------------------------------
 
 /// A Sim tree whose dialog shows the string `hi`.
@@ -833,6 +857,20 @@ fn a_const_written_as_its_value_in_raw_is_used() {
 }
 
 #[test]
+fn a_const_named_only_in_raw_is_not_used() {
+    // The build rejects the name in `raw`: say so instead of counting it as a use.
+    let d = one(
+        &obj(
+            "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { temp[0] := LEVEL_SLOT; }\n    }",
+        ),
+        "unused_decl",
+    );
+    assert!(d.message.contains("only named inside `raw"), "{d:?}");
+    assert!(d.note.as_deref().unwrap().contains("does not resolve `const`"), "{d:?}");
+    assert_eq!(d.help.as_deref(), Some("write its value, 7, in the `raw` body"));
+}
+
+#[test]
 fn odd_raw_text_does_not_crash_the_linter() {
     // A non-ASCII comment before `[`, and an index no frame can hold.
     for raw in [
@@ -952,39 +990,50 @@ fn if_returning_bool_literals_is_flagged() {
     );
     let d = one(&source, "redundant_bool_return");
     assert_eq!(d.suggestion.as_deref(), Some("return self.on;"));
-    let inverted = obj(
-        "    state on: bool;\n    fn low() -> bool {\n        if self.on { return false; } else { return true; }\n    }",
+    let with_else = obj(
+        "    state on: bool;\n    fn high() -> bool {\n        if self.on { return true; } else { return false; }\n    }",
     );
     assert_eq!(
-        one(&inverted, "redundant_bool_return")
+        one(&with_else, "redundant_bool_return")
             .suggestion
             .as_deref(),
-        Some("return !self.on;")
-    );
-    // A negated condition returning false is the operand, not `!!`.
-    let negated = obj(
-        "    state on: bool;\n    fn on() -> bool {\n        if !self.on { return false; }\n        return true;\n    }",
-    );
-    assert_eq!(
-        one(&negated, "redundant_bool_return").suggestion.as_deref(),
         Some("return self.on;")
     );
 }
 
 #[test]
-fn if_returning_a_comparison_keeps_its_last_result() {
-    // `return a op b;` lowers with the opposite last result: not reported.
-    for cond in [
-        "self.level > 3",
-        "!(self.level > 3)",
-        "self.on && self.level == 2",
+fn if_returning_a_comparison_is_flagged_in_the_same_polarity() {
+    // `return c;` ends on the node testing `c` with the same exits: the same last result.
+    for (cond, returned) in [
+        ("self.level > 3", "self.level > 3"),
+        ("!(self.level > 3)", "!(self.level > 3)"),
+        ("self.on && self.level == 2", "self.on && (self.level == 2)"),
     ] {
-        none(
+        let d = one(
             &obj(&format!(
                 "    state on: bool;\n    fn high() -> bool {{\n        if {cond} {{ return true; }}\n        return false;\n    }}"
             )),
             "redundant_bool_return",
         );
+        assert_eq!(d.suggestion, Some(format!("return {returned};")));
+    }
+}
+
+#[test]
+fn if_returning_false_then_true_keeps_its_last_result() {
+    // `return !c;` would end on the opposite last result: never reported.
+    for cond in ["self.on", "!self.on", "self.level > 3", "!(self.level > 3)"] {
+        for shape in [
+            format!("if {cond} {{ return false; }}\n        return true;"),
+            format!("if {cond} {{ return false; }} else {{ return true; }}"),
+        ] {
+            none(
+                &obj(&format!(
+                    "    state on: bool;\n    fn low() -> bool {{\n        {shape}\n    }}"
+                )),
+                "redundant_bool_return",
+            );
+        }
     }
 }
 
@@ -1112,7 +1161,7 @@ fn inline_guid_literals_in_bodies_are_flagged() {
 #[test]
 fn negated_comparisons_are_flagged_with_a_polarity_note() {
     let source = tree(
-        "        if !(self.level == 3) { sleep(1); }\n        if !(self.level < temp[0]) { sleep(1); }\n        sleep(2);",
+        "        if !(self.level == 3) { temp[0] = 1; }\n        if !(self.level < temp[0]) { self.level = temp[1] + 1; }\n        self.mode = Mode::Low;\n        sleep(2);",
     );
     let found = of(&source, "negated_comparison");
     let suggestions: Vec<&str> = found
@@ -1121,6 +1170,11 @@ fn negated_comparisons_are_flagged_with_a_polarity_note() {
         .collect();
     assert_eq!(suggestions, ["self.level != 3", "self.level >= temp[0]"]);
     assert!(found[0].note.as_deref().unwrap().contains("polarity"));
+    // Both branches go on to a test of places that cannot fault.
+    one(
+        &tree("        while !(self.level > 3) { self.level += 1; }\n        if temp[0] == 2 { sleep(1); }"),
+        "negated_comparison",
+    );
 }
 
 #[test]
@@ -1128,19 +1182,41 @@ fn negated_comparisons_a_branch_may_end_on_are_fine() {
     // A branch that can end the tree right after the compare leaves its result as the
     // tree's last result: flipping it would change that.
     for body in [
-        "        if !(self.level == 3) { sleep(1); }",
-        "        if !(self.level == 3) { return true; }\n        sleep(1);",
-        "        if !(self.level == 3) { sleep(1); }\n        return false;",
+        "        if !(self.level == 3) { temp[0] = 1; }",
+        "        if !(self.level == 3) { return true; }\n        temp[0] = 1;",
+        "        if !(self.level == 3) { temp[0] = 1; }\n        return false;",
         "        while !(self.level > 3) { self.level += 1; }",
         // A test of constants folds away: the `return` right after is the next node.
-        "        if !(self.level == 3) {\n            if true { return true; }\n        }\n        sleep(1);",
-        "        if !(self.level == 3) {\n            if true || self.level == 0 { return true; }\n        }\n        sleep(1);",
+        "        if !(self.level == 3) {\n            if true { return true; }\n        }\n        temp[0] = 1;",
+        "        if !(self.level == 3) {\n            if true || self.level == 0 { return true; }\n        }\n        temp[0] = 1;",
     ] {
         none(&tree(body), "negated_comparison");
     }
-    // Both branches run a node first.
+}
+
+#[test]
+fn negated_comparisons_before_a_call_or_a_fault_are_fine() {
+    // The last result is observable at a call (the callee and the verifier see it) and
+    // at a fault, so the compare's own result may be the one that shows.
+    for body in [
+        "        if !(self.level == 3) { sleep(1); }\n        temp[0] = 1;",
+        "        if !(self.level == 3) { temp[0] = 1; }\n        sleep(1);",
+        "        while !(self.level > 3) { self.level += 1; }\n        sleep(1);",
+        "        if !(self.level == 3) { temp[0] = 1; }\n        temp[1] = temp[0] / 2;",
+        "        if !(self.level == 3) { temp[0] = 1; }\n        temp[1] = temp[temp[0]];",
+        // A store to a `let` may be folded away.
+        "        let n = 0;\n        if !(self.level == 3) { n = 1; }\n        temp[0] = n;",
+    ] {
+        none(&tree(body), "negated_comparison");
+    }
+    // In a Sim's body `self` follows `stack_obj`, which may be missing: a store to it
+    // can fault.
+    none(
+        &sim_tree("        if !(self.level == 3) { self.level = 1; }\n        temp[0] = 1;"),
+        "negated_comparison",
+    );
     one(
-        &tree("        while !(self.level > 3) { self.level += 1; }\n        sleep(1);"),
+        &sim_tree("        if !(temp[0] == 3) { temp[1] = 1; }\n        temp[2] = 1;"),
         "negated_comparison",
     );
 }

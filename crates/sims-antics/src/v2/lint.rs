@@ -289,6 +289,7 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             dialog_strings: Vec::new(),
             tree: None,
             self_handles: BTreeSet::new(),
+            sim_body: false,
             diags: Vec::new(),
         };
         cx.lint_file(ast);
@@ -595,7 +596,7 @@ struct Symbols {
     ident_counts: BTreeMap<String, usize>,
     /// Literal `attr[N]` indices.
     attr_indices: BTreeSet<i64>,
-    /// Identifier-like words inside `raw { }` bodies.
+    /// Identifier-like words inside `raw { }` bodies (which never resolve a `const`).
     raw_words: BTreeSet<String>,
     /// Literal indices `raw { }` bodies address (`attr[5]`, `data[0x10]`), outside the
     /// frame's own `local` / `temp` / `param` words: `raw` does not resolve `const` names,
@@ -1073,6 +1074,8 @@ struct FileLinter<'a> {
     /// Locals holding this object's own handle (`let saved = stack_obj;` before any
     /// reassignment), in the Sim-context body `clobber_walk` is in.
     self_handles: BTreeSet<String>,
+    /// The body being linted is one a Sim runs (`self` follows `stack_obj`).
+    sim_body: bool,
     diags: Vec<LintDiagnostic>,
 }
 
@@ -1507,11 +1510,21 @@ impl FileLinter<'_> {
 
     fn unused_const(&mut self, c: &crate::v2::ast::ConstDecl) {
         let count = self.symbols.ident_counts.get(&c.name).copied().unwrap_or(0);
-        if count <= 1
-            && !self.symbols.raw_words.contains(&c.name)
-            && !self.symbols.raw_index_literals.contains(&c.value)
-            && !c.name.starts_with('_')
-        {
+        if count > 1 || c.name.starts_with('_') {
+            return;
+        }
+        // `raw` does not resolve `const` names (the build rejects one there), so a name
+        // in a `raw` body is not a use; only the value written in its place is.
+        if self.symbols.raw_words.contains(&c.name) {
+            self.emit(
+                UNUSED_DECL,
+                c.span,
+                format!("constant `{}` is only named inside `raw {{ }}`", c.name),
+                Some(format!("write its value, {}, in the `raw` body", c.value)),
+                None,
+                Some("`raw` does not resolve `const` names: the build rejects the name there".to_owned()),
+            );
+        } else if !self.symbols.raw_index_literals.contains(&c.value) {
             self.emit(
                 UNUSED_DECL,
                 c.span,
@@ -1532,6 +1545,7 @@ impl FileLinter<'_> {
     }
 
     fn lint_body(&mut self, body: &[V2Stmt], cx: BodyCx) {
+        self.sim_body = cx.sim;
         self.lint_list(body, false, false);
         if cx.sim {
             self.self_handles.clear();
@@ -2212,47 +2226,25 @@ impl FileLinter<'_> {
         } else {
             ret_bool(else_body)
         };
-        if other != Some(!t) {
+        // Only the same-polarity form: `return c;` ends on the node that tests `c`, with
+        // the same exits, so the tree's last result is unchanged. The inverted form
+        // (`if c { return false; } return true;`) would need `return !c;`, which ends
+        // on the opposite last result, observable at the tree's exit.
+        if !t || other != Some(false) {
             return;
         }
-        // `return a op b;` lowers to the flipped compare with swapped exits, so it ends
-        // the tree on the opposite last result: the `if` form is the only spelling that
-        // keeps it.
-        let mut compares = false;
-        walk_expr(cond, &mut |x| {
-            compares |= matches!(x, V2Expr::Binary { op, .. } if flipped(*op).is_some());
-        });
-        if compares {
-            return;
-        }
-        let returned = if t {
-            print_expr(cond)
-        } else if let V2Expr::Unary {
-            op: V2UnaryOp::Not,
-            inner,
-            ..
-        } = cond
-        {
-            print_expr(inner)
-        } else if matches!(cond, V2Expr::Binary { .. }) {
-            print_expr(cond).map(|c| format!("!({c})"))
-        } else {
-            print_expr(cond).map(|c| format!("!{c}"))
-        };
-        let suggestion = returned.map(|c| format!("return {c};"));
+        let suggestion = print_expr(cond).map(|c| format!("return {c};"));
         self.emit(
             REDUNDANT_BOOL_RETURN,
             *span,
-            format!(
-                "this `if` returns {} when the condition holds and {} otherwise",
-                t, !t
-            ),
-            Some(format!(
-                "return the condition directly: `return {}<condition>;`",
-                if t { "" } else { "!" }
-            )),
+            "this `if` returns true when the condition holds and false otherwise".to_owned(),
+            Some("return the condition directly: `return <condition>;`".to_owned()),
             suggestion,
-            Some("comparisons are not reported: `return a op b;` ends the tree on the opposite last result".to_owned()),
+            Some(
+                "`if c { return false; } return true;` is not reported: `return !c;` ends the \
+                 tree on the opposite last result"
+                    .to_owned(),
+            ),
         );
     }
 
@@ -2286,7 +2278,9 @@ impl FileLinter<'_> {
         let Some(flip) = flipped(*op) else {
             return;
         };
-        if !(on_true.is_some_and(runs_a_node) && on_false.is_some_and(runs_a_node)) {
+        let sim = self.sim_body;
+        let quiet = |s: Option<&V2Stmt>| s.is_some_and(|s| runs_a_quiet_node(s, sim));
+        if !(quiet(on_true) && quiet(on_false)) {
             return;
         }
         let suggestion = print_expr(lhs)
@@ -2302,7 +2296,7 @@ impl FileLinter<'_> {
             ),
             Some(format!("write the comparison with `{}`", binop_str(flip))),
             suggestion,
-            Some("v2 keeps `!(a op b)` as the negated compare node with its branches swapped (the opposite last-result polarity); this one is only reported because both branches run another node before the tree can end, so the node's own result is never the tree's last result. If you mirror an original tree's node bytes on purpose, allow this lint".to_owned()),
+            Some("v2 keeps `!(a op b)` as the negated compare node with its branches swapped (the opposite last-result polarity); this one is only reported because both branches go on to a plain store or test that cannot fault, so the node's own result is never the tree's last result. Before a call, a primitive, `sleep` or the tree's end the result is observable, and that is not reported. If you mirror an original tree's node bytes on purpose, allow this lint".to_owned()),
         );
     }
 
@@ -2815,74 +2809,101 @@ fn hex_guid(v: i64) -> String {
 }
 
 /// The builtins with an argument naming a local the VM writes.
-const LOCAL_WRITING_BUILTINS: &[&str] = &["random_into", "animate"];
+const LOCAL_WRITING_BUILTINS: &[&str] = &["random_into", "animate", "relationship"];
 
 /// Whether argument `k` of a call to the builtin `callee` is a local the VM writes:
-/// `random_into`'s first positional argument, `animate`'s event `local:`.
+/// `random_into`'s first positional argument, `animate`'s event `local:`, and
+/// `relationship`'s `value:` unless its `flags:` are a literal with flag 4 (which
+/// writes the relationship from the local instead). Flags that are not a literal
+/// count as a write, so no read is reported that may not happen.
 /// (`set_headline(local:)` and `push_interaction(icon:)` read theirs.)
 fn writes_arg(callee: &str, args: &[CallArg], k: usize) -> bool {
     match callee {
         "random_into" => args.iter().position(|a| a.name.is_none()) == Some(k),
         "animate" => args[k].name.as_deref() == Some("local"),
+        "relationship" => {
+            args[k].name.as_deref() == Some("value")
+                && !args.iter().any(|a| {
+                    a.name.as_deref() == Some("flags")
+                        && matches!(a.value, V2Expr::Int(_, f) if f & 4 != 0)
+                })
+        }
         _ => false,
     }
 }
 
-/// Whether a statement surely runs at least one node before control can leave it (so
-/// the node before it is not the tree's last result). Conservative: anything the
-/// optimizer might fold or drop (a `let`, a store to a local, a test of constants)
-/// does not count.
-fn runs_a_node(s: &V2Stmt) -> bool {
-    // A call or a read of a place (`self.level`, `temp[0]`) cannot be folded away.
-    let live = |e: &V2Expr| {
-        let mut found = false;
-        walk_expr(e, &mut |x| {
-            found |= matches!(
-                x,
-                V2Expr::Call { .. }
-                    | V2Expr::MethodCall { .. }
-                    | V2Expr::Field { .. }
-                    | V2Expr::Index { .. }
-            );
-        });
-        found
+/// Whether a statement first runs one expression node that cannot fault and calls
+/// nothing: a store to `temp[n]` (or to a field of `self` outside a Sim's body, where
+/// `self` is the object running the tree and cannot be missing), or a test of such
+/// places. Then the result of the node before it is overwritten without being
+/// observed: the tree does not end, call, or fault in between. Conservative: a store
+/// to a `let` (which the optimizer may fold or drop), a division, an indexed read and
+/// a test of a literal or `&&` / `||` (which may fold) do not count.
+fn runs_a_quiet_node(s: &V2Stmt, sim: bool) -> bool {
+    let place = |e: &V2Expr| match e {
+        V2Expr::Index { base, index, .. } => {
+            matches!(base.as_ref(), V2Expr::Ident(_, b) if b == "temp")
+                && matches!(index.as_ref(), V2Expr::Int(..))
+        }
+        V2Expr::Field { base, .. } => {
+            !sim && matches!(base.as_ref(), V2Expr::Ident(_, b) if b == "self")
+        }
+        _ => false,
     };
+    fn value(e: &V2Expr, place: &dyn Fn(&V2Expr) -> bool) -> bool {
+        match e {
+            V2Expr::Int(..) | V2Expr::Ident(..) | V2Expr::Path(..) => true,
+            V2Expr::Index { .. } | V2Expr::Field { .. } => place(e),
+            V2Expr::Unary {
+                op: V2UnaryOp::Neg,
+                inner,
+                ..
+            } => value(inner, place),
+            V2Expr::Binary { lhs, op, rhs, .. } => {
+                matches!(
+                    op,
+                    V2BinOp::Add
+                        | V2BinOp::Sub
+                        | V2BinOp::Mul
+                        | V2BinOp::BitAnd
+                        | V2BinOp::BitOr
+                        | V2BinOp::BitXor
+                ) && value(lhs, place)
+                    && value(rhs, place)
+            }
+            _ => false,
+        }
+    }
     match s {
-        V2Stmt::Return { value, .. } => value.as_ref().is_some_and(live),
-        V2Stmt::Assign { target, value, .. } => {
-            !matches!(target, V2Expr::Ident(..))
-                && print_expr(target).is_none_or(|t| print_expr(value).is_none_or(|v| t != v))
+        V2Stmt::Assign {
+            target, op, value: v, ..
+        } => {
+            place(target)
+                && !matches!(op, V2AssignOp::Div | V2AssignOp::Mod)
+                && value(v, &place)
+                && print_expr(target).is_none_or(|t| print_expr(v).is_none_or(|v| t != v))
         }
-        // A test with a literal or a short-circuit (`true || x`) may fold.
         V2Stmt::If { cond, .. } | V2Stmt::While { cond, .. } => {
-            let mut foldable = false;
-            walk_expr(cond, &mut |x| {
-                foldable |= matches!(
-                    x,
-                    V2Expr::Bool(..)
-                        | V2Expr::Binary {
-                            op: V2BinOp::Or | V2BinOp::And,
-                            ..
-                        }
-                );
-            });
-            live(cond) && !foldable
+            let cond = match cond {
+                V2Expr::Unary {
+                    op: V2UnaryOp::Not,
+                    inner,
+                    ..
+                } => inner.as_ref(),
+                c => c,
+            };
+            let V2Expr::Binary { lhs, op, rhs, .. } = cond else {
+                return false;
+            };
+            flipped(*op).is_some()
+                && value(lhs, &place)
+                && value(rhs, &place)
+                // A test of two constants may fold away.
+                && [lhs, rhs]
+                    .iter()
+                    .any(|x| !matches!(x.as_ref(), V2Expr::Int(..) | V2Expr::Ident(..) | V2Expr::Path(..)))
         }
-        V2Stmt::Match { scrutinee, .. } => live(scrutinee),
-        V2Stmt::Expr { expr, .. } => matches!(
-            expr,
-            V2Expr::Call { .. } | V2Expr::MethodCall { .. } | V2Expr::Try { .. }
-        ),
-        V2Stmt::LetSome { .. } | V2Stmt::WithLock { .. } | V2Stmt::Animate { .. } => true,
-        V2Stmt::ReturnError { .. }
-        | V2Stmt::Break { .. }
-        | V2Stmt::Continue { .. }
-        | V2Stmt::Let { .. }
-        | V2Stmt::LetUninit { .. }
-        | V2Stmt::Defer { .. }
-        | V2Stmt::RawAir { .. }
-        | V2Stmt::Repeat { .. }
-        | V2Stmt::ForEach { .. } => false,
+        _ => false,
     }
 }
 
