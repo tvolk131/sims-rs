@@ -971,3 +971,45 @@ tree 4096 "MixedRawIdle" (locals: 1) {
         .is_err()
     );
 }
+
+/// `compile_pack_dir` rejects a catalog variant whose GUID another object of the pack
+/// also defines, not only clashing primary and tile GUIDs.
+#[test]
+fn pack_dir_rejects_variant_guid_collisions_across_objects() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("variant-guid-collision-{}", std::process::id()));
+    let pack = |name: &str, second_guid: &str| {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("objects")).expect("mkdir objects");
+        std::fs::write(
+            dir.join("pack.toml"),
+            "[pack]\nid = \"variant_guids\"\nname = \"Variant GUIDs\"\nversion = \"0.1.0\"\n\
+             archive = \"variant-guids.far\"\nobjects = [\"first\", \"second\"]\n",
+        )
+        .expect("write pack.toml");
+        std::fs::write(
+            dir.join("objects/first.antics"),
+            "object \"First\" {\n    guid: 0x7F51_0001;\n    state level: i16;\n    \
+             init { self.level = 1; }\n    variant \"First Variant\" { guid: 0x7F51_0002 }\n}\n",
+        )
+        .expect("write first");
+        std::fs::write(
+            dir.join("objects/second.antics"),
+            format!(
+                "object \"Second\" {{\n    guid: {second_guid};\n    state level: i16;\n    \
+                 init {{ self.level = 2; }}\n}}\n"
+            ),
+        )
+        .expect("write second");
+        dir
+    };
+    let clash = sims_antics::compile_pack_dir(&pack("clash", "0x7F51_0002"))
+        .expect_err("a variant GUID shared with another object must be rejected");
+    assert!(
+        clash.to_string().contains("duplicate GUID 0x7f510002"),
+        "{clash}"
+    );
+    let distinct = sims_antics::compile_pack_dir(&pack("distinct", "0x7F51_0003"))
+        .expect("distinct GUIDs compile");
+    assert_eq!(distinct.objects.len(), 2);
+}

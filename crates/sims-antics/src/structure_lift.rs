@@ -1286,12 +1286,9 @@ fn decode_named(
             Some(DecodedIns::always_true(head))
         }
         36 => {
-            // `.air` cannot spell bit 7 of byte 5, and the VM keeps it: the dialog record
-            // copies every operand byte (`dialog.rs`), so neither mode drops it.
-            if ops[5] & 0x80 != 0 {
-                return None;
-            }
-            let kind = ops[5] & 0x7F;
+            // The whole byte: the VM shows kind `& 0x7F`, but the dialog record copies
+            // every operand byte (`dialog.rs`), so bit 7 is kept and spelled.
+            let kind = ops[5];
             let expr = format!(
                 "dialog(kind: {kind}, message: {}, title: {}, button1: {}, button2: {}, button3: {}, mode4_str: {}, flags: {})",
                 ops[2], ops[6], ops[3], ops[4], ops[0], ops[1], ops[7]

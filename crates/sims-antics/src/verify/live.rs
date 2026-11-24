@@ -58,6 +58,7 @@
 //! The checker never reports `Equivalent` for trees it cannot fully explore within its
 //! bounds.
 
+use super::domains::ParamDomains;
 use super::replay::{self, Witness};
 use super::{
     EquivResult, FrameUse, TraceStep, canonicalize_primitive_operands,
@@ -66,6 +67,7 @@ use super::{
 use crate::ir::BhavChunk;
 use crate::lower::{TARGET_ERROR, TARGET_FALSE, TARGET_TRUE};
 use sims_formats::behavior::Instruction;
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Attributes every object has, whatever its definition says (`sims-vm/src/factory.rs:314`,
@@ -110,6 +112,11 @@ pub struct LiveContext {
     /// compares any spelling of them as `[0xFF; 8]`, when `callee_arities` agrees
     /// ([`LiveContext::call_reads_no_operands`]).
     pub argless_callees: Option<BTreeSet<u16>>,
+    /// Values tree parameters are assumed to hold on entry (`tree -> param -> domain`;
+    /// `verify-equiv --param-domain`). Empty by default, which assumes nothing. With
+    /// one, `Equivalent` holds only for runs that enter each constrained tree inside its
+    /// domain. Ignored for kind-4 trees, whose first parameter is their entry node.
+    pub param_domains: ParamDomains,
 }
 
 impl LiveContext {
@@ -137,6 +144,7 @@ impl Default for LiveContext {
             my_attribute_count: GUARANTEED_ATTRIBUTES,
             local_bcons: None,
             argless_callees: None,
+            param_domains: ParamDomains::new(),
         }
     }
 }
@@ -148,7 +156,9 @@ pub struct LiveOptions {
     pub max_paths: usize,
     /// Most instructions one path may execute before giving up (loops).
     pub max_steps: usize,
-    /// Most pairs of paths with different summaries checked for joint feasibility.
+    /// Most pairs of paths with different summaries checked for joint feasibility. A
+    /// pair whose conditions contain one branch with opposite outcomes is ruled out
+    /// without a check and does not count.
     pub max_pair_checks: usize,
     /// Compare the scratch-pointer state at events and at exit. A caller that reads
     /// Global 34 right after the call observes it (`expression.rs:31`).
@@ -378,13 +388,15 @@ impl Interner {
     }
 
     fn sym(&mut self, key: SymKey) -> Val {
-        if let Some(&id) = self.syms.get(&key) {
-            return Val::Sym(id);
+        // One search, hit or miss: keys can be long to compare.
+        match self.syms.entry(key) {
+            Entry::Occupied(e) => Val::Sym(*e.get()),
+            Entry::Vacant(e) => {
+                let id = self.sym_keys.len() as u32;
+                self.sym_keys.push(e.key().clone());
+                Val::Sym(*e.insert(id))
+            }
         }
-        let id = self.sym_keys.len() as u32;
-        self.syms.insert(key.clone(), id);
-        self.sym_keys.push(key);
-        Val::Sym(id)
     }
 
     fn lookup(&self, key: &SymKey) -> Option<Val> {
@@ -412,13 +424,14 @@ impl Interner {
     }
 
     fn prefix(&mut self, node: PrefixNode) -> u32 {
-        if let Some(&id) = self.prefixes.get(&node) {
-            return id;
+        match self.prefixes.entry(node) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                let id = self.prefix_nodes.len() as u32;
+                self.prefix_nodes.push(e.key().clone());
+                *e.insert(id)
+            }
         }
-        let id = self.prefix_nodes.len() as u32;
-        self.prefixes.insert(node.clone(), id);
-        self.prefix_nodes.push(node);
-        id
     }
 
     /// The events (with branch outcomes) leading to `prefix`, oldest first, back to the
@@ -644,36 +657,36 @@ enum Feasibility {
 }
 
 fn feasibility(conds: &[&[(Atom, bool)]], interner: &Interner) -> Feasibility {
-    let mut decided: BTreeMap<Atom, bool> = BTreeMap::new();
+    // Sorted, an atom taken both ways is two neighbours with the same atom.
+    let mut literals: Vec<(Atom, bool)> = conds.iter().flat_map(|c| c.iter().copied()).collect();
+    literals.sort_unstable();
+    literals.dedup();
+    if literals.windows(2).any(|w| w[0].0 == w[1].0) {
+        return Feasibility::Unsat;
+    }
     let mut ranges: BTreeMap<u32, Range> = BTreeMap::new();
     let mut exact = true;
-    for cond in conds {
-        for &(atom, value) in *cond {
-            if let Some(prev) = decided.insert(atom, value)
-                && prev != value
-            {
-                return Feasibility::Unsat;
-            }
-            if let Some(v) = eval_atom(atom)
-                && v != value
-            {
-                return Feasibility::Unsat;
-            }
-            match atom {
-                Atom::Outcome(_) => {}
-                _ => match atom_sym_vs_const(atom) {
-                    Some(sym) => {
-                        ranges
-                            .entry(sym)
-                            .or_insert_with(Range::full)
-                            .apply(atom, value, sym);
-                        if !interner.is_input(sym) {
-                            exact = false;
-                        }
+    // Ranges only narrow, so the order literals are applied in does not matter.
+    for &(atom, value) in &literals {
+        if let Some(v) = eval_atom(atom)
+            && v != value
+        {
+            return Feasibility::Unsat;
+        }
+        match atom {
+            Atom::Outcome(_) => {}
+            _ => match atom_sym_vs_const(atom) {
+                Some(sym) => {
+                    ranges
+                        .entry(sym)
+                        .or_insert_with(Range::full)
+                        .apply(atom, value, sym);
+                    if !interner.is_input(sym) {
+                        exact = false;
                     }
-                    None => exact = false,
-                },
-            }
+                }
+                None => exact = false,
+            },
         }
     }
     if ranges.values().any(|r| r.count() <= 0) {
@@ -832,6 +845,32 @@ struct PathState {
     at: Option<FaultPoint>,
 }
 
+impl PathState {
+    /// A copy for one side of a split. Unlike `clone`, it leaves room for the next few
+    /// conditions and nodes, so the push that follows does not copy them again.
+    fn fork(&self) -> Self {
+        let mut cond = Vec::with_capacity(self.cond.len() + 8);
+        cond.extend_from_slice(&self.cond);
+        let mut nodes = Vec::with_capacity(self.nodes.len() + 16);
+        nodes.extend_from_slice(&self.nodes);
+        Self {
+            pc: self.pc,
+            prefix: self.prefix,
+            epoch: self.epoch,
+            params: self.params.clone(),
+            locals: self.locals.clone(),
+            store: self.store.clone(),
+            scratch: self.scratch,
+            last_result: self.last_result,
+            unwritten: self.unwritten.clone(),
+            cond,
+            steps: self.steps,
+            nodes,
+            at: self.at.clone(),
+        }
+    }
+}
+
 /// Where an `Expression` operand lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Loc {
@@ -860,6 +899,8 @@ struct Explorer<'a> {
     /// (`interpreter.rs:964`): exactly this value, or (`false`) at least it, for the
     /// last node, which every larger entry is clamped to.
     entry_param: Option<(i16, bool)>,
+    /// Bounds the entry assumes on parameters, `(index, lo, hi)` (a domain region).
+    region: &'a [(usize, i16, i16)],
 }
 
 /// `(params, locals)` the VM gives a frame running `bhav` (`sims_vm::interpreter::dimensions`).
@@ -885,6 +926,7 @@ impl<'a> Explorer<'a> {
         opts: &'a LiveOptions,
         entry: usize,
         entry_param: Option<(i16, bool)>,
+        region: &'a [(usize, i16, i16)],
     ) -> Self {
         let (args, locals) = frame_dims(bhav);
         Self {
@@ -895,6 +937,7 @@ impl<'a> Explorer<'a> {
             locals,
             entry,
             entry_param,
+            region,
         }
     }
 
@@ -912,6 +955,15 @@ impl<'a> Explorer<'a> {
                 *first = Val::Const(raw);
             } else if raw > 0 {
                 cond.push((Atom::Lt(Val::Const(raw - 1), *first), true));
+            }
+        }
+        for &(i, lo, hi) in self.region {
+            let Some(&p) = params.get(i) else { continue };
+            if lo > i16::MIN {
+                cond.push((Atom::Lt(p, Val::Const(lo)), false));
+            }
+            if hi < i16::MAX {
+                cond.push((Atom::Lt(Val::Const(hi), p), false));
             }
         }
         PathState {
@@ -993,8 +1045,44 @@ impl<'a> Explorer<'a> {
         Ok((done, steps))
     }
 
-    fn finish(&self, state: PathState, exit: Exit, interner: &mut Interner) -> Step {
-        let store = self.normalized_store(&state, interner);
+    fn finish(&self, mut state: PathState, exit: Exit, interner: &mut Interner) -> Step {
+        let cond = std::mem::take(&mut state.cond);
+        let nodes = std::mem::take(&mut state.nodes);
+        let at = state.at.take();
+        Step::Done(self.summarize(&state, at, cond, nodes, exit, interner))
+    }
+
+    /// Finishes a copy of `state` that also assumes `literal`, without copying the
+    /// state: a faulting branch off a path that goes on. `event`, when given, is the
+    /// event the fault point records.
+    fn finish_branch(
+        &self,
+        state: &PathState,
+        literal: (Atom, bool),
+        event: Option<u32>,
+        exit: Exit,
+        interner: &mut Interner,
+    ) -> Step {
+        let mut cond = Vec::with_capacity(state.cond.len() + 1);
+        cond.extend_from_slice(&state.cond);
+        cond.push(literal);
+        let mut at = state.at.clone();
+        if let (Some(at), Some(event)) = (at.as_mut(), event) {
+            at.event = Some(event);
+        }
+        Step::Done(self.summarize(state, at, cond, state.nodes.clone(), exit, interner))
+    }
+
+    fn summarize(
+        &self,
+        state: &PathState,
+        at: Option<FaultPoint>,
+        cond: Vec<(Atom, bool)>,
+        nodes: Vec<u8>,
+        exit: Exit,
+        interner: &mut Interner,
+    ) -> PathSummary {
+        let store = self.normalized_store(state, interner);
         let faults = !matches!(exit, Exit::True | Exit::False);
         // A fault leaves the faulting frame on the stack and the thread's last result
         // in the object (`interpreter.rs:809`), so a faulting path compares the whole
@@ -1005,10 +1093,7 @@ impl<'a> Explorer<'a> {
             }
             // An entry past the last node faults before any node runs; it is never
             // compared (`check_bhav_live_equivalent`).
-            state
-                .at
-                .clone()
-                .unwrap_or_else(|| self.fault_point(&state, u8::MAX, None, interner))
+            at.unwrap_or_else(|| self.fault_point(state, u8::MAX, None, interner))
         });
         // The behavioral relation does not observe node numbers: a jump to a missing
         // node is the same fault whatever its target and the tree's length.
@@ -1025,7 +1110,7 @@ impl<'a> Explorer<'a> {
                 )
             });
         let last_result = (self.opts.observe_last_result || faults).then_some(state.last_result);
-        Step::Done(PathSummary {
+        PathSummary {
             out: Outputs {
                 exit,
                 fault,
@@ -1036,10 +1121,10 @@ impl<'a> Explorer<'a> {
                 last_result,
                 residue,
             },
-            cond: state.cond,
-            nodes: state.nodes,
+            cond,
+            nodes,
             entry: self.entry,
-        })
+        }
     }
 
     /// The tracked cells that differ from their value at the start of the epoch.
@@ -1239,12 +1324,13 @@ impl<'a> Explorer<'a> {
         interner: &mut Interner,
     ) {
         let faults = interner.prefix(PrefixNode::Fault(prefix));
-        let mut faulted = state.clone();
-        faulted.cond.push((Atom::Outcome(faults), true));
-        if let Some(at) = faulted.at.as_mut() {
-            at.event = Some(prefix);
-        }
-        out.push(self.finish(faulted, Exit::OperandFault, interner));
+        out.push(self.finish_branch(
+            state,
+            (Atom::Outcome(faults), true),
+            Some(prefix),
+            Exit::OperandFault,
+            interner,
+        ));
         state.cond.push((Atom::Outcome(faults), false));
     }
 
@@ -1319,9 +1405,13 @@ impl<'a> Explorer<'a> {
             }
             Some(_) => Some(state),
             None => {
-                let mut trapped = state.clone();
-                trapped.cond.push((atom, trap_when));
-                out.push(self.finish(trapped, Exit::Trap(code), interner));
+                out.push(self.finish_branch(
+                    &state,
+                    (atom, trap_when),
+                    None,
+                    Exit::Trap(code),
+                    interner,
+                ));
                 state.cond.push((atom, !trap_when));
                 Some(state)
             }
@@ -1348,7 +1438,7 @@ impl<'a> Explorer<'a> {
         match decide(&state.cond, atom) {
             Some(value) => out.push(go(state, value)),
             None => {
-                let mut t = state.clone();
+                let mut t = state.fork();
                 t.cond.push((atom, true));
                 out.push(go(t, true));
                 let mut f = state;
@@ -1462,8 +1552,8 @@ impl<'a> Explorer<'a> {
             // that leaves it in another state. So it is whatever the write event left
             // (`havoc_shared`), not `Scratch::Expression`.
             if matches!(op, 11 | 17) {
-                for value in [true, false] {
-                    let mut s = state.clone();
+                let taken = state.fork();
+                for (value, mut s) in [(true, taken), (false, state)] {
                     s.prefix = interner.prefix(PrefixNode::Branch(prefix, value));
                     s.cond.push((Atom::Outcome(prefix), value));
                     Self::havoc_shared(&mut s);
@@ -1746,9 +1836,13 @@ impl<'a> Explorer<'a> {
         // the same history, and their faults are equal only from the same state at the
         // same node ([`FaultPoint`]).
         let faults = interner.prefix(PrefixNode::Fault(prefix));
-        let mut faulted = state.clone();
-        faulted.cond.push((Atom::Outcome(faults), true));
-        out.push(self.finish(faulted, Exit::PrimitiveFault, interner));
+        out.push(self.finish_branch(
+            &state,
+            (Atom::Outcome(faults), true),
+            None,
+            Exit::PrimitiveFault,
+            interner,
+        ));
         state.cond.push((Atom::Outcome(faults), false));
 
         // Random never takes its false branch: it succeeds or faults (`random.rs`).
@@ -1758,8 +1852,14 @@ impl<'a> Explorer<'a> {
             } else {
                 vec![(Some(true), ins.on_true), (Some(false), ins.on_false)]
             };
-        for (outcome, target) in outcomes {
-            let mut s = state.clone();
+        let last = outcomes.len() - 1;
+        let mut state = Some(state);
+        for (i, (outcome, target)) in outcomes.into_iter().enumerate() {
+            // The last outcome takes the state itself; the others take a fork.
+            let mut s = match (i == last, &state) {
+                (false, Some(state)) => state.fork(),
+                _ => state.take().expect("one state per outcome"),
+            };
             if let Some(value) = outcome {
                 s.prefix = interner.prefix(PrefixNode::Branch(prefix, value));
                 s.cond.push((Atom::Outcome(prefix), value));
@@ -1914,15 +2014,79 @@ struct ProductState {
 /// Per pair of nodes: visits so far, and each slot's literal if every visit had the same.
 type WidenTable = BTreeMap<((u8, u8), Vec<Cell>), (usize, Vec<Option<i16>>)>;
 
+/// Where [`bisimulate`] cuts the runs.
+#[derive(Clone, Copy)]
+enum Cuts<'h> {
+    /// After each primitive or call.
+    Primitives,
+    /// After any node that recorded an event.
+    EveryEvent,
+    /// After each primitive or call, and on reaching a loop head of this side's tree
+    /// (`.0` for A, `.1` for B; [`Explorer::loop_heads`]), so a loop that records no
+    /// event is cut too.
+    LoopHeads(&'h BTreeSet<u8>, &'h BTreeSet<u8>),
+}
+
 impl Explorer<'_> {
-    /// Runs `start` until each path has run a cut node (a primitive or call, or with
-    /// `every_event` any node that recorded an event) or has ended.
+    /// The targets of the back edges of a depth-first walk from the entry, following
+    /// the true branch first: every cycle the walk reaches passes through one. The
+    /// walk follows the graph, not the node numbers, so a tree laid out differently
+    /// has the same loop heads.
+    fn loop_heads(&self) -> BTreeSet<u8> {
+        let len = self.bhav.instructions.len().min(LAST_NODE + 1);
+        let next = |n: usize| -> Vec<usize> {
+            let ins = &self.bhav.instructions[n];
+            let mut out = Vec::new();
+            for t in [ins.on_true, ins.on_false] {
+                let t = usize::from(t);
+                if t < len && !out.contains(&t) {
+                    out.push(t);
+                }
+            }
+            out
+        };
+        let mut heads = BTreeSet::new();
+        if self.entry >= len {
+            return heads;
+        }
+        // 0 unvisited, 1 on the walk's stack, 2 finished.
+        let mut color = vec![0u8; len];
+        let mut stack: Vec<(usize, Vec<usize>)> = vec![(self.entry, next(self.entry))];
+        color[self.entry] = 1;
+        while let Some((node, succ)) = stack.last_mut() {
+            if succ.is_empty() {
+                color[*node] = 2;
+                stack.pop();
+                continue;
+            }
+            let t = succ.remove(0);
+            match color[t] {
+                0 => {
+                    color[t] = 1;
+                    stack.push((t, next(t)));
+                }
+                1 => {
+                    heads.insert(t as u8);
+                }
+                _ => {}
+            }
+        }
+        heads
+    }
+
+    /// Runs `start` until each path has run a cut node (see [`Cuts`]) or has ended.
     fn segment(
         &self,
         start: PathState,
-        every_event: bool,
+        cuts: Cuts,
+        side_b: bool,
         interner: &mut Interner,
     ) -> Result<Vec<SegmentEnd>, String> {
+        let every_event = matches!(cuts, Cuts::EveryEvent);
+        let heads = match cuts {
+            Cuts::LoopHeads(a, b) => Some(if side_b { b } else { a }),
+            _ => None,
+        };
         let mut ends = Vec::new();
         let mut stack = vec![start];
         while let Some(state) = stack.pop() {
@@ -1950,6 +2114,11 @@ impl Explorer<'_> {
                     Step::Done(summary) => ends.push(SegmentEnd::Done(summary)),
                     Step::Continue(s)
                         if s.prefix != before && (primitive || every_event) && to_node(&s) =>
+                    {
+                        ends.push(SegmentEnd::Cut(s));
+                    }
+                    Step::Continue(s)
+                        if heads.is_some_and(|h| h.contains(&s.pc)) && to_node(&s) =>
                     {
                         ends.push(SegmentEnd::Cut(s));
                     }
@@ -2112,7 +2281,7 @@ fn divergence(a: u32, b: u32, interner: &Interner) -> String {
 fn bisimulate(
     xa: &Explorer,
     xb: &Explorer,
-    every_event: bool,
+    cuts: Cuts,
     interner: &mut Interner,
 ) -> Result<(usize, usize), String> {
     let opts = xa.opts;
@@ -2124,16 +2293,22 @@ fn bisimulate(
     while let Some((sa, sb)) = work.pop() {
         segments += 1;
         let ends_a = xa
-            .segment(sa, every_event, interner)
+            .segment(sa, cuts, false, interner)
             .map_err(|e| format!("A: {e}"))?;
         let ends_b = xb
-            .segment(sb, every_event, interner)
+            .segment(sb, cuts, true, interner)
             .map_err(|e| format!("B: {e}"))?;
+        let index = ConflictIndex::new(ends_b.iter().map(SegmentEnd::cond));
         for ea in &ends_a {
-            for eb in &ends_b {
+            let conflicts = index.conflicts(ea.cond());
+            for (j, eb) in ends_b.iter().enumerate() {
                 if let (SegmentEnd::Done(pa), SegmentEnd::Done(pb)) = (ea, eb)
                     && pa.out == pb.out
                 {
+                    continue;
+                }
+                // Infeasible together (see `compare_paths`).
+                if ConflictIndex::has(&conflicts, j) {
                     continue;
                 }
                 checks += 1;
@@ -2291,6 +2466,24 @@ pub fn check_bhav_live_equivalent(
     let (len_a, len_b) = (a.instructions.len(), b.instructions.len());
     let entries = if a.kind == 4 { len_a.max(len_b) } else { 1 };
 
+    // Assumed parameter domains (never for kind 4, whose first parameter is the entry):
+    // the entry is split into regions that cover the domain exactly, each explored from
+    // a path condition bounding the parameters to it. A replay witness outside the
+    // domain is not a run the assumption covers, so it is never replayed.
+    let domains = (a.kind != 4)
+        .then(|| ctx_a.param_domains.get(&a.id))
+        .flatten();
+    let regions = super::domains::entry_regions(domains, frame_dims(a).0);
+    let in_domain = |w: &Witness| {
+        domains.is_none_or(|d| {
+            d.iter().all(|(&i, domain)| {
+                w.params
+                    .get(usize::from(i))
+                    .is_none_or(|&v| domain.contains(v))
+            })
+        })
+    };
+
     let mut interner = Interner::new();
     let mut steps = 0usize;
     let mut paths = 0usize;
@@ -2325,74 +2518,87 @@ pub fn check_bhav_live_equivalent(
                 entry + 1 < entries,
             )
         });
-        let explore =
-            |bhav: &BhavChunk, ctx: &LiveContext, entry: usize, interner: &mut Interner| {
-                Explorer::new(bhav, ctx, opts, entry, entry_param).explore(interner)
-            };
-        let explored = explore(a, ctx_a, entry_a, &mut interner)
-            .map_err(|e| format!("A: {e}"))
-            .and_then(|pa| {
-                explore(b, ctx_b, entry_b, &mut interner)
-                    .map(|pb| (pa, pb))
-                    .map_err(|e| format!("B: {e}"))
-            });
-        let ((paths_a, steps_a), (paths_b, steps_b)) = match explored {
-            Ok(r) => r,
-            Err(reason) => {
-                // Too many paths, or a loop the literals do not bound: cut both runs at
-                // their events instead (`bisimulate`).
-                let (xa, xb) = (
-                    Explorer::new(a, ctx_a, opts, entry_a, entry_param),
-                    Explorer::new(b, ctx_b, opts, entry_b, entry_param),
-                );
-                let proof = bisimulate(&xa, &xb, false, &mut interner).or_else(|first| {
-                    bisimulate(&xa, &xb, true, &mut interner).map_err(|every| {
-                        format!("cut at primitives: {first}; cut at every event: {every}")
-                    })
+        for region in &regions {
+            let explore =
+                |bhav: &BhavChunk, ctx: &LiveContext, entry: usize, interner: &mut Interner| {
+                    Explorer::new(bhav, ctx, opts, entry, entry_param, region).explore(interner)
+                };
+            let explored = explore(a, ctx_a, entry_a, &mut interner)
+                .map_err(|e| format!("A: {e}"))
+                .and_then(|pa| {
+                    explore(b, ctx_b, entry_b, &mut interner)
+                        .map(|pb| (pa, pb))
+                        .map_err(|e| format!("B: {e}"))
                 });
-                match proof {
-                    Ok((segments, states)) => {
-                        steps += segments;
-                        paths += states;
-                        continue;
-                    }
-                    Err(why) => {
-                        return EquivResult::Inconclusive {
-                            reason: format!("{reason}; cut-point bisimulation failed: {why}"),
-                        };
+            let ((paths_a, steps_a), (paths_b, steps_b)) = match explored {
+                Ok(r) => r,
+                Err(reason) => {
+                    // Too many paths, or a loop the literals do not bound: cut both runs at
+                    // their events instead (`bisimulate`).
+                    let (xa, xb) = (
+                        Explorer::new(a, ctx_a, opts, entry_a, entry_param, region),
+                        Explorer::new(b, ctx_b, opts, entry_b, entry_param, region),
+                    );
+                    let proof = bisimulate(&xa, &xb, Cuts::Primitives, &mut interner)
+                        .or_else(|first| {
+                            bisimulate(&xa, &xb, Cuts::EveryEvent, &mut interner)
+                                .map_err(|every| (first, every))
+                        })
+                        .or_else(|(first, every)| {
+                            let (heads_a, heads_b) = (xa.loop_heads(), xb.loop_heads());
+                            bisimulate(&xa, &xb, Cuts::LoopHeads(&heads_a, &heads_b), &mut interner)
+                                .map_err(|heads| {
+                                    format!(
+                                        "cut at primitives: {first}; cut at every event: {every}; \
+                                     cut at loop heads: {heads}"
+                                    )
+                                })
+                        });
+                    match proof {
+                        Ok((segments, states)) => {
+                            steps += segments;
+                            paths += states;
+                            continue;
+                        }
+                        Err(why) => {
+                            return EquivResult::Inconclusive {
+                                reason: format!("{reason}; cut-point bisimulation failed: {why}"),
+                            };
+                        }
                     }
                 }
-            }
-        };
-        steps += steps_a + steps_b;
-        paths += paths_a.len() + paths_b.len();
-        // A difference counts only if both trees, run in `sims-vm` from the same world
-        // built from a witness, end differently.
-        let mut confirm = |w: &Witness| -> Option<String> {
-            if replays >= MAX_REPLAYS
-                || !replay::replayable(a, entry_a)
-                || !replay::replayable(b, entry_b)
-            {
-                return None;
-            }
-            replays += 1;
-            replay::replay(a, ctx_a, b, ctx_b, opts, w)
-        };
-        match compare_paths(
-            &paths_a,
-            &paths_b,
-            &interner,
-            opts,
-            entry_param,
-            frame_dims(a).0.max(frame_dims(b).0),
-            &mut confirm,
-        ) {
-            PairVerdict::Same => {}
-            PairVerdict::Differ(path, divergence) => {
-                return EquivResult::Counterexample { path, divergence };
-            }
-            PairVerdict::Undecided(reason) => {
-                undecided.get_or_insert(reason);
+            };
+            steps += steps_a + steps_b;
+            paths += paths_a.len() + paths_b.len();
+            // A difference counts only if both trees, run in `sims-vm` from the same world
+            // built from a witness, end differently.
+            let mut confirm = |w: &Witness| -> Option<String> {
+                if replays >= MAX_REPLAYS
+                    || !in_domain(w)
+                    || !replay::replayable(a, entry_a)
+                    || !replay::replayable(b, entry_b)
+                {
+                    return None;
+                }
+                replays += 1;
+                replay::replay(a, ctx_a, b, ctx_b, opts, w)
+            };
+            match compare_paths(
+                &paths_a,
+                &paths_b,
+                &interner,
+                opts,
+                entry_param,
+                frame_dims(a).0.max(frame_dims(b).0),
+                &mut confirm,
+            ) {
+                PairVerdict::Same => {}
+                PairVerdict::Differ(path, divergence) => {
+                    return EquivResult::Counterexample { path, divergence };
+                }
+                PairVerdict::Undecided(reason) => {
+                    undecided.get_or_insert(reason);
+                }
             }
         }
     }
@@ -2402,6 +2608,46 @@ pub fn check_bhav_live_equivalent(
             states_checked: steps,
             paths_verified: paths,
         },
+    }
+}
+
+/// For a list of path conditions, which of them take a branch the other way: a
+/// condition that holds `(atom, v)` conflicts with every one holding `(atom, !v)`.
+struct ConflictIndex {
+    /// `(atom, value)` -> bitset of the conditions holding `(atom, !value)`.
+    by_literal: BTreeMap<(Atom, bool), Vec<u64>>,
+    words: usize,
+}
+
+impl ConflictIndex {
+    fn new<'c>(conds: impl ExactSizeIterator<Item = &'c [(Atom, bool)]>) -> Self {
+        let words = conds.len().div_ceil(64);
+        let mut by_literal: BTreeMap<(Atom, bool), Vec<u64>> = BTreeMap::new();
+        for (j, cond) in conds.enumerate() {
+            for &(atom, value) in cond {
+                by_literal
+                    .entry((atom, !value))
+                    .or_insert_with(|| vec![0; words])[j / 64] |= 1 << (j % 64);
+            }
+        }
+        Self { by_literal, words }
+    }
+
+    /// The conditions that conflict with `cond`, as a bitset.
+    fn conflicts(&self, cond: &[(Atom, bool)]) -> Vec<u64> {
+        let mut out = vec![0u64; self.words];
+        for literal in cond {
+            if let Some(bits) = self.by_literal.get(literal) {
+                for (o, b) in out.iter_mut().zip(bits) {
+                    *o |= b;
+                }
+            }
+        }
+        out
+    }
+
+    fn has(bits: &[u64], j: usize) -> bool {
+        bits[j / 64] & (1 << (j % 64)) != 0
     }
 }
 
@@ -2432,6 +2678,10 @@ fn compare_paths(
     }
     let groups_a = group(paths_a);
     let groups_b = group(paths_b);
+    // Pairs that take one branch both ways are infeasible (the first test
+    // `feasibility` makes), and need neither a check nor budget.
+    let index = ConflictIndex::new(paths_b.iter().map(|p| p.cond.as_slice()));
+    let conflicts: Vec<Vec<u64>> = paths_a.iter().map(|p| index.conflicts(&p.cond)).collect();
     let mut checks = 0usize;
     let mut undecided: Option<String> = None;
     for (out_a, idx_a) in &groups_a {
@@ -2441,6 +2691,9 @@ fn compare_paths(
             }
             for &i in idx_a {
                 for &j in idx_b {
+                    if ConflictIndex::has(&conflicts[i], j) {
+                        continue;
+                    }
                     checks += 1;
                     if checks > opts.max_pair_checks {
                         return PairVerdict::Undecided(format!(
@@ -2513,7 +2766,12 @@ fn witnesses(
     args: usize,
 ) -> Vec<Witness> {
     let mut out: Vec<Witness> = Vec::new();
-    for distinct in [false, true] {
+    // Inputs near 0, then pairwise distinct, then at the bottom and at the top of what
+    // the condition allows, then alternating bottom and top from one input to the next:
+    // a difference that shows only at one end of a range (a parameter domain's bound,
+    // say), or only when two inputs sit at different ends, still gets a witness.
+    for seed in 0..6 {
+        let mut nth_input = 0usize;
         // A kind-4 entry is passed as the first argument even to a tree that takes none.
         let mut w = Witness {
             params: vec![0; args.max(usize::from(entry_param.is_some()))],
@@ -2525,12 +2783,22 @@ fn witnesses(
             if !interner.is_input(id) {
                 continue;
             }
-            let base = if distinct {
-                i16::try_from(3 * (id + 1)).unwrap_or(i16::MAX)
-            } else {
-                0
+            let range = range_of(cond, id);
+            let clamp = |v: i32| v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            let low_end = match seed {
+                4 => nth_input.is_multiple_of(2),
+                _ => !nth_input.is_multiple_of(2),
             };
-            let Some(v) = range_of(cond, id).pick_near(base) else {
+            nth_input += 1;
+            let base = match seed {
+                0 => 0,
+                1 => i16::try_from(3 * (id + 1)).unwrap_or(i16::MAX),
+                2 => clamp(range.lo),
+                3 => clamp(range.hi),
+                _ if low_end => clamp(range.lo),
+                _ => clamp(range.hi),
+            };
+            let Some(v) = range.pick_near(base) else {
                 feasible = false;
                 break;
             };

@@ -530,6 +530,63 @@ fn off_by_one_loop_bounds_are_never_equivalent() {
     assert_never_equivalent(&animated(LT), &animated(LE));
 }
 
+/// A loop that records no event: `local[0]` counts up to `param[0]` (no literal bounds
+/// it), then lands in `temp[0]`. Only cutting at the loop head proves it.
+/// `step` is the increment, `test` the exit comparison, `scratch` a temp the body
+/// writes each iteration.
+fn pure_loop(step: i16, test: u8, scratch: Option<i16>) -> BhavChunk {
+    let mut body = vec![
+        expr((LOCAL, 0), SET, (LIT, 0), 1, 1),
+        // 1: loop head.
+        expr((LOCAL, 0), test, (PARAM, 0), 2, 3),
+        expr((LOCAL, 0), ADD, (LIT, step), 1, 1),
+        expr((TEMP, 0), SET, (LOCAL, 0), T, T),
+    ];
+    if let Some(v) = scratch {
+        body[2].on_true = 4;
+        body[2].on_false = 4;
+        body.push(expr((TEMP, 1), SET, (LIT, v), 1, 1));
+    }
+    tree(4096, 1, 1, body)
+}
+
+#[test]
+fn event_free_loops_prove_by_cutting_at_loop_heads() {
+    let a = pure_loop(1, LT, None);
+    // Before loop-head cuts both the path enumeration and the event cuts give up.
+    assert_equivalent(&live(&a, &a, &strict()));
+    assert_equivalent(&live(&a, &reversed(&a), &behavioral()));
+    assert_equivalent(&live(&reversed(&a), &a, &behavioral()));
+    let with_scratch = pure_loop(1, LT, Some(3));
+    assert_equivalent(&live(
+        &with_scratch,
+        &reversed(&with_scratch),
+        &behavioral(),
+    ));
+}
+
+/// Negatives: each mutation changes what the loop leaves behind, so no cut placement
+/// may prove it.
+#[test]
+fn mutated_event_free_loops_are_never_equivalent() {
+    let a = pure_loop(1, LT, None);
+    // Another increment: `temp[0]` ends at a different value for most inputs.
+    assert_never_equivalent(&a, &pure_loop(2, LT, None));
+    // `<=` instead of `<`: one more iteration.
+    assert_never_equivalent(&a, &pure_loop(1, LE, None));
+    // The body also writes a temp the caller sees.
+    assert_never_equivalent(&a, &pure_loop(1, LT, Some(3)));
+    // Two different scratch values.
+    assert_never_equivalent(&pure_loop(1, LT, Some(3)), &pure_loop(1, LT, Some(4)));
+    // The same loop, laid out differently, but with the other increment.
+    assert_never_equivalent(&a, &reversed(&pure_loop(2, LT, None)));
+    // No loop at all: `temp[0] = param[0]`, which differs for negative inputs. One side
+    // cuts at its loop head where the other ends, a misaligned cut that must fail.
+    let straight = tree(4096, 1, 1, vec![expr((TEMP, 0), SET, (PARAM, 0), T, T)]);
+    assert_never_equivalent(&a, &straight);
+    assert_never_equivalent(&straight, &reversed(&a));
+}
+
 // ============================================================================
 // Diamonds
 // ============================================================================
@@ -996,34 +1053,73 @@ fn install_trees_match_their_reversed_layout() {
     let index = Index::build(&install).expect("index SIMS_INSTALL");
     let pool = ArchivePool::new();
     let opts = behavioral();
-    let (mut total, mut equivalent, mut inconclusive, mut counterexamples) = (0, 0, 0, 0);
-    let mut first_problem = None;
-    for resource in &index.resources {
-        let name = resource.name();
-        if !name.to_ascii_lowercase().ends_with(".iff") {
-            continue;
-        }
-        let Some(iff) = resource
+    // The libraries' argument counts, as `verify-equiv --global` and `--semi-global`
+    // supply them: without them a call into one with spilled arguments is undecidable.
+    let catalog = sims_content::Catalog::build_with_pool(&index, &pool).expect("catalog");
+    let library = |resource: usize, range: std::ops::RangeInclusive<u16>| {
+        index.resources[resource]
+            .read_with(&pool)
+            .ok()
+            .and_then(|bytes| sims_antics::verify::library_arities_from_iff(&bytes).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(id, n)| Some((id, n?)))
+            .filter(|(id, _)| range.contains(id))
+            .collect::<BTreeMap<u16, usize>>()
+    };
+    let global = library(catalog.global, 256..=4095);
+    let semi_globals: BTreeMap<usize, BTreeMap<u16, usize>> = catalog
+        .semi_globals
+        .values()
+        .flatten()
+        .map(|&semi| (semi, library(semi, 8192..=u16::MAX)))
+        .collect();
+    let resources: Vec<usize> = (0..index.resources.len())
+        .filter(|&i| {
+            index.resources[i]
+                .name()
+                .to_ascii_lowercase()
+                .ends_with(".iff")
+        })
+        .collect();
+    /// One resource's results: counts, inconclusive reasons, first counterexample.
+    #[derive(Default)]
+    struct Tally {
+        total: usize,
+        equivalent: usize,
+        inconclusive: usize,
+        counterexamples: usize,
+        reasons: BTreeMap<String, usize>,
+        first_problem: Option<String>,
+    }
+    let check_resource = |resource_index: usize| -> Tally {
+        let mut tally = Tally::default();
+        let Some(iff) = index.resources[resource_index]
             .read_with(&pool)
             .ok()
             .and_then(|b| Iff::parse(b).ok())
         else {
-            continue;
+            return tally;
         };
-        let arities: BTreeMap<u16, usize> = iff
-            .chunks
-            .iter()
-            .filter(|c| c.flags & DELETED == 0 && &c.tag == b"BHAV")
-            .filter_map(|c| {
-                let b = Behavior::parse(iff.data(c)).ok()?;
-                let args = match b.format {
-                    0x8000 => 4,
-                    0x8001 => usize::from(b.args).min(4),
-                    _ => usize::from(b.args),
-                };
-                Some((c.id, args))
-            })
-            .collect();
+        let mut arities: BTreeMap<u16, usize> = global.clone();
+        arities.extend(
+            iff.chunks
+                .iter()
+                .filter(|c| c.flags & DELETED == 0 && &c.tag == b"BHAV")
+                .filter(|c| (4096..8192).contains(&c.id))
+                .filter_map(|c| {
+                    let b = Behavior::parse(iff.data(c)).ok()?;
+                    let args = match b.format {
+                        0x8000 => 4,
+                        0x8001 => usize::from(b.args).min(4),
+                        _ => usize::from(b.args),
+                    };
+                    Some((c.id, args))
+                }),
+        );
+        if let Some(Some(semi)) = catalog.semi_globals.get(&resource_index).copied() {
+            arities.extend(semi_globals[&semi].iter().map(|(&id, &n)| (id, n)));
+        }
         let ctx = LiveContext {
             callee_arities: Some(arities),
             ..LiveContext::default()
@@ -1039,22 +1135,83 @@ fn install_trees_match_their_reversed_layout() {
             if bhav.kind == 4 || bhav.instructions.len() < 3 {
                 continue;
             }
-            total += 1;
+            tally.total += 1;
             match check_bhav_live_equivalent(&bhav, &ctx, &reversed(&bhav), &ctx, &opts) {
-                EquivResult::Equivalent { .. } => equivalent += 1,
-                EquivResult::Inconclusive { .. } => inconclusive += 1,
+                EquivResult::Equivalent { .. } => tally.equivalent += 1,
+                EquivResult::Inconclusive { reason } => {
+                    tally.inconclusive += 1;
+                    // The bisimulation's failure says why a loop stays unproven.
+                    let reason = match reason.split_once("cut-point bisimulation failed: ") {
+                        Some((_, why)) => format!("bisimulation: {why}"),
+                        None => reason,
+                    };
+                    // Numbers blanked, so like reasons group together.
+                    let blanked: String = reason
+                        .chars()
+                        .map(|c| if c.is_ascii_digit() { '#' } else { c })
+                        .take(220)
+                        .collect();
+                    *tally.reasons.entry(blanked).or_default() += 1;
+                }
                 EquivResult::Counterexample { divergence, .. } => {
-                    counterexamples += 1;
-                    first_problem
+                    tally.counterexamples += 1;
+                    tally
+                        .first_problem
                         .get_or_insert_with(|| format!("BHAV #{}: {divergence}", chunk.id));
                 }
             }
+        }
+        tally
+    };
+    // Resources are handed out one at a time and merged in index order, so the output
+    // does not depend on the thread count.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(1, usize::from);
+    let mut tallies: Vec<(usize, Tally)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&resource_index) = resources.get(k) else {
+                            break done;
+                        };
+                        done.push((k, check_resource(resource_index)));
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().expect("sweep worker"))
+            .collect()
+    });
+    tallies.sort_by_key(|(k, _)| *k);
+    let (mut total, mut equivalent, mut inconclusive, mut counterexamples) = (0, 0, 0, 0);
+    let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
+    let mut first_problem = None;
+    for (_, t) in tallies {
+        total += t.total;
+        equivalent += t.equivalent;
+        inconclusive += t.inconclusive;
+        counterexamples += t.counterexamples;
+        for (reason, n) in t.reasons {
+            *reasons.entry(reason).or_default() += n;
+        }
+        if first_problem.is_none() {
+            first_problem = t.first_problem;
         }
     }
     eprintln!(
         "behavioral_equiv install sweep: total={total} equivalent={equivalent} \
          inconclusive={inconclusive} counterexamples={counterexamples}"
     );
+    let mut common: Vec<_> = reasons.into_iter().collect();
+    common.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
+    for (reason, count) in common.iter().take(25) {
+        eprintln!("behavioral_equiv install sweep: inconclusive {count}x: {reason}");
+    }
     assert!(total > 0, "no trees found under SIMS_INSTALL");
     assert_eq!(counterexamples, 0, "{first_problem:?}");
 }
