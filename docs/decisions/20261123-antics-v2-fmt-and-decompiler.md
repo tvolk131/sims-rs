@@ -56,11 +56,11 @@ Layout rules:
 
 `decompile_iff_to_v2(iff, options)` writes one `object`, from the file's first OBJD (later OBJDs of a multi-tile object are counted, not written):
 
-- metadata: `guid`, `price`; v2 supplies its own placeholder sprite;
-- named `bcon` tables, from the file's private BCONs, with entries `e0`, `e1`, ... BCONs are chosen as the VM loads them: the last chunk of an ID wins, and only the first 128 entries (all an operand can address) are written;
-- `sound sound_N = preset(.., wav: "event", id: N);` for every FWAV v2 can declare, keeping its ID and event name;
-- `extern bcon library_consts` entries (`g256_3`, `s8192_1`) for the global/semi-global constants it uses;
-- `state attr_N @ N: i16;` for every object attribute it touches, with no initializer, so `init` never writes it;
+- metadata: `guid`, `price`, and `attributes:` (the OBJD's attribute count, so `state` declarations never grow it); v2 supplies its own placeholder sprite;
+- named `bcon` tables, from the file's private BCONs, with entries `e0`, `e1`, ... BCONs are chosen as the VM loads them: the last chunk of an ID wins, and only the first 128 entries (all an operand can address) are written. Table names are kept distinct ignoring case and underscores (the compiler's aliases), never take `library_consts`, and fit a 63-byte chunk label with any `{id}_{n}` suffix;
+- `sound sound_N = preset(.., wav: "event", id: N);` for every FWAV v2 can declare, keeping its ID and event name (not ID 0, a shared event name, or a name longer than a chunk label);
+- `extern bcon library_consts` entries (`g256_3`, `s8192_1`) for the global/semi-global constants it uses; a constant operand that addresses no table stays `raw`;
+- `state attr_N @ N: i16;` for every object attribute below the attribute count that it touches, with no initializer, so `init` never writes it (higher attributes stay `raw`);
 - `extern mod globals` / `extern mod semi_globals` for called library trees;
 - `const GUID_XXXXXXXX` items for GUIDs used more than once;
 - the interaction table as a comment (the trees it names are kept by ID; TTAB itself is not rebuilt);
@@ -110,9 +110,9 @@ Special cases:
 - **Unreachable tail.** v2 treats `raw` as opaque and appends `return true;`. After a labeled raw body that adds one trailing node no edge reaches. A recompiled tree that equals the original plus such a node counts as Equivalent, under these conditions:
   - same header, and not an indexed tree (kind 4);
   - every original edge stays in range (an out-of-range edge faults with the node count);
-  - the last node is not a call whose inline arguments could run on into the appended node (the VM copies arguments past the operand bytes).
+  - no call's inline arguments could run on into the appended node: the VM copies `2 × argc` bytes from the operands onward, across later nodes, so every call with inline arguments needs a known arity whose bytes fit before the original's end.
 - **Lifecycle trees.** An init or main tree whose header v2's `init`/`main` block cannot reproduce (format other than 0x8002, or a tree still unproven at the lowest level) is written as a plain `@id(N) @frame(..) tree` instead. v2 then emits its own init/main tree for the OBJD, so the decompiled object's OBJD entry points no longer name the original IDs.
-- **Calls.** A call is written as a v2 call only when caller and callee share a context. Otherwise it stays `raw`.
+- **Calls.** A call is written as a v2 call only when caller and callee share a context. Otherwise it stays `raw`. A tree is only as proven as the private trees it calls: a proven caller of a tree that is not proven (inconclusive, omitted, different), or of an ID the original lacks but the recompiled object has (such as v2's own `init`), is reported inconclusive. This repeats until callers of callers settle.
 - **Omitted trees.** Some trees have no v2 spelling: a BHAV format outside 0x8000–0x8002, or a 0x8000/0x8001 header with more than four arguments. So does a tree that still does not compile at its lowest level, such as a full 251-node tree, which has no room for v2's appended return. Such a tree is left out with a comment, and the report gives the compiler's reason; the rest of the file is still written.
 - **Resources.** The report lists behaviour-relevant chunks (`STR#`, `CTSS`, `TTAB`, `TTAs`, `SLOT`, `FCNS`, `GLOB`, `TPRP`) that the recompiled object does not carry byte for byte. The CLI prints them as a note. Tree checks cover code, constants, callee shapes and sounds, not these.
 

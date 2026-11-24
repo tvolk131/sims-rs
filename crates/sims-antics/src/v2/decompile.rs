@@ -44,6 +44,8 @@ const MAX_STATE_SLOT: i16 = 255;
 /// OBJD words holding the main and init tree IDs (after the 32-bit version).
 const OBJD_MAIN_WORD: usize = 3;
 const OBJD_INIT_WORD: usize = 41;
+/// OBJD word (after the version) holding how many attributes an instance gets.
+const OBJD_ATTRIBUTES_WORD: usize = 56;
 
 /// Options for [`decompile_iff_to_v2`].
 #[derive(Debug, Clone)]
@@ -214,7 +216,7 @@ pub fn decompile_iff_to_v2_report(
                     continue;
                 }
                 let source = format_v2_source(&generated.text)?;
-                let trees = model
+                let mut trees: Vec<DecompiledTree> = model
                     .trees
                     .iter()
                     .map(|t| DecompiledTree {
@@ -229,6 +231,7 @@ pub fn decompile_iff_to_v2_report(
                         },
                     })
                     .collect();
+                model.propagate_unproven_callees(&mut trees, &recompiled);
                 return Ok(DecompileV2Report {
                     source,
                     trees,
@@ -301,6 +304,10 @@ struct Model {
     extern_bcons: BTreeMap<u16, String>,
     /// Attribute slots referenced as `my.attr` / `stack.attr`.
     states: BTreeSet<i16>,
+    /// The OBJD's attribute count, pinned with `attributes:` so states never grow it.
+    attributes: Option<u16>,
+    /// Highest attribute slot spelled `self.attr_N` (others stay `raw`).
+    state_limit: i16,
     /// GUIDs used more than once -> `const` name.
     guid_consts: BTreeMap<u32, String>,
     /// Library trees called with the caller's temps (`call N(temps)`).
@@ -334,6 +341,11 @@ impl Model {
                 .get(at..at + 2)
                 .map(|b| u16::from_le_bytes([b[0], b[1]]))
         };
+        let attributes = objd_word(OBJD_ATTRIBUTES_WORD);
+        // Highest attribute a `state` may name without growing the object.
+        let state_limit = attributes.map_or(MAX_STATE_SLOT, |a| {
+            i16::try_from(a).map_or(MAX_STATE_SLOT, |a| (a - 1).min(MAX_STATE_SLOT))
+        });
         let mut lifecycle: BTreeMap<u16, Lifecycle> = BTreeMap::new();
         for (word, kind) in [
             (OBJD_INIT_WORD, Lifecycle::Init),
@@ -352,7 +364,7 @@ impl Model {
         let mut bcons = Vec::new();
         let mut bcon_names = BTreeMap::new();
         // `library_consts` is the extern table's name.
-        let mut used_names = BTreeSet::from(["library_consts".to_owned()]);
+        let mut used_names = BTreeSet::from([name_key("library_consts")]);
         // The VM keeps the last chunk of an ID.
         let mut bcon_chunks: BTreeMap<u16, &Chunk> = BTreeMap::new();
         for c in iff.chunks.iter().filter(|c| &c.tag == b"BCON") {
@@ -376,9 +388,12 @@ impl Model {
             {
                 label = format!("Bcon{label}");
             }
-            let base = label.clone();
+            // Labels are identifiers (ASCII), and must fit a chunk label, leaving room for
+            // a `{id}_{n}` suffix when one is needed.
+            label.truncate(MAX_CHUNK_LABEL);
+            let base: String = label.chars().take(MAX_CHUNK_LABEL - 12).collect();
             let mut n = 0;
-            while !used_names.insert(snake_case_ident(&label)) {
+            while !used_names.insert(name_key(&label)) {
                 n += 1;
                 label = if n == 1 {
                     format!("{base}{}", c.id)
@@ -502,7 +517,7 @@ impl Model {
             walk_stmts(body, &mut |s| {
                 for op in stmt_operands(s) {
                     if let OperandRef::Direct(o) = op {
-                        if matches!(o.scope, 0 | 1) && (0..=MAX_STATE_SLOT).contains(&o.index) {
+                        if matches!(o.scope, 0 | 1) && (0..=state_limit).contains(&o.index) {
                             states.insert(o.index);
                         }
                         if o.scope == 26 {
@@ -578,6 +593,8 @@ impl Model {
                 "v2 cannot declare it (FWAV IDs start at 1)"
             } else if crate::manifest::validate_relative_filename(name, "sound").is_err() {
                 "v2 cannot spell its event name (a plain file name)"
+            } else if name.len() > MAX_CHUNK_LABEL {
+                "its event name is longer than a chunk label, which v2 uses it as"
             } else if !sound_names.insert(name.to_ascii_lowercase()) {
                 "another FWAV names the same event, which v2 does not allow"
             } else {
@@ -597,6 +614,8 @@ impl Model {
             bcon_names,
             extern_bcons,
             states,
+            attributes,
+            state_limit,
             guid_consts,
             extern_calls,
             trees,
@@ -651,6 +670,7 @@ impl Model {
             ctx,
             sounds: fwav_sounds(&iff),
             resources: resource_chunks(&iff),
+            attributes: objd_attributes(&iff),
         })
     }
 
@@ -713,6 +733,7 @@ impl Model {
             )
         };
         a.my_attribute_count == b.my_attribute_count
+            && self.attributes == recompiled.attributes
             && a.local_bcons == b.local_bcons
             && tree
                 .instructions
@@ -758,6 +779,70 @@ impl Model {
     }
 }
 
+/// The longest chunk label the IFF writer accepts.
+const MAX_CHUNK_LABEL: usize = 63;
+
+/// What two table names must not share: the compiler refers to a table by its label
+/// and by aliases that differ in case and underscores.
+fn name_key(label: &str) -> String {
+    label
+        .chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+impl Model {
+    /// A tree is only as proven as the private trees it calls: a proven caller of a tree
+    /// that is not proven (or that the original lacks but the recompiled object has, such
+    /// as v2's own `init`) becomes inconclusive. Repeats until callers of callers settle.
+    fn propagate_unproven_callees(
+        &self,
+        trees: &mut [DecompiledTree],
+        recompiled: &RecompiledFile,
+    ) {
+        let proven = |c: &TreeCheck| matches!(c, TreeCheck::Identical | TreeCheck::Equivalent);
+        loop {
+            let status: BTreeMap<u16, bool> =
+                trees.iter().map(|t| (t.id, proven(&t.check))).collect();
+            let mut changed = false;
+            for (t, model) in trees.iter_mut().zip(&self.trees) {
+                if !proven(&t.check) {
+                    continue;
+                }
+                let bad = model.original.instructions.iter().find_map(|ins| {
+                    let callee = ins.opcode;
+                    if !PRIVATE_TREES.contains(&callee) || callee == t.id {
+                        return None;
+                    }
+                    let ok = match status.get(&callee) {
+                        Some(&ok) => ok,
+                        None => !recompiled.trees.contains_key(&callee),
+                    };
+                    (!ok).then_some(callee)
+                });
+                if let Some(callee) = bad {
+                    t.check = TreeCheck::Inconclusive(format!(
+                        "calls tree {callee}, which is not proven the same"
+                    ));
+                    changed = true;
+                }
+            }
+            if !changed {
+                return;
+            }
+        }
+    }
+}
+
+/// The first OBJD's attribute count.
+fn objd_attributes(iff: &Iff) -> Option<u16> {
+    let objd = iff.chunks.iter().find(|c| &c.tag == b"OBJD")?;
+    let at = 4 + OBJD_ATTRIBUTES_WORD * 2;
+    let b = iff.data(objd).get(at..at + 2)?;
+    Some(u16::from_le_bytes([b[0], b[1]]))
+}
+
 /// Entries an operand can address in one BCON table (7 bits of entry index).
 const BCON_ADDRESSABLE: usize = 128;
 
@@ -794,6 +879,7 @@ struct RecompiledFile {
     ctx: LiveContext,
     sounds: BTreeMap<u16, String>,
     resources: BTreeMap<([u8; 4], u16), Vec<u8>>,
+    attributes: Option<u16>,
 }
 
 enum Failure {
@@ -812,7 +898,7 @@ enum Failure {
 ///
 /// The node must also be unread and must not change a fault: every edge of `a` stays
 /// in range (an out-of-range target faults with the tree's node count), and the last
-/// node is not a call whose inline arguments could run on into the next node
+/// no call's inline arguments could run on into the appended node
 /// (`sims-vm/src/interpreter.rs`, the argument copy past the operand bytes).
 fn same_but_unreachable_tail(a: &BhavChunk, b: &BhavChunk, ctx: &LiveContext) -> bool {
     let n = a.instructions.len();
@@ -833,14 +919,16 @@ fn same_but_unreachable_tail(a: &BhavChunk, b: &BhavChunk, ctx: &LiveContext) ->
                 .iter()
                 .all(|&t| t < tail || t >= 0xfd)
         })
-        && a.instructions.last().is_some_and(|last| {
-            last.opcode < 0x100
-                || last.operands == [0xff; 8]
+        && a.instructions.iter().enumerate().all(|(i, ins)| {
+            // Bytes the original holds from this call's operands to its last node.
+            let available = 8 + 12 * (n - 1 - i);
+            ins.opcode < 0x100
+                || ins.operands == [0xff; 8]
                 || ctx
                     .callee_arities
                     .as_ref()
-                    .and_then(|m| m.get(&last.opcode))
-                    .is_some_and(|&argc| argc <= 4)
+                    .and_then(|m| m.get(&ins.opcode))
+                    .is_some_and(|&argc| argc * 2 <= available)
         })
 }
 
@@ -949,7 +1037,9 @@ fn library_bcon_name(addr: u16) -> Option<String> {
     match table {
         0..=63 => None,
         64..=127 => Some(format!("s{}_{entry}", 8192 + (table - 64))),
-        _ => Some(format!("g{}_{entry}", 256 + (table - 128))),
+        128..=191 => Some(format!("g{}_{entry}", 256 + (table - 128))),
+        // No table: the VM reads nothing there (`Program::constant`).
+        _ => None,
     }
 }
 
@@ -1504,6 +1594,9 @@ impl Model {
         out.indent += 1;
         out.line(format!("guid: {};", hex_u32(self.guid)));
         out.line(format!("price: {};", self.price));
+        if let Some(n) = self.attributes {
+            out.line(format!("attributes: {n};"));
+        }
         out.line("");
         if !self.interactions.is_empty() {
             out.line("// Interactions (TTAB), kept by ID:");
@@ -2236,7 +2329,7 @@ impl Translator<'_> {
             (8, _) => format!("temp[{i}]"),
             (6, _) => format!("global[{i}]"),
             (10, _) if i == 0 => "stack_obj".to_owned(),
-            (0, false) | (1, true) if i <= MAX_STATE_SLOT => format!("self.attr_{i}"),
+            (0, false) | (1, true) if i <= self.model.state_limit => format!("self.attr_{i}"),
             (3, false) => format!("self.data[{i}]"),
             (14, true) => format!("sim.motive[{i}]"),
             (18, true) => format!("sim.person[{i}]"),
@@ -2255,6 +2348,7 @@ mod tests {
         assert_eq!(library_bcon_name((129 << 7) | 3).as_deref(), Some("g257_3"));
         assert_eq!(library_bcon_name((64 << 7) | 1).as_deref(), Some("s8192_1"));
         assert_eq!(library_bcon_name(5), None);
+        assert_eq!(library_bcon_name(192 << 7), None);
     }
 
     #[test]
@@ -2335,6 +2429,14 @@ mod tests {
         assert!(same_but_unreachable_tail(&fits, &with_tail(&fits), &ctx));
         let temps = tree(&[(4202, 0xfe, 0xfd, [0xff; 8])]);
         assert!(same_but_unreachable_tail(&temps, &with_tail(&temps), &ctx));
+        // An earlier call's arguments can run across later nodes into the tail too:
+        // 8 operand bytes plus one 12-byte node hold 10 arguments, not 11.
+        let ctx = arities(&[(4210, 10), (4211, 11)]);
+        let reaches = |callee| tree(&[(callee, 1, 0xfd, [0; 8]), (2, 0xfe, 0xfd, [0; 8])]);
+        let near = reaches(4210);
+        assert!(same_but_unreachable_tail(&near, &with_tail(&near), &ctx));
+        let far = reaches(4211);
+        assert!(!same_but_unreachable_tail(&far, &with_tail(&far), &ctx));
     }
 
     #[test]

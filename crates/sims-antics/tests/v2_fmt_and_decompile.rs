@@ -345,6 +345,178 @@ fn a_tree_v2_cannot_write_is_omitted_not_fatal() {
     compile("decompiled.antics", &report.source);
 }
 
+/// A synthetic object whose trees touch attributes past its attribute count.
+const SPARSE: &str = r#"object "Synth Sparse" {
+    guid: 0x7E00_0003;
+    price: 5;
+    attributes: 4;
+    sprite: Sprite::procedural("floor_lamp", primary: #504030, accent: #A09080, trim: #201810);
+
+    state level @ 2: i16;
+
+    @id(4500) tree poke "Poke" {
+        self.level += 1;
+        raw { my.attr[20] := 1; }
+        return true;
+    }
+}
+"#;
+
+fn proven(check: &TreeCheck) -> bool {
+    matches!(check, TreeCheck::Identical | TreeCheck::Equivalent)
+}
+
+#[test]
+fn the_attribute_count_is_kept_and_bounds_states() {
+    let iff = parse_iff(&compile("synth-sparse.antics", SPARSE).iff_bytes);
+    let report =
+        decompile_iff_to_v2_report(&iff, &DecompileV2Options::default()).expect("decompile");
+    let source = &report.source;
+    assert!(source.contains("attributes: 4;"), "{source}");
+    // A `state` past the count would grow the object, so attribute 20 stays `raw`.
+    assert!(source.contains("state attr_2 @ 2: i16;"), "{source}");
+    assert!(!source.contains("attr_20"), "{source}");
+    assert!(
+        report.trees.iter().all(|t| proven(&t.check)),
+        "{:?}\n{source}",
+        report.trees
+    );
+}
+
+fn bhav(id: u16, label: &str, instructions: Vec<Instruction>) -> ChunkData {
+    let mut tree = BhavChunk::new(id, label, instructions);
+    tree.format = 0x8002;
+    ChunkData {
+        tag: *b"BHAV",
+        id,
+        flags: 0x10,
+        label: label.to_owned(),
+        data: encode_bhav(&tree).expect("encode BHAV"),
+    }
+}
+
+fn node(opcode: u16, operands: [u8; 8]) -> Instruction {
+    Instruction {
+        opcode,
+        on_true: 0xfe,
+        on_false: 0xfd,
+        operands,
+    }
+}
+
+#[test]
+fn a_sound_v2_cannot_label_leaves_its_player_inconclusive() {
+    let iff = parse_iff(&compile("synth-counter.antics", COUNTER).iff_bytes);
+    let long_name = "s".repeat(70);
+    let mut fwav = long_name.clone().into_bytes();
+    fwav.push(0);
+    let iff = with_chunks(
+        &iff,
+        vec![
+            ChunkData {
+                tag: *b"FWAV",
+                id: 5,
+                flags: 0x10,
+                label: "Long".to_owned(),
+                data: fwav,
+            },
+            // Play Sound Event 5.
+            bhav(4410, "Chime", vec![node(23, [5, 0, 0, 0, 0, 0, 0, 0])]),
+        ],
+    );
+    let report =
+        decompile_iff_to_v2_report(&iff, &DecompileV2Options::default()).expect("decompile");
+    assert!(!report.source.contains(&long_name), "{}", report.source);
+    let chime = report
+        .trees
+        .iter()
+        .find(|t| t.id == 4410)
+        .expect("tree 4410");
+    assert!(
+        matches!(&chime.check, TreeCheck::Inconclusive(why) if why.contains("chunk label")),
+        "{:?}",
+        chime.check
+    );
+}
+
+#[test]
+fn constant_table_names_stay_distinct_for_the_compiler() {
+    let iff = parse_iff(&compile("synth-counter.antics", COUNTER).iff_bytes);
+    let iff = with_chunks(
+        &iff,
+        vec![
+            // Same name as `Limits` up to case and underscores.
+            bcon(4104, "LI_MITS", vec![1]),
+            bcon(4105, "Library_Consts", vec![2]),
+            // A label at the length limit still has room for its suffix.
+            bcon(4106, &"Long".repeat(15), vec![3]),
+            bcon(4107, &"Long".repeat(15), vec![4]),
+        ],
+    );
+    let report =
+        decompile_iff_to_v2_report(&iff, &DecompileV2Options::default()).expect("decompile");
+    let source = &report.source;
+    assert!(source.contains("bcon 4104 \"LIMITS4104\""), "{source}");
+    assert!(
+        source.contains("bcon 4105 \"LibraryConsts4105\""),
+        "{source}"
+    );
+    let long = "Long".repeat(15);
+    assert!(
+        source.contains(&format!("bcon 4106 \"{long}\"")),
+        "{source}"
+    );
+    assert!(
+        source.contains(&format!("bcon 4107 \"{}4107\"", &long[..51])),
+        "{source}"
+    );
+    assert!(
+        report.trees.iter().all(|t| proven(&t.check)),
+        "{:?}\n{source}",
+        report.trees
+    );
+    compile("decompiled.antics", source);
+}
+
+#[test]
+fn a_caller_of_an_unproven_tree_is_not_proven() {
+    let iff = parse_iff(&compile("synth-counter.antics", COUNTER).iff_bytes);
+    // 4400 cannot be written (251 nodes); 4401 calls it, 4402 calls 4401.
+    let long = (0..251u16)
+        .map(|i| Instruction {
+            on_true: if i == 250 { 0xfe } else { (i + 1) as u8 },
+            ..node(4300, [0xff; 8])
+        })
+        .collect();
+    let iff = with_chunks(
+        &iff,
+        vec![
+            bhav(4400, "Long", long),
+            bhav(4401, "Caller", vec![node(4400, [0xff; 8])]),
+            bhav(4402, "Outer", vec![node(4401, [0xff; 8])]),
+        ],
+    );
+    let report =
+        decompile_iff_to_v2_report(&iff, &DecompileV2Options::default()).expect("decompile");
+    let check = |id| {
+        &report
+            .trees
+            .iter()
+            .find(|t| t.id == id)
+            .expect("tree")
+            .check
+    };
+    assert!(matches!(check(4400), TreeCheck::Omitted(_)));
+    // The checker itself sees that 4400 changed shape; 4402's own code is the same.
+    assert!(!proven(check(4401)), "{:?}", check(4401));
+    assert!(
+        matches!(check(4402), TreeCheck::Inconclusive(why) if why.contains("calls tree 4401")),
+        "{:?}",
+        check(4402)
+    );
+    assert!(proven(check(4300)));
+}
+
 #[test]
 fn validation_off_still_writes_formatted_source() {
     let original = compile("synth-lamp.antics", LAMP);
