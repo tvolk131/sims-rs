@@ -204,6 +204,8 @@ pub struct V2EnumDomain {
     pub tree_name: String,
     /// The BHAV label it lowers to, which the files compared must give that BHAV too.
     pub label: String,
+    /// The object's GUID, which the files compared must define too.
+    pub object_guid: u32,
     pub param_index: u16,
     pub param_name: String,
     pub enum_name: String,
@@ -309,9 +311,18 @@ pub fn v2_enum_param_domains(path: &Path, pack_dir: Option<&Path>) -> Result<Vec
             let Some(values) = enum_values(module, enum_name) else {
                 continue;
             };
-            let id = match by_label.get(tree.label.as_str()).map(Vec::as_slice) {
-                Some([id]) => *id,
-                Some(ids) => {
+            let labeled = by_label.get(tree.label.as_str()).map(Vec::as_slice);
+            let id = match (tree.pinned_id, labeled) {
+                // `@id(N)` names the BHAV even when other trees share the label.
+                (Some(pinned), Some(ids)) if ids.contains(&pinned) => pinned,
+                (Some(pinned), _) => {
+                    return Err(Error::new(format!(
+                        "tree '{}' is pinned to BHAV #{pinned}, which the lowered object does not label \"{}\"",
+                        tree.ident, tree.label
+                    )));
+                }
+                (None, Some([id])) => *id,
+                (None, Some(ids)) => {
                     return Err(Error::new(format!(
                         "tree '{}' (label \"{}\") matches {} BHAVs in the lowered object",
                         tree.ident,
@@ -319,7 +330,7 @@ pub fn v2_enum_param_domains(path: &Path, pack_dir: Option<&Path>) -> Result<Vec
                         ids.len()
                     )));
                 }
-                None => {
+                (None, None) => {
                     return Err(Error::new(format!(
                         "tree '{}' (label \"{}\") is not in the lowered object",
                         tree.ident, tree.label
@@ -344,6 +355,7 @@ pub fn v2_enum_param_domains(path: &Path, pack_dir: Option<&Path>) -> Result<Vec
                 tree: id,
                 tree_name: tree.ident.clone(),
                 label: tree.label.clone(),
+                object_guid: expanded.guid,
                 param_index: u16::try_from(index).unwrap_or(u16::MAX),
                 param_name: param.name.clone(),
                 enum_name: enum_name.clone(),

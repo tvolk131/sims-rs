@@ -2490,7 +2490,7 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
     }
     // The BHAV label each v2 domain's tree lowers to: both files must give the BHAV that
     // label, or the domain could constrain a different tree that took the ID.
-    let mut labels: Vec<(u16, String, String)> = Vec::new();
+    let mut labels: Vec<(u16, String, u32, String)> = Vec::new();
     for source in &enum_sources {
         let shown = sanitize_path_display(source);
         let found = v2_enum_param_domains(source, pack.as_deref())
@@ -2499,7 +2499,7 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
             eprintln!("note: --v2-enum-domains {shown}: no tree takes an enum-typed parameter");
         }
         for d in found {
-            labels.push((d.tree, d.label.clone(), shown.clone()));
+            labels.push((d.tree, d.label.clone(), d.object_guid, shown.clone()));
             assumed.push((
                 d.tree,
                 d.param_index,
@@ -2604,7 +2604,31 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
             break;
         }
         let iff = Iff::parse(bytes.clone()).map_err(|e| format!("{}: {e}", path.display()))?;
-        for (tree, label, from) in &labels {
+        // The same ID and label can belong to another object's tree: the files must
+        // define the source's object.
+        let guids: Vec<u32> = iff
+            .chunks
+            .iter()
+            .filter(|c| &c.tag == b"OBJD" && c.flags & sims_formats::iff::DELETED == 0)
+            .filter_map(|c| {
+                let d = iff.data(c);
+                let word = |w: usize| {
+                    d.get(2 * w..2 * w + 2)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                };
+                Some(u32::from(word(14)?) | (u32::from(word(15)?) << 16))
+            })
+            .collect();
+        for (_, _, guid, from) in &labels {
+            if !guids.contains(guid) {
+                return Err(sanitize_single_line(&format!(
+                    "--v2-enum-domains {from}: the source's object (GUID 0x{guid:08X}) is not in {}",
+                    sanitize_path_display(path)
+                ))
+                .into());
+            }
+        }
+        for (tree, label, _, from) in &labels {
             let found: Vec<&str> = iff
                 .chunks
                 .iter()

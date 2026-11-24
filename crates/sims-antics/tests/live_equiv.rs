@@ -3490,6 +3490,11 @@ fn param_domain_bound_gets_a_witness() {
         &with_domains(&[(4200, 0, "0..=5")]),
         &opts,
     ));
+    // Two inputs that differ only when they sit at different ends of their ranges.
+    let a = tree(4200, 2, 0, vec![expr((TEMP, 0), SET, (PARAM, 0), T, T)]);
+    let b = tree(4200, 2, 0, vec![expr((TEMP, 0), SET, (PARAM, 1), T, T)]);
+    let both = with_domains(&[(4200, 0, "100..=101"), (4200, 1, "100..=101")]);
+    assert_counterexample(&live_with(&a, &b, &both, &opts));
 }
 
 /// Callers are read from the nodes the VM can run: a row no entry reaches is not a call,
@@ -3508,18 +3513,13 @@ fn domain_callers_are_read_from_runnable_nodes_only() {
         param_domains: domains(&[(4097, 0, "0..=3")]),
         ..IffEquivOptions::default()
     };
-    // Node 1 holds a call passing 7, but node 0 never branches to it. (Each count
-    // covers both files.)
-    for (to_node_1, violating) in [(T, 0), (1, 2)] {
-        let caller = tree(
-            4096,
-            0,
-            0,
-            vec![
-                prim(4097, literal_call(2), T, to_node_1),
-                prim(4097, literal_call(7), T, T),
-            ],
-        );
+    // Node 1 holds a call passing 7. Node 0 reaches it only when it branches there on
+    // an outcome it can have: not when it never does, and not on the false edge of an
+    // assignment, which always succeeds. (Each count covers both files.)
+    let call_first = |to_node_1: u8| prim(4097, literal_call(2), T, to_node_1);
+    let assign_first = expr((TEMP, 0), SET, (LIT, 1), T, 1);
+    for (first, violating) in [(call_first(T), 0), (assign_first, 0), (call_first(1), 2)] {
+        let caller = tree(4096, 0, 0, vec![first, prim(4097, literal_call(7), T, T)]);
         let (a, b) = (
             file(&caller, &callee(&callee_a)),
             file(&caller, &callee(&callee_b)),
@@ -3755,6 +3755,38 @@ fn verify_equiv_cli_v2_enum_domains_check_labels() {
         text.contains("lowers to BHAV #4098") && text.contains("labeled \"Reset\""),
         "{text}"
     );
+    // Another object that gives the same BHAV the same label is not the source's object.
+    let other_source = dir.join("other.antics");
+    std::fs::write(
+        &other_source,
+        ENUM_OBJECT
+            .replace("BODY", PLAIN_BODY.trim_start())
+            .replace("0x7F53_0001", "0x7F53_0077"),
+    )
+    .unwrap();
+    let other = dir.join("other.iff");
+    std::fs::write(
+        &other,
+        sims_antics::compile_v2_object_file(&other_source, None)
+            .expect("compile v2")
+            .iff_bytes,
+    )
+    .unwrap();
+    let out = cli()
+        .arg("verify-equiv")
+        .arg("--v2-enum-domains")
+        .arg(&source)
+        .arg(&other)
+        .arg(&other)
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("(GUID 0x7F530001) is not in"), "{text}");
 }
 
 /// A kind-4 tree's first parameter is its entry node, so a domain on it is never
@@ -3777,4 +3809,28 @@ fn param_domains_never_restrict_a_kind_4_entry() {
     let opts = LiveOptions::default();
     assert_counterexample(&live(&a, &b));
     assert_counterexample(&live_with(&a, &b, &with_domains(&[(4200, 0, "0")]), &opts));
+}
+
+/// `@id(N)` names a tree's BHAV even when another tree shares its label.
+#[test]
+fn v2_enum_domains_follow_pinned_ids() {
+    let dir = scratch_dir("enum-pinned");
+    let source = dir.join("pinned.antics");
+    std::fs::write(
+        &source,
+        ENUM_OBJECT
+            .replace("BODY", PLAIN_BODY.trim_start())
+            .replace(
+                "    tree serve \"Serve\"",
+                "    @id(4201) tree tidy \"Serve\" () {\n        self.served = 0;\n    }\n\n    @id(4200) tree serve \"Serve\"",
+            ),
+    )
+    .unwrap();
+    let found = sims_antics::verify::v2_enum_param_domains(&source, None).expect("extract");
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert_eq!(
+        (found[0].tree, found[0].param_index),
+        (4200, 0),
+        "{found:#?}"
+    );
 }

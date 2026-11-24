@@ -13,7 +13,8 @@
 use super::domains::{ParamDomain, ParamDomains};
 use super::{
     EquivMethod, EquivOptions, EquivResult, LiveContext, LiveOptions, bhav_param_limit,
-    check_bhav_equivalent_combined, context_mismatch, reads_no_call_operands,
+    check_bhav_equivalent_combined, context_mismatch, is_always_true_instruction,
+    reads_no_call_operands,
 };
 use crate::arity_catalog::vm_kept_bhavs;
 use crate::error::{Error, Result};
@@ -487,30 +488,39 @@ fn domain_calls(
     (lines, violations)
 }
 
-/// The `arity` argument words a call at `node` passes inline: its operand words, then
-/// (past four) the bytes of the following nodes (`interpreter.rs:1539`). `None` when they
-/// run past the tree's end.
-/// Which nodes of `bhav` the VM can run: those reachable from an entry. A kind-4 tree is
-/// entered at any node (`interpreter.rs:964`); every other tree at node 0.
+/// Which nodes of `bhav` the VM can run: those reachable from an entry over the edges
+/// the VM can take. A kind-4 tree is entered at any node (`interpreter.rs:964`); every
+/// other tree at node 0. Node indices past 250 never run: a target there is invalid or
+/// an exit (`interpreter.rs:1695`). An instruction that always succeeds (an assignment,
+/// say) never takes its false edge, and Random never does (`random.rs`).
 fn runnable_nodes(bhav: &Behavior) -> Vec<bool> {
+    const LAST_NODE: usize = 250;
     let n = bhav.instructions.len();
+    let runnable = n.min(LAST_NODE + 1);
     let mut runs = vec![false; n];
     let mut stack: Vec<usize> = if bhav.kind == 4 {
-        (0..n).collect()
+        (0..runnable).collect()
     } else {
         vec![0]
     };
     while let Some(node) = stack.pop() {
-        if node >= n || runs[node] {
+        if node >= runnable || runs[node] {
             continue;
         }
         runs[node] = true;
         let ins = &bhav.instructions[node];
-        stack.extend([usize::from(ins.on_true), usize::from(ins.on_false)]);
+        stack.push(usize::from(ins.on_true));
+        let always_true = ins.opcode == 8 || is_always_true_instruction(ins);
+        if !always_true {
+            stack.push(usize::from(ins.on_false));
+        }
     }
     runs
 }
 
+/// The `arity` argument words a call at `node` passes inline: its operand words, then
+/// (past four) the bytes of the following nodes (`interpreter.rs:1539`). `None` when they
+/// run past the tree's end.
 fn inline_call_words(
     instructions: &[sims_formats::behavior::Instruction],
     node: usize,
