@@ -39,8 +39,11 @@ pub const ROOM: usize = 13;
 const SOCIAL: usize = 14;
 const FUN: usize = 15;
 
-/// Person data words the decay reads.
-const NEAT: usize = 3;
+/// Person data words the decay reads (person data at +0x58c): the Active
+/// trait, word 3 (+0x592 at 0x421054), and Outgoing, word 6 (+0x598 at
+/// 0x421093). Comfort's rate runs from "comfort decrement lazy" at Active
+/// 0 to "comfort decrement active" at 1000.
+const ACTIVE: usize = 3;
 const OUTGOING: usize = 6;
 /// The person's age: 0 or 18 and up is an adult.
 const AGE: usize = 58;
@@ -253,7 +256,8 @@ impl Tuning {
     ///    drift.
     /// 2. If hunger rose since the last decay, bladder loses a share of
     ///    the rise.
-    /// 3. Comfort loses a rate that depends on person data word 3.
+    /// 3. Comfort loses a rate that depends on the Active trait (person
+    ///    data word 3).
     /// 4. Hunger loses a share of its distance from -100.
     /// 5. Awake, social loses a rate that depends on person data word 6.
     /// 6. Fun, hygiene and bladder lose their awake or asleep rates;
@@ -272,7 +276,7 @@ impl Tuning {
         } else {
             0
         }];
-        let (neat, outgoing) = (word(NEAT), word(OUTGOING));
+        let (active, outgoing) = (word(ACTIVE), word(OUTGOING));
         let mut m = person.motives.map(F32::from_f32);
         let previous_hunger = F32::from_f32(person.previous_motives[HUNGER]);
         let asleep = above(Ext::ZERO, m[ALERTNESS].ext());
@@ -294,7 +298,7 @@ impl Tuning {
         m[COMFORT] = sub(
             m[COMFORT].ext(),
             add(
-                mul(Ext::from_i32(neat), rates.comfort_slope.ext()),
+                mul(Ext::from_i32(active), rates.comfort_slope.ext()),
                 rates.comfort_base.ext(),
             ),
         )

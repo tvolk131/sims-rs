@@ -27,6 +27,7 @@ use crate::migration::{
     NeighborhoodSchemaStatus, StoreMigrationError, StoreMigrationReport,
     decode_neighborhood_strict, decode_neighborhood_with_report,
 };
+use crate::neighborhood_save::SaveInputs;
 use crate::{Error, Result, World};
 use flate2::Compression;
 use flate2::read::DeflateDecoder;
@@ -103,6 +104,14 @@ const NEIGHBORHOOD_HOUSES: TableDefinition<(&str, u32), &[u8]> =
 /// `(neighborhood_id, house_number)`.
 const NEIGHBORHOOD_LOTS: TableDefinition<(&str, u32), &[u8]> =
     TableDefinition::new("neighborhood_lots");
+
+/// What the `Neighborhood.iff` save writes beyond the record
+/// ([`SaveInputs::encode`]), keyed by neighborhood ID: FAMh payloads, the
+/// bytes the save leaves uninitialized, and option bytes and family names
+/// as read. Kept apart from [`NEIGHBORHOODS`] so the record's layout (and
+/// `NEIGHBORHOOD_FORMAT`) is unchanged.
+const NEIGHBORHOOD_SAVE_INPUTS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("neighborhood_save_inputs");
 
 /// Persisted custom neighborhood map lot thumbnails keyed by
 /// `(neighborhood_id, lot_id)`.
@@ -1498,6 +1507,28 @@ fn store(error: impl std::fmt::Display) -> Error {
     Error::Store(error.to_string())
 }
 
+/// `directory`'s `Neighborhood.iff`, matched without regard to case as the
+/// original's file system does, if there is one.
+pub(crate) fn neighborhood_iff_path(directory: &Path) -> Option<PathBuf> {
+    let direct = directory.join("Neighborhood.iff");
+    if direct.is_file() {
+        return Some(direct);
+    }
+    #[expect(clippy::disallowed_methods, reason = "entries are sorted before use")]
+    let entries = std::fs::read_dir(directory).ok()?;
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    paths.sort();
+    paths.into_iter().find(|p| {
+        p.is_file()
+            && p.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("Neighborhood.iff"))
+    })
+}
+
 /// Reads optional household surnames from `Neighborhood.iff` `FAMs` chunks for
 /// every family present in `families`. Missing or unreadable `FAMs` chunks are
 /// skipped non-fatally so synthetic or minimal neighborhood fixtures still
@@ -1507,27 +1538,7 @@ fn read_family_surnames(
     families: &BTreeMap<u16, Family>,
 ) -> BTreeMap<u16, String> {
     let mut surnames = BTreeMap::new();
-    let direct = directory.join("Neighborhood.iff");
-    let path = if direct.is_file() {
-        Some(direct)
-    } else {
-        #[expect(clippy::disallowed_methods, reason = "entries are sorted before use")]
-        let entries = std::fs::read_dir(directory).ok();
-        entries.and_then(|entries| {
-            let mut paths: Vec<PathBuf> = entries
-                .filter_map(std::result::Result::ok)
-                .map(|entry| entry.path())
-                .collect();
-            paths.sort();
-            paths.into_iter().find(|p| {
-                p.is_file()
-                    && p.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.eq_ignore_ascii_case("Neighborhood.iff"))
-            })
-        })
-    };
-    let Some(path) = path else {
+    let Some(path) = neighborhood_iff_path(directory) else {
         return surnames;
     };
     let Ok(bytes) = std::fs::read(&path) else {
@@ -1977,13 +1988,8 @@ impl NeighborhoodStore {
             houses.insert(number, bytes);
         }
 
-        // The content reader reads every FAMI with a member list, but the
-        // original reads none for family 0 (0x4105e7): what it took for
-        // family 0's member count is the secondary house.
-        let mut families = neighborhood.families;
-        if let Some(zero) = families.get_mut(&0) {
-            *zero = zero.for_chunk(0).map_err(store)?;
-        }
+        let save_inputs = SaveInputs::from_directory(directory)?.encode();
+        let families = neighborhood.families;
         let mut stored = StoredNeighborhood {
             name: id.to_owned(),
             family_surnames: read_family_surnames(directory, &families),
@@ -2060,6 +2066,10 @@ impl NeighborhoodStore {
             purge_lot_thumbnails_in_txn(&txn, id)?;
 
             nh_table.insert(id, encoded.as_slice()).map_err(store)?;
+            txn.open_table(NEIGHBORHOOD_SAVE_INPUTS)
+                .map_err(store)?
+                .insert(id, save_inputs.as_slice())
+                .map_err(store)?;
             for (name, bytes) in &characters {
                 char_table
                     .insert((id, name.as_str()), bytes.as_slice())
@@ -2251,6 +2261,10 @@ impl NeighborhoodStore {
                 crate::autosave::purge_neighborhood_in_txn(&txn, id)?;
                 crate::album_store::purge_neighborhood_in_txn(&txn, id)?;
                 purge_lot_thumbnails_in_txn(&txn, id)?;
+                txn.open_table(NEIGHBORHOOD_SAVE_INPUTS)
+                    .map_err(store)?
+                    .remove(id)
+                    .map_err(store)?;
                 let mut meta_table = txn.open_table(NEIGHBORHOOD_META).map_err(store)?;
                 let is_active = meta_table
                     .get(ACTIVE_KEY)
@@ -2790,6 +2804,57 @@ impl NeighborhoodStore {
         }
         bump_neighborhood_revision(&txn, self.store_id, id)?;
         txn.commit().map_err(store)
+    }
+
+    /// What the `Neighborhood.iff` save of `id` writes beyond its record
+    /// (FAMh payloads, uninitialized bytes, option bytes and names as
+    /// read). A neighborhood imported before the store kept them has none:
+    /// the save then writes no FAMh and zeros.
+    pub fn load_save_inputs(&self, id: &str) -> Result<SaveInputs> {
+        let txn = self.db.begin_read().map_err(store)?;
+        let table = match txn.open_table(NEIGHBORHOOD_SAVE_INPUTS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(SaveInputs::default()),
+            Err(error) => return Err(store(error)),
+        };
+        table.get(id).map_err(store)?.map_or_else(
+            || Ok(SaveInputs::default()),
+            |value| SaveInputs::decode(value.value()),
+        )
+    }
+
+    /// Replaces `id`'s save inputs, for instance with a family's FAMh when
+    /// a `.FAM` file moves in (0x4107cf copies it from the file). `id` must
+    /// be an imported neighborhood.
+    pub fn save_save_inputs(&self, id: &str, inputs: &SaveInputs) -> Result<()> {
+        let txn = self.db.begin_write().map_err(store)?;
+        {
+            let exists = txn
+                .open_table(NEIGHBORHOODS)
+                .map_err(store)?
+                .get(id)
+                .map_err(store)?
+                .is_some();
+            if !exists {
+                return Err(Error::Store(format!("no neighborhood {id:?}")));
+            }
+            txn.open_table(NEIGHBORHOOD_SAVE_INPUTS)
+                .map_err(store)?
+                .insert(id, inputs.encode().as_slice())
+                .map_err(store)?;
+        }
+        txn.commit().map_err(store)
+    }
+
+    /// Saves neighborhood `id` as `Neighborhood.iff` in `directory`
+    /// ([`StoredNeighborhood::save_neighborhood_iff`]) with its stored save
+    /// inputs, and returns the file's path.
+    pub fn save_neighborhood_iff(&self, id: &str, directory: &Path) -> Result<PathBuf> {
+        let neighborhood = self
+            .load_neighborhood(id)?
+            .ok_or_else(|| Error::Store(format!("no neighborhood {id:?}")))?;
+        let inputs = self.load_save_inputs(id)?;
+        neighborhood.save_neighborhood_iff(directory, &inputs)
     }
 
     /// Loads the latest saved lot bytes for `(id, house)`, if any.

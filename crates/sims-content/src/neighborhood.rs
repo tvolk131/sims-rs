@@ -60,7 +60,8 @@ impl Neighborhood {
         let iff = read_iff(&path)?;
         let mut families = BTreeMap::new();
         for chunk in iff.all(b"FAMI") {
-            let family = Family::parse(iff.data(chunk))
+            // Family 0 has no member list (0x4105e7).
+            let family = Family::parse_chunk(iff.data(chunk), chunk.id)
                 .map_err(|e| Error::format(&format!("{} FAMI #{}", path.display(), chunk.id), e))?;
             families.insert(chunk.id, family);
         }
