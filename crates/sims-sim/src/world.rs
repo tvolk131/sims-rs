@@ -578,12 +578,44 @@ pub struct World {
     /// [`World::encode`] to preserve snapshot format 32.
     #[serde(skip)]
     pub family_flags: BTreeMap<i32, u32>,
+    /// The house change Generic Sims Call 17 asked for and the shell has
+    /// not yet carried out ([`TripRequest`]). Kept out of [`World::encode`]
+    /// to preserve snapshot format 32: the original keeps it in the game
+    /// object, not in the house file.
+    #[serde(skip)]
+    pub trip_request: Option<TripRequest>,
     /// The interface's indicator refresh queues ([`IndicatorQueues`]).
     /// The house file does not hold them. Kept out of [`World::encode`] to
     /// preserve snapshot format 32; `sims_vm::boot::save::Saved` keeps
     /// them across lot save/restore.
     #[serde(skip)]
     pub indicator_queues: IndicatorQueues,
+}
+
+/// A house change the game must make between ticks, as Generic Sims Call
+/// 17 leaves it for the shell.
+///
+/// `Sims.exe` 1.91: routine 17 (0x450660) calls 0x45a22d, which ends in
+/// 0x4fc713(house, leader GUID, family). Mode 0 passes the leader's GUID and
+/// family 0 (the leader travels, with a companion if it holds one); mode 1
+/// passes GUID 0 and the family's id (the whole family travels). Routine 17
+/// then sets the game's byte +0x1c +0xe1, which the main loop reads to
+/// leave the house.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TripRequest {
+    /// The house to load: a destination lot, or the home house on return.
+    pub house: i16,
+    /// The leader's GUID in mode 0, 0 in mode 1.
+    pub leader_guid: u32,
+    /// The family id in mode 1, 0 in mode 0.
+    pub family: i16,
+    /// The object id of the person that ran routine 17.
+    pub caller: u16,
+    /// The neighbor ids whose inventories 0x45a22d wrote saved-state
+    /// tokens into, in the order written (not a field of the original's
+    /// request: the trip's return takes back only these). A request made
+    /// while one is pending adds its own to the pending one's.
+    pub saved: Vec<i16>,
 }
 
 /// The people whose indicators the interface will refresh when it next
@@ -1118,6 +1150,7 @@ impl World {
             types_by_guid: TypesByGuidCache(None),
             dirty_frames: CowBox::default(),
             family_flags: BTreeMap::new(),
+            trip_request: None,
         }
     }
 

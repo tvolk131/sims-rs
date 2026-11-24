@@ -939,6 +939,25 @@ pub fn compile_object_from_dir(dir: &Path) -> Result<CompiledObject> {
     compile_object_dir(dir)
 }
 
+/// Every GUID an IFF's `OBJD` chunks define (words 14 and 15).
+fn objd_guids(iff_bytes: &[u8]) -> Result<BTreeSet<u32>> {
+    let iff = sims_formats::iff::Iff::parse(iff_bytes.to_vec())
+        .map_err(|e| Error::new(format!("re-reading compiled IFF: {e}")))?;
+    Ok(iff
+        .chunks
+        .iter()
+        .filter(|c| &c.tag == b"OBJD")
+        .filter_map(|c| {
+            let d = iff.data(c);
+            let word = |w: usize| {
+                d.get(2 * w..2 * w + 2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            };
+            Some(u32::from(word(14)?) | (u32::from(word(15)?) << 16))
+        })
+        .collect())
+}
+
 /// Compiles an entire clean-room pack directory containing `pack.toml` and
 /// `objects/<slug>/{object.toml, *.antics}` into a packaged `FAR!byAZ` archive
 /// and deterministic synthesized WAV sound bank.
@@ -986,7 +1005,12 @@ pub fn compile_pack_dir(dir: &Path) -> Result<CompiledPack> {
             let obj_dir = ensure_contained_path(dir, &root_canon, &["objects", slug.as_str()])?;
             compile_object_dir(&obj_dir).map_err(|e| e.with_context(format!("object '{slug}'")))?
         };
-        for guid in std::iter::once(compiled.guid).chain(compiled.tile_guids.iter().copied()) {
+        // Every GUID the object's IFF defines: primary, tiles and catalog variants (a v2
+        // `variant` adds an OBJD of its own that `tile_guids` does not list).
+        let mut guids: BTreeSet<u32> = objd_guids(&compiled.iff_bytes)?;
+        guids.insert(compiled.guid);
+        guids.extend(compiled.tile_guids.iter().copied());
+        for guid in guids {
             if let Some(prev_slug) = seen_guids.insert(guid, slug.clone()) {
                 return Err(Error::new(format!(
                     "duplicate GUID {guid:#010x} between objects '{prev_slug}' and '{slug}'"
