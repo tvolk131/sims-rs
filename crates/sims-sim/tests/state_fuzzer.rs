@@ -494,6 +494,10 @@ fn check_world_run(
                 loaded.indicator_queues = main.indicator_queues.clone();
                 forks.push(("REDB restore", loaded));
             }
+            // The parent as it stood when it forked, to show that running a
+            // fork changed nothing in it, even a write the parent's next
+            // command would make again and so hide from its trace.
+            let parent = main.encode_snapshot();
             for (name, mut fork) in forks {
                 let replay: Vec<TraceEntry> = commands[i..]
                     .iter()
@@ -503,6 +507,11 @@ fn check_world_run(
                     return Err(format!("{name} at {i} left the reference at {why}"));
                 }
                 world_invariants(&fork).map_err(|e| format!("{name} at {i}, at the end: {e}"))?;
+                if main.encode_snapshot() != parent {
+                    return Err(format!(
+                        "{name} at {i} wrote through to the run it came from"
+                    ));
+                }
             }
         }
         trace.push(trace_entry(&mut main, command));
@@ -700,10 +709,13 @@ fn stored_neighborhoods_and_save_inputs_round_trip() {
         assert_eq!(decoded, inputs, "seed {seed}");
         assert_eq!(decoded.encode(), bytes, "seed {seed}");
 
-        // The save is a function of the record and the inputs.
-        let first = state.neighborhood_iff(&inputs).map_err(|e| e.to_string());
+        // Every generated record saves, and the save is a function of the
+        // record and the inputs.
+        let first = state
+            .neighborhood_iff(&inputs)
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let second = decoded_state_save(&state, &inputs);
-        assert_eq!(first, second, "seed {seed}");
+        assert_eq!(Ok(first), second, "seed {seed}");
     }
 }
 
@@ -803,9 +815,13 @@ impl Model {
         let previous = self.record.take().expect("a commit needs a record");
         next.instance_id = version.0;
         next.revision = version.1;
-        self.inputs.retain_families(|family| {
-            next.families.contains_key(&family) || !previous.families.contains_key(&family)
-        });
+        // Written out here rather than through `SaveInputs::retain_families`,
+        // so the model does not share the code it checks.
+        for family in previous.families.keys() {
+            if !next.families.contains_key(family) {
+                forget_family(&mut self.inputs, *family);
+            }
+        }
         self.record = Some(next);
     }
 
@@ -816,6 +832,45 @@ impl Model {
     }
 }
 
+/// A family's three save-input entries: its FAMh, its name as read and
+/// its name's stray byte. The model keeps them by hand, apart from the
+/// `SaveInputs` methods the store runs.
+fn forget_family(inputs: &mut SaveInputs, family: u16) {
+    inputs.histories.remove(&family);
+    inputs.family_names.remove(&family);
+    inputs.uninitialized.family_names.remove(&family);
+}
+
+/// A move-in from a `.FAM` file: the file's FAMh, or none, and no name
+/// read for the ID.
+fn model_move_in(inputs: &mut SaveInputs, family: u16, history: Option<Vec<u8>>) {
+    forget_family(inputs, family);
+    if let Some(history) = history {
+        inputs.histories.insert(family, history);
+    }
+}
+
+/// A renumbering: `to` takes `from`'s three entries, or loses its own
+/// where `from` has none.
+fn model_renumber(inputs: &mut SaveInputs, from: u16, to: u16) {
+    if from == to {
+        return;
+    }
+    let history = inputs.histories.remove(&from);
+    let name = inputs.family_names.remove(&from);
+    let byte = inputs.uninitialized.family_names.remove(&from);
+    forget_family(inputs, to);
+    if let Some(history) = history {
+        inputs.histories.insert(to, history);
+    }
+    if let Some(name) = name {
+        inputs.family_names.insert(to, name);
+    }
+    if let Some(byte) = byte {
+        inputs.uninitialized.family_names.insert(to, byte);
+    }
+}
+
 fn check_store_run(ops: &[StoreOp]) -> Result<(), String> {
     let file = TempPath::new("store");
     let mut store = NeighborhoodStore::open(&file.0).map_err(|e| e.to_string())?;
@@ -823,144 +878,169 @@ fn check_store_run(ops: &[StoreOp]) -> Result<(), String> {
     let mut instances = BTreeSet::new();
     let fail = |step: usize, what: String| Err(format!("op {step}: {what}"));
     for (step, op) in ops.iter().enumerate() {
-        match op {
-            StoreOp::Save(id, state) => {
-                let model = &mut models[*id as usize];
-                let name = STORE_IDS[*id as usize];
-                store
-                    .save_neighborhood(name, state)
-                    .map_err(|e| e.to_string())?;
-                match &model.record {
-                    Some(previous) => {
-                        let version = (previous.instance_id, previous.revision + 1);
-                        model.commit((**state).clone(), version);
+        // A rejected operation leaves the block early, and still reaches
+        // the comparison below, which shows it changed nothing.
+        'apply: {
+            match op {
+                StoreOp::Save(id, state) => {
+                    let model = &mut models[*id as usize];
+                    let name = STORE_IDS[*id as usize];
+                    store
+                        .save_neighborhood(name, state)
+                        .map_err(|e| e.to_string())?;
+                    match &model.record {
+                        Some(previous) => {
+                            let version = (previous.instance_id, previous.revision + 1);
+                            model.commit((**state).clone(), version);
+                        }
+                        None => {
+                            // A new record gets a fresh instance and revision 0.
+                            let loaded = store
+                                .load_neighborhood(name)
+                                .map_err(|e| e.to_string())?
+                                .ok_or("a saved neighborhood is missing")?;
+                            if loaded.revision != 0 || !instances.insert(loaded.instance_id) {
+                                return fail(
+                                    step,
+                                    format!(
+                                        "new record has version {:?}",
+                                        (loaded.instance_id, loaded.revision)
+                                    ),
+                                );
+                            }
+                            let mut record = (**state).clone();
+                            record.instance_id = loaded.instance_id;
+                            record.revision = 0;
+                            model.record = Some(record);
+                        }
                     }
-                    None => {
-                        // A new record gets a fresh instance and revision 0.
-                        let loaded = store
-                            .load_neighborhood(name)
-                            .map_err(|e| e.to_string())?
-                            .ok_or("a saved neighborhood is missing")?;
-                        if loaded.revision != 0 || !instances.insert(loaded.instance_id) {
+                }
+                StoreOp::SaveChecked { id, state, stale } => {
+                    let model = &mut models[*id as usize];
+                    let name = STORE_IDS[*id as usize];
+                    let Some(record) = &model.record else {
+                        if store.save_neighborhood_checked(name, 0, 0, state).is_ok() {
+                            return fail(step, "a checked save made a record".into());
+                        }
+                        break 'apply;
+                    };
+                    let (instance, revision) = (record.instance_id, record.revision);
+                    let expected = if *stale {
+                        revision.wrapping_sub(1)
+                    } else {
+                        revision
+                    };
+                    let result = store
+                        .save_neighborhood_checked(name, instance, expected, state)
+                        .map_err(|e| e.to_string())?;
+                    match (result, *stale) {
+                        (Ok(version), false) => {
+                            if version != (instance, revision + 1) {
+                                return fail(step, format!("committed {version:?}"));
+                            }
+                            model.commit((**state).clone(), version);
+                        }
+                        (Err(_), true) => {}
+                        (result, stale) => {
+                            return fail(step, format!("stale {stale} gave {result:?}"));
+                        }
+                    }
+                }
+                StoreOp::Commit {
+                    id,
+                    state,
+                    files,
+                    move_in,
+                    renumber,
+                } => {
+                    let model = &mut models[*id as usize];
+                    let name = STORE_IDS[*id as usize];
+                    let batch = files.iter().map(|(n, b)| (n.as_str(), b.as_slice()));
+                    let Some(record) = &model.record else {
+                        let result = store.save_characters_neighborhood_and_save_inputs_checked(
+                            name,
+                            0,
+                            0,
+                            batch,
+                            state,
+                            |_| {},
+                        );
+                        if result.is_ok() {
+                            return fail(step, "a commit made a record".into());
+                        }
+                        break 'apply;
+                    };
+                    let (instance, revision) = (record.instance_id, record.revision);
+                    let change = |inputs: &mut SaveInputs| {
+                        inputs.move_in_family(move_in.0, move_in.1.clone());
+                        if let Some((from, to)) = *renumber {
+                            inputs.renumber_family(from, to);
+                        }
+                    };
+                    let unique: BTreeSet<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+                    let result = store.save_characters_neighborhood_and_save_inputs_checked(
+                        name, instance, revision, batch, state, change,
+                    );
+                    if unique.len() != files.len() {
+                        if result.is_ok() {
                             return fail(
                                 step,
-                                format!(
-                                    "new record has version {:?}",
-                                    (loaded.instance_id, loaded.revision)
-                                ),
+                                "a batch with a repeated file name committed".into(),
                             );
                         }
-                        let mut record = (**state).clone();
-                        record.instance_id = loaded.instance_id;
-                        record.revision = 0;
-                        model.record = Some(record);
+                        break 'apply;
                     }
-                }
-            }
-            StoreOp::SaveChecked { id, state, stale } => {
-                let model = &mut models[*id as usize];
-                let name = STORE_IDS[*id as usize];
-                let Some(record) = &model.record else {
-                    if store.save_neighborhood_checked(name, 0, 0, state).is_ok() {
-                        return fail(step, "a checked save made a record".into());
+                    let version = result
+                        .map_err(|e| e.to_string())?
+                        .map_err(|e| format!("{e:?}"))?;
+                    if version != (instance, revision + 1) {
+                        return fail(step, format!("committed {version:?}"));
                     }
-                    continue;
-                };
-                let (instance, revision) = (record.instance_id, record.revision);
-                let expected = if *stale {
-                    revision.wrapping_sub(1)
-                } else {
-                    revision
-                };
-                let result = store
-                    .save_neighborhood_checked(name, instance, expected, state)
-                    .map_err(|e| e.to_string())?;
-                match (result, *stale) {
-                    (Ok(version), false) => {
-                        if version != (instance, revision + 1) {
-                            return fail(step, format!("committed {version:?}"));
-                        }
-                        model.commit((**state).clone(), version);
-                    }
-                    (Err(_), true) => {}
-                    (result, stale) => {
-                        return fail(step, format!("stale {stale} gave {result:?}"));
-                    }
-                }
-            }
-            StoreOp::Commit {
-                id,
-                state,
-                files,
-                move_in,
-                renumber,
-            } => {
-                let model = &mut models[*id as usize];
-                let name = STORE_IDS[*id as usize];
-                let Some(record) = &model.record else {
-                    continue;
-                };
-                let (instance, revision) = (record.instance_id, record.revision);
-                let change = |inputs: &mut SaveInputs| {
-                    inputs.move_in_family(move_in.0, move_in.1.clone());
+                    model_move_in(&mut model.inputs, move_in.0, move_in.1.clone());
                     if let Some((from, to)) = *renumber {
-                        inputs.renumber_family(from, to);
+                        model_renumber(&mut model.inputs, from, to);
                     }
-                };
-                let batch = files.iter().map(|(n, b)| (n.as_str(), b.as_slice()));
-                let unique: BTreeSet<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
-                let result = store.save_characters_neighborhood_and_save_inputs_checked(
-                    name, instance, revision, batch, state, change,
-                );
-                if unique.len() != files.len() {
-                    if result.is_ok() {
-                        return fail(step, "a batch with a repeated file name committed".into());
+                    for (n, b) in files {
+                        model.characters.insert(n.clone(), b.clone());
                     }
-                    continue;
+                    model.commit((**state).clone(), version);
                 }
-                let version = result
-                    .map_err(|e| e.to_string())?
-                    .map_err(|e| format!("{e:?}"))?;
-                if version != (instance, revision + 1) {
-                    return fail(step, format!("committed {version:?}"));
-                }
-                change(&mut model.inputs);
-                for (n, b) in files {
-                    model.characters.insert(n.clone(), b.clone());
-                }
-                model.commit((**state).clone(), version);
-            }
-            StoreOp::UpdateInputs(id, inputs) => {
-                let model = &mut models[*id as usize];
-                let name = STORE_IDS[*id as usize];
-                let result = store.update_save_inputs(name, |stored| *stored = (**inputs).clone());
-                match (&model.record, result) {
-                    (Some(_), Ok(())) => model.inputs = (**inputs).clone(),
-                    (None, Err(_)) => {}
-                    (record, result) => {
-                        return fail(step, format!("record {} gave {result:?}", record.is_some()));
+                StoreOp::UpdateInputs(id, inputs) => {
+                    let model = &mut models[*id as usize];
+                    let name = STORE_IDS[*id as usize];
+                    let result =
+                        store.update_save_inputs(name, |stored| *stored = (**inputs).clone());
+                    match (&model.record, result) {
+                        (Some(_), Ok(())) => model.inputs = (**inputs).clone(),
+                        (None, Err(_)) => {}
+                        (record, result) => {
+                            return fail(
+                                step,
+                                format!("record {} gave {result:?}", record.is_some()),
+                            );
+                        }
                     }
                 }
-            }
-            StoreOp::CharacterFile(id, file, bytes) => {
-                let model = &mut models[*id as usize];
-                store
-                    .save_character_file(STORE_IDS[*id as usize], file, bytes)
-                    .map_err(|e| e.to_string())?;
-                model.characters.insert(file.clone(), bytes.clone());
-                model.bump();
-            }
-            StoreOp::BaseHouse(id, house, bytes) => {
-                let model = &mut models[*id as usize];
-                store
-                    .save_base_house(STORE_IDS[*id as usize], *house, bytes)
-                    .map_err(|e| e.to_string())?;
-                model.houses.insert(*house, bytes.clone());
-                model.bump();
-            }
-            StoreOp::Reopen => {
-                drop(store);
-                store = NeighborhoodStore::open(&file.0).map_err(|e| e.to_string())?;
+                StoreOp::CharacterFile(id, file, bytes) => {
+                    let model = &mut models[*id as usize];
+                    store
+                        .save_character_file(STORE_IDS[*id as usize], file, bytes)
+                        .map_err(|e| e.to_string())?;
+                    model.characters.insert(file.clone(), bytes.clone());
+                    model.bump();
+                }
+                StoreOp::BaseHouse(id, house, bytes) => {
+                    let model = &mut models[*id as usize];
+                    store
+                        .save_base_house(STORE_IDS[*id as usize], *house, bytes)
+                        .map_err(|e| e.to_string())?;
+                    model.houses.insert(*house, bytes.clone());
+                    model.bump();
+                }
+                StoreOp::Reopen => {
+                    drop(store);
+                    store = NeighborhoodStore::open(&file.0).map_err(|e| e.to_string())?;
+                }
             }
         }
         for (id, model) in models.iter().enumerate() {
@@ -1013,18 +1093,14 @@ fn compare(store: &NeighborhoodStore, name: &str, model: &Model) -> Result<(), S
             .save_neighborhood_iff(name, &directory.0)
             .map_err(|e| e.to_string())
             .and_then(|path| std::fs::read(path).map_err(|e| e.to_string()));
+        // Every generated record can be saved, so a failure on either side
+        // is one.
         let expected = record
             .neighborhood_iff(&model.inputs)
-            .map_err(|e| e.to_string());
-        match (saved, expected) {
-            (Ok(a), Ok(b)) if a != b => return Err(format!("{name}: Neighborhood.iff differs")),
-            (Ok(_), Err(e)) => {
-                return Err(format!(
-                    "{name}: the store saved what the model cannot: {e}"
-                ));
-            }
-            (Err(e), Ok(_)) => return Err(format!("{name}: the store failed to save: {e}")),
-            _ => {}
+            .map_err(|e| format!("{name}: the model's record cannot be saved: {e}"))?;
+        let saved = saved.map_err(|e| format!("{name}: the store failed to save: {e}"))?;
+        if saved != expected {
+            return Err(format!("{name}: Neighborhood.iff differs"));
         }
     }
     Ok(())

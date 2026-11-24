@@ -77,7 +77,8 @@ The import hands the `.FAM` file to the family (+0x140, 0x4291e6). When the neig
 - `SaveInputs::move_in_family(family, history)` sets or clears the FAMh. It also drops the name and stray name byte read for the ID, because they belonged to whoever had the ID before. FAMs is then written from the stored name.
 - `SaveInputs::renumber_family(from, to)` moves all three entries, as a family renumbered in memory keeps its file and record (0x42c1ad renumbers family 4000). `to`'s own entries are replaced.
 - `NeighborhoodStore::save_characters_neighborhood_and_save_inputs_checked` applies the change in the same transaction as the record. The change runs before the store forgets the save inputs of families the commit drops.
-- The Patch import calls `Opened::update_save_inputs` to apply both.
+- `Opened::update_save_inputs` (the Patch import's result) applies both to a `SaveInputs`, in scan order.
+- **Not wired yet.** Neither import path in `sims-vm` passes the file's FAMh yet, so an imported family still saves without it. Those are the `.FAM` Import button (`caf.rs` `import_family_fam`, which commits through `persist_household_atomic`) and the Patch open (`neighborhood_open.rs`, after `open`). Wiring them belongs to the `sims-vm` track, which this change does not touch: commit through `save_characters_neighborhood_and_save_inputs_checked` with `move_in_family(family_id, parsed.history)`, and apply `Opened::update_save_inputs` where the opened neighborhood's inputs are saved.
 
 ## Decision 5: the exploration fuzzer's design, ported for the state layer
 
@@ -103,7 +104,8 @@ It runs on `sims-sim` state alone, because `sims-sim` cannot depend on `sims-vm`
   - character and house writes bump the revision;
   - stale and repeated-name commits change nothing.
 
-  After every operation, the record, the inputs, the files and the saved `Neighborhood.iff` must match the model.
+  The model keeps each family's three save-input entries by hand rather than through the `SaveInputs` methods the store runs. After every operation, rejected ones included, the record, the inputs, the files and the saved `Neighborhood.iff` must match the model. Every generated record must save successfully.
+- **Write-through.** After each branch runs, the run it came from must still encode as it did when it forked. A write the parent's next command would repeat cannot hide this way.
 
 The tests take about 5 s in release. Deliberately breaking the model (not forgetting dropped families) or the restore (decoding without the refreshes) makes them fail, with a shrunk list.
 
@@ -120,7 +122,7 @@ The catalog short-read tests and the text-avatar rejection tests were re-express
 ## Consequences
 
 - `sims-content` gains an additive public API (`BuyCatalog`, `BuyDefinition`, `BuyEligibility`, `BuyEntry`, `BuyLabels`, `CatalogText`, `has_interactions`, `master_of`). No existing signature changes.
-- `sims-sim` gains `SaveInputs::move_in_family` and `renumber_family`, the `SaveInputsChange` alias, the checked commit with a save-inputs change, and `Opened::update_save_inputs`.
+- `sims-sim` gains `SaveInputs::move_in_family` and `renumber_family`, the `SaveInputsChange` alias, the checked commit with a save-inputs change, and `Opened::update_save_inputs`. Until `sims-vm` calls them (Decision 4), saves are unchanged.
 - CI gains a deterministic fuzzer for snapshots and the neighborhood store. A failure prints its seed and a shrunk command list.
 - The audit marks `sims-content` items 1–3 and the `sims-formats` items as done, and `sims-runtime` item 1 as partly ported.
 

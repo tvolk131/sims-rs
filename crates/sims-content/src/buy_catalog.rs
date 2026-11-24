@@ -455,9 +455,12 @@ impl BuyLabels {
     }
 
     /// STR# 150's string for catalog row `catalog` (0–6) and `column`
-    /// (0–7).
+    /// (0–7). Empty outside those ranges.
     pub fn root(&self, catalog: usize, column: usize) -> &[u8] {
-        &self.roots[catalog][column]
+        self.roots
+            .get(catalog)
+            .and_then(|row| row.get(column))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// The text of category button `column` (0–7) in catalog `catalog`
@@ -471,20 +474,27 @@ impl BuyLabels {
     ///   for buttons 0 to 3, and STR# 210's strings 4, 5, 2 and 3 for
     ///   buttons 4 to 7; every other catalog reads STR# 150 row 1.
     ///
-    /// Whether a button is shown is [`BuyLabels::shown`].
+    /// Whether a button is shown is [`BuyLabels::shown`]. A catalog, row
+    /// or column outside those ranges has no button, and an empty label.
     pub fn label(&self, catalog: usize, subcatalog: i32, row: usize, column: usize) -> &[u8] {
+        if catalog > 6 || column > 7 {
+            return &[];
+        }
         if subcatalog != 0 {
             return match (catalog, column) {
-                (1, 0..=3) => &self.functions[row][column],
+                (1, 0..=3) => self
+                    .functions
+                    .get(row)
+                    .map_or(&[], |functions| functions[column].as_slice()),
                 (1, _) => &self.special[[2, 3, 0, 1][column - 4]],
-                _ => &self.roots[1][column],
+                _ => self.root(1, column),
             };
         }
         match (catalog, column) {
-            (6, 2) => &self.roots[5][4],
-            (6, 3) => &self.roots[4][2],
-            (5 | 6, _) => &self.roots[5][column],
-            _ => &self.roots[catalog][column],
+            (6, 2) => self.root(5, 4),
+            (6, 3) => self.root(4, 2),
+            (5 | 6, _) => self.root(5, column),
+            _ => self.root(catalog, column),
         }
     }
 
@@ -492,8 +502,11 @@ impl BuyLabels {
     /// catalogs 2 to 6 hide buttons 4 to 6 in subcatalog 0
     /// (0x506944–0x506959 and the like, to 0x506ca1). Catalog 1's buttons
     /// 4 to 7 in a subcatalog have further conditions that are not ported.
+    /// A catalog or column outside 0–6 and 0–7 has no button.
     pub fn shown(catalog: usize, subcatalog: i32, column: usize) -> bool {
-        !(subcatalog == 0 && (2..=6).contains(&catalog) && (4..=6).contains(&column))
+        catalog <= 6
+            && column <= 7
+            && !(subcatalog == 0 && (2..=6).contains(&catalog) && (4..=6).contains(&column))
     }
 }
 

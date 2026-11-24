@@ -330,6 +330,13 @@ fn labels_read_their_tables_slots() {
     assert!(BuyLabels::shown(3, 1, 5));
     assert!(!BuyLabels::shown(3, 0, 5));
     assert!(BuyLabels::shown(6, 0, 7));
+    // Past the last catalog, row or column there is no button.
+    assert!(!BuyLabels::shown(1, 1, 8));
+    assert!(!BuyLabels::shown(7, 0, 0));
+    assert_eq!(labels.label(1, 1, 0, 8), b"");
+    assert_eq!(labels.label(1, 1, 8, 0), b"");
+    assert_eq!(labels.label(7, 0, 0, 0), b"");
+    assert_eq!(labels.root(7, 0), b"");
 }
 
 #[test]
