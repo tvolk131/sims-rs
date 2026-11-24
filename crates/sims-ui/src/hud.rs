@@ -20,6 +20,7 @@ use crate::font::Font;
 use crate::frame::{Frame, Rect};
 use crate::house::{self, House};
 use crate::household::{Faces, InventoryEntry, JobPanel, PetKind, Relation, Snapshot, Work, money};
+use crate::needs_history;
 use crate::options::{self, OptionsState, OptionsTexts};
 use crate::thumbnail::Thumbnails;
 use sims_formats::bitmap::Image;
@@ -361,6 +362,11 @@ pub struct Controls {
     /// Options action button currently held down (`0x5e44dd..0x5e44e1`), drawn
     /// in its pressed cell while the pointer remains over its rectangle.
     pub pressed_options_action: Option<crate::command::OptionsAction>,
+    /// What each need bar's trend arrows show this frame, in the panel's
+    /// order ([`NEEDS`]), from the host's
+    /// [`crate::needs_history::NeedsTrend::draw`] (0x50c2fa); none while a
+    /// bar does not draw.
+    pub trends: [Option<needs_history::Arrows>; 8],
 }
 
 /// What the camera buttons show. The host's camera owns it.
@@ -410,6 +416,7 @@ impl Default for Controls {
             help: None,
             options: OptionsState::default(),
             pressed_options_action: None,
+            trends: [None; 8],
         }
     }
 }
@@ -610,6 +617,8 @@ pub enum Kind {
     },
     /// A motive meter.
     Meter(f32),
+    /// A need bar's trend arrows, in `rect`, the need control (0x50c2fa).
+    Trend(needs_history::Arrows),
     /// Marker for the open Needs (`[esi + 0x100]`) or Pet Needs (`[esi + 0x104]`)
     /// subpanel rect, used as the balloon owner (`0x519603`, `0x5197f3`).
     /// Draws nothing and takes no presses.
@@ -1346,6 +1355,15 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
                 kind: Kind::Meter(resident.motives[*motive]),
                 command: None,
             });
+            // The bar draws its arrows after its meter (0x50c2fa), at its
+            // anchors in the need control.
+            if let Some(arrows) = controls.trends[n] {
+                items.push(Item {
+                    rect: Rect::new(panel.x + 100 * column, panel.y + 21 + 19 * row, 100, 20),
+                    kind: Kind::Trend(arrows),
+                    command: None,
+                });
+            }
             // Clickable NeedMeter control (`0x513330`, `0x519a34..0x519a9e`:
             // 100x20 controls placed at 19px vertical stride from (0, 21)).
             items.push(Item {
@@ -2940,7 +2958,7 @@ fn draw_relation(
 /// The needs in the panel's order, left column first, with their motive
 /// numbers (`crates/sims-sim/src/motives.rs`). The order is the
 /// original's screen.
-const NEEDS: [(&str, usize); 8] = [
+pub const NEEDS: [(&str, usize); 8] = [
     ("Hunger", 7),
     ("Energy", 5),
     ("Comfort", 6),
@@ -3262,6 +3280,12 @@ pub fn draw_with_thumbnails(
             Kind::Balloon(b) => balloon::draw_with_thumbnails(frame, art, thumbnails, b),
             Kind::OptionsBalloon(b) => options::draw_balloon(frame, art, b),
             Kind::OptionsTooltip(tip) => options::draw_tooltip(frame, art, r, tip),
+            Kind::Trend(arrows) => {
+                for ([x, y], rgb) in arrows.pixels([r.x, r.y]) {
+                    let [_, red, green, blue] = rgb.to_be_bytes();
+                    frame.fill(Rect::new(x, y, 1, 1), [red, green, blue]);
+                }
+            }
             Kind::Meter(value) => {
                 let (width, left, right) = meter(*value);
                 frame.fill(r, right);
@@ -3315,6 +3339,7 @@ impl Item {
                     | Kind::Friends(_)
                     | Kind::Bars { .. }
                     | Kind::Meter(_)
+                    | Kind::Trend(_)
                     | Kind::Needs { .. }
                     | Kind::Name { .. }
                     | Kind::Personality { .. }

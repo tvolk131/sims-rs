@@ -33,6 +33,7 @@ use sims_ui::frame::{Frame, Rect};
 use sims_ui::house;
 use sims_ui::household::{Acquaintances, Careers, Faces, Fame, Snapshot};
 use sims_ui::hud::{self, Controls, Item, Selected};
+use sims_ui::needs_history::{NeedsTrend, PanelFrame};
 use sims_ui::options::{self, OptionsTexts};
 use sims_ui::pie;
 use sims_ui::queue::{Queue, QueueSlideState};
@@ -231,6 +232,11 @@ pub struct Hud {
     dialog_fade: DialogFadeState,
     /// Last presentation clock timestamp in microseconds (`0` for static/headless frames).
     last_clock_us: u64,
+    /// The live panel's need histories and trend arrows (`0x51ce79`,
+    /// `0x513b41`, `0x50c2fa`), run on the presentation clock.
+    needs_trend: NeedsTrend,
+    /// Whether the last frame drew the need bars (the Needs panel shown).
+    needs_trend_shown: bool,
     /// The clock controls' shared 500 ms blink timer (`0x53b4b0..0x53b7e7`):
     /// state 2 blinks Pause (row 0 <-> row 1) and state 3 blinks Ultra
     /// (`selected` false <-> true) during idle speed when return speed != Ultra.
@@ -685,6 +691,8 @@ impl Hud {
             last_balloon: None,
             dialog_fade: DialogFadeState::hidden(),
             last_clock_us: 0,
+            needs_trend: NeedsTrend::default(),
+            needs_trend_shown: false,
             clock_blink: ClockBlink::default(),
             idle_speed: false,
             buy_catalog: None,
@@ -1077,7 +1085,8 @@ impl Hud {
     }
 
     /// Whether any temporal UI animation (250 ms help-balloon fade, modal
-    /// dialog fade-in, or 500 ms action-queue icon slide) is actively in flight
+    /// dialog fade-in, 500 ms action-queue icon slide, or a shown need bar's
+    /// 500 ms trend-arrow fade) is actively in flight
     /// at `clock_us`. Always `false` when `clock_us == 0`.
     pub fn is_ui_animating(&self, clock_us: u64) -> bool {
         if clock_us == 0 {
@@ -1087,6 +1096,50 @@ impl Hud {
         self.balloon_fade.is_animating(now_ms)
             || self.dialog_fade.is_animating(now_ms)
             || self.queue_slide.is_animating(now_ms)
+            || (self.needs_trend_shown && self.needs_trend.animating(now_ms))
+    }
+
+    /// One frame of the live panel's need sampling and its bars' draw
+    /// (`0x4ce390` → `0x51ce79`, then `0x50c2fa`), at the presentation
+    /// clock: the arrows the layout shows go to `controls.trends`. Static
+    /// frames (`clock_us == 0`) neither sample nor show arrows.
+    fn step_needs_trend(&mut self, world: &World, household: &Snapshot, clock_us: u64) {
+        self.controls.trends = [None; 8];
+        self.needs_trend_shown = false;
+        if clock_us == 0 {
+            return;
+        }
+        let now = (clock_us / 1_000) as u32;
+        let members: Vec<[f32; 16]> = household.residents.iter().map(|r| r.motives).collect();
+        let shown = household.selected_resident();
+        let member =
+            shown.and_then(|s| household.residents.iter().position(|r| std::ptr::eq(r, s)));
+        let live = self.controls.mode == Mode::Live;
+        let open = self.controls.panel == Some(UiPanel::Needs);
+        self.needs_trend.update(&PanelFrame {
+            now,
+            speed: world.speed(),
+            live,
+            open,
+            members: &members,
+            selected: household.selected,
+            member,
+            motives: hud::NEEDS.map(|(_, motive)| motive),
+        });
+        // The bars draw only while the Needs panel shows (the layout's
+        // condition in `live_strip`).
+        if live && open && self.controls.expanded && shown.is_some() {
+            self.controls.trends = self.needs_trend.draw(now);
+            self.needs_trend_shown = true;
+        }
+    }
+
+    /// Whether the live panel's next need sample is due at `clock_us`, so
+    /// a frame should be drawn to take it.
+    pub fn needs_sample_due(&self, clock_us: u64) -> bool {
+        clock_us > 0
+            && self.controls.mode == Mode::Live
+            && self.needs_trend.due_in((clock_us / 1_000) as u32) == 0
     }
 
     /// Current Live help-balloon fade state (`BalloonFadeState`).
@@ -1850,6 +1903,12 @@ impl Hud {
         if let Some(us) = self.cheat_console.next_blink_us(clock_us) {
             consider(us);
         }
+        // The live panel samples the needs on its own clock, paused or not
+        // (`0x4ce390`).
+        if clock_us > 0 && self.controls.mode == Mode::Live {
+            let ms = u64::from(self.needs_trend.due_in((clock_us / 1_000) as u32));
+            consider((ms * 1_000).saturating_sub(clock_us % 1_000).max(1_000));
+        }
         best
     }
 
@@ -2167,6 +2226,7 @@ impl Hud {
                 self.play(WHOOSH);
             }
         }
+        self.step_needs_trend(world, &household, clock_us);
         if self.controls.expanded && residential && self.controls.panel == Some(UiPanel::House) {
             self.kinds.learn(world, assets.index(), assets.catalog());
         }

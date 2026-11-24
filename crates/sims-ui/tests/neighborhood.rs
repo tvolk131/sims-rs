@@ -6,8 +6,9 @@ use sims_ui::frame::{Frame, Rect};
 use sims_ui::neighborhood::{
     BAR_HEIGHT, BarButton, BarLayout, ExpansionFlags, LotInfo, LotKind, LotOccupant,
     LotPopupLayout, MAX_NEIGHBORHOOD, MIN_NEIGHBORHOOD, NeighborhoodChrome, NeighborhoodCommand,
-    NeighborhoodMode, NeighborhoodState, NeighborhoodStrings, art_id, format_lot_address,
-    format_lot_popup_text, format_simoleons, load_art,
+    NeighborhoodMode, NeighborhoodState, NeighborhoodStrings, TooltipOwner, art_id,
+    format_lot_address, format_lot_popup_text, format_simoleons, load_art, popup_alpha_shift,
+    tooltip_origin,
 };
 use std::path::PathBuf;
 
@@ -571,4 +572,42 @@ fn non_native_wide_tall_and_compact_chrome_alignment_and_round_buttons() {
         "compact button should keep 1:1 aspect ratio: width={}, painted_h={painted_h}",
         sel.draw_rect.width
     );
+}
+
+/// `0x5ddbda` (cWinLot slot 0xbc) hangs the card above the lot, at the cursor's
+/// x clamped into the lot's rect; `0x5da2b0` then pulls it back onto the screen.
+#[test]
+fn the_lot_card_hangs_from_its_lot_like_the_original_tooltip() {
+    let screen = [800, 600];
+    // The Goth lot at 800x600: no room above, so the card hangs below (B + 2),
+    // and the right screen edge pulls it back to W - w - 1.
+    let goth = TooltipOwner {
+        rect: Rect::new(586, 162, 144, 88),
+        cursor_x: 600,
+    };
+    assert_eq!(tooltip_origin(goth, [275, 180], screen), [524, 252]);
+    // Room above: y = T - h - 1, x at the cursor.
+    let owner = |cursor_x| TooltipOwner {
+        rect: Rect::new(100, 300, 50, 40),
+        cursor_x,
+    };
+    assert_eq!(tooltip_origin(owner(120), [100, 80], screen), [120, 219]);
+    // The cursor is clamped into [L, R - 1].
+    assert_eq!(tooltip_origin(owner(20), [100, 80], screen), [100, 219]);
+    assert_eq!(tooltip_origin(owner(400), [100, 80], screen), [149, 219]);
+    // Left and bottom screen edges.
+    let low = TooltipOwner {
+        rect: Rect::new(-40, 0, 30, 590),
+        cursor_x: -30,
+    };
+    assert_eq!(tooltip_origin(low, [100, 80], screen), [0, 519]);
+}
+
+/// `0x54f939`: level = ftol(fade * 255.0 + 0.5) - 0x145, clamped to -255..255.
+#[test]
+fn the_lot_card_blends_through_its_tiler_less_70() {
+    assert_eq!(popup_alpha_shift(1.0), -70);
+    assert_eq!(popup_alpha_shift(0.5), -197);
+    assert_eq!(popup_alpha_shift(0.0), -255);
+    assert_eq!(popup_alpha_shift(2.0), -70);
 }
