@@ -181,6 +181,13 @@ pub struct LiveOptions {
     /// memory, exits, tracked cells, and whether and how a path faults still are. Implies
     /// that frame residue is not observed.
     pub behavioral: bool,
+    /// Compare the last branch result on paths that fault (on by default, whatever
+    /// `observe_last_result` says). A fault keeps it: play-mode recovery rebuilds an
+    /// object's frame with the result its last primitive took (`visits.rs:280`), and
+    /// resets a person after copying it into the person's last-action flags
+    /// (`people.rs:1297`). Turning this off (`verify-equiv --ignore-fault-last-result`)
+    /// is an assumption that nothing reads it after a fault, which the CLI prints.
+    pub observe_fault_last_result: bool,
 }
 
 impl LiveOptions {
@@ -200,6 +207,7 @@ impl Default for LiveOptions {
             observe_frame_residue: true,
             observe_last_result: true,
             behavioral: false,
+            observe_fault_last_result: true,
         }
     }
 }
@@ -901,6 +909,9 @@ struct Explorer<'a> {
     entry_param: Option<(i16, bool)>,
     /// Bounds the entry assumes on parameters, `(index, lo, hi)` (a domain region).
     region: &'a [(usize, i16, i16)],
+    /// End every path right after its first primitive or call event
+    /// ([`decisive_difference`]).
+    stop_at_primitive: bool,
 }
 
 /// `(params, locals)` the VM gives a frame running `bhav` (`sims_vm::interpreter::dimensions`).
@@ -938,6 +949,7 @@ impl<'a> Explorer<'a> {
             entry,
             entry_param,
             region,
+            stop_at_primitive: false,
         }
     }
 
@@ -1093,7 +1105,11 @@ impl<'a> Explorer<'a> {
             }
             // An entry past the last node faults before any node runs; it is never
             // compared (`check_bhav_live_equivalent`).
-            at.unwrap_or_else(|| self.fault_point(state, u8::MAX, None, interner))
+            let mut at = at.unwrap_or_else(|| self.fault_point(state, u8::MAX, None, interner));
+            if !self.opts.observe_fault_last_result {
+                at.last_result = None;
+            }
+            at
         });
         // The behavioral relation does not observe node numbers: a jump to a missing
         // node is the same fault whatever its target and the tree's length.
@@ -1109,7 +1125,12 @@ impl<'a> Explorer<'a> {
                     state.unwritten.clone(),
                 )
             });
-        let last_result = (self.opts.observe_last_result || faults).then_some(state.last_result);
+        let observed = if faults {
+            self.opts.observe_fault_last_result
+        } else {
+            self.opts.observe_last_result
+        };
+        let last_result = observed.then_some(state.last_result);
         PathSummary {
             out: Outputs {
                 exit,
@@ -1827,6 +1848,10 @@ impl<'a> Explorer<'a> {
         if let Some(at) = state.at.as_mut() {
             at.event = Some(prefix);
         }
+        if self.stop_at_primitive {
+            // Only the history up to this event and the condition for reaching it matter.
+            return Ok(vec![self.finish(state, Exit::PrimitiveFault, interner)]);
+        }
 
         let mut out = Vec::new();
         // Any primitive or call may fault: Random with a zero range (`random.rs`), a
@@ -1898,7 +1923,7 @@ fn event_operands(opcode: u16, ops: [u8; 8]) -> [u8; 8] {
 
 /// Frame slots primitives write beyond their listed destinations (mirrors the lockstep
 /// checker's per-opcode frame updates).
-fn primitive_frame_writes(opcode: u16, ops: &[u8; 8]) -> Vec<(u8, i16)> {
+pub(super) fn primitive_frame_writes(opcode: u16, ops: &[u8; 8]) -> Vec<(u8, i16)> {
     match opcode {
         // Sleep / IdleForInput write their parameter back (`sleep.rs`, `idle.rs`).
         0 | 17 => vec![(9, word_i16(ops, 0))],
@@ -2396,6 +2421,31 @@ pub fn check_bhav_live_equivalent(
     ctx_b: &LiveContext,
     opts: &LiveOptions,
 ) -> EquivResult {
+    let result = check_as_written(a, ctx_a, b, ctx_b, opts);
+    // The behavioral relation does not observe frame storage, so locals that hold the
+    // same values under different slot numbers may be renamed first (`super::rename`).
+    // Only a proof counts: a renaming that does not prove the trees equivalent says
+    // nothing about them.
+    if !opts.behavioral || !matches!(result, EquivResult::Inconclusive { .. }) {
+        return result;
+    }
+    for (renamed_a, renamed_b) in super::rename::candidates(a, ctx_a, b, ctx_b) {
+        let renamed = check_as_written(&renamed_a, ctx_a, &renamed_b, ctx_b, opts);
+        if matches!(renamed, EquivResult::Equivalent { .. }) {
+            return renamed;
+        }
+    }
+    result
+}
+
+/// [`check_bhav_live_equivalent`] on the trees as they are, without renaming locals.
+fn check_as_written(
+    a: &BhavChunk,
+    ctx_a: &LiveContext,
+    b: &BhavChunk,
+    ctx_b: &LiveContext,
+    opts: &LiveOptions,
+) -> EquivResult {
     if let Some(reason) = super::context_mismatch(a, ctx_a, b, ctx_b) {
         return EquivResult::Inconclusive { reason };
     }
@@ -2427,12 +2477,13 @@ pub fn check_bhav_live_equivalent(
     //   wants more (`factory.rs:494`);
     // - Create New Object Instance (flag 0x02) writes into the new object's bottom frame:
     //   its first argument, else its first local, and fails when the frame has neither
-    //   (`create.rs:524`).
+    //   (`create.rs:537`). With an argument it never looks at the locals, so whether
+    //   there is a local matters only to a tree that takes no argument.
     // The frame-residue and fault checks observe both in strict mode only when the frame
     // is compared, so check them up front, on the counts the VM uses (the format caps
     // them and the local count is a byte), not the header's.
     let ((args_a, locals_a), (args_b, locals_b)) = (frame_dims(a), frame_dims(b));
-    if args_a != args_b || (locals_a == 0) != (locals_b == 0) {
+    if args_a != args_b || (args_a == 0 && (locals_a == 0) != (locals_b == 0)) {
         return EquivResult::Inconclusive {
             reason: format!(
                 "the trees' frames differ in shape ({args_a} arguments and {locals_a} locals \
@@ -2523,6 +2574,32 @@ pub fn check_bhav_live_equivalent(
                 |bhav: &BhavChunk, ctx: &LiveContext, entry: usize, interner: &mut Interner| {
                     Explorer::new(bhav, ctx, opts, entry, entry_param, region).explore(interner)
                 };
+            // Where the comparison cannot decide, a wrong operand on the first primitive
+            // both trees run is still a counterexample (`decisive_difference`).
+            let first_primitive = |interner: &mut Interner| {
+                // Only for a tree that runs as itself with a witness that says how it is
+                // entered. A frame's tree word with bit 15 set selects the dispatch hook
+                // and is looked up without it (`saved_objects.rs:29`), so tree 0x9000
+                // runs 0x1000's nodes. A kind-4 tree's entry picks its first node, which
+                // the witness's parameters do not pin down.
+                if a.id & sims_formats::saved_objects::Frame::TREE_FLAG != 0
+                    || entry_param.is_some()
+                {
+                    return None;
+                }
+                let mut xa = Explorer::new(a, ctx_a, opts, entry_a, entry_param, region);
+                let mut xb = Explorer::new(b, ctx_b, opts, entry_b, entry_param, region);
+                xa.stop_at_primitive = true;
+                xb.stop_at_primitive = true;
+                decisive_difference(
+                    &xa,
+                    &xb,
+                    interner,
+                    entry_param,
+                    frame_dims(a).0.max(frame_dims(b).0),
+                    &in_domain,
+                )
+            };
             let explored = explore(a, ctx_a, entry_a, &mut interner)
                 .map_err(|e| format!("A: {e}"))
                 .and_then(|pa| {
@@ -2561,6 +2638,9 @@ pub fn check_bhav_live_equivalent(
                             continue;
                         }
                         Err(why) => {
+                            if let Some((path, divergence)) = first_primitive(&mut interner) {
+                                return EquivResult::Counterexample { path, divergence };
+                            }
                             return EquivResult::Inconclusive {
                                 reason: format!("{reason}; cut-point bisimulation failed: {why}"),
                             };
@@ -2597,6 +2677,9 @@ pub fn check_bhav_live_equivalent(
                     return EquivResult::Counterexample { path, divergence };
                 }
                 PairVerdict::Undecided(reason) => {
+                    if let Some((path, divergence)) = first_primitive(&mut interner) {
+                        return EquivResult::Counterexample { path, divergence };
+                    }
                     undecided.get_or_insert(reason);
                 }
             }
@@ -2829,6 +2912,242 @@ fn witnesses(
         }
     }
     out
+}
+
+/// The value `v` takes under witness `w`, when `v` is a literal or an input.
+fn concrete(v: Val, w: &Witness, interner: &Interner) -> Option<i16> {
+    match v {
+        Val::Const(c) => Some(c),
+        Val::Sym(id) => match interner.key(id) {
+            SymKey::InitParam(i) => w.params.get(usize::from(*i)).copied(),
+            SymKey::InitLocal(word) => Some(w.frame_words.get(word).copied().unwrap_or(0)),
+            SymKey::Cell(0, Cell::Temp(i)) => Some(w.temps.get(i).copied().unwrap_or(0)),
+            SymKey::Cell(0, Cell::Attr(i)) => Some(w.attrs.get(i).copied().unwrap_or(0)),
+            _ => None,
+        },
+    }
+}
+
+/// Whether witness `w` satisfies every literal of `cond` that is not a primitive's or
+/// read's outcome. `None` when a literal is not over literals and inputs only.
+fn satisfies(cond: &[(Atom, bool)], w: &Witness, interner: &Interner) -> Option<bool> {
+    for &(atom, value) in cond {
+        let holds = match atom {
+            Atom::Outcome(_) => continue,
+            Atom::Lt(l, r) => concrete(l, w, interner)? < concrete(r, w, interner)?,
+            Atom::Eq(l, r) => concrete(l, w, interner)? == concrete(r, w, interner)?,
+            Atom::Flag(l, r) => {
+                let r = concrete(r, w, interner)?;
+                if !(0..=16).contains(&r) {
+                    return None;
+                }
+                i32::from(concrete(l, w, interner)?) & flag_bit(i32::from(r)) != 0
+            }
+        };
+        if holds != value {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// The routing slot Go To Routing Slot (opcode 45) names, as far as it decides the
+/// outcome (`go_to_slot.rs:333`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteSlot {
+    /// Slot `index` of the stack object's own definition (sources 0 and 1).
+    Own(i16),
+    /// The lot's global routing slot `number` (source 2).
+    Global(i16),
+    /// Any other source: native error 0x25 once the slot is looked up.
+    NoSlot,
+}
+
+impl std::fmt::Display for RouteSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Own(i) => write!(f, "the stack object's own slot {i}"),
+            Self::Global(n) => write!(f, "global routing slot {n}"),
+            Self::NoSlot => write!(f, "no slot (an invalid source, native error 0x25)"),
+        }
+    }
+}
+
+/// The slot a Go To Routing Slot event names under witness `w`: source 0 names it by
+/// the parameter `number`, whose value the event's frame snapshot holds.
+fn route_slot(event: &LiveEvent, w: &Witness, interner: &Interner) -> Option<RouteSlot> {
+    let EventKind::Primitive {
+        opcode: 45,
+        operands,
+        ..
+    } = &event.kind
+    else {
+        return None;
+    };
+    let number = word_i16(operands, 0);
+    Some(match u16::from_le_bytes([operands[2], operands[3]]) {
+        0 => {
+            let val = event.frame.iter().find_map(|f| match f {
+                FrameVal::Read(9, idx, Ok(val), _) if *idx == number => Some(*val),
+                _ => None,
+            })?;
+            RouteSlot::Own(concrete(val, w, interner)?)
+        }
+        1 => RouteSlot::Own(number),
+        2 => RouteSlot::Global(number),
+        _ => RouteSlot::NoSlot,
+    })
+}
+
+/// Why two Go To Routing Slot runs from the same state behave differently in some
+/// world, or `None` when the checker cannot tell. Both test the same things first (a
+/// person runs it, a stack object exists and stands on the lot), then look the slot up
+/// (`go_to_slot.rs:313`). A stack object's definition is part of the world, and its
+/// slots are an array: index `i` exists exactly when `0 <= i < len`. The lot's global
+/// slots are fixed game data the checker does not know.
+/// - Two different own slots, one of them at least 0: a definition with both, placed
+///   apart (or, when the other is negative, with the one) routes them differently.
+/// - An own slot at least 0 against a global slot or an invalid source: a definition
+///   with the own slot, when the global one is missing, or without it, when it exists,
+///   makes exactly one of them fail with native error 0x25.
+///
+/// Two global slots, or a global slot against an invalid source, depend on the fixed
+/// table, so they are not decisive.
+fn route_slots_differ(a: RouteSlot, b: RouteSlot) -> bool {
+    match (a, b) {
+        (RouteSlot::Own(x), RouteSlot::Own(y)) => x != y && x.max(y) >= 0,
+        (RouteSlot::Own(x), RouteSlot::Global(_) | RouteSlot::NoSlot)
+        | (RouteSlot::Global(_) | RouteSlot::NoSlot, RouteSlot::Own(x)) => x >= 0,
+        _ => false,
+    }
+}
+
+/// Whether a path reached its last event with no event before it, from the entry (not a
+/// cut), and with no condition on an event's outcome. Then the world (the running object,
+/// its stack object, the stack object's definition and position) is whatever the entry
+/// had, and the witness's literal bounds are all the path needs, so the world a decisive
+/// difference picks is one the trees can meet. Any earlier event could rule that world
+/// out: a write can set the stack object to an ID no object has (`stack_obj := -1`), and
+/// an opaque read may fault in every world (`global[-1]`, `memory.rs:103`), which
+/// [`satisfies`] cannot check because it skips outcome atoms.
+fn reached_without_events(parent: u32, cond: &[(Atom, bool)]) -> bool {
+    parent == 0
+        && !cond
+            .iter()
+            .any(|(atom, _)| matches!(atom, Atom::Outcome(_)))
+}
+
+/// A difference both trees definitely reach: their first primitive (or call), after the
+/// same history, from the same state, with operands that make the VM behave differently
+/// in some world. Used where the full comparison cannot decide (a loop the checker
+/// cannot close, a difference after a primitive), so a wrong operand on a primitive
+/// both trees run is still reported.
+///
+/// Every path ends at its first primitive event, and only paths with no event before it
+/// count ([`reached_without_events`]): nothing earlier might fail, never return the way
+/// the path needs, or pin the world. The paths' joint condition must hold for a concrete
+/// witness on its literal bounds. Only primitives whose operand
+/// semantics are modeled here count ([`route_slots_differ`]); the VM replay never runs
+/// primitives, so the counterexample says it is not replayed.
+fn decisive_difference(
+    xa: &Explorer,
+    xb: &Explorer,
+    interner: &mut Interner,
+    entry_param: Option<(i16, bool)>,
+    args: usize,
+    in_domain: &dyn Fn(&Witness) -> bool,
+) -> Option<(Vec<TraceStep>, String)> {
+    let (paths_a, _) = xa.explore(interner).ok()?;
+    let (paths_b, _) = xb.explore(interner).ok()?;
+    let last_event = |p: &PathSummary| match interner.prefix_nodes[p.out.prefix as usize] {
+        PrefixNode::Event(parent, ref event) => Some((parent, event.clone())),
+        _ => None,
+    };
+    for pa in &paths_a {
+        let Some((parent_a, ea)) = last_event(pa) else {
+            continue;
+        };
+        for pb in &paths_b {
+            let Some((parent_b, eb)) = last_event(pb) else {
+                continue;
+            };
+            if parent_a != parent_b || ea == eb {
+                continue;
+            }
+            let (
+                EventKind::Primitive {
+                    opcode: oa,
+                    operands: _,
+                    node: na,
+                    inline_args: ia,
+                    unknown_arity_suffix: ua,
+                    callee_arity: ca,
+                    argless: ga,
+                    caller_frame: fa,
+                },
+                EventKind::Primitive {
+                    opcode: ob,
+                    operands: _,
+                    node: nb,
+                    inline_args: ib,
+                    unknown_arity_suffix: ub,
+                    callee_arity: cb,
+                    argless: gb,
+                    caller_frame: fb,
+                },
+            ) = (&ea.kind, &eb.kind)
+            else {
+                continue;
+            };
+            // The same primitive at the same point from the same state; the frame
+            // snapshot is left out because it is what source 0 reads, which
+            // `route_slot` resolves.
+            if (oa, na, ia, ua, ca, ga, fa) != (ob, nb, ib, ub, cb, gb, fb)
+                || *oa != 45
+                || (ea.epoch, &ea.store, ea.scratch, ea.last_result)
+                    != (eb.epoch, &eb.store, eb.scratch, eb.last_result)
+            {
+                continue;
+            }
+            if !matches!(
+                feasibility(&[&pa.cond, &pb.cond], interner),
+                Feasibility::Sat { exact: true }
+            ) {
+                continue;
+            }
+            let mut cond = pa.cond.clone();
+            cond.extend_from_slice(&pb.cond);
+            if !reached_without_events(parent_a, &cond) {
+                continue;
+            }
+            for w in witnesses(&cond, interner, entry_param, args) {
+                if !in_domain(&w) || satisfies(&cond, &w, interner) != Some(true) {
+                    continue;
+                }
+                let (Some(sa), Some(sb)) =
+                    (route_slot(&ea, &w, interner), route_slot(&eb, &w, interner))
+                else {
+                    continue;
+                };
+                if !route_slots_differ(sa, sb) {
+                    continue;
+                }
+                return Some((
+                    trace_steps(pa, pb),
+                    format!(
+                        "both trees reach Go To Routing Slot as their first primitive, after the \
+                         same events and from the same state, but A routes to {sa} and B to {sb} \
+                         (A path {}, B path {}; witness: {w}). Not replayed in sims-vm, which \
+                         does not run primitives: a stack object whose definition has one slot \
+                         and not the other, or both placed apart, tells them apart",
+                        format_nodes(pa),
+                        format_nodes(pb),
+                    ),
+                ));
+            }
+        }
+    }
+    None
 }
 
 enum Difference {
