@@ -10876,15 +10876,26 @@ impl<'a> TreeLowerer<'a> {
                 .ok_or_else(|| Error::at(span, format!("job_data() requires '{key}'")))
         };
         let (career_arg, level_arg, field_arg) = (get("career")?, get("level")?, get("field")?);
-        let mut career = self.lower_job_operand("career", career_arg)?;
-        // The career is read when it is staged, after the level is lowered: a level that may
-        // write anything (a call, a nested `job_data`) gets a copy of the career first.
-        if !self.is_pure_single_operand(&level_arg.value) {
-            career = self.snapshot_operand(career, "job_career");
+        // Operands are evaluated in source order (named arguments may be reordered), as for a
+        // call. Each is read when it is staged, so one is copied first when an operand evaluated
+        // after it may write anything (a call, a nested `job_data`), or when it is the level and
+        // reads `temp[0]`, which the career's staging overwrites.
+        let level_first = args.iter().position(|a| std::ptr::eq(a, level_arg))
+            < args.iter().position(|a| std::ptr::eq(a, career_arg));
+        let (first, second) = if level_first {
+            (level_arg, career_arg)
+        } else {
+            (career_arg, level_arg)
+        };
+        let first_key = if level_first { "level" } else { "career" };
+        let second_key = if level_first { "career" } else { "level" };
+        let mut a = self.lower_job_operand(first_key, first)?;
+        if !self.is_pure_single_operand(&second.value) {
+            a = self.snapshot_operand(a, &format!("job_{first_key}"));
         }
-        let mut level = self.lower_job_operand("level", level_arg)?;
+        let b = self.lower_job_operand(second_key, second)?;
+        let (career, mut level) = if level_first { (b, a) } else { (a, b) };
         let field = self.eval_builtin_int(&field_arg.value, "job_data field", 0, 32767)?;
-        // `temp[0]` is written first: a level read from it is copied before that store.
         if level.contains("temp[0]") {
             level = self.snapshot_operand(level, "job_level");
         }
@@ -10903,7 +10914,13 @@ impl<'a> TreeLowerer<'a> {
                 format!("job_data {key} must be an i16"),
             ));
         }
-        Ok(air)
+        // A runtime (`extern bcon`) read faults on a missing chunk: as for a call argument, it is
+        // read now, so the fault cannot follow a partial staging of the temps.
+        Ok(if air.starts_with("bcon[") {
+            self.snapshot_operand(air, &format!("job_{key}"))
+        } else {
+            air
+        })
     }
 
     /// `air` copied into a fresh local, unless it is a literal (which nothing can change).
@@ -10928,8 +10945,9 @@ impl<'a> TreeLowerer<'a> {
         let mut target = self.lower_distance_handle("target", target_arg)?;
         // The target is read when `stack_obj` moves, after `from` is lowered: a `from` that may
         // write anything gets a copy of the target first.
-        if from_arg.is_some_and(|a| !self.is_pure_single_operand(&a.value)) && target != "stack_obj"
-        {
+        // That includes `stack_obj` itself, which a `from` that moves and restores the stack
+        // object (a nested `distance_to`) leaves pointing elsewhere.
+        if from_arg.is_some_and(|a| !self.is_pure_single_operand(&a.value)) {
             target = self.snapshot_operand(target, "dist_target");
         }
         let mut from = match from_arg {

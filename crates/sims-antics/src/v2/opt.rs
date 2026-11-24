@@ -38,7 +38,6 @@ pub(crate) fn optimize_tree_body(body: &str) -> String {
         unwrap_single_pass_loops(&mut nodes);
         drop_dead_local_stores(&mut nodes);
         forward_copies(&mut nodes);
-        drop_identity_stores(&mut nodes);
         merge_duplicate_tails(&mut nodes);
         coalesce_locals(&mut nodes);
         drop_unused_decls(&mut nodes);
@@ -47,6 +46,8 @@ pub(crate) fn optimize_tree_body(body: &str) -> String {
             break;
         }
     }
+    // Last, so no later pass rewrites the node an identity store was checked against.
+    drop_identity_stores(&mut nodes);
     if nodes == before {
         return body.to_owned();
     }
@@ -94,13 +95,29 @@ pub(crate) fn drop_unread_entry_save(body: &str) -> Option<String> {
     // pass cannot parse (a raw block with several statements on a line) is checked by its
     // lines: every local the lowering declares without a value (`let x;`) might be read first,
     // while `let x = e;` writes it where it comes into scope. Each statement of a line counts.
+    // A raw block may also spell a declaration `local x;`, which neither check models: any such
+    // statement keeps the save.
+    let statements = || {
+        body.lines()
+            .flat_map(|l| {
+                strip_strings(l)
+                    .split([';', '{', '}'])
+                    .map(|stmt| stmt.trim().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    if statements().iter().any(|stmt| {
+        stmt.strip_prefix("local")
+            .is_some_and(|r| r.starts_with(char::is_whitespace))
+    }) {
+        return None;
+    }
     let defined = match parse_body(body) {
         Some(nodes) => locals_defined_before_reads(&nodes),
-        None => !body.lines().any(|l| {
-            strip_strings(l)
-                .split([';', '{', '}'])
-                .any(|stmt| matches!(classify(stmt.trim()), Kind::Let { init: None, .. }))
-        }),
+        None => !statements()
+            .iter()
+            .any(|stmt| matches!(classify(stmt), Kind::Let { init: None, .. })),
     };
     if !defined {
         return None;
@@ -1477,9 +1494,15 @@ fn forward_copies(nodes: &mut Vec<Node>) {
 }
 
 /// Drops `temp[i] := temp[i];` for a temp the VM always has (0 to 7), which forwarding a staged
-/// argument copy leaves behind: the store changes nothing and cannot fault, and the next node
-/// does not read its result. Other cells stay: an out-of-range temp, a parameter past the frame's
-/// arguments, or a local holding half of a stale pointer faults on the read.
+/// argument copy leaves behind: the store changes no cell and cannot fault. Other cells stay: an
+/// out-of-range temp, a parameter past the frame's arguments, or a local holding half of a stale
+/// pointer faults on the read.
+///
+/// Every Expression node also sets the object's scratch pointer (`[object + 0x128]`), which a
+/// later Expression reading global 34 depends on (`sims-vm` `primitives/expression.rs`). So the
+/// store is only dropped when the next node is itself a call-free Expression that does not touch
+/// a global or raw scope: that node ignores the last result and leaves the scratch pointer
+/// exactly as the dropped store would have.
 fn drop_identity_stores(nodes: &mut Vec<Node>) {
     for_each_block(nodes, &mut |block| {
         for i in (0..block.len()).rev() {
@@ -1494,11 +1517,25 @@ fn drop_identity_stores(nodes: &mut Vec<Node>) {
                 .and_then(|r| r.strip_suffix(']'))
                 .and_then(|n| n.parse::<u8>().ok())
                 .is_some_and(|n| n < 8);
-            if lhs == rhs && in_range_temp && next_ignores_last_result(&block[i + 1..]) {
+            if lhs == rhs && in_range_temp && next_is_plain_expression(&block[i + 1..]) {
                 block.remove(i);
             }
         }
     });
+}
+
+/// The next node (skipping declarations) is an Expression assignment or initializer whose text
+/// names no call, raw scope, or global.
+fn next_is_plain_expression(rest: &[Node]) -> bool {
+    let Some(Node::Line(l)) = rest.iter().find(|n| !is_decl(n)) else {
+        return false;
+    };
+    let text = strip_strings(l);
+    matches!(
+        classify(l),
+        Kind::Assign { .. } | Kind::Let { init: Some(_), .. }
+    ) && !text.contains('(')
+        && !text.contains("global")
 }
 
 /// Drops `let x;` declarations of names nothing else mentions.

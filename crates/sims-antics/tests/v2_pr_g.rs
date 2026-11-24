@@ -639,3 +639,51 @@ fn review_raw_declarations_keep_the_entry_save() {
     assert!(air.contains("let dangling; temp[0] := dangling;"), "{air}");
     assert!(air.contains("let __self_obj = stack_obj;"), "{air}");
 }
+
+#[test]
+fn review_round2_source_order_scratch_pointer_and_raw_locals() {
+    // An identity store is an Expression node, which sets the object's scratch pointer that a
+    // later global 34 read depends on: before a global read it stays.
+    let air = expand(
+        "identity_g34.antics",
+        &sim_tree("temp[0] = temp[0]; temp[1] = global[34];"),
+    );
+    assert!(air.contains("temp[0] := temp[0];"), "{air}");
+
+    // Named `job_data` arguments are evaluated in source order: the level's nested lookup runs
+    // first, and the career reads the `temp[0]` it staged, with no copy taken before it.
+    let air = expand(
+        "job_named_order.antics",
+        &sim_tree(
+            "temp[0] = 6; self.n = job_data(level: job_data(1, 0, 0), career: temp[0], field: 0);",
+        ),
+    );
+    let body = &air[air.find("\"t\" {").expect("tree")..];
+    let inner = body.find("temp[0] := 1;").expect("inner career");
+    let lookup = body.find("scope(33, 0)").expect("inner lookup");
+    let outer = body.rfind("temp[1] := ").expect("outer level");
+    assert!(inner < lookup && lookup < outer, "{body}");
+    assert!(!body.contains("= temp[0];"), "{body}");
+
+    // A `from:` that moves and restores the stack object (a nested `distance_to`) leaves
+    // `stack_obj` elsewhere: a `stack_obj` target is copied before it runs.
+    let air = expand(
+        "dist_target_stack.antics",
+        &sim_tree(
+            "raw { stack_obj := my.id; } temp[7] = distance_to(stack_obj, from: if distance_to(sim) == 0 { sim } else { self.id });",
+        ),
+    );
+    let body = &air[air.find("\"t\" {").expect("tree")..];
+    let copy = body.find("= stack_obj;").expect("target copied");
+    let inner = body.find("get_distance_to(").expect("inner primitive");
+    assert!(copy < inner, "{body}");
+
+    // `local x;` declares a local in `.air` too: a raw one keeps the entry save.
+    let air = expand(
+        "raw_local_decl.antics",
+        &sim_tree(
+            "raw { local dangling; temp[0] := dangling; stack_obj := my.id; } self.n = sim.data[0];",
+        ),
+    );
+    assert!(air.contains("let __self_obj = stack_obj;"), "{air}");
+}
