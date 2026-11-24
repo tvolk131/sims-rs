@@ -90,9 +90,17 @@ pub(crate) fn drop_unread_entry_save(body: &str) -> Option<String> {
         return None;
     }
     // Every named local after the save moves down one frame word, which keeps whatever an
-    // earlier frame left there: none may be read before it is written.
-    let nodes = parse_body(body)?;
-    if !locals_defined_before_reads(&nodes) {
+    // earlier frame left there: none may be read before it is written. A body the structured
+    // pass cannot parse (a raw block with several statements on a line) is checked by its
+    // lines: every local the lowering declares without a value (`let x;`) might be read first,
+    // while `let x = e;` writes it where it comes into scope.
+    let defined = match parse_body(body) {
+        Some(nodes) => locals_defined_before_reads(&nodes),
+        None => !body
+            .lines()
+            .any(|l| matches!(classify(l.trim()), Kind::Let { init: None, .. })),
+    };
+    if !defined {
         return None;
     }
     let mut out = String::with_capacity(body.len());
@@ -1805,7 +1813,7 @@ fn rewrite(nodes: &mut Vec<Node>, rename: &BTreeMap<String, String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{drop_unread_entry_save, optimize_tree_body, pin_in_place};
+    use super::{drop_unread_entry_save, optimize_tree_body, parse_body, pin_in_place};
 
     #[test]
     fn dead_stores_unread_self_obj_and_coalescing() {
@@ -1944,6 +1952,19 @@ mod tests {
         // Not when a local read before it is written would move to another frame word.
         let body = "    let __self_obj = stack_obj;\n    let __v_x_0;\n    temp[0] := __v_x_0;\n    call 300(temps);\n    return true;\n";
         assert_eq!(drop_unread_entry_save(body), None);
+        // A raw line the structured pass cannot parse falls back to the declarations: written
+        // where they come into scope, the save goes; declared without a value, it stays.
+        let raw_line = "    if !call 281(0, 0) {\n    if push_interaction(menu: 2, object: 0, priority: 0, flags: 7) { return true; }\n    }\n";
+        let body = format!(
+            "    let __self_obj = stack_obj;\n    let __v_x_0 = 1;\n    local[0] := stack_obj;\n    stack_obj := my.id;\n{raw_line}    stack_obj := local[0];\n    temp[0] := __v_x_0;\n    return true;\n"
+        );
+        assert!(parse_body(&body).is_none());
+        assert_eq!(
+            drop_unread_entry_save(&body).as_deref(),
+            Some(&body["    let __self_obj = stack_obj;\n".len()..])
+        );
+        let body = body.replace("let __v_x_0 = 1;", "let __v_x_0;");
+        assert_eq!(drop_unread_entry_save(&body), None);
         // Scope 27 (sprite flags) reads the stack object, so the switch before it stays.
         let body = "    stack_obj := my.id;\n    temp[0] := 0;\n    scope(27, 0) := 1;\n    return true;\n";
         assert_eq!(optimize_tree_body(body), body);
