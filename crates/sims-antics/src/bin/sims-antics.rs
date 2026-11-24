@@ -31,8 +31,8 @@ use sims_antics::{
     structured_lift_header_check,
     v2::is_v2_source,
     verify::{
-        check_tree_with_callees, extract_bhav_from_iff, library_arities_from_iff,
-        single_file_problem,
+        check_tree_with_callees, extract_bhav_from_iff, library_argless_from_iff,
+        library_arities_from_iff, single_file_problem,
     },
     verify_object_safety, verify_pack_safety,
 };
@@ -2237,12 +2237,17 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
     // trees 256 to 4095, a semi-global file 8192 and up, with the argument counts the
     // VM's loader keeps. The files are trusted to be the libraries the game loads; two
     // that disagree on a tree cannot both be, so that is an error.
-    let mut library: std::collections::BTreeMap<u16, (Option<usize>, PathBuf)> =
+    //
+    // A tree is argument-free (its call reads no operand bytes) only if every file
+    // that supplies it says so, and its count is 0.
+    let mut library: std::collections::BTreeMap<u16, (Option<usize>, bool, PathBuf)> =
         std::collections::BTreeMap::new();
     for (extra, semi) in &with {
         let bytes = read(extra)?;
         let arities =
             library_arities_from_iff(&bytes).map_err(|e| format!("{}: {e}", extra.display()))?;
+        let argless = library_argless_from_iff(&bytes, *semi)
+            .map_err(|e| format!("{}: {e}", extra.display()))?;
         let in_range = |id: u16| {
             if *semi {
                 id >= 8192
@@ -2251,31 +2256,39 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
             }
         };
         for (id, argc) in arities.into_iter().filter(|&(id, _)| in_range(id)) {
-            if let Some((seen, from)) = library.get(&id)
-                && *seen != argc
-            {
-                let count = |n: &Option<usize>| {
-                    n.map_or_else(
-                        || "an unparseable tree".to_owned(),
-                        |n| format!("{n} arguments"),
+            let mut is_argless = argless.contains(&id);
+            if let Some((seen, seen_argless, from)) = library.get(&id) {
+                if *seen != argc {
+                    let count = |n: &Option<usize>| {
+                        n.map_or_else(
+                            || "an unparseable tree".to_owned(),
+                            |n| format!("{n} arguments"),
+                        )
+                    };
+                    return Err(format!(
+                        "library tree #{id} has {} in {} but {} in {}",
+                        count(seen),
+                        from.display(),
+                        count(&argc),
+                        extra.display()
                     )
-                };
-                return Err(format!(
-                    "library tree #{id} has {} in {} but {} in {}",
-                    count(seen),
-                    from.display(),
-                    count(&argc),
-                    extra.display()
-                )
-                .into());
+                    .into());
+                }
+                is_argless &= *seen_argless;
             }
-            library.insert(id, (argc, extra.clone()));
+            library.insert(id, (argc, is_argless, extra.clone()));
         }
     }
+    opts.extra_argless.extend(
+        library
+            .iter()
+            .filter(|(_, (argc, argless, _))| *argless && *argc == Some(0))
+            .map(|(&id, _)| id),
+    );
     opts.extra_arities.extend(
         library
             .into_iter()
-            .filter_map(|(id, (argc, _))| Some((id, argc?))),
+            .filter_map(|(id, (argc, _, _))| Some((id, argc?))),
     );
     let (a, b) = (read(&path_a)?, read(&path_b)?);
     let report = check_iff_equivalent(&a, &b, &opts).map_err(|e| e.to_string())?;
