@@ -44,7 +44,7 @@ knowledge.
 | sims-kernel | 5.5k | **removed** | 0 | [sims-kernel](#sims-kernel--removed) |
 | sims-tools | 0.9k | **removed** | 0 | [sims-tools](#sims-tools--removed) |
 | sims-fixtures | 6.8k | **removed** | 0 | [sims-fixtures](#sims-fixtures--removed) |
-| sims-formats (leftovers) | 2.1k | stays | 2 | [sims-formats](#sims-formats-leftovers--stays) |
+| sims-formats (leftovers) | 2.1k | **removed** | 0 | [sims-formats](#sims-formats-leftovers--removed) |
 | sims-runtime | 129k | stays | 2 | [sims-runtime](#sims-runtime--stays) |
 | sims-app | 88k | stays | 5 | [sims-app](#sims-app--stays) |
 | sims-content | 98k | stays | 13 | [sims-content](#sims-content--stays) |
@@ -64,9 +64,9 @@ the details, the legacy line ranges and the evidence. Several items overlap acro
 (noted in brackets). A crate can be removed once its items are ported, or dropped with a
 cited reason.
 
-**sims-formats**
-1. Parity for an empty SKN texture line. Legacy evidence says the original reader skips empty lines, which would make three EP7 meshes fail to load, but `crates/sims-formats/src/avatar/text.rs:214` accepts them. Settle it with the oracle.
-2. Re-express the catalog short-read tests and the synthetic text-avatar rejection tests.
+**sims-formats** (removed; both items done)
+1. ~~Parity for an empty SKN texture line.~~ Settled from the disassembly: the reader (0x59a629) skips empty lines, so an empty texture line fails. `crates/sims-formats/src/avatar/text.rs` now does the same ([ADR](decisions/20261124-buy-catalog-famh-move-in-fuzzer-and-skn.md)).
+2. ~~Re-express the catalog short-read tests and the synthetic text-avatar rejection tests.~~ They are in `crates/sims-formats/tests/avatar_codecs/{catalog,avatar}.rs`.
 
 **sims-runtime**
 1. Port the exploration fuzzer (`src/exploration.rs`) as the CI determinism and snapshot fuzzer. This was the salvage audit's PORT item, and nothing equivalent exists.
@@ -182,26 +182,27 @@ bit patterns in a round-trip storage test. No file outside `legacy/` cites the c
 
 The salvage audit marked its design as worth reading ("design only"). The README stays readable at the tag. The legacy `sims-runtime` (`fixture_replay`, `conformance`) and `sims-render` (dev-dependency) still name this crate; they are not built. The suite manifests in `legacy/fixtures/suites/` belong to the legacy `sims-runtime` conformance runner, so they stay with that crate.
 
-## sims-formats (leftovers) — stays
+## sims-formats (leftovers) — removed
 
-**Verdict: STAYS.** Only 2.1k lines remain here. The rest moved into `crates/sims-formats` during the
-re-founding. What remains is the PE32 reader, the native FAR mount reader and nine test files
-whose code they test now lives in `crates/sims-formats`. One real parity question is unresolved,
-so the crate stays.
+**Verdict: DELETE-SAFE (removed 2026-11-24).** The 2.1k lines left here were the PE32 reader,
+the native FAR mount reader and nine test files whose code now lives in `crates/sims-formats`.
+The last two items are done: the empty SKN texture line is settled and the reader aligned
+([ADR](decisions/20261124-buy-catalog-famh-move-in-fuzzer-and-skn.md)), and the two
+synthetic test suites are re-expressed. The files are byte-identical at `legacy-final`, so
+`legacy/crates/sims-formats/<path>` is read with
+`git show legacy-final:crates/sims-formats/<path>`.
 
 | Legacy module/area | Knowledge | Status | Evidence |
 | --- | --- | --- | --- |
 | `src/pe32.rs` (+`pe32/tests.rs`) | Bounded PE32/I386 reader for the executable's initial image (sections, imports) | deliberately dropped | salvage-audit (formats): "drop `far/mount.rs` and `pe32` (oracle tooling only)". No current crate reads Sims.exe bytes |
 | `src/far/mount.rs`, `tests/far_mount.rs` | Native incremental FAR mount (0x5b9dbc): magic and version are not validated; the signed count is read at the manifest offset; a name of 2048 bytes or more fails ("native mount buffer"); a name is cut at its first NUL. The native catalog manager registers the archive and publishes each member as it is read, so a short read leaves earlier members visible and the archive registered, and a retry takes the already-mounted branch (see legacy `sims-sim/src/pose/clothing/catalog_mount.rs:121`) | deliberately dropped | salvage-audit (formats), as above. `crates/sims-formats/src/far.rs:83` validates more strictly (32 KiB cap, embedded NUL rejected). `crates/sims-content/src/index.rs` parses a whole directory before registering any member, so partial mounting is not reproduced. `crates/sims-formats/src/far.rs:83` parses names up to 32 KiB, and the content index then skips members whose names exceed 1,024 bytes (`crates/sims-content/src/index.rs:1108`), so the native 2,047-byte limit is never what decides. All of these differences only show on malformed archives. They are recorded here as a deliberate drop |
 | `tests/resource_map.rs` `map_ordinal_order_overrides_file_and_numeric_id_order` | `rsmp` order decides resource order over file and ID order | ported | `crates/sims-formats/tests/boundaries.rs` `a_resource_map_decides_lookup_as_well_as_order`, `a_resource_map_can_choose_the_earlier_chunk`, `only_version_2_5_headers_name_a_resource_map` |
-| `tests/catalog.rs` (2 public tests) | Binary avatar catalog: a native short read on a count returns "none" and keeps earlier successes; the next count read then errors; three groups decode and leave a tail unread | ported in code, **tests to re-express** | Behavior is in `crates/sims-formats/src/avatar/catalog.rs:60-62` (doc: "None represents the native count reader's short-read failure"). No current test pins it |
-| `tests/skn_texture_names.rs` | **The original's SKN name reader skips empty lines.** With an empty texture line, the bone count (`1`) is taken as the texture and parsing then fails ("invalid avatar integer"). The native token sequence comes from a private-fixture capture. The legacy Rust reader, which follows it, fails on three EP7 meshes (`xskin-funhousecart-ROOT-CART.skn` at offset 0x27, and `xskin-magic-wizeyelashes-R_HAND-WAX_JAR01/08.skn` at 0x36). What the original game does with these meshes is still an open oracle question | **still to mine** | `crates/sims-formats/src/avatar/text.rs:214-216` deliberately *accepts* an empty texture line ("EP7's untextured fun-house cart skins"), and `tests/avatar_codecs/avatar.rs` `skn_texture_line_may_be_empty` pins that. This disagrees with the legacy reader. Settle the original's behavior with the oracle, then align the reader or its note |
-| `tests/text_avatar.rs` `text_avatar_rejects_invalid_or_unrepresented_data` | CMX `version 301`, nonzero trailing counts, NUL in names and trailing bytes are rejected; SKN out-of-range indices, NaN, oversize blends (32769), huge counts and incomplete lines are rejected | ported in code, **tests to re-express** | `crates/sims-formats/src/avatar/text.rs` enforces these bounds. The legacy test was gated on a private fixture, but its rejection cases are synthetic |
+| `tests/catalog.rs` (2 public tests) | Binary avatar catalog: a native short read on a count returns "none" and keeps earlier successes; the next count read then errors; three groups decode and leave a tail unread | ported | Behavior is in `crates/sims-formats/src/avatar/catalog.rs:60-62`. Tests: `crates/sims-formats/tests/avatar_codecs/catalog.rs` `catalog_keeps_what_it_read_before_a_later_short_read`, `a_mixed_catalog_decodes_all_three_groups_and_leaves_the_tail_unread`. Its private-fixture motion test is not minable |
+| `tests/skn_texture_names.rs` | **The original's SKN name reader skips empty lines.** With an empty texture line, the bone count (`1`) is taken as the texture and parsing then fails ("invalid avatar integer"). The legacy Rust reader, which follows it, fails on three EP7 accessory meshes | ported | Settled from the disassembly: 0x59a629 reads the name, texture and bone names with one getline loop (0x59a644, 0x59a6a9, 0x59a733) that skips empty lines (0x59a676, 0x59a6db, 0x59a769), and a failed read returns the failed stream (0x59a921). `crates/sims-formats/src/avatar/text.rs` `read_skn` now does the same. Tests: `skn_skips_empty_name_lines_so_an_empty_texture_line_fails` and, with `SIMS_INSTALL`, `installed_skns_fail_only_for_an_empty_texture_line` (3,165 SKNs, exactly 3 fail, all with an empty texture line) |
+| `tests/text_avatar.rs` `text_avatar_rejects_invalid_or_unrepresented_data` | CMX `version 301`, nonzero trailing counts, NUL in names and trailing bytes are rejected; SKN out-of-range indices, NaN, oversize blends (32769), huge counts and incomplete lines are rejected | ported | `crates/sims-formats/src/avatar/text.rs` enforces these bounds. Test: `crates/sims-formats/tests/avatar_codecs/avatar.rs` `text_avatars_reject_invalid_or_unrepresented_data`, on a synthetic SKN in place of the private fixture's. Its native-record comparisons are not minable |
 | `tests/{career,neighborhood,surface_map,legacy_rle,resource_map(native),catalog(native motion),text_avatar(native)}.rs` | Native-reader parity on private captures | not minable (fixture JSON absent) | The `tests/fixtures/*.json` files were never public. The parsers are in `crates/sims-formats/src/{career,neighborhood,lot,legacy_sprite,iff,avatar}.rs` |
 
-**Still to mine (sims-formats):**
-1. SKN empty-texture-line parity (`legacy/crates/sims-formats/tests/skn_texture_names.rs`) → `crates/sims-formats/src/avatar/text.rs`. Settle it with the oracle (load an EP7 fun-house cart accessory), then align either the reader or the legacy note.
-2. Re-express the two catalog short-read tests and the synthetic text-avatar rejection cases as `crates/sims-formats` tests.
+Nothing is left to mine. Legacy crates that name `sims-formats` in their `Cargo.toml` mean the workspace crate, not this one, and they are not built.
 
 ## sims-runtime — stays
 

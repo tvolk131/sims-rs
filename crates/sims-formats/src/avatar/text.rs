@@ -210,10 +210,15 @@ fn read_appearance(r: &mut Text<'_>) -> Result<Appearance> {
 
 pub fn read_skn(data: &[u8]) -> Result<Mesh> {
     let mut r = Text::new(data)?;
+    // 59a629 reads the name, the texture and each bone name with the same
+    // line loop (59a644, 59a6a9, 59a733: getline of up to 0x400 bytes),
+    // which skips empty lines (59a676, 59a6db, 59a769). So an empty
+    // texture line is skipped and the next line, the bone count, is taken
+    // as the texture; the count is then read from the first bone name and
+    // the read fails, as the original's stream does (59a921). Three EP7
+    // accessory meshes have an empty texture line and fail this way.
     let name = r.name(1024)?;
-    // The texture line directly follows the name and may be empty: EP7's
-    // untextured fun-house cart skins leave it blank.
-    let texture = crate::strings::decode(r.line(1024)?, 1);
+    let texture = r.name(1024)?;
     let mut bones = Vec::new();
     for _ in 0..r.count(256)? {
         let bone = r.name(1024)?;
