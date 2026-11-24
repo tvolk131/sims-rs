@@ -2750,10 +2750,21 @@ fn resolve_tree_sigs(
 fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTree) -> Result<()> {
     let d = &t.decl;
     let sig = &env.trees[&d.ident];
-    let must_return = matches!(
-        d.ret,
-        ReturnAbi::Bool | ReturnAbi::Value { .. } | ReturnAbi::ResultValue { .. }
-    );
+    let frame = d.frame.unwrap_or_default();
+    if frame.empty && !d.body.is_empty() {
+        return Err(Error::at(
+            frame.span,
+            format!(
+                "@frame(empty) tree '{}' has no nodes, so its body must be '{{}}'",
+                d.ident
+            ),
+        ));
+    }
+    let must_return = !frame.empty
+        && matches!(
+            d.ret,
+            ReturnAbi::Bool | ReturnAbi::Value { .. } | ReturnAbi::ResultValue { .. }
+        );
     if must_return && !stmts_always_return(&d.body, env, &t.owner_module, true) {
         return Err(Error::at(
             d.span,
@@ -2828,13 +2839,12 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
         }
     }
     ctx.lower_stmts(&d.body)?;
-    if !stmts_always_return(&d.body, env, &t.owner_module, true) {
+    if !frame.empty && !stmts_always_return(&d.body, env, &t.owner_module, true) {
         ctx.emit_all_cleanups()?;
         ctx.line("return true;".to_owned());
     }
     let label = escape_str(&d.label);
     let mut header: Vec<String> = Vec::new();
-    let frame = d.frame.unwrap_or_default();
     match frame.args {
         Some(args) if usize::from(args) < positional => {
             return Err(Error::at(
@@ -2891,7 +2901,12 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
             ),
         ));
     }
-    let body = ctx.finish();
+    // A 0-node tree keeps no entry code either (temp-bound parameter snapshots).
+    let body = if frame.empty {
+        String::new()
+    } else {
+        ctx.finish()
+    };
     if let (Some((espan, slot)), Some(locals)) = (event_local, frame.locals) {
         // `.air` grows the frame to fit the named locals (after an explicit `local[0]` pin).
         let used = count_frame_locals(&body);

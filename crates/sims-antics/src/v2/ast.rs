@@ -159,6 +159,9 @@ pub struct TreeFrame {
     pub revision: Option<u32>,
     /// The header's kind byte (`.air` `kind:`).
     pub kind: Option<u8>,
+    /// `@frame(empty)`: a 0-node BHAV (the body must be `{}`). Entering one faults, as the
+    /// original's do; a plain `{}` body is `return true;`.
+    pub empty: bool,
 }
 
 /// Zero-cost integer enum declaration (`[pub] enum Name { VariantA, VariantB = 2 }`).

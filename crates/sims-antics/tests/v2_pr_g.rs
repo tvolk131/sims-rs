@@ -205,3 +205,51 @@ fn n2_entry_save_only_when_the_entry_stack_object_is_read_after_a_move() {
     );
     assert!(air.contains("let __self_obj = stack_obj;"), "{air}");
 }
+
+#[test]
+fn empty_frame_tree_has_zero_nodes_and_plain_braces_still_return_true() {
+    let cfg = PackResolverConfig::default();
+    let src = obj(
+        "    @id(4200) @frame(empty) tree unused \"Unused\" (sim: Sim, a: i16) {}\n    \
+         @id(4201) tree plain \"Plain\" {}\n    \
+         @id(4202) @frame(args: 2, empty, locals: 1) tree pinned \"Pinned\" {}",
+    );
+    let air = expand("empty.antics", &src);
+    assert!(air.contains("tree 4200 \"Unused\" (args: 1) {\n}"), "{air}");
+    assert!(
+        air.contains("tree 4201 \"Plain\" {\n    return true;\n}"),
+        "{air}"
+    );
+    assert!(
+        air.contains("tree 4202 \"Pinned\" (args: 2, locals: 1) {\n}"),
+        "{air}"
+    );
+    let compiled = compile_v2_source("empty.antics", &src, &cfg).expect("compile");
+    let nodes = |id: u16| {
+        compiled
+            .behaviors
+            .get(&id)
+            .unwrap_or_else(|| panic!("no BHAV {id}"))
+            .instructions
+            .len()
+    };
+    assert_eq!(nodes(4200), 0);
+    assert_eq!(nodes(4201), 1);
+    assert_eq!(nodes(4202), 0);
+
+    expect_err(
+        "empty_body.antics",
+        &obj("    @frame(empty) tree t { self.n = 1; }"),
+        "@frame(empty) tree 't' has no nodes, so its body must be '{}'",
+    );
+    expect_err(
+        "empty_dup.antics",
+        &obj("    @frame(empty, empty) tree t {}"),
+        "duplicate @frame field 'empty'",
+    );
+    // A return value is not required of a tree that has no nodes.
+    expand(
+        "empty_ret.antics",
+        &obj("    @frame(empty) tree t -> bool {}"),
+    );
+}

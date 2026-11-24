@@ -964,7 +964,17 @@ impl Parser {
         };
         while !self.eat(&TokenKind::RParen) {
             let (key, kspan) =
-                self.expect_ident("'args', 'locals', 'format', 'revision', or 'kind'")?;
+                self.expect_ident("'args', 'locals', 'format', 'revision', 'kind', or 'empty'")?;
+            if key == "empty" && self.peek().kind != TokenKind::Colon {
+                if std::mem::replace(&mut frame.empty, true) {
+                    return Err(Error::at(kspan, "duplicate @frame field 'empty'"));
+                }
+                if !self.eat(&TokenKind::Comma) {
+                    self.expect(&TokenKind::RParen, "')'")?;
+                    break;
+                }
+                continue;
+            }
             self.expect(&TokenKind::Colon, "':'")?;
             let dup = match key.as_str() {
                 "args" => frame
@@ -995,7 +1005,7 @@ impl Parser {
                     return Err(Error::at(
                         kspan,
                         format!(
-                            "unknown @frame field '{other}' (expected args, locals, format, revision, or kind)"
+                            "unknown @frame field '{other}' (expected args, locals, format, revision, kind, or empty)"
                         ),
                     ));
                 }
