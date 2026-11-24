@@ -84,6 +84,32 @@ fn catalog(tree: &Tree, neighborhood: &Neighborhood) -> (Index, Catalog) {
     (index, catalog)
 }
 
+/// Family 0 has no member list (0x4105e7): after its fixed fields come
+/// the secondary house and the version 9 words. Read with a member list,
+/// a secondary house of 5 would ask for five members the chunk lacks.
+#[test]
+fn family_zero_is_read_without_a_member_list() {
+    let mut zero = saved(b"IMAF", 9);
+    for value in [0i32, 3, 1000, 0, 0] {
+        zero.extend(value.to_le_bytes());
+    }
+    zero.extend(0u32.to_le_bytes()); // flags
+    zero.extend(5i32.to_le_bytes()); // secondary house
+    zero.extend([1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]); // magic words
+    let tree = Tree::new("family-zero");
+    tree.file(
+        "Hood/Neighborhood.iff",
+        &iff(&[(b"FAMI", 0, &zero), (b"FAMI", 1, &family(2, 1, &[0x2222]))]),
+    );
+    let neighborhood = Neighborhood::open(&tree.0.join("Hood")).unwrap();
+    let family = &neighborhood.families[&0];
+    assert!(family.members.is_empty());
+    assert_eq!(family.secondary_house(), 5);
+    assert_eq!(family.tail.len(), 16);
+    assert_eq!(family.to_chunk(0).unwrap(), zero);
+    assert_eq!(neighborhood.families[&1].members, [0x2222]);
+}
+
 #[test]
 fn reads_families_and_finds_houses() {
     let tree = Tree::new("neighborhood");

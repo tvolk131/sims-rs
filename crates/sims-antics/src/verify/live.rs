@@ -59,7 +59,9 @@
 //! bounds.
 
 use super::domains::ParamDomains;
+use super::rename::local_operands;
 use super::replay::{self, Witness};
+use super::text::{TableLocals, TextLocals};
 use super::{
     EquivResult, FrameUse, TraceStep, canonicalize_primitive_operands,
     collect_inline_call_arg_bytes, is_always_true_instruction, primitive_frame_uses, word_i16,
@@ -117,9 +119,72 @@ pub struct LiveContext {
     /// one, `Equivalent` holds only for runs that enter each constrained tree inside its
     /// domain. Ignored for kind-4 trees, whose first parameter is their entry node.
     pub param_domains: ParamDomains,
+    /// The locals the tree's own file's string tables may make `Dialog` and
+    /// `Add/Change Action String` read ([`TextLocals`]). Used for private trees
+    /// (`4096..=8191`), whose strings come from their own file (`dialog.rs`,
+    /// `string_table`). Without it those primitives may read any local.
+    pub text_locals: Option<TextLocals>,
+    /// Private trees (`4096..=8191`) of the tree's own file that are not indexed (kind 4)
+    /// and whose first node sets the last branch result before anything can read the
+    /// value the caller left ([`overwrites_last_result_first`]). Used only under
+    /// `LiveOptions::observe_fault_last_result == false`.
+    pub last_result_overwriters: Option<BTreeSet<u16>>,
+    /// For private trees (`4096..=8191`) of the tree's own file that are not indexed
+    /// (kind 4): the parameters the tree overwrites before anything can see what its
+    /// caller passed ([`params_written_first`]). A call from a private tree to one of
+    /// them, with its arguments in its operands (at most 4), compares only the other
+    /// arguments ([`FrameVal::CallArgs`]).
+    pub dead_args: Option<BTreeMap<u16, BTreeSet<usize>>>,
 }
 
 impl LiveContext {
+    /// Whether node `ins` sets the running object's last branch result before anything
+    /// can read the value it had, unless it faults ([`overwrites_last_result_first`],
+    /// [`LiveContext::last_result_overwriters`]).
+    /// A call names this file's tree only from a private tree (`tree`).
+    pub(crate) fn overwrites_last_result(&self, tree: u16, ins: &Instruction) -> bool {
+        if ins.opcode >= 256 {
+            (4096..=8191).contains(&tree)
+                && (4096..=8191).contains(&ins.opcode)
+                && self
+                    .last_result_overwriters
+                    .as_ref()
+                    .is_some_and(|set| set.contains(&ins.opcode))
+        } else {
+            overwrites_last_result_first(ins.opcode, &ins.operands)
+        }
+    }
+
+    /// The locals primitive `opcode` of private tree `tree` reads through its text, when
+    /// it formats text from a table [`LiveContext::text_locals`] knows every string of.
+    /// `None` when it may read any local, or formats no text.
+    pub(crate) fn text_reads(
+        &self,
+        tree: u16,
+        opcode: u16,
+        ops: &[u8; 8],
+    ) -> Option<BTreeSet<i16>> {
+        if !(4096..=8191).contains(&tree) {
+            return None;
+        }
+        match self.text_locals.as_ref()?.primitive(opcode, ops)? {
+            TableLocals::Known(slots) => Some(slots),
+            TableLocals::Unknown => None,
+        }
+    }
+
+    /// The arguments a call from private tree `tree` to `callee` passes that the callee
+    /// overwrites unseen ([`LiveContext::dead_args`]), when the call's arguments are its
+    /// operand words or temps (at most 4 of them, `interpreter.rs:1539`).
+    pub(crate) fn dead_args(&self, tree: u16, callee: u16) -> Option<&BTreeSet<usize>> {
+        if !(4096..=8191).contains(&tree) || !(4096..=8191).contains(&callee) {
+            return None;
+        }
+        let dead = self.dead_args.as_ref()?.get(&callee)?;
+        let arity = *self.callee_arities.as_ref()?.get(&callee)?;
+        (arity <= 4 && dead.iter().all(|&i| i < arity)).then_some(dead)
+    }
+
     /// Whether a call to tree `id` reads none of its operand bytes: `argless_callees`
     /// lists it and `callee_arities` agrees it takes no arguments. A context that lists
     /// a tree with no count, or with a count above 0, gets its operands compared.
@@ -137,6 +202,54 @@ impl LiveContext {
     }
 }
 
+/// Whether node `opcode` with `ops` sets the running object's last branch result before
+/// anything can read the value it had, unless it faults.
+///
+/// A node sets it only when its primitive returns a branch (`interpreter.rs:1479`,
+/// `:1493`); a yield or a fault leaves it (`interpreter.rs:1426`, `:1452`). Then the old
+/// value is read by a resumed primitive, by recovery (`tick.rs` `recover`,
+/// `people.rs:1297`, `visits.rs:280`), by a person letting go of an object
+/// (`forget.rs:142`), or by a tree some primitive runs on the running object's own
+/// stack and pops (`interpreter.rs:1246`). So a node qualifies when it never yields,
+/// runs no tree, and cannot make sims-vm run one on the running object:
+///
+/// - an `Expression` (`expression.rs`) that compares (operators 0, 1, 2, 8, 14, 15, 16),
+///   or writes a temporary, parameter or local (scopes 8, 9, 25). Another destination
+///   may be global 3, which in co-op mode selects a person (`memory.rs:846`), and
+///   moving the selection indicator runs PLACED on either person (`selection.rs:346`,
+///   `:413`, `placement.rs:1506`);
+/// - a primitive that returns a bool (`primitives.rs`, the `.into()` arms) and touches
+///   only data: Change Suit (6), Refresh (7), Own Events (10), Get Distance To (11),
+///   Breakpoint (15), Show String (21), Play Sound Event (23), Old Relationship (24),
+///   Alter Budget (25), Set Motive Change (29), Test Object Type (32), Find 5 Worst
+///   Motives (33), Test Sim Interacting With (37), Set Balloon/Headline (41), Stop All
+///   Sounds (48), Notify Out of Idle (49), Add/Change Action String (50), Manage
+///   Inventory (51);
+/// - Generic Sims Call (1) except routines 19 and 20, which make a person or object and
+///   run its Init (`generic.rs:758`, `:762`, `factory.rs:189`);
+/// - Random Number (8), Get Direction To (12), Relationship (26) and Set To Next (31),
+///   when their destination is a temporary, parameter or local (or, for Set To Next,
+///   the stack object), for the reason `Expression`'s must be.
+///
+/// Every other primitive may yield, run a tree, or run callbacks on the running object
+/// (Grab, Drop, Burn, Push Interaction, Find Best Object For, Find Location For, Create
+/// New Object Instance, Drop Onto, Snap To Slot), or build a temporary person (Make New
+/// Character, UI Effect).
+pub(crate) fn overwrites_last_result_first(opcode: u16, ops: &[u8; 8]) -> bool {
+    let plain = |scope: u16| matches!(scope, 8 | 9 | 25);
+    match opcode {
+        2 => matches!(ops[5], 0 | 1 | 2 | 8 | 14 | 15 | 16) || plain(u16::from(ops[6])),
+        1 => !matches!(u16::from_le_bytes([ops[0], ops[1]]), 19 | 20),
+        6 | 7 | 10 | 11 | 15 | 21 | 23 | 24 | 25 | 29 | 32 | 33 | 37 | 41 | 48 | 49 | 50 | 51 => {
+            true
+        }
+        8 | 12 => plain(u16::from_le_bytes([ops[2], ops[3]])),
+        26 => plain(u16::from(ops[4])),
+        31 => ops[4] & 0x80 == 0 || plain(u16::from(ops[5])),
+        _ => false,
+    }
+}
+
 impl Default for LiveContext {
     fn default() -> Self {
         Self {
@@ -144,7 +257,10 @@ impl Default for LiveContext {
             my_attribute_count: GUARANTEED_ATTRIBUTES,
             local_bcons: None,
             argless_callees: None,
+            dead_args: None,
             param_domains: ParamDomains::new(),
+            text_locals: None,
+            last_result_overwriters: None,
         }
     }
 }
@@ -188,6 +304,14 @@ pub struct LiveOptions {
     /// (`people.rs:1297`). Turning this off (`verify-equiv --ignore-fault-last-result`)
     /// is an assumption that nothing reads it after a fault, which the CLI prints.
     pub observe_fault_last_result: bool,
+    /// Compare the scratch-pointer state on paths that fault (on by default, whatever
+    /// `observe_scratch_pointer` says). A fault leaves it in the object's state
+    /// (`World::scratch_ptrs`, cleared only when the object goes away), where the
+    /// object's next `Expression` or `UI Effect` reading Global 34 observes it
+    /// (`expression.rs:34`, `ui_effect.rs:371`). Turning this off
+    /// (`verify-equiv --ignore-fault-scratch-pointer`) is an assumption that nothing
+    /// reads it after a fault, which the CLI prints.
+    pub observe_fault_scratch_pointer: bool,
 }
 
 impl LiveOptions {
@@ -208,6 +332,7 @@ impl Default for LiveOptions {
             observe_last_result: true,
             behavioral: false,
             observe_fault_last_result: true,
+            observe_fault_scratch_pointer: true,
         }
     }
 }
@@ -249,6 +374,11 @@ enum SymKey {
     StackObject(u32),
     /// A frame slot after event `prefix` that may have written it; it was `old` before.
     FrameMaybe(u32, u8, i16, Val),
+    /// The number Random Number event `prefix` drew and stored in its destination.
+    Drawn(u32),
+    /// The running object's data word `idx` after the event that ends at `prefix`
+    /// ([`MY_DATA_WORDS`]).
+    MyData(u32, i16),
     /// An arithmetic `Expression` operator applied to two values.
     Op(u8, Val, Val),
     /// Equivalence class `k` of the product state that cut `prefix` starts
@@ -270,6 +400,181 @@ enum Scratch {
     Inherited,
     /// `SCRATCH_PTR_SET | SCRATCH_PTR_EXPRESSION`, set by an `Expression`.
     Expression,
+    /// `SCRATCH_PTR_SET | SCRATCH_PTR_ARG_SLOT`, set by Random Number or Get Direction
+    /// To (`random.rs`, `direction.rs`).
+    ArgSlot,
+    /// `SCRATCH_PTR_SET_TO_NEXT`, set by Set To Next (`set_to_next.rs:117`).
+    SetToNext,
+}
+
+/// Reading the running object's data words `0..MY_DATA_WORDS` (scope 3) cannot fail
+/// and changes nothing, except the lockout word ([`MY_DATA_LOCKOUT`]), so it is not an
+/// event. `sims-vm` resolves scope 3 to `Cell::Data(me, index)` after checking
+/// `index < 72` and `index < data.len()` (`memory.rs:448`), and the running object
+/// always exists. Every object has at least 72 data words: the factory makes 72
+/// (`factory.rs:325`), a saved object is loaded with 72 (`saved_objects.rs:385`,
+/// `objects.rs:579`), co-op and placement make 128 (`coop.rs:3467`,
+/// `placement.rs:2864`); only test fixtures make fewer. Reading a `Cell::Data` is a
+/// plain array read (`memory.rs:742`).
+const MY_DATA_WORDS: i16 = 72;
+
+/// The data word whose resolution wakes the object (`memory.rs:22`, `LOCKOUT`, and
+/// `memory.rs:137`): reading it stays an event.
+const MY_DATA_LOCKOUT: i16 = 25;
+
+/// The parameters tree `bhav` overwrites before anything can see the value its caller
+/// passed ([`LiveContext::dead_args`]). Empty for an indexed (kind 4) tree, whose entry
+/// node comes from the call.
+///
+/// The VM enters any other tree at node 0 (`entry_node`). From there the tree runs a
+/// chain of `Expression` assignments (operator 5, which writes without using the old
+/// value and returns true, `expression.rs:75`), each to a temp or a parameter in range
+/// and from a literal, a temp or a parameter in range. None of those can fault
+/// (`memory.rs:472`, `memory.rs:752`, `memory.rs:969`). A parameter the chain assigns
+/// before it reads it is overwritten before any node can read it, fault with it in the
+/// frame, or return with it in frame storage. The chain ends at the first other node.
+///
+/// Under the behavioral relation (`behavioral`), which observes no frame at a fault and
+/// no frame storage, the chain may also read memory the frame does not address: the
+/// running or stack object's attributes or data words (scopes 0, 1, 3, 4), the stack
+/// object (scope 10, index 0), a tuning constant (26), or a global other than 34. Such
+/// a read may fault or be an event, but neither depends on a parameter's value, and a
+/// fault there leaves nothing the relation compares that does.
+#[must_use]
+pub fn params_written_first(bhav: &BhavChunk, behavioral: bool) -> BTreeSet<usize> {
+    let mut written = BTreeSet::new();
+    if bhav.kind == 4 {
+        return written;
+    }
+    let args = usize::from(bhav.args);
+    let param = |idx: i16| usize::try_from(idx).ok().filter(|&i| i < args);
+    let mut read = BTreeSet::new();
+    let mut pc = 0usize;
+    for _ in 0..bhav.instructions.len() {
+        let Some(ins) = bhav.instructions.get(pc) else {
+            break;
+        };
+        let ops = &ins.operands;
+        if ins.opcode != 2 || ops[5] != 5 {
+            break;
+        }
+        let (lhs_idx, rhs_idx, lhs_scope, rhs_scope) =
+            (word_i16(ops, 0), word_i16(ops, 2), ops[6], ops[7]);
+        match rhs_scope {
+            7 => {}
+            8 if (0..8).contains(&rhs_idx) => {}
+            0 | 1 | 3 | 4 | 26 if behavioral => {}
+            10 if behavioral && rhs_idx == 0 => {}
+            6 if behavioral && rhs_idx != 34 => {}
+            9 => match param(rhs_idx) {
+                Some(i) => {
+                    if !written.contains(&i) {
+                        read.insert(i);
+                    }
+                }
+                None => break,
+            },
+            _ => break,
+        }
+        match lhs_scope {
+            8 if (0..8).contains(&lhs_idx) => {}
+            9 => match param(lhs_idx) {
+                Some(i) => {
+                    if !read.contains(&i) {
+                        written.insert(i);
+                    }
+                }
+                None => break,
+            },
+            _ => break,
+        }
+        pc = usize::from(ins.on_true);
+    }
+    if behavioral {
+        written.extend(params_never_read(bhav));
+    }
+    written
+}
+
+/// The parameters no node of `bhav` reads (the behavioral part of
+/// [`params_written_first`]). An `Expression` reads a parameter it names on its right, on
+/// its left unless it assigns (operators 5 and 20, `expression.rs:75`), and through
+/// scope 22 on either side (`memory.rs:511`). A primitive reads the frame slots
+/// [`primitive_frame_uses`] lists, scope 22 included, and every one when it lists the
+/// whole frame. A call reads none: its arguments are operand bytes or temps
+/// (`interpreter.rs:1539`). The behavioral relation observes no frame storage and no
+/// frame at a fault, so the value of a parameter nothing reads is never seen.
+fn params_never_read(bhav: &BhavChunk) -> BTreeSet<usize> {
+    let args = usize::from(bhav.args);
+    let mut read = vec![false; args];
+    let mut mark = |scope: u8, idx: i16| {
+        if matches!(scope, 9 | 22)
+            && let Some(slot) = usize::try_from(idx).ok().and_then(|i| read.get_mut(i))
+        {
+            *slot = true;
+        }
+    };
+    for ins in &bhav.instructions {
+        let ops = &ins.operands;
+        match ins.opcode {
+            2 => {
+                let (op, lhs_scope, rhs_scope) = (ops[5], ops[6], ops[7]);
+                mark(rhs_scope, word_i16(ops, 2));
+                if !matches!(op, 5 | 20) || lhs_scope == 22 {
+                    mark(lhs_scope, word_i16(ops, 0));
+                }
+            }
+            0..=255 => {
+                for use_ in primitive_frame_uses(ins.opcode, ops) {
+                    match use_ {
+                        FrameUse::Read(scope, idx, _) | FrameUse::Dst(scope, idx, _) => {
+                            mark(scope, idx);
+                        }
+                        FrameUse::WholeFrame => return BTreeSet::new(),
+                        FrameUse::AllLocals(_) => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (0..args).filter(|&i| !read[i]).collect()
+}
+
+/// What a built-in primitive that cannot observe the scratch-pointer state does to it,
+/// or `None` for one that may observe it.
+///
+/// In `sims-vm` only two readers look at the state (`ScratchPtrs::get`/`has`):
+/// `Expression` with a Global 34 right operand (`expression.rs:34`) and `UI Effect`
+/// reading Global 34 (`ui_effect.rs:371`). A primitive therefore observes the state its
+/// node starts with only if it is one of those, or if code reads it while the primitive
+/// runs: a tree it runs (Push Interaction runs an at-once interaction's trees,
+/// `in_way.rs:674`; Find Best Object, Create, Reach, Run Tree, Idle, ...), or anything
+/// that runs while it yields. The primitives listed here return `bool` from their
+/// handler (`primitives.rs:126`), so they never yield, and none of them runs a tree,
+/// removes an object or calls a routine that does:
+///
+/// - these leave the state as it was (`Some(None)`): Refresh 7, Own Events 10, Get
+///   Distance To 11, Breakpoint 15, Show String 21, Play Sound 23, Old Relationship 24
+///   (`relationship.rs:171`), Alter Budget 25, Set Motive Change 29, Test Object Type
+///   32, Find Worst Motives 33, Sim Interacting With 37, Stop All Sounds 48;
+/// - these set it before anything else, so before any fault too (`Some(Some(_))`):
+///   Random Number 8 (`random.rs:22`; its scope check comes after), Set To Next 31
+///   (`set_to_next.rs:116`), and Get Direction To 12 (`direction.rs:49`) when its
+///   destination scope word fits a byte: it checks that word first (`direction.rs:45`),
+///   and a fault there leaves the state as it was, so then it counts as observing.
+///
+/// For these, the state before the node is observed only through what follows: the
+/// state they leave (compared at the next event or exit) and, when they fault, the state
+/// at the fault (compared at that exit).
+fn scratch_effect(opcode: u16, ops: &[u8; 8]) -> Option<Option<Scratch>> {
+    match opcode {
+        7 | 10 | 11 | 15 | 21 | 23 | 24 | 25 | 29 | 32 | 33 | 37 | 48 => Some(None),
+        8 => Some(Some(Scratch::ArgSlot)),
+        12 if u16::from_le_bytes([ops[2], ops[3]]) <= 255 => Some(Some(Scratch::ArgSlot)),
+        31 => Some(Some(Scratch::SetToNext)),
+        _ => None,
+    }
 }
 
 // ============================================================================
@@ -327,9 +632,23 @@ enum FrameVal {
     Dst(u8, i16, Result<(), Outside>),
     /// Every local, and which may be unwritten (text formatting `$Local` tokens).
     AllLocals(Vec<Val>, Vec<bool>),
+    /// The locals text formatting may read, from the file's own strings
+    /// ([`LiveContext::text_reads`]): each slot, its value or where it falls outside the
+    /// frame, and whether it may be unwritten.
+    TextLocals(Vec<(i16, Result<Val, Outside>, bool)>),
     /// Every parameter and local, and which locals may be unwritten (unmodeled primitive).
     WholeFrame(Vec<Val>, Vec<Val>, Vec<bool>),
+    /// The arguments a call passes, whether from its operand words or the temps; `None`
+    /// for one the callee overwrites unseen ([`LiveContext::dead_args`]). The call's
+    /// operands are then compared as zeros: with at most 4 arguments and a callee that is
+    /// not indexed, the VM reads nothing else of them (`interpreter.rs:1539`,
+    /// `entry_node`).
+    CallArgs(Vec<Option<Val>>),
 }
+
+/// The local number a [`FrameVal::Read`] shows for a local a primitive acts on by value
+/// only, under the behavioral relation (`Explorer::value_read_locals`).
+const BY_VALUE: i16 = i16::MIN;
 
 /// How far past the end of its scope a frame operand falls (`idx - count`; negative for
 /// an index below zero).
@@ -477,6 +796,8 @@ impl Interner {
                 SymKey::EventValue(p) => format!("read#{p}"),
                 SymKey::StackObject(p) => format!("stack_obj@epoch{p}"),
                 SymKey::FrameMaybe(p, s, i, _) => format!("frame({s},{i})@event{p}"),
+                SymKey::Drawn(p) => format!("random@event{p}"),
+                SymKey::MyData(p, i) => format!("my.data[{i}]@event{p}"),
                 SymKey::CutClass(p, k) => format!("class{k}@cut{p}"),
                 SymKey::Op(..) if depth >= 3 => format!("t{id}"),
                 SymKey::Op(op, a, b) => format!(
@@ -1109,6 +1430,9 @@ impl<'a> Explorer<'a> {
             if !self.opts.observe_fault_last_result {
                 at.last_result = None;
             }
+            if !self.opts.observe_fault_scratch_pointer {
+                at.scratch = Scratch::Inherited;
+            }
             at
         });
         // The behavioral relation does not observe node numbers: a jump to a missing
@@ -1138,7 +1462,12 @@ impl<'a> Explorer<'a> {
                 prefix: state.prefix,
                 epoch: state.epoch,
                 store,
-                scratch: (self.opts.observe_scratch_pointer || faults).then_some(state.scratch),
+                scratch: if faults {
+                    self.opts.observe_fault_scratch_pointer
+                } else {
+                    self.opts.observe_scratch_pointer
+                }
+                .then_some(state.scratch),
                 last_result,
                 residue,
             },
@@ -1225,6 +1554,40 @@ impl<'a> Explorer<'a> {
         })
     }
 
+    /// The locals primitive `opcode` with `ops` only reads, under the behavioral
+    /// relation: those a renamable operand names ([`local_operands`]) that the primitive
+    /// does not also write ([`primitive_frame_uses`]' destinations,
+    /// [`primitive_frame_writes`]). The relation does not observe frame storage, and a
+    /// primitive acts on such a local's value only, which nothing but the running tree
+    /// writes, also across a yield (Notify Out of Idle writes only parameters). So the
+    /// event records each one's value under [`BY_VALUE`], and its operand bytes as 0.
+    fn value_read_locals(&self, opcode: u16, ops: &[u8; 8]) -> BTreeSet<i16> {
+        if !self.opts.behavioral || opcode >= 256 {
+            return BTreeSet::new();
+        }
+        let mut written: BTreeSet<i16> = primitive_frame_writes(opcode, ops)
+            .into_iter()
+            .filter(|&(scope, _)| scope == 25)
+            .map(|(_, idx)| idx)
+            .collect();
+        for frame_use in primitive_frame_uses(opcode, ops) {
+            match frame_use {
+                FrameUse::Dst(25, idx, _) => {
+                    written.insert(idx);
+                }
+                FrameUse::Read(..) | FrameUse::Dst(..) => {}
+                // Never with a renamable operand; nothing is read by value.
+                FrameUse::AllLocals(_) | FrameUse::WholeFrame => return BTreeSet::new(),
+            }
+        }
+        local_operands(opcode, ops)
+            .into_iter()
+            .filter(|&(_, writes)| !writes)
+            .map(|(pos, _)| pos.get(ops))
+            .filter(|idx| !written.contains(idx))
+            .collect()
+    }
+
     fn bcon(&self, idx: i16) -> Option<i16> {
         let bcons = self.ctx.local_bcons.as_ref()?;
         if !(4096..=8191).contains(&self.bhav.id) {
@@ -1274,7 +1637,21 @@ impl<'a> Explorer<'a> {
         last_result: Option<Option<bool>>,
         interner: &mut Interner,
     ) -> u32 {
+        self.record_with(state, kind, frame, last_result, true, interner)
+    }
+
+    /// [`Self::record`], leaving the scratch-pointer state out unless `scratch_observed`.
+    fn record_with(
+        &self,
+        state: &PathState,
+        kind: EventKind,
+        frame: Vec<FrameVal>,
+        last_result: Option<Option<bool>>,
+        scratch_observed: bool,
+        interner: &mut Interner,
+    ) -> u32 {
         let (store, scratch) = self.snapshot(state, interner);
+        let scratch = scratch.filter(|_| scratch_observed);
         let event = LiveEvent {
             kind,
             frame,
@@ -1303,6 +1680,13 @@ impl<'a> Explorer<'a> {
             // not an event.
             return Ok(Ok(interner.sym(SymKey::StackObject(state.epoch))));
         }
+        if scope == 3 && (0..MY_DATA_WORDS).contains(&idx) && idx != MY_DATA_LOCKOUT {
+            // See `MY_DATA_WORDS`. Only events change the running object's data words
+            // (writes to scope 3 are opaque write events), so the value is keyed by the
+            // last event, whatever kind: a read event of the lockout word wakes the
+            // object (`memory.rs:137`) without ending the epoch.
+            return Ok(Ok(interner.sym(SymKey::MyData(state.prefix, idx))));
+        }
         let loc = self.locate(state, scope, idx)?;
         if let Loc::Trap(code) = loc {
             return Ok(Err(code));
@@ -1314,7 +1698,10 @@ impl<'a> Explorer<'a> {
         let Loc::Opaque(indirect) = loc else {
             unreachable!("tracked locations return above")
         };
-        let prefix = self.record(
+        // A read observes no scratch-pointer state: only an `Expression` or `UI Effect`
+        // reading Global 34 does (`scratch_effect`), and Global 34 is refused. When it
+        // faults, the state at the fault is compared at that exit.
+        let prefix = self.record_with(
             state,
             EventKind::Read {
                 scope,
@@ -1323,6 +1710,7 @@ impl<'a> Explorer<'a> {
             },
             Vec::new(),
             None,
+            false,
             interner,
         );
         state.prefix = prefix;
@@ -1370,7 +1758,7 @@ impl<'a> Explorer<'a> {
         if let Loc::Local(i) = loc
             && state.unwritten[i]
         {
-            let prefix = self.record(
+            let prefix = self.record_with(
                 state,
                 EventKind::Read {
                     scope,
@@ -1379,6 +1767,7 @@ impl<'a> Explorer<'a> {
                 },
                 Vec::new(),
                 None,
+                false,
                 interner,
             );
             state.prefix = prefix;
@@ -1561,7 +1950,11 @@ impl<'a> Explorer<'a> {
                     rhs,
                 },
                 Vec::new(),
-                None,
+                // A global's store may run code on this object: the only writable one
+                // the checker does not refuse is global 3, which in co-op mode selects a
+                // person and runs PLACED on them (`memory.rs:846`,
+                // `overwrites_last_result_first`). So it records the last result.
+                (self.opts.observe_last_result && lhs_scope == 6).then_some(state.last_result),
                 interner,
             );
             state.prefix = prefix;
@@ -1771,6 +2164,27 @@ impl<'a> Explorer<'a> {
 
         // What the primitive reads from the frame, and which frame slots it may write.
         let mut frame = Vec::new();
+        // A call to a tree that overwrites some parameters unseen passes the others by
+        // value, from its operand words or the temps (`interpreter.rs:1539`).
+        let dead_args = self.ctx.dead_args(self.bhav.id, ins.opcode);
+        if let (Some(dead), Some(arity)) = (dead_args, callee_arity) {
+            let from_temps = *ops == [0xFF; 8];
+            let mut args = Vec::with_capacity(arity);
+            for i in 0..arity {
+                args.push(if dead.contains(&i) {
+                    None
+                } else if from_temps {
+                    let temp = Loc::Tracked(Cell::Temp(i as i16));
+                    Some(
+                        self.tracked(&state, temp, interner)
+                            .expect("temps are tracked"),
+                    )
+                } else {
+                    Some(Val::Const(word_i16(ops, 2 * i)))
+                });
+            }
+            frame.push(FrameVal::CallArgs(args));
+        }
         let mut written: BTreeSet<(u8, i16)> = BTreeSet::new();
         let in_frame = |scope: u8, idx: i16| match scope {
             9 => idx >= 0 && (idx as usize) < self.args,
@@ -1788,6 +2202,7 @@ impl<'a> Explorer<'a> {
             9 => state.params[idx as usize],
             _ => state.locals[idx as usize],
         };
+        let by_value = self.value_read_locals(ins.opcode, ops);
         for frame_use in primitive_frame_uses(ins.opcode, ops) {
             match frame_use {
                 FrameUse::Read(scope, idx, _) | FrameUse::Dst(scope @ 22, idx, _) => {
@@ -1795,7 +2210,12 @@ impl<'a> Explorer<'a> {
                     if matches!(scope, 9 | 25) {
                         let val = fit(scope, idx).map(|()| slot_val(&state, scope, idx));
                         let unwritten = val.is_ok() && scope == 25 && state.unwritten[idx as usize];
-                        frame.push(FrameVal::Read(scope, idx, val, unwritten));
+                        let shown = if scope == 25 && by_value.contains(&idx) {
+                            BY_VALUE
+                        } else {
+                            idx
+                        };
+                        frame.push(FrameVal::Read(scope, shown, val, unwritten));
                     }
                 }
                 FrameUse::Dst(scope, idx, _) => {
@@ -1804,10 +2224,21 @@ impl<'a> Explorer<'a> {
                         written.insert((scope, idx));
                     }
                 }
-                FrameUse::AllLocals(_) => frame.push(FrameVal::AllLocals(
-                    state.locals.clone(),
-                    state.unwritten.clone(),
-                )),
+                FrameUse::AllLocals(_) => {
+                    frame.push(match self.ctx.text_reads(self.bhav.id, ins.opcode, ops) {
+                        Some(slots) => FrameVal::TextLocals(
+                            slots
+                                .into_iter()
+                                .map(|idx| {
+                                    let val = fit(25, idx).map(|()| slot_val(&state, 25, idx));
+                                    let unwritten = val.is_ok() && state.unwritten[idx as usize];
+                                    (idx, val, unwritten)
+                                })
+                                .collect(),
+                        ),
+                        None => FrameVal::AllLocals(state.locals.clone(), state.unwritten.clone()),
+                    });
+                }
                 FrameUse::WholeFrame => {
                     frame.push(FrameVal::WholeFrame(
                         state.params.clone(),
@@ -1822,14 +2253,39 @@ impl<'a> Explorer<'a> {
         written.extend(primitive_frame_writes(ins.opcode, ops));
         written.retain(|&(scope, idx)| in_frame(scope, idx));
 
-        let prefix = self.record(
+        // A primitive that cannot observe the scratch-pointer state does not record it
+        // (`scratch_effect`); one that sets it first leaves its value at a fault too.
+        let scratch_effect = if ins.opcode < 256 {
+            scratch_effect(ins.opcode, ops)
+        } else {
+            None
+        };
+        if let Some(Some(set)) = scratch_effect {
+            state.scratch = set;
+        }
+
+        let prefix = self.record_with(
             &state,
             EventKind::Primitive {
                 // The behavioral relation observes neither the node a yield leaves the
                 // frame at nor where in frame storage a callee's frame starts.
                 node: if self.opts.behavioral { 0 } else { state.pc },
                 opcode: ins.opcode,
-                operands: event_operands(ins.opcode, *ops),
+                operands: {
+                    let mut operands = event_operands(ins.opcode, *ops);
+                    if dead_args.is_some() {
+                        operands = [0; 8];
+                    }
+                    // Reached through `Read(25, BY_VALUE, ..)` instead (`value_read_locals`).
+                    if !by_value.is_empty() {
+                        for (pos, _) in local_operands(ins.opcode, ops) {
+                            if by_value.contains(&pos.get(ops)) {
+                                let _ = pos.set(&mut operands, 0);
+                            }
+                        }
+                    }
+                    operands
+                },
                 inline_args,
                 unknown_arity_suffix,
                 callee_arity,
@@ -1841,7 +2297,15 @@ impl<'a> Explorer<'a> {
                 },
             },
             frame,
-            self.opts.observe_last_result.then_some(state.last_result),
+            // When faults are assumed not to expose it, a node that sets the last
+            // result before anything reads it hides the value it had. Each side
+            // records the value unless its own node hides it, so two values are
+            // equated only when both sides hide them.
+            (self.opts.observe_last_result
+                && (self.opts.observe_fault_last_result
+                    || !self.ctx.overwrites_last_result(self.bhav.id, ins)))
+            .then_some(state.last_result),
+            scratch_effect.is_none(),
             interner,
         );
         state.prefix = prefix;
@@ -1890,6 +2354,21 @@ impl<'a> Explorer<'a> {
                 s.cond.push((Atom::Outcome(prefix), value));
             }
             for &(scope, idx) in &written {
+                // Random Number's only write is its destination, which it always stores
+                // its draw in when it takes its one branch (`random.rs`; the global-34
+                // redirect is refused above). The draw depends on the world and the
+                // range, which the event records, so not on the slot.
+                if ins.opcode == 8 {
+                    let new = interner.sym(SymKey::Drawn(s.prefix));
+                    match scope {
+                        9 => s.params[idx as usize] = new,
+                        _ => {
+                            s.locals[idx as usize] = new;
+                            s.unwritten[idx as usize] = false;
+                        }
+                    }
+                    continue;
+                }
                 let old = slot_val(&s, scope, idx);
                 let new = interner.sym(SymKey::FrameMaybe(s.prefix, scope, idx, old));
                 match scope {
@@ -1897,7 +2376,11 @@ impl<'a> Explorer<'a> {
                     _ => s.locals[idx as usize] = new,
                 }
             }
+            let scratch = s.scratch;
             Self::havoc_shared(&mut s);
+            if scratch_effect.is_some() {
+                s.scratch = scratch;
+            }
             s.last_result = Some(outcome.unwrap_or(true));
             s.pc = target;
             out.push(Step::Continue(s));
@@ -2383,15 +2866,17 @@ fn bisimulate(
                     }
                     (SegmentEnd::Done(p), SegmentEnd::Cut(s)) => {
                         return Err(format!(
-                            "A may end ({}) where B runs on: {}",
+                            "A may end ({}, path {}) where B runs on: {}",
                             p.out.exit,
+                            format_nodes(p),
                             divergence(p.out.prefix, s.prefix, interner)
                         ));
                     }
                     (SegmentEnd::Cut(s), SegmentEnd::Done(p)) => {
                         return Err(format!(
-                            "B may end ({}) where A runs on: {}",
+                            "B may end ({}, path {}) where A runs on: {}",
                             p.out.exit,
+                            format_nodes(p),
                             divergence(s.prefix, p.out.prefix, interner)
                         ));
                     }
@@ -3617,11 +4102,20 @@ fn event_difference(
                     )),
                 }
             }
-            (FrameVal::AllLocals(..), FrameVal::AllLocals(..)) => Difference::Possible(format!(
+            (
+                FrameVal::AllLocals(..) | FrameVal::TextLocals(..),
+                FrameVal::AllLocals(..) | FrameVal::TextLocals(..),
+            ) => Difference::Possible(format!(
                 "{at}: text formatting may read frame locals via $Local tokens and local state differs"
             )),
             (FrameVal::WholeFrame(..), FrameVal::WholeFrame(..)) => Difference::Possible(format!(
                 "{at}: an unmodeled primitive may read the frame and frame state differs"
+            )),
+            (FrameVal::CallArgs(x), FrameVal::CallArgs(y)) => Difference::Possible(format!(
+                "{at} {}: call arguments may differ (A {} vs B {})",
+                describe_kind(&a.kind, interner),
+                describe_args(x, interner),
+                describe_args(y, interner)
             )),
             _ => Difference::Definite(format!(
                 "{at} {}: frame operands differ ({fa:?} vs {fb:?})",
@@ -3630,6 +4124,14 @@ fn event_difference(
         };
     }
     Difference::Possible(format!("{at}: events differ"))
+}
+
+fn describe_args(args: &[Option<Val>], interner: &Interner) -> String {
+    let words: Vec<String> = args
+        .iter()
+        .map(|a| a.map_or_else(|| "unread".to_owned(), |v| interner.describe(v)))
+        .collect();
+    format!("({})", words.join(", "))
 }
 
 fn is_primitive(node: &&PrefixNode) -> bool {

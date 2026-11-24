@@ -627,6 +627,9 @@ pub struct NeighborhoodShell {
     hovered_lot_since_us: Option<u64>,
     /// Lot ID whose House Info card is currently popped in `nbhd_state.hovered_lot`.
     hover_card_shown_for: Option<u16>,
+    /// The cursor when the card was popped: the original's tooltip places a
+    /// card once, from the cursor at that moment (`0x5da0ed`, `0x5ddbda`).
+    hover_card_cursor: Option<[i32; 2]>,
     /// 300 ms native per-lot roof cross-fade state (`cWinLot`, `0x54ea7f..0x54eb3d`).
     hover_fade: HoverFadeState,
     /// Tracks whether any roof cross-fade was actively animating on the last tick
@@ -1003,6 +1006,7 @@ impl NeighborhoodShell {
             hovered_lot_id: None,
             hovered_lot_since_us: None,
             hover_card_shown_for: None,
+            hover_card_cursor: None,
             hover_fade: HoverFadeState::new(),
             hover_fade_was_animating: false,
             pressed_lot_id: None,
@@ -1800,6 +1804,7 @@ impl NeighborhoodShell {
                     && self.clock_us.saturating_sub(since_us) >= HOVER_CARD_DELAY_US
                 {
                     self.hover_card_shown_for = Some(lot_id);
+                    self.hover_card_cursor = self.pointer;
                     self.nbhd_state.hovered_lot = self.build_lot_info(lot_id);
                     if self.nbhd_state.hovered_lot.is_some() {
                         redraw = true;
@@ -2130,6 +2135,18 @@ impl NeighborhoodShell {
                             &self.travel_strings,
                         );
                     } else {
+                        // The card fades in with the lot's roof (`0x54f939`).
+                        if let Some(info) = &mut self.nbhd_state.hovered_lot {
+                            let fade = if self.clock_us > 0
+                                && self.hover_fade.hovered() == Some(info.lot_number)
+                            {
+                                self.hover_fade
+                                    .fade_for(info.lot_number, self.clock_us / 1_000)
+                            } else {
+                                1.0
+                            };
+                            info.alpha_shift = Some(sims_ui::neighborhood::popup_alpha_shift(fade));
+                        }
                         self.chrome.draw(
                             &mut frame,
                             &self.nbhd_state,
@@ -5137,6 +5154,7 @@ impl NeighborhoodShell {
             origin[0].saturating_add(map_lot.anchor[0]),
             origin[1].saturating_add(map_lot.anchor[1]),
         ];
+        let [left, top, right, bottom] = self.map.lot_screen_rect(map_lot, self.frame_size_u32());
         let meta = self.lot_meta.get(&lot_id);
         let is_magic_res = (90..=92).contains(&lot_id);
         let is_magic_comm = (93..=98).contains(&lot_id);
@@ -5159,10 +5177,17 @@ impl NeighborhoodShell {
                     .get(&fam_id)
                     .cloned()
                     .unwrap_or_else(|| format!("Family {fam_id}"));
+                // `0x550b02..0x550c53` draws each member's framed
+                // thumbnail (`BMP_` 2004) one to one.
                 let portraits = fam
                     .members
                     .iter()
-                    .filter_map(|guid| self.faces.face(*guid).cloned())
+                    .filter_map(|guid| {
+                        self.faces
+                            .thumbnail(*guid)
+                            .or_else(|| self.faces.face(*guid))
+                            .cloned()
+                    })
                     .collect();
                 let magic_coins = lifecycle::family_magic_coins(&self.stored, fam_id);
                 LotOccupant {
@@ -5187,6 +5212,14 @@ impl NeighborhoodShell {
             magic_cost: self.magic_cost_for_lot(lot_id),
             occupant,
             anchor,
+            tooltip: Some(sims_ui::neighborhood::TooltipOwner {
+                rect: Rect::new(left, top, right - left, bottom - top),
+                cursor_x: self
+                    .hover_card_cursor
+                    .or(self.pointer)
+                    .map_or(anchor[0], |p| p[0]),
+            }),
+            alpha_shift: None,
         })
     }
 

@@ -1906,16 +1906,68 @@ fn arrival_time(destination: TravelDestination, lot_rng: &mut sims_core::GameRng
 /// already wrote the travelers' tokens, and the script already paid the
 /// fare (the Go Downtown plugin's Alter Budget), so the fare is 0. The
 /// request is cleared once the departure succeeds; on an error it stays.
+///
+/// The destination boots with answers `[3]`, the default frames and the
+/// destination's default transport; [`depart_from_request_with`] takes the
+/// shell's own.
 pub fn depart_from_request(
     install_root: &Path,
     store: &NeighborhoodStore,
     neighborhood_id: &str,
     home_lot: &mut Lot,
 ) -> Result<DepartureResult, TravelError> {
+    depart_from_request_with(
+        install_root,
+        store,
+        neighborhood_id,
+        home_lot,
+        &TripDeparture {
+            answers: vec![3],
+            ..TripDeparture::default()
+        },
+    )
+}
+
+/// What the shell, not the script, decides about a trip a script asked
+/// for with Generic Sims Call 17: the request names only the house and
+/// the party ([`travel_request_for_trip`]).
+#[derive(Clone, Debug, Default)]
+pub struct TripDeparture {
+    /// The transport the script's lot picker chose (the Magic Town hole,
+    /// the blimp, the limo...), which the arrival places the travelers
+    /// by ([`TravelSession::transport`]). It must serve the destination.
+    /// `None` is the destination's default.
+    pub transport: Option<TravelTransport>,
+    /// The destination lot's scripted dialog answers; empty leaves every
+    /// dialog to the player.
+    pub answers: Vec<u8>,
+    /// The destination lot's frame schedule.
+    pub frames: Frames,
+    /// The destination lot's first camera centre tile.
+    pub view_centre: Option<[i8; 2]>,
+}
+
+/// [`depart_from_request`] with the shell's transport, answers, frames
+/// and camera ([`TripDeparture`]). A transport that does not serve the
+/// trip's destination is refused ([`TravelError::IncompatibleTransport`]),
+/// and the request stays.
+pub fn depart_from_request_with(
+    install_root: &Path,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    home_lot: &mut Lot,
+    departure: &TripDeparture,
+) -> Result<DepartureResult, TravelError> {
     let trip = home_lot.world.trip_request.clone().ok_or_else(|| {
         TravelError::Lot("no trip was asked for (Generic Sims Call 17 has not run)".into())
     })?;
-    let request = travel_request_for_trip(&home_lot.world, &trip)?;
+    let request = TravelRequest {
+        transport: departure.transport,
+        answers: departure.answers.clone(),
+        frames: departure.frames.clone(),
+        view_centre: departure.view_centre,
+        ..travel_request_for_trip(&home_lot.world, &trip)?
+    };
     let result = depart(
         install_root,
         store,
@@ -2866,6 +2918,39 @@ fn verify_persisted_trip_against_snapshot(
     Ok(())
 }
 
+impl Lot {
+    /// Drops the trip a script asked for with Generic Sims Call 17
+    /// ([`World::trip_request`]) that the shell will not carry out, so a
+    /// later routine 17 asks again instead of adding to it. The original
+    /// has no refusal: its main loop always leaves the house. As an abort
+    /// does, the saved-state tokens routine 17 wrote (kind 2, with the
+    /// arrival clock) are taken back, so the script's tail, which goes on
+    /// on this lot, restores nothing from them. A companion's kind-1 token
+    /// the script wrote stays. Returns the request dropped.
+    pub fn cancel_trip_request(&mut self) -> Option<sims_sim::TripRequest> {
+        let trip = self.world.trip_request.take()?;
+        for &neighbor in &trip.saved {
+            clear_saved_state_tokens(&mut self.world, neighbor);
+        }
+        let caller = self.world.objects.get(&trip.caller).map(|o| o.guid);
+        if let Some(neighbor) = caller.and_then(|guid| self.world.neighbors.first_of(guid)) {
+            let neighbor = neighbor.id;
+            clear_arrival_clock_tokens(&mut self.world, neighbor);
+        }
+        Some(trip)
+    }
+}
+
+/// Erases the arrival clock tokens (kind 2, GUIDs 7 and 8) of
+/// `neighbor_id`'s inventory. In mode 1 routine 17 writes the clock into
+/// the caller's inventory without its saved state when member 0 is not on
+/// the lot, so [`sims_sim::TripRequest::saved`] does not name it.
+fn clear_arrival_clock_tokens(world: &mut World, neighbor_id: i16) {
+    for guid in [trip::ARRIVAL_HOUR_GUID, trip::ARRIVAL_MINUTE_GUID] {
+        set_neighbor_token_count(world, neighbor_id, trip::SAVED_STATE_KIND, guid, 0);
+    }
+}
+
 /// Erases every saved-state token (kind 2) of `neighbor_id`'s inventory.
 fn clear_saved_state_tokens(world: &mut World, neighbor_id: i16) {
     for inv in &mut world.neighbors.inventories {
@@ -3291,6 +3376,73 @@ pub fn return_from_destination(
     answers: &[u8],
     frames: Frames,
 ) -> Result<ReturnResult, TravelError> {
+    return_home(
+        install_root,
+        store,
+        session,
+        destination_lot,
+        answers,
+        frames,
+        None,
+    )
+}
+
+/// Carries out the trip home a script on the destination lot asked for
+/// with Generic Sims Call 17 ([`World::trip_request`]): the destination's
+/// Go Home (each phone plugin's tree 0x1004 runs routine 17 with house
+/// -1, which 0x45a22d resolves to the house of the leader's family).
+///
+/// It returns like [`return_from_destination`], and takes back the tokens
+/// routine 17 wrote as the home lot's tail of the plugin would leave them.
+/// Natively the house reloads with the leader's stack frozen just after
+/// the outbound routine 17, and the tail reads the arrival clock (routine
+/// 23, erased), restores the caller from its kind-2 tokens (routine 21),
+/// then takes one kind-3 token from the caller (routine 20, in either
+/// mode: the Go Downtown plugin's n14, the Vacation plugin's n79) and
+/// restores the companion it names (routine 21). The port places the
+/// travelers from their live state instead ([`return_from_destination`]),
+/// so every kind-2 token the request saved is erased, and one is taken
+/// from the caller's first kind-3 token. A companion that token names who
+/// did not travel is not made on the home lot.
+///
+/// A request for another house (a destination's Go Somewhere Else, tree
+/// 0x1016) or by a person who is not one of the trip's travelers is
+/// refused, and the request stays. It is cleared once the return
+/// succeeds.
+pub fn return_from_request(
+    install_root: &Path,
+    store: &NeighborhoodStore,
+    session: &TravelSession,
+    destination_lot: &mut Lot,
+    answers: &[u8],
+    frames: Frames,
+) -> Result<ReturnResult, TravelError> {
+    let trip = destination_lot.world.trip_request.clone().ok_or_else(|| {
+        TravelError::Lot("no trip home was asked for (Generic Sims Call 17 has not run)".into())
+    })?;
+    let result = return_home(
+        install_root,
+        store,
+        session,
+        destination_lot,
+        answers,
+        frames,
+        Some(&trip),
+    )?;
+    destination_lot.world.trip_request = None;
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn return_home(
+    install_root: &Path,
+    store: &NeighborhoodStore,
+    session: &TravelSession,
+    destination_lot: &mut Lot,
+    answers: &[u8],
+    frames: Frames,
+    homebound: Option<&sims_sim::TripRequest>,
+) -> Result<ReturnResult, TravelError> {
     if destination_lot.load.finished.is_none() {
         return Err(TravelError::Lot(
             "destination lot load did not complete".into(),
@@ -3413,6 +3565,45 @@ pub fn return_from_destination(
     let auth_session = &persisted.session;
     let frozen_home_bytes = &persisted.frozen_home_bytes;
 
+    // A trip home a script asked for: its house and its caller are checked
+    // against the persisted trip, and the caller's neighbor record is the
+    // one whose kind-3 token the tail's routine 20 takes.
+    let homebound = match homebound {
+        None => None,
+        Some(trip) => {
+            if i64::from(trip.house) != i64::from(auth_session.home_house) {
+                return Err(TravelError::SessionMismatch(format!(
+                    "routine 17 asked for house {}, not the trip's home house {}; a trip from \
+                     one destination to another is not carried out",
+                    trip.house, auth_session.home_house
+                )));
+            }
+            let caller_guid = destination_lot
+                .world
+                .objects
+                .get(&trip.caller)
+                .filter(|o| o.person.is_some())
+                .map(|o| o.guid)
+                .ok_or_else(|| {
+                    TravelError::Lot(format!(
+                        "the person {} that asked for the trip home is gone",
+                        trip.caller
+                    ))
+                })?;
+            let caller = auth_session
+                .travelers
+                .iter()
+                .find(|t| t.guid == caller_guid)
+                .ok_or_else(|| {
+                    TravelError::InvalidParty(format!(
+                        "Sim 0x{caller_guid:08X} asked for the trip home but is not one of the \
+                         trip's travelers"
+                    ))
+                })?;
+            Some((trip, caller.neighbor_id))
+        }
+    };
+
     // Clone the destination lot's saved snapshot so we can flush persons,
     // capture returning state, and strip visiting travelers without leaving
     // `destination_lot` half-mutated on error.
@@ -3509,6 +3700,26 @@ pub fn return_from_destination(
     //     departure did not save keeps its own.
     for &neighbor in &persisted.departure_tokens {
         clear_saved_state_tokens(&mut dest_saved.world, neighbor);
+    }
+    // A trip home routine 17 asked for wrote them again (and the arrival
+    // clock), for the neighbors it saved; the tail would leave none, and
+    // would have taken one kind-3 token from the caller (routine 20 on
+    // `my.data[11]`, in either mode).
+    if let Some((trip, caller_neighbor)) = homebound {
+        for &neighbor in &trip.saved {
+            clear_saved_state_tokens(&mut dest_saved.world, neighbor);
+        }
+        clear_arrival_clock_tokens(&mut dest_saved.world, caller_neighbor);
+        if let Some(inventory) = dest_saved
+            .world
+            .neighbors
+            .inventories
+            .iter_mut()
+            .find(|i| i.neighbor == caller_neighbor)
+        {
+            let place = trip::token_place(&inventory.items, trip::HOMEBOUND_COMPANION_KIND, 0);
+            trip::take_token(&mut inventory.items, place, 1);
+        }
     }
 
     // 3. Capture returning state for every traveler on the destination lot
@@ -8208,6 +8419,252 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    /// Routine 17 (`request_trip`) run by `person` on `lot`, recorded as
+    /// [`World::trip_request`] the way 0x4fc713 would.
+    fn ask_for_trip(lot: &mut Lot, person: u16, house: i16, hour: i16, minute: i16, mode: i16) {
+        let asked = Interpreter::new(&lot.program, &lot.catalog, Stream::Lot)
+            .machine(&mut lot.world, person, 0, true)
+            .request_trip(house, hour, minute, mode)
+            .unwrap()
+            .expect("routine 17 asks for the trip");
+        lot.world.trip_request = Some(asked);
+    }
+
+    /// The tokens of `kind` in neighbor `nid`'s inventory in `world`.
+    fn tokens_of(world: &World, nid: i16, kind: i32) -> Vec<(u32, u16)> {
+        world
+            .neighbors
+            .inventories
+            .iter()
+            .filter(|i| i.neighbor == nid)
+            .flat_map(|i| &i.items)
+            .filter(|t| t.kind == kind)
+            .map(|t| (t.guid, t.count))
+            .collect()
+    }
+
+    /// A trip request the shell will not carry out is dropped with the
+    /// saved-state tokens routine 17 wrote, and the Sim can ask again on
+    /// the same lot.
+    #[test]
+    fn a_cancelled_trip_request_takes_back_its_tokens() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard) = live_store(&root, "cancel-request");
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let leader_guid = nh.family_in(5).unwrap().1.members[0];
+        let mut home =
+            crate::lifecycle::enter_lot(&root, &store, "UserData", 5, &[3], Frames::default())
+                .unwrap();
+        let leader = person_with_guid(&home.world, leader_guid).unwrap();
+        let leader_nid = home.world.neighbors.first_of(leader_guid).unwrap().id;
+        assert_eq!(home.cancel_trip_request(), None);
+        ask_for_trip(&mut home, leader, 21, 0, 30, 0);
+        assert!(!saved_state_tokens(&home.world, leader_nid).is_empty());
+        let dropped = home.cancel_trip_request().expect("a request was pending");
+        assert_eq!(dropped.saved, [leader_nid]);
+        assert_eq!(home.world.trip_request, None);
+        assert_eq!(saved_state_tokens(&home.world, leader_nid), []);
+        // Asking again goes as the first ask would have.
+        ask_for_trip(&mut home, leader, 21, 0, 30, 0);
+        let departed = depart_from_request(&root, &store, "UserData", &mut home).unwrap();
+        assert_eq!(departed.session.travelers.len(), 1);
+    }
+
+    /// The shell's picked transport goes with a requested trip: the Magic
+    /// Town hole is recorded in the session instead of the blimp, and a
+    /// transport that does not serve the destination is refused with the
+    /// request kept.
+    #[test]
+    fn a_requested_trip_takes_the_shells_transport() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard) = live_store(&root, "request-transport");
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let leader_guid = nh.family_in(5).unwrap().1.members[0];
+        let mut home =
+            crate::lifecycle::enter_lot(&root, &store, "UserData", 5, &[3], Frames::default())
+                .unwrap();
+        let leader = person_with_guid(&home.world, leader_guid).unwrap();
+        ask_for_trip(&mut home, leader, 93, 14, 0, 0);
+        let Err(err) = depart_from_request_with(
+            &root,
+            &store,
+            "UserData",
+            &mut home,
+            &TripDeparture {
+                transport: Some(TravelTransport::DowntownCab),
+                answers: vec![3],
+                ..TripDeparture::default()
+            },
+        ) else {
+            panic!("a cab does not go to Magic Town");
+        };
+        assert!(
+            matches!(err, TravelError::IncompatibleTransport { .. }),
+            "{err:?}"
+        );
+        assert!(home.world.trip_request.is_some(), "the request was dropped");
+        let departed = depart_from_request_with(
+            &root,
+            &store,
+            "UserData",
+            &mut home,
+            &TripDeparture {
+                transport: Some(TravelTransport::MagicHole),
+                answers: vec![3],
+                ..TripDeparture::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(departed.session.transport, TravelTransport::MagicHole);
+        assert_eq!(departed.session.fare_paid, 0);
+        assert_eq!(home.world.trip_request, None);
+    }
+
+    /// The trip home a script on the destination asks for (Go Home: house
+    /// -1, which routine 17 makes the family's house) is carried out and
+    /// takes back what routine 17 wrote: no saved-state tokens, and one
+    /// kind-3 token taken from the caller as routine 20 would. A trip to
+    /// another destination is refused, and can be cancelled first.
+    #[test]
+    fn a_trip_home_a_script_asks_for_takes_back_its_tokens() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard) = live_store(&root, "request-home");
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let members = nh.family_in(5).unwrap().1.members.clone();
+        let leader_guid = members[0];
+        let mut home =
+            crate::lifecycle::enter_lot(&root, &store, "UserData", 5, &[3], Frames::default())
+                .unwrap();
+        let leader = person_with_guid(&home.world, leader_guid).unwrap();
+        let leader_nid = home.world.neighbors.first_of(leader_guid).unwrap().id;
+        ask_for_trip(&mut home, leader, 21, 0, 30, 0);
+        let departed = depart_from_request(&root, &store, "UserData", &mut home).unwrap();
+        let session = departed.session;
+        let mut lot = departed.destination_lot;
+        let traveler = person_with_guid(&lot.world, leader_guid).unwrap();
+
+        ask_for_trip(&mut lot, traveler, 58, 0, 15, 0);
+        let Err(err) =
+            return_from_request(&root, &store, &session, &mut lot, &[3], Frames::default())
+        else {
+            panic!("a hop to Old Town is not a trip home");
+        };
+        assert!(matches!(err, TravelError::SessionMismatch(_)), "{err:?}");
+        assert!(lot.world.trip_request.is_some());
+        lot.cancel_trip_request().unwrap();
+
+        ask_for_trip(&mut lot, traveler, -1, 0, 30, 0);
+        let asked = lot.world.trip_request.clone().unwrap();
+        assert_eq!(i64::from(asked.house), i64::from(session.home_house));
+        assert!(!saved_state_tokens(&lot.world, leader_nid).is_empty());
+        set_neighbor_token_count(
+            &mut lot.world,
+            leader_nid,
+            trip::HOMEBOUND_COMPANION_KIND,
+            members[1],
+            2,
+        );
+        let returned =
+            return_from_request(&root, &store, &session, &mut lot, &[3], Frames::default())
+                .unwrap();
+        assert_eq!(lot.world.trip_request, None);
+        let world = &returned.home_lot.world;
+        assert_eq!(saved_state_tokens(world, leader_nid), []);
+        assert_eq!(
+            tokens_of(world, leader_nid, trip::HOMEBOUND_COMPANION_KIND),
+            [(members[1], 1)]
+        );
+        let stored = store.load_neighborhood("UserData").unwrap().unwrap();
+        assert_eq!(
+            stored_tokens(&stored, leader_nid, trip::SAVED_STATE_KIND),
+            []
+        );
+        assert_eq!(
+            stored_tokens(&stored, leader_nid, trip::HOMEBOUND_COMPANION_KIND),
+            [(members[1], 1)]
+        );
+    }
+
+    /// A group trip writes no departure tokens (0x4f1ae9 makes no
+    /// arrival), so only the trip home's own takeback clears what its
+    /// routine 17 wrote. The caller's record is the persisted roster's,
+    /// not the one in the session the shell hands in.
+    #[test]
+    fn a_trip_home_from_a_group_trip_takes_back_its_own_tokens() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard) = live_store(&root, "request-home-group");
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let members = nh.family_in(5).unwrap().1.members.clone();
+        let leader_guid = members[0];
+        let mut home =
+            crate::lifecycle::enter_lot(&root, &store, "UserData", 5, &[3], Frames::default())
+                .unwrap();
+        let leader_nid = home.world.neighbors.first_of(leader_guid).unwrap().id;
+        let departed = depart_to_destination(
+            &root,
+            &store,
+            "UserData",
+            &mut home,
+            &TravelRequest::magic_town(
+                90,
+                TravelParty::Single {
+                    sim_guid: leader_guid,
+                },
+                TravelTransport::MagicHole,
+            ),
+        )
+        .unwrap();
+        let snapshot = store.load_lot_snapshot("UserData", 5).unwrap().unwrap();
+        let record = decode_travel_envelope(snapshot.saved_lot.as_deref().unwrap()).unwrap();
+        assert_eq!(record.departure_tokens, [], "a group trip writes none");
+        let session = departed.session;
+        let mut lot = departed.destination_lot;
+        let traveler = person_with_guid(&lot.world, leader_guid).unwrap();
+        ask_for_trip(&mut lot, traveler, -1, 0, 30, 0);
+        assert!(!saved_state_tokens(&lot.world, leader_nid).is_empty());
+
+        // The shell's session names another neighbor record for the
+        // caller; the persisted roster's is the one routine 20 takes from.
+        let companion = members[2 % members.len()];
+        let other_nid = lot.world.neighbors.first_of(members[1]).unwrap().id;
+        for nid in [leader_nid, other_nid] {
+            set_neighbor_token_count(
+                &mut lot.world,
+                nid,
+                trip::HOMEBOUND_COMPANION_KIND,
+                companion,
+                2,
+            );
+        }
+        let mut forged = session.clone();
+        forged.travelers[0].neighbor_id = other_nid;
+        let returned =
+            return_from_request(&root, &store, &forged, &mut lot, &[3], Frames::default()).unwrap();
+        let world = &returned.home_lot.world;
+        assert_eq!(saved_state_tokens(world, leader_nid), []);
+        assert_eq!(
+            tokens_of(world, leader_nid, trip::HOMEBOUND_COMPANION_KIND),
+            [(companion, 1)]
+        );
+        assert_eq!(
+            tokens_of(world, other_nid, trip::HOMEBOUND_COMPANION_KIND),
+            [(companion, 2)]
+        );
+        let stored = store.load_neighborhood("UserData").unwrap().unwrap();
+        assert_eq!(
+            stored_tokens(&stored, leader_nid, trip::SAVED_STATE_KIND),
+            []
+        );
     }
 
     /// A lone traveler holding a companion's kind-1 token would have

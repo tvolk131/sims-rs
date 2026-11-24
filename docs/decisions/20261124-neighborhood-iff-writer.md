@@ -140,8 +140,9 @@ adds no fields to it. A save needs things the store doesn't keep:
   written while it trims to the stored one.
 
 They go in a separate `SaveInputs`, which `SaveInputs::from_saved` reads
-from an earlier save. Keeping FAMh in REDB needs a store migration, which
-is a follow-up.
+from an earlier save. The store now keeps them in their own table, with
+no record migration
+([save inputs in the store](20261124-neighborhood-save-inputs-and-active-trait.md)).
 
 ## Family 0
 
@@ -170,10 +171,9 @@ still reads them, but the result isn't what the original read:
 The project hasn't shipped, so only development stores can hold these
 records. Importing the folder again restores them.
 
-`Neighborhood::open` itself still fails on a family 0 whose secondary
-house, taken as a count, runs past the chunk. The fix belongs in
-sims-content's reader (`Family::parse_chunk` with the chunk ID), which is
-outside this change.
+`Neighborhood::open` now reads FAMI by chunk ID itself, and the import's
+re-read is gone
+([save inputs in the store](20261124-neighborhood-save-inputs-and-active-trait.md)).
 
 The lot-dependent updates in steps 2 and 5, and 0x427bd7, are
 writeback, not serialization. `StoredNeighborhood::write_back_world`
