@@ -30,6 +30,7 @@ mod neighbors;
 mod object_type;
 mod object_uses;
 mod objects;
+mod outfit_editor;
 mod person_factory;
 mod portrait;
 mod presentation;
