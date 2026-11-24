@@ -9466,6 +9466,73 @@ fn build_mode_walls_floors_wallpaper_doors_windows_and_undo_redo() {
 /// carries its plate (object 263, his slot 0) away from the fridge at
 /// chest height, inside his own figure; on his tile's floor it would sit
 /// at the bottom of it.
+/// Nothing a Sim carries is drawn on the floor. The person's draw
+/// (`0x459dc0`) draws what its slots 0, 2, 3 and 4 hold at an attach
+/// point (`0x59185d`), and only there. Mortimer goes for a snack and the
+/// household plays on by free will for 6,000 ticks. Every tenth tick's
+/// frame, each object in a drawn
+/// slot of a Sim the camera shows has that Sim's point for the slot, so
+/// the held pass places it at the hand, the pelvis or the head, never at
+/// the holder's own position on the floor.
+#[test]
+fn what_the_sims_carry_is_never_drawn_on_the_floor() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(50), 50);
+    game.resize([800, 600]);
+    game.render();
+    let (_, snack, _) = snack_pie(&mut game);
+    game.press(snack);
+    game.release(snack);
+    let mut held_frames = 0;
+    let mut carried = std::collections::BTreeSet::new();
+    for _ in 0..600 {
+        assert_eq!(game.run(10), 10);
+        game.render();
+        let attach = game.held_attach();
+        let floor = game.level();
+        let world = game.lot().world();
+        for object in world.objects.values() {
+            let (holder, slot) = (object.data[2], object.data[3]);
+            let Some(holder) = u16::try_from(holder)
+                .ok()
+                .filter(|&h| h != 0)
+                .and_then(|h| world.objects.get(&h))
+            else {
+                continue;
+            };
+            // Slot 1 is not drawn by the person (0x459dc0 skips it), and a
+            // Sim off the lot or above the floor shown is not drawn at all.
+            let [x, y, level] = holder.position;
+            if holder.person.is_none()
+                || !matches!(slot, 0 | 2 | 3 | 4)
+                || x < 0
+                || y < 0
+                || level > floor
+            {
+                continue;
+            }
+            let point = attach
+                .get(&holder.id)
+                .and_then(|a| a.for_slot(slot as usize));
+            assert!(
+                point.is_some(),
+                "tick {}: object {} in person {}'s slot {slot} has no attach point",
+                game.lot().ticks(),
+                object.id,
+                holder.id
+            );
+            held_frames += 1;
+            carried.insert(object.id);
+        }
+    }
+    eprintln!("{held_frames} held object-frames, objects {carried:?}, none without a point");
+    assert!(carried.contains(&263), "Mortimer never carried the snack");
+    assert!(held_frames >= 20, "{held_frames} held frames");
+}
+
 #[test]
 fn a_carried_snack_is_drawn_in_the_carriers_hand() {
     let Some(install) = install() else {

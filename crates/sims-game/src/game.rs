@@ -4260,11 +4260,7 @@ impl Game {
         // What a Sim holds is drawn at the Sim's attach points (a carried
         // plate in the right palm), after the people and depth-tested, as
         // the person's own draw does (0x459dc0 → 0x59185d).
-        let attach = if self.open_pack_mode {
-            std::collections::BTreeMap::new()
-        } else {
-            self.people.held_attach(&self.view.camera)
-        };
+        let attach = self.held_attach();
         sims_render::draw_held_with_attach(
             world,
             draw_shape,
@@ -4524,6 +4520,17 @@ impl Game {
     /// The canvas last drawn.
     pub fn canvas(&self) -> &Canvas {
         &self.canvas
+    }
+
+    /// Where each person the last [`Game::render`] drew draws what they
+    /// hold: their attach points ([`sims_render::PersonAttach`]), as the
+    /// held pass took them. Empty in open-pack mode, whose sprite Sims have
+    /// no hands.
+    pub fn held_attach(&self) -> BTreeMap<u16, sims_render::PersonAttach> {
+        if self.open_pack_mode {
+            return BTreeMap::new();
+        }
+        self.people.held_attach(&self.drawn_camera)
     }
 
     /// Passes the house view's screen-centre pick (`0x4a7b58` over the active
