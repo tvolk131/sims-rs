@@ -410,15 +410,16 @@ fn a_renamed_local_holding_another_value_is_not_equivalent() {
     );
 }
 
-/// Slot numbers another primitive names (Random's destination here) stay put.
+/// Slot numbers another primitive names where the renaming does not rewrite them (Set
+/// Balloon/Headline's local, `ops[0] >> 1`) stay put. (Random Number's destination is
+/// renamed: see `tests/equiv_round2.rs`.)
 #[test]
 fn a_local_another_primitive_names_is_not_renamed() {
-    let random_into = |slot: i16| {
+    let headline_from = |slot: i16| {
         let mut ops = [0u8; 8];
-        ops[0..2].copy_from_slice(&slot.to_le_bytes());
-        ops[2] = LOCAL;
-        ops[4] = 10;
-        ops[6] = LIT;
+        ops[0..2].copy_from_slice(&(slot << 1).to_le_bytes());
+        ops[2] = 2;
+        ops[3] = 7;
         ops
     };
     let body = |slot: i16| {
@@ -427,8 +428,8 @@ fn a_local_another_primitive_names_is_not_renamed() {
             0,
             4,
             vec![
-                prim(8, random_into(slot), 1, 1),
-                expr((TEMP, 0), SET, (LOCAL, slot), T, T),
+                expr((LOCAL, slot), SET, (LIT, 7), 1, 1),
+                prim(41, headline_from(slot), T, T),
             ],
         )
     };

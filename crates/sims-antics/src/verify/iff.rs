@@ -11,6 +11,8 @@
 //! only, never their contents.
 
 use super::domains::{ParamDomain, ParamDomains};
+use super::live::{overwrites_last_result_first, params_written_first};
+use super::text::TextLocals;
 use super::{
     EquivMethod, EquivOptions, EquivResult, LiveContext, LiveOptions, bhav_param_limit,
     check_bhav_equivalent_combined, context_mismatch, is_always_true_instruction,
@@ -224,16 +226,31 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
     if !report.file_problems.is_empty() {
         return Ok(report);
     }
-    let ctx = |iff: &Iff| LiveContext {
+    // The structure check leaves the same chunks, in the same order, on both sides.
+    let (trees_a, trees_b) = (lift_all(&iff_a), lift_all(&iff_b));
+    let common_dead = common_dead_args(
+        dead_args(
+            &trees_a,
+            &arities(&iff_a, &opts.extra_arities),
+            opts.live.behavioral,
+        ),
+        &dead_args(
+            &trees_b,
+            &arities(&iff_b, &opts.extra_arities),
+            opts.live.behavioral,
+        ),
+    );
+    let ctx = |iff: &Iff, trees: &BTreeMap<u16, BhavChunk>| LiveContext {
+        dead_args: Some(common_dead.clone()),
         callee_arities: Some(arities(iff, &opts.extra_arities)),
         my_attribute_count: opts.my_attribute_count,
         local_bcons: Some(bcons(iff)),
         argless_callees: Some(argless(iff, &opts.extra_argless, &opts.extra_arities)),
         param_domains: opts.param_domains.clone(),
+        text_locals: Some(TextLocals::from_iff(iff)),
+        last_result_overwriters: Some(last_result_overwriters(trees)),
     };
-    let (ctx_a, ctx_b) = (ctx(&iff_a), ctx(&iff_b));
-    // The structure check leaves the same chunks, in the same order, on both sides.
-    let (trees_a, trees_b) = (lift_all(&iff_a), lift_all(&iff_b));
+    let (ctx_a, ctx_b) = (ctx(&iff_a, &trees_a), ctx(&iff_b, &trees_b));
     // The trees a call can reach in the file: only private ones. A call to any other ID
     // runs a library tree, which [`tree_reach`] treats as opaque.
     let ids: BTreeSet<u16> = iff_a
@@ -288,6 +305,15 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
     if !opts.live.observe_fault_last_result {
         report.assumptions.push(
             "a path that faults is compared without the last branch result it leaves              (--ignore-fault-last-result): nothing reads it after the fault, although              play-mode recovery keeps it in the object's rebuilt frame and copies it into              a reset person's last-action flags"
+                .to_owned(),
+        );
+    }
+    if !opts.live.observe_fault_scratch_pointer {
+        report.assumptions.push(
+            "a path that faults is compared without the scratch-pointer state it leaves \
+             (--ignore-fault-scratch-pointer): nothing reads it after the fault, although \
+             the object keeps it and its next Expression or UI Effect reading Global 34 \
+             observes it"
                 .to_owned(),
         );
     }
@@ -713,6 +739,59 @@ pub(crate) fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync)
 }
 
 /// Every `BHAV` of the file that lifts, by ID.
+/// The private trees of `trees` a call runs from their first node, and whose first node
+/// sets the last branch result before anything reads it
+/// ([`LiveContext::last_result_overwriters`]).
+fn last_result_overwriters(trees: &BTreeMap<u16, BhavChunk>) -> BTreeSet<u16> {
+    trees
+        .iter()
+        .filter(|&(&id, tree)| {
+            runs_from_own_file(id)
+                && tree.kind != 4
+                && tree
+                    .instructions
+                    .first()
+                    .is_some_and(|ins| overwrites_last_result_first(ins.opcode, &ins.operands))
+        })
+        .map(|(&id, _)| id)
+        .collect()
+}
+
+/// The private trees of a file whose callers' arguments they partly overwrite unseen
+/// ([`LiveContext::dead_args`]): only trees whose argument count is the one the VM's
+/// loader keeps for the ID (`arities`).
+fn dead_args(
+    trees: &BTreeMap<u16, BhavChunk>,
+    arities: &BTreeMap<u16, usize>,
+    behavioral: bool,
+) -> BTreeMap<u16, BTreeSet<usize>> {
+    trees
+        .iter()
+        .filter(|&(&id, tree)| {
+            runs_from_own_file(id)
+                && tree.kind != 4
+                && arities.get(&id) == Some(&usize::from(tree.args))
+        })
+        .map(|(&id, tree)| (id, params_written_first(tree, behavioral)))
+        .filter(|(_, dead)| !dead.is_empty())
+        .collect()
+}
+
+/// The arguments both files' callees overwrite unseen: each side's set is sound for that
+/// side, and so is any part of it, while the call events the two sides record must agree
+/// on which arguments they leave out ([`super::live::FrameVal`]'s `CallArgs`).
+fn common_dead_args(
+    a: BTreeMap<u16, BTreeSet<usize>>,
+    b: &BTreeMap<u16, BTreeSet<usize>>,
+) -> BTreeMap<u16, BTreeSet<usize>> {
+    a.into_iter()
+        .filter_map(|(id, dead)| {
+            let both: BTreeSet<usize> = dead.intersection(b.get(&id)?).copied().collect();
+            (!both.is_empty()).then_some((id, both))
+        })
+        .collect()
+}
+
 fn lift_all(iff: &Iff) -> BTreeMap<u16, BhavChunk> {
     iff.chunks
         .iter()
@@ -930,27 +1009,24 @@ pub fn check_tree_with_callees(
     };
     let parsed = |file: Option<&[u8]>| file.and_then(|f| Iff::parse(f.to_vec()).ok());
     let (iff_a, iff_b) = (parsed(file_a), parsed(file_b));
+    // The trees and arities a side's file is given with drive its summaries, dead
+    // arguments and last-result overwriters, so they must be what the VM loads from it.
+    for (side, file, iff, trees, arity) in [
+        ("A", file_a, &iff_a, a, arities.0),
+        ("B", file_b, &iff_b, b, arities.1),
+    ] {
+        let problem = match (file, iff) {
+            (None, _) => None,
+            (Some(_), None) => Some("its file does not parse".to_owned()),
+            (Some(_), Some(iff)) => given_differs_from_file(trees, arity, iff),
+        };
+        if let Some(problem) = problem {
+            return inconclusive(format!("side {side}: {problem}"));
+        }
+    }
     // Constant tables only when both sides have a file; a run that may read them then
     // needs the two files to match outside BHAV bodies (below).
     let both = iff_a.is_some() && iff_b.is_some();
-    // A private callee reads no operand bytes when this side's argument count for it
-    // is 0 and this side's tree is not indexed. Library trees are not known here.
-    let ctx = |arities: &BTreeMap<u16, usize>,
-               trees: &BTreeMap<u16, BhavChunk>,
-               iff: &Option<Iff>| LiveContext {
-        callee_arities: Some(arities.clone()),
-        local_bcons: iff.as_ref().filter(|_| both).map(bcons),
-        argless_callees: Some(
-            arities
-                .iter()
-                .filter(|&(id, &n)| {
-                    n == 0 && runs_from_own_file(*id) && trees.get(id).is_some_and(|t| t.kind != 4)
-                })
-                .map(|(&id, _)| id)
-                .collect(),
-        ),
-        ..LiveContext::default()
-    };
     if let Some(why) = not_run_from_file(root) {
         return inconclusive(why);
     }
@@ -962,6 +1038,31 @@ pub fn check_tree_with_callees(
             .collect()
     };
     let (arities_a, arities_b) = (private(arities.0), private(arities.1));
+    let common_dead = common_dead_args(
+        dead_args(a, &arities_a, live.behavioral),
+        &dead_args(b, &arities_b, live.behavioral),
+    );
+    // A private callee reads no operand bytes when this side's argument count for it
+    // is 0 and this side's tree is not indexed. Library trees are not known here.
+    let ctx = |arities: &BTreeMap<u16, usize>,
+               trees: &BTreeMap<u16, BhavChunk>,
+               iff: &Option<Iff>| LiveContext {
+        callee_arities: Some(arities.clone()),
+        local_bcons: iff.as_ref().filter(|_| both).map(bcons),
+        text_locals: iff.as_ref().map(TextLocals::from_iff),
+        last_result_overwriters: Some(last_result_overwriters(trees)),
+        dead_args: Some(common_dead.clone()),
+        argless_callees: Some(
+            arities
+                .iter()
+                .filter(|&(id, &n)| {
+                    n == 0 && runs_from_own_file(*id) && trees.get(id).is_some_and(|t| t.kind != 4)
+                })
+                .map(|(&id, _)| id)
+                .collect(),
+        ),
+        ..LiveContext::default()
+    };
     let (ctx_a, ctx_b) = (ctx(&arities_a, a, &iff_a), ctx(&arities_b, b, &iff_b));
     let (Some(ra), Some(rb)) = (a.get(&root), b.get(&root)) else {
         return inconclusive(format!("tree #{root} is not defined on both sides"));
@@ -1030,6 +1131,43 @@ pub fn check_tree_with_callees(
         }
     }
     first
+}
+
+/// Why the private trees and arities given for a side differ from the ones the VM
+/// loads from its file `iff` ([`vm_kept_bhavs`], [`arities`]), or `None` when each
+/// given one is the file's. A tree or an arity left out is unknown, which every
+/// checker already treats as a possible difference.
+fn given_differs_from_file(
+    trees: &BTreeMap<u16, BhavChunk>,
+    arities_given: &BTreeMap<u16, usize>,
+    iff: &Iff,
+) -> Option<String> {
+    let kept: BTreeMap<u16, &Chunk> = vm_kept_bhavs(iff)
+        .chunks
+        .into_iter()
+        .map(|c| (c.id, c))
+        .collect();
+    for (&id, given) in trees.iter().filter(|&(&id, _)| runs_from_own_file(id)) {
+        let Some(chunk) = kept.get(&id) else {
+            return Some(format!("tree #{id} is given but not in its file"));
+        };
+        match lift(iff, chunk) {
+            Ok(file_tree) if same_tree_bytes(given, &file_tree) => {}
+            Ok(_) => return Some(format!("tree #{id} is not the one its file holds")),
+            Err(e) => return Some(format!("tree #{id} of its file does not lift: {e}")),
+        }
+    }
+    let loaded = arities(iff, &BTreeMap::new());
+    arities_given
+        .iter()
+        .filter(|&(&id, _)| runs_from_own_file(id))
+        .find(|&(id, n)| loaded.get(id) != Some(n))
+        .map(|(id, n)| {
+            format!(
+                "tree #{id} is given {n} argument(s), and its file's has {:?}",
+                loaded.get(id)
+            )
+        })
 }
 
 fn has_bhav(iff: &Iff, id: u16) -> bool {

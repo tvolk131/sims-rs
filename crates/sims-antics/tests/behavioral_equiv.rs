@@ -652,8 +652,9 @@ fn read_diamonds_merge_at_cuts() {
 // What the behavioral relation still observes
 // ============================================================================
 
-/// An extra `Expression` before a primitive sets the scratch pointer the primitive may
-/// read; an extra branch changes the last result. Both stay observable.
+/// An extra `Expression` before a primitive sets the scratch pointer and changes the last
+/// result. Play Sound cannot read the scratch pointer, so that is compared where it can be
+/// read: at the exit, and at the sound's fault. Both stay observable.
 #[test]
 fn scratch_pointer_and_last_result_stay_observed() {
     let a = tree(4096, 0, 0, vec![sound(1, T)]);
@@ -663,16 +664,16 @@ fn scratch_pointer_and_last_result_stay_observed() {
         0,
         vec![expr((TEMP, 0), SET, (TEMP, 0), 1, 1), sound(1, T)],
     );
-    assert_inconclusive_because(&live(&a, &b, &behavioral()), "scratch-pointer");
+    assert_inconclusive_because(&live(&a, &b, &behavioral()), "last branch result");
     let relaxed = LiveOptions {
-        observe_scratch_pointer: false,
+        observe_last_result: false,
         ..behavioral()
     };
-    assert_inconclusive_because(&live(&a, &b, &relaxed), "last branch result");
+    assert_inconclusive_because(&live(&a, &b, &relaxed), "scratch-pointer");
     // Ignoring both still leaves the sound's fault: a failing primitive leaves the
     // scratch pointer and the last result behind.
     let relaxed = LiveOptions {
-        observe_last_result: false,
+        observe_scratch_pointer: false,
         ..relaxed
     };
     assert_inconclusive_because(&live(&a, &b, &relaxed), "scratch-pointer state at exit");
