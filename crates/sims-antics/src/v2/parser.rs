@@ -3037,11 +3037,18 @@ impl Parser {
         let ispan = self.span();
         if let Some(iter) = self.try_parse_range_iter()? {
             let body = self.parse_block()?;
+            if self.eat_ident("else") {
+                return Err(Error::at(
+                    self.span(),
+                    "'for ... else' requires an object iterator",
+                ));
+            }
             return Ok(V2Stmt::ForEach {
                 span,
                 binding,
                 iter,
                 body,
+                else_body: None,
             });
         }
         let (src, _) = self
@@ -3106,11 +3113,17 @@ impl Parser {
             }
         };
         let body = self.parse_block()?;
+        let else_body = if self.eat_ident("else") {
+            Some(self.parse_block()?)
+        } else {
+            None
+        };
         Ok(V2Stmt::ForEach {
             span,
             binding,
             iter,
             body,
+            else_body,
         })
     }
 
