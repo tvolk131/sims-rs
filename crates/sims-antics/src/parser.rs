@@ -2,8 +2,8 @@
 
 use crate::ast::{
     AssignOp, BconDecl, Branches, CallTarget, CompareOp, Condition, Item, LocalRef, Module,
-    Operand, OperandRef, PrimitiveCall, SlotSpec, Stmt, StrDecl, StrEntryDecl, StringRef, Target,
-    TreeDecl, TreeHeader,
+    Operand, OperandPad, OperandRef, PrimitiveCall, SlotSpec, Stmt, StrDecl, StrEntryDecl,
+    StringRef, Target, TreeDecl, TreeHeader,
 };
 use crate::error::{Error, Result, Span};
 use crate::lexer::{Token, TokenKind, tokenize};
@@ -1206,6 +1206,22 @@ impl Parser {
                 }
                 PrimitiveCall::GetDirectionTo { dst, flags, from }
             }
+            "breakpoint"
+                if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "invalid_scope")
+                    && self.peek_at(1).kind == TokenKind::Colon =>
+            {
+                self.bump();
+                self.expect(&TokenKind::Colon, "':'")?;
+                let scope = self.expect_u16("breakpoint scope word")?;
+                self.expect(&TokenKind::Comma, "','")?;
+                let (key, key_span) = self.expect_ident("'index'")?;
+                if key != "index" {
+                    return Err(Error::at(key_span, "expected 'index:'"));
+                }
+                self.expect(&TokenKind::Colon, "':'")?;
+                let index = self.expect_i16("breakpoint index")?;
+                PrimitiveCall::BreakpointInvalidScope { scope, index }
+            }
             "breakpoint" => {
                 let cond = if self.peek().kind == TokenKind::RParen {
                     OperandRef::Direct(Operand::literal(1))
@@ -2178,7 +2194,33 @@ impl Parser {
             }
         };
         self.expect(&TokenKind::RParen, "')'")?;
+        if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "pad") {
+            self.bump();
+            let pad = self.parse_operand_pad()?;
+            return Ok(PrimitiveCall::Padded {
+                call: Box::new(prim),
+                pad,
+            });
+        }
         Ok(prim)
+    }
+
+    /// `pad 0xNN` or `pad(i: 0xNN, ...)` after a primitive call (the `pad` is eaten).
+    fn parse_operand_pad(&mut self) -> Result<OperandPad> {
+        if !self.eat(&TokenKind::LParen) {
+            return Ok(OperandPad::Fill(self.expect_u8("pad byte value")?));
+        }
+        let mut bytes = Vec::new();
+        loop {
+            let index = self.expect_u8("pad byte index")?;
+            self.expect(&TokenKind::Colon, "':'")?;
+            bytes.push((index, self.expect_u8("pad byte value")?));
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RParen, "')'")?;
+        Ok(OperandPad::Bytes(bytes))
     }
 
     fn parse_temp_slot(&mut self, span: Span) -> Result<u8> {
@@ -2469,6 +2511,7 @@ impl Parser {
                 | "get_distance_to"
                 | "get_direction_to"
                 | "breakpoint"
+                | "expr"
                 | "idle_for_input"
                 | "stop_all_sounds"
                 | "set_motive_change"

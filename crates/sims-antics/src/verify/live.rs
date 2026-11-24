@@ -104,6 +104,30 @@ pub struct LiveContext {
     /// is a private tree (`4096..=8191`), reads of the owner's tuning constants
     /// (scope 26, tables `0..64`, `sims-vm/src/interpreter.rs:713`) fold to literals.
     pub local_bcons: Option<BTreeMap<u16, Vec<i16>>>,
+    /// Trees a call can name that take no arguments and are not indexed (kind 4). A
+    /// call to one reads none of its operand bytes (`interpreter.rs:1539`: no argument
+    /// words, and `entry_node` ignores the entry for other kinds), so the checker
+    /// compares any spelling of them as `[0xFF; 8]`, when `callee_arities` agrees
+    /// ([`LiveContext::call_reads_no_operands`]).
+    pub argless_callees: Option<BTreeSet<u16>>,
+}
+
+impl LiveContext {
+    /// Whether a call to tree `id` reads none of its operand bytes: `argless_callees`
+    /// lists it and `callee_arities` agrees it takes no arguments. A context that lists
+    /// a tree with no count, or with a count above 0, gets its operands compared.
+    pub(crate) fn call_reads_no_operands(&self, id: u16) -> bool {
+        id >= 256
+            && self
+                .argless_callees
+                .as_ref()
+                .is_some_and(|set| set.contains(&id))
+            && self
+                .callee_arities
+                .as_ref()
+                .and_then(|arities| arities.get(&id))
+                == Some(&0)
+    }
 }
 
 impl Default for LiveContext {
@@ -112,6 +136,7 @@ impl Default for LiveContext {
             callee_arities: None,
             my_attribute_count: GUARANTEED_ATTRIBUTES,
             local_bcons: None,
+            argless_callees: None,
         }
     }
 }
@@ -186,6 +211,10 @@ enum SymKey {
     Cell(u32, Cell),
     /// The value an opaque read returned; `prefix` is the read event.
     EventValue(u32),
+    /// The running frame's stack object at the start of epoch `prefix`. Only an event
+    /// changes it: an `Expression` writing scope 10 is an opaque write, and every
+    /// primitive and call ends its epoch.
+    StackObject(u32),
     /// A frame slot after event `prefix` that may have written it; it was `old` before.
     FrameMaybe(u32, u8, i16, Val),
     /// An arithmetic `Expression` operator applied to two values.
@@ -226,6 +255,9 @@ enum EventKind {
         unknown_arity_suffix: Option<Vec<u8>>,
         /// The called tree's argument count in this side's file, for subroutine calls.
         callee_arity: Option<usize>,
+        /// Whether this side's file says the called tree reads no operand bytes, so
+        /// `operands` is the normalized `[0xFF; 8]` ([`LiveContext::argless_callees`]).
+        argless: bool,
         /// `(params, locals)` of the running frame. Frame storage is one word stack,
         /// so a tree the primitive runs (a call, or a callback such as a routing door
         /// tree or Idle For Input's interaction) starts after this frame and its
@@ -380,6 +412,7 @@ impl Interner {
                 SymKey::Cell(p, Cell::Temp(i)) => format!("temp[{i}]@epoch{p}"),
                 SymKey::Cell(p, Cell::Attr(i)) => format!("my.attr[{i}]@epoch{p}"),
                 SymKey::EventValue(p) => format!("read#{p}"),
+                SymKey::StackObject(p) => format!("stack_obj@epoch{p}"),
                 SymKey::FrameMaybe(p, s, i, _) => format!("frame({s},{i})@event{p}"),
                 SymKey::Op(..) if depth >= 3 => format!("t{id}"),
                 SymKey::Op(op, a, b) => format!(
@@ -824,7 +857,7 @@ impl Explorer<'_> {
         FaultPoint {
             tree: self.bhav.id,
             node,
-            instruction: ins.map(|i| (i.opcode, i.operands)),
+            instruction: ins.map(|i| (i.opcode, self.operands(i))),
             prefix: state.prefix,
             event: None,
             epoch: state.epoch,
@@ -834,6 +867,16 @@ impl Explorer<'_> {
             params: state.params.clone(),
             locals: state.locals.clone(),
             unwritten: state.unwritten.clone(),
+        }
+    }
+
+    /// `ins`'s operands as the VM uses them: `[0xFF; 8]` for a call that reads none
+    /// ([`LiveContext::call_reads_no_operands`]).
+    fn operands(&self, ins: &Instruction) -> [u8; 8] {
+        if self.ctx.call_reads_no_operands(ins.opcode) {
+            [0xFF; 8]
+        } else {
+            ins.operands
         }
     }
 
@@ -1047,6 +1090,12 @@ impl Explorer<'_> {
         out: &mut Vec<Step>,
         interner: &mut Interner,
     ) -> Result<Result<Val, u16>, String> {
+        if scope == 10 && idx == 0 {
+            // The stack object is a field of the running frame (`memory.rs:474`,
+            // `memory.rs:777`): reading it cannot fail and changes nothing, so it is
+            // not an event.
+            return Ok(Ok(interner.sym(SymKey::StackObject(state.epoch))));
+        }
         let loc = self.locate(state, scope, idx)?;
         if let Loc::Trap(code) = loc {
             return Ok(Err(code));
@@ -1443,7 +1492,8 @@ impl Explorer<'_> {
         ins: &Instruction,
         interner: &mut Interner,
     ) -> Result<Vec<Step>, String> {
-        let ops = &ins.operands;
+        let argless = self.ctx.call_reads_no_operands(ins.opcode);
+        let ops = &self.operands(ins);
         let pc = usize::from(state.pc);
         match ins.opcode {
             // Random / GetDirectionTo redirect their store to Global 34 after some
@@ -1561,6 +1611,7 @@ impl Explorer<'_> {
                 inline_args,
                 unknown_arity_suffix,
                 callee_arity,
+                argless,
                 caller_frame: (self.args, self.locals),
             },
             frame,
@@ -2523,6 +2574,7 @@ fn same_shape(a: &EventKind, b: &EventKind) -> bool {
                 inline_args: ia,
                 unknown_arity_suffix: sa,
                 callee_arity: ca,
+                argless: ga,
                 caller_frame: fa,
             },
             EventKind::Primitive {
@@ -2532,9 +2584,19 @@ fn same_shape(a: &EventKind, b: &EventKind) -> bool {
                 inline_args: ib,
                 unknown_arity_suffix: sb,
                 callee_arity: cb,
+                argless: gb,
                 caller_frame: fb,
             },
-        ) => na == nb && oa == ob && xa == xb && ia == ib && sa == sb && ca == cb && fa == fb,
+        ) => {
+            na == nb
+                && oa == ob
+                && xa == xb
+                && ia == ib
+                && sa == sb
+                && ca == cb
+                && ga == gb
+                && fa == fb
+        }
         (
             EventKind::Read {
                 scope: sa, idx: ia, ..
