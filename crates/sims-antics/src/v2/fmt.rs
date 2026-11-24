@@ -699,8 +699,8 @@ fn analyze(toks: &[Tok]) -> Analysis {
         // The statement's `;`, outside every bracket.
         let mut depth = 0usize;
         let mut end = None;
-        for k in eq + 1..n {
-            if toks[k].class == Class::Punct {
+        for (k, tok) in toks.iter().enumerate().take(n).skip(eq + 1) {
+            if tok.class == Class::Punct {
                 match text(k) {
                     "{" | "(" | "[" => depth += 1,
                     "}" | ")" | "]" => {
@@ -795,7 +795,10 @@ fn analyze(toks: &[Tok]) -> Analysis {
     for i in 0..n.saturating_sub(2) {
         if is_punct(i, "@")
             && toks[i + 1].class == Class::Ident
-            && matches!(text(i + 1), "id" | "frame" | "guard_id" | "slot" | "context")
+            && matches!(
+                text(i + 1),
+                "id" | "frame" | "guard_id" | "slot" | "context"
+            )
             && is_punct(i + 2, "(")
             && let Some(c) = partner[i + 2]
         {

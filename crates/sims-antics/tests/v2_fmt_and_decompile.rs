@@ -193,8 +193,10 @@ fn assert_round_trip(name: &str, source: &str) -> String {
 fn synthetic_lamp_round_trips_with_idioms() {
     let source = assert_round_trip("synth-lamp.antics", LAMP);
     for idiom in [
+        // A lifecycle block takes `@frame` only when the default header does not do: `main`
+        // reads `param[0]`.
         "@id(4096) init {",
-        "@id(4097) main {",
+        "@id(4097) @frame(args: 1, locals: 0, format: 0x8002, revision: 0) main {",
         "loop {",
         "if self.attr_0 != 0 {",
         "animate(clip: 3, table: 1, flags: 0, events: 0) |event| {",
@@ -304,7 +306,15 @@ fn zero_local_loops_sounds_and_frame_kinds_round_trip() {
     assert!(!source.contains("set_to_next"), "{source}");
     // Trees without a kind keep the plain frame.
     assert!(
-        source.contains("@id(4302) @frame(args: 0, locals: 0, format: 0x8002, revision: 0) tree"),
+        source.contains("@id(4303) @frame(args: 0, locals: 0, format: 0x8002, revision: 0) tree"),
+        "{source}"
+    );
+    // `census` prefers the Sim context (it reads the stack object's attributes) but `main`
+    // calls it: it is written for either context.
+    assert!(
+        source.contains(
+            "@id(4302) @frame(args: 0, locals: 0, format: 0x8002, revision: 0) @context(inherit) tree"
+        ),
         "{source}"
     );
 }

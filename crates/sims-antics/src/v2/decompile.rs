@@ -201,6 +201,7 @@ pub fn decompile_iff_to_v2_report(
                 // clashes with the rest of the tree.
                 let unblamed = tree.is_none() && plan.drop_all_extras(&generated);
                 if !unblamed
+                    && !tree.is_some_and(|id| plan.add_frame(&model, id))
                     && !tree.is_some_and(|id| plan.drop_extras(id, &generated))
                     && !plan.lower_at_line(&model, &generated, line)
                     // A tree that fails at its lowest level is left out.
@@ -212,7 +213,8 @@ pub fn decompile_iff_to_v2_report(
             Err(Failure::Air { tree, message }) => {
                 let handled = match tree {
                     Some(id) => {
-                        plan.drop_extras(id, &generated)
+                        plan.add_frame(&model, id)
+                            || plan.drop_extras(id, &generated)
                             || plan.lower_tree(&model, id)
                             || model.omit(id, &message)
                     }
@@ -223,17 +225,25 @@ pub fn decompile_iff_to_v2_report(
                 }
             }
             Ok(recompiled) => {
-                let mut changed = false;
                 let mut checks = BTreeMap::new();
+                let mut unproven = Vec::new();
                 for t in model.trees.iter().filter(|t| t.omitted.is_none()) {
                     let check = model.check_tree(t, &recompiled, &mut cache);
-                    let proven = matches!(check, TreeCheck::Identical | TreeCheck::Equivalent);
-                    if !proven
-                        && (plan.drop_extras(t.id, &generated) || plan.lower_tree(&model, t.id))
-                    {
-                        changed = true;
+                    if !matches!(check, TreeCheck::Identical | TreeCheck::Equivalent) {
+                        unproven.push(t.id);
                     }
                     checks.insert(t.id, check);
+                }
+                // A block given its header may be all its callers were missing (a caller is
+                // proven only with its callees), so such a round lowers nothing else.
+                let mut changed = false;
+                for &id in &unproven {
+                    changed |= plan.add_frame(&model, id);
+                }
+                if !changed {
+                    for &id in &unproven {
+                        changed |= plan.drop_extras(id, &generated) || plan.lower_tree(&model, id);
+                    }
                 }
                 if changed {
                     continue;
@@ -649,7 +659,8 @@ impl Model {
         }
         let guid_consts = guid_uses
             .into_iter()
-            .filter(|&(g, n)| n > 1 && g > 0x7FFF)
+            // `lint` asks for a name for any GUID-sized literal (over 0xFFFF).
+            .filter(|&(g, n)| g > 0xFFFF || (n > 1 && g > 0x7FFF))
             .map(|(g, _)| (g, format!("GUID_{g:08X}")))
             .collect();
 
@@ -1992,6 +2003,7 @@ fn prim_guids(p: &PrimitiveCall, out: &mut Vec<u32>) {
     match p {
         PrimitiveCall::TestObjectType { guid, .. }
         | PrimitiveCall::ManageInventory { guid, .. } => out.push(*guid),
+        PrimitiveCall::SetToNext { guid, .. } if *guid != 0 => out.push(*guid),
         PrimitiveCall::Padded { call, .. } => prim_guids(call, out),
         _ => {}
     }
@@ -2082,6 +2094,11 @@ fn builtin_local(s: &Stmt) -> Option<u16> {
             flags,
             ..
         } if flags & 1 != 0 || *i != 0 => Some(u16::from(*i)),
+        PrimitiveCall::SetToNext {
+            mode,
+            local: LocalRef::Index(i),
+            ..
+        } if mode & 0x7F == 9 => Some(u16::from(*i)),
         PrimitiveCall::Relationship {
             direction,
             local: LocalRef::Index(i),
@@ -2135,6 +2152,9 @@ struct Plan {
     raw_stmts: BTreeMap<u16, BTreeSet<usize>>,
     /// `init`/`main` trees written as plain `tree`s.
     standalone: BTreeSet<u16>,
+    /// Lifecycle blocks written with their whole header as `@frame(..)`: those the default
+    /// header does not reproduce.
+    framed: BTreeSet<u16>,
     /// Why the catalog variants are left out (the compiler rejected them).
     variants_off: Option<String>,
     /// Why the `strings` members are left out (the compiler rejected them).
@@ -2142,6 +2162,9 @@ struct Plan {
     /// Trees written without the extra idioms (see [`Translator::extra`]), after a round
     /// that used them was not proven.
     plain: BTreeSet<u16>,
+    /// Trees some caller runs in the other context: written `@context(inherit)` (an extra
+    /// idiom) so that either context may call them.
+    inherit: BTreeSet<u16>,
 }
 
 impl Plan {
@@ -2158,27 +2181,74 @@ impl Plan {
                 (t.id, level)
             })
             .collect();
-        // A lifecycle block always gets the default header, so other formats start plain.
+        // A lifecycle block carries any other header as `@frame(..)`, but never an empty
+        // one (entering a 0-node tree faults; v2 refuses `@frame(empty)` there), so a
+        // 0-node lifecycle tree starts plain.
         let standalone = model
             .trees
             .iter()
+            .filter(|t| t.lifecycle.is_some() && t.original.instructions.is_empty())
+            .map(|t| t.id)
+            .collect();
+        // Formats and kinds the compiler never gives a block by default start with `@frame`;
+        // anything else gets one when the default header does not compile or is not proven
+        // (see `add_frame`).
+        let framed = model
+            .trees
+            .iter()
             .filter(|t| {
-                t.lifecycle.is_some() && (t.original.format != 0x8002 || t.original.kind != 0)
+                let b = &t.original;
+                t.lifecycle.is_some() && (b.format != 0x8002 || b.kind != 0)
             })
             .map(|t| t.id)
             .collect();
+        // A private tree called from a tree of the other context (by the contexts the
+        // trees prefer); never a lifecycle tree or a variant's init/main.
+        let mut inherit = BTreeSet::new();
+        for caller in &model.trees {
+            let Some(body) = &caller.body else {
+                continue;
+            };
+            walk_stmts(body, &mut |s| {
+                if let Some((id, _)) = stmt_call(s)
+                    && let Some(callee) = model.tree(id)
+                    && callee.sim_ctx != caller.sim_ctx
+                    && callee.body.is_some()
+                    && callee.lifecycle.is_none()
+                    && !model.variants.iter().any(|v| v.init == id || v.main == id)
+                {
+                    inherit.insert(id);
+                }
+            });
+        }
         Self {
             styles,
             raw_stmts: BTreeMap::new(),
             standalone,
+            framed,
             variants_off: None,
             strings_off: None,
             plain: BTreeSet::new(),
+            inherit,
         }
+    }
+
+    /// Whether tree `t` is written `@context(inherit)` this round.
+    fn inherits(&self, t: &TreeModel) -> bool {
+        self.inherit.contains(&t.id) && !self.plain.contains(&t.id) && self.level(t).idiomatic()
     }
 
     /// Turns off tree `id`'s extra idioms when the last round used them. `false` when it
     /// did not, so the tree has to move down a style instead.
+    /// Writes lifecycle block `id` with its whole header as `@frame(..)` from now on, when
+    /// it is still written with the default one. Tried before anything else: the header is
+    /// the original's, so it only ever helps.
+    fn add_frame(&mut self, model: &Model, id: u16) -> bool {
+        model.tree(id).is_some_and(|t| t.lifecycle.is_some())
+            && !self.standalone.contains(&id)
+            && self.framed.insert(id)
+    }
+
     fn drop_extras(&mut self, id: u16, generated: &Generated) -> bool {
         generated.extras.contains(&id) && self.plain.insert(id)
     }
@@ -2204,7 +2274,7 @@ impl Plan {
 
     /// Whether the tree is written with `(sim: Sim)` this round.
     fn sim(&self, t: &TreeModel) -> bool {
-        t.sim_ctx && self.level(t) == Level::Idiomatic
+        t.sim_ctx && self.level(t) == Level::Idiomatic && !self.inherits(t)
     }
 
     /// Moves tree `id` one style down. `false` when it is already at its last style.
@@ -2527,8 +2597,26 @@ impl Model {
             let sim = plan.sim(t);
             let as_lifecycle = t.lifecycle.filter(|_| !plan.standalone.contains(&t.id));
             match as_lifecycle {
-                Some(kind) => {
+                Some(kind) if !plan.framed.contains(&t.id) => {
                     out.line(format!("@id({}) {} {{", t.id, kind.keyword()));
+                }
+                Some(kind) => {
+                    // The block keeps the tree's own header, as a plain tree does.
+                    let b = &t.original;
+                    let frame_kind = if b.kind == 0 {
+                        String::new()
+                    } else {
+                        format!(", kind: {}", b.kind)
+                    };
+                    out.line(format!(
+                        "@id({}) @frame(args: {}, locals: {}, format: {:#06x}, revision: {}{frame_kind}) {} {{",
+                        t.id,
+                        b.args,
+                        b.locals,
+                        b.format,
+                        b.revision,
+                        kind.keyword()
+                    ));
                 }
                 None => {
                     if let Some(kind) = t.lifecycle {
@@ -2559,8 +2647,14 @@ impl Model {
                     if b.instructions.is_empty() {
                         kind.push_str(", empty");
                     }
+                    let context = if plan.inherits(t) {
+                        extras.insert(t.id);
+                        " @context(inherit)"
+                    } else {
+                        ""
+                    };
                     out.line(format!(
-                        "@id({}) @frame(args: {}, locals: {}, format: {:#06x}, revision: {}{kind}) tree {} \"{}\"{ctx} {{",
+                        "@id({}) @frame(args: {}, locals: {}, format: {:#06x}, revision: {}{kind}){context} tree {} \"{}\"{ctx} {{",
                         t.id, b.args, b.locals, b.format, b.revision, t.ident, t.label
                     ));
                 }
@@ -2584,6 +2678,7 @@ impl Model {
                         plan,
                         tree: t,
                         sim,
+                        inherit: as_lifecycle.is_none() && plan.inherits(t),
                         next_id: 0,
                         raw: Vec::new(),
                         raw_count: 0,
@@ -2597,13 +2692,10 @@ impl Model {
                         extras: std::cell::Cell::new(false),
                     };
                     if named_locals > 0 && tr.extra() {
-                        if named_locals > 1 {
-                            // A raw block disables v2's removal of unused declarations.
-                            // The earlier slots must stay allocated even when unread.
-                            out.line("raw { /* Preserve builtin local slot numbers. */ }");
-                        }
+                        // `@slot` pins each word the builtins address by number; the
+                        // build keeps a pinned word in the frame even when nothing names it.
                         for i in 0..named_locals {
-                            out.line(format!("let slot_{i}: i16;"));
+                            out.line(format!("@slot({i}) let slot_{i}: i16;"));
                         }
                     }
                     let body = match tr.hoisted_save {
@@ -2734,6 +2826,39 @@ fn dedent(lines: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// Byte spans of one written v2 line's tokens (identifiers and numbers, strings, single
+/// punctuation), or `None` for a line with a comment.
+fn ladder_tokens(line: &str) -> Option<Vec<std::ops::Range<usize>>> {
+    let b = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let from = i;
+        if c == b'"' {
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            i = (i + 1).min(b.len());
+        } else if c == b'/' && b.get(i + 1).is_some_and(|n| matches!(n, b'/' | b'*')) {
+            return None;
+        } else if c.is_ascii_alphanumeric() || c == b'_' {
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+        } else {
+            i += line[i..].chars().next().map_or(1, char::len_utf8);
+        }
+        out.push(from..i);
+    }
+    Some(out)
+}
+
 fn write_raw_block(out: &mut Out, lines: &[String]) {
     if lines.is_empty() {
         return;
@@ -2752,6 +2877,9 @@ struct Translator<'a> {
     plan: &'a Plan,
     tree: &'a TreeModel,
     sim: bool,
+    /// `@context(inherit)`: the runner's cells are `me.*` and the stack object's
+    /// `stack_obj.*`; `self` and `sim` are not written.
+    inherit: bool,
     /// Pre-order index of the next statement.
     next_id: usize,
     /// Pending raw lines, merged into one `raw { ... }` block.
@@ -2897,6 +3025,7 @@ impl Translator<'_> {
                 let start = out.lines.len();
                 out.line(format!("if {c} {{"));
                 self.if_rest(id, start, then_body, else_body, out);
+                self.constant_ladder(id, start, out);
             }
             Stmt::While { cond, body, .. } => {
                 let animate = self.animate_loop(cond, body.is_empty());
@@ -3148,6 +3277,129 @@ impl Translator<'_> {
             out.indent -= 1;
         }
         out.line("}");
+        self.record(id, start, out);
+    }
+
+    /// v2 PR H's branch specialization, `const K = if c { a } else { b };`, for an `if`
+    /// whose arms are the same text but for integer literals in value positions: the arms
+    /// become one copy reading `K`, which v2 copies per arm again. v2 copies the statements
+    /// up to the last one naming `K` and joins after them, so the arm's last statement
+    /// must name it; and the arm declares no `let`, which the copy would leave in scope
+    /// after the join. Lines `start..` are the written `if`; rewritten in place when it
+    /// applies.
+    fn constant_ladder(&mut self, id: usize, start: usize, out: &mut Out) {
+        let lines = &out.lines[start..];
+        let Some(head) = lines.first() else {
+            return;
+        };
+        let indent = head.len() - head.trim_start().len();
+        let Some(cond) = head
+            .trim_start()
+            .strip_prefix("if ")
+            .and_then(|h| h.strip_suffix(" {"))
+        else {
+            return;
+        };
+        // The `if`'s own lines: the header, `} else {` and the closing `}`.
+        let own: Vec<usize> = (1..lines.len())
+            .filter(|&k| lines[k].len() - lines[k].trim_start().len() <= indent)
+            .collect();
+        let [mid, end] = own[..] else {
+            return;
+        };
+        if lines[mid].trim() != "} else {" || lines[end].trim() != "}" || end + 1 != lines.len() {
+            return;
+        }
+        let (then_arm, else_arm) = (&lines[1..mid], &lines[mid + 1..end]);
+        if then_arm.is_empty()
+            || then_arm.len() != else_arm.len()
+            || then_arm.iter().any(|l| {
+                let t = l.trim_start();
+                l.contains("raw {") || t.starts_with('@') || t.starts_with("let ") || t.is_empty()
+            })
+        {
+            return;
+        }
+        // The first line of the arm's last statement.
+        let arm_indent = indent + 4;
+        let last_stmt = then_arm
+            .iter()
+            .rposition(|l| {
+                l.len() - l.trim_start().len() == arm_indent && !l.trim_start().starts_with('}')
+            })
+            .unwrap_or(0);
+        // (line, byte span, then value, else value) per differing literal.
+        let mut holes: Vec<(usize, std::ops::Range<usize>, String, String)> = Vec::new();
+        for (k, (a, b)) in then_arm.iter().zip(else_arm).enumerate() {
+            let (Some(ta), Some(tb)) = (ladder_tokens(a), ladder_tokens(b)) else {
+                return;
+            };
+            if ta.len() != tb.len() {
+                return;
+            }
+            for (n, (ra, rb)) in ta.iter().zip(&tb).enumerate() {
+                let (x, y) = (&a[ra.clone()], &b[rb.clone()]);
+                if x == y {
+                    continue;
+                }
+                let value = |t: &str| t.starts_with(|c: char| c.is_ascii_digit());
+                let before = n.checked_sub(1).map(|p| &a[ta[p].clone()]);
+                let after = ta.get(n + 1).map(|r| &a[r.clone()]);
+                // A value operand only: not an index, a field, a negation, a pattern or
+                // a named argument's key.
+                if !value(x)
+                    || !value(y)
+                    || matches!(before, Some("[" | "." | "-" | "@"))
+                    || matches!(after, Some("=" | ":" | "[" | "."))
+                {
+                    return;
+                }
+                holes.push((k, ra.clone(), x.to_owned(), y.to_owned()));
+            }
+        }
+        if holes.is_empty()
+            || holes.len() > 4
+            || !holes.iter().any(|h| h.0 >= last_stmt)
+            || !self.extra()
+        {
+            return;
+        }
+        let names: Vec<String> = if holes.len() == 1 {
+            vec![format!("ARM_{id}")]
+        } else {
+            (0..holes.len())
+                .map(|n| format!("ARM_{id}_{}", (b'A' + n as u8) as char))
+                .collect()
+        };
+        let tuple = |values: Vec<&str>| {
+            if values.len() == 1 {
+                values[0].to_owned()
+            } else {
+                format!("({})", values.join(", "))
+            }
+        };
+        let binding = tuple(names.iter().map(String::as_str).collect());
+        let then_values = tuple(holes.iter().map(|h| h.2.as_str()).collect());
+        let else_values = tuple(holes.iter().map(|h| h.3.as_str()).collect());
+        let pad = " ".repeat(indent);
+        let mut region: Vec<String> = then_arm
+            .iter()
+            .map(|l| l.strip_prefix("    ").unwrap_or(l).to_owned())
+            .collect();
+        for ((k, span, _, _), name) in holes.iter().zip(&names).rev() {
+            // The arm lines lost one indent level: four bytes.
+            let span = span.start - 4..span.end - 4;
+            region[*k].replace_range(span, name);
+        }
+        let mut rewritten = vec![format!(
+            "{pad}const {binding} = if {cond} {{ {then_values} }} else {{ {else_values} }};"
+        )];
+        rewritten.extend(region);
+        out.lines.truncate(start);
+        out.lines.extend(rewritten);
+        // The statements inside are one statement now: a failure there writes the `if` raw.
+        self.ranges
+            .retain(|r| r.tree != self.tree.id || r.start < start);
         self.record(id, start, out);
     }
 
@@ -3659,6 +3911,11 @@ impl Translator<'_> {
                 target: Target::ReturnTrue,
                 ..
             } => Some("return true;".to_owned()),
+            // An animation event handler is a closure: `return` there is v2's to place.
+            Stmt::Return {
+                target: Target::Error,
+                ..
+            } if !self.in_handler => Some("return error;".to_owned()),
             Stmt::Return {
                 target: Target::ReturnFalse,
                 ..
@@ -3695,10 +3952,16 @@ impl Translator<'_> {
             let callee = self.model.tree(id)?;
             let standalone = callee.lifecycle.is_none() || self.plan.standalone.contains(&id);
             let callee_sim = self.plan.sim(callee);
-            if callee.omitted.is_some() || !standalone || callee_sim != self.sim {
+            let callee_inherit = self.plan.inherits(callee);
+            // Either context calls an inherit tree; an inherit tree, lowered in both, calls
+            // no other context's tree.
+            let context_ok = callee_inherit || (!self.inherit && callee_sim == self.sim);
+            if callee.omitted.is_some() || !standalone || !context_ok {
                 return None;
             }
-            if self.sim && !pass_temps {
+            // A Sim tree's calls name the Sim first, argless ones too (`f(sim)` is
+            // `call ID(temps)`).
+            if self.sim && !callee_inherit {
                 params.push("sim".to_owned());
             }
             callee.ident.clone()
@@ -3933,6 +4196,7 @@ impl Translator<'_> {
                 };
                 format!("stack_obj.run_functional({function}{icon})")
             }
+            PrimitiveCall::SetToNext { .. } => return self.set_to_next(p),
             PrimitiveCall::Breakpoint { cond } => format!("breakpoint({})", self.rvalue(cond)?),
             PrimitiveCall::Random { dst, range } => {
                 let range = self.rvalue(range)?;
@@ -4081,6 +4345,57 @@ impl Translator<'_> {
         self.extra().then_some(text)
     }
 
+    /// v2 PR H's in-place step, `set_to_next(mode, guid: K, dest: stack_obj)`: one
+    /// primitive that moves the stack object (or, without `dest`, the VM's default cursor).
+    /// Not inside a loop whose cursor is the stack object, which the step would move.
+    fn set_to_next(&self, p: &PrimitiveCall) -> Option<String> {
+        let PrimitiveCall::SetToNext {
+            mode,
+            guid,
+            dest,
+            local,
+        } = p
+        else {
+            return None;
+        };
+        if self.cursor.is_some() || !self.extra() {
+            return None;
+        }
+        // `.air` writes the destination flag (mode bit 7) as the `dest:` operand.
+        let dest = match dest {
+            None => "",
+            Some(d) if is_operand(d, 10, 0) => ", dest: stack_obj",
+            Some(_) => return None,
+        };
+        let base = mode & 0x7F;
+        let word = match base {
+            0 => "all",
+            1 => "person",
+            2 => "non_person",
+            3 => "part",
+            4 => "guid",
+            5 => "neighbor",
+            6 => "category",
+            7 => "neighbor_guid",
+            8 => "on_tile",
+            9 => "beside",
+            10 => "career",
+            12 => "family",
+            _ => return None,
+        };
+        let local = match (base, local) {
+            (9, LocalRef::Index(i)) => format!(", local: {}", self.local_name(u16::from(*i))?),
+            (_, LocalRef::Index(0)) => String::new(),
+            _ => return None,
+        };
+        let guid = if *guid == 0 {
+            String::new()
+        } else {
+            format!(", {}", self.guid(*guid))
+        };
+        Some(format!("set_to_next({word}{guid}{dest}{local})"))
+    }
+
     fn slot_builtin(
         prim: &str,
         slot: u16,
@@ -4126,7 +4441,7 @@ impl Translator<'_> {
             }
             10 if o.index == 0 && self.cursor.is_some() => self.cursor.clone(),
             9 if o.index == 0 && self.in_handler => Some("event".to_owned()),
-            20 if !self.sim && o.index >= 0 && self.extra() => {
+            20 if !self.sim && !self.inherit && o.index >= 0 && self.extra() => {
                 Some(format!("self.slot[{}]", o.index))
             }
             16 if self.sim && o.index >= 0 && self.extra() => {
@@ -4165,7 +4480,7 @@ impl Translator<'_> {
     fn flags_place(&self, r: &OperandRef) -> Option<String> {
         let handle = if is_operand(r, 4, 8) {
             self.cursor.as_deref().unwrap_or("stack_obj")
-        } else if !self.sim && is_operand(r, 3, 8) {
+        } else if !self.sim && !self.inherit && is_operand(r, 3, 8) {
             "self"
         } else {
             return None;
@@ -4196,6 +4511,23 @@ impl Translator<'_> {
                 }
                 10 | 13 | 15 | 27 => return None,
                 _ => {}
+            }
+        }
+        if self.inherit {
+            let cell = match o.scope {
+                0 => Some(("me", "attr")),
+                3 => Some(("me", "data")),
+                14 => Some(("me", "motive")),
+                18 => Some(("me", "person")),
+                20 => Some(("me", "slot")),
+                1 => Some(("stack_obj", "attr")),
+                4 => Some(("stack_obj", "data")),
+                16 => Some(("stack_obj", "slot")),
+                19 if self.person_binding().is_none() => Some(("stack_obj", "person")),
+                _ => None,
+            };
+            if let Some((handle, field)) = cell {
+                return (i <= 255).then(|| format!("{handle}.{field}[{i}]"));
             }
         }
         Some(match (o.scope, self.sim) {

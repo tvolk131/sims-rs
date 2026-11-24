@@ -605,7 +605,9 @@ fn a_slot_pinned_local_is_neither_unread_nor_uninitialized() {
     }
     // An unpinned one still is.
     one(
-        &tree("        let x: i16;\n        self.level = x;\n        x = 3;\n        self.level += x;"),
+        &tree(
+            "        let x: i16;\n        self.level = x;\n        x = 3;\n        self.level += x;",
+        ),
         "uninitialized_local_read",
     );
 }
