@@ -7985,9 +7985,7 @@ mod tests {
             &mut goth,
             &TravelRequest::magic_town(
                 90,
-                TravelParty::WholeFamily {
-                    leader_guid: leader_guid,
-                },
+                TravelParty::WholeFamily { leader_guid },
                 TravelTransport::MagicHole,
             ),
         )
