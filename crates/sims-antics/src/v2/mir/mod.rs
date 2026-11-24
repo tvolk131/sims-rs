@@ -14,15 +14,19 @@
 //!   stray or missing closer rejects the body;
 //! - one simple statement: exactly one `;`, at the end, and no braces.
 //!
-//! A line is rejected (and `parse_body` returns `None`) when it holds `//`, `/*`, `*/`, `->` or
-//! `#`, or when `names_local_slot` holds for it: a raw `op` (except the operand-free spelling
-//! `op N (0, 0, 0, 0, 0, 0, 0, 0)` of the opcodes in `OPERAND_FREE_OPS`), or a `scope(N, ...)`
-//! whose scope is the locals scope (25) or not a literal.
+//! A line is also rejected (and `parse_body` returns `None`) when it holds `//`, `/*`, `*/`, `->`
+//! or `#`, or when [`names_local_slot`] holds for it. That function is the definition; it is a
+//! conservative token scan that errs towards rejecting. Roughly, it rejects any `op` token that
+//! is not a `.field` or an `op:` argument name (so even `let op = 1;`), except the operand-free
+//! spelling `op N (0, 0, 0, 0, 0, 0, 0, 0)` of the opcodes in `OPERAND_FREE_OPS`. It also rejects
+//! a `scope(N, ...)` unless `N` is a decimal or lowercase-`0x` literal other than 25 (the locals
+//! scope).
 //!
-//! An accepted statement keeps its text; [`classify`] gives its typed view. A numbered-local
-//! operand is not rejected and takes part in that view like any other (`local[0] := x;` is an
-//! assignment). A same-line label is also accepted, and its statement classifies as
-//! [`InstKind::Other`] (`done: return true;`).
+//! An accepted statement keeps its whole line as text, and [`classify`] gives its typed view of
+//! that whole line. A numbered-local operand is not rejected and takes part in that view like
+//! any other (`local[0] := x;` is an assignment). A same-line label is not split off: it stays
+//! part of the text `classify` sees, so `done: return true;` is [`InstKind::Other`] while
+//! `done:local[0] := x;` is an assignment to `done:local[0]`.
 //!
 //! The passes that need the tree (the optimizer, `pin_in_place`) leave a rejected body untouched.
 //! The others still run on it: `drop_unread_entry_save` works line by line (checking definitions
@@ -36,7 +40,7 @@
 //! - [`effects`]: `stack_obj` and last-result effects;
 //! - [`liveness`]: local liveness for dead stores, copy forwarding and coalescing;
 //! - [`frame`]: frame allocation (pinned slot, `@slot(N)` placement, local renaming);
-//! - [`entry_save`]: the Sim-tree `stack_obj` entry save;
+//! - [`entry_save`](mod@entry_save): the Sim-tree `stack_obj` entry save;
 //! - [`emit`]: the emitter lowering writes a body through;
 //! - [`pipeline`]: the per-tree backend pipeline from a lowered body to final `.air`.
 //!
