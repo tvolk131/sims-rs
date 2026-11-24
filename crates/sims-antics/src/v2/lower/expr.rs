@@ -1,0 +1,937 @@
+//! Value expressions: arithmetic in place, the value-expression lowerer, job data, operand
+//! snapshots and distances.
+
+use super::*;
+
+impl<'a> TreeLowerer<'a> {
+    /// Returns `true` iff `expr` contains a division or remainder whose divisor is not a known
+    /// non-zero compile-time constant (and therefore could trap partway through evaluation).
+    pub(super) fn expr_may_trap_arith(&self, expr: &V2Expr) -> bool {
+        match expr {
+            V2Expr::Binary { lhs, op, rhs, .. } => {
+                if matches!(op, V2BinOp::Div | V2BinOp::Mod)
+                    && !self.eval_const_i16(rhs).is_ok_and(|v| v != 0)
+                {
+                    return true;
+                }
+                self.expr_may_trap_arith(lhs) || self.expr_may_trap_arith(rhs)
+            }
+            V2Expr::Unary { inner, .. }
+            | V2Expr::Deref { inner, .. }
+            | V2Expr::MutRef { inner, .. } => self.expr_may_trap_arith(inner),
+            V2Expr::Index { base, index, .. } => {
+                self.expr_may_trap_arith(base) || self.expr_may_trap_arith(index)
+            }
+            V2Expr::Field { base, .. } => match self.bcon_field_ref(expr) {
+                // `extern bcon` entries are read at runtime and trap when the chunk/entry is
+                // missing; private tables are compile-time constants.
+                Some(Ok((_, Some(_)))) => false,
+                Some(_) => true,
+                None => self.expr_may_trap_arith(base),
+            },
+            V2Expr::Tuple(_, elems) => elems.iter().any(|e| self.expr_may_trap_arith(e)),
+            V2Expr::Call { .. }
+            | V2Expr::MethodCall { .. }
+            | V2Expr::Try { .. }
+            | V2Expr::Match { .. }
+            | V2Expr::If { .. } => true,
+            V2Expr::Int(..)
+            | V2Expr::Bool(..)
+            | V2Expr::Str(..)
+            | V2Expr::Ident(..)
+            | V2Expr::Path(..) => false,
+        }
+    }
+
+    /// Returns `true` iff `expr` can be lowered directly in-place into `dst_air` without aliasing,
+    /// partial writes on trap, observable VM write side effects, or premature motive/skill clamping!
+    pub(super) fn can_lower_arith_in_place(
+        &self,
+        dst_air: &str,
+        expr: &V2Expr,
+        is_fresh_local: bool,
+    ) -> bool {
+        let canon_dst = canonical_air_cell(dst_air);
+        if canon_dst.starts_with("my.motive")
+            || canon_dst.starts_with("stack.motive")
+            || canon_dst.starts_with("my.person")
+            || canon_dst.starts_with("stack.person")
+            || canon_dst.starts_with("my.data[")
+            || canon_dst.starts_with("stack.data[")
+            || canon_dst.starts_with("global[")
+        {
+            return false;
+        }
+        if !is_fresh_local && self.expr_may_trap_arith(expr) {
+            return false;
+        }
+        let (base, ops) = flatten_arith_chain(expr);
+        if ops.is_empty() {
+            if let V2Expr::Unary {
+                op: V2UnaryOp::Neg,
+                inner,
+                ..
+            } = base
+            {
+                return !self.expr_may_read_or_clobber_air(inner, &canon_dst);
+            }
+            return true;
+        }
+        if ops
+            .iter()
+            .any(|(_, rhs)| self.expr_may_read_or_clobber_air(rhs, &canon_dst))
+        {
+            return false;
+        }
+        // If `base` itself is unary `-inner`, emitting `dst := 0; dst -= inner;` would overwrite
+        // `dst` before reading `inner` if `inner` reads `dst`!
+        if let V2Expr::Unary {
+            op: V2UnaryOp::Neg,
+            inner,
+            ..
+        } = base
+        {
+            return !self.expr_may_read_or_clobber_air(inner, &canon_dst);
+        }
+        true
+    }
+
+    /// Conservatively checks whether evaluating `expr` could read or mutate `canon_target`
+    /// (already canonicalized via [`canonical_air_cell`]).
+    pub(super) fn expr_may_read_or_clobber_air(&self, expr: &V2Expr, canon_target: &str) -> bool {
+        match expr {
+            V2Expr::Int(_, _) | V2Expr::Bool(_, _) | V2Expr::Str(_, _) | V2Expr::Path(_, _) => {
+                false
+            }
+            V2Expr::Ident(_, name) => match self.lookup_var(name) {
+                Some(Binding::Local { air_name, .. }) => {
+                    canonical_air_cell(air_name) == canon_target
+                }
+                Some(Binding::BhavParam { index, .. }) => format!("param[{index}]") == canon_target,
+                Some(Binding::MutRef {
+                    target: LValue::Direct { air, .. },
+                }) => canonical_air_cell(air) == canon_target,
+                Some(Binding::MutRef { .. }) => true,
+                Some(Binding::ConstI16 { air, .. } | Binding::Operand { air, .. }) => {
+                    canonical_air_cell(air) == canon_target
+                }
+                _ => false,
+            },
+            V2Expr::Deref { inner, .. } => {
+                if let V2Expr::Ident(_, pname) = inner.as_ref() {
+                    match self.lookup_var(pname) {
+                        Some(Binding::MutRef {
+                            target: LValue::Direct { air, .. },
+                        }) => canonical_air_cell(air) == canon_target,
+                        _ => true,
+                    }
+                } else {
+                    true
+                }
+            }
+            V2Expr::Field { base, field, .. } => {
+                if let V2Expr::Ident(_, bname) = base.as_ref() {
+                    if self.is_bcon_table_ref(bname) {
+                        // Read-only BCON constant: never aliases a writable cell.
+                        return false;
+                    }
+                    if self.is_self_ident(bname) {
+                        if let Some(st) = self.env.states.get(field) {
+                            return format!("{}.attr[{}]", self.self_prefix(), st.attr_index)
+                                == canon_target;
+                        }
+                        let prop_air = match field.as_str() {
+                            "graphic" => format!("{}.data[0]", self.self_prefix()),
+                            "flags" => format!("{}.data[8]", self.self_prefix()),
+                            "allowed_heights" => format!("{}.data[4]", self.self_prefix()),
+                            "placement" => format!("{}.data[42]", self.self_prefix()),
+                            "prep_score" => format!("{}.data[31]", self.self_prefix()),
+                            "cook_score" => format!("{}.data[32]", self.self_prefix()),
+                            "in_use" => format!("{}.data[25]", self.self_prefix()),
+                            "id" => format!("{}.data[11]", self.self_prefix()),
+                            "room" => format!("{}.data[29]", self.self_prefix()),
+                            _ => return true,
+                        };
+                        return prop_air == canon_target;
+                    }
+                    if self.is_sim_ident(bname) {
+                        let sim_air = match field.as_str() {
+                            "id" => "my.data[11]",
+                            "priority" => "my.person[33]",
+                            "room" => "my.data[29]",
+                            "hand" => "my.slot[0]",
+                            "age" => "my.person[58]",
+                            "visitor_kind" => "my.person[32]",
+                            _ => return true,
+                        };
+                        return sim_air == canon_target;
+                    }
+                    // Foreign object field access swaps `stack_obj` AND the foreign handle may
+                    // alias the current object (`stack.*` in interactions OR `my.attr`/`my.data`
+                    // in `ObjectSelf` lifecycle hooks such as `for p in objects_of::<Self>()`)!
+                    return canon_target.starts_with("stack.")
+                        || canon_target == "stack_obj"
+                        || canon_target.starts_with("my.attr[")
+                        || canon_target.starts_with("my.data[");
+                }
+                if let V2Expr::Field {
+                    base: root,
+                    field: group,
+                    ..
+                } = base.as_ref()
+                    && let V2Expr::Ident(_, rname) = root.as_ref()
+                    && self.is_sim_ident(rname)
+                {
+                    let sim_air = match group.as_str() {
+                        "motive" => canonical_air_cell(&format!("my.motive.{field}")),
+                        "skill" => canonical_air_cell(&format!("my.skill.{field}")),
+                        _ => return true,
+                    };
+                    return sim_air == canon_target;
+                }
+                true
+            }
+            V2Expr::Index { base, index, .. } => {
+                if self.expr_may_read_or_clobber_air(index, canon_target) {
+                    return true;
+                }
+                if let V2Expr::Ident(_, bname) = base.as_ref()
+                    && matches!(bname.as_str(), "temp" | "global")
+                {
+                    return if let Ok(idx) = self.eval_const_i16(index) {
+                        format!("{bname}[{idx}]") == canon_target
+                    } else {
+                        true
+                    };
+                }
+                if let V2Expr::Field {
+                    base: root, field, ..
+                } = base.as_ref()
+                    && let V2Expr::Ident(_, rname) = root.as_ref()
+                    && self.is_self_ident(rname)
+                    && matches!(field.as_str(), "attr" | "data")
+                {
+                    return if let Ok(idx) = self.eval_const_i16(index) {
+                        format!("{}.{field}[{idx}]", self.self_prefix()) == canon_target
+                    } else {
+                        true
+                    };
+                }
+                true
+            }
+            V2Expr::Unary { inner, .. } | V2Expr::MutRef { inner, .. } => {
+                self.expr_may_read_or_clobber_air(inner, canon_target)
+            }
+            V2Expr::Binary { lhs, rhs, .. } => {
+                self.expr_may_read_or_clobber_air(lhs, canon_target)
+                    || self.expr_may_read_or_clobber_air(rhs, canon_target)
+            }
+            V2Expr::Tuple(_, elems) => elems
+                .iter()
+                .any(|e| self.expr_may_read_or_clobber_air(e, canon_target)),
+            // Calls/method calls (and `?`-propagated calls) may have arbitrary side effects.
+            V2Expr::Call { .. }
+            | V2Expr::MethodCall { .. }
+            | V2Expr::Try { .. }
+            | V2Expr::Match { .. }
+            | V2Expr::If { .. } => true,
+        }
+    }
+
+    /// Lowers a compound arithmetic/bitwise/unary-negation expression directly into `dst_air`,
+    /// collapsing left-associative chains `(a * 24) / 5 + 1` into zero extra scratch locals!
+    pub(super) fn lower_arith_into_dest(
+        &mut self,
+        expr: &V2Expr,
+        dst_air: &str,
+        declare_let: bool,
+    ) -> Result<ValueType> {
+        // Constant-fold compile-time `Bitflags` expressions (e.g. `Placement::Floor | Placement::Terrain` -> `3`).
+        if let Some((key, mask, _)) = self.try_eval_any_const_bitflag(expr)? {
+            if declare_let {
+                self.line(format!("let {dst_air} = {mask};"));
+            } else {
+                self.line(format!("{dst_air} := {mask};"));
+            }
+            return Ok(ValueType::Bitflags(key));
+        }
+
+        let (base, ops) = flatten_arith_chain(expr);
+
+        // Emit base into `dst_air`.
+        let base_ty = match base {
+            V2Expr::Unary {
+                span,
+                op: V2UnaryOp::Neg,
+                inner,
+            } => {
+                if let V2Expr::Int(_, v) = inner.as_ref() {
+                    let n = v
+                        .checked_neg()
+                        .and_then(|x| i16::try_from(x).ok())
+                        .ok_or_else(|| {
+                            Error::at(*span, format!("negated integer -{v} out of i16 range"))
+                        })?;
+                    if declare_let {
+                        self.line(format!("let {dst_air} = {n};"));
+                    } else {
+                        self.line(format!("{dst_air} := {n};"));
+                    }
+                    ValueType::I16
+                } else {
+                    let (v_air, v_ty) = self.lower_value_expr(inner)?;
+                    if v_ty != ValueType::I16 {
+                        return Err(Error::at(
+                            *span,
+                            format!(
+                                "cannot apply unary '-' to '{}' expression",
+                                self.env.display_value_type(&v_ty)
+                            ),
+                        ));
+                    }
+                    if declare_let {
+                        self.line(format!("let {dst_air} = 0;"));
+                    } else {
+                        self.line(format!("{dst_air} := 0;"));
+                    }
+                    self.line(format!("{dst_air} -= {v_air};"));
+                    ValueType::I16
+                }
+            }
+            other => {
+                let (b_air, b_ty) = self.lower_value_expr(other)?;
+                if !ops.is_empty() && !matches!(b_ty, ValueType::I16 | ValueType::Bitflags(_)) {
+                    return Err(Error::at(
+                        other.span(),
+                        format!(
+                            "arithmetic/bitwise operator cannot be applied to '{}' operand",
+                            self.env.display_value_type(&b_ty)
+                        ),
+                    ));
+                }
+                if declare_let {
+                    self.line(format!("let {dst_air} = {b_air};"));
+                } else if b_air != dst_air {
+                    self.line(format!("{dst_air} := {b_air};"));
+                }
+                b_ty
+            }
+        };
+
+        for (op, rhs) in ops {
+            if matches!(base_ty, ValueType::Bitflags(_))
+                && !matches!(op, V2BinOp::BitAnd | V2BinOp::BitOr | V2BinOp::BitXor)
+            {
+                return Err(Error::at(
+                    rhs.span(),
+                    format!(
+                        "arithmetic operator cannot be applied to bitflags '{}' (only |, &, ^ are allowed)",
+                        self.env.display_value_type(&base_ty)
+                    ),
+                ));
+            }
+            let (r_air, r_ty) = self.lower_value_expr(rhs)?;
+            if r_ty != base_ty {
+                return Err(Error::at(
+                    rhs.span(),
+                    format!(
+                        "mismatched operand types in arithmetic/bitwise expression: '{}' vs '{}'",
+                        self.env.display_value_type(&base_ty),
+                        self.env.display_value_type(&r_ty)
+                    ),
+                ));
+            }
+            let aop = match op {
+                V2BinOp::Add => "+=",
+                V2BinOp::Sub => "-=",
+                V2BinOp::Mul => "*=",
+                V2BinOp::Div => "/=",
+                V2BinOp::Mod => "%=",
+                V2BinOp::BitAnd => "&=",
+                V2BinOp::BitOr => "|=",
+                V2BinOp::BitXor => "^=",
+                _ => unreachable!(),
+            };
+            self.line(format!("{dst_air} {aop} {r_air};"));
+        }
+
+        Ok(base_ty)
+    }
+
+    /// Lowers a value-producing expression into an `.air` operand string + its [`ValueType`].
+    pub(super) fn lower_value_expr(&mut self, expr: &V2Expr) -> Result<(String, ValueType)> {
+        match expr {
+            V2Expr::Int(span, v) => {
+                let n = i16::try_from(*v)
+                    .map_err(|_| Error::at(*span, format!("integer {v} out of i16 range")))?;
+                Ok((n.to_string(), ValueType::I16))
+            }
+            V2Expr::Bool(_, b) => Ok((if *b { "1" } else { "0" }.to_owned(), ValueType::Bool)),
+            V2Expr::Path(span, segs) => {
+                if segs.len() != 2 {
+                    return Err(Error::at(
+                        *span,
+                        format!("unsupported path expression '{}'", segs.join("::")),
+                    ));
+                }
+                let (tname, vname) = (&segs[0], &segs[1]);
+                if let Some(e) =
+                    self.env
+                        .lookup_enum(&self.owner_module, tname, self.in_object_scope)
+                {
+                    let &val = e.variants.get(vname).ok_or_else(|| {
+                        Error::at(
+                            *span,
+                            format!("enum '{}' has no variant '{vname}'", e.display_name),
+                        )
+                    })?;
+                    return Ok((val.to_string(), ValueType::Enum(e.canonical_key.clone())));
+                }
+                if let Some(bf) =
+                    self.env
+                        .lookup_bitflags(&self.owner_module, tname, self.in_object_scope)
+                {
+                    let mask = if vname == "None" {
+                        0i16
+                    } else if let Some(&bit) = bf.flags.get(vname) {
+                        bit_to_mask(bit)
+                    } else {
+                        return Err(Error::at(
+                            *span,
+                            format!("bitflags '{}' has no flag '{vname}'", bf.display_name),
+                        ));
+                    };
+                    return Ok((
+                        mask.to_string(),
+                        ValueType::Bitflags(bf.canonical_key.clone()),
+                    ));
+                }
+                Err(Error::at(
+                    *span,
+                    format!("unknown enum or bitflags type '{tname}'"),
+                ))
+            }
+            V2Expr::Ident(span, name) => {
+                if let Some(binding) = self.lookup_var(name).cloned() {
+                    return match binding {
+                        Binding::Local { air_name, ty } => Ok((air_name, ty)),
+                        Binding::Operand { air, ty } => Ok((air, ty)),
+                        Binding::ConstI16 { air, .. } => Ok((air, ValueType::I16)),
+                        Binding::ConstBool(b) => {
+                            Ok((if b { "1" } else { "0" }.to_owned(), ValueType::Bool))
+                        }
+                        Binding::ConstEnum { key, value } => {
+                            Ok((value.to_string(), ValueType::Enum(key)))
+                        }
+                        Binding::ConstBitflag { key, mask, .. } => {
+                            Ok((mask.to_string(), ValueType::Bitflags(key)))
+                        }
+                        Binding::AutonomousFlag => {
+                            let tmp = self.fresh("auto");
+                            self.line(format!("let {tmp} = 0;"));
+                            self.line("if param[0] == 1 {".to_owned());
+                            self.indent += 1;
+                            self.line(format!("{tmp} := 1;"));
+                            self.indent -= 1;
+                            self.line("}".to_owned());
+                            Ok((tmp, ValueType::Bool))
+                        }
+                        Binding::BhavParam { index, ty } => Ok((format!("param[{index}]"), ty)),
+                        Binding::ForeignObject { air_name } => Ok((air_name, ValueType::ObjectId)),
+                        Binding::MutRef { .. } => Err(Error::at(
+                            *span,
+                            format!("use '*{name}' to read through '&mut' parameter '{name}'"),
+                        )),
+                        Binding::SelfHandle => match self.tree_ctx {
+                            TreeContext::ObjectSelf => {
+                                Ok(("my.id".to_owned(), ValueType::ObjectId))
+                            }
+                            TreeContext::SimOnObject { .. } => Ok((
+                                if self.has_self_obj_local {
+                                    "__self_obj".to_owned()
+                                } else {
+                                    "stack_obj".to_owned()
+                                },
+                                ValueType::ObjectId,
+                            )),
+                        },
+                        Binding::SimHandle => Ok(("my.id".to_owned(), ValueType::ObjectId)),
+                        Binding::Motive(_)
+                        | Binding::Guid(_)
+                        | Binding::Skill(_)
+                        | Binding::Sound(_)
+                        | Binding::Slot(_) => Err(Error::at(
+                            *span,
+                            format!("'{name}' cannot be used directly as a numeric value"),
+                        )),
+                    };
+                }
+                if self.is_self_ident(name) {
+                    return match self.tree_ctx {
+                        TreeContext::ObjectSelf => Ok(("my.id".to_owned(), ValueType::ObjectId)),
+                        TreeContext::SimOnObject { .. } => Ok((
+                            if self.has_self_obj_local {
+                                "__self_obj".to_owned()
+                            } else {
+                                "stack_obj".to_owned()
+                            },
+                            ValueType::ObjectId,
+                        )),
+                    };
+                }
+                if name == "sim" && matches!(self.tree_ctx, TreeContext::ObjectSelf) {
+                    return Err(Error::at(
+                        *span,
+                        "'sim' is not available in init/main (object lifecycle context)",
+                    ));
+                }
+                if let Some(v) = self.const_item(name) {
+                    let n = i16::try_from(v).map_err(|_| {
+                        Error::at(
+                            *span,
+                            format!(
+                                "const '{name}' ({v:#x}) does not fit in i16; use it where a GUID is expected"
+                            ),
+                        )
+                    })?;
+                    return Ok((n.to_string(), ValueType::I16));
+                }
+                if name == "stack_obj" {
+                    return Ok(("stack_obj".to_owned(), ValueType::ObjectId));
+                }
+                if self.env.i16_params.contains_key(name) {
+                    return Ok((format!("bcon.{name}"), ValueType::I16));
+                }
+                if let Some(&b) = self.env.bool_params.get(name) {
+                    return Ok((if b { "1" } else { "0" }.to_owned(), ValueType::Bool));
+                }
+                Err(Error::at(*span, format!("unknown identifier '{name}'")))
+            }
+            V2Expr::Deref { span, inner } => {
+                let lval = self.resolve_lvalue(&V2Expr::Deref {
+                    span: *span,
+                    inner: inner.clone(),
+                })?;
+                self.read_lvalue(&lval)
+            }
+            V2Expr::Field { span, base, field } => {
+                if let Some(r) = self.bcon_field_ref(expr) {
+                    return Ok((r?.0, ValueType::I16));
+                }
+                // Handle read-only properties like `sim.id`, `sim.priority`, `self.id`, `self.room`
+                if let V2Expr::Ident(bspan, bname) = base.as_ref() {
+                    if self.is_sim_ident(bname) {
+                        return match field.as_str() {
+                            "id" => Ok(("my.id".to_owned(), ValueType::ObjectId)),
+                            "priority" => Ok(("my.person.priority".to_owned(), ValueType::I16)),
+                            "room" => Ok(("my.room".to_owned(), ValueType::I16)),
+                            "hand" => Ok(("my.slot[0]".to_owned(), ValueType::ObjectId)),
+                            "age" => Ok(("my.person[58]".to_owned(), ValueType::I16)),
+                            "visitor_kind" => Ok(("my.person[32]".to_owned(), ValueType::I16)),
+                            // Object data word 2: the object whose slot holds the Sim (read-only).
+                            "container" => Ok(("my.data[2]".to_owned(), ValueType::ObjectId)),
+                            other => Err(Error::at(
+                                *span,
+                                format!(
+                                    "unknown Sim property '{bname}.{other}' (expected motive, skill, personality, id, priority, room, hand, age, visitor_kind, container, attr[i], data[i], slot[i], or person[i]; use 'self.<state>' for object state)"
+                                ),
+                            )),
+                        };
+                    }
+                    if bname == "sim" && matches!(self.tree_ctx, TreeContext::ObjectSelf) {
+                        return Err(Error::at(
+                            *bspan,
+                            "'sim' is not available in init/main (object lifecycle context)",
+                        ));
+                    }
+                    if self.is_self_ident(bname) {
+                        match field.as_str() {
+                            "id" => {
+                                return self
+                                    .read_lvalue(&self.self_cell("id", ValueType::ObjectId));
+                            }
+                            "room" => {
+                                return self.read_lvalue(&self.self_cell("room", ValueType::I16));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let lval = self.resolve_lvalue(expr)?;
+                self.read_lvalue(&lval)
+            }
+            V2Expr::Index { span, base, index }
+                if matches!(base.as_ref(), V2Expr::Ident(_, n) if n == "local")
+                    && self.lookup_var("local").is_none() =>
+            {
+                self.read_frame_local_slot(*span, index)
+            }
+            V2Expr::Index { .. } => {
+                let lval = self.resolve_lvalue(expr)?;
+                self.read_lvalue(&lval)
+            }
+            V2Expr::Match {
+                span,
+                scrutinee,
+                arms,
+            } => self.lower_match_expr(*span, scrutinee, arms, None),
+            V2Expr::If {
+                span,
+                cond,
+                then_value,
+                else_value,
+            } => self.lower_if_expr(*span, cond, then_value, else_value, None),
+            V2Expr::Unary { span, op, inner } => match op {
+                V2UnaryOp::Not => {
+                    let tmp = self.fresh("not");
+                    self.line(format!("let {tmp} = 0;"));
+                    self.emit_bool_into_local(expr, &tmp)?;
+                    Ok((tmp, ValueType::Bool))
+                }
+                V2UnaryOp::Neg => {
+                    if let V2Expr::Int(_, v) = inner.as_ref() {
+                        let n = v
+                            .checked_neg()
+                            .and_then(|x| i16::try_from(x).ok())
+                            .ok_or_else(|| {
+                                Error::at(*span, format!("negated integer -{v} out of i16 range"))
+                            })?;
+                        return Ok((n.to_string(), ValueType::I16));
+                    }
+                    let tmp = self.fresh("neg");
+                    let ty = self.lower_arith_into_dest(expr, &tmp, true)?;
+                    Ok((tmp, ty))
+                }
+            },
+            V2Expr::Binary { op, .. } => match op {
+                V2BinOp::And
+                | V2BinOp::Or
+                | V2BinOp::Eq
+                | V2BinOp::Ne
+                | V2BinOp::Lt
+                | V2BinOp::Le
+                | V2BinOp::Gt
+                | V2BinOp::Ge
+                | V2BinOp::FlagTest => {
+                    let tmp = self.fresh("bool");
+                    self.line(format!("let {tmp} = 0;"));
+                    self.emit_bool_into_local(expr, &tmp)?;
+                    Ok((tmp, ValueType::Bool))
+                }
+                V2BinOp::Add
+                | V2BinOp::Sub
+                | V2BinOp::Mul
+                | V2BinOp::Div
+                | V2BinOp::Mod
+                | V2BinOp::BitAnd
+                | V2BinOp::BitOr
+                | V2BinOp::BitXor => {
+                    // Constant-fold pure Bitflags expressions into an immediate literal!
+                    if let Some((key, mask, _)) = self.try_eval_any_const_bitflag(expr)? {
+                        return Ok((mask.to_string(), ValueType::Bitflags(key)));
+                    }
+                    let tmp = self.fresh("arith");
+                    let ty = self.lower_arith_into_dest(expr, &tmp, true)?;
+                    Ok((tmp, ty))
+                }
+            },
+            V2Expr::Call {
+                span,
+                callee,
+                type_args,
+                args,
+            } => {
+                if matches!(callee.as_ref(), V2Expr::Ident(_, name) if name == "create_object")
+                    && has_create_dest(args)
+                    && !self.user_callable_named(callee, *span)?
+                {
+                    let temp = self.fresh("call");
+                    self.line(format!("let {temp} = 0;"));
+                    self.emit_bool_into_local(expr, &temp)?;
+                    return Ok((temp, ValueType::Bool));
+                }
+                if !type_args.is_empty() {
+                    return Err(Error::at(
+                        *span,
+                        "type arguments are only supported on 'create_object::<T>', 'find_best_object::<T>', and 'objects_of::<T>'",
+                    ));
+                }
+                if let Some(sig) = self.resolve_callable(callee, *span)? {
+                    return self.lower_callable_value(&sig, args, *span, false, false);
+                }
+                if let V2Expr::Ident(_, fname) = callee.as_ref() {
+                    if fname == "random" {
+                        if args.len() != 1 || args[0].name.is_some() {
+                            return Err(Error::at(*span, "random(range) expects 1 argument"));
+                        }
+                        let (mut range_air, _) = self.lower_value_expr(&args[0].value)?;
+                        // See `random_into`: a global range would receive the draw.
+                        if range_air.starts_with("global[") {
+                            let copy = self.fresh("rnd_range");
+                            self.line(format!("let {copy} = {range_air};"));
+                            range_air = copy;
+                        }
+                        let tmp = self.fresh("rnd");
+                        self.line(format!("let {tmp} = 0;"));
+                        self.line(format!("random({tmp}, {range_air});"));
+                        return Ok((tmp, ValueType::I16));
+                    }
+                    if fname == "job_data"
+                        && self
+                            .env
+                            .lookup_fn(&self.owner_module, fname, self.in_object_scope)
+                            .is_none()
+                    {
+                        return self.lower_job_data(args, *span);
+                    }
+                    if fname == "distance_to"
+                        && self
+                            .env
+                            .lookup_fn(&self.owner_module, fname, self.in_object_scope)
+                            .is_none()
+                    {
+                        return self.lower_distance_to(args, *span);
+                    }
+                    if matches!(
+                        fname.as_str(),
+                        "can_afford"
+                            | "debit_funds"
+                            | "credit_funds"
+                            | "dialog"
+                            | "route_to"
+                            | "snap"
+                            | "find_best_object"
+                    ) || (fname == "create_object"
+                        && !self.user_callable_named(callee, *span)?)
+                    {
+                        let tmp = self.fresh("call");
+                        self.line(format!("let {tmp} = 0;"));
+                        self.emit_bool_into_local(expr, &tmp)?;
+                        return Ok((tmp, ValueType::Bool));
+                    }
+                    if let Some((fn_mod, fn_decl, is_local)) =
+                        self.env
+                            .lookup_fn(&self.owner_module, fname, self.in_object_scope)
+                    {
+                        let ret =
+                            self.inline_helper_call(&fn_mod, &fn_decl, is_local, args, *span)?;
+                        let (rv, vty) = ret.ok_or_else(|| {
+                            Error::at(
+                                *span,
+                                format!("void helper function '{fname}' does not return a value"),
+                            )
+                        })?;
+                        return Ok((rv, vty));
+                    }
+                    if is_prim_builtin_name(fname) {
+                        let tmp = self.fresh("call");
+                        self.line(format!("let {tmp} = 0;"));
+                        self.emit_bool_into_local(expr, &tmp)?;
+                        return Ok((tmp, ValueType::Bool));
+                    }
+                }
+                Err(Error::at(*span, "unsupported value call expression"))
+            }
+            V2Expr::MethodCall {
+                method, type_args, ..
+            } if method == "is_type" && type_args.is_empty() => {
+                let tmp = self.fresh("call");
+                self.line(format!("let {tmp} = 0;"));
+                self.emit_bool_into_local(expr, &tmp)?;
+                Ok((tmp, ValueType::Bool))
+            }
+            V2Expr::MethodCall {
+                span,
+                receiver,
+                method,
+                type_args,
+                args,
+            } if method == "run_functional" => {
+                if !type_args.is_empty() {
+                    return Err(Error::at(
+                        *span,
+                        "type arguments on run_functional are only valid inside 'let Some(x) = obj.run_functional::<T>(...)'",
+                    ));
+                }
+                let tmp = self.fresh("rf");
+                self.line(format!("let {tmp} = 0;"));
+                self.emit_run_functional(receiver, args, *span, Some(&tmp))?;
+                Ok((tmp, ValueType::Bool))
+            }
+            V2Expr::MethodCall { method, .. }
+                if matches!(method.as_str(), "contains" | "intersects" | "is_empty") =>
+            {
+                let tmp = self.fresh("bf");
+                self.line(format!("let {tmp} = 0;"));
+                self.emit_bool_into_local(expr, &tmp)?;
+                Ok((tmp, ValueType::Bool))
+            }
+            V2Expr::Try { span, inner } => {
+                if let V2Expr::Call {
+                    span: cspan,
+                    callee,
+                    type_args,
+                    args,
+                } = inner.as_ref()
+                    && type_args.is_empty()
+                    && let Some(sig) = self.resolve_callable(callee, *cspan)?
+                {
+                    return self.lower_callable_value(&sig, args, *cspan, true, false);
+                }
+                Err(Error::at(
+                    *span,
+                    "'?' in an expression needs a call to an 'extern mod' fn or 'tree' (use 'cond?;' as a statement for plain bool checks)",
+                ))
+            }
+            other => Err(Error::at(
+                other.span(),
+                "expression cannot be evaluated as a value",
+            )),
+        }
+    }
+
+    /// `job_data(career, level, field)`: scope 33 reads a field of a career level, the career
+    /// taken from `temp[0]` and the level from `temp[1]`. Both temps are overwritten.
+    pub(super) fn lower_job_data(
+        &mut self,
+        args: &[CallArg],
+        span: Span,
+    ) -> Result<(String, ValueType)> {
+        let bound = self.bind_builtin_args("job_data", args, &["career", "level", "field"], &[])?;
+        let get = |key: &str| {
+            bound
+                .get(key)
+                .copied()
+                .ok_or_else(|| Error::at(span, format!("job_data() requires '{key}'")))
+        };
+        let (career_arg, level_arg, field_arg) = (get("career")?, get("level")?, get("field")?);
+        // Operands are evaluated in source order (named arguments may be reordered), as for a
+        // call. Each is read when it is staged, so one is copied first when an operand evaluated
+        // after it may write anything (a call, a nested `job_data`), or when it is the level and
+        // reads `temp[0]`, which the career's staging overwrites.
+        let level_first = args.iter().position(|a| std::ptr::eq(a, level_arg))
+            < args.iter().position(|a| std::ptr::eq(a, career_arg));
+        let (first, second) = if level_first {
+            (level_arg, career_arg)
+        } else {
+            (career_arg, level_arg)
+        };
+        let first_key = if level_first { "level" } else { "career" };
+        let second_key = if level_first { "career" } else { "level" };
+        let mut a = self.lower_job_operand(first_key, first)?;
+        if !self.is_pure_single_operand(&second.value) {
+            a = self.snapshot_operand(a, &format!("job_{first_key}"));
+        }
+        let b = self.lower_job_operand(second_key, second)?;
+        let (career, mut level) = if level_first { (b, a) } else { (a, b) };
+        let field = self.eval_builtin_int(&field_arg.value, "job_data field", 0, 32767)?;
+        if level.contains("temp[0]") {
+            level = self.snapshot_operand(level, "job_level");
+        }
+        self.line(format!("temp[0] := {career};"));
+        self.line(format!("temp[1] := {level};"));
+        let tmp = self.fresh("job");
+        self.line(format!("let {tmp} = scope(33, {field});"));
+        Ok((tmp, ValueType::I16))
+    }
+
+    pub(super) fn lower_job_operand(&mut self, key: &str, arg: &CallArg) -> Result<String> {
+        let (air, ty) = self.lower_value_expr(&arg.value)?;
+        if ty != ValueType::I16 {
+            return Err(Error::at(
+                arg.span,
+                format!("job_data {key} must be an i16"),
+            ));
+        }
+        // A runtime (`extern bcon`) read faults on a missing chunk: as for a call argument, it is
+        // read now, so the fault cannot follow a partial staging of the temps.
+        Ok(if air.starts_with("bcon[") {
+            self.snapshot_operand(air, &format!("job_{key}"))
+        } else {
+            air
+        })
+    }
+
+    /// `air` copied into a fresh local, unless it is a literal (which nothing can change).
+    pub(super) fn snapshot_operand(&mut self, air: String, prefix: &str) -> String {
+        if air.parse::<i64>().is_ok() {
+            return air;
+        }
+        let copy = self.fresh(prefix);
+        self.line(format!("let {copy} = {air};"));
+        copy
+    }
+
+    /// `distance_to(target, from: obj, temp: n)`: Get Distance To measures from `from` (the
+    /// running object by default) to the stack object, so `stack_obj` points at `target` around
+    /// it. The result lands in `temp[n]` (0 by default).
+    pub(super) fn lower_distance_to(
+        &mut self,
+        args: &[CallArg],
+        span: Span,
+    ) -> Result<(String, ValueType)> {
+        let bound = self.bind_builtin_args("distance_to", args, &["target"], &["from", "temp"])?;
+        let target_arg = *bound
+            .get("target")
+            .ok_or_else(|| Error::at(span, "distance_to() requires a target object"))?;
+        let from_arg = bound.get("from").copied();
+        let mut target = self.lower_distance_handle("target", target_arg)?;
+        // The target is read when `stack_obj` moves, after `from` is lowered: a `from` that may
+        // write anything gets a copy of the target first.
+        // That includes `stack_obj` itself, which a `from` that moves and restores the stack
+        // object (a nested `distance_to`) leaves pointing elsewhere.
+        if from_arg.is_some_and(|a| !self.is_pure_single_operand(&a.value)) {
+            target = self.snapshot_operand(target, "dist_target");
+        }
+        let mut from = match from_arg {
+            Some(arg) => Some(self.lower_distance_handle("from", arg)?),
+            None => None,
+        };
+        let temp = match bound.get("temp") {
+            Some(arg) => self.eval_builtin_int(&arg.value, "distance_to temp", 0, 7)?,
+            None => 0,
+        };
+        let moves = target != "stack_obj";
+        // `from` is read after `stack_obj` moves to the target: one that names the stack object
+        // (`stack_obj`, or a `stack.` cell such as `stack.id`) is copied before the move.
+        if moves && let Some(f) = from.take() {
+            let stack_relative = f == "stack_obj" || f.contains("stack.");
+            from = Some(if stack_relative {
+                self.snapshot_operand(f, "dist_from")
+            } else {
+                f
+            });
+        }
+        let saved = if moves {
+            let saved = self.save_stack_obj_for_move();
+            self.line(format!("stack_obj := {target};"));
+            saved
+        } else {
+            None
+        };
+        self.line(match &from {
+            Some(f) => format!("get_distance_to(temp[{temp}], from: {f});"),
+            None => format!("get_distance_to(temp[{temp}]);"),
+        });
+        if moves {
+            self.emit_restore_stack_obj(saved.as_deref());
+        }
+        let tmp = self.fresh("dist");
+        self.line(format!("let {tmp} = temp[{temp}];"));
+        Ok((tmp, ValueType::I16))
+    }
+
+    pub(super) fn lower_distance_handle(&mut self, key: &str, arg: &CallArg) -> Result<String> {
+        let (air, ty) = self.lower_value_expr(&arg.value)?;
+        if !ty.is_object_handle() {
+            return Err(Error::at(
+                arg.span,
+                format!(
+                    "distance_to {key} must be an object, found '{}'",
+                    self.env.display_value_type(&ty)
+                ),
+            ));
+        }
+        Ok(air)
+    }
+}
