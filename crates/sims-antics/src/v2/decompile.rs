@@ -117,6 +117,11 @@ pub struct DecompileV2Report {
     pub trees: Vec<DecompiledTree>,
     /// Whether the final source compiled (always `false` when validation is off).
     pub compiled: bool,
+    /// Behaviour-relevant resource chunks of the original (`"STR# 300"`) that the
+    /// recompiled object does not carry byte for byte. Tree checks cover code,
+    /// constants, callee shapes and sounds; trees that read these resources (strings,
+    /// interaction tables, slots) may still behave differently.
+    pub resources_not_reproduced: Vec<String>,
 }
 
 impl DecompileV2Report {
@@ -143,7 +148,7 @@ pub fn decompile_iff_to_v2_report(
     iff: &Iff,
     options: &DecompileV2Options,
 ) -> Result<DecompileV2Report> {
-    let model = Model::build(iff, options)?;
+    let mut model = Model::build(iff, options)?;
     let mut plan = Plan::initial(&model);
     if !options.validate {
         let source = format_v2_source(&model.generate(&plan).text)?;
@@ -165,29 +170,33 @@ pub fn decompile_iff_to_v2_report(
             source,
             trees,
             compiled: false,
+            resources_not_reproduced: Vec::new(),
         });
     }
 
-    let mut cache: BTreeMap<(u16, String), TreeCheck> = BTreeMap::new();
+    let mut cache: BTreeMap<(u16, String, String), TreeCheck> = BTreeMap::new();
     // Every round lowers at least one tree or statement, so this bound is never reached by
     // a run that converges; it only guards against a bug turning into a hang.
     let max_rounds = 8 + model.trees.len() * 4 + model.statement_count() * 2;
     for _ in 0..max_rounds {
         let generated = model.generate(&plan);
         match model.compile(&generated.text) {
-            Err(Failure::V2 { line }) => {
+            Err(Failure::V2 { line, message }) => {
                 if !plan.lower_at_line(&model, &generated, line) {
-                    return Err(Error::new(
-                        "decompiled source does not compile even with every tree in 'raw'",
-                    ));
+                    // A tree that fails at its lowest level is left out.
+                    let tree = line.and_then(|l| generated.tree_at_line(l.saturating_sub(1)));
+                    if !tree.is_some_and(|id| model.omit(id, &message)) {
+                        return Err(no_compile(&message));
+                    }
                 }
             }
-            Err(Failure::Air { tree }) => {
-                let lowered = tree.is_some_and(|id| plan.lower_tree(&model, id));
-                if !lowered && !plan.lower_all(&model) {
-                    return Err(Error::new(
-                        "decompiled source does not compile even with every tree in 'raw'",
-                    ));
+            Err(Failure::Air { tree, message }) => {
+                let handled = match tree {
+                    Some(id) => plan.lower_tree(&model, id) || model.omit(id, &message),
+                    None => plan.lower_all(&model),
+                };
+                if !handled {
+                    return Err(no_compile(&message));
                 }
             }
             Ok(recompiled) => {
@@ -224,6 +233,7 @@ pub fn decompile_iff_to_v2_report(
                     source,
                     trees,
                     compiled: true,
+                    resources_not_reproduced: model.resources_not_reproduced(&recompiled),
                 });
             }
         }
@@ -297,8 +307,16 @@ struct Model {
     extern_calls: BTreeSet<u16>,
     trees: Vec<TreeModel>,
     interactions: Vec<String>,
+    /// FWAV chunks written as `sound` declarations: chunk id -> sound event name.
+    sounds: BTreeMap<u16, String>,
+    /// FWAV chunks v2 cannot declare, and why.
+    sounds_skipped: BTreeMap<u16, &'static str>,
     /// Original-side checker context.
     ctx_original: LiveContext,
+    /// The sound event each original FWAV names, as the VM reads it (last chunk wins).
+    original_sounds: BTreeMap<u16, String>,
+    /// Behaviour-relevant non-code chunks of the original, as the VM reads them.
+    original_resources: BTreeMap<([u8; 4], u16), Vec<u8>>,
     library_arities: BTreeMap<u16, usize>,
 }
 
@@ -333,15 +351,22 @@ impl Model {
         // BCON tables.
         let mut bcons = Vec::new();
         let mut bcon_names = BTreeMap::new();
-        let mut used_names = BTreeSet::new();
+        // `library_consts` is the extern table's name.
+        let mut used_names = BTreeSet::from(["library_consts".to_owned()]);
+        // The VM keeps the last chunk of an ID.
+        let mut bcon_chunks: BTreeMap<u16, &Chunk> = BTreeMap::new();
         for c in iff.chunks.iter().filter(|c| &c.tag == b"BCON") {
-            if !PRIVATE_BCONS.contains(&c.id) || bcon_names.contains_key(&c.id) {
-                continue;
+            if PRIVATE_BCONS.contains(&c.id) {
+                bcon_chunks.insert(c.id, c);
             }
-            let Ok(values) = sims_formats::execution::constants(iff.data(c)) else {
+        }
+        for c in bcon_chunks.into_values() {
+            let Ok(mut values) = sims_formats::execution::constants(iff.data(c)) else {
                 continue;
             };
-            if values.is_empty() || values.len() > 128 {
+            // An operand addresses entries 0..128 only.
+            values.truncate(BCON_ADDRESSABLE);
+            if values.is_empty() {
                 continue;
             }
             let mut label = object_type_ident(&c.label);
@@ -351,9 +376,15 @@ impl Model {
             {
                 label = format!("Bcon{label}");
             }
-            if !used_names.insert(snake_case_ident(&label)) {
-                label = format!("{label}{}", c.id);
-                used_names.insert(snake_case_ident(&label));
+            let base = label.clone();
+            let mut n = 0;
+            while !used_names.insert(snake_case_ident(&label)) {
+                n += 1;
+                label = if n == 1 {
+                    format!("{base}{}", c.id)
+                } else {
+                    format!("{base}{}_{n}", c.id)
+                };
             }
             bcon_names.insert(c.id, label.clone());
             bcons.push(BconModel {
@@ -536,6 +567,26 @@ impl Model {
             }
         }
 
+        // Sounds: v2 can pin an FWAV's ID and event name when the name is a plain file
+        // name (`sound s = preset(.., wav: "name", id: N)`).
+        let original_sounds = fwav_sounds(iff);
+        let mut sounds = BTreeMap::new();
+        let mut sounds_skipped = BTreeMap::new();
+        let mut sound_names = BTreeSet::new();
+        for (&id, name) in &original_sounds {
+            let why = if id == 0 {
+                "v2 cannot declare it (FWAV IDs start at 1)"
+            } else if crate::manifest::validate_relative_filename(name, "sound").is_err() {
+                "v2 cannot spell its event name (a plain file name)"
+            } else if !sound_names.insert(name.to_ascii_lowercase()) {
+                "another FWAV names the same event, which v2 does not allow"
+            } else {
+                sounds.insert(id, name.clone());
+                continue;
+            };
+            sounds_skipped.insert(id, why);
+        }
+
         let ctx_original = live_context(iff, &options.library_arities);
         Ok(Self {
             name: objd_chunk.label.trim().to_owned(),
@@ -550,7 +601,11 @@ impl Model {
             extern_calls,
             trees,
             interactions,
+            sounds,
+            sounds_skipped,
             ctx_original,
+            original_sounds,
+            original_resources: resource_chunks(iff),
             library_arities: options.library_arities.clone(),
         })
     }
@@ -572,20 +627,30 @@ impl Model {
             expand_v2_source_to_objects("decompiled.antics", text, &PackResolverConfig::default())
                 .map_err(|e| Failure::V2 {
                     line: e.span.map(|s| s.line),
+                    message: e.message.clone(),
                 })?;
         if expanded.len() != 1 {
-            return Err(Failure::V2 { line: None });
+            return Err(Failure::V2 {
+                line: None,
+                message: format!("the source declares {} objects", expanded.len()),
+            });
         }
         let expanded = expanded.remove(0);
         let air = expanded.air_source.clone();
         let compiled = compile_expanded_v2_object(expanded).map_err(|e| Failure::Air {
             tree: e.span.and_then(|s| air_tree_at_line(&air, s.line)),
+            message: e.message.clone(),
         })?;
-        let iff = Iff::parse(compiled.iff_bytes).map_err(|_| Failure::Air { tree: None })?;
+        let iff = Iff::parse(compiled.iff_bytes).map_err(|e| Failure::Air {
+            tree: None,
+            message: format!("the compiled IFF does not parse: {e}"),
+        })?;
         let ctx = live_context(&iff, &self.library_arities);
         Ok(RecompiledFile {
             trees: compiled.behaviors,
             ctx,
+            sounds: fwav_sounds(&iff),
+            resources: resource_chunks(&iff),
         })
     }
 
@@ -593,20 +658,29 @@ impl Model {
         &self,
         t: &TreeModel,
         recompiled: &RecompiledFile,
-        cache: &mut BTreeMap<(u16, String), TreeCheck>,
+        cache: &mut BTreeMap<(u16, String, String), TreeCheck>,
     ) -> TreeCheck {
         let Some(b) = recompiled.trees.get(&t.id) else {
             return TreeCheck::Inconclusive(
                 "the recompiled object has no tree with this ID".into(),
             );
         };
-        if same_tree_bytes(&t.original, b) {
-            return TreeCheck::Identical;
+        // The checker does not model sounds: a tree that plays one whose event the
+        // decompiled object names differently cannot be proven.
+        if let Some(gap) = self.sound_gap(&t.original, recompiled) {
+            return TreeCheck::Inconclusive(gap);
         }
-        if same_but_unreachable_tail(&t.original, b) {
-            return TreeCheck::Equivalent;
+        // Byte comparisons prove nothing when the tree runs against different constants
+        // or callees; the checker takes both contexts into account.
+        if self.same_context_for(&t.original, recompiled) {
+            if same_tree_bytes(&t.original, b) {
+                return TreeCheck::Identical;
+            }
+            if same_but_unreachable_tail(&t.original, b, &self.ctx_original) {
+                return TreeCheck::Equivalent;
+            }
         }
-        let key = (t.id, format!("{b:?}"));
+        let key = (t.id, format!("{b:?}"), format!("{:?}", recompiled.ctx));
         if let Some(hit) = cache.get(&key) {
             return hit.clone();
         }
@@ -626,24 +700,121 @@ impl Model {
         cache.insert(key, check.clone());
         check
     }
+
+    /// Whether `tree` sees the same constants, attribute count and callee shapes in the
+    /// recompiled file as in the original (constants as [`live_context`] normalizes
+    /// them).
+    fn same_context_for(&self, tree: &BhavChunk, recompiled: &RecompiledFile) -> bool {
+        let (a, b) = (&self.ctx_original, &recompiled.ctx);
+        let callee = |c: &LiveContext, id: u16| {
+            (
+                c.callee_arities.as_ref().and_then(|m| m.get(&id).copied()),
+                c.argless_callees.as_ref().map(|s| s.contains(&id)),
+            )
+        };
+        a.my_attribute_count == b.my_attribute_count
+            && a.local_bcons == b.local_bcons
+            && tree
+                .instructions
+                .iter()
+                .filter(|i| i.opcode >= 0x100)
+                .all(|i| callee(a, i.opcode) == callee(b, i.opcode))
+    }
+
+    /// Why `tree`'s sounds may differ: a Play Sound Event (primitive 23) naming an FWAV
+    /// whose event the recompiled object does not reproduce.
+    fn sound_gap(&self, tree: &BhavChunk, recompiled: &RecompiledFile) -> Option<String> {
+        tree.instructions
+            .iter()
+            .filter(|i| i.opcode == PLAY_SOUND)
+            .map(|i| u16::from_le_bytes([i.operands[0], i.operands[1]]))
+            .find(|id| self.original_sounds.get(id) != recompiled.sounds.get(id))
+            .map(|id| match self.sounds_skipped.get(&id) {
+                Some(why) => format!("plays sound {id}: {why}"),
+                None => format!("plays sound {id}, which the decompiled object does not reproduce"),
+            })
+    }
+
+    fn resources_not_reproduced(&self, recompiled: &RecompiledFile) -> Vec<String> {
+        self.original_resources
+            .iter()
+            .filter(|(key, data)| recompiled.resources.get(key) != Some(*data))
+            .map(|((tag, id), _)| format!("{} {id}", String::from_utf8_lossy(tag)))
+            .collect()
+    }
+
+    /// Marks tree `id` as not writable at any level. Returns `false` if it already was.
+    fn omit(&mut self, id: u16, message: &str) -> bool {
+        match self.trees.iter_mut().find(|t| t.id == id) {
+            Some(t) if t.omitted.is_none() => {
+                t.omitted = Some(format!(
+                    "it does not compile at any level: {}",
+                    message.lines().next().unwrap_or_default()
+                ));
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Entries an operand can address in one BCON table (7 bits of entry index).
+const BCON_ADDRESSABLE: usize = 128;
+
+/// Play Sound Event.
+const PLAY_SOUND: u16 = 23;
+
+/// The sound event each FWAV chunk names, as the VM reads it: the bytes up to the first
+/// zero as Latin-1, the last chunk of an ID winning (`sims-vm/src/program.rs`).
+fn fwav_sounds(iff: &Iff) -> BTreeMap<u16, String> {
+    let mut out = BTreeMap::new();
+    for c in iff.chunks.iter().filter(|c| &c.tag == b"FWAV") {
+        let data = iff.data(c);
+        let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+        out.insert(c.id, data[..end].iter().map(|&b| char::from(b)).collect());
+    }
+    out
+}
+
+/// Non-code chunks a tree can read through a primitive, keyed by tag and ID (last
+/// chunk of a key wins).
+fn resource_chunks(iff: &Iff) -> BTreeMap<([u8; 4], u16), Vec<u8>> {
+    const TAGS: [&[u8; 4]; 8] = [
+        b"STR#", b"CTSS", b"TTAB", b"TTAs", b"SLOT", b"FCNS", b"GLOB", b"TPRP",
+    ];
+    let mut out = BTreeMap::new();
+    for c in iff.chunks.iter().filter(|c| TAGS.contains(&&c.tag)) {
+        out.insert((c.tag, c.id), iff.data(c).to_vec());
+    }
+    out
 }
 
 struct RecompiledFile {
     trees: BTreeMap<u16, BhavChunk>,
     ctx: LiveContext,
+    sounds: BTreeMap<u16, String>,
+    resources: BTreeMap<([u8; 4], u16), Vec<u8>>,
 }
 
 enum Failure {
     /// The v2 front end rejected the source (line in the generated text).
-    V2 { line: Option<usize> },
+    V2 {
+        line: Option<usize>,
+        message: String,
+    },
     /// The `.air` compiler rejected the lowered source (the tree it was in).
-    Air { tree: Option<u16> },
+    Air { tree: Option<u16>, message: String },
 }
 
 /// Whether `b` is `a` plus one trailing node nothing can reach: the `return true;` v2
 /// adds after a `raw` body, which it cannot see always returns. Only node 0 is an entry
 /// unless the tree is indexed (kind 4), so a node no edge names never runs.
-fn same_but_unreachable_tail(a: &BhavChunk, b: &BhavChunk) -> bool {
+///
+/// The node must also be unread and must not change a fault: every edge of `a` stays
+/// in range (an out-of-range target faults with the tree's node count), and the last
+/// node is not a call whose inline arguments could run on into the next node
+/// (`sims-vm/src/interpreter.rs`, the argument copy past the operand bytes).
+fn same_but_unreachable_tail(a: &BhavChunk, b: &BhavChunk, ctx: &LiveContext) -> bool {
     let n = a.instructions.len();
     let header = |x: &BhavChunk| (x.format, x.kind, x.args, x.locals);
     let Ok(tail) = u8::try_from(n) else {
@@ -657,9 +828,20 @@ fn same_but_unreachable_tail(a: &BhavChunk, b: &BhavChunk) -> bool {
             (x.opcode, x.on_true, x.on_false, x.operands)
                 == (y.opcode, y.on_true, y.on_false, y.operands)
         })
-        && b.instructions[..n]
-            .iter()
-            .all(|i| i.on_true != tail && i.on_false != tail)
+        && a.instructions.iter().all(|i| {
+            [i.on_true, i.on_false]
+                .iter()
+                .all(|&t| t < tail || t >= 0xfd)
+        })
+        && a.instructions.last().is_some_and(|last| {
+            last.opcode < 0x100
+                || last.operands == [0xff; 8]
+                || ctx
+                    .callee_arities
+                    .as_ref()
+                    .and_then(|m| m.get(&last.opcode))
+                    .is_some_and(|&argc| argc <= 4)
+        })
 }
 
 /// The checker context for a file: its private arities plus the library's, its private
@@ -676,6 +858,15 @@ fn live_context(iff: &Iff, library: &BTreeMap<u16, usize>) -> LiveContext {
             bcons.insert(c.id, values);
         }
     }
+    // What an operand can read: entries past 127 have no address, and an empty table
+    // reads like a missing one (`sims-vm/src/program.rs`, `Program::constant`).
+    let bcons: BTreeMap<u16, Vec<i16>> = bcons
+        .into_iter()
+        .filter_map(|(id, mut values)| {
+            values.truncate(BCON_ADDRESSABLE);
+            (!values.is_empty()).then_some((id, values))
+        })
+        .collect();
     let mut argless = BTreeSet::new();
     for c in vm_kept_bhavs(iff).chunks {
         if PRIVATE_TREES.contains(&c.id)
@@ -1185,15 +1376,19 @@ impl Plan {
             return self.raw_stmts.entry(r.tree).or_default().insert(r.stmt)
                 || self.lower_tree(model, r.tree);
         }
-        match generated
-            .tree_ranges
-            .iter()
-            .find(|(_, start, end)| *start <= line && line <= *end)
-        {
-            Some(&(id, _, _)) => self.lower_tree(model, id) || self.lower_all(model),
+        match generated.tree_at_line(line) {
+            // The caller leaves out a tree that cannot go lower.
+            Some(id) => self.lower_tree(model, id),
             None => self.lower_all(model),
         }
     }
+}
+
+fn no_compile(message: &str) -> Error {
+    Error::new(format!(
+        "decompiled source does not compile even with every tree in 'raw': {}",
+        message.lines().next().unwrap_or_default()
+    ))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1205,6 +1400,16 @@ struct StmtRange {
     end: usize,
     tree: u16,
     stmt: usize,
+}
+
+impl Generated {
+    /// The tree whose lines include 0-based line `line`.
+    fn tree_at_line(&self, line: usize) -> Option<u16> {
+        self.tree_ranges
+            .iter()
+            .find(|(_, start, end)| *start <= line && line <= *end)
+            .map(|&(id, _, _)| id)
+    }
 }
 
 struct Generated {
@@ -1326,6 +1531,14 @@ impl Model {
         for s in &self.states {
             out.line(format!("state attr_{s} @ {s}: i16;"));
         }
+        if !self.sounds.is_empty() {
+            out.line("");
+        }
+        for (id, name) in &self.sounds {
+            out.line(format!(
+                "sound sound_{id} = preset(\"ui_click\", wav: \"{name}\", id: {id});"
+            ));
+        }
         if !self.states.is_empty() {
             out.line("");
         }
@@ -1425,16 +1638,23 @@ fn hex_u32(v: u32) -> String {
 
 /// Removes the common leading indentation of `lines` (blank lines ignored).
 fn dedent(lines: &[&str]) -> Vec<String> {
+    let indent_of = |l: &str| l.chars().take_while(|c| c.is_whitespace()).count();
     let indent = lines
         .iter()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| l.len() - l.trim_start().len())
+        .map(|l| indent_of(l))
         .min()
         .unwrap_or(0);
     lines
         .iter()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| l[indent.min(l.len())..].trim_end().to_owned())
+        .map(|l| {
+            l.chars()
+                .skip(indent)
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
         .collect()
 }
 
@@ -2028,6 +2248,7 @@ impl Translator<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sims_formats::behavior::Instruction;
 
     #[test]
     fn library_constant_names() {
@@ -2045,6 +2266,83 @@ mod tests {
         );
         assert_eq!(unique_ident("", 4201, &mut used), "tree_4201");
         assert_eq!(unique_ident("42 things", 4202, &mut used), "tree_4202");
+    }
+
+    fn tree(instructions: &[(u16, u8, u8, [u8; 8])]) -> BhavChunk {
+        let mut t = BhavChunk::new(
+            4200,
+            "T",
+            instructions
+                .iter()
+                .map(|&(opcode, on_true, on_false, operands)| Instruction {
+                    opcode,
+                    on_true,
+                    on_false,
+                    operands,
+                })
+                .collect(),
+        );
+        t.format = 0x8002;
+        t
+    }
+
+    fn with_tail(a: &BhavChunk) -> BhavChunk {
+        let mut b = a.clone();
+        b.instructions.push(Instruction {
+            opcode: 2,
+            on_true: 0xfe,
+            on_false: 0xfe,
+            operands: [0; 8],
+        });
+        b
+    }
+
+    fn arities(pairs: &[(u16, usize)]) -> LiveContext {
+        LiveContext {
+            callee_arities: Some(pairs.iter().copied().collect()),
+            ..LiveContext::default()
+        }
+    }
+
+    #[test]
+    fn unreachable_tail_needs_an_unread_node() {
+        let ctx = arities(&[(4201, 4), (4202, 5)]);
+        let plain = tree(&[(2, 0xfe, 0xfd, [0; 8])]);
+        assert!(same_but_unreachable_tail(&plain, &with_tail(&plain), &ctx));
+        // An edge to the appended node, or past the original's end, rules it out.
+        let to_tail = tree(&[(2, 1, 0xfd, [0; 8])]);
+        assert!(!same_but_unreachable_tail(
+            &to_tail,
+            &with_tail(&to_tail),
+            &ctx
+        ));
+        let out_of_range = tree(&[(2, 0xfe, 9, [0; 8])]);
+        assert!(!same_but_unreachable_tail(
+            &out_of_range,
+            &with_tail(&out_of_range),
+            &ctx
+        ));
+        // A last-node call whose inline arguments run past its operands reads the tail.
+        let spill = tree(&[(4202, 0xfe, 0xfd, [0; 8])]);
+        assert!(!same_but_unreachable_tail(&spill, &with_tail(&spill), &ctx));
+        let unknown = tree(&[(4203, 0xfe, 0xfd, [0; 8])]);
+        assert!(!same_but_unreachable_tail(
+            &unknown,
+            &with_tail(&unknown),
+            &ctx
+        ));
+        let fits = tree(&[(4201, 0xfe, 0xfd, [0; 8])]);
+        assert!(same_but_unreachable_tail(&fits, &with_tail(&fits), &ctx));
+        let temps = tree(&[(4202, 0xfe, 0xfd, [0xff; 8])]);
+        assert!(same_but_unreachable_tail(&temps, &with_tail(&temps), &ctx));
+    }
+
+    #[test]
+    fn dedent_counts_characters() {
+        assert_eq!(
+            dedent(&["  a", "\u{a0}  b"]),
+            vec!["a".to_owned(), " b".to_owned()]
+        );
     }
 
     #[test]

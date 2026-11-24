@@ -3,12 +3,15 @@
 //! Every object here is synthetic (GUIDs in the clean-room 0x7E00_xxxx range); the
 //! formatter is additionally exercised on the clean-room `open-pack` sources.
 
+use sims_antics::encode::{encode_bcon, encode_bhav};
+use sims_antics::ir::{BconChunk, BhavChunk};
 use sims_antics::v2::{
     DecompileV2Options, PackResolverConfig, TreeCheck, TreeStyle, decompile_iff_to_v2,
     decompile_iff_to_v2_report, format_v2_source, is_v2_formatted,
 };
 use sims_antics::{CompiledObject, compile_v2_source, expand_v2_to_air};
-use sims_formats::iff::Iff;
+use sims_formats::behavior::Instruction;
+use sims_formats::iff::{ChunkData, Iff};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -203,6 +206,8 @@ fn synthetic_lamp_round_trips_with_idioms() {
         "sim.motive[13] += SynthLampTuning.e0;",
         "guid: 0x7E00_0001;",
         "bcon 4097 \"Tuning\" {",
+        // The FWAV keeps its ID and event name.
+        "id: 1);",
     ] {
         assert!(source.contains(idiom), "missing `{idiom}` in:\n{source}");
     }
@@ -218,6 +223,126 @@ fn synthetic_counter_round_trips() {
     assert!(source.contains("Limits.e1"), "{source}");
     assert!(source.contains("for o in lot.objects() {"), "{source}");
     assert!(source.contains("@id(4096) init {"), "{source}");
+}
+
+/// Re-encodes `iff` with `extra` chunks appended after its own.
+fn with_chunks(iff: &Iff, extra: Vec<ChunkData>) -> Iff {
+    let mut chunks: Vec<ChunkData> = iff
+        .chunks
+        .iter()
+        .filter(|c| &c.tag != b"rsmp")
+        .map(|c| ChunkData {
+            tag: c.tag,
+            id: c.id,
+            flags: c.flags,
+            label: c.label.clone(),
+            data: iff.data(c).to_vec(),
+        })
+        .collect();
+    chunks.extend(extra);
+    parse_iff(&sims_formats::iff::write(&chunks).expect("write IFF"))
+}
+
+fn bcon(id: u16, label: &str, values: Vec<i16>) -> ChunkData {
+    let chunk = BconChunk {
+        id,
+        label: label.to_owned(),
+        flags: 0,
+        values,
+        trailing: Vec::new(),
+    };
+    ChunkData {
+        tag: *b"BCON",
+        id,
+        flags: 0x10,
+        label: label.to_owned(),
+        data: encode_bcon(&chunk).expect("encode BCON"),
+    }
+}
+
+#[test]
+fn constant_tables_follow_the_vm() {
+    let iff = parse_iff(&compile("synth-counter.antics", COUNTER).iff_bytes);
+    let iff = with_chunks(
+        &iff,
+        vec![
+            // A later chunk of an ID replaces the earlier one, as in the VM.
+            bcon(4100, "Limits", vec![3, 7]),
+            // Labels whose fallback names collide.
+            bcon(4101, "Limits4102", vec![1]),
+            bcon(4102, "Limits", vec![2]),
+            // Only the first 128 entries are addressable.
+            bcon(4103, "Wide", (0..130).collect()),
+        ],
+    );
+    let report =
+        decompile_iff_to_v2_report(&iff, &DecompileV2Options::default()).expect("decompile");
+    let source = &report.source;
+    assert_eq!(report.counterexamples(), 0, "{source}");
+    assert!(
+        report
+            .trees
+            .iter()
+            .all(|t| matches!(t.check, TreeCheck::Identical | TreeCheck::Equivalent)),
+        "{:?}\n{source}",
+        report.trees
+    );
+    assert!(
+        source.contains("bcon 4100 \"Limits\" {\n        e0 = 3,\n        e1 = 7,"),
+        "{source}"
+    );
+    assert!(source.contains("bcon 4101 \"Limits4102\""), "{source}");
+    assert!(source.contains("bcon 4102 \"Limits4102_2\""), "{source}");
+    assert!(
+        source.contains("e127 = 127,") && !source.contains("e128"),
+        "{source}"
+    );
+}
+
+#[test]
+fn a_tree_v2_cannot_write_is_omitted_not_fatal() {
+    let iff = parse_iff(&compile("synth-counter.antics", COUNTER).iff_bytes);
+    // 251 nodes, each calling a private tree with the caller's temps: the most a tree
+    // holds, so the `return true;` v2 adds after a raw body does not fit.
+    let instructions = (0..251u16)
+        .map(|i| Instruction {
+            opcode: 4300,
+            on_true: if i == 250 { 0xfe } else { (i + 1) as u8 },
+            on_false: 0xfd,
+            operands: [0xff; 8],
+        })
+        .collect();
+    let mut long = BhavChunk::new(4400, "Long", instructions);
+    long.format = 0x8002;
+    let iff = with_chunks(
+        &iff,
+        vec![ChunkData {
+            tag: *b"BHAV",
+            id: 4400,
+            flags: 0x10,
+            label: "Long".to_owned(),
+            data: encode_bhav(&long).expect("encode BHAV"),
+        }],
+    );
+    let report =
+        decompile_iff_to_v2_report(&iff, &DecompileV2Options::default()).expect("decompile");
+    assert_eq!(report.counterexamples(), 0);
+    let long = report
+        .trees
+        .iter()
+        .find(|t| t.id == 4400)
+        .expect("tree 4400");
+    assert!(
+        matches!(&long.check, TreeCheck::Omitted(why) if why.contains("251 instructions")),
+        "{:?}",
+        long.check
+    );
+    assert!(
+        report
+            .source
+            .contains("// tree 4400 \"Long\" is not written")
+    );
+    compile("decompiled.antics", &report.source);
 }
 
 #[test]
@@ -288,6 +413,20 @@ fn formatter_is_idempotent_and_keeps_comments() {
     assert_eq!(
         compile("messy.antics", MESSY).iff_bytes,
         compile("messy.antics", &once).iff_bytes
+    );
+}
+
+#[test]
+fn formatter_handles_unicode_indentation_and_raw_comments() {
+    let source = "object \"Synth Odd\" {\n    guid: 0x7E00_0004;\n    @id(4200) tree t \"T\" {\n        raw // why raw\n        {\n            temp[0] := 1;\n \u{a0}           temp[1] := 2;\n        }\n        raw /* a */ { temp[2] := 3; }\n        return true;\n    }\n}\n";
+    compile("odd.antics", source);
+    let once = format_v2_source(source).expect("format");
+    assert_eq!(format_v2_source(&once).expect("format twice"), once);
+    assert!(once.contains("raw // why raw\n        {\n"), "{once}");
+    assert!(once.contains("raw /* a */ { temp[2] := 3; }"), "{once}");
+    assert_eq!(
+        compile("odd.antics", source).iff_bytes,
+        compile("odd.antics", &once).iff_bytes
     );
 }
 

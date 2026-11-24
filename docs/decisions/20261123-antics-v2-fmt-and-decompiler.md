@@ -57,7 +57,8 @@ Layout rules:
 `decompile_iff_to_v2(iff, options)` writes one `object`, from the file's first OBJD (later OBJDs of a multi-tile object are counted, not written):
 
 - metadata: `guid`, `price`; v2 supplies its own placeholder sprite;
-- named `bcon` tables, from the file's private BCONs, with entries `e0`, `e1`, ...;
+- named `bcon` tables, from the file's private BCONs, with entries `e0`, `e1`, ... BCONs are chosen as the VM loads them: the last chunk of an ID wins, and only the first 128 entries (all an operand can address) are written;
+- `sound sound_N = preset(.., wav: "event", id: N);` for every FWAV v2 can declare, keeping its ID and event name;
 - `extern bcon library_consts` entries (`g256_3`, `s8192_1`) for the global/semi-global constants it uses;
 - `state attr_N @ N: i16;` for every object attribute it touches, with no initializer, so `init` never writes it;
 - `extern mod globals` / `extern mod semi_globals` for called library trees;
@@ -87,6 +88,14 @@ The decompiler checks its own output:
 1. It compiles the generated object with the real v2 compiler.
 2. It compares every original private BHAV with the recompiled one: byte equality first, then `check_bhav_equivalent_combined`.
 
+Byte equality only proves anything when the tree runs in the same surroundings. Both shortcuts (byte equality, and the unreachable tail below) therefore also need:
+
+- the same tuning constants, compared as the VM reads them (entries past 127 have no address, and an empty table reads like a missing one);
+- the same attribute count;
+- the same arity, and argument-free status, for every callee the tree names.
+
+Otherwise the checker decides, with both contexts. The checker does not model sounds. A tree whose Play Sound Event names an FWAV that the recompiled object does not reproduce is reported inconclusive, with the reason.
+
 Each tree starts at the most readable level and moves down until it compiles and is proven:
 
 1. **Idiomatic.** Statements are translated; single statements can be forced to `raw`.
@@ -98,10 +107,14 @@ A v2 compile error is mapped back by line, to the innermost statement (which goe
 
 Special cases:
 
-- **Unreachable tail.** v2 treats `raw` as opaque and appends `return true;`. After a labeled raw body that adds one trailing node no edge reaches. A recompiled tree that equals the original plus such a node (same header, not a yielding node) counts as Equivalent.
+- **Unreachable tail.** v2 treats `raw` as opaque and appends `return true;`. After a labeled raw body that adds one trailing node no edge reaches. A recompiled tree that equals the original plus such a node counts as Equivalent, under these conditions:
+  - same header, and not an indexed tree (kind 4);
+  - every original edge stays in range (an out-of-range edge faults with the node count);
+  - the last node is not a call whose inline arguments could run on into the appended node (the VM copies arguments past the operand bytes).
 - **Lifecycle trees.** An init or main tree whose header v2's `init`/`main` block cannot reproduce (format other than 0x8002, or a tree still unproven at the lowest level) is written as a plain `@id(N) @frame(..) tree` instead. v2 then emits its own init/main tree for the OBJD, so the decompiled object's OBJD entry points no longer name the original IDs.
 - **Calls.** A call is written as a v2 call only when caller and callee share a context. Otherwise it stays `raw`.
-- **Omitted trees.** A BHAV format outside 0x8000–0x8002, or a 0x8000/0x8001 header with more than four arguments, has no v2 spelling. The tree is left out with a comment, and the report says why.
+- **Omitted trees.** Some trees have no v2 spelling: a BHAV format outside 0x8000–0x8002, or a 0x8000/0x8001 header with more than four arguments. So does a tree that still does not compile at its lowest level, such as a full 251-node tree, which has no room for v2's appended return. Such a tree is left out with a comment, and the report gives the compiler's reason; the rest of the file is still written.
+- **Resources.** The report lists behaviour-relevant chunks (`STR#`, `CTSS`, `TTAB`, `TTAs`, `SLOT`, `FCNS`, `GLOB`, `TPRP`) that the recompiled object does not carry byte for byte. The CLI prints them as a note. Tree checks cover code, constants, callee shapes and sounds, not these.
 
 **Why validate inside the decompiler.** Lowering adds its own structure: the `__self_obj` save, local allocation, and its own loop forms. Predicting all of that in the decompiler would copy Track 8's lowering. Asking the compiler and the verifier gives the same guarantee and stays correct as lowering changes.
 
@@ -114,6 +127,10 @@ Special cases:
 - The formatter is safe on any parseable file: the worst outcome is an error, never a semantic change. A token-equality failure is a bug in the formatter.
 - The decompiler's readability can grow one idiom at a time. A wrong idiom cannot ship silently, because the validation loop drops that tree to a lower level.
 - **Not whole-file equivalent.** The recompiled IFF has the v2 compiler's own chunk layout (sprites, OBJD words, CTSS, no TTAB). Equivalence is therefore checked tree by tree on BHAV IDs, not with whole-file `verify-equiv`, which needs identical non-BHAV chunks.
+- **Known v2 gaps** (Track 8 follow-ups), reported as inconclusive rather than hidden:
+  - an FWAV with ID 0;
+  - two FWAVs naming the same event;
+  - a tree's kind byte, which `@frame` cannot set.
 - **What would reopen this:**
   - v2 gains a way to pin non-BHAV chunks (TTAB, OBJD entry points); whole-file `verify-equiv` would then apply;
   - the checker learns to prove renumbered yielding trees; real content would then stay idiomatic;

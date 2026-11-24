@@ -152,7 +152,7 @@ struct Tok {
     text: String,
     class: Class,
     /// For `Raw`: trivia (comments) between `raw` and `{`, verbatim.
-    raw_prefix: String,
+    raw_prefix: Vec<(String, bool)>,
     leading: Vec<Comment>,
     /// Line breaks between the previous item (token or comment) and this token.
     newlines_before: usize,
@@ -192,7 +192,7 @@ fn scan(source: &str) -> Result<Scanned> {
         let mut tok = Tok {
             text: source[start..end].to_owned(),
             class,
-            raw_prefix: String::new(),
+            raw_prefix: Vec::new(),
             leading: comments,
             newlines_before: newlines,
         };
@@ -208,14 +208,8 @@ fn scan(source: &str) -> Result<Scanned> {
                     tok.class = Class::Raw;
                     tok.raw_prefix = pre_comments
                         .iter()
-                        .map(|c| c.text.trim_end().to_owned())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if pre_comments.iter().any(|c| c.is_line) {
-                        return Err(Error::new(
-                            "unsupported layout: a line comment between 'raw' and '{'",
-                        ));
-                    }
+                        .map(|c| (c.text.trim_end().to_owned(), c.is_line))
+                        .collect();
                     tok.text = source[brace + 1..body_end].to_owned();
                     pos = body_end + 1;
                 }
@@ -1128,11 +1122,20 @@ impl<'a> Printer<'a> {
         let body = self.toks[i].text.clone();
         let prefix = self.toks[i].raw_prefix.clone();
         self.write("raw");
-        if !prefix.is_empty() {
-            self.write(" ");
-            self.write(&prefix);
+        // Comments between `raw` and `{`; a line comment puts `{` on the next line.
+        for (text, is_line) in &prefix {
+            if !self.at_line_start {
+                self.write(" ");
+            }
+            self.write(text);
+            if *is_line {
+                self.newline(false);
+            }
         }
-        self.write(" {");
+        if !self.at_line_start {
+            self.write(" ");
+        }
+        self.write("{");
         if !body.contains('\n') {
             let t = body.trim();
             if t.is_empty() {
@@ -1146,11 +1149,13 @@ impl<'a> Printer<'a> {
         }
         let lines: Vec<&str> = body.lines().map(str::trim_end).collect();
         // The first line follows `{` directly; the others keep their relative indentation.
+        // Indentation is counted in characters: it may hold any Unicode whitespace.
+        let indent_of = |l: &str| l.chars().take_while(|c| c.is_whitespace()).count();
         let min_indent = lines
             .iter()
             .skip(1)
             .filter(|l| !l.trim().is_empty())
-            .map(|l| l.len() - l.trim_start().len())
+            .map(|l| indent_of(l))
             .min()
             .unwrap_or(0);
         let mut rendered: Vec<String> = Vec::new();
@@ -1160,9 +1165,12 @@ impl<'a> Printer<'a> {
             } else if k == 0 {
                 rendered.push(line.trim().to_owned());
             } else {
-                let lead = line.len() - line.trim_start().len();
-                let rel = lead.saturating_sub(min_indent);
-                rendered.push(format!("{}{}", &line[lead - rel..lead], line.trim_start()));
+                let kept: String = line
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .skip(min_indent)
+                    .collect();
+                rendered.push(format!("{kept}{}", line.trim_start()));
             }
         }
         // Drop leading/trailing empty lines and collapse runs of empty lines.

@@ -2270,6 +2270,13 @@ fn lift_v2(
         };
         eprintln!("  tree {}: {}", t.id, sanitize_single_line(&why));
     }
+    if !report.resources_not_reproduced.is_empty() {
+        eprintln!(
+            "note: {} resource chunk(s) are not reproduced byte for byte ({}); trees that read them are checked as code only",
+            report.resources_not_reproduced.len(),
+            report.resources_not_reproduced.join(", ")
+        );
+    }
     if report.counterexamples() > 0 {
         return Err(CliError::Exit(1));
     }
