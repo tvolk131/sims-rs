@@ -5,7 +5,7 @@
 
 use sims_antics::v2::lint::{
     ENUM_WILDCARD_ALL_COVERED, LINT_RULES, LintDiagnostic, LintInput, Severity,
-    diagnostics_to_json, lint_v2_source, lint_v2_sources, render_diagnostic,
+    diagnostics_to_json, lint_v2_paths, lint_v2_source, lint_v2_sources, render_diagnostic,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -181,25 +181,27 @@ fn wildcard_rules_resolve_the_enum_through_imports() {
             "enum Mode { Off, Low, High }\n",
             "use crate::shared::wide::Wider as Mode;\n",
         );
+    // A pack on disk: the import resolves to `shared/wide.antics`, which is not among the
+    // linted files; an unrelated `Wider` and `Mode` are.
+    let dir = scratch("enum-imports");
+    std::fs::create_dir_all(dir.join("shared")).unwrap();
+    std::fs::create_dir_all(dir.join("objects")).unwrap();
+    std::fs::write(dir.join("pack.toml"), "[pack]\nname = \"Synth Pack\"\n").unwrap();
+    std::fs::write(
+        dir.join("shared").join("wide.antics"),
+        "pub enum Wider { Off, Low, High }\n",
+    )
+    .unwrap();
+    let narrow = dir.join("narrow.antics");
+    std::fs::write(
+        &narrow,
+        "pub enum Wider { Off, Low }\npub enum Mode { Off, Low }\n",
+    )
+    .unwrap();
     let files = |user: &str| {
-        lint_v2_sources(&[
-            LintInput {
-                name: "wide.antics".to_owned(),
-                source: "pub enum Wider { Off, Low, High }\n".to_owned(),
-                ..LintInput::default()
-            },
-            LintInput {
-                name: "narrow.antics".to_owned(),
-                source: "pub enum Mode { Off, Low }\n".to_owned(),
-                ..LintInput::default()
-            },
-            LintInput {
-                name: "user.antics".to_owned(),
-                source: user.to_owned(),
-                ..LintInput::default()
-            },
-        ])
-        .unwrap()
+        let path = dir.join("objects").join("user.antics");
+        std::fs::write(&path, user).unwrap();
+        lint_v2_paths(&[path, narrow.clone()]).unwrap().0
     };
     let found = files(&user);
     assert!(
@@ -215,6 +217,24 @@ fn wildcard_rules_resolve_the_enum_through_imports() {
     // A name neither declared nor imported is not judged.
     let unimported = user.replace("use crate::shared::wide::Wider as Mode;\n", "");
     let found = files(&unimported);
+    assert!(
+        !found.iter().any(|d| d.rule.starts_with("enum_wildcard")),
+        "{found:#?}"
+    );
+    // Without a pack the import cannot be resolved, so it is not judged either.
+    let found = lint_v2_sources(&[
+        LintInput {
+            name: "narrow.antics".to_owned(),
+            source: "pub enum Wider { Off, Low }\n".to_owned(),
+            ..LintInput::default()
+        },
+        LintInput {
+            name: "user.antics".to_owned(),
+            source: user.clone(),
+            ..LintInput::default()
+        },
+    ])
+    .unwrap();
     assert!(
         !found.iter().any(|d| d.rule.starts_with("enum_wildcard")),
         "{found:#?}"
@@ -424,6 +444,17 @@ fn locals_are_not_judged_when_raw_code_addresses_locals_by_number() {
         &tree("        let x: i16;\n        raw { local [0] := 2; }\n        self.level = x;"),
         "unused_decl",
     );
+    none(
+        &tree("        let x = 7;\n        raw { temp[1] := local /* gap */ [1]; }"),
+        "unused_decl",
+    );
+    // A mention in an `.air` comment is not an address.
+    one(
+        &tree(
+            "        let x = 7;\n        raw {\n            temp[1] := 2; # not local[1]\n        }",
+        ),
+        "unused_decl",
+    );
 }
 
 #[test]
@@ -432,7 +463,12 @@ fn bcon_entries_are_not_judged_when_something_reads_them_by_number() {
          tree probe \"Probe\" {\n        self.level = Tuning.low;\n        self.mode = Mode::Off;\n";
     let flagged = obj(&format!("{members}    }}"));
     assert_eq!(of(&flagged, "unused_decl").len(), 1, "{flagged}");
-    for read in ["bcon[129]", "bcon [129]"] {
+    for read in [
+        "bcon[129]",
+        "bcon [129]",
+        "bcon /* gap */ [129]",
+        "const[129]",
+    ] {
         let raw = obj(&format!(
             "{members}        raw {{ temp[0] := {read}; }}\n    }}"
         ));
@@ -539,6 +575,12 @@ fn frame_headroom_points_at_the_tree_in_its_own_object() {
     let d = one(&source, "frame_headroom");
     assert!(d.message.contains("tree 4200"), "{d:?}");
     assert_eq!(d.line, line_of(&source, "@id(4200)"), "{d:?}");
+    // Two unpinned trees sharing a label in one object: the object, not the wrong tree.
+    let source = obj(&format!(
+        "    tree a \"Shared\" {{\n        self.mode = Mode::Off;\n    }}\n    tree b \"Shared\" {{\n        self.mode = Mode::Off;\n{many_nodes}    }}"
+    ));
+    let d = one(&source, "frame_headroom");
+    assert_eq!(d.line, line_of(&source, "object \"Synth Probe\""), "{d:?}");
 }
 
 #[test]
@@ -598,12 +640,22 @@ fn three_equality_tests_of_one_place_are_flagged_once() {
 }
 
 #[test]
+fn enum_chains_on_an_enum_state_are_flagged() {
+    let source = tree(
+        "        if self.mode == Mode::Off {\n            sleep(1);\n        } else if self.mode == Mode::Low {\n            sleep(2);\n        } else if self.mode == Mode::High {\n            sleep(3);\n        }",
+    );
+    one(&source, "collapsible_if_chain");
+}
+
+#[test]
 fn short_or_mixed_chains_are_fine() {
     for body in [
         "        if self.level == 1 {\n            sleep(1);\n        } else if self.level == 2 {\n            sleep(2);\n        }",
         "        if self.level == 1 {\n            sleep(1);\n        } else if temp[0] == 2 {\n            sleep(2);\n        } else if self.level == 3 {\n            sleep(3);\n        }",
         "        if self.level == 1 {\n            sleep(1);\n        } else if self.level > 2 {\n            sleep(2);\n        } else if self.level == 3 {\n            sleep(3);\n        }",
         "        if self.level == 1 {\n            sleep(1);\n        } else if self.level == 1 {\n            sleep(2);\n        } else if self.level == 3 {\n            sleep(3);\n        }",
+        // A `match` on an `ObjectId` does not compile.
+        "        if stack_obj == 1 {\n            sleep(1);\n        } else if stack_obj == 2 {\n            sleep(2);\n        } else if stack_obj == 3 {\n            sleep(3);\n        }",
         // `match` arms take only literals and enum variants.
         "        let a = random(10);\n        let b = random(10);\n        let c = random(10);\n        if self.level == a {\n            sleep(1);\n        } else if self.level == b {\n            sleep(2);\n        } else if self.level == c {\n            sleep(3);\n        }",
     ] {
@@ -647,6 +699,9 @@ fn raw_blocks_v2_cannot_spell_are_fine() {
         "        raw { special_effect(duration: 0, flags: 32); }",
         "        raw { show_string(table: 300, index: local[0]); }",
         "        raw { breakpoint(temp[0]); }",
+        "        raw { refresh(target: 2, mode: 0); }",
+        "        raw { go_to_relative(location: 200); }",
+        "        raw { special_effect(duration: --9223372036854775808); }",
     ] {
         none(&tree(raw), "manual_raw_has_builtin");
     }
@@ -746,6 +801,19 @@ fn allow_directives_suppress_by_line_and_file() {
     one(
         &tree(&format!(
             "        raw {{\n            //! antics-lint: allow(while_true)\n            notify_idle() pad 0xff;\n        }}\n{flagged}"
+        )),
+        "while_true",
+    );
+    // However the block is introduced.
+    one(
+        &tree(&format!(
+            "        raw /* {{ */ {{\n            //! antics-lint: allow(while_true)\n            notify_idle() pad 0xff;\n        }}\n{flagged}"
+        )),
+        "while_true",
+    );
+    one(
+        &tree(&format!(
+            "        dialog(\"\u{e9}\u{e9}\u{e9}\u{e9}\"); raw {{\n            //! antics-lint: allow(while_true)\n            notify_idle() pad 0xff;\n        }}\n{flagged}"
         )),
         "while_true",
     );

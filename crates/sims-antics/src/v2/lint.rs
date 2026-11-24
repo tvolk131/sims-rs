@@ -14,8 +14,8 @@
 
 use crate::error::{Error, Result, Span};
 use crate::v2::ast::{
-    CallArg, FnDecl, ForEachIter, GuardBody, MatchPattern, ObjectMember, ReturnAbi, V2AssignOp,
-    V2BinOp, V2Expr, V2File, V2Item, V2Stmt, V2Type, V2UnaryOp,
+    CallArg, FnDecl, ForEachIter, GuardBody, MatchPattern, ObjectMember, ReturnAbi, StateType,
+    V2AssignOp, V2BinOp, V2Expr, V2File, V2Item, V2Stmt, V2Type, V2UnaryOp,
 };
 use crate::v2::lexer::{TokenKind, tokenize};
 use crate::v2::parser::parse_v2_file;
@@ -250,7 +250,8 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             file: &input.name,
             lines: input.source.lines().collect(),
             symbols: &symbols,
-            enums: symbols.file_enums(ast),
+            enums: file_enums(input, ast),
+            states: file_states(ast),
             diags: Vec::new(),
         };
         cx.lint_file(ast);
@@ -329,9 +330,16 @@ impl Directives {
                 let TokenKind::RawBlock(body) = &t.kind else {
                     return None;
                 };
-                let start = line_starts.get(t.span.line.checked_sub(1)?)? + t.span.column - 1;
-                let open = start + source.get(start..)?.find('{')?;
-                Some((start, open + 1 + body.len() + 1))
+                let line_start = *line_starts.get(t.span.line.checked_sub(1)?)?;
+                let line = lines.get(t.span.line - 1)?;
+                // The span's column may count bytes or characters; either names this `raw`.
+                let (at, _) = line.match_indices("raw").find(|&(b, _)| {
+                    b + 1 == t.span.column || line[..b].chars().count() + 1 == t.span.column
+                })?;
+                let start = line_start + at;
+                let open = skip_ws_and_comments(source, start + 3);
+                (source.as_bytes().get(open) == Some(&b'{'))
+                    .then_some((start, open + 1 + body.len() + 1))
             })
             .collect();
         let mut skip_until = 0usize;
@@ -435,6 +443,40 @@ impl Directives {
     }
 }
 
+/// The byte offset of the first byte at or after `at` that is not whitespace or inside a
+/// `//` or (nested) `/* */` comment.
+fn skip_ws_and_comments(source: &str, mut at: usize) -> usize {
+    let b = source.as_bytes();
+    loop {
+        while at < b.len() && b[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        if b[at..].starts_with(b"//") {
+            while at < b.len() && b[at] != b'\n' {
+                at += 1;
+            }
+        } else if b[at..].starts_with(b"/*") {
+            let mut depth = 0usize;
+            while at < b.len() {
+                if b[at..].starts_with(b"/*") {
+                    depth += 1;
+                    at += 2;
+                } else if b[at..].starts_with(b"*/") {
+                    depth -= 1;
+                    at += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    at += 1;
+                }
+            }
+        } else {
+            return at;
+        }
+    }
+}
+
 /// `antics-lint: allow(a, b)` → `[a, b]`.
 fn parse_allow(text: &str) -> Option<Vec<String>> {
     let rest = text.trim().strip_prefix("antics-lint:")?.trim();
@@ -463,8 +505,6 @@ enum RetKind {
 
 #[derive(Default)]
 struct Symbols {
-    /// Enum name -> variant names (`None` when two declarations disagree).
-    enums: BTreeMap<String, Option<Vec<String>>>,
     /// Callee (`name` or `module::name`) -> return kind (`None` when definitions disagree).
     returns: BTreeMap<String, Option<RetKind>>,
     /// Every identifier written right after a `.` (fields, methods, BCON entries).
@@ -499,7 +539,8 @@ impl Symbols {
                     }
                 }
                 TokenKind::RawBlock(code) => {
-                    self.bcon_by_number |= raw_indexes(code, "bcon");
+                    // `.air` reads a BCON entry as `bcon[N]` or `const[N]`.
+                    self.bcon_by_number |= raw_indexes(code, "bcon") || raw_indexes(code, "const");
                     for w in code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
                         if !w.is_empty() {
                             self.raw_words.insert(w.to_owned());
@@ -521,7 +562,6 @@ impl Symbols {
         let add_members = |members: &[ObjectMember], this: &mut Self| {
             for m in members {
                 match m {
-                    ObjectMember::Enum(e) => this.add_enum(&e.name, &e.variants),
                     ObjectMember::Fn(f) => this.add_fn(f),
                     ObjectMember::Tree(t) => this.add_return(&t.ident, ret_kind(&t.ret)),
                     ObjectMember::ExternMod(m) => {
@@ -536,7 +576,6 @@ impl Symbols {
         };
         for item in &file.items {
             match item {
-                V2Item::Enum(e) => self.add_enum(&e.name, &e.variants),
                 V2Item::Fn(f) => self.add_fn(f),
                 V2Item::ExternMod(m) => {
                     self.bcon_by_number = true;
@@ -549,50 +588,6 @@ impl Symbols {
                 _ => {}
             }
         }
-    }
-
-    fn add_enum(&mut self, name: &str, variants: &[crate::v2::ast::EnumVariant]) {
-        let names: Vec<String> = variants.iter().map(|v| v.name.clone()).collect();
-        merge_enum(&mut self.enums, name, Some(names));
-    }
-
-    /// The enums a file can name: its own declarations, then its `use` imports (under
-    /// their alias) resolved against the file set. A name this cannot pin to one variant
-    /// list maps to `None`; a name neither declared nor imported is absent.
-    fn file_enums(&self, file: &V2File) -> BTreeMap<String, Option<Vec<String>>> {
-        let mut local = BTreeMap::new();
-        let mut add = |e: &crate::v2::ast::EnumDecl| {
-            let names = e.variants.iter().map(|v| v.name.clone()).collect();
-            merge_enum(&mut local, &e.name, Some(names));
-        };
-        for item in &file.items {
-            let members = match item {
-                V2Item::Enum(e) => {
-                    add(e);
-                    continue;
-                }
-                V2Item::Object(o) => &o.members,
-                V2Item::Template(t) => &t.members,
-                _ => continue,
-            };
-            for m in members {
-                if let ObjectMember::Enum(e) = m {
-                    add(e);
-                }
-            }
-        }
-        let mut imported = BTreeMap::new();
-        for u in &file.uses {
-            for item in &u.items {
-                let name = item.alias.as_deref().unwrap_or(&item.name);
-                if !local.contains_key(name) {
-                    let target = self.enums.get(&item.name).cloned().flatten();
-                    merge_enum(&mut imported, name, target);
-                }
-            }
-        }
-        local.extend(imported);
-        local
     }
 
     fn add_fn(&mut self, f: &FnDecl) {
@@ -947,9 +942,87 @@ struct FileLinter<'a> {
     file: &'a str,
     lines: Vec<&'a str>,
     symbols: &'a Symbols,
-    /// Enums this file can name (see `Symbols::file_enums`).
+    /// Enums this file can name (see `file_enums`).
     enums: BTreeMap<String, Option<Vec<String>>>,
+    /// The file's object states by name, with their type (`None` when two disagree).
+    states: BTreeMap<String, Option<StateType>>,
     diags: Vec<LintDiagnostic>,
+}
+
+/// A file's object and template states by name, with their type (`None` when two
+/// declarations disagree).
+fn file_states(file: &V2File) -> BTreeMap<String, Option<StateType>> {
+    let mut out: BTreeMap<String, Option<StateType>> = BTreeMap::new();
+    for item in &file.items {
+        let members = match item {
+            V2Item::Object(o) => &o.members,
+            V2Item::Template(t) => &t.members,
+            _ => continue,
+        };
+        for m in members {
+            if let ObjectMember::State(st) = m {
+                out.entry(st.name.clone())
+                    .and_modify(|t| {
+                        if t.as_ref() != Some(&st.ty) {
+                            *t = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(st.ty.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// The enums a file can name: its own declarations, then its `use` imports (under their
+/// alias) as the module loader resolves them. A name declared twice with different
+/// variants maps to `None`. Imports are left out when the file's imports do not resolve
+/// (no pack on disk), since a same-named enum elsewhere may not be the one imported.
+fn file_enums(input: &LintInput, file: &V2File) -> BTreeMap<String, Option<Vec<String>>> {
+    let mut local = BTreeMap::new();
+    let mut add = |e: &crate::v2::ast::EnumDecl| {
+        let names = e.variants.iter().map(|v| v.name.clone()).collect();
+        merge_enum(&mut local, &e.name, Some(names));
+    };
+    for item in &file.items {
+        let members = match item {
+            V2Item::Enum(e) => {
+                add(e);
+                continue;
+            }
+            V2Item::Object(o) => &o.members,
+            V2Item::Template(t) => &t.members,
+            _ => continue,
+        };
+        for m in members {
+            if let ObjectMember::Enum(e) = m {
+                add(e);
+            }
+        }
+    }
+    if file.uses.is_empty() {
+        return local;
+    }
+    let resolved = match (&input.path, &input.pack_dir) {
+        (Some(path), Some(pack)) => crate::v2::resolve_v2_file(path, Some(pack)).ok(),
+        _ => None,
+    };
+    let Some(resolved) = resolved else {
+        return local;
+    };
+    for u in &file.uses {
+        for item in &u.items {
+            let name = item.alias.as_deref().unwrap_or(&item.name);
+            if local.contains_key(name) {
+                continue;
+            }
+            if let Some((_, e)) = resolved.enums.get(name) {
+                let names = e.variants.iter().map(|v| v.name.clone()).collect();
+                local.insert(name.to_owned(), Some(names));
+            }
+        }
+    }
+    local
 }
 
 /// Whether the operands of raw `.air` primitive `word` (`args` is the text after its name)
@@ -972,24 +1045,129 @@ fn native_operands(word: &str, args: &str) -> bool {
             Some(hex) => i64::from_str_radix(&hex.replace('_', ""), 16).ok()?,
             None => digits.replace('_', "").parse().ok()?,
         };
-        Some(if neg { -n } else { n })
+        if neg { n.checked_neg() } else { Some(n) }
     };
     !inner.is_empty()
         && inner.split(',').all(|arg| {
             let Some((key, value)) = arg.split_once(':') else {
                 return false;
             };
+            let Some(&(_, _, kind)) = PRIM_OPERANDS
+                .iter()
+                .find(|(w, k, _)| *w == word && *k == key.trim())
+            else {
+                return false;
+            };
             let value = value.trim();
-            match literal(value) {
+            match (kind, literal(value)) {
+                (Operand::Range(lo, hi), Some(n)) => (lo..=hi).contains(&n),
                 // `special_effect` flag 0x20 reads the duration from a local.
-                Some(n) => !(word == "special_effect" && key.trim() == "flags" && n & 0x20 != 0),
-                None => matches!(value, "true" | "false"),
+                (Operand::Flags(lo, hi), Some(n)) => (lo..=hi).contains(&n) && n & 0x20 == 0,
+                (Operand::Bool, None) => matches!(value, "true" | "false"),
+                _ => false,
             }
         })
 }
 
+/// What a v2 builtin accepts for one named operand.
+#[derive(Clone, Copy)]
+enum Operand {
+    Range(i64, i64),
+    /// A flags operand of `special_effect` (bit `0x20` reads a local).
+    Flags(i64, i64),
+    Bool,
+}
+
+/// `(.air primitive, operand key, what the v2 builtin accepts)`, mirroring the v2 lowering's
+/// one-to-one builtins. A key not listed (such as `set_headline`'s `local`) is not judged.
+const PRIM_OPERANDS: &[(&str, &str, Operand)] = &[
+    ("run_tree_by_name", "table", Operand::Range(0, 65535)),
+    ("run_tree_by_name", "index", Operand::Range(0, 255)),
+    ("run_tree_by_name", "mode", Operand::Range(0, 255)),
+    ("run_tree_by_name", "global", Operand::Bool),
+    ("go_to_relative", "location", Operand::Range(-128, 127)),
+    ("go_to_relative", "facing", Operand::Range(0, 255)),
+    ("go_to_relative", "options", Operand::Range(0, 255)),
+    ("manage_inventory", "op", Operand::Range(0, 255)),
+    ("manage_inventory", "kind", Operand::Range(0, 255)),
+    ("manage_inventory", "flags", Operand::Range(0, 65535)),
+    ("manage_inventory", "guid", Operand::Range(0, 0xFFFF_FFFF)),
+    // v2 names the target `self` / `stack_obj`, or `0` / `1`.
+    ("refresh", "target", Operand::Range(0, 1)),
+    ("refresh", "mode", Operand::Range(0, 65535)),
+    ("action_string", "table", Operand::Range(0, 65535)),
+    ("action_string", "index", Operand::Range(0, 255)),
+    ("show_string", "table", Operand::Range(0, 65535)),
+    ("show_string", "index", Operand::Range(0, 65535)),
+    ("set_headline", "kind", Operand::Range(0, 255)),
+    ("set_headline", "index", Operand::Range(0, 255)),
+    ("set_headline", "duration", Operand::Range(-32768, 32767)),
+    ("set_headline", "options", Operand::Range(0, 65535)),
+    ("set_headline", "stack_obj", Operand::Bool),
+    ("special_effect", "duration", Operand::Range(-32768, 32767)),
+    ("special_effect", "kind", Operand::Range(0, 255)),
+    ("special_effect", "size", Operand::Range(0, 255)),
+    ("special_effect", "flags", Operand::Flags(0, 255)),
+    ("special_effect", "str_index", Operand::Range(0, 255)),
+];
+
+/// `.air` text with its comments (`//`, `#`, nested `/* */`) replaced by a space; strings
+/// are kept as they are.
+fn strip_air_comments(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    let mut chars = code.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                out.push(c);
+                let mut escaped = false;
+                for s in chars.by_ref() {
+                    out.push(s);
+                    if escaped {
+                        escaped = false;
+                    } else if s == '\\' {
+                        escaped = true;
+                    } else if s == '"' {
+                        break;
+                    }
+                }
+            }
+            '#' => {
+                chars.by_ref().find(|&s| s == '\n');
+                out.push('\n');
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                chars.by_ref().find(|&s| s == '\n');
+                out.push('\n');
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut depth = 1usize;
+                while depth > 0 {
+                    match chars.next() {
+                        Some('/') if chars.peek() == Some(&'*') => {
+                            chars.next();
+                            depth += 1;
+                        }
+                        Some('*') if chars.peek() == Some(&'/') => {
+                            chars.next();
+                            depth -= 1;
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+                out.push(' ');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Whether `.air` text indexes `word` by number (`word[`, spaces allowed before the `[`).
 fn raw_indexes(code: &str, word: &str) -> bool {
+    let code = &strip_air_comments(code);
     code.match_indices(word).any(|(at, _)| {
         let before = code[..at].chars().next_back();
         !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
@@ -1563,6 +1741,8 @@ impl FileLinter<'_> {
     fn collapsible_chain(&mut self, s: &V2Stmt) {
         let mut key: Option<String> = None;
         let mut values: Vec<String> = Vec::new();
+        let mut scrutinee: Option<&V2Expr> = None;
+        let mut patterns: Vec<&V2Expr> = Vec::new();
         let mut has_else = false;
         let mut cur = s;
         while let V2Stmt::If {
@@ -1581,11 +1761,8 @@ impl FileLinter<'_> {
             let (Some(k), Some(v)) = (place_key(lhs), pattern_text(rhs)) else {
                 return;
             };
-            if let V2Expr::Path(_, segs) = rhs.as_ref()
-                && !self.enums.contains_key(&segs[0])
-            {
-                return;
-            }
+            scrutinee = Some(lhs);
+            patterns.push(rhs);
             if key.as_ref().is_some_and(|x| *x != k) || values.contains(&v) {
                 return;
             }
@@ -1603,9 +1780,12 @@ impl FileLinter<'_> {
         if values.len() < 3 {
             return;
         }
-        let Some(key) = key else {
+        let (Some(key), Some(scrutinee)) = (key, scrutinee) else {
             return;
         };
+        if !self.matchable(scrutinee, &patterns) {
+            return;
+        }
         let arms: Vec<String> = values.iter().map(|v| format!("{v} => {{ ... }}")).collect();
         let fallback = if has_else { "_ => { ... }" } else { "_ => {}" };
         self.emit(
@@ -1619,6 +1799,38 @@ impl FileLinter<'_> {
             None,
             None,
         );
+    }
+
+    /// Whether `match scrutinee { patterns.. }` would compile: integer literals against an
+    /// `i16` place (`temp[N]`, `param[N]`, an `i16` state), or variants of one resolved enum
+    /// against a state of that enum. Places of unknown or other types are not judged.
+    fn matchable(&self, scrutinee: &V2Expr, patterns: &[&V2Expr]) -> bool {
+        let ty = match scrutinee {
+            V2Expr::Index { base, .. } if is_ident(base, "temp") || is_ident(base, "param") => {
+                StateType::I16
+            }
+            V2Expr::Field { base, field, .. } if is_ident(base, "self") => {
+                match self.states.get(field) {
+                    Some(Some(ty)) => ty.clone(),
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        };
+        match ty {
+            StateType::I16 => patterns
+                .iter()
+                .all(|p| pattern_text(p).is_some() && !matches!(p, V2Expr::Path(..))),
+            StateType::Named(e) => patterns.iter().all(|p| match p {
+                V2Expr::Path(_, segs) => {
+                    segs.len() == 2
+                        && segs[0] == e
+                        && matches!(self.enums.get(&e), Some(Some(vs)) if vs.contains(&segs[1]))
+                }
+                _ => false,
+            }),
+            _ => false,
+        }
     }
 
     fn raw_builtin(&mut self, span: Span, code: &str) {
@@ -1752,7 +1964,8 @@ impl FileLinter<'_> {
             name: String,
             span: Span,
             by_id: BTreeMap<u16, Span>,
-            by_label: BTreeMap<String, Span>,
+            /// `None` for a label two members share.
+            by_label: BTreeMap<String, Option<Span>>,
         }
         let mut sources = Vec::new();
         for item in &ast.items {
@@ -1776,7 +1989,11 @@ impl FileLinter<'_> {
                 if let Some(id) = id {
                     spans.by_id.insert(id, span);
                 }
-                spans.by_label.entry(label.to_owned()).or_insert(span);
+                spans
+                    .by_label
+                    .entry(label.to_owned())
+                    .and_modify(|s| *s = None)
+                    .or_insert(Some(span));
             }
             sources.push(spans);
         }
@@ -1796,8 +2013,8 @@ impl FileLinter<'_> {
                 let at = source
                     .by_id
                     .get(&b.id)
-                    .or_else(|| source.by_label.get(&b.label))
                     .copied()
+                    .or_else(|| source.by_label.get(&b.label).copied().flatten())
                     .unwrap_or(source.span);
                 if nodes > NODE_WARN {
                     self.emit(
