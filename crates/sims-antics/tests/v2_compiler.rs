@@ -7001,11 +7001,11 @@ fn maxis_interop_extern_calls_bcon_tables_sparse_states_and_trees_lower_exactly(
     for needle in [
         "if call 256(2, 10) {\n    }\n    my.attr[1] := temp[0];",
         "temp[0] := __v_q_0;\n    temp[1] := bcon[129];\n    if call 256(temps) {\n    }\n    my.attr[2] := temp[0];",
-        "temp[4] := 4;\n    if call 257 {\n        my.attr[3] := 1;\n    }",
+        "temp[4] := 4;\n    if call 257(temps) {\n        my.attr[3] := 1;\n    }",
         "temp[0] := my.attr[0];\n    if !call 8192(temps) {\n        return error;\n    }\n    my.attr[5] := temp[1];",
         "if !call 258(1) {\n        return error;\n    }",
-        "if call 4098 {\n    }\n    my.attr[6] := temp[0];",
-        "if call 4143 {\n        my.attr[9] := 5;\n    }",
+        "if call 4098(temps) {\n    }\n    my.attr[6] := temp[0];",
+        "if call 4143(temps) {\n        my.attr[9] := 5;\n    }",
     ] {
         assert!(air.contains(needle), "missing:\n{needle}\n---\n{air}");
     }
@@ -7435,5 +7435,963 @@ fn maxis_interop_negative_diagnostics() {
         err.message
             .contains("collides with helper function 'check'"),
         "{err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR D: readability, zero-`raw` builtins, and proof-friendly lowering
+// ---------------------------------------------------------------------------
+
+const READABILITY_LIVE_V2: &str = r#"
+const BASE = 3;
+
+bitflags Marks {
+    Low = 1,
+    High = 14,
+}
+
+object "Counting Frame" {
+    guid: 0x7F40_0001;
+    const STEP = 2;
+    const OTHER_KIND = 0x7F40_0999;
+    state fwd: i16;
+    state rev: i16;
+    state incl: i16;
+    state dyn_sum: i16;
+    state banded: i16;
+    state looped: i16;
+    state uninit: i16;
+    state tail: i16;
+    state is_me: i16;
+    state not_other: i16;
+    state age: i16;
+    state persons: i16;
+    state objs: i16;
+    state flagged: i16;
+    state rnd: i16;
+    state hand_empty: i16;
+    state limit: i16 = 4;
+    state seen_self: i16;
+
+    fn band(x: i16) -> i16 {
+        let r = 0;
+        match x {
+            -5..0 => { r = 1; }
+            0..=9 => { r = 2; }
+            10..20 => { r = 3; }
+            _ => { r = 4; }
+        }
+        return r;
+    }
+
+    fn above(x: i16, lim: i16) -> bool {
+        let d = x - lim;
+        return d > 0;
+    }
+
+    init {
+        for i in 0..5 {
+            self.fwd += i;
+        }
+        for i in (0..5).rev() {
+            self.rev = self.rev * 2 + i;
+        }
+        for i in 1..=STEP {
+            self.incl += i;
+        }
+        let n = self.limit;
+        for i in BASE..n {
+            self.dyn_sum += i;
+        }
+        let a = band(-3);
+        let b = band(0);
+        let c = band(15);
+        let d = band(20);
+        self.banded = a * 1000 + b * 100 + c * 10 + d;
+        let k = 0;
+        loop {
+            k += 1;
+            if k == 7 {
+                break;
+            }
+        }
+        self.looped = k;
+        let u: i16;
+        u = 9;
+        self.uninit = u;
+        if above(self.limit, 3) {
+            self.tail = 1;
+        }
+        if self.is_type(0x7F40_0001) {
+            self.is_me = 1;
+        }
+        if !self.is_type(OTHER_KIND) {
+            self.not_other = 1;
+        }
+        for p in lot.sims() {
+            self.persons += 1;
+        }
+        for o in lot.objects() {
+            self.objs += 1;
+        }
+        self.flags.set(Marks::High);
+        if self.flags.contains(Marks::High) {
+            self.flagged = 1;
+        }
+        self.flags.clear(Marks::High);
+        if self.flags.contains(Marks::High) {
+            self.flagged = 2;
+        }
+        self.rnd = 5;
+        random_into(self.rnd, 1);
+    }
+
+    @id(4300) tree probe "Probe" (sim: Sim) {
+        self.age = sim.age;
+        if sim.person[58] == 25 {
+            self.age += 100;
+        }
+        if sim.hand == 0 {
+            self.hand_empty = 1;
+        }
+        let s = stack_obj;
+        if s.is_type(0x7F40_0001) {
+            self.seen_self = 1;
+        }
+    }
+}
+"#;
+
+#[test]
+fn readability_loops_ranges_consts_fields_and_builtins_run_live() {
+    let cfg = PackResolverConfig::default();
+    let obj = compile_v2_source("counting.antics", READABILITY_LIVE_V2, &cfg)
+        .expect("compile counting frame");
+    let mut vm = V2VmFixture::from_objects(&[&obj], 5000);
+    let o = vm.spawn(0x7F40_0001, 4, 4);
+    let attr = |vm: &V2VmFixture, i: usize| vm.obj_attr(o, i);
+    assert_eq!(attr(&vm, 0), 10, "for i in 0..5 sums 0..=4");
+    assert_eq!(
+        attr(&vm, 1),
+        98,
+        "(0..5).rev() visits 4, 3, 2, 1, 0 in order"
+    );
+    assert_eq!(attr(&vm, 2), 3, "1..=STEP with an object const bound");
+    assert_eq!(
+        attr(&vm, 3),
+        3,
+        "BASE..n with a module const and a runtime bound"
+    );
+    assert_eq!(
+        attr(&vm, 4),
+        1234,
+        "range match arms (negative, inclusive, exclusive, _)"
+    );
+    assert_eq!(attr(&vm, 5), 7, "loop {{ }} with break");
+    assert_eq!(attr(&vm, 6), 9, "let u: i16; then assign");
+    assert_eq!(attr(&vm, 7), 1, "tail-return bool helper as a condition");
+    assert_eq!(attr(&vm, 8), 1, "self.is_type(own GUID)");
+    assert_eq!(attr(&vm, 9), 1, "!self.is_type(GUID const)");
+    assert_eq!(attr(&vm, 11), 1, "lot.sims() visits the one Sim");
+    assert_eq!(
+        attr(&vm, 12),
+        2,
+        "lot.objects() visits the Sim and this object"
+    );
+    assert_eq!(
+        attr(&vm, 13),
+        1,
+        "self.flags set/contains/clear with any bitflags"
+    );
+    assert_eq!(attr(&vm, 14), 0, "random_into(x, 1) writes 0");
+    assert_eq!(attr(&vm, 16), 4);
+
+    assert!(vm.try_run_tree(o, 4300, 0).expect("probe runs"));
+    assert_eq!(attr(&vm, 10), 125, "sim.age and sim.person[58]");
+    assert_eq!(attr(&vm, 15), 1, "sim.hand is empty");
+    assert_eq!(attr(&vm, 17), 1, "stack_obj read + ObjectId.is_type");
+
+    // Proof-friendly shapes: counted loops are one node per iteration, `loop` has no
+    // condition node, and tail-return bool helpers inline without a wrapper loop.
+    let expanded =
+        sims_antics::v2::expand_v2_source_to_objects("counting.antics", READABILITY_LIVE_V2, &cfg)
+            .expect("expand counting frame");
+    let air = &expanded[0].air_source;
+    for needle in [
+        "let __v_i_0 = -1;\n    while __v_i_0 inc_lt 5 {",
+        "let __v_i_1 = 5;\n    while __v_i_1 dec_gt -1 {",
+        "let __v_i_2 = 0;\n    while __v_i_2 inc_lt 3 {",
+        "let __range_4 = __v_n_3;\n    let __v_i_5 = 2;\n    while __v_i_5 inc_lt __range_4 {",
+        "while true {\n        __v_k_40 += 1;",
+        "let __v_u_41;\n",
+        "__v_d_43 -= 3;\n    if __v_d_43 > 0 {\n        my.attr[7] := 1;",
+        "if !test_object_type(0x7f400999, object: my.id) {",
+        "while set_to_next(person, dest: __v_p_44) {",
+        "while set_to_next(all, dest: __v_o_45) {",
+        "my.data[8] flag_set 14;",
+        "random(my.attr[14], 1);",
+        "stack.attr[10] := my.person[58];",
+        "if my.slot[0] == 0 {",
+    ] {
+        assert!(air.contains(needle), "missing:\n{needle}\n---\n{air}");
+    }
+    assert!(
+        !air.contains("__ret_above"),
+        "tail helper must not use a wrapper:\n{air}"
+    );
+}
+
+const READABILITY_SHAPE_V2: &str = r#"
+enum Mode {
+    Quiet = 0,
+    Loud = 1,
+}
+
+object "Shape Probe" {
+    guid: 0x7F40_0010;
+    const KIND = 0x7F40_0011;
+    const TABLE = 301;
+    state n: i16;
+    state got: i16;
+
+    fn pick(mode: Mode) {
+        if mode == Mode::Loud {
+            self.n = 1;
+        } else {
+            self.n = 2;
+        }
+    }
+
+    @id(4096) tree pinned "Pinned" {
+        return true;
+    }
+    tree helper "Helper" {
+        return true;
+    }
+    @frame(args: 3, locals: 2, format: 0x8002, revision: 5)
+    tree framed "Framed" (a: i16) {
+        self.n = a;
+    }
+
+    @id(4200) tree builtins "Builtins" (sim: Sim) {
+        let icon: i16 = 0;
+        let ev: i16;
+        push_interaction(menu: 2, object: 1, priority: 50, flags: 4, icon: icon);
+        run_tree_by_name(table: TABLE, index: 3, mode: 1, global: true);
+        go_to_relative(location: -1, facing: 2, options: 1);
+        manage_inventory(op: 1, kind: 2, flags: 3, guid: KIND);
+        refresh(target: self, mode: 2);
+        action_label(table: TABLE, index: 4);
+        show_string(table: TABLE, index: 5);
+        set_headline(kind: 1, index: 2, duration: -1, options: 0, stack_obj: true, local: icon);
+        special_effect(duration: 10, kind: 1, size: 2, flags: 0, str_index: 3);
+        breakpoint();
+        breakpoint(self.n);
+        if !go_to_relative(location: 0, facing: 1) {
+            return false;
+        }
+        animate(clip: 7, table: 0, flags: 0x10, events: 1);
+        animate(clip: 8, table: 0, events: 2) |event| {
+            self.got = event;
+        }
+        animate(clip: 9, table: 0, events: 1, local: ev) |e| {
+            if e == 3 {
+                break;
+            }
+        }
+        if animate(clip: 10, table: 0) {
+            self.n = 4;
+        }
+        grab();
+        drop();
+        notify_out_of_idle();
+        if find_best_interaction() {
+            gosub_found_action();
+        }
+        if create_object(KIND, mode: 0) {
+            self.n = 5;
+        }
+        create_object(KIND, mode: 0);
+        pick(Mode::Loud);
+        advert.delta[2] = 10;
+        advert.personality[3] = -5;
+        advert.minimum[Motive::Energy] = 1;
+        sim.person[40] = 3;
+        refresh(target: sim, mode: 0);
+        random_into(self.n, global[3]);
+    }
+
+    init {
+        helper();
+        if !helper() {
+            self.n = 9;
+        }
+        framed(4);
+    }
+
+    @id(4201) tree raw_safe "Raw Safe" (sim: Sim) {
+        raw { my.attr[0] := 1; call 256(temps); }
+        self.n = 1;
+    }
+    @id(4202) tree raw_clobber "Raw Clobber" (sim: Sim) {
+        raw { set_to_next(all); }
+        self.n = 1;
+    }
+    @id(4203) tree manual_stack "Manual Stack" (sim: Sim) {
+        let keep = stack_obj;
+        stack_obj = sim;
+        stack_obj = keep;
+        self.n = 2;
+    }
+}
+"#;
+
+#[test]
+fn readability_builtins_animate_frame_and_raw_lower_exactly() {
+    let cfg = PackResolverConfig::default();
+    // Everything must also encode: the `.air` text below is accepted by the `.air` compiler.
+    compile_v2_source("shape.antics", READABILITY_SHAPE_V2, &cfg).expect("compile shape probe");
+    let expanded =
+        sims_antics::v2::expand_v2_source_to_objects("shape.antics", READABILITY_SHAPE_V2, &cfg)
+            .expect("expand shape probe");
+    let air = &expanded[0].air_source;
+    for needle in [
+        // Pinned private IDs are reserved before init/main take the lowest free ones.
+        "tree 4097 \"Init\" {",
+        "tree 4098 \"Main\" {",
+        "tree 4096 \"Pinned\" {",
+        // Argless calls pass the caller's temps ([0xFF; 8]).
+        "if call 4099(temps) {\n    }\n    if !call 4099(temps) {",
+        "tree 4100 \"Framed\" (args: 3, locals: 2, format: 0x8002, revision: 5) {",
+        // `icon:` sets flag 0x01 (the icon is read from the named local).
+        "push_interaction(menu: 2, object: 1, priority: 50, flags: 5, icon: __v_icon_0);",
+        "run_tree_by_name(table: 301, index: 3, mode: 1, global: true);",
+        "go_to_relative(location: -1, facing: 2, options: 1);",
+        "manage_inventory(op: 1, kind: 2, flags: 3, guid: 0x7f400011);",
+        // In a Sim-on-object tree `me` is the Sim; the object is the stack object.
+        "refresh(target: stack_obj, mode: 2);",
+        "refresh(target: me, mode: 0);",
+        // A global range would receive the draw, so it is copied first.
+        "let __rnd_range_",
+        "action_string(table: 301, index: 4);",
+        "show_string(table: 301, index: 5);",
+        "set_headline(kind: 1, index: 2, duration: -1, options: 0, stack_obj: true, local: __v_icon_0);",
+        "special_effect(duration: 10, kind: 1, size: 2, flags: 0, str_index: 3);",
+        "breakpoint();\n    breakpoint(stack.attr[0]);",
+        "if !go_to_relative(location: 0, facing: 1) {\n        return false;",
+        "while !animate(clip: 7, table: 0, flags: 0x10, events: 1) {\n    }",
+        "while !animate(clip: 8, table: 0, flags: 0x00, events: 2) {\n        stack.attr[1] := param[0];",
+        "while !animate(clip: 9, table: 0, flags: 0x20, events: 1, local: __v_ev_1) {\n        if __v_ev_1 == 3 {\n            break;",
+        "if animate(clip: 10, table: 0, flags: 0x00, events: 0) {",
+        "op 0x0004 (0, 0, 0, 0, 0, 0, 0, 0);\n    op 0x0005 (0, 0, 0, 0, 0, 0, 0, 0);\n    op 0x0031 (0, 0, 0, 0, 0, 0, 0, 0);",
+        // `find_best_interaction()` leaves its pick in stack_obj for `gosub_found_action()`.
+        "if op 0x0003 (0, 0, 0, 0, 0, 0, 0, 0) {\n        op 0x001e (0, 0, 0, 0, 0, 0, 0, 0);\n    }",
+        // `create_object` puts back the stack object it found, on both edges.
+        "= stack_obj;\n    if create_object(0x7f400011, mode: 0, flags: 0x00) {",
+        "= stack_obj;\n    create_object(0x7f400011, mode: 0, flags: 0x00);\n    stack_obj := __pre_stack_obj_",
+        // `pick(Mode::Loud)`: the literal enum compare folds away.
+        ";\n    stack.attr[0] := 1;\n    scope(12, 2) := 10;",
+        "scope(28, 3) := -5;\n    scope(29, 5) := 1;",
+        "my.person[40] := 3;",
+        // A raw block that only writes attributes and calls a BHAV keeps no dead self save.
+        "tree 4201 \"Raw Safe\" {\n    my.attr[0] := 1; call 256(temps);\n    stack.attr[0] := 1;",
+        "tree 4202 \"Raw Clobber\" {\n    let __self_obj = stack_obj;",
+        "tree 4203 \"Manual Stack\" {\n    let __self_obj = stack_obj;\n    let __v_keep_0 = stack_obj;\n    stack_obj := my.id;",
+    ] {
+        assert!(air.contains(needle), "missing:\n{needle}\n---\n{air}");
+    }
+    assert!(
+        !air.contains("1 == 1"),
+        "no always-true condition nodes:\n{air}"
+    );
+    assert!(
+        !air.contains("Mode"),
+        "folded compare leaves no enum test:\n{air}"
+    );
+
+    // Existing helpers and trees keep their names: a user `fn drop` / `tree grab` wins over
+    // the new builtins of the same name.
+    let src = r#"
+object "Shadow" {
+    guid: 0x7F40_0012;
+    state n: i16;
+    fn drop(x: i16) {
+        self.n = x;
+    }
+    tree grab "Grab" {
+        return true;
+    }
+    init {
+        drop(3);
+        grab();
+    }
+}
+"#;
+    let expanded = sims_antics::v2::expand_v2_source_to_objects("shadow.antics", src, &cfg)
+        .expect("expand shadow");
+    let air = &expanded[0].air_source;
+    assert!(air.contains("my.attr[0] := 3;"), "{air}");
+    assert!(air.contains("(temps)"), "{air}");
+    assert!(!air.contains("op 0x"), "{air}");
+}
+
+#[test]
+fn readability_negative_diagnostics() {
+    let cfg = PackResolverConfig::default();
+    let expect_err = |name: &str, src: &str, needle: &str| {
+        let err = compile_v2_source(name, src, &cfg).expect_err(&format!("{name} must fail"));
+        assert!(err.span.is_some(), "{name}: expected a span: {err}");
+        assert!(
+            err.message.contains(needle),
+            "{name}: expected '{needle}' in: {err}"
+        );
+    };
+    let obj = |members: &str| {
+        format!("object \"Neg\" {{\n    guid: 0x7F40_0020;\n    state n: i16;\n{members}\n}}\n")
+    };
+    let init = |body: &str| obj(&format!("    init {{\n{body}\n    }}"));
+    let sim_tree = |body: &str| obj(&format!("    tree t (sim: Sim) {{\n{body}\n    }}"));
+
+    // Loops and ranges.
+    expect_err(
+        "range_mut.antics",
+        &init("for i in 0..3 { i = 2; }"),
+        "range loop variable 'i' is read-only",
+    );
+    expect_err(
+        "range_empty.antics",
+        &init("match self.n { 3..3 => { } _ => { } }"),
+        "empty range pattern",
+    );
+    expect_err(
+        "range_overlap.antics",
+        &init("match self.n { 0..=4 => { } 3..9 => { } _ => { } }"),
+        "overlaps an earlier match arm",
+    );
+    expect_err(
+        "range_value_overlap.antics",
+        &init("match self.n { 2 => { } 0..5 => { } _ => { } }"),
+        "overlaps an earlier match arm",
+    );
+    expect_err(
+        "let_uninit_untyped.antics",
+        &init("let x;"),
+        "needs a type ('let x: i16;')",
+    );
+
+    // Consts.
+    expect_err(
+        "dup_const.antics",
+        &obj("    const A = 1;\n    const A = 2;"),
+        "duplicate const",
+    );
+    expect_err(
+        "guid_const_value.antics",
+        &obj("    const KIND = 0x7F40_0021;\n    init { self.n = KIND; }"),
+        "does not fit in i16; use it where a GUID is expected",
+    );
+
+    // @frame.
+    expect_err(
+        "frame_args.antics",
+        &obj("    @frame(args: 1)\n    tree t (a: i16, b: i16) { }"),
+        "is below its 2 positional parameter(s)",
+    );
+    expect_err(
+        "frame_format.antics",
+        &obj("    @frame(format: 0x8009)\n    tree t { }"),
+        "not a supported BHAV format",
+    );
+    expect_err(
+        "frame_on_fn.antics",
+        &obj("    @frame(args: 1)\n    fn f() { }"),
+        "only allowed on a standalone 'tree'",
+    );
+
+    // Builtins.
+    expect_err(
+        "builtin_positional.antics",
+        &sim_tree("show_string(301, 2);"),
+        "show_string() only takes named arguments",
+    );
+    expect_err(
+        "builtin_unknown_key.antics",
+        &sim_tree("show_string(table: 301, line: 2);"),
+        "unknown show_string() argument 'line'",
+    );
+    expect_err(
+        "builtin_dup_key.antics",
+        &sim_tree("show_string(table: 301, table: 302);"),
+        "duplicate show_string() argument 'table'",
+    );
+    expect_err(
+        "builtin_range.antics",
+        &sim_tree("action_label(table: 301, index: 300);"),
+        "action_label index 300 out of range 0..=255",
+    );
+    expect_err(
+        "builtin_runtime.antics",
+        &sim_tree("action_label(table: self.n, index: 1);"),
+        "action_label table must be a compile-time constant",
+    );
+    expect_err(
+        "builtin_local.antics",
+        &sim_tree("push_interaction(menu: 1, icon: self.n);"),
+        "push_interaction(icon:) must name an i16 local variable",
+    );
+    expect_err(
+        "animate_local.antics",
+        &sim_tree("animate(clip: 1, local: 4);"),
+        "animate(local:) must name an i16 local variable",
+    );
+    expect_err(
+        "op_args.antics",
+        &sim_tree("grab(1);"),
+        "grab() takes no arguments",
+    );
+    expect_err(
+        "random_into_target.antics",
+        &sim_tree("random_into(3, 4);"),
+        "not a valid assignment target",
+    );
+    expect_err(
+        "is_type_on_i16.antics",
+        &sim_tree("if self.n.is_type(0x7F40_0020) { }"),
+        "'.is_type(...)' needs an object handle",
+    );
+    expect_err(
+        "is_type_runtime_guid.antics",
+        &sim_tree("if self.is_type(self.n) { }"),
+        "expected a GUID literal (0x...) or a const",
+    );
+    expect_err(
+        "event_readonly.antics",
+        &sim_tree("animate(clip: 1, events: 1) |e| { e = 2; }"),
+        "the animation event 'e' is read-only",
+    );
+    expect_err(
+        "event_local_readonly.antics",
+        &sim_tree("let x: i16;\nanimate(clip: 1, local: x) |e| { e = 2; }"),
+        "the animation event 'e' is read-only",
+    );
+    expect_err(
+        "animate_flag_local.antics",
+        &sim_tree("animate(clip: 1, flags: 0x20);"),
+        "store events in a local; name it with 'local:'",
+    );
+    expect_err(
+        "animate_shadowed_handler.antics",
+        &obj("    fn animate(x: i16) { self.n = x; }\n    init { animate(1) |e| { } }"),
+        "a user function named 'animate' shadows it",
+    );
+    expect_err(
+        "push_object_local.antics",
+        &sim_tree("push_interaction(menu: 1, flags: 2);"),
+        "reads the object from a local slot",
+    );
+    expect_err(
+        "push_icon_flag.antics",
+        &sim_tree("push_interaction(menu: 1, flags: 1);"),
+        "name it with 'icon:' instead",
+    );
+    expect_err(
+        "effect_local.antics",
+        &sim_tree("special_effect(duration: 1, flags: 0x20);"),
+        "reads the duration from a local slot",
+    );
+    expect_err(
+        "builtin_guid_const.antics",
+        &obj(
+            "    const KIND = 0x7F40_0021;\n    tree t (sim: Sim) { action_label(table: KIND, index: 1); }",
+        ),
+        "const 'KIND' (0x7f400021) does not fit in i16",
+    );
+    expect_err(
+        "range_random_into.antics",
+        &init("for i in 0..3 { random_into(i, 2); }"),
+        "range loop variable 'i' is read-only",
+    );
+    expect_err(
+        "range_animate_local.antics",
+        &sim_tree("for i in 0..3 { animate(clip: 1, local: i); }"),
+        "range loop variable 'i' is read-only",
+    );
+    expect_err(
+        "range_nested_bound_borrow.antics",
+        &obj(
+            "    fn bump(x: &mut i16) -> i16 { *x += 1; return 2; }\n    init { for i in 0..3 { for j in bump(&mut i)..4 { } } }",
+        ),
+        "range loop variable 'i' is read-only",
+    );
+    expect_err(
+        "frame_format_args.antics",
+        &obj("    @frame(format: 0x8000)\n    tree t (a: i16, b: i16, c: i16, d: i16, e: i16) { }"),
+        "allows at most 4 arguments, not 5",
+    );
+    expect_err(
+        "frame_format_pinned_args.antics",
+        &obj("    @frame(args: 6, format: 0x8001)\n    tree t { }"),
+        "allows at most 4 arguments, not 6",
+    );
+
+    // Folded conditions still check what they fold away.
+    expect_err(
+        "fold_if_dead.antics",
+        &init("if true { } else { missing(); }"),
+        "unknown function 'missing'",
+    );
+    expect_err(
+        "fold_while_dead.antics",
+        &init("while 1 == 2 { missing(); }"),
+        "unknown function 'missing'",
+    );
+    expect_err(
+        "fold_enum_order.antics",
+        &format!(
+            "enum E {{ A = 0, B = 1 }}\n{}",
+            obj("    init { if E::A < E::B { self.n = 1; } }")
+        ),
+        "ordering comparison is not supported",
+    );
+
+    // Fields.
+    expect_err(
+        "advert_range.antics",
+        &sim_tree("advert.minimum[16] = 1;"),
+        "motive index 16 out of 0..16 range",
+    );
+    expect_err(
+        "sim_field.antics",
+        &sim_tree("sim.shoes = 1;"),
+        "cannot assign to 'sim.shoes'",
+    );
+    expect_err(
+        "sim_hand_write.antics",
+        &sim_tree("sim.hand = 0;"),
+        "'sim.hand' is read-only",
+    );
+    expect_err(
+        "sim_slot_write.antics",
+        &sim_tree("sim.slot[2] = 0;"),
+        "'sim.slot[i]' is read-only",
+    );
+    expect_err(
+        "flags_typed.antics",
+        &format!(
+            "bitflags M {{ A = 1 }}\nbitflags K {{ B = 1 }}\n{}",
+            obj("    state m: M;\n    init { self.m.set(K::B); }")
+        ),
+        "type mismatch",
+    );
+}
+
+const RANGE_EDGES_V2: &str = r#"
+object "Edge Frame" {
+    guid: 0x7F40_0030;
+    state e1: i16;
+    state e2: i16;
+    state e3: i16;
+    state e4: i16;
+    state e5: i16;
+    state e6: i16;
+    state e7: i16;
+    state e8: i16;
+    state e9: i16;
+    state e10: i16;
+    state e11: i16;
+    state e12: i16;
+    state top: i16 = 32767;
+    state bottom: i16 = -32768;
+    state one: i16 = 1;
+    state five: i16 = 5;
+    state four: i16 = 4;
+
+    init {
+        for i in 32765..=32767 {
+            self.e1 += 1;
+        }
+        for i in (-32768..-32766).rev() {
+            self.e2 = self.e2 * 10 + i + 32767 + 2;
+        }
+        for i in (0..-32768).rev() {
+            self.e3 += 1;
+        }
+        let hi = self.top;
+        for i in 32760..=hi {
+            self.e4 += 1;
+        }
+        let lo = self.bottom;
+        for i in (lo..-32765).rev() {
+            self.e5 += 1;
+        }
+        let hi2 = self.five;
+        for i in (0..=hi2).rev() {
+            if i == 3 {
+                continue;
+            }
+            self.e6 += 1;
+        }
+        for i in -32768..-32765 {
+            self.e7 += 1;
+        }
+        for i in self.one..3 {
+            self.e8 += i;
+        }
+        for i in (1 + 1)..4 {
+            self.e9 += i;
+        }
+        for i in self.five..=self.four {
+            self.e10 += 1;
+        }
+        for i in 0..=hi {
+            if i == 2 {
+                break;
+            }
+            self.e11 += 1;
+        }
+        while 1 == 1 {
+            self.e12 += 1;
+            if self.e12 == 2 {
+                break;
+            }
+        }
+        while 1 == 2 {
+            self.e12 = 99;
+        }
+    }
+}
+"#;
+
+#[test]
+fn range_edges_and_folded_loops_run_live() {
+    let cfg = PackResolverConfig::default();
+    let obj = compile_v2_source("edges.antics", RANGE_EDGES_V2, &cfg).expect("compile edge frame");
+    let mut vm = V2VmFixture::from_objects(&[&obj], 5000);
+    let o = vm.spawn(0x7F40_0030, 4, 4);
+    let attr = |i: usize| vm.obj_attr(o, i);
+    assert_eq!(attr(0), 3, "32765..=32767 reaches the i16 maximum");
+    assert_eq!(
+        attr(1),
+        21,
+        "(-32768..-32766).rev() visits -32767, then -32768"
+    );
+    assert_eq!(attr(2), 0, "(0..-32768).rev() is empty");
+    assert_eq!(attr(3), 8, "32760..=hi with a run-time hi of 32767");
+    assert_eq!(
+        attr(4),
+        3,
+        "(lo..-32765).rev() with a run-time lo of -32768"
+    );
+    assert_eq!(attr(5), 5, "continue in an edge-safe reversed range");
+    assert_eq!(attr(6), 3, "-32768..-32765 starts at the i16 minimum");
+    assert_eq!(attr(7), 3, "self.one..3 parses as a range");
+    assert_eq!(attr(8), 5, "(1 + 1)..4 parses as a range, not .rev()");
+    assert_eq!(attr(9), 0, "an empty run-time inclusive range");
+    assert_eq!(attr(10), 2, "break in an edge-safe range");
+    assert_eq!(
+        attr(11),
+        2,
+        "while 1 == 1 is a loop; while 1 == 2 never runs"
+    );
+
+    let expanded =
+        sims_antics::v2::expand_v2_source_to_objects("edges.antics", RANGE_EDGES_V2, &cfg)
+            .expect("expand edge frame");
+    let air = &expanded[0].air_source;
+    // A literal range away from the edges keeps the one-node form; the exclusive start at
+    // the minimum wraps (32767 + 1 == -32768).
+    assert!(air.contains("= 32767;\n    while __v_i_"), "{air}");
+    assert!(
+        !air.contains("99"),
+        "a constant-false loop emits nothing:\n{air}"
+    );
+    assert!(!air.contains("1 == 1") && !air.contains("1 == 2"), "{air}");
+}
+
+#[test]
+fn stack_obj_review_cases_keep_the_self_save() {
+    let cfg = PackResolverConfig::default();
+    let src = r#"
+object "Stack Cases" {
+    guid: 0x7F40_0031;
+    state n: i16;
+
+    fn set_obj(x: &mut ObjectId) {
+        *x = 0;
+    }
+
+    @id(4300) tree raw_step "Raw Step" (sim: Sim) {
+        raw { if stack_obj inc_lt 3 { } }
+        self.n = 1;
+    }
+    @id(4301) tree borrow "Borrow" (sim: Sim) {
+        set_obj(&mut stack_obj);
+        self.n = 2;
+    }
+    @id(4302) tree cancel_defer "Cancel Defer" (sim: Sim) {
+        defer {
+            self.n = 7;
+        }
+        while true cancel_on_abort {
+            sleep(1);
+        }
+    }
+}
+"#;
+    compile_v2_source("stack.antics", src, &cfg).expect("compile stack cases");
+    let expanded = sims_antics::v2::expand_v2_source_to_objects("stack.antics", src, &cfg)
+        .expect("expand stack cases");
+    let air = &expanded[0].air_source;
+    for tree in [
+        "\"Raw Step\" {\n    let __self_obj = stack_obj;",
+        "\"Borrow\" {\n    let __self_obj = stack_obj;",
+    ] {
+        assert!(air.contains(tree), "missing {tree}:\n{air}");
+    }
+    // A cancelled loop falls through to the deferred block and the tree's own return.
+    let cancel = &air[air.find("\"Cancel Defer\"").expect("cancel tree")..];
+    let after_loop = &cancel[cancel.find("idle(1);").expect("idle")..];
+    assert!(after_loop.contains("stack.attr[0] := 7;"), "{cancel}");
+    assert!(after_loop.contains("return true;"), "{cancel}");
+
+    // User functions named like builtins keep winning in statement position too.
+    let src = r#"
+object "Shadow Two" {
+    guid: 0x7F40_0032;
+    state n: i16;
+    fn animate(x: i16) {
+        self.n = x;
+    }
+    fn create_object(x: i16) {
+        self.n = x + 10;
+    }
+    init {
+        animate(3);
+        create_object(4);
+    }
+}
+"#;
+    let expanded = sims_antics::v2::expand_v2_source_to_objects("shadow2.antics", src, &cfg)
+        .expect("expand shadow two");
+    let air = &expanded[0].air_source;
+    assert!(air.contains("my.attr[0] := 3;"), "{air}");
+    assert!(!air.contains("animate("), "{air}");
+    assert!(!air.contains("create_object("), "{air}");
+}
+
+#[test]
+fn shadowed_builtins_folded_checks_and_local_slots() {
+    let cfg = PackResolverConfig::default();
+    let obj = |members: &str| {
+        format!(
+            "object \"Round Two\" {{\n    guid: 0x7F40_0040;\n    state n: i16;\n{members}\n}}\n"
+        )
+    };
+    let expand = |name: &str, src: &str| {
+        compile_v2_source(name, src, &cfg).unwrap_or_else(|e| panic!("{name}: {e}"));
+        sims_antics::v2::expand_v2_source_to_objects(name, src, &cfg)
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .remove(0)
+            .air_source
+    };
+    let expect_err = |name: &str, src: &str, needle: &str| {
+        let err = compile_v2_source(name, src, &cfg).expect_err(&format!("{name} must fail"));
+        assert!(
+            err.message.contains(needle),
+            "{name}: expected '{needle}' in: {err}"
+        );
+    };
+
+    // A user `fn animate` that writes stack_obj is followed by the clobber analysis.
+    let air = expand(
+        "shadow_clobber.antics",
+        &obj(
+            "    fn animate() { stack_obj = 0; }\n    tree t (sim: Sim) { animate(); self.n = 1; }",
+        ),
+    );
+    assert!(air.contains("let __self_obj = stack_obj;"), "{air}");
+
+    // User functions win in value position and are not treated as local-writing builtins.
+    let air = expand(
+        "shadow_value.antics",
+        &obj(
+            "    fn create_object(x: i16) -> i16 { return x; }\n    init { let n: i16 = create_object(4); self.n = n; }",
+        ),
+    );
+    assert!(!air.contains("create_object("), "{air}");
+    expand(
+        "shadow_local.antics",
+        &obj(
+            "    fn animate(local: i16) { self.n = local; }\n    init { for i in 0..3 { animate(local: i); } }",
+        ),
+    );
+
+    // Builtin iterator names are only iterators in their call syntax.
+    expand(
+        "iter_name.antics",
+        &obj(
+            "    init { let objects_by_guid: i16 = 1; for i in objects_by_guid..3 { self.n += i; } }",
+        ),
+    );
+
+    // Discarded code does not shift later generated names.
+    let air = expand(
+        "dead_names.antics",
+        &obj("    init { while false { let dead = 1; } let live = 1; self.n = live; }"),
+    );
+    assert!(air.contains("let __v_live_0 = 1;"), "{air}");
+
+    // Modes that read a local name it.
+    let air = expand(
+        "create_local.antics",
+        &obj(
+            "    tree t (sim: Sim) { let o: i16 = 0; create_object(0x7F40_0041, mode: local_pos, local: o); }",
+        ),
+    );
+    assert!(
+        air.contains("mode: local_pos, flags: 0x00, local: __v_o_0);"),
+        "{air}"
+    );
+    expect_err(
+        "create_local_missing.antics",
+        &obj("    tree t (sim: Sim) { create_object(0x7F40_0041, mode: local_pos); }"),
+        "reads a local; name it with 'local:'",
+    );
+    expect_err(
+        "create_local_unused.antics",
+        &obj(
+            "    tree t (sim: Sim) { let o: i16 = 0; create_object(0x7F40_0041, mode: here, local: o); }",
+        ),
+        "does not read 'local:'",
+    );
+    expect_err(
+        "animate_enum_local.antics",
+        &format!(
+            "enum Ev {{ Z = 0 }}\n{}",
+            obj("    tree t (sim: Sim) { let e: Ev = Ev::Z; animate(clip: 1, local: e); }")
+        ),
+        "animate(local:) must name an i16 local variable",
+    );
+
+    // Folded conditions and bodies are still fully checked.
+    expect_err(
+        "dead_raw.antics",
+        &obj("    init { while false { raw { nonexistent; } } }"),
+        "invalid .air syntax in raw block",
+    );
+    expect_err(
+        "dead_operand.antics",
+        &obj("    init { while false && missing() { } }"),
+        "unsupported boolean call expression",
+    );
+    expect_err(
+        "dead_if_operand.antics",
+        &obj("    init { if false && missing() { } }"),
+        "unsupported boolean call expression",
+    );
+    expect_err(
+        "rev_missing_end.antics",
+        &obj("    init { for i in (1..).rev() { } }"),
+        "expected expression",
     );
 }

@@ -33,6 +33,8 @@ pub enum TokenKind {
     Semicolon,
     Comma,
     Dot,
+    DotDot,   // ..
+    DotDotEq, // ..=
     At,
     Question, // ?
     Arrow,    // ->
@@ -123,7 +125,17 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>> {
             }
             b'.' => {
                 lexer.bump();
-                TokenKind::Dot
+                if lexer.peek() == Some(b'.') {
+                    lexer.bump();
+                    if lexer.peek() == Some(b'=') {
+                        lexer.bump();
+                        TokenKind::DotDotEq
+                    } else {
+                        TokenKind::DotDot
+                    }
+                } else {
+                    TokenKind::Dot
+                }
             }
             b'@' => {
                 lexer.bump();

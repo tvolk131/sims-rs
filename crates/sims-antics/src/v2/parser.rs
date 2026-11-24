@@ -6,13 +6,13 @@ use crate::error::{Error, Result, Span};
 use crate::parser::motive_by_name;
 use crate::v2::ast::{
     AbiParam, AbiParamSlot, AdvertiseDecl, BconTableDecl, BitflagVariant, BitflagsDecl, CallArg,
-    ConstIntExpr, EnumDecl, EnumVariant, ExternBconDecl, ExternBconEntry, ExternFnDecl,
+    ConstDecl, ConstIntExpr, EnumDecl, EnumVariant, ExternBconDecl, ExternBconEntry, ExternFnDecl,
     ExternModDecl, FnDecl, FnParam, ForEachIter, FunctionalDecl, GuardBody, GuardDecl,
     InteractionDecl, LifecycleBlock, MatchArm, MatchPattern, MetaField, MetaFieldKind, ObjectDecl,
     ObjectMember, ParamAssignDecl, ParamDecl, ParamType, ParamValue, ReturnAbi, SlotDecl,
     SoundDecl, SpriteDecl, StateDecl, StateInitValue, StateType, StringsDecl, TemplateDecl,
-    TileDecl, TreeMemberDecl, UseDecl, UseItem, V2AssignOp, V2BinOp, V2Expr, V2File, V2Item,
-    V2Stmt, V2Type, V2UnaryOp,
+    TileDecl, TreeFrame, TreeMemberDecl, UseDecl, UseItem, V2AssignOp, V2BinOp, V2Expr, V2File,
+    V2Item, V2Stmt, V2Type, V2UnaryOp,
 };
 use crate::v2::lexer::{Token, TokenKind, tokenize};
 use std::collections::BTreeSet;
@@ -218,7 +218,7 @@ impl Parser {
             }
             let is_pub = self.eat_ident("pub");
             let (kw, kw_span) = self.expect_ident(
-                "top-level item ('use', 'fn', 'template', 'object', 'enum', 'bitflags', 'extern')",
+                "top-level item ('use', 'const', 'fn', 'template', 'object', 'enum', 'bitflags', 'extern')",
             )?;
             match kw.as_str() {
                 "extern" => {
@@ -239,6 +239,7 @@ impl Parser {
                         }
                     }
                 }
+                "const" => items.push(V2Item::Const(self.parse_const(kw_span, is_pub)?)),
                 "fn" => items.push(V2Item::Fn(self.parse_fn(kw_span, is_pub)?)),
                 "template" => items.push(V2Item::Template(self.parse_template(kw_span, is_pub)?)),
                 "enum" => items.push(V2Item::Enum(self.parse_enum(kw_span, is_pub)?)),
@@ -257,7 +258,7 @@ impl Parser {
                         kw_span,
                         format!(
                             "unexpected top-level keyword '{other}' in .antics v2 file \
-                             (expected 'use', 'pub', 'fn', 'template', 'enum', 'bitflags', 'extern', or 'object')"
+                             (expected 'use', 'pub', 'const', 'fn', 'template', 'enum', 'bitflags', 'extern', or 'object')"
                         ),
                     ));
                 }
@@ -938,6 +939,75 @@ impl Parser {
             params,
             ret,
             body,
+            frame: None,
+        })
+    }
+
+    /// Parses the `key: value, ...)` tail of `@frame(` (the `(` is consumed).
+    fn parse_frame_fields(&mut self, span: Span) -> Result<TreeFrame> {
+        let mut frame = TreeFrame {
+            span,
+            ..TreeFrame::default()
+        };
+        while !self.eat(&TokenKind::RParen) {
+            let (key, kspan) = self.expect_ident("'args', 'locals', 'format', or 'revision'")?;
+            self.expect(&TokenKind::Colon, "':'")?;
+            let dup = match key.as_str() {
+                "args" => frame
+                    .args
+                    .replace(u8::try_from(self.expect_u16("BHAV args")?).map_err(|_| {
+                        Error::at(kspan, "@frame args must fit in a byte (0..=255)")
+                    })?)
+                    .is_some(),
+                "locals" => frame
+                    .locals
+                    .replace(self.expect_u16("BHAV locals")?)
+                    .is_some(),
+                "format" => frame
+                    .format
+                    .replace(self.expect_u16("BHAV format")?)
+                    .is_some(),
+                "revision" => frame
+                    .revision
+                    .replace(self.expect_u32("BHAV revision")?)
+                    .is_some(),
+                other => {
+                    return Err(Error::at(
+                        kspan,
+                        format!(
+                            "unknown @frame field '{other}' (expected args, locals, format, or revision)"
+                        ),
+                    ));
+                }
+            };
+            if dup {
+                return Err(Error::at(kspan, format!("duplicate @frame field '{key}'")));
+            }
+            if !self.eat(&TokenKind::Comma) {
+                self.expect(&TokenKind::RParen, "')'")?;
+                break;
+            }
+        }
+        Ok(frame)
+    }
+
+    /// Parses `NAME = <integer>;` after `const`.
+    fn parse_const(&mut self, span: Span, is_pub: bool) -> Result<ConstDecl> {
+        let (name, _) = self.expect_ident("constant name")?;
+        self.expect(&TokenKind::Assign, "'='")?;
+        let (value, vspan) = self.parse_signed_int("constant value")?;
+        if !(i64::from(i16::MIN)..=i64::from(u32::MAX)).contains(&value) {
+            return Err(Error::at(
+                vspan,
+                format!("constant {value} must be an i16 or a 32-bit GUID"),
+            ));
+        }
+        self.expect(&TokenKind::Semicolon, "';'")?;
+        Ok(ConstDecl {
+            span,
+            is_pub,
+            name,
+            value,
         })
     }
 
@@ -976,9 +1046,18 @@ impl Parser {
             // Parse optional `@id(N)` / `@guard_id(N)` annotations.
             let mut pinned_id: Option<u16> = None;
             let mut pinned_guard_id: Option<u16> = None;
+            let mut frame: Option<TreeFrame> = None;
             while self.eat(&TokenKind::At) {
-                let (attr, aspan) = self.expect_ident("attribute name ('id' or 'guard_id')")?;
+                let (attr, aspan) =
+                    self.expect_ident("attribute name ('id', 'guard_id', or 'frame')")?;
                 self.expect(&TokenKind::LParen, "'('")?;
+                if attr == "frame" {
+                    if frame.is_some() {
+                        return Err(Error::at(aspan, "duplicate @frame annotation"));
+                    }
+                    frame = Some(self.parse_frame_fields(aspan)?);
+                    continue;
+                }
                 let id = self.expect_u16("BHAV tree id")?;
                 self.expect(&TokenKind::RParen, "')'")?;
                 match attr.as_str() {
@@ -1018,6 +1097,14 @@ impl Parser {
                     "@id/@guard_id annotations are only allowed on init, main, load, reset, cleanup, functional, interaction, or tree",
                 ));
             }
+            if let Some(f) = &frame
+                && kw != "tree"
+            {
+                return Err(Error::at(
+                    f.span,
+                    "@frame(...) is only allowed on a standalone 'tree'",
+                ));
+            }
             if pinned_guard_id.is_some() && !matches!(kw.as_str(), "functional" | "interaction") {
                 return Err(Error::at(
                     kw_span,
@@ -1026,6 +1113,9 @@ impl Parser {
             }
 
             match kw.as_str() {
+                "const" => {
+                    members.push(ObjectMember::Const(self.parse_const(kw_span, false)?));
+                }
                 "param" => {
                     members.push(self.parse_param_member(kw_span)?);
                 }
@@ -1112,9 +1202,9 @@ impl Parser {
                     members.push(ObjectMember::Fn(self.parse_fn(kw_span, false)?));
                 }
                 "tree" => {
-                    members.push(ObjectMember::Tree(
-                        self.parse_tree_member(kw_span, pinned_id)?,
-                    ));
+                    let mut tree = self.parse_tree_member(kw_span, pinned_id)?;
+                    tree.frame = frame;
+                    members.push(ObjectMember::Tree(tree));
                 }
                 "bcon" => {
                     members.push(ObjectMember::Bcon(self.parse_bcon_table(kw_span)?));
@@ -2349,6 +2439,19 @@ impl Parser {
                 }
                 "repeat" => return self.parse_repeat_stmt(span),
                 "while" => return self.parse_while_stmt(span),
+                "loop" if self.peek_at(1).kind == TokenKind::LBrace => {
+                    self.bump();
+                    let body = self.parse_block()?;
+                    return Ok(V2Stmt::While {
+                        span,
+                        cond: V2Expr::Bool(span, true),
+                        cancel_on_abort: false,
+                        body,
+                    });
+                }
+                "animate" if self.peek_at(1).kind == TokenKind::LParen => {
+                    return self.parse_animate_stmt(span);
+                }
                 "for" => return self.parse_for_stmt(span),
                 "if" => return self.parse_if_stmt(span),
                 "match" => return self.parse_match_stmt(span),
@@ -2402,6 +2505,44 @@ impl Parser {
         }
         self.expect(&TokenKind::Semicolon, "';'")?;
         Ok(V2Stmt::Expr { span, expr: lhs })
+    }
+
+    /// `animate(...);` or `animate(...) |event| { ... }`.
+    fn parse_animate_stmt(&mut self, span: Span) -> Result<V2Stmt> {
+        let call = self.parse_postfix_expr()?;
+        let V2Expr::Call {
+            args, type_args, ..
+        } = call
+        else {
+            // `animate(...)?;` or another postfix form: an ordinary expression statement (only
+            // meaningful when a user function named `animate` exists).
+            self.expect(&TokenKind::Semicolon, "';'")?;
+            return Ok(V2Stmt::Expr { span, expr: call });
+        };
+        if !type_args.is_empty() {
+            return Err(Error::at(span, "'animate' does not take type arguments"));
+        }
+        if self.eat(&TokenKind::Pipe) {
+            let (event, _) = self.expect_ident("animation event binding name")?;
+            self.expect(&TokenKind::Pipe, "'|'")?;
+            let body = self.parse_block()?;
+            return Ok(V2Stmt::Animate {
+                span,
+                args,
+                event: Some(event),
+                body,
+            });
+        }
+        self.expect(
+            &TokenKind::Semicolon,
+            "';' or an event handler '|event| { ... }' after 'animate(...)'",
+        )?;
+        Ok(V2Stmt::Animate {
+            span,
+            args,
+            event: None,
+            body: Vec::new(),
+        })
     }
 
     fn try_eat_assign_op(&mut self) -> Option<V2AssignOp> {
@@ -2461,6 +2602,16 @@ impl Parser {
         } else {
             None
         };
+        if self.peek().kind == TokenKind::Semicolon {
+            let Some(ty) = ty else {
+                return Err(Error::at(
+                    span,
+                    format!("uninitialized 'let {name};' needs a type ('let {name}: i16;')"),
+                ));
+            };
+            self.bump();
+            return Ok(V2Stmt::LetUninit { span, name, ty });
+        }
         self.expect(&TokenKind::Assign, "'='")?;
         let init = self.parse_expr()?;
         self.expect(&TokenKind::Semicolon, "';'")?;
@@ -2521,14 +2672,41 @@ impl Parser {
             return Err(Error::at(self.span(), "expected 'in' in 'for' loop"));
         }
         let ispan = self.span();
-        let (src, _) =
-            self.expect_ident("iterator ('objects_by_guid', 'objects_of', or 'self')")?;
+        if let Some(iter) = self.try_parse_range_iter()? {
+            let body = self.parse_block()?;
+            return Ok(V2Stmt::ForEach {
+                span,
+                binding,
+                iter,
+                body,
+            });
+        }
+        let (src, _) = self
+            .expect_ident("iterator ('a..b', 'objects_by_guid', 'objects_of', 'lot', or 'self')")?;
         let iter = match src.as_str() {
             "objects_by_guid" => {
                 self.expect(&TokenKind::LParen, "'('")?;
-                let guid = self.expect_u32("object GUID")?;
+                let guid = self.parse_expr()?;
                 self.expect(&TokenKind::RParen, "')'")?;
                 ForEachIter::ObjectsByGuid(guid)
+            }
+            "lot" => {
+                self.expect(&TokenKind::Dot, "'.'")?;
+                let (m, mspan) = self.expect_ident("'sims' or 'objects'")?;
+                self.expect(&TokenKind::LParen, "'('")?;
+                self.expect(&TokenKind::RParen, "')'")?;
+                match m.as_str() {
+                    "sims" => ForEachIter::LotSims,
+                    "objects" => ForEachIter::LotObjects,
+                    other => {
+                        return Err(Error::at(
+                            mspan,
+                            format!(
+                                "unknown lot iterator 'lot.{other}()' (expected 'lot.sims()' or 'lot.objects()')"
+                            ),
+                        ));
+                    }
+                }
             }
             "objects_of" => {
                 self.expect(&TokenKind::ColonColon, "'::'")?;
@@ -2559,7 +2737,7 @@ impl Parser {
                 return Err(Error::at(
                     ispan,
                     format!(
-                        "unsupported 'for' iterator '{other}' (expected 'objects_of::<Type>()', 'objects_by_guid(0x...)', or 'self.parts()')"
+                        "unsupported 'for' iterator '{other}' (expected 'a..b', 'objects_of::<Type>()', 'objects_by_guid(0x...)', 'lot.sims()', 'lot.objects()', or 'self.parts()')"
                     ),
                 ));
             }
@@ -2571,6 +2749,92 @@ impl Parser {
             iter,
             body,
         })
+    }
+
+    /// Parses `a..b`, `a..=b`, or `(a..b).rev()` when the iterator is a range (anything other
+    /// than the built-in object iterators).
+    fn try_parse_range_iter(&mut self) -> Result<Option<ForEachIter>> {
+        if self.peek().kind == TokenKind::LParen {
+            // `(a..b).rev()`, or a range whose start is parenthesized (`(n + 1)..m`).
+            // Once the start is followed by `..`/`..=` inside the parentheses, this is the
+            // reversed form and its errors are reported as such.
+            let (saved_pos, saved_depth) = (self.pos, self.depth);
+            self.bump();
+            let rev = match self.parse_expr() {
+                Ok(start)
+                    if matches!(self.peek().kind, TokenKind::DotDot | TokenKind::DotDotEq) =>
+                {
+                    let inclusive = self.eat(&TokenKind::DotDotEq);
+                    if !inclusive {
+                        self.bump();
+                    }
+                    let end = self.parse_expr()?;
+                    Some((start, end, inclusive))
+                }
+                _ => None,
+            };
+            if let Some((start, end, inclusive)) = rev {
+                self.expect(&TokenKind::RParen, "')'")?;
+                self.expect(&TokenKind::Dot, "'.rev()'")?;
+                let (m, mspan) = self.expect_ident("'rev'")?;
+                if m != "rev" {
+                    return Err(Error::at(
+                        mspan,
+                        format!("unknown range adapter '.{m}()' (expected '.rev()')"),
+                    ));
+                }
+                self.expect(&TokenKind::LParen, "'('")?;
+                self.expect(&TokenKind::RParen, "')'")?;
+                return Ok(Some(ForEachIter::Range {
+                    start,
+                    end,
+                    inclusive,
+                    rev: true,
+                }));
+            }
+            self.pos = saved_pos;
+            self.depth = saved_depth;
+        }
+        // The builtin iterators, by their call syntax: `objects_by_guid(...)`, `objects_of::<T>()`,
+        // and the method forms `lot.sims()`, `lot.objects()`, `self.parts()` (another `lot.x()`
+        // or `self.x()` gets the iterator diagnostic). Anything else, such as `self.count..3` or
+        // a local named `objects_by_guid`, is a range start.
+        let is_method_call = |p: &Self| {
+            p.peek_at(1).kind == TokenKind::Dot
+                && matches!(p.peek_at(2).kind, TokenKind::Ident(_))
+                && p.peek_at(3).kind == TokenKind::LParen
+        };
+        let builtin = match &self.peek().kind {
+            TokenKind::Ident(s) => match s.as_str() {
+                "objects_by_guid" => self.peek_at(1).kind == TokenKind::LParen,
+                "objects_of" => self.peek_at(1).kind == TokenKind::ColonColon,
+                "lot" | "self" => is_method_call(self),
+                _ => false,
+            },
+            _ => false,
+        };
+        if builtin {
+            return Ok(None);
+        }
+        let (start, end, inclusive) = self.parse_range_bounds()?;
+        Ok(Some(ForEachIter::Range {
+            start,
+            end,
+            inclusive,
+            rev: false,
+        }))
+    }
+
+    fn parse_range_bounds(&mut self) -> Result<(V2Expr, V2Expr, bool)> {
+        let start = self.parse_expr()?;
+        let inclusive = if self.eat(&TokenKind::DotDotEq) {
+            true
+        } else {
+            self.expect(&TokenKind::DotDot, "'..' or '..='")?;
+            false
+        };
+        let end = self.parse_expr()?;
+        Ok((start, end, inclusive))
     }
 
     fn parse_if_stmt(&mut self, span: Span) -> Result<V2Stmt> {
@@ -2677,7 +2941,19 @@ impl Parser {
             }
             TokenKind::Int(_) | TokenKind::Minus | TokenKind::Plus => {
                 let val = self.expect_i16("match integer pattern")?;
-                Ok(MatchPattern::Int(span, val))
+                let inclusive = self.eat(&TokenKind::DotDotEq);
+                if !inclusive && !self.eat(&TokenKind::DotDot) {
+                    return Ok(MatchPattern::Int(span, val));
+                }
+                let (hi, hspan) = self.parse_signed_int("range pattern end")?;
+                let hi = if inclusive { hi } else { hi - 1 };
+                let hi = i16::try_from(hi).map_err(|_| {
+                    Error::at(hspan, format!("range pattern end {hi} out of i16 range"))
+                })?;
+                if hi < val {
+                    return Err(Error::at(span, "empty range pattern"));
+                }
+                Ok(MatchPattern::Range(span, val, hi))
             }
             other => Err(Error::at(
                 span,
