@@ -29,8 +29,20 @@ without them `verify-equiv` is unconditional, as before.
 - **`--v2-enum-domains <file.antics>`** reads a v2 source with the v2 loader. Every
   standalone `tree` parameter typed with an `enum` gets that enum's exact variant values
   as its domain. The parameter is `param[i]`, where `i` counts positional parameters only:
-  a leading `sim: Sim` binding and `@ temp[N]` parameters are not BHAV parameters. Trees
-  are matched by their BHAV label in the lowered object.
+  a leading `sim: Sim` binding and `@ temp[N]` parameters are not BHAV parameters.
+  - The object's trees are merged as the v2 lowering merges them: template trees first,
+    and an object tree replaces a template tree of the same name.
+  - A parameter's type resolves where its tree was declared, by the lowering's rules:
+    object- and template-local types, then built-in names, then the scope of the
+    declaring module. An inherited tree's enum is the template module's, even when the
+    object's own module has another enum of the same name. A name that does not resolve
+    to an enum there gets no domain, which only assumes less.
+  - Trees are matched to BHAVs by label in the lowered object. Both files compared must
+    give that BHAV the same label, or `verify-equiv` stops with an error. Without that
+    check a domain could land on a different tree that took the same ID.
+
+  The v2 compiler does not export its resolved tree signatures, so these rules are
+  mirrored, not shared. Tests cover inherited, overriding and `@frame`-widened trees.
 
 `verify-equiv` prints every assumption before any verdict, one line per parameter, with
 where it came from. An assumption the checker cannot use is printed as not applied, with
@@ -51,7 +63,8 @@ so equivalence on every region is equivalence on the domain.
   replays both trees on a witness and they differ. Witnesses are built from the path
   condition, which includes the region's bounds, and any witness outside the domain is
   dropped before replay. A bug on a value inside the domain is therefore still a
-  counterexample.
+  counterexample. Witnesses are tried near 0, pairwise distinct, and at the bottom and
+  top of each input's range, so a difference only at a bound is found too.
 - **The lockstep checker** proves equivalence for all inputs, so its proofs stand under
   any domain. A lockstep counterexample is never reported under a domain; the live
   checker decides.
@@ -65,7 +78,9 @@ so equivalence on every region is equivalence on the domain.
   constrained argument is inside the domain, and **violates** it otherwise. That holds
   for arguments in the node and for arguments that spill into the nodes after it. A
   violation makes the callee's verdict, and every verdict that depends on it,
-  inconclusive;
+  inconclusive. Only nodes the VM can run count as calls: those reachable from node 0,
+  or from any node of a kind-4 tree. A row that holds another call's spilled
+  arguments is data, whatever its opcode field says;
 - a call that passes temps (`call(temps)`), or whose arguments run past the end of the
   tree, is **not discharged**. It is listed by tree and node, and the assumption stands
   there as a stated boundary, like any external caller's.
@@ -116,8 +131,8 @@ inconclusive tree that failed because of them; diamonds already merge at cuts.
 
 ## Decision 3: the last raw operand forms in `.air`
 
-55 of 28,690 install trees still lift with an `op 0x…` line under strict padding.
-Grouped by form and by the tree's frame:
+55 of 28,690 install trees lifted with an `op 0x…` line under strict padding; 54 do
+now. Grouped by form and by the tree's frame:
 
 - **Out-of-frame operands (49 trees).** The operand names a parameter the tree does not
   take, or a local past its locals:
@@ -129,7 +144,7 @@ Grouped by form and by the tree's frame:
 
   These read or write another frame's storage in the VM. `.air` names frame slots by
   the tree's own frame, so it has no honest spelling for them. They stay raw.
-- **Remove Object Instance with mode `0xFFFF` (6 lines).** Modes above 2 fault
+- **Remove Object Instance with mode `0xFFFF` (5 trees).** Modes above 2 fault
   (`remove.rs`), so the bytes are a guaranteed fault, not a form to name. They stay raw.
 - **Dialog with byte 5 bit 7 set (1 tree): now decoded.** The VM shows `kind & 0x7F`,
   but the dialog record copies the whole byte. `kind` now takes 0 to 255 and lowers
@@ -180,3 +195,5 @@ tile GUIDs were compared, so a v2 `variant` could reuse another object's GUID un
 - Domains are wanted on values other than entry parameters (temps, attributes).
 - A v2 parameter is passed through temps often enough that undischarged callers hide
   real bugs. That would mean tracking the caller's temps into the call.
+- The v2 compiler exports resolved tree signatures. `--v2-enum-domains` should then
+  read them instead of mirroring the lowering's scope rules.

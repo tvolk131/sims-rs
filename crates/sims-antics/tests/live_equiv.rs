@@ -3470,3 +3470,311 @@ fn verify_equiv_cli_v2_enum_domains() {
         assert!(text.contains("BHAV #4098: DIFFERENT"), "{text}");
     }
 }
+
+/// A difference that shows only at a domain's bound still gets a replayed witness:
+/// `temp[0] = param[0]` and `temp[0] = 0` differ at -1 only, inside `-1..=0`.
+#[test]
+fn param_domain_bound_gets_a_witness() {
+    let a = tree(4200, 1, 0, vec![expr((TEMP, 0), SET, (PARAM, 0), T, T)]);
+    let b = tree(4200, 1, 0, vec![expr((TEMP, 0), SET, (LIT, 0), T, T)]);
+    let opts = LiveOptions::default();
+    assert_counterexample(&live_with(
+        &a,
+        &b,
+        &with_domains(&[(4200, 0, "-1..=0")]),
+        &opts,
+    ));
+    assert_counterexample(&live_with(
+        &a,
+        &b,
+        &with_domains(&[(4200, 0, "0..=5")]),
+        &opts,
+    ));
+}
+
+/// Callers are read from the nodes the VM can run: a row no entry reaches is not a call,
+/// even when its opcode field names the constrained tree.
+#[test]
+fn domain_callers_are_read_from_runnable_nodes_only() {
+    let file = |caller: &BhavChunk, callee: &BhavChunk| {
+        write_iff(&[bhav_chunk(caller, "caller"), bhav_chunk(callee, "callee")]).expect("write IFF")
+    };
+    let (callee_a, callee_b) = defensive_pair();
+    let callee = |t: &BhavChunk| BhavChunk {
+        id: 4097,
+        ..t.clone()
+    };
+    let opts = IffEquivOptions {
+        param_domains: domains(&[(4097, 0, "0..=3")]),
+        ..IffEquivOptions::default()
+    };
+    // Node 1 holds a call passing 7, but node 0 never branches to it. (Each count
+    // covers both files.)
+    for (to_node_1, violating) in [(T, 0), (1, 2)] {
+        let caller = tree(
+            4096,
+            0,
+            0,
+            vec![
+                prim(4097, literal_call(2), T, to_node_1),
+                prim(4097, literal_call(7), T, T),
+            ],
+        );
+        let (a, b) = (
+            file(&caller, &callee(&callee_a)),
+            file(&caller, &callee(&callee_b)),
+        );
+        let report = check_iff_equivalent(&a, &b, &opts).expect("check");
+        let lines = report.assumptions.join("\n");
+        assert!(
+            lines.contains(&format!("{violating} violating")),
+            "{lines}\n{report:#?}"
+        );
+        let expected = if violating == 0 {
+            IffVerdict::Equivalent
+        } else {
+            IffVerdict::Inconclusive
+        };
+        assert_eq!(report.verdict(), expected, "{report:#?}");
+    }
+}
+
+/// A violating fifth argument, spilled into the row after the call, voids the callee's
+/// proof and the proofs of every tree that runs it, two callers up.
+#[test]
+fn spilled_argument_violation_reaches_every_caller() {
+    let callee = |bound: i16| tree(4097, 5, 0, vec![expr((PARAM, 4), LT, (LIT, bound), T, F)]);
+    let file = |bound: i16, fifth: u16| {
+        let middle = tree(
+            4096,
+            0,
+            0,
+            vec![
+                prim(4097, [0, 0, 1, 0, 2, 0, 3, 0], T, T),
+                // Data: the fifth argument, in the opcode field.
+                prim(fifth, [0; 8], T, T),
+            ],
+        );
+        let top = tree(4098, 0, 0, vec![prim(4096, [0; 8], T, T)]);
+        write_iff(&[
+            bhav_chunk(&top, "top"),
+            bhav_chunk(&middle, "middle"),
+            bhav_chunk(&callee(bound), "callee"),
+        ])
+        .expect("write IFF")
+    };
+    let opts = IffEquivOptions {
+        param_domains: domains(&[(4097, 4, "0..=3")]),
+        ..IffEquivOptions::default()
+    };
+    let verdict = |report: &IffEquivReport, id: u16| {
+        report
+            .resources
+            .iter()
+            .find(|r| &r.tag == b"BHAV" && r.id == id)
+            .map(|r| r.verdict.clone())
+            .expect("tree report")
+    };
+    // Passing 2: discharged, and the pair differs only outside the domain.
+    let report = check_iff_equivalent(&file(4, 2), &file(9, 2), &opts).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
+    // Passing 7: a violation, so no tree on the way up proves.
+    let report = check_iff_equivalent(&file(4, 7), &file(9, 7), &opts).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+    for id in [4097, 4096, 4098] {
+        assert!(
+            matches!(verdict(&report, id), ResourceVerdict::Inconclusive { .. }),
+            "#{id}: {report:#?}"
+        );
+    }
+    assert!(
+        report
+            .assumptions
+            .join("\n")
+            .contains("passes param[4] = 7"),
+        "{report:#?}"
+    );
+}
+
+/// A pack whose template declares `Mode = {0, 7}` and whose object's own module
+/// declares another `Mode = {0}`.
+fn mode_pack(dir: &std::path::Path, object_trees: &str) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir.join("objects")).unwrap();
+    std::fs::write(
+        dir.join("pack.toml"),
+        r#"
+[pack]
+id = "domain_pack"
+name = "Domain Pack"
+version = "0.1.0"
+archive = "domain-pack.far"
+objects = ["probe"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("templates.antics"),
+        r#"
+pub enum Mode {
+    Off = 0,
+    Turbo = 7,
+}
+
+pub template Gadget {
+    state level: i16;
+
+    tree run_mode "Run Mode" (mode: Mode) {
+        self.level = 1;
+        if mode == Mode::Turbo {
+            self.level = 2;
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let object = dir.join("objects/probe.antics");
+    std::fs::write(
+        &object,
+        format!(
+            r#"
+use domain_pack::templates::Gadget;
+
+enum Mode {{
+    Off = 0,
+}}
+
+object "Mode Probe" from Gadget {{
+    guid: 0x7F53_0101;
+{object_trees}
+}}
+"#
+        ),
+    )
+    .unwrap();
+    object
+}
+
+/// An inherited tree's enum resolves where the tree was declared, an overriding tree's
+/// where it was, and the domain follows the label the override gives.
+#[test]
+fn v2_enum_domains_follow_the_declaring_module() {
+    let dir = scratch_dir("enum-modules");
+    let inherited = mode_pack(&dir.join("inherited"), "");
+    let found =
+        sims_antics::verify::v2_enum_param_domains(&inherited, Some(&dir.join("inherited")))
+            .expect("extract");
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert_eq!(
+        (found[0].label.as_str(), found[0].domain.to_string()),
+        ("Run Mode", "0,7".to_owned()),
+        "{found:#?}"
+    );
+
+    let overridden = mode_pack(
+        &dir.join("overridden"),
+        r#"
+    tree run_mode "Run Mode Two" (mode: Mode) {
+        self.level = 3;
+    }
+"#,
+    );
+    let found =
+        sims_antics::verify::v2_enum_param_domains(&overridden, Some(&dir.join("overridden")))
+            .expect("extract");
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert_eq!(
+        (found[0].label.as_str(), found[0].domain.to_string()),
+        ("Run Mode Two", "0".to_owned()),
+        "{found:#?}"
+    );
+}
+
+/// `@frame(args: 2)` gives a tree more arguments than positional parameters; the enum
+/// parameter is still `param[0]`.
+#[test]
+fn v2_enum_domains_allow_extra_frame_arguments() {
+    let dir = scratch_dir("enum-frame");
+    let source = dir.join("framed.antics");
+    std::fs::write(
+        &source,
+        ENUM_OBJECT
+            .replace("BODY", PLAIN_BODY.trim_start())
+            .replace(
+                "    tree serve \"Serve\"",
+                "    @frame(args: 3)\n    tree serve \"Serve\"",
+            ),
+    )
+    .unwrap();
+    let found = sims_antics::verify::v2_enum_param_domains(&source, None).expect("extract");
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert_eq!(
+        (found[0].tree, found[0].param_index),
+        (4098, 0),
+        "{found:#?}"
+    );
+}
+
+/// A v2 domain applies to a BHAV only when both files give it the source's label.
+#[test]
+fn verify_equiv_cli_v2_enum_domains_check_labels() {
+    let dir = scratch_dir("enum-labels");
+    let (source, original) = enum_object(&dir, "original", DEFENSIVE_BODY);
+    let relabeled_source = dir.join("relabeled.antics");
+    std::fs::write(
+        &relabeled_source,
+        ENUM_OBJECT
+            .replace("BODY", PLAIN_BODY.trim_start())
+            .replace("tree serve \"Serve\"", "tree serve \"Reset\""),
+    )
+    .unwrap();
+    let relabeled = dir.join("relabeled.iff");
+    std::fs::write(
+        &relabeled,
+        sims_antics::compile_v2_object_file(&relabeled_source, None)
+            .expect("compile v2")
+            .iff_bytes,
+    )
+    .unwrap();
+    let out = cli()
+        .arg("verify-equiv")
+        .arg("--v2-enum-domains")
+        .arg(&source)
+        .arg("--ignore-scratch-pointer")
+        .arg(&original)
+        .arg(&relabeled)
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains("lowers to BHAV #4098") && text.contains("labeled \"Reset\""),
+        "{text}"
+    );
+}
+
+/// A kind-4 tree's first parameter is its entry node, so a domain on it is never
+/// applied: restricting it to node 0 would hide a difference at node 1.
+#[test]
+fn param_domains_never_restrict_a_kind_4_entry() {
+    let kind4 = |second: i16| BhavChunk {
+        kind: 4,
+        ..tree(
+            4200,
+            1,
+            0,
+            vec![
+                expr((TEMP, 0), SET, (LIT, 1), T, T),
+                expr((TEMP, 0), SET, (LIT, second), T, T),
+            ],
+        )
+    };
+    let (a, b) = (kind4(1), kind4(2));
+    let opts = LiveOptions::default();
+    assert_counterexample(&live(&a, &b));
+    assert_counterexample(&live_with(&a, &b, &with_domains(&[(4200, 0, "0")]), &opts));
+}

@@ -580,6 +580,11 @@ fn mutated_event_free_loops_are_never_equivalent() {
     assert_never_equivalent(&pure_loop(1, LT, Some(3)), &pure_loop(1, LT, Some(4)));
     // The same loop, laid out differently, but with the other increment.
     assert_never_equivalent(&a, &reversed(&pure_loop(2, LT, None)));
+    // No loop at all: `temp[0] = param[0]`, which differs for negative inputs. One side
+    // cuts at its loop head where the other ends, a misaligned cut that must fail.
+    let straight = tree(4096, 1, 1, vec![expr((TEMP, 0), SET, (PARAM, 0), T, T)]);
+    assert_never_equivalent(&a, &straight);
+    assert_never_equivalent(&straight, &reversed(&a));
 }
 
 // ============================================================================

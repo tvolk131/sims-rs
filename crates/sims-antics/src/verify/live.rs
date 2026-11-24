@@ -2766,7 +2766,10 @@ fn witnesses(
     args: usize,
 ) -> Vec<Witness> {
     let mut out: Vec<Witness> = Vec::new();
-    for distinct in [false, true] {
+    // Inputs near 0, then pairwise distinct, then at the bottom and at the top of what
+    // the condition allows: a difference that shows only at one end of a range (a
+    // parameter domain's bound, say) still gets a witness.
+    for seed in 0..4 {
         // A kind-4 entry is passed as the first argument even to a tree that takes none.
         let mut w = Witness {
             params: vec![0; args.max(usize::from(entry_param.is_some()))],
@@ -2778,12 +2781,15 @@ fn witnesses(
             if !interner.is_input(id) {
                 continue;
             }
-            let base = if distinct {
-                i16::try_from(3 * (id + 1)).unwrap_or(i16::MAX)
-            } else {
-                0
+            let range = range_of(cond, id);
+            let clamp = |v: i32| v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            let base = match seed {
+                0 => 0,
+                1 => i16::try_from(3 * (id + 1)).unwrap_or(i16::MAX),
+                2 => clamp(range.lo),
+                _ => clamp(range.hi),
             };
-            let Some(v) = range_of(cond, id).pick_near(base) else {
+            let Some(v) = range.pick_near(base) else {
                 feasible = false;
                 break;
             };

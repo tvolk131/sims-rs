@@ -2457,6 +2457,9 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
                     continue;
                 }
                 "--pack" => {
+                    if pack.is_some() {
+                        return Err("duplicate --pack flag".to_owned().into());
+                    }
                     pack = Some(PathBuf::from(value(s)?));
                     i += 2;
                     continue;
@@ -2485,6 +2488,9 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
     if pack.is_some() && enum_sources.is_empty() {
         return Err("--pack only applies to --v2-enum-domains".to_owned().into());
     }
+    // The BHAV label each v2 domain's tree lowers to: both files must give the BHAV that
+    // label, or the domain could constrain a different tree that took the ID.
+    let mut labels: Vec<(u16, String, String)> = Vec::new();
     for source in &enum_sources {
         let shown = sanitize_path_display(source);
         let found = v2_enum_param_domains(source, pack.as_deref())
@@ -2493,6 +2499,7 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
             eprintln!("note: --v2-enum-domains {shown}: no tree takes an enum-typed parameter");
         }
         for d in found {
+            labels.push((d.tree, d.label.clone(), shown.clone()));
             assumed.push((
                 d.tree,
                 d.param_index,
@@ -2592,6 +2599,34 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
             .filter_map(|(id, (argc, _, _))| Some((id, argc?))),
     );
     let (a, b) = (read(&path_a)?, read(&path_b)?);
+    for (bytes, path) in [(&a, &path_a), (&b, &path_b)] {
+        if labels.is_empty() {
+            break;
+        }
+        let iff = Iff::parse(bytes.clone()).map_err(|e| format!("{}: {e}", path.display()))?;
+        for (tree, label, from) in &labels {
+            let found: Vec<&str> = iff
+                .chunks
+                .iter()
+                .filter(|c| {
+                    &c.tag == b"BHAV" && c.id == *tree && c.flags & sims_formats::iff::DELETED == 0
+                })
+                .map(|c| c.label.as_str())
+                .collect();
+            if found != [label.as_str()] {
+                return Err(sanitize_single_line(&format!(
+                    "--v2-enum-domains {from}: tree \"{label}\" lowers to BHAV #{tree}, but {} has {}",
+                    sanitize_path_display(path),
+                    match found.as_slice() {
+                        [] => "no such BHAV".to_owned(),
+                        [other] => format!("BHAV #{tree} labeled \"{other}\""),
+                        _ => format!("{} BHAVs #{tree}", found.len()),
+                    }
+                ))
+                .into());
+            }
+        }
+    }
     let report = check_iff_equivalent(&a, &b, &opts).map_err(|e| e.to_string())?;
 
     let mut counts = [0usize; 4];

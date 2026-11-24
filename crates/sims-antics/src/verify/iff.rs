@@ -409,8 +409,11 @@ fn domain_calls(
                 .as_ref()
                 .and_then(|m| m.get(&tree).copied());
             for (&caller, bhav) in trees.iter().filter(|(id, _)| runs_from_own_file(**id)) {
+                let runs = runnable_nodes(bhav);
                 for (node, ins) in bhav.instructions.iter().enumerate() {
-                    if ins.opcode != tree {
+                    // A row no entry reaches is never run as a node: it may be another
+                    // call's spilled arguments, whatever its opcode field says.
+                    if ins.opcode != tree || !runs[node] {
                         continue;
                     }
                     let at = format!("{side} #{caller} node {node}");
@@ -487,6 +490,27 @@ fn domain_calls(
 /// The `arity` argument words a call at `node` passes inline: its operand words, then
 /// (past four) the bytes of the following nodes (`interpreter.rs:1539`). `None` when they
 /// run past the tree's end.
+/// Which nodes of `bhav` the VM can run: those reachable from an entry. A kind-4 tree is
+/// entered at any node (`interpreter.rs:964`); every other tree at node 0.
+fn runnable_nodes(bhav: &Behavior) -> Vec<bool> {
+    let n = bhav.instructions.len();
+    let mut runs = vec![false; n];
+    let mut stack: Vec<usize> = if bhav.kind == 4 {
+        (0..n).collect()
+    } else {
+        vec![0]
+    };
+    while let Some(node) = stack.pop() {
+        if node >= n || runs[node] {
+            continue;
+        }
+        runs[node] = true;
+        let ins = &bhav.instructions[node];
+        stack.extend([usize::from(ins.on_true), usize::from(ins.on_false)]);
+    }
+    runs
+}
+
 fn inline_call_words(
     instructions: &[sims_formats::behavior::Instruction],
     node: usize,

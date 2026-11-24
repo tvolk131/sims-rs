@@ -51,15 +51,19 @@ impl ParamDomain {
         let number = |s: &str| -> Result<i16> {
             let s = s.trim();
             let (neg, digits) = s.strip_prefix('-').map_or((false, s), |d| (true, d));
-            let magnitude = if let Some(hex) = digits
+            // One optional minus sign, then digits only: `--1` and `+1` are errors.
+            let bad = || Error::new(format!("'{s}' is not an integer"));
+            let (radix, body) = match digits
                 .strip_prefix("0x")
                 .or_else(|| digits.strip_prefix("0X"))
             {
-                i32::from_str_radix(hex, 16)
-            } else {
-                digits.parse::<i32>()
+                Some(hex) => (16, hex),
+                None => (10, digits),
+            };
+            if body.is_empty() || !body.chars().all(|c| c.is_digit(radix)) {
+                return Err(bad());
             }
-            .map_err(|_| Error::new(format!("'{s}' is not an integer")))?;
+            let magnitude = i32::from_str_radix(body, radix).map_err(|_| bad())?;
             let value = if neg { -magnitude } else { magnitude };
             i16::try_from(value).map_err(|_| Error::new(format!("{value} is out of i16 range")))
         };
@@ -198,6 +202,8 @@ pub struct V2EnumDomain {
     pub tree: u16,
     /// The tree's name in the source.
     pub tree_name: String,
+    /// The BHAV label it lowers to, which the files compared must give that BHAV too.
+    pub label: String,
     pub param_index: u16,
     pub param_name: String,
     pub enum_name: String,
@@ -227,7 +233,7 @@ pub fn v2_enum_param_domains(path: &Path, pack_dir: Option<&Path>) -> Result<Vec
     };
     // Plain trees by label; interactions (which may share a label) take no arguments.
     let air = crate::parser::parse_module(&expanded.air_source)?;
-    let module = crate::compile::compile_antics(&expanded.air_source)?;
+    let compiled = crate::compile::compile_antics(&expanded.air_source)?;
     let mut by_label: BTreeMap<&str, Vec<u16>> = BTreeMap::new();
     for item in &air.items {
         if let crate::ast::Item::Tree(t) = item
@@ -237,35 +243,61 @@ pub fn v2_enum_param_domains(path: &Path, pack_dir: Option<&Path>) -> Result<Vec
         }
     }
 
-    // Enums an object's trees can name: the object's own, its template's, the module's.
-    let template = object
-        .from_template
-        .as_ref()
-        .and_then(|(name, _)| resolved.templates.get(name))
-        .map(|(_, t)| t.members.as_slice())
-        .unwrap_or_default();
-    let members = || object.members.iter().chain(template);
-    let mut enums: BTreeMap<String, Vec<i16>> = resolved
-        .enums
-        .iter()
-        .map(|(name, (_, e))| (name.clone(), e.variants.iter().map(|v| v.value).collect()))
-        .collect();
-    for member in template.iter().chain(&object.members) {
-        if let ObjectMember::Enum(e) = member {
-            enums.insert(e.name.clone(), e.variants.iter().map(|v| v.value).collect());
+    // The object's effective trees, each with the module it was declared in, merged as
+    // the v2 lowering does: the template's first, then the object's, an object tree
+    // replacing a template tree of the same name.
+    let template = match &object.from_template {
+        Some((name, _)) => Some(
+            resolved
+                .templates
+                .get(name)
+                .ok_or_else(|| Error::new(format!("unknown template '{name}'")))?,
+        ),
+        None => None,
+    };
+    let layers = template
+        .map(|(module, t)| (module.as_str(), t.members.as_slice()))
+        .into_iter()
+        .chain(std::iter::once((
+            resolved.module_id.as_str(),
+            object.members.as_slice(),
+        )));
+    let mut trees: Vec<(&str, &crate::v2::ast::TreeMemberDecl)> = Vec::new();
+    // Object- and template-local types by name: an enum's values, or `None` for bitflags.
+    let mut local_types: BTreeMap<&str, Option<Vec<i16>>> = BTreeMap::new();
+    for (module, members) in layers {
+        for member in members {
+            match member {
+                ObjectMember::Tree(t) => match trees.iter().position(|(_, x)| x.ident == t.ident) {
+                    Some(pos) => trees[pos] = (module, t),
+                    None => trees.push((module, t)),
+                },
+                ObjectMember::Enum(e) => {
+                    local_types.insert(&e.name, Some(e.variants.iter().map(|v| v.value).collect()));
+                }
+                ObjectMember::Bitflags(b) => {
+                    local_types.insert(&b.name, None);
+                }
+                _ => {}
+            }
         }
     }
-    let enum_values = |name: &str| {
-        enums
-            .get(name)
-            .or_else(|| enums.get(name.rsplit("::").next().unwrap_or(name)))
+    // A parameter type resolves like the v2 lowering's `lookup_named_type`: local types,
+    // then the built-in names, then the scope of the module that declared the tree. A
+    // name that is not an enum there gets no domain, which only assumes less.
+    let enum_values = |module: &str, name: &str| -> Option<Vec<i16>> {
+        if let Some(local) = local_types.get(name) {
+            return local.clone();
+        }
+        if matches!(name, "Height" | "Placement" | "Self") {
+            return None;
+        }
+        let (_, e) = resolved.module_scopes.get(module)?.enums.get(name)?;
+        Some(e.variants.iter().map(|v| v.value).collect())
     };
 
     let mut out = Vec::new();
-    for member in members() {
-        let ObjectMember::Tree(tree) = member else {
-            continue;
-        };
+    for &(module, tree) in &trees {
         let positional = tree
             .params
             .iter()
@@ -274,7 +306,7 @@ pub fn v2_enum_param_domains(path: &Path, pack_dir: Option<&Path>) -> Result<Vec
             let V2Type::Named(enum_name) = &param.ty else {
                 continue;
             };
-            let Some(values) = enum_values(enum_name) else {
+            let Some(values) = enum_values(module, enum_name) else {
                 continue;
             };
             let id = match by_label.get(tree.label.as_str()).map(Vec::as_slice) {
@@ -300,16 +332,18 @@ pub fn v2_enum_param_domains(path: &Path, pack_dir: Option<&Path>) -> Result<Vec
                 .iter()
                 .filter(|p| p.slot == AbiParamSlot::Positional)
                 .count();
-            let args = module.behaviors.get(&id).map(|b| usize::from(b.args));
-            if args != Some(positional_count) {
+            // `@frame(args: N)` may give it more.
+            let args = compiled.behaviors.get(&id).map(|b| usize::from(b.args));
+            if args.is_none_or(|args| args < positional_count) {
                 return Err(Error::new(format!(
-                    "tree '{}' lowered to BHAV #{id} with {args:?} arguments, not its {positional_count} positional parameters",
+                    "tree '{}' lowered to BHAV #{id} with {args:?} arguments, fewer than its {positional_count} positional parameters",
                     tree.ident
                 )));
             }
             out.push(V2EnumDomain {
                 tree: id,
                 tree_name: tree.ident.clone(),
+                label: tree.label.clone(),
                 param_index: u16::try_from(index).unwrap_or(u16::MAX),
                 param_name: param.name.clone(),
                 enum_name: enum_name.clone(),
@@ -333,7 +367,9 @@ mod tests {
         assert_eq!(d.to_string(), "-4,0..=3,9,16");
         assert!(d.contains(2) && !d.contains(4) && !d.contains(-3));
         assert_eq!(d.hull(), (-4, 16));
-        for bad in ["", "1,,2", "3..=1", "0..3", "x", "40000"] {
+        for bad in [
+            "", "1,,2", "3..=1", "0..3", "x", "40000", "--1", "+1", "-+1", "0x-1", "0x",
+        ] {
             assert!(ParamDomain::parse(bad).is_err(), "{bad}");
         }
         let (tree, index, domain) = parse_param_domain_arg("0x1001:2=0..=3").unwrap();
