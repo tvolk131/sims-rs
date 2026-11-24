@@ -10,6 +10,7 @@
 //! same only if every tree it may run does too ([`tree_reach`]). Reports name chunks
 //! only, never their contents.
 
+use super::domains::{ParamDomain, ParamDomains};
 use super::{
     EquivMethod, EquivOptions, EquivResult, LiveContext, LiveOptions, bhav_param_limit,
     check_bhav_equivalent_combined, context_mismatch, reads_no_call_operands,
@@ -44,6 +45,11 @@ pub struct IffEquivOptions {
     /// only when `extra_arities` also gives it 0 arguments. Private IDs are ignored
     /// here too.
     pub extra_argless: BTreeSet<u16>,
+    /// Values tree parameters are assumed to hold on entry (see
+    /// [`LiveContext::param_domains`]). Empty by default, which assumes nothing. The
+    /// files' own calls to a constrained tree are checked against it
+    /// ([`IffEquivReport::assumptions`]).
+    pub param_domains: ParamDomains,
 }
 
 impl Default for IffEquivOptions {
@@ -55,6 +61,7 @@ impl Default for IffEquivOptions {
             tree: None,
             extra_arities: BTreeMap::new(),
             extra_argless: BTreeSet::new(),
+            param_domains: ParamDomains::new(),
         }
     }
 }
@@ -144,6 +151,9 @@ pub struct IffEquivReport {
     pub resources: Vec<ResourceReport>,
     /// Why the files fall outside the structural precondition (see the module docs).
     pub file_problems: Vec<String>,
+    /// Every parameter domain assumed ([`IffEquivOptions::param_domains`]): applied or
+    /// not and why, and how the files' own calls to the tree stand against it.
+    pub assumptions: Vec<String>,
 }
 
 impl IffEquivReport {
@@ -205,6 +215,7 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
         my_attribute_count: opts.my_attribute_count,
         local_bcons: Some(bcons(iff)),
         argless_callees: Some(argless(iff, &opts.extra_argless, &opts.extra_arities)),
+        param_domains: opts.param_domains.clone(),
     };
     let (ctx_a, ctx_b) = (ctx(&iff_a), ctx(&iff_b));
     // The structure check leaves the same chunks, in the same order, on both sides.
@@ -248,6 +259,9 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
         ..opts.clone()
     };
     let mut dependency_verdicts = verdicts.clone();
+    let (assumptions, violations) =
+        domain_calls(&opts.param_domains, &iff_a, &iff_b, &ctx_a, &ctx_b);
+    report.assumptions = assumptions;
     if strict.live != opts.live {
         for (ca, cb) in iff_a.chunks.iter().zip(&iff_b.chunks) {
             if &ca.tag == b"BHAV"
@@ -269,6 +283,15 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
                     &mut Vec::new(),
                 );
                 dependency_verdicts.insert(ca.id, (verdict, Vec::new()));
+            }
+        }
+    }
+    // A tree proven equivalent only for its assumed domain is not shown the same where
+    // the file itself calls it outside the domain.
+    for (id, why) in &violations {
+        for map in [&mut verdicts, &mut dependency_verdicts] {
+            if let Some((verdict @ ResourceVerdict::Equivalent { .. }, _)) = map.get_mut(id) {
+                *verdict = ResourceVerdict::Inconclusive { why: why.clone() };
             }
         }
     }
@@ -303,6 +326,175 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
         });
     }
     Ok(report)
+}
+
+/// How each assumed parameter domain stands in the two files: whether it applies (to a
+/// private tree both files define, not kind 4, below its argument count) and, for each
+/// call to it from a tree of either file, whether the call is **discharged** (every
+/// constrained argument is a literal inside the domain), **violates** the domain (a
+/// literal outside it), or is **not discharged** (it passes temps, or its arguments run
+/// past the tree's end). Returns the report lines and, per tree, why a violation makes
+/// its proof not apply.
+fn domain_calls(
+    domains: &ParamDomains,
+    iff_a: &Iff,
+    iff_b: &Iff,
+    ctx_a: &LiveContext,
+    ctx_b: &LiveContext,
+) -> (Vec<String>, BTreeMap<u16, String>) {
+    const LISTED: usize = 8;
+    let mut lines = Vec::new();
+    let mut violations: BTreeMap<u16, String> = BTreeMap::new();
+    let kept = |iff: &Iff| -> BTreeMap<u16, Behavior> {
+        vm_kept_bhavs(iff)
+            .chunks
+            .into_iter()
+            .filter_map(|c| Behavior::parse(iff.data(c)).ok().map(|b| (c.id, b)))
+            .collect()
+    };
+    if domains.is_empty() {
+        return (lines, violations);
+    }
+    let sides = [("A", kept(iff_a), ctx_a), ("B", kept(iff_b), ctx_b)];
+    for (&tree, params) in domains {
+        let shape = sides
+            .iter()
+            .map(|(_, trees, _)| trees.get(&tree).map(|t| (t.kind, bhav_param_limit(t))))
+            .collect::<Vec<_>>();
+        let not_applied = if !runs_from_own_file(tree) {
+            Some(not_run_from_file(tree).unwrap_or_default())
+        } else if shape.iter().any(Option::is_none) {
+            Some("not both files define it".to_owned())
+        } else if shape.iter().flatten().any(|&(kind, _)| kind == 4) {
+            Some("it is kind 4, so its first parameter is the entry node".to_owned())
+        } else {
+            None
+        };
+        let args = shape.iter().flatten().map(|&(_, n)| n).min().unwrap_or(0);
+        let mut applied: Vec<(u16, &ParamDomain)> = Vec::new();
+        for (&index, domain) in params {
+            let why = not_applied.clone().or_else(|| {
+                (usize::from(index) >= args).then(|| format!("the tree takes {args} argument(s)"))
+            });
+            match why {
+                Some(why) => lines.push(format!(
+                    "BHAV #{tree} param[{index}] in {{{domain}}}: NOT APPLIED ({why})"
+                )),
+                None => applied.push((index, domain)),
+            }
+        }
+        if applied.is_empty() {
+            continue;
+        }
+        let (mut discharged, mut open, mut violated) = (0usize, Vec::new(), Vec::new());
+        for (side, trees, ctx) in &sides {
+            let arity = ctx
+                .callee_arities
+                .as_ref()
+                .and_then(|m| m.get(&tree).copied());
+            for (&caller, bhav) in trees.iter().filter(|(id, _)| runs_from_own_file(**id)) {
+                for (node, ins) in bhav.instructions.iter().enumerate() {
+                    if ins.opcode != tree {
+                        continue;
+                    }
+                    let at = format!("{side} #{caller} node {node}");
+                    let words = match arity {
+                        _ if ins.operands == [0xFF; 8] => None,
+                        Some(n) => inline_call_words(&bhav.instructions, node, n),
+                        None => None,
+                    };
+                    let Some(words) = words else {
+                        open.push(at);
+                        continue;
+                    };
+                    let bad: Vec<String> = applied
+                        .iter()
+                        .filter_map(|&(i, d)| {
+                            let v = *words.get(usize::from(i))?;
+                            (!d.contains(v)).then(|| format!("param[{i}] = {v}"))
+                        })
+                        .collect();
+                    if bad.is_empty() {
+                        discharged += 1;
+                    } else {
+                        violated.push(format!("{at} passes {}", bad.join(", ")));
+                    }
+                }
+            }
+        }
+        let list = |items: &[String]| {
+            let mut text = items
+                .iter()
+                .take(LISTED)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ");
+            if items.len() > LISTED {
+                text.push_str(&format!("; and {} more", items.len() - LISTED));
+            }
+            text
+        };
+        for (index, domain) in &applied {
+            lines.push(format!(
+                "BHAV #{tree} param[{index}] in {{{domain}}}: applied"
+            ));
+        }
+        lines.push(format!(
+            "BHAV #{tree} callers in the files: {discharged} discharged, {} not discharged{}, {} violating{}",
+            open.len(),
+            if open.is_empty() {
+                String::new()
+            } else {
+                format!(" (assumed: {})", list(&open))
+            },
+            violated.len(),
+            if violated.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", list(&violated))
+            }
+        ));
+        if !violated.is_empty() {
+            violations.insert(
+                tree,
+                format!(
+                    "equivalent only for the assumed parameter domain, which a call in the \
+                     files violates: {}",
+                    list(&violated)
+                ),
+            );
+        }
+    }
+    (lines, violations)
+}
+
+/// The `arity` argument words a call at `node` passes inline: its operand words, then
+/// (past four) the bytes of the following nodes (`interpreter.rs:1539`). `None` when they
+/// run past the tree's end.
+fn inline_call_words(
+    instructions: &[sims_formats::behavior::Instruction],
+    node: usize,
+    arity: usize,
+) -> Option<Vec<i16>> {
+    let mut bytes: Vec<u8> = instructions.get(node)?.operands.to_vec();
+    for next in &instructions[node + 1..] {
+        if bytes.len() >= 2 * arity {
+            break;
+        }
+        bytes.extend_from_slice(&next.opcode.to_le_bytes());
+        bytes.extend_from_slice(&[next.on_true, next.on_false]);
+        bytes.extend_from_slice(&next.operands);
+    }
+    if bytes.len() < 2 * arity {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(2)
+            .take(arity)
+            .map(|w| i16::from_le_bytes([w[0], w[1]]))
+            .collect(),
+    )
 }
 
 /// Every `BHAV` of the file that lifts, by ID.
@@ -1006,7 +1198,20 @@ fn compare_bhav(
                     format!("lockstep: {states_checked} states")
                 }
                 EquivMethod::LiveOutput => {
-                    format!("live-output: {paths_verified} paths, {states_checked} steps")
+                    let assumed = ctx_a
+                        .param_domains
+                        .get(&id)
+                        .filter(|_| a.kind != 4)
+                        .map(|d| {
+                            d.iter()
+                                .filter(|&(&i, _)| usize::from(i) < args_a)
+                                .map(|(i, d)| format!("param[{i}] in {{{d}}}"))
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|d| !d.is_empty())
+                        .map(|d| format!(", assuming {}", d.join(", ")))
+                        .unwrap_or_default();
+                    format!("live-output: {paths_verified} paths, {states_checked} steps{assumed}")
                 }
             };
             ResourceVerdict::Equivalent { how }

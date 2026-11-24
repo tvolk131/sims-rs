@@ -996,8 +996,29 @@ fn install_trees_match_their_reversed_layout() {
     let index = Index::build(&install).expect("index SIMS_INSTALL");
     let pool = ArchivePool::new();
     let opts = behavioral();
+    // The global library's argument counts, as `verify-equiv --global` supplies them:
+    // without them a call into it with spilled arguments is undecidable.
+    let global: BTreeMap<u16, usize> = index
+        .resources
+        .iter()
+        .filter(|r| {
+            let name = r.name().to_ascii_lowercase();
+            name == "global.iff" || name.ends_with("/global.iff")
+        })
+        .filter_map(|r| r.read_with(&pool).ok())
+        .filter_map(|bytes| sims_antics::verify::library_arities_from_iff(&bytes).ok())
+        .flat_map(|arities| arities.into_iter())
+        .filter_map(|(id, n)| Some((id, n?)))
+        .filter(|(id, _)| (256..4096).contains(id))
+        .collect();
+    eprintln!(
+        "behavioral_equiv install sweep: {} global library arities",
+        global.len()
+    );
     let (mut total, mut equivalent, mut inconclusive, mut counterexamples) = (0, 0, 0, 0);
     let mut first_problem = None;
+    // Why trees stay inconclusive, with numbers blanked so like reasons group together.
+    let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
     for resource in &index.resources {
         let name = resource.name();
         if !name.to_ascii_lowercase().ends_with(".iff") {
@@ -1010,7 +1031,8 @@ fn install_trees_match_their_reversed_layout() {
         else {
             continue;
         };
-        let arities: BTreeMap<u16, usize> = iff
+        let mut arities: BTreeMap<u16, usize> = global.clone();
+        let own: BTreeMap<u16, usize> = iff
             .chunks
             .iter()
             .filter(|c| c.flags & DELETED == 0 && &c.tag == b"BHAV")
@@ -1024,6 +1046,7 @@ fn install_trees_match_their_reversed_layout() {
                 Some((c.id, args))
             })
             .collect();
+        arities.extend(own.into_iter().filter(|(id, _)| (4096..8192).contains(id)));
         let ctx = LiveContext {
             callee_arities: Some(arities),
             ..LiveContext::default()
@@ -1042,7 +1065,20 @@ fn install_trees_match_their_reversed_layout() {
             total += 1;
             match check_bhav_live_equivalent(&bhav, &ctx, &reversed(&bhav), &ctx, &opts) {
                 EquivResult::Equivalent { .. } => equivalent += 1,
-                EquivResult::Inconclusive { .. } => inconclusive += 1,
+                EquivResult::Inconclusive { reason } => {
+                    inconclusive += 1;
+                    // The bisimulation's failure says why a loop stays unproven.
+                    let reason = match reason.split_once("cut-point bisimulation failed: ") {
+                        Some((_, why)) => format!("bisimulation: {why}"),
+                        None => reason,
+                    };
+                    let blanked: String = reason
+                        .chars()
+                        .map(|c| if c.is_ascii_digit() { '#' } else { c })
+                        .take(220)
+                        .collect();
+                    *reasons.entry(blanked).or_default() += 1;
+                }
                 EquivResult::Counterexample { divergence, .. } => {
                     counterexamples += 1;
                     first_problem
@@ -1055,6 +1091,11 @@ fn install_trees_match_their_reversed_layout() {
         "behavioral_equiv install sweep: total={total} equivalent={equivalent} \
          inconclusive={inconclusive} counterexamples={counterexamples}"
     );
+    let mut common: Vec<_> = reasons.into_iter().collect();
+    common.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
+    for (reason, count) in common.iter().take(25) {
+        eprintln!("behavioral_equiv install sweep: inconclusive {count}x: {reason}");
+    }
     assert!(total > 0, "no trees found under SIMS_INSTALL");
     assert_eq!(counterexamples, 0, "{first_problem:?}");
 }

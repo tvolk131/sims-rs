@@ -42,6 +42,8 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
     let mut lifted_structured = 0usize;
     let mut lifted_pure_high_level = 0usize;
     let mut lifted_with_inline_raw_op = 0usize;
+    // The raw `op 0x` lines strict lifting still spells, by opcode and operand bytes.
+    let mut raw_op_lines: std::collections::BTreeMap<String, usize> = Default::default();
     let mut lifted_relaxed_pure_high_level = 0usize;
     let mut verified_equivalent = 0usize;
     let mut verified_annotated_equivalent = 0usize;
@@ -119,6 +121,11 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                     }
                     if source_text.contains("op 0x") {
                         lifted_with_inline_raw_op += 1;
+                        for line in source_text.lines().filter(|l| l.contains("op 0x")) {
+                            let line = line.trim();
+                            let shown = line.split(" -> ").next().unwrap_or(line);
+                            *raw_op_lines.entry(shown.to_owned()).or_default() += 1;
+                        }
                     } else {
                         lifted_pure_high_level += 1;
                     }
@@ -335,6 +342,11 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
         }
     }
 
+    let mut raw_ops: Vec<_> = raw_op_lines.into_iter().collect();
+    raw_ops.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
+    for (line, count) in raw_ops.iter().take(40) {
+        eprintln!("structured_equiv raw op {count}x: {line}");
+    }
     let total_fallbacks = unstructured + unsupported_header_or_target;
     eprintln!(
         "structured_equiv summary: total_bhavs={total_bhavs}, lifted_structured={lifted_structured} \

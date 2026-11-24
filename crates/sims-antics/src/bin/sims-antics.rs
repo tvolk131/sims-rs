@@ -7,9 +7,11 @@
 //! - `sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result] [--ignore-frame-residue]`
-//! - `sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--global <Global.iff>] [--semi-global <semi.iff>] [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--behavioral] [--all]`
+//! - `sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--global <Global.iff>] [--semi-global <semi.iff>] [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--behavioral] [--param-domain <tree>:<index>=<set>]... [--v2-enum-domains <file.antics> [--pack <pack_dir>]] [--all]`
 //!   (exit 0 equivalent, 1 different, 2 inconclusive or error). `--behavioral` compares
 //!   without node numbers and frame storage (`docs/decisions/20261123-verifier-behavioral-mode.md`).
+//!   The domain flags assume parameter values on entry and print every assumption
+//!   (`docs/decisions/20261124-verifier-domains-and-speed.md`).
 //!   Only files that differ in BHAV bodies alone are compared; DIFFERENT is reported only when both trees, run in
 //!   sims-vm from the same world, end differently; EQUIVALENT assumes neither run
 //!   exhausts the VM's instruction budget.
@@ -34,8 +36,9 @@ use sims_antics::{
     structured_lift_header_check,
     v2::{DecompileV2Options, TreeCheck, decompile_iff_to_v2_report, is_v2_source},
     verify::{
-        check_tree_with_callees, extract_bhav_from_iff, library_argless_from_iff,
-        library_arities_from_iff, single_file_problem,
+        ParamDomain, check_tree_with_callees, extract_bhav_from_iff, library_argless_from_iff,
+        library_arities_from_iff, parse_param_domain_arg, single_file_problem,
+        v2_enum_param_domains,
     },
     verify_object_safety, verify_pack_safety,
 };
@@ -167,7 +170,7 @@ fn print_usage() {
          sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result] [--ignore-frame-residue]\n  \
-         sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--global <Global.iff>] [--semi-global <semi.iff>] [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--behavioral] [--all]   (exit 0 equivalent, 1 different, 2 inconclusive)\n    \
+         sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--global <Global.iff>] [--semi-global <semi.iff>] [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--behavioral] [--param-domain <tree>:<index>=<set>]... [--v2-enum-domains <file.antics> [--pack <pack_dir>]] [--all]   (exit 0 equivalent, 1 different, 2 inconclusive)\n    \
              (files must differ in BHAV bodies alone; DIFFERENT needs a sims-vm replay that ends differently;\n    \
               EQUIVALENT assumes neither run exhausts the VM instruction budget; the same holds for equiv;\n    \
               a tree is EQUIVALENT only if every tree it may run is the same bytes or proven equivalent too;\n    \
@@ -179,7 +182,10 @@ fn print_usage() {
               --my-attributes is the attribute count of whatever runs as me, which call_as may make another\n    \
               object than the one whose file holds the tree: give the smallest count of anything that runs it;\n    \
               --behavioral ignores node numbers and frame storage (implies --ignore-frame-residue) and holds\n    \
-              only for runs that start and end under one build, see docs/decisions/20261123-verifier-behavioral-mode.md)\n  \
+              only for runs that start and end under one build, see docs/decisions/20261123-verifier-behavioral-mode.md;\n    \
+              --param-domain assumes param[<index>] of <tree> is in <set> (1,4,9 or 0..=3) on entry, and\n    \
+              --v2-enum-domains assumes it for every enum-typed parameter of the file's trees: EQUIVALENT then\n    \
+              holds only for such runs; every assumption is printed, with how the files' own calls stand against it)\n  \
          sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv] [--globals <Global.iff|archive.far[!member.iff]>] [--semiglobal <file.iff|archive.far!member.iff>] [--no-catalog]   (lifts to .air Antics IR)\n  \
          sims-antics lift --v2 <file.iff|archive.far> [--entry <name.iff>] [--install <dir>] [--globals ...] [--semiglobal ...] [--no-catalog]   (decompiles an object to checked .antics v2)\n  \
          sims-antics build <pack_dir> --out <dir>\n  \
@@ -2373,6 +2379,10 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
     let mut with: Vec<(PathBuf, bool)> = Vec::new();
     let mut opts = IffEquivOptions::default();
     let mut show_all = false;
+    // Parameter domains: `(tree, index, domain, where it came from)`.
+    let mut assumed: Vec<(u16, u16, ParamDomain, String)> = Vec::new();
+    let mut enum_sources: Vec<PathBuf> = Vec::new();
+    let mut pack: Option<PathBuf> = None;
     let mut i = 1usize;
     while i < args.len() {
         let arg = args[i].as_os_str();
@@ -2433,6 +2443,24 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
                     i += 1;
                     continue;
                 }
+                "--param-domain" => {
+                    let v = os_arg_to_str(value(s)?, "--param-domain value")?;
+                    let (tree, index, domain) =
+                        parse_param_domain_arg(v).map_err(|e| e.to_string())?;
+                    assumed.push((tree, index, domain, format!("--param-domain {v}")));
+                    i += 2;
+                    continue;
+                }
+                "--v2-enum-domains" => {
+                    enum_sources.push(PathBuf::from(value(s)?));
+                    i += 2;
+                    continue;
+                }
+                "--pack" => {
+                    pack = Some(PathBuf::from(value(s)?));
+                    i += 2;
+                    continue;
+                }
                 "--all" => {
                     show_all = true;
                     i += 1;
@@ -2454,6 +2482,54 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
     }
     let [path_a, path_b] = <[PathBuf; 2]>::try_from(paths)
         .map_err(|_| "verify-equiv requires <a.iff> <b.iff>".to_owned())?;
+    if pack.is_some() && enum_sources.is_empty() {
+        return Err("--pack only applies to --v2-enum-domains".to_owned().into());
+    }
+    for source in &enum_sources {
+        let shown = sanitize_path_display(source);
+        let found = v2_enum_param_domains(source, pack.as_deref())
+            .map_err(|e| format!("--v2-enum-domains {shown}: {e}"))?;
+        if found.is_empty() {
+            eprintln!("note: --v2-enum-domains {shown}: no tree takes an enum-typed parameter");
+        }
+        for d in found {
+            assumed.push((
+                d.tree,
+                d.param_index,
+                d.domain,
+                format!(
+                    "{shown}: tree {} parameter {}: {}",
+                    d.tree_name, d.param_name, d.enum_name
+                ),
+            ));
+        }
+    }
+    let mut out = OutWriter::stdout();
+    if !assumed.is_empty() {
+        out.writeln_str(
+            "ASSUMING parameter domains: an EQUIVALENT verdict holds only for runs that enter \
+             each constrained tree with its parameters inside these sets",
+        )?;
+    }
+    for (tree, index, domain, from) in assumed {
+        let slot = opts.param_domains.entry(tree).or_default().entry(index);
+        let line = match slot {
+            std::collections::btree_map::Entry::Occupied(e) if *e.get() != domain => {
+                return Err(format!(
+                    "BHAV #{tree} param[{index}] is assumed both in {{{}}} and in {{{domain}}} ({from})",
+                    e.get()
+                )
+                .into());
+            }
+            std::collections::btree_map::Entry::Occupied(_) => continue,
+            std::collections::btree_map::Entry::Vacant(e) => {
+                let line = format!("ASSUME: BHAV #{tree} param[{index}] in {{{domain}}} ({from})");
+                e.insert(domain);
+                line
+            }
+        };
+        out.writeln_str(&sanitize_single_line(&line))?;
+    }
     let read = |path: &Path| -> Result<Vec<u8>, CliError> {
         let (mut file, len, hdr) = read_regular_file_prefix(path)?;
         Ok(read_bounded_iff_file(path, &mut file, len, hdr)?)
@@ -2518,8 +2594,10 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
     let (a, b) = (read(&path_a)?, read(&path_b)?);
     let report = check_iff_equivalent(&a, &b, &opts).map_err(|e| e.to_string())?;
 
-    let mut out = OutWriter::stdout();
     let mut counts = [0usize; 4];
+    for line in &report.assumptions {
+        out.writeln_str(&sanitize_single_line(&format!("ASSUME: {line}")))?;
+    }
     for problem in &report.file_problems {
         out.writeln_str(&format!("FILE: {problem}"))?;
     }

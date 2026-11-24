@@ -58,6 +58,7 @@
 //! The checker never reports `Equivalent` for trees it cannot fully explore within its
 //! bounds.
 
+use super::domains::ParamDomains;
 use super::replay::{self, Witness};
 use super::{
     EquivResult, FrameUse, TraceStep, canonicalize_primitive_operands,
@@ -110,6 +111,11 @@ pub struct LiveContext {
     /// compares any spelling of them as `[0xFF; 8]`, when `callee_arities` agrees
     /// ([`LiveContext::call_reads_no_operands`]).
     pub argless_callees: Option<BTreeSet<u16>>,
+    /// Values tree parameters are assumed to hold on entry (`tree -> param -> domain`;
+    /// `verify-equiv --param-domain`). Empty by default, which assumes nothing. With
+    /// one, `Equivalent` holds only for runs that enter each constrained tree inside its
+    /// domain. Ignored for kind-4 trees, whose first parameter is their entry node.
+    pub param_domains: ParamDomains,
 }
 
 impl LiveContext {
@@ -137,6 +143,7 @@ impl Default for LiveContext {
             my_attribute_count: GUARANTEED_ATTRIBUTES,
             local_bcons: None,
             argless_callees: None,
+            param_domains: ParamDomains::new(),
         }
     }
 }
@@ -860,6 +867,8 @@ struct Explorer<'a> {
     /// (`interpreter.rs:964`): exactly this value, or (`false`) at least it, for the
     /// last node, which every larger entry is clamped to.
     entry_param: Option<(i16, bool)>,
+    /// Bounds the entry assumes on parameters, `(index, lo, hi)` (a domain region).
+    region: &'a [(usize, i16, i16)],
 }
 
 /// `(params, locals)` the VM gives a frame running `bhav` (`sims_vm::interpreter::dimensions`).
@@ -885,6 +894,7 @@ impl<'a> Explorer<'a> {
         opts: &'a LiveOptions,
         entry: usize,
         entry_param: Option<(i16, bool)>,
+        region: &'a [(usize, i16, i16)],
     ) -> Self {
         let (args, locals) = frame_dims(bhav);
         Self {
@@ -895,6 +905,7 @@ impl<'a> Explorer<'a> {
             locals,
             entry,
             entry_param,
+            region,
         }
     }
 
@@ -912,6 +923,15 @@ impl<'a> Explorer<'a> {
                 *first = Val::Const(raw);
             } else if raw > 0 {
                 cond.push((Atom::Lt(Val::Const(raw - 1), *first), true));
+            }
+        }
+        for &(i, lo, hi) in self.region {
+            let Some(&p) = params.get(i) else { continue };
+            if lo > i16::MIN {
+                cond.push((Atom::Lt(p, Val::Const(lo)), false));
+            }
+            if hi < i16::MAX {
+                cond.push((Atom::Lt(Val::Const(hi), p), false));
             }
         }
         PathState {
@@ -2291,6 +2311,24 @@ pub fn check_bhav_live_equivalent(
     let (len_a, len_b) = (a.instructions.len(), b.instructions.len());
     let entries = if a.kind == 4 { len_a.max(len_b) } else { 1 };
 
+    // Assumed parameter domains (never for kind 4, whose first parameter is the entry):
+    // the entry is split into regions that cover the domain exactly, each explored from
+    // a path condition bounding the parameters to it. A replay witness outside the
+    // domain is not a run the assumption covers, so it is never replayed.
+    let domains = (a.kind != 4)
+        .then(|| ctx_a.param_domains.get(&a.id))
+        .flatten();
+    let regions = super::domains::entry_regions(domains, frame_dims(a).0);
+    let in_domain = |w: &Witness| {
+        domains.is_none_or(|d| {
+            d.iter().all(|(&i, domain)| {
+                w.params
+                    .get(usize::from(i))
+                    .is_none_or(|&v| domain.contains(v))
+            })
+        })
+    };
+
     let mut interner = Interner::new();
     let mut steps = 0usize;
     let mut paths = 0usize;
@@ -2325,74 +2363,77 @@ pub fn check_bhav_live_equivalent(
                 entry + 1 < entries,
             )
         });
-        let explore =
-            |bhav: &BhavChunk, ctx: &LiveContext, entry: usize, interner: &mut Interner| {
-                Explorer::new(bhav, ctx, opts, entry, entry_param).explore(interner)
-            };
-        let explored = explore(a, ctx_a, entry_a, &mut interner)
-            .map_err(|e| format!("A: {e}"))
-            .and_then(|pa| {
-                explore(b, ctx_b, entry_b, &mut interner)
-                    .map(|pb| (pa, pb))
-                    .map_err(|e| format!("B: {e}"))
-            });
-        let ((paths_a, steps_a), (paths_b, steps_b)) = match explored {
-            Ok(r) => r,
-            Err(reason) => {
-                // Too many paths, or a loop the literals do not bound: cut both runs at
-                // their events instead (`bisimulate`).
-                let (xa, xb) = (
-                    Explorer::new(a, ctx_a, opts, entry_a, entry_param),
-                    Explorer::new(b, ctx_b, opts, entry_b, entry_param),
-                );
-                let proof = bisimulate(&xa, &xb, false, &mut interner).or_else(|first| {
-                    bisimulate(&xa, &xb, true, &mut interner).map_err(|every| {
-                        format!("cut at primitives: {first}; cut at every event: {every}")
-                    })
+        for region in &regions {
+            let explore =
+                |bhav: &BhavChunk, ctx: &LiveContext, entry: usize, interner: &mut Interner| {
+                    Explorer::new(bhav, ctx, opts, entry, entry_param, region).explore(interner)
+                };
+            let explored = explore(a, ctx_a, entry_a, &mut interner)
+                .map_err(|e| format!("A: {e}"))
+                .and_then(|pa| {
+                    explore(b, ctx_b, entry_b, &mut interner)
+                        .map(|pb| (pa, pb))
+                        .map_err(|e| format!("B: {e}"))
                 });
-                match proof {
-                    Ok((segments, states)) => {
-                        steps += segments;
-                        paths += states;
-                        continue;
-                    }
-                    Err(why) => {
-                        return EquivResult::Inconclusive {
-                            reason: format!("{reason}; cut-point bisimulation failed: {why}"),
-                        };
+            let ((paths_a, steps_a), (paths_b, steps_b)) = match explored {
+                Ok(r) => r,
+                Err(reason) => {
+                    // Too many paths, or a loop the literals do not bound: cut both runs at
+                    // their events instead (`bisimulate`).
+                    let (xa, xb) = (
+                        Explorer::new(a, ctx_a, opts, entry_a, entry_param, region),
+                        Explorer::new(b, ctx_b, opts, entry_b, entry_param, region),
+                    );
+                    let proof = bisimulate(&xa, &xb, false, &mut interner).or_else(|first| {
+                        bisimulate(&xa, &xb, true, &mut interner).map_err(|every| {
+                            format!("cut at primitives: {first}; cut at every event: {every}")
+                        })
+                    });
+                    match proof {
+                        Ok((segments, states)) => {
+                            steps += segments;
+                            paths += states;
+                            continue;
+                        }
+                        Err(why) => {
+                            return EquivResult::Inconclusive {
+                                reason: format!("{reason}; cut-point bisimulation failed: {why}"),
+                            };
+                        }
                     }
                 }
-            }
-        };
-        steps += steps_a + steps_b;
-        paths += paths_a.len() + paths_b.len();
-        // A difference counts only if both trees, run in `sims-vm` from the same world
-        // built from a witness, end differently.
-        let mut confirm = |w: &Witness| -> Option<String> {
-            if replays >= MAX_REPLAYS
-                || !replay::replayable(a, entry_a)
-                || !replay::replayable(b, entry_b)
-            {
-                return None;
-            }
-            replays += 1;
-            replay::replay(a, ctx_a, b, ctx_b, opts, w)
-        };
-        match compare_paths(
-            &paths_a,
-            &paths_b,
-            &interner,
-            opts,
-            entry_param,
-            frame_dims(a).0.max(frame_dims(b).0),
-            &mut confirm,
-        ) {
-            PairVerdict::Same => {}
-            PairVerdict::Differ(path, divergence) => {
-                return EquivResult::Counterexample { path, divergence };
-            }
-            PairVerdict::Undecided(reason) => {
-                undecided.get_or_insert(reason);
+            };
+            steps += steps_a + steps_b;
+            paths += paths_a.len() + paths_b.len();
+            // A difference counts only if both trees, run in `sims-vm` from the same world
+            // built from a witness, end differently.
+            let mut confirm = |w: &Witness| -> Option<String> {
+                if replays >= MAX_REPLAYS
+                    || !in_domain(w)
+                    || !replay::replayable(a, entry_a)
+                    || !replay::replayable(b, entry_b)
+                {
+                    return None;
+                }
+                replays += 1;
+                replay::replay(a, ctx_a, b, ctx_b, opts, w)
+            };
+            match compare_paths(
+                &paths_a,
+                &paths_b,
+                &interner,
+                opts,
+                entry_param,
+                frame_dims(a).0.max(frame_dims(b).0),
+                &mut confirm,
+            ) {
+                PairVerdict::Same => {}
+                PairVerdict::Differ(path, divergence) => {
+                    return EquivResult::Counterexample { path, divergence };
+                }
+                PairVerdict::Undecided(reason) => {
+                    undecided.get_or_insert(reason);
+                }
             }
         }
     }

@@ -1012,6 +1012,7 @@ fn file_problems_take_precedence() {
             notes: Vec::new(),
         }],
         file_problems: vec!["map".to_owned()],
+        assumptions: Vec::new(),
     };
     assert_eq!(report.verdict(), IffVerdict::Inconclusive);
 }
@@ -3005,5 +3006,467 @@ fn verify_equiv_cli_takes_argless_library_trees() {
         );
         let (code, text) = run(300, &[("--global", &lib)]);
         assert_eq!(code, Some(0), "{text}");
+    }
+}
+
+// ============================================================================
+// Parameter domains (`docs/decisions/20261124-verifier-domains-and-speed.md`)
+// ============================================================================
+
+fn domains(items: &[(u16, u16, &str)]) -> sims_antics::verify::ParamDomains {
+    let mut out = sims_antics::verify::ParamDomains::new();
+    for &(tree, index, set) in items {
+        out.entry(tree).or_default().insert(
+            index,
+            sims_antics::verify::ParamDomain::parse(set).expect("domain"),
+        );
+    }
+    out
+}
+
+fn with_domains(items: &[(u16, u16, &str)]) -> LiveContext {
+    LiveContext {
+        param_domains: domains(items),
+        ..LiveContext::default()
+    }
+}
+
+/// `return param[0] < 4` against `return param[0] < 9`: they differ for 4 to 8 only.
+fn defensive_pair() -> (BhavChunk, BhavChunk) {
+    (
+        tree(4200, 1, 0, vec![expr((PARAM, 0), LT, (LIT, 4), T, F)]),
+        tree(4200, 1, 0, vec![expr((PARAM, 0), LT, (LIT, 9), T, F)]),
+    )
+}
+
+/// A domain proves the pair equivalent only where it excludes every differing value,
+/// and a differing value inside the domain is still a replayed counterexample.
+#[test]
+fn param_domains_prove_only_inside_the_domain() {
+    let (a, b) = defensive_pair();
+    let opts = LiveOptions::default();
+    assert_counterexample(&live(&a, &b));
+    for set in ["0..=3", "0..=3,20", "-100..=3", "9..=30000", "-32768..=3"] {
+        let ctx = with_domains(&[(4200, 0, set)]);
+        assert_equivalent(&live_with(&a, &b, &ctx, &opts));
+    }
+    // Adversarial: one differing value (5, or the edges 4 and 8) inside the domain.
+    for set in ["0..=3,5", "0..=4", "8,9", "-32768..=32767", "6"] {
+        let ctx = with_domains(&[(4200, 0, set)]);
+        assert_counterexample(&live_with(&a, &b, &ctx, &opts));
+    }
+    // A domain for another tree, or a parameter the tree does not have, assumes nothing.
+    for ctx in [
+        with_domains(&[(4201, 0, "0..=3")]),
+        with_domains(&[(4200, 1, "0..=3")]),
+    ] {
+        assert_counterexample(&live_with(&a, &b, &ctx, &opts));
+    }
+    // The sides must assume the same domain.
+    let ctx = with_domains(&[(4200, 0, "0..=3")]);
+    assert_inconclusive(&check_bhav_live_equivalent(
+        &a,
+        &ctx,
+        &b,
+        &LiveContext::default(),
+        &opts,
+    ));
+}
+
+/// A rewrite that is wrong on exactly one value: `temp[0] := param[0]` against one that
+/// stores 7 when `param[0] == 2`.
+#[test]
+fn param_domain_bug_on_a_valid_value_is_a_counterexample() {
+    let a = tree(4200, 1, 0, vec![expr((TEMP, 0), SET, (PARAM, 0), T, T)]);
+    let b = tree(
+        4200,
+        1,
+        0,
+        vec![
+            expr((PARAM, 0), EQ, (LIT, 2), 1, 2),
+            expr((TEMP, 0), SET, (LIT, 7), T, T),
+            expr((TEMP, 0), SET, (PARAM, 0), T, T),
+        ],
+    );
+    let opts = LiveOptions::default();
+    assert_counterexample(&live(&a, &b));
+    for set in ["0,1,3", "-5..=-1,4..=9", "7"] {
+        let ctx = with_domains(&[(4200, 0, set)]);
+        assert_equivalent(&live_with(&a, &b, &ctx, &opts));
+    }
+    for set in ["0..=3", "2", "-1000..=1000", "1,2,3"] {
+        let ctx = with_domains(&[(4200, 0, set)]);
+        let result = live_with(&a, &b, &ctx, &opts);
+        assert_counterexample(&result);
+    }
+}
+
+/// Two constrained parameters split the entry into the product of their ranges.
+#[test]
+fn param_domains_combine_across_parameters() {
+    // `temp[0] := param[0]` against a version wrong when both parameters are 5.
+    let a = tree(4200, 2, 0, vec![expr((TEMP, 0), SET, (PARAM, 0), T, T)]);
+    let b = tree(
+        4200,
+        2,
+        0,
+        vec![
+            expr((PARAM, 0), EQ, (LIT, 5), 1, 3),
+            expr((PARAM, 1), EQ, (LIT, 5), 2, 3),
+            expr((TEMP, 0), SET, (LIT, 0), T, T),
+            expr((TEMP, 0), SET, (PARAM, 0), T, T),
+        ],
+    );
+    let opts = LiveOptions::default();
+    for sets in [("0..=2,7", "0,1,5"), ("5", "0,1"), ("0..=4", "-9..=9")] {
+        let ctx = with_domains(&[(4200, 0, sets.0), (4200, 1, sets.1)]);
+        assert_equivalent(&live_with(&a, &b, &ctx, &opts));
+    }
+    for sets in [("0..=2,5", "0,1,5"), ("5", "5"), ("-9..=9", "4..=6")] {
+        let ctx = with_domains(&[(4200, 0, sets.0), (4200, 1, sets.1)]);
+        assert_counterexample(&live_with(&a, &b, &ctx, &opts));
+    }
+}
+
+/// A tree whose loop the explorer cannot bound goes through the bisimulation, which
+/// starts from the constrained entry.
+#[test]
+fn param_domains_reach_the_bisimulation() {
+    // `loop { if param[0] < 4 { break } ; sleep }` style: an idle primitive inside a
+    // loop on a parameter, against the same loop testing `< 9`.
+    let looped = |bound: i16| {
+        tree(
+            4200,
+            1,
+            0,
+            vec![
+                expr((PARAM, 0), LT, (LIT, bound), T, 1),
+                prim(0x0000, [1, 0, 0, 0, 0, 0, 0, 0], 0, 0),
+            ],
+        )
+    };
+    let (a, b) = (looped(4), looped(9));
+    let opts = LiveOptions::default();
+    let ctx = with_domains(&[(4200, 0, "0..=3")]);
+    assert_equivalent(&live_with(&a, &b, &ctx, &opts));
+    let ctx = with_domains(&[(4200, 0, "0..=5")]);
+    assert!(
+        !matches!(
+            live_with(&a, &b, &ctx, &opts),
+            EquivResult::Equivalent { .. }
+        ),
+        "a differing value inside the domain must not prove equivalent"
+    );
+}
+
+/// `4096` calls `4097` (one argument) with `call_operands`; `4097` is the defensive pair.
+fn domain_files(call_operands: [u8; 8]) -> (Vec<u8>, Vec<u8>) {
+    let (callee_a, callee_b) = defensive_pair();
+    let caller = tree(4096, 0, 0, vec![prim(4097, call_operands, T, T)]);
+    let callee = |t: &BhavChunk| BhavChunk {
+        id: 4097,
+        ..t.clone()
+    };
+    let file = |callee: &BhavChunk| {
+        write_iff(&[bhav_chunk(&caller, "caller"), bhav_chunk(callee, "callee")])
+            .expect("write IFF")
+    };
+    (file(&callee(&callee_a)), file(&callee(&callee_b)))
+}
+
+fn literal_call(value: i16) -> [u8; 8] {
+    let mut ops = [0u8; 8];
+    ops[0..2].copy_from_slice(&value.to_le_bytes());
+    ops
+}
+
+#[test]
+fn whole_file_domains_check_the_files_own_callers() {
+    let verdict = |report: &IffEquivReport, id: u16| {
+        report
+            .resources
+            .iter()
+            .find(|r| &r.tag == b"BHAV" && r.id == id)
+            .map(|r| r.verdict.clone())
+            .expect("tree report")
+    };
+    let opts = |set: Option<&str>| IffEquivOptions {
+        param_domains: set.map_or_else(Default::default, |s| domains(&[(4097, 0, s)])),
+        ..IffEquivOptions::default()
+    };
+
+    // A literal call inside the domain is discharged.
+    let (a, b) = domain_files(literal_call(2));
+    let report = check_iff_equivalent(&a, &b, &opts(None)).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Different, "{report:#?}");
+    assert!(report.assumptions.is_empty());
+    let report = check_iff_equivalent(&a, &b, &opts(Some("0..=3"))).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
+    let lines = report.assumptions.join("\n");
+    assert!(
+        lines.contains("BHAV #4097 param[0] in {0..=3}: applied"),
+        "{lines}"
+    );
+    // One call in each file.
+    assert!(
+        lines.contains("2 discharged, 0 not discharged, 0 violating"),
+        "{lines}"
+    );
+    assert!(
+        matches!(verdict(&report, 4097), ResourceVerdict::Equivalent { how } if how.contains("assuming param[0] in {0..=3}")),
+        "{report:#?}"
+    );
+
+    // A literal call outside it voids the callee's proof, and its caller's with it,
+    // even though the callee differs only outside the domain... and it is never
+    // reported as a difference.
+    let (a, b) = domain_files(literal_call(7));
+    let report = check_iff_equivalent(&a, &b, &opts(Some("0..=3"))).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Inconclusive, "{report:#?}");
+    assert!(
+        matches!(verdict(&report, 4097), ResourceVerdict::Inconclusive { why } if why.contains("violates") && why.contains("A #4096 node 0 passes param[0] = 7")),
+        "{report:#?}"
+    );
+    assert!(
+        matches!(verdict(&report, 4096), ResourceVerdict::Inconclusive { .. }),
+        "{report:#?}"
+    );
+    // A caller that passes temps is not discharged: the assumption stands, and says so.
+    let (a, b) = domain_files([0xFF; 8]);
+    let report = check_iff_equivalent(&a, &b, &opts(Some("0..=3"))).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
+    let lines = report.assumptions.join("\n");
+    assert!(
+        lines.contains("0 discharged, 2 not discharged (assumed: A #4096 node 0; B #4096 node 0)"),
+        "{lines}"
+    );
+    // A domain for a parameter the tree does not have is printed as not applied.
+    let opts = IffEquivOptions {
+        param_domains: domains(&[(4097, 2, "1"), (4100, 0, "1"), (300, 0, "1")]),
+        ..IffEquivOptions::default()
+    };
+    let report = check_iff_equivalent(&a, &b, &opts).expect("check");
+    let lines = report.assumptions.join("\n");
+    assert!(
+        lines.contains("BHAV #4097 param[2] in {1}: NOT APPLIED (the tree takes 1 argument(s))"),
+        "{lines}"
+    );
+    assert!(
+        lines.contains("BHAV #4100 param[0] in {1}: NOT APPLIED (not both files define it)"),
+        "{lines}"
+    );
+    assert!(
+        lines.contains("BHAV #300 param[0] in {1}: NOT APPLIED (the VM never runs"),
+        "{lines}"
+    );
+}
+
+#[test]
+fn verify_equiv_cli_param_domains() {
+    let dir = scratch_dir("domains");
+    let (a, b) = domain_files(literal_call(2));
+    let (path_a, path_b) = (dir.join("a.iff"), dir.join("b.iff"));
+    std::fs::write(&path_a, a).unwrap();
+    std::fs::write(&path_b, b).unwrap();
+    let run = |flags: &[&str]| {
+        let out = cli()
+            .arg("verify-equiv")
+            .args(flags)
+            .arg(&path_a)
+            .arg(&path_b)
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    let (code, text) = run(&[]);
+    assert_eq!(code, Some(1), "{text}");
+    assert!(!text.contains("ASSUM"), "{text}");
+    let (code, text) = run(&["--param-domain", "4097:0=0..=3"]);
+    assert_eq!(code, Some(0), "{text}");
+    for line in [
+        "ASSUMING parameter domains",
+        "ASSUME: BHAV #4097 param[0] in {0..=3} (--param-domain 4097:0=0..=3)",
+        "ASSUME: BHAV #4097 param[0] in {0..=3}: applied",
+        "ASSUME: BHAV #4097 callers in the files: 2 discharged",
+    ] {
+        assert!(text.contains(line), "missing {line:?}:\n{text}");
+    }
+    // Behavioral mode takes domains too; a value that differs inside one does not hide.
+    let (code, text) = run(&["--behavioral", "--param-domain", "0x1001:0=0..=3"]);
+    assert_eq!(code, Some(0), "{text}");
+    let (code, text) = run(&["--behavioral", "--param-domain", "4097:0=0..=3,6"]);
+    assert_eq!(code, Some(1), "{text}");
+    // Conflicting or malformed domains are errors.
+    let (code, text) = run(&["--param-domain", "4097:0=1", "--param-domain", "4097:0=2"]);
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("is assumed both in"), "{text}");
+    for bad in [
+        "4097=1",
+        "4097:0=",
+        "4097:0=3..=1",
+        "4097:x=1",
+        "4097:0=0..3",
+    ] {
+        let (code, text) = run(&["--param-domain", bad]);
+        assert_eq!(code, Some(2), "{bad}: {text}");
+    }
+}
+
+const ENUM_OBJECT: &str = r#"
+object "Domain Probe" {
+    guid: 0x7F53_0001;
+
+    enum Meal {
+        Soup = 0,
+        Stew = 1,
+        Pie = 3,
+    }
+
+    state served: i16;
+
+    tree serve "Serve" (sim: Sim, meal: Meal, count: i16) {
+        BODY
+    }
+
+    interaction "Serve" {
+        run(sim) {
+            serve(sim, Meal::Stew, 2);
+        }
+    }
+}
+"#;
+
+/// The original keeps a defensive fallback for values no `Meal` has.
+const DEFENSIVE_BODY: &str = "
+        self.served = count;
+        if meal == Meal::Soup {
+        } else if meal == Meal::Stew {
+        } else if meal == Meal::Pie {
+        } else {
+            self.served = 99;
+        }";
+/// The rewrite drops it.
+const PLAIN_BODY: &str = "
+        self.served = count;";
+/// A rewrite with a bug on a valid variant, `Meal::Pie`.
+const BUGGY_BODY: &str = "
+        self.served = count;
+        if meal == Meal::Pie {
+            self.served = 98;
+        }";
+
+fn enum_object(
+    dir: &std::path::Path,
+    name: &str,
+    body: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let source = dir.join(format!("{name}.antics"));
+    std::fs::write(&source, ENUM_OBJECT.replace("BODY", body.trim_start())).unwrap();
+    let compiled = sims_antics::compile_v2_object_file(&source, None).expect("compile v2");
+    let iff = dir.join(format!("{name}.iff"));
+    std::fs::write(&iff, compiled.iff_bytes).unwrap();
+    (source, iff)
+}
+
+#[test]
+fn v2_enum_domains_are_extracted_by_positional_index() {
+    let dir = scratch_dir("enum-extract");
+    let (source, _) = enum_object(&dir, "a", DEFENSIVE_BODY);
+    let found = sims_antics::verify::v2_enum_param_domains(&source, None).expect("extract");
+    assert_eq!(found.len(), 1, "{found:#?}");
+    let d = &found[0];
+    // `sim: Sim` is not a BHAV parameter; `count: i16` is not an enum.
+    assert_eq!((d.tree, d.param_index), (4098, 0), "{d:#?}");
+    assert_eq!(
+        (
+            d.tree_name.as_str(),
+            d.param_name.as_str(),
+            d.enum_name.as_str()
+        ),
+        ("serve", "meal", "Meal")
+    );
+    // Adjacent variants print as a range.
+    assert_eq!(d.domain.to_string(), "0..=1,3");
+    // Two objects in one file are refused: trees are matched by label in one object.
+    let two = dir.join("two.antics");
+    std::fs::write(
+        &two,
+        format!(
+            "{}\n{}",
+            ENUM_OBJECT.replace("BODY", PLAIN_BODY.trim_start()),
+            ENUM_OBJECT
+                .replace("BODY", PLAIN_BODY.trim_start())
+                .replace("Domain Probe", "Other Probe")
+                .replace("0x7F53_0001", "0x7F53_0002")
+        ),
+    )
+    .unwrap();
+    let err = sims_antics::verify::v2_enum_param_domains(&two, None).expect_err("two objects");
+    assert!(err.to_string().contains("exactly one"), "{err}");
+}
+
+#[test]
+fn verify_equiv_cli_v2_enum_domains() {
+    let dir = scratch_dir("enum-cli");
+    let (source, original) = enum_object(&dir, "original", DEFENSIVE_BODY);
+    let (_, plain) = enum_object(&dir, "plain", PLAIN_BODY);
+    let (_, buggy) = enum_object(&dir, "buggy", BUGGY_BODY);
+    let run = |b: &std::path::Path, flags: &[&std::ffi::OsStr]| {
+        let out = cli()
+            .arg("verify-equiv")
+            .args(flags)
+            .arg(&original)
+            .arg(b)
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    // The rewrite runs fewer `Expression` nodes, so the scratch pointer is not observed.
+    let flag = [
+        std::ffi::OsStr::new("--ignore-scratch-pointer"),
+        std::ffi::OsStr::new("--v2-enum-domains"),
+        source.as_os_str(),
+    ];
+    // Unconditionally the dropped fallback is a difference (`meal = 2`), which the
+    // checker does not prove equivalent.
+    let (code, text) = run(&plain, &flag[..1]);
+    assert_ne!(code, Some(0), "{text}");
+    assert!(!text.contains("ASSUM"), "{text}");
+    // Assuming `meal` is a `Meal`, the rewrite is equivalent, and the run says so.
+    let (code, text) = run(&plain, &flag);
+    assert_eq!(code, Some(0), "{text}");
+    for line in [
+        "ASSUMING parameter domains",
+        "ASSUME: BHAV #4098 param[0] in {0..=1,3} (",
+        ": tree serve parameter meal: Meal)",
+        "ASSUME: BHAV #4098 callers in the files: 2 discharged, 0 not discharged, 0 violating",
+        "BHAV #4098: equivalent (live-output",
+        "assuming param[0] in {0..=1,3}",
+    ] {
+        assert!(text.contains(line), "missing {line:?}:\n{text}");
+    }
+    // A bug on a valid variant is still a counterexample, in both modes.
+    for behavioral in [false, true] {
+        let mut flags = flag.to_vec();
+        if behavioral {
+            flags.push(std::ffi::OsStr::new("--behavioral"));
+        }
+        let (code, text) = run(&buggy, &flags);
+        assert_eq!(code, Some(1), "{text}");
+        assert!(text.contains("BHAV #4098: DIFFERENT"), "{text}");
     }
 }
