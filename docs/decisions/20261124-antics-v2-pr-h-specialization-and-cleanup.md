@@ -29,7 +29,7 @@ Constraints:
 - **Lowering targets.** Everything lowers onto existing `.air`.
 - **Files changed.**
   - v2 changes stay in `src/v2/{ast,parser,lower,opt,specialize,mod}.rs`.
-  - The `.air` compiler (`src/lower.rs`) gains one read-only query.
+  - The `.air` compiler (`src/lower.rs`) gains one read-only query: `air_local_usage`.
   - The verifier, `fmt`, `lint` and `decompile` are untouched; parallel tracks own them.
 - **Synthetic tests.** Every test is synthetic, in `tests/v2_pr_h*.rs`. `open-pack/` builds unchanged.
 
@@ -143,7 +143,23 @@ Inline `fn` helpers lower directly into their caller's targets:
   - a second `@frame` on the same lifecycle tree, from a template and its object.
 - **Init with no prelude.** States declared at an explicit slot without an initializer add no init prelude. An init can therefore match an original's exactly.
 
-### 8. Deferred to PR I
+### 8. Tier 2: context polymorphism
+
+- **Runner cells.** `me.person[i]`, `me.motive[i]`, `me.data[i]`, `me.attr[i]` and `me.slot[i]` are the cells of whoever runs the tree.
+  - They lower to `my.*` in an object tree and in a Sim tree alike.
+  - A binding the source names `me` keeps its meaning.
+- **`@context(inherit)`.** A standalone tree marked this way can be called from object trees and Sim trees.
+  - A private call keeps the caller's runner and stack object, so the callee needs no wrapper and no extra locals.
+- **Soundness by construction.**
+  - The compiler lowers an inherit tree once in each context and requires the two `.air` texts to be identical.
+  - The bytecode therefore means the same thing whichever context calls it.
+  - `self` and `sim` are refused, because they differ by context. Only `me.*`, `stack_obj`, parameters, temps and globals pass.
+  - The check restores the dialog-string table between passes, which is the only interior-mutable state in lowering.
+- **Deferred.**
+  - A typed `self` on a caller-supplied stack object needs a call-site proof of its identity and type.
+  - Changing the runner needs a VM operation that does so.
+
+### 9. Deferred to PR I
 
 Each item below is clean as its own change, so this PR leaves it out:
 
@@ -155,6 +171,6 @@ Each item below is clean as its own change, so this PR leaves it out:
 
 ## Consequences
 
-- **Pilot gaps closed.** The R2 reports' entry-save bugs (1–3) and the `!=` polarity question (4) are closed. Most raw sites listed under stack cursor, `create_object`, `relationship(value:)` and `@slot` now have v2 spellings.
+- **Pilot gaps closed.** The R2 reports' entry-save bugs (1–3) and the `!=` polarity question (4) are closed. Most raw sites listed under stack cursor, `create_object`, `relationship(value:)`, `@slot`, Init/Main stubs and person data in object context now have v2 spellings.
 - **Verifier gap 1 remains.** Cut-point bisimulation compares local slots literally. `@slot` lets a source match Maxis's slots exactly where that matters.
 - **New invariant.** Generated local names starting `__slot` are reserved for pinned locals. `merge_group` and the text liveness treat them as source locals.
