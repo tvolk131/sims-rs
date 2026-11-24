@@ -32,6 +32,7 @@ pub fn parse_v2_file(source: &str) -> Result<V2File> {
         tokens,
         pos: 0,
         depth: 0,
+        bound_vars: std::collections::BTreeSet::new(),
     };
     parser.parse_file()
 }
@@ -40,6 +41,10 @@ struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     depth: usize,
+    /// Every variable name bound so far in the file (parameters, `let`s, loop and event
+    /// bindings). A const binding may not yield one of these: a variable can change, or be
+    /// written through a frame-word alias, between the test and a use in the region.
+    bound_vars: std::collections::BTreeSet<String>,
 }
 
 impl Parser {
@@ -123,6 +128,7 @@ impl Parser {
                 format!("'stack_obj' is the frame's stack object and cannot be used as a {desc}"),
             ));
         }
+        self.bound_vars.insert(name.clone());
         Ok((name, span))
     }
 
@@ -1404,7 +1410,14 @@ impl Parser {
     }
 
     fn parse_param_member(&mut self, span: Span) -> Result<ObjectMember> {
-        let (name, _) = self.expect_binding_ident("parameter name")?;
+        // A tuning parameter is a constant, so a const binding may yield it.
+        let (name, name_span) = self.expect_ident("parameter name")?;
+        if name == "stack_obj" {
+            return Err(Error::at(
+                name_span,
+                "'stack_obj' is the frame's stack object and cannot be used as a parameter name",
+            ));
+        }
         if self.eat(&TokenKind::Assign) {
             // `param energy_step = 20;` binding form
             let value = self.parse_param_value()?;
@@ -2624,12 +2637,27 @@ impl Parser {
             ));
         };
         self.expect(&TokenKind::Semicolon, "';'")?;
-        Ok(ConstBinding {
+        let binding = ConstBinding {
             span,
             names,
             tuple,
             selector,
-        })
+        };
+        // Names are substituted where they are used, so a yielded name must mean the same
+        // value there as at the test: a variable could have changed in between.
+        if let Some((yspan, n)) = specialize::yielded_idents_at(&binding)
+            .into_iter()
+            .find(|(_, n)| self.bound_vars.contains(n))
+        {
+            return Err(Error::at(
+                yspan,
+                format!(
+                    "a const binding yields compile-time operands, and '{n}' is a variable; \
+                     use a 'let' with 'match' or 'if' for a run-time value"
+                ),
+            ));
+        }
+        Ok(binding)
     }
 
     fn parse_binding_match(&mut self, span: Span) -> Result<Selector> {

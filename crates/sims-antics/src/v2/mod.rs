@@ -24,6 +24,7 @@
 //! result in the cursor. In Sim trees that use these operations, `self` still names the entry
 //! object and temporary cursor moves preserve the current value.
 
+mod air_words;
 pub mod ast;
 pub mod decompile;
 pub mod fmt;

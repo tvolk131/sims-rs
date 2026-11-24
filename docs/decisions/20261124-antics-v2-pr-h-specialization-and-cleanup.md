@@ -43,8 +43,11 @@ Constraints:
     - `animate(local:)` writes on the false exit (an event);
     - a relationship read writes on the true exit.
   - A `break` carries its state to the loop exit, and the states meet there. `return` and `continue` are vacuous.
+  - A relationship read without flag 1 adds a missing row, so it writes on both exits. With flag 1 a missing row takes the false exit unwritten.
   - Raw code is split one statement per line before the analysis.
-  - Only positional branch targets block the drop. A raw `local` declaration still keeps the save.
+  - Positional branch targets block the drop, wherever their lines fall after the `->`. A raw `local` declaration still keeps the save.
+  - Raw code the analysis cannot parse (a label graph) keeps the save when it moves any named local.
+  - In a tree that keeps its `.air` layout, a tree that formats text keeps the save, since `$Local:N` could name its word.
 - **H-2: `sim.attr` and `sim.data` never clobber the stack object.** A Sim tree that only touches Sim cells drops its save.
 - **H-3: `$Local` text keeps its locals.**
   - In a tree that formats text (`dialog`, `action_string`), every source local keeps its store and its own word: `let`, inlined-helper `let` and `@slot` alike.
@@ -64,13 +67,17 @@ Constraints:
 - **Inline operands.** A `match` or `if` used directly as a builtin's operand is split the same way by the lowering; its region is that one statement.
 - **Soundness rules.**
   - Arms yield compile-time operands or diverge: `break`, `continue`, `return`, or a block ending in one.
+  - A yielded name must not be a variable (any name a `let`, parameter or loop binds earlier in the file), and an arm cannot yield `stack_obj`, which primitives change. A variable's value can change inside the region, so it is not a compile-time operand; a run-time choice uses a `let` with `match` or `if`.
   - A `match` needs `_`, and an `if` needs `else`.
   - The region runs up to the last statement that names a bound name. It extends to every later use of a `let` it declares.
   - The region may not:
     - redeclare a bound name;
     - write a name an arm yields;
     - contain a `defer`;
-    - name a bound name inside `raw { }`.
+    - name a bound name inside `raw { }`;
+    - assign or borrow a bound name (substitution would write through it);
+    - define a label in a `raw { }` block (each arm would define it again).
+  - In a tree that formats text, the region may not declare a variable: each arm's copy takes its own frame word, so no `$Local:N` names it on every path. Declaring it before the binding works. Lowering detects the copies by declaration span per inline and defer instance.
 - **Other passes.** `fmt` and `lint` are token- and AST-based and see ordinary statements, so they need no change.
 
 ### 3. Tier 2: zero-cost inline helpers
@@ -85,17 +92,22 @@ Inline `fn` helpers lower directly into their caller's targets:
   - A possible alias, a primitive that clobbers, or a Sim-side `stack.attr` read keeps the snapshot.
 - **Helper locals.** Disjoint helper locals share a word unless the tree formats text (H-3).
 - **Types.** `Guid` parameters and `fn -> Result` helpers inline.
-- **Fallback.** Cancellation, an exit from a caller loop, and layout-sensitive code keep the general path.
+- **Fallback.** Cancellation, an exit from a caller loop, and layout-sensitive code keep the general path. So do:
+  - a helper with a `defer`, and a result stored into a pinned `@slot` word. The result is staged and stored after the helper's cleanup, which may read the word as `$Local:N`. A fault ends the frame, so a partial store before one is unobservable, as in ordinary code;
+  - a `return` in a `for … else` exhaustion block, which is lowered inside the iterator loop and needs the return flag.
+- **Pinned arguments.** An argument in a `@slot` word is always copied. A helper's raw code can write that word by number.
 
 ### 4. Tier 2: stack cursor
 
 - **`for … else`.** All five object iterators take an exhaustion block. Exhaustion reaches it directly, and `break` skips it.
   - This removes the Fridges 4112 flag.
+  - Exhaustion restores the stack object only when the iterator or its body moved it. A redundant store would replace the iterator's false result, which the block can read (`gosub_found_action`). Where a restore is needed it is bookkeeping, as with the entry save.
 - **In-place stepping.** `while set_to_next(guid, K, dest: stack_obj) { .. }` steps the cursor in place.
   - It starts at the current object and needs no locals.
   - Modes `category` (6, reads `param[0]`) and `on_tile` (8) are available.
   - `part` gives a single multipart step.
 - **`create_object` into the stack object.** `if create_object(K, dest: stack_obj) { .. }` branches on the primitive itself, with zero save locals.
+- **Loop conditions re-read.** A condition that reads a `self` cell after the cursor moved swaps the cursor and reads at the head of every iteration. It is never hoisted.
 - **`self` stays the entry object.**
   - In a Sim tree that moves the cursor explicitly, `self` is still the entry object.
   - Temporary moves for `self` restore the active cursor.
@@ -106,7 +118,8 @@ Inline `fn` helpers lower directly into their caller's targets:
 - **Constants.** A `const` in an operand position of raw `.air` is its number; a GUID is written in hex.
 - **Tuning entries.** A tuning table's `Table.entry` is its `bcon[N]` operand.
 - **Left alone:**
-  - labels (`@x`) and branch targets;
+  - labels (`@x` and bare `x:`) and branch targets, including target lists continued on later lines;
+  - `.air` words, such as the `part` mode of `set_to_next`. `src/v2/air_words.rs` lists them, and a unit test keeps the list in step with every word the `.air` parser matches;
   - fields, cells, call names and argument keys;
   - strings and comments;
   - `.air` keywords.
@@ -123,13 +136,14 @@ Inline `fn` helpers lower directly into their caller's targets:
   - When the tree is finished, `opt::assign_frame_slots` rewrites it to `local[N]`.
   - It also places the tree's other generated locals first-fit, in declaration order, around every slot `.air` reports as explicit. On its own, `.air` would put them after the highest explicit slot.
   - The `.air` scan (`lower::air_local_usage`) now records explicit slots as a set, not a maximum. The allocation of trees without `@slot` is unchanged.
+- **Rewriting.** The rewrite changes local operands only. A label spelled like a pinned name stays a label.
 - **Kept as `.air` places them:**
-  - locals a raw block declares under its own name;
+  - locals a raw block declares under its own name (even one starting `__`);
   - every unpinned local of a tree with raw `op` bytes.
 - **Refused:**
   - inside an inlined helper, because the frame is the caller's;
   - in a tree with a pinned `push_interaction` object slot;
-  - while another variable of the same slot is in scope.
+  - while another variable of the same slot is in scope, including a shadowed one a `defer` still captures.
 - **Allowed:** disjoint scopes may reuse a slot, and a raw block may share a pinned word on purpose.
 - **Formatting.** `fmt` does not know the attribute yet and prints `@ slot(N)`, which parses the same. Teaching `fmt` the attribute is a one-word follow-up in `fmt.rs` (attribute list) for the lint track.
 
@@ -174,3 +188,5 @@ Each item below is clean as its own change, so this PR leaves it out:
 - **Pilot gaps closed.** The R2 reports' entry-save bugs (1–3) and the `!=` polarity question (4) are closed. Most raw sites listed under stack cursor, `create_object`, `relationship(value:)`, `@slot`, Init/Main stubs and person data in object context now have v2 spellings.
 - **Verifier gap 1 remains.** Cut-point bisimulation compares local slots literally. `@slot` lets a source match Maxis's slots exactly where that matters.
 - **New invariant.** Generated local names starting `__slot` are reserved for pinned locals. `merge_group` and the text liveness treat them as source locals.
+- **`$Local:N` contract.** In a tree that formats text, each source local keeps a word that holds its value. The word's number is fixed only by `@slot(N)`; an unpinned local's number is the compiler's.
+- **Review.** Codex Sol review round 1 found twelve soundness bugs. Each fix above has a synthetic regression test in `tests/v2_pr_h_review.rs`.

@@ -1998,7 +1998,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
                 "tree {action_id} \"{action_label}\" (args: {header_args}) {{"
             );
         }
-        trees_air.push_str(&ctx.finish());
+        trees_air.push_str(&ctx.finish()?);
         trees_air.push_str("}\n\n");
 
         callback_specs.push(CallbackSpec {
@@ -2148,7 +2148,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             ctx.line("return true;".to_owned());
         }
         let _ = writeln!(trees_air, "interaction {action_id} \"{base_ident}\" {{");
-        trees_air.push_str(&ctx.finish());
+        trees_air.push_str(&ctx.finish()?);
         trees_air.push_str("}\n\n");
 
         let mut motives = Vec::with_capacity(inter.decl.advertises.len());
@@ -3107,7 +3107,7 @@ fn write_framed_tree(
     let body = if frame.empty {
         String::new()
     } else {
-        ctx.finish()
+        ctx.finish()?
     };
     if let (Some((espan, slot)), Some(locals)) = (event_local, frame.locals) {
         // `.air` grows the frame to fit the named locals (after an explicit `local[0]` pin).
@@ -3614,7 +3614,7 @@ fn emit_guard_tree(
     } else {
         let _ = writeln!(air, "tree {tree_id} \"{label}\" {{");
     }
-    air.push_str(&ctx.finish());
+    air.push_str(&ctx.finish()?);
     air.push_str("}\n\n");
     Ok(())
 }
@@ -3874,6 +3874,10 @@ enum HelperCell {
     OwnAttr(i16),
 }
 
+/// One lowering of a source declaration: the inline-helper instances around it, the defer
+/// instance, and its (line, column) (see `TreeLowerer::seen_decls`).
+type DeclInstance = (Vec<usize>, Option<usize>, (usize, usize));
+
 #[derive(Clone)]
 struct TreeLowerer<'a> {
     env: &'a ObjectEnv<'a>,
@@ -3923,6 +3927,14 @@ struct TreeLowerer<'a> {
     /// The tree's first `@slot(N) let`: its pinned locals are named `__slot<N>_..` through the
     /// optimizer and placed by `opt::assign_frame_slots` when the tree is finished.
     slot_span: Option<Span>,
+    /// Declarations lowered so far, by lowering instance (the inline-helper instances and the
+    /// defer instance around them) and source span. Lowering one source declaration twice in
+    /// the same instance means it was copied (a const binding's region), and each copy has its
+    /// own frame word: `dup_decl` records the first, which a tree that formats text refuses.
+    seen_decls: BTreeSet<DeclInstance>,
+    inline_epochs: Vec<usize>,
+    inline_epoch_seq: usize,
+    dup_decl: Option<(Span, String)>,
     /// Set when the tree's bytes after some node matter beyond `.air` semantics, so the backend
     /// pass must leave the tree alone: a `raw` block (its literal calls and ops may read the
     /// following instruction's bytes), or a literal-argument call whose callee frame may read
@@ -3978,6 +3990,10 @@ impl<'a> TreeLowerer<'a> {
             raw_declared: BTreeSet::new(),
             raw_resolved: BTreeSet::new(),
             slot_span: None,
+            seen_decls: BTreeSet::new(),
+            inline_epochs: Vec::new(),
+            inline_epoch_seq: 0,
+            dup_decl: None,
             keep_layout: false,
             param_words_used: 0,
             frame_locals: None,
@@ -4070,7 +4086,19 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
-    fn finish(self) -> String {
+    fn finish(self) -> Result<String> {
+        if let Some((span, name)) = &self.dup_decl
+            && super::opt::body_formats_text(&self.out)
+        {
+            return Err(Error::at(
+                *span,
+                format!(
+                    "'{name}' is declared in a const binding's region, which is copied into each \
+                     arm with its own frame word, and this tree formats text that can name frame \
+                     words ('$Local:N'); declare '{name}' before the binding and assign it in the region"
+                ),
+            ));
+        }
         let mut out = if self.used_saved_stack_obj {
             format!("    let __saved_stack_obj = stack_obj;\n{}", self.out)
         } else {
@@ -4098,11 +4126,11 @@ impl<'a> TreeLowerer<'a> {
                 out
             }
         };
-        if self.slot_span.is_some() {
-            super::opt::assign_frame_slots(&out)
+        Ok(if self.slot_span.is_some() {
+            super::opt::assign_frame_slots(&out, &self.raw_declared)
         } else {
             out
-        }
+        })
     }
 
     /// A lifecycle tree's `@frame(...)`: `param[0..args]` become addressable and `locals` bounds
@@ -4680,8 +4708,18 @@ impl<'a> TreeLowerer<'a> {
     }
 
     fn bind_var(&mut self, name: String, binding: Binding) {
-        if let Some(top) = self.var_scopes.last_mut() {
-            top.insert(name, binding);
+        if let Some(top) = self.var_scopes.last_mut()
+            && let Some(old) = top.insert(name.clone(), binding)
+            && matches!(&old, Binding::Local { air_name, .. } if air_name.starts_with("__slot"))
+        {
+            // A `defer` registered before the shadowing still uses the old `@slot` variable,
+            // so its frame word stays taken until the scope ends. The key is no identifier, so
+            // only the slot conflict check in `local_air_name` sees it.
+            let mut k = 0;
+            while top.contains_key(&format!("{name}#shadowed{k}")) {
+                k += 1;
+            }
+            top.insert(format!("{name}#shadowed{k}"), old);
         }
     }
 
@@ -5121,6 +5159,39 @@ impl<'a> TreeLowerer<'a> {
         Ok(())
     }
 
+    /// Records a statement that declares a local (see `seen_decls`).
+    fn note_decl(&mut self, stmt: &V2Stmt) {
+        let (span, name) = match stmt {
+            V2Stmt::Let { span, name, .. }
+            | V2Stmt::LetUninit { span, name, .. }
+            | V2Stmt::LetSome { span, name, .. }
+            | V2Stmt::ForEach {
+                span,
+                binding: name,
+                ..
+            } => (*span, name.as_str()),
+            V2Stmt::Animate {
+                span,
+                event: Some(name),
+                ..
+            } => (*span, name.as_str()),
+            _ => return,
+        };
+        if self.checking_discarded > 0 || self.dup_decl.is_some() {
+            return;
+        }
+        let depth = self.inline_call_stack.len();
+        self.inline_epochs.truncate(depth);
+        let key = (
+            self.inline_epochs.clone(),
+            self.current_defer_id,
+            (span.line, span.column),
+        );
+        if !self.seen_decls.insert(key) {
+            self.dup_decl = Some((span, name.to_owned()));
+        }
+    }
+
     fn lower_stmts(&mut self, stmts: &[V2Stmt]) -> Result<()> {
         for stmt in stmts {
             self.lower_stmt(stmt)?;
@@ -5132,6 +5203,7 @@ impl<'a> TreeLowerer<'a> {
         if let Some(split) = self.split_inline_specialization(stmt)? {
             return self.lower_stmt(&split);
         }
+        self.note_decl(stmt);
         match stmt {
             V2Stmt::Let {
                 span,
@@ -5660,16 +5732,22 @@ impl<'a> TreeLowerer<'a> {
                     && !self.has_active_cleanups()
                     && (else_body.is_none() || else_diverges)
                     && body.iter().all(|s| self.cursor_stmt_ok(s, binding));
+                // Only a loop that moves the stack object restores it: a redundant store would
+                // replace the iterator's false result, which the exhaustion block may read
+                // (`gosub_found_action` in raw code).
+                let sim_name = match &self.tree_ctx {
+                    TreeContext::SimOnObject { sim_name } => Some(sim_name.clone()),
+                    TreeContext::ObjectSelf => None,
+                };
                 let restore_on_exhaustion = else_body.is_some()
                     && !self.explicit_stack_obj
                     && (stack_cursor
-                        || matches!(self.tree_ctx, TreeContext::SimOnObject { .. })
                         || stmts_may_clobber_stack_obj(
                             body,
                             self.env,
                             &self.owner_module,
                             self.in_object_scope,
-                            None,
+                            sim_name.as_deref(),
                             0,
                         ));
                 let restore_on_break = restore_on_exhaustion && !else_diverges;
@@ -6204,7 +6282,10 @@ impl<'a> TreeLowerer<'a> {
         {
             return Err(Error::at(
                 span,
-                format!("local slot {n} already holds '{other}', which is still in scope"),
+                format!(
+                    "local slot {n} already holds '{}', which is still in scope",
+                    other.split('#').next().unwrap_or(other)
+                ),
             ));
         }
         if self.checking_discarded == 0 {
@@ -6229,41 +6310,6 @@ impl<'a> TreeLowerer<'a> {
     /// declares stays a local in all of them, and declaring a name an earlier block resolved as
     /// a `const` is an error rather than a silent change of meaning.
     fn resolve_raw_consts(&mut self, code: &str, span: Span) -> Result<String> {
-        const AIR_WORDS: &[&str] = &[
-            "my",
-            "stack",
-            "temp",
-            "param",
-            "local",
-            "global",
-            "stack_obj",
-            "me",
-            "true",
-            "false",
-            "error",
-            "let",
-            "if",
-            "else",
-            "while",
-            "break",
-            "continue",
-            "return",
-            "bcon",
-            "const",
-            "str",
-            "tree",
-            "interaction",
-            "raw",
-            "op",
-            "pad",
-            "scope",
-            "neighbor",
-            "neighborhood",
-            "data",
-            "attr",
-            "person",
-            "motive",
-        ];
         let bytes = code.as_bytes();
         let is_ident_start = |b: u8| b.is_ascii_alphabetic() || b == b'_';
         let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
@@ -6327,7 +6373,8 @@ impl<'a> TreeLowerer<'a> {
             if b == b'-' && bytes.get(i + 1) == Some(&b'>') {
                 in_targets = true;
             }
-            if matches!(b, b';' | b'{' | b'}' | b'\n') {
+            // A target list runs to its `;`, across line breaks.
+            if matches!(b, b';' | b'{' | b'}') {
                 in_targets = false;
             }
             if !is_ident_start(b) || (i > 0 && is_ident(bytes[i - 1])) {
@@ -6347,7 +6394,7 @@ impl<'a> TreeLowerer<'a> {
             let operand_position = !in_targets
                 && !matches!(before, Some(b'.' | b'@'))
                 && !matches!(after, Some(b'[' | b'(' | b':'))
-                && !AIR_WORDS.contains(&word)
+                && !super::air_words::is_air_word(word)
                 && !self.raw_declared.contains(word);
             // `Table.entry` of a tuning table.
             if operand_position && after == Some(b'.') {
@@ -9416,7 +9463,9 @@ impl<'a> TreeLowerer<'a> {
         let read_only = !stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name);
         // A caller local passed by value needs no `__arg_*` copy when nothing can change it
         // while the helper runs: the helper never mutates or borrows the parameter, and no
-        // argument of this call borrows the local (`&mut x`, or a local-writing builtin).
+        // argument of this call borrows the local (`&mut x`, or a local-writing builtin). An
+        // `@slot` local lives in an explicit frame word, which helper raw code can write as
+        // `local[N]`, so it is always copied.
         let elide_local = match arg_expr {
             V2Expr::Ident(_, n)
                 if !matches!(param.ty, V2Type::MutRef(_))
@@ -9427,7 +9476,8 @@ impl<'a> TreeLowerer<'a> {
             {
                 match self.lookup_var(n) {
                     Some(Binding::Local { air_name, .. })
-                        if !call_args.iter().any(|e| {
+                        if !air_name.starts_with("__slot")
+                            && !call_args.iter().any(|e| {
                             matches!(e, V2Expr::Ident(_, name)
                                 if matches!(self.lookup_var(name), Some(Binding::MutRef { target: LValue::Direct { air, .. } }) if air == air_name))
                         }) => Some(air_name.clone()),
@@ -9728,7 +9778,13 @@ impl<'a> TreeLowerer<'a> {
         let Some((module, decl, local, args, span)) = self.direct_helper(expr)? else {
             return Ok(None);
         };
-        if decl.return_type.is_none() {
+        // Into mode stores the result in `dest` at the helper's `return`, before its defers
+        // run, and an `@slot` word is visible to raw code by number: either could observe the
+        // early store, so those keep the general path (store after the helper finishes).
+        if decl.return_type.is_none()
+            || dest.starts_with("__slot")
+            || super::specialize::stmts_any(&decl.body, &|s| matches!(s, V2Stmt::Defer { .. }))
+        {
             return Ok(None);
         }
         Ok(self
@@ -10029,6 +10085,9 @@ impl<'a> TreeLowerer<'a> {
 
         // Register `fqn` on `inline_call_stack` BEFORE evaluating omitted default expressions
         // so recursive default parameters (e.g. `fn f(x: i16 = f())`) trigger cycle/depth detection.
+        self.inline_epochs.truncate(self.inline_call_stack.len());
+        self.inline_epoch_seq += 1;
+        self.inline_epochs.push(self.inline_epoch_seq);
         self.inline_call_stack.push(fqn);
 
         // Evaluate omitted defaulted parameters hygienically in the callee's module/object scope
@@ -12541,7 +12600,10 @@ impl<'a> TreeLowerer<'a> {
                         field != "sprite_flags"
                             && matches!(
                                 root.as_ref(),
-                                V2Expr::Ident(_, rname) if self.is_self_ident(rname)
+                                // In a Sim tree that moves the cursor, `self.f[i]` switches to
+                                // the entry object first, like the named fields above.
+                                V2Expr::Ident(_, rname) if (self.is_self_ident(rname)
+                                        && self.self_stack_target() == "stack_obj")
                                     || self.is_sim_ident(rname)
                                     || self.is_frame_me(rname)
                                     || rname == "stack_obj"
@@ -15355,10 +15417,14 @@ fn stmts_have_return(stmts: &[V2Stmt]) -> bool {
 /// inside one of the helper's own loops, including the loop for animation events.
 fn stmts_return_through_loop(stmts: &[V2Stmt]) -> bool {
     stmts.iter().any(|stmt| match stmt {
-        V2Stmt::Repeat { body, .. }
-        | V2Stmt::While { body, .. }
-        | V2Stmt::ForEach { body, .. }
-        | V2Stmt::Animate { body, .. } => stmts_have_return(body),
+        V2Stmt::Repeat { body, .. } | V2Stmt::While { body, .. } | V2Stmt::Animate { body, .. } => {
+            stmts_have_return(body)
+        }
+        // The exhaustion block is lowered inside the iterator's loop, so a return there leaves
+        // a loop too.
+        V2Stmt::ForEach {
+            body, else_body, ..
+        } => stmts_have_return(body) || else_body.as_deref().is_some_and(stmts_have_return),
         V2Stmt::If {
             then_body,
             else_body,

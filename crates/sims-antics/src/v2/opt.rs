@@ -69,9 +69,12 @@ pub(crate) fn drop_unread_entry_save(body: &str) -> Option<String> {
     // local would move the frame words of the named locals after it, which a raw op or a
     // `scope(25, N)` cell may name by number. (`.air` places named locals after every explicit
     // `local[N]`, so those keep their words.)
+    // A tree that formats text reads frame words by number (`$Local:N`), so it sees the shift.
     if body.contains("/*")
         || has_positional_targets(body)
-        || body.lines().any(|l| names_local_slot(&strip_strings(l)))
+        || body
+            .lines()
+            .any(|l| names_local_slot(&strip_strings(l)) || formats_text(l))
     {
         return None;
     }
@@ -93,10 +96,9 @@ pub(crate) fn drop_unread_entry_save(body: &str) -> Option<String> {
     // Every named local after the save moves down one frame word, which keeps whatever an
     // earlier frame left there: none may be read before it is written. The flow analysis runs on
     // the body with one statement per line, so raw blocks written on one line parse too. A body
-    // it still cannot parse (a raw node graph with labels) is checked statement by statement:
-    // a local the lowering declares without a value (`let x;`) must not be read anywhere, while
-    // `let x = e;` writes it where it comes into scope. A raw `local x;` declaration, which
-    // neither check models, keeps the save.
+    // it still cannot parse (a raw node graph with labels, whose jumps it does not model) keeps
+    // the save unless it has no other named local to move, as does a raw `local x;`
+    // declaration.
     let split = one_statement_per_line(body);
     let statements: Vec<&str> = split.lines().map(str::trim).collect();
     if statements.iter().any(|stmt| {
@@ -105,27 +107,17 @@ pub(crate) fn drop_unread_entry_save(body: &str) -> Option<String> {
     }) {
         return None;
     }
+    let moves_a_local = statements
+        .iter()
+        .filter(|stmt| {
+            stmt.strip_prefix("let")
+                .is_some_and(|r| r.starts_with(char::is_whitespace))
+        })
+        .count()
+        > 1;
     let defined = match parse_body(&split) {
         Some(nodes) => locals_defined_before_reads(&nodes),
-        None => statements.iter().all(|stmt| {
-            let Kind::Let { name, init: None } = classify(stmt) else {
-                return true;
-            };
-            statements.iter().all(|other| {
-                let other = other.strip_suffix(';').unwrap_or(other);
-                match classify(other) {
-                    Kind::Let { name: n, .. } if n == name => true,
-                    Kind::Assign { lhs, op: ":=", rhs } if lhs == name => {
-                        !idents(rhs).contains(&name)
-                    }
-                    _ => {
-                        let other = other.trim_start_matches(['!', ' ']);
-                        let rest = out_operand_write(other, name).map(|(rest, _)| rest);
-                        !idents(rest.as_deref().unwrap_or(other)).contains(&name)
-                    }
-                }
-            })
-        }),
+        None => !moves_a_local,
     };
     if !defined {
         return None;
@@ -142,13 +134,25 @@ pub(crate) fn drop_unread_entry_save(body: &str) -> Option<String> {
 
 /// Whether a node graph names a branch target by position (`-> true: 3`, `raw(1)`), which
 /// deleting a node would shift. Labels and `true` / `false` / `error` do not move.
+///
+/// A target list runs from `->` to its `;`, which may be on a later line.
 fn has_positional_targets(body: &str) -> bool {
-    body.lines().any(|l| {
-        let stripped = strip_strings(l);
-        let Some((_, targets)) = stripped.split_once("->") else {
+    let code: String = body
+        .lines()
+        .map(|l| {
+            let stripped = strip_strings(l);
+            match stripped.find("//") {
+                Some(at) => stripped[..at].to_owned(),
+                None => stripped,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    code.split([';', '{', '}']).any(|stmt| {
+        let Some((_, targets)) = stmt.split_once("->") else {
             return false;
         };
-        targets.split([',', ';']).any(|t| {
+        targets.split(',').any(|t| {
             let target = t.split_once(':').map_or(t, |(_, v)| v).trim();
             target.starts_with("raw") || target.starts_with(|c: char| c.is_ascii_digit())
         })
@@ -277,7 +281,7 @@ pub(crate) fn pin_in_place(body: &str) -> String {
 /// block declares under its own name keep `.air`'s placement (after every explicit slot), as do
 /// all unpinned locals of a tree with raw `op` bytes, whose operands no scan can read. A body
 /// `.air` cannot parse is left alone: compiling it reports the error.
-pub(crate) fn assign_frame_slots(body: &str) -> String {
+pub(crate) fn assign_frame_slots(body: &str, raw_declared: &BTreeSet<String>) -> String {
     let wrapped = format!("tree 4096 \"__slots\" {{\n{body}\n}}\n");
     let Some(usage) =
         crate::parser::parse_module(&wrapped)
@@ -304,7 +308,7 @@ pub(crate) fn assign_frame_slots(body: &str) -> String {
     }
     if !usage.has_raw_ops {
         for name in &usage.lets {
-            if name.starts_with("__") && !slots.contains_key(name) {
+            if name.starts_with("__") && !slots.contains_key(name) && !raw_declared.contains(name) {
                 let k = (0..).find(|k| !used.contains(k)).expect("a free slot");
                 used.insert(k);
                 slots.insert(name.clone(), k);
@@ -383,8 +387,20 @@ fn place_locals_in_line(line: &str, slots: &BTreeMap<String, usize>) -> String {
                 }
             }
         }
+        // Not a field (`x.y`) or a label (`@x:`, bare `x:`, `-> true: @x`). A local followed
+        // by `:` can only be a label (`x := ..` is an assignment).
+        let after = skip_spaces(end);
+        let label_def = bytes.get(after) == Some(&b':') && bytes.get(after + 1) != Some(&b'=');
         match slots.get(word) {
-            Some(k) if !(i > 0 && bytes[i - 1] == b'.') => out.push_str(&format!("local[{k}]")),
+            Some(k)
+                if !label_def
+                    && !matches!(
+                        bytes[..i].iter().rev().find(|c| !matches!(c, b' ' | b'\t')),
+                        Some(b'.' | b'@')
+                    ) =>
+            {
+                out.push_str(&format!("local[{k}]"));
+            }
             _ => out.push_str(word),
         }
         i = end;
@@ -496,13 +512,13 @@ fn flow_defined(nodes: &[Node], name: &str, defined: &mut bool, breaks: &mut Opt
                     *defined = true;
                 }
                 _ => match out_operand_write(l, name) {
-                    // A bare primitive's false exit leaves the tree, so the next line runs on
-                    // its true exit.
+                    // Both exits of a bare statement reach the next line, so it defines the
+                    // cell only when every exit writes it.
                     Some((rest, exit)) => {
                         if !*defined && reads(&rest) {
                             return false;
                         }
-                        *defined |= exit != WriteExit::False;
+                        *defined |= exit == WriteExit::Both;
                     }
                     None => {
                         if !*defined && reads(l) {
@@ -607,7 +623,8 @@ enum WriteExit {
 /// - `random(x, n)` stores the draw, then takes the true exit;
 /// - `animate(.., local: x)` stores an event in the local, then takes the false exit;
 /// - `relationship(.., value: x)` without flag 4 reads the number into the cell and takes the
-///   true exit (flag 1 takes the false exit, unwritten, when the number is missing).
+///   true exit; with flag 1 a missing number takes the false exit unwritten, and without it
+///   the row is added, so the false exit never runs.
 fn out_operand_write(text: &str, name: &str) -> Option<(String, WriteExit)> {
     let t = text.trim();
     let t = t.strip_suffix(';').unwrap_or(t).trim_end();
@@ -640,7 +657,14 @@ fn out_operand_write(text: &str, name: &str) -> Option<(String, WriteExit)> {
                 Some(f) => parse_int(value_of(f))?,
                 None => 0,
             };
-            (value_of(i) == name && flags & 4 == 0).then_some((i, WriteExit::True))?
+            // Without flag 1 a missing row is added, so the read always writes the cell and
+            // takes the true exit: the false exit never runs.
+            let exit = if flags & 1 == 0 {
+                WriteExit::Both
+            } else {
+                WriteExit::True
+            };
+            (value_of(i) == name && flags & 4 == 0).then_some((i, exit))?
         }
         _ => return None,
     };
@@ -1563,7 +1587,10 @@ fn drop_unread_entry_save_node(nodes: &mut Vec<Node>) {
     let Some(name) = entry_save(nodes) else {
         return;
     };
-    if !mentions(&nodes[1..], name) && locals_defined_before_reads(&nodes[1..]) {
+    if !mentions(&nodes[1..], name)
+        && !nodes_format_text(&nodes[1..])
+        && locals_defined_before_reads(&nodes[1..])
+    {
         nodes.remove(0);
     }
 }
@@ -2032,6 +2059,11 @@ fn merge_duplicate_tails(nodes: &mut Vec<Node>) {
 // ---------------------------------------------------------------------------
 // Liveness and coalescing
 // ---------------------------------------------------------------------------
+
+/// Whether a tree body runs a primitive that formats text (see [`formats_text`]).
+pub(crate) fn body_formats_text(body: &str) -> bool {
+    body.lines().any(formats_text)
+}
 
 /// Whether `text` runs a primitive that formats text (Dialog, Action String), which reads frame
 /// locals by number through `$Local:N`, `$TimeLocal:N` and similar tokens.

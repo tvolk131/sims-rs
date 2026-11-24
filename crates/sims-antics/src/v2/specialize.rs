@@ -185,6 +185,12 @@ fn check_arms(binding: &ConstBinding, names: &[String]) -> Result<()> {
                     ));
                 }
                 for v in values {
+                    if matches!(v, V2Expr::Ident(_, n) if n == "stack_obj") {
+                        return Err(Error::at(
+                            v.span(),
+                            "a const binding cannot yield 'stack_obj', which primitives change; copy it into a local first",
+                        ));
+                    }
                     if !is_const_operand(v) {
                         return Err(Error::at(
                             v.span(),
@@ -237,14 +243,14 @@ fn is_const_operand(e: &V2Expr) -> bool {
     }
 }
 
-/// The names an arm yields.
-fn yielded_idents(binding: &ConstBinding) -> Vec<String> {
+/// The names an arm yields, with their spans.
+pub(crate) fn yielded_idents_at(binding: &ConstBinding) -> Vec<(Span, String)> {
     let mut out = Vec::new();
     let mut add = |arm: &Arm| {
         if let Arm::Values(_, values) = arm {
             for v in values {
-                if let V2Expr::Ident(_, n) = v {
-                    out.push(n.clone());
+                if let V2Expr::Ident(span, n) = v {
+                    out.push((*span, n.clone()));
                 }
             }
         }
@@ -307,6 +313,12 @@ fn check_region(region: &[V2Stmt], binding: &ConstBinding, names: &[String]) -> 
             ));
         }
     }
+    if let Some(span) = find_raw_label(region) {
+        return Err(Error::at(
+            span,
+            "a 'raw { }' block that defines a label cannot be in a const binding's region (each arm would define it again)",
+        ));
+    }
     for n in names {
         if let Some(span) = find_binding_of(region, n) {
             return Err(Error::at(
@@ -316,6 +328,12 @@ fn check_region(region: &[V2Stmt], binding: &ConstBinding, names: &[String]) -> 
                 ),
             ));
         }
+        if let Some(span) = find_write_through(region, n) {
+            return Err(Error::at(
+                span,
+                format!("'{n}' is bound by a const binding, so it cannot be assigned or borrowed"),
+            ));
+        }
         if let Some(span) = find_raw_mention(region, n) {
             return Err(Error::at(
                 span,
@@ -323,7 +341,7 @@ fn check_region(region: &[V2Stmt], binding: &ConstBinding, names: &[String]) -> 
             ));
         }
     }
-    for n in yielded_idents(binding) {
+    for (_, n) in yielded_idents_at(binding) {
         if let Some(span) = find_write(region, &n) {
             return Err(Error::at(
                 span,
@@ -414,6 +432,13 @@ pub(super) fn stmt_bodies(s: &V2Stmt) -> Vec<&[V2Stmt]> {
         V2Stmt::Match { arms, .. } => arms.iter().map(|a| a.body.as_slice()).collect(),
         _ => vec![],
     }
+}
+
+/// Whether `pred` holds for any statement of `stmts`, nested bodies included.
+pub(super) fn stmts_any(stmts: &[V2Stmt], pred: &dyn Fn(&V2Stmt) -> bool) -> bool {
+    stmts
+        .iter()
+        .any(|s| pred(s) || stmt_bodies(s).into_iter().any(|b| stmts_any(b, pred)))
 }
 
 fn stmt_mentions(s: &V2Stmt, name: &str) -> bool {
@@ -630,6 +655,76 @@ fn find_write(stmts: &[V2Stmt], name: &str) -> Option<Span> {
         }
     }
     None
+}
+
+/// A statement that assigns the bound name `name` itself (`X = v`, `X += v`) or borrows it
+/// (`&mut X`): substitution would turn it into a write of the yielded operand.
+fn find_write_through(stmts: &[V2Stmt], name: &str) -> Option<Span> {
+    for s in stmts {
+        let assigns = matches!(s, V2Stmt::Assign { target: V2Expr::Ident(_, n), .. } if n == name);
+        let mut borrows = false;
+        for e in stmt_exprs(s) {
+            visit_expr(e, &mut |x| {
+                if matches!(x, V2Expr::MutRef { inner, .. } if matches!(inner.as_ref(), V2Expr::Ident(_, n) if n == name))
+                {
+                    borrows = true;
+                }
+            });
+        }
+        if assigns || borrows {
+            return Some(stmt_span(s));
+        }
+        for b in stmt_bodies(s) {
+            if let Some(span) = find_write_through(b, name) {
+                return Some(span);
+            }
+        }
+    }
+    None
+}
+
+/// A `raw { }` block in `stmts` that defines a label (`@name:`): each copy of the region would
+/// define it again.
+fn find_raw_label(stmts: &[V2Stmt]) -> Option<Span> {
+    for s in stmts {
+        if let V2Stmt::RawAir { span, code } = s
+            && raw_defines_label(code)
+        {
+            return Some(*span);
+        }
+        for b in stmt_bodies(s) {
+            if let Some(span) = find_raw_label(b) {
+                return Some(span);
+            }
+        }
+    }
+    None
+}
+
+/// Whether `.air` code defines a label (`@name:` or bare `name:`). Code that does not parse is
+/// assumed to.
+fn raw_defines_label(code: &str) -> bool {
+    use crate::ast::Stmt;
+    fn any_label(stmts: &[Stmt]) -> bool {
+        stmts.iter().any(|s| match s {
+            Stmt::Label { .. } => true,
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => any_label(then_body) || any_label(else_body),
+            Stmt::While { body, .. } | Stmt::Loop { body, .. } => any_label(body),
+            _ => false,
+        })
+    }
+    let wrapped = format!("tree 4096 \"__label_check\" {{\n{code}\n}}\n");
+    match crate::parser::parse_module(&wrapped)
+        .ok()
+        .and_then(|m| m.items.into_iter().next())
+    {
+        Some(crate::ast::Item::Tree(t)) => any_label(&t.body),
+        _ => true,
+    }
 }
 
 fn args_bare(args: &[CallArg], name: &str) -> bool {

@@ -561,7 +561,7 @@ fn specialize_rejects_unsound_bindings() {
         (
             "written.antics",
             "let v = 1; const X = match k { 1 => v, _ => 3 }; v = 9; self.n = X;",
-            "may change",
+            "'v' is a variable",
         ),
         (
             "defer.antics",
@@ -782,8 +782,9 @@ fn slot_lets_share_words_with_raw_and_text() {
         "local[5] := my.data[9];",
         "my.data[9] := local[5];",
         "temp[0] := local[5];",
-        "local[0] := 1;",
-        "temp[1] := local[0];",
+        // A local a raw block declares keeps `.air`'s placement, even under a `__` name.
+        "__w := 1;",
+        "temp[1] := __w;",
     ] {
         assert!(u.contains(want), "missing `{want}` in:\n{u}");
     }
