@@ -8256,7 +8256,9 @@ object "Stack Cases" {
         .expect("expand stack cases");
     let air = &expanded[0].air_source;
     for tree in [
-        "\"Raw Step\" {\n    let __self_obj = stack_obj;",
+        // Nothing reads the save after the raw step (a raw block leaves `stack_obj` where it
+        // put it), so it is dropped.
+        "\"Raw Step\" {\n    if stack_obj inc_lt 3 { }\n    stack.attr[0] := 1;",
         // The user's own `stack_obj` write stands; the self save is unread and dropped.
         "\"Borrow\" {\n    stack_obj := 0;\n    stack.attr[0] := 2;",
     ] {
