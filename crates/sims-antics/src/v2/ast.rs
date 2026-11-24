@@ -145,7 +145,7 @@ pub struct TreeMemberDecl {
     pub params: Vec<AbiParam>,
     pub ret: ReturnAbi,
     pub body: Vec<V2Stmt>,
-    /// `@frame(args: N, locals: M, format: F, revision: R)` header pins (all optional).
+    /// `@frame(args: N, locals: M, format: F, revision: R, kind: K)` header pins (all optional).
     pub frame: Option<TreeFrame>,
 }
 
@@ -157,6 +157,8 @@ pub struct TreeFrame {
     pub locals: Option<u16>,
     pub format: Option<u16>,
     pub revision: Option<u32>,
+    /// The header's kind byte (`.air` `kind:`).
+    pub kind: Option<u8>,
 }
 
 /// Zero-cost integer enum declaration (`[pub] enum Name { VariantA, VariantB = 2 }`).
@@ -714,6 +716,9 @@ pub enum MatchPattern {
     Path(Span, Vec<String>),
     /// `lo..hi` / `lo..=hi` on an `i16` scrutinee (stored inclusive: `lo..=hi`).
     Range(Span, i16, i16),
+    /// `A | B | ..`: matches when any alternative does. Flat (no nested `Or`), at least two
+    /// alternatives, none of them `_` or an identifier.
+    Or(Span, Vec<MatchPattern>),
 }
 
 /// Built-in loop iteration sources for `for obj in ...`.
@@ -811,6 +816,13 @@ pub enum V2Expr {
         scrutinee: Box<V2Expr>,
         arms: Vec<MatchExprArm>,
     },
+    /// Expression `if c { a } else { b }` (`else if` nests another `If` as `else_value`).
+    If {
+        span: Span,
+        cond: Box<V2Expr>,
+        then_value: Box<V2Expr>,
+        else_value: Box<V2Expr>,
+    },
 }
 
 impl V2Expr {
@@ -832,7 +844,8 @@ impl V2Expr {
             | Self::Call { span: s, .. }
             | Self::MethodCall { span: s, .. }
             | Self::Try { span: s, .. }
-            | Self::Match { span: s, .. } => *s,
+            | Self::Match { span: s, .. }
+            | Self::If { span: s, .. } => *s,
         }
     }
 }

@@ -7629,8 +7629,9 @@ fn readability_loops_ranges_consts_fields_and_builtins_run_live() {
         "my.attr[6] := 9;",
         "__v_d_18 -= 3;\n    if __v_d_18 > 0 {\n        my.attr[7] := 1;",
         "if !test_object_type(0x7f400999, object: my.id) {",
-        "while set_to_next(person, dest: __v_p_28) {",
-        "while set_to_next(all, dest: __v_o_29) {",
+        // Loop bodies that cannot read the stack object step `stack_obj` itself.
+        "stack_obj := 0;\n    while set_to_next(person, dest: stack_obj) {",
+        "stack_obj := 0;\n    while set_to_next(all, dest: stack_obj) {",
         "my.data[8] flag_set 14;",
         "random(my.attr[14], 1);",
         "stack.attr[10] := my.person[58];",
@@ -7946,7 +7947,7 @@ fn readability_negative_diagnostics() {
     expect_err(
         "builtin_local.antics",
         &sim_tree("push_interaction(menu: 1, icon: self.n);"),
-        "push_interaction(icon:) must name an i16 local variable",
+        "push_interaction(icon:) must name an i16 local, an object-handle local",
     );
     expect_err(
         "animate_local.antics",
@@ -8667,7 +8668,8 @@ fn pr_e_zero_raw_gaps_run_live() {
         "stack_obj := __v_p_0;\n        stack.person[40] := 7;",
         "temp[0] := 2;\n    let __fdata_1 = scope(27, 0);\n    temp[0] := 3;\n    let __arith_2 = scope(27, 0);",
         "temp[0] := 2;\n    scope(27, 0) := 1;",
-        "local[0] := __v_target_",
+        // The pinned handle lives in `local[0]` itself.
+        "local[0] := stack_obj;\n    stack_obj := my.id;",
         "push_interaction(menu: 0, object: 0, priority: 2, flags: 2);",
         "while stack.attr[5] inc_lt 4 {",
         "param[0] += 5;",
@@ -8991,9 +8993,20 @@ object "Pr E Review" {
     assert!(tree("One Arm").contains("= my.person[12];"), "{air}");
     // The reference keeps the index the call saw; the helper's `*i = 0` does not move it.
     let sprite = tree("Sprite Ref");
-    assert!(sprite.contains("__ref_idx_flag"), "{sprite}");
-    assert!(sprite.contains("temp[0] := __ref_idx_flag"), "{sprite}");
-    assert!(tree("Pinned").contains("local[0] := __v_o_0;"), "{air}");
+    let select = sprite
+        .lines()
+        .find(|l| l.trim_start().starts_with("temp[0] := "))
+        .unwrap_or_else(|| panic!("{sprite}"));
+    assert!(
+        select.contains("__ref_") && !select.contains("__v_i_"),
+        "{sprite}"
+    );
+    assert!(
+        sprite.find("= stack.attr[1];").expect("snapshot")
+            < sprite.find("__v_i_0 := 0;").expect("helper write"),
+        "the index snapshot is taken before the helper runs:\n{sprite}"
+    );
+    assert!(tree("Pinned").contains("local[0] := stack_obj;"), "{air}");
     // `param[3]` is inside a functional's frame, and its header declares the four words.
     assert!(air.contains("param[3]"), "{air}");
     assert!(air.contains("(args: 4)"), "{air}");

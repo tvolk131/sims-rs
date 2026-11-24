@@ -963,7 +963,8 @@ impl Parser {
             ..TreeFrame::default()
         };
         while !self.eat(&TokenKind::RParen) {
-            let (key, kspan) = self.expect_ident("'args', 'locals', 'format', or 'revision'")?;
+            let (key, kspan) =
+                self.expect_ident("'args', 'locals', 'format', 'revision', or 'kind'")?;
             self.expect(&TokenKind::Colon, "':'")?;
             let dup = match key.as_str() {
                 "args" => frame
@@ -984,11 +985,17 @@ impl Parser {
                     .revision
                     .replace(self.expect_u32("BHAV revision")?)
                     .is_some(),
+                "kind" => frame
+                    .kind
+                    .replace(u8::try_from(self.expect_u16("BHAV kind")?).map_err(|_| {
+                        Error::at(kspan, "@frame kind must fit in a byte (0..=255)")
+                    })?)
+                    .is_some(),
                 other => {
                     return Err(Error::at(
                         kspan,
                         format!(
-                            "unknown @frame field '{other}' (expected args, locals, format, or revision)"
+                            "unknown @frame field '{other}' (expected args, locals, format, revision, or kind)"
                         ),
                     ));
                 }
@@ -3053,7 +3060,89 @@ impl Parser {
         })
     }
 
+    /// Expression `if c { a } else { b }` (the `if` keyword is already consumed). Like a
+    /// `match` level, it counts twice against the nesting budget.
+    fn parse_if_expr(&mut self, span: Span) -> Result<V2Expr> {
+        self.enter_nesting(span)?;
+        if let Err(e) = self.enter_nesting(span) {
+            self.leave_nesting();
+            return Err(e);
+        }
+        let res = (|| {
+            let cond = self.parse_expr()?;
+            let then_value = self.parse_if_expr_branch()?;
+            if !self.eat_ident("else") {
+                return Err(Error::at(
+                    span,
+                    "an 'if' expression needs an 'else' branch (every path yields a value)",
+                ));
+            }
+            let else_value = if self.is_ident("if") {
+                let elif_span = self.bump().span;
+                self.parse_if_expr(elif_span)?
+            } else {
+                self.parse_if_expr_branch()?
+            };
+            Ok(V2Expr::If {
+                span,
+                cond: Box::new(cond),
+                then_value: Box::new(then_value),
+                else_value: Box::new(else_value),
+            })
+        })();
+        self.leave_nesting();
+        self.leave_nesting();
+        res
+    }
+
+    /// `{ value }`: one branch of an `if` expression.
+    fn parse_if_expr_branch(&mut self) -> Result<V2Expr> {
+        self.expect(&TokenKind::LBrace, "'{'")?;
+        let value = self.parse_expr()?;
+        if self.peek().kind != TokenKind::RBrace {
+            return Err(Error::at(
+                self.span(),
+                "an 'if' expression branch is one value ('{ expr }'), not a block of statements",
+            ));
+        }
+        self.bump();
+        Ok(value)
+    }
+
+    /// A match pattern, with `A | B | ..` alternatives.
     fn parse_match_pattern(&mut self) -> Result<MatchPattern> {
+        let span = self.span();
+        let first = self.parse_single_match_pattern()?;
+        if self.peek().kind != TokenKind::Pipe {
+            return Ok(first);
+        }
+        let mut alts = vec![first];
+        while self.eat(&TokenKind::Pipe) {
+            alts.push(self.parse_single_match_pattern()?);
+        }
+        for alt in &alts {
+            match alt {
+                MatchPattern::Wildcard(s) => {
+                    return Err(Error::at(
+                        *s,
+                        "'_' cannot be an alternative of an OR-pattern (it would match everything)",
+                    ));
+                }
+                MatchPattern::Ident(s, name) => {
+                    return Err(Error::at(
+                        *s,
+                        format!(
+                            "'{name}' cannot be an alternative of an OR-pattern: alternatives are values, ranges, or 'Enum::Variant' paths"
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(MatchPattern::Or(span, alts))
+    }
+
+    fn parse_single_match_pattern(&mut self) -> Result<MatchPattern> {
         let span = self.span();
         match &self.peek().kind {
             TokenKind::Ident(s) if s == "_" => {
@@ -3561,6 +3650,7 @@ impl Parser {
                     "true" => Ok(V2Expr::Bool(tok.span, true)),
                     "false" => Ok(V2Expr::Bool(tok.span, false)),
                     "match" => self.parse_match_expr(tok.span),
+                    "if" => self.parse_if_expr(tok.span),
                     _ => {
                         if self.peek().kind == TokenKind::ColonColon
                             && self.peek_at(1).kind != TokenKind::Lt
