@@ -841,6 +841,32 @@ struct PathState {
     at: Option<FaultPoint>,
 }
 
+impl PathState {
+    /// A copy for one side of a split. Unlike `clone`, it leaves room for the next few
+    /// conditions and nodes, so the push that follows does not copy them again.
+    fn fork(&self) -> Self {
+        let mut cond = Vec::with_capacity(self.cond.len() + 8);
+        cond.extend_from_slice(&self.cond);
+        let mut nodes = Vec::with_capacity(self.nodes.len() + 16);
+        nodes.extend_from_slice(&self.nodes);
+        Self {
+            pc: self.pc,
+            prefix: self.prefix,
+            epoch: self.epoch,
+            params: self.params.clone(),
+            locals: self.locals.clone(),
+            store: self.store.clone(),
+            scratch: self.scratch,
+            last_result: self.last_result,
+            unwritten: self.unwritten.clone(),
+            cond,
+            steps: self.steps,
+            nodes,
+            at: self.at.clone(),
+        }
+    }
+}
+
 /// Where an `Expression` operand lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Loc {
@@ -1015,8 +1041,44 @@ impl<'a> Explorer<'a> {
         Ok((done, steps))
     }
 
-    fn finish(&self, state: PathState, exit: Exit, interner: &mut Interner) -> Step {
-        let store = self.normalized_store(&state, interner);
+    fn finish(&self, mut state: PathState, exit: Exit, interner: &mut Interner) -> Step {
+        let cond = std::mem::take(&mut state.cond);
+        let nodes = std::mem::take(&mut state.nodes);
+        let at = state.at.take();
+        Step::Done(self.summarize(&state, at, cond, nodes, exit, interner))
+    }
+
+    /// Finishes a copy of `state` that also assumes `literal`, without copying the
+    /// state: a faulting branch off a path that goes on. `event`, when given, is the
+    /// event the fault point records.
+    fn finish_branch(
+        &self,
+        state: &PathState,
+        literal: (Atom, bool),
+        event: Option<u32>,
+        exit: Exit,
+        interner: &mut Interner,
+    ) -> Step {
+        let mut cond = Vec::with_capacity(state.cond.len() + 1);
+        cond.extend_from_slice(&state.cond);
+        cond.push(literal);
+        let mut at = state.at.clone();
+        if let (Some(at), Some(event)) = (at.as_mut(), event) {
+            at.event = Some(event);
+        }
+        Step::Done(self.summarize(state, at, cond, state.nodes.clone(), exit, interner))
+    }
+
+    fn summarize(
+        &self,
+        state: &PathState,
+        at: Option<FaultPoint>,
+        cond: Vec<(Atom, bool)>,
+        nodes: Vec<u8>,
+        exit: Exit,
+        interner: &mut Interner,
+    ) -> PathSummary {
+        let store = self.normalized_store(state, interner);
         let faults = !matches!(exit, Exit::True | Exit::False);
         // A fault leaves the faulting frame on the stack and the thread's last result
         // in the object (`interpreter.rs:809`), so a faulting path compares the whole
@@ -1027,10 +1089,7 @@ impl<'a> Explorer<'a> {
             }
             // An entry past the last node faults before any node runs; it is never
             // compared (`check_bhav_live_equivalent`).
-            state
-                .at
-                .clone()
-                .unwrap_or_else(|| self.fault_point(&state, u8::MAX, None, interner))
+            at.unwrap_or_else(|| self.fault_point(state, u8::MAX, None, interner))
         });
         // The behavioral relation does not observe node numbers: a jump to a missing
         // node is the same fault whatever its target and the tree's length.
@@ -1047,7 +1106,7 @@ impl<'a> Explorer<'a> {
                 )
             });
         let last_result = (self.opts.observe_last_result || faults).then_some(state.last_result);
-        Step::Done(PathSummary {
+        PathSummary {
             out: Outputs {
                 exit,
                 fault,
@@ -1058,10 +1117,10 @@ impl<'a> Explorer<'a> {
                 last_result,
                 residue,
             },
-            cond: state.cond,
-            nodes: state.nodes,
+            cond,
+            nodes,
             entry: self.entry,
-        })
+        }
     }
 
     /// The tracked cells that differ from their value at the start of the epoch.
@@ -1261,12 +1320,13 @@ impl<'a> Explorer<'a> {
         interner: &mut Interner,
     ) {
         let faults = interner.prefix(PrefixNode::Fault(prefix));
-        let mut faulted = state.clone();
-        faulted.cond.push((Atom::Outcome(faults), true));
-        if let Some(at) = faulted.at.as_mut() {
-            at.event = Some(prefix);
-        }
-        out.push(self.finish(faulted, Exit::OperandFault, interner));
+        out.push(self.finish_branch(
+            state,
+            (Atom::Outcome(faults), true),
+            Some(prefix),
+            Exit::OperandFault,
+            interner,
+        ));
         state.cond.push((Atom::Outcome(faults), false));
     }
 
@@ -1341,9 +1401,13 @@ impl<'a> Explorer<'a> {
             }
             Some(_) => Some(state),
             None => {
-                let mut trapped = state.clone();
-                trapped.cond.push((atom, trap_when));
-                out.push(self.finish(trapped, Exit::Trap(code), interner));
+                out.push(self.finish_branch(
+                    &state,
+                    (atom, trap_when),
+                    None,
+                    Exit::Trap(code),
+                    interner,
+                ));
                 state.cond.push((atom, !trap_when));
                 Some(state)
             }
@@ -1370,7 +1434,7 @@ impl<'a> Explorer<'a> {
         match decide(&state.cond, atom) {
             Some(value) => out.push(go(state, value)),
             None => {
-                let mut t = state.clone();
+                let mut t = state.fork();
                 t.cond.push((atom, true));
                 out.push(go(t, true));
                 let mut f = state;
@@ -1484,8 +1548,8 @@ impl<'a> Explorer<'a> {
             // that leaves it in another state. So it is whatever the write event left
             // (`havoc_shared`), not `Scratch::Expression`.
             if matches!(op, 11 | 17) {
-                for value in [true, false] {
-                    let mut s = state.clone();
+                let taken = state.fork();
+                for (value, mut s) in [(true, taken), (false, state)] {
                     s.prefix = interner.prefix(PrefixNode::Branch(prefix, value));
                     s.cond.push((Atom::Outcome(prefix), value));
                     Self::havoc_shared(&mut s);
@@ -1768,9 +1832,13 @@ impl<'a> Explorer<'a> {
         // the same history, and their faults are equal only from the same state at the
         // same node ([`FaultPoint`]).
         let faults = interner.prefix(PrefixNode::Fault(prefix));
-        let mut faulted = state.clone();
-        faulted.cond.push((Atom::Outcome(faults), true));
-        out.push(self.finish(faulted, Exit::PrimitiveFault, interner));
+        out.push(self.finish_branch(
+            &state,
+            (Atom::Outcome(faults), true),
+            None,
+            Exit::PrimitiveFault,
+            interner,
+        ));
         state.cond.push((Atom::Outcome(faults), false));
 
         // Random never takes its false branch: it succeeds or faults (`random.rs`).
@@ -1780,8 +1848,14 @@ impl<'a> Explorer<'a> {
             } else {
                 vec![(Some(true), ins.on_true), (Some(false), ins.on_false)]
             };
-        for (outcome, target) in outcomes {
-            let mut s = state.clone();
+        let last = outcomes.len() - 1;
+        let mut state = Some(state);
+        for (i, (outcome, target)) in outcomes.into_iter().enumerate() {
+            // The last outcome takes the state itself; the others take a fork.
+            let mut s = match (i == last, &state) {
+                (false, Some(state)) => state.fork(),
+                _ => state.take().expect("one state per outcome"),
+            };
             if let Some(value) = outcome {
                 s.prefix = interner.prefix(PrefixNode::Branch(prefix, value));
                 s.cond.push((Atom::Outcome(prefix), value));

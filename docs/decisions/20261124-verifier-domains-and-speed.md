@@ -62,11 +62,13 @@ so equivalence on every region is equivalence on the domain.
 **Callers in the same file.** A whole-file run checks the assumption where it can:
 
 - a call with literal arguments to a constrained tree is **discharged** when every
-  constrained argument is inside the domain, and **violates** it otherwise. A violation
-  makes the callee's verdict, and every verdict that depends on it, inconclusive;
-- a call that passes temps (`call(temps)`), or whose arguments spill past the node, is
-  **not discharged**. It is listed by tree and node, and the assumption stands there as a
-  stated boundary, like any external caller's.
+  constrained argument is inside the domain, and **violates** it otherwise. That holds
+  for arguments in the node and for arguments that spill into the nodes after it. A
+  violation makes the callee's verdict, and every verdict that depends on it,
+  inconclusive;
+- a call that passes temps (`call(temps)`), or whose arguments run past the end of the
+  tree, is **not discharged**. It is listed by tree and node, and the assumption stands
+  there as a stated boundary, like any external caller's.
 
 The checker does not track values into another tree's temps, so it does not prove those
 calls respect the domain.

@@ -506,9 +506,11 @@ fn inline_call_words(
     }
     Some(
         bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .take(arity)
-            .map(|w| i16::from_le_bytes([w[0], w[1]]))
+            .map(|&w| i16::from_le_bytes(w))
             .collect(),
     )
 }

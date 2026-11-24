@@ -241,7 +241,9 @@ fn dialog_kind_bit_7_is_spelled_in_kind() {
             panic!("structured lift failed");
         };
         assert!(text.contains("dialog(kind: 133,"), "{text}");
-        let rebuilt = &compile_antics(&text).expect("structured compiles").behaviors[&4096];
+        let rebuilt = &compile_antics(&text)
+            .expect("structured compiles")
+            .behaviors[&4096];
         assert_eq!(encode_bhav(rebuilt).unwrap(), encode_bhav(&bhav).unwrap());
     }
 }
