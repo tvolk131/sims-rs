@@ -156,6 +156,20 @@ appends zeros to a version 9 tail, and the first 16 bytes after the
 fixed fields are what the original read. The layout is format 5's, so a
 format-5 build refuses a format-6 store rather than misreading it.
 
+Two kinds of format-5 record can't be recovered exactly. The migration
+still reads them, but the result isn't what the original read:
+
+- **Rewritten members.** A world writeback can replace family 0's
+  misread "members" with the live member list. The live list drops GUIDs
+  that aren't in NBRS (`neighbors.rs`), and those GUIDs were really the
+  secondary house and magic words. Once the writeback has saved the
+  rewritten list, the bytes are gone.
+- **Non-canonical v8.** A version 8 family 0 followed by bytes the
+  original never writes gains magic words from them.
+
+The project hasn't shipped, so only development stores can hold these
+records. Importing the folder again restores them.
+
 `Neighborhood::open` itself still fails on a family 0 whose secondary
 house, taken as a count, runs past the chunk. The fix belongs in
 sims-content's reader (`Family::parse_chunk` with the chunk ID), which is
