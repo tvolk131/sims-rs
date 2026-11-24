@@ -2920,9 +2920,11 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
     Ok(())
 }
 
-/// The frame locals `.air` allocates for a lowered tree body: one per `let` name, after every
-/// explicit local (`local[N]`, `scope(25, N)`). Read from the body's tokens, so comments and
-/// strings name nothing.
+/// The frame locals `.air` allocates for a lowered tree body: one per `let` / `local` name,
+/// after every explicit local (`local[N]`, `scope(25, N)`). Read from the body's tokens, so
+/// comments and strings name nothing. This only words the diagnostic: the `.air` compiler
+/// rejects a tree whose locals outgrow its `@frame(locals: K)`, and `K <= N` is checked when
+/// lowering, so a slot it misses (a raw primitive's numeric local operand) is still caught.
 fn count_frame_locals(body: &str) -> usize {
     use crate::lexer::{TokenKind as T, tokenize};
     let Ok(tokens) = tokenize(body) else {
@@ -2935,7 +2937,7 @@ fn count_frame_locals(body: &str) -> usize {
     for (i, k) in kinds.iter().enumerate() {
         let next = |n: usize| kinds.get(i + n).copied();
         match k {
-            T::Ident(w) if w == "let" => {
+            T::Ident(w) if w == "let" || (w == "local" && matches!(next(1), Some(T::Ident(_)))) => {
                 if let Some(T::Ident(name)) = next(1) {
                     names.insert(name.as_str());
                 }
@@ -10878,6 +10880,7 @@ impl<'a> TreeLowerer<'a> {
         let out_len = self.out.len();
         let indent = self.indent;
         let used_saved = self.used_saved_stack_obj;
+        let (event_local, sleep_span) = (self.event_local, self.sleep_span);
         let expansions = self.inline_expansions;
         let next_id = self.next_id;
         let defer_generation = self.defer_generation;
@@ -10888,6 +10891,7 @@ impl<'a> TreeLowerer<'a> {
         self.out.truncate(out_len);
         self.indent = indent;
         self.used_saved_stack_obj = used_saved;
+        (self.event_local, self.sleep_span) = (event_local, sleep_span);
         self.inline_expansions = expansions;
         self.next_id = next_id;
         self.defer_generation = defer_generation;

@@ -70,7 +70,7 @@ Constraints:
   - a pinned tree has no `raw`;
   - only the push reads the slot;
   - `push_interaction` does not read the last result;
-  - `s` is written before every read, on every path. Otherwise an early read would see whatever its frame word held, and a different word holds something else.
+  - every named local, `s` included, is written before every read, on every path. Once `s` leaves the named list, every later named local moves down one word. A local read before any write sees whatever its frame word held, and the new word holds something else.
 
 ### 2. `raw` gaps
 
@@ -83,7 +83,7 @@ Constraints:
   - When it is the same handle as `object:`, the icon reads the pinned `local[0]` (flags `0x01 | 0x02`), so one handle supplies both.
   - Another handle must be a plain local.
   - `self` is copied into a fresh local: from the stack object on entry in a Sim tree, from `my.id` in an object's own tree.
-- **G3.** `animate(.., event_local: N)` sends events to slot `N` (flag `0x20`) without binding them. It needs `@frame(locals: K)` with `N >= K`, so the slot is outside the frame and no binding can be there. After lowering, the tree's own locals are counted too: if they need more than `N` slots, it is an error. It lowers to the primitive's raw `op 0x002c (..)` form, because `.air`'s `animate(local: N)` would grow the frame to `N + 1`. It cannot be combined with `local:` or an `|event|` body. Because it is a raw op, a tree that uses it cannot also `sleep` (`.air` rejects raw ops alongside `idle()`). v2 reports that itself. The local count reads the lowered body's tokens, so comments and strings do not count: `let` names, after the highest explicit `local[N]` or `scope(25, N)`.
+- **G3.** `animate(.., event_local: N)` sends events to slot `N` (flag `0x20`) without binding them. It needs `@frame(locals: K)` with `N >= K`, so the slot is outside the frame and no binding can be there. After lowering, the tree's own locals are counted too: if they need more than `N` slots, it is an error. It lowers to the primitive's raw `op 0x002c (..)` form, because `.air`'s `animate(local: N)` would grow the frame to `N + 1`. It cannot be combined with `local:` or an `|event|` body. Because it is a raw op, a tree that uses it cannot also `sleep` (`.air` rejects raw ops alongside `idle()`). v2 reports that itself, ignoring code that a constant condition folds away. The `.air` compiler stays the authority on frame size: it rejects a tree whose locals outgrow `@frame(locals: K)`, and `K <= N`. v2's own count only words the error. The local count reads the lowered body's tokens, so comments and strings do not count: `let` / `local` names, after the highest explicit `local[N]` or `scope(25, N)`.
 
 ### 3. Decompiler gaps
 
@@ -115,7 +115,7 @@ Constraints:
 
 ### 5. The last result is not part of v2's source semantics
 
-No v2 construct names the last result, and branch structure already decides it. For example, the body of `if !(a == 0)` starts after a false test, and an `else` body starts after a failed one. The optimizer keeps a node whose result a primitive or a branch test may read next. It does not keep a node only for the last result a frame pop sees: the VM passes that to the use-release check before the return writes its own result. Dead `stack_obj` stores before `return`, which earlier PRs already dropped, change it. So does L8's direct `return [!]run_functional(..)`, and so do the short-circuit `||` / `&&` forms, which can reach a `return` straight from a failed test. This matches the originals' code shapes, and the verifier proves the pilot trees equivalent with it.
+No v2 construct names the last result, and branch structure already decides it. For example, the body of `if !(a == 0)` starts after a false test, and an `else` body starts after a failed one. The optimizer keeps a node whose result a primitive or a branch test may read next. It does not keep a node only for the last result a frame pop sees: the VM passes that to the use-release check before the return writes its own result. When that pop ends the Sim's last use of an object, the value becomes bit `0x20` of the finished action's saved flags. Dead `stack_obj` stores before `return`, which earlier PRs already dropped, change it. So does L8's direct `return [!]run_functional(..)`, and so do the short-circuit `||` / `&&` forms, which can reach a `return` straight from a failed test. This matches the originals' code shapes, and the verifier proves the pilot trees equivalent with it.
 
 ## Consequences
 

@@ -139,7 +139,11 @@ pub(crate) fn pin_in_place(body: &str) -> String {
     if !lets.contains(&source)
         || merge_group(&source).is_none()
         || matches!(source.as_str(), "__self_obj" | "__saved_stack_obj")
-        || !defined_before_reads(&nodes, &source, &mut false)
+        // Every named local moves down one word once `s` leaves the named list, so none may be
+        // read before it is written (frame words keep what an earlier frame left there).
+        || !lets
+            .iter()
+            .all(|name| defined_before_reads(&nodes, name, &mut false))
     {
         return body.to_owned();
     }
@@ -1915,6 +1919,15 @@ mod tests {
         // A local read before any write is not moved into the pin slot.
         let body = "    let o;\n    local[0] := o;\n    push_interaction(menu: 0, object: 0, priority: 2, flags: 3, icon: 0);\n    return true;\n";
         assert_eq!(pin_in_place(body), body);
+        // Nor when another local read before any write would move to a different word.
+        let body = "    let __v_o_0 = stack_obj;\n    let __v_inherited_1;\n    temp[0] := __v_inherited_1;\n    local[0] := __v_o_0;\n    push_interaction(menu: 0, object: 0, priority: 2, flags: 3, icon: 0);\n    return true;\n";
+        assert_eq!(pin_in_place(body), body);
+        // With every local written first, the pin applies.
+        let body = "    let __v_o_0 = stack_obj;\n    local[0] := __v_o_0;\n    push_interaction(menu: 0, object: 0, priority: 2, flags: 3, icon: 0);\n    return true;\n";
+        assert_eq!(
+            pin_in_place(body),
+            "    local[0] := stack_obj;\n    push_interaction(menu: 0, object: 0, priority: 2, flags: 3, icon: 0);\n    return true;\n"
+        );
     }
 
     #[test]

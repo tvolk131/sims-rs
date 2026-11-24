@@ -9746,4 +9746,27 @@ fn pr_f_review_regressions_lower_soundly() {
             .contains("a tree cannot mix raw ops with sleep()"),
         "{err}"
     );
+    // Folded-away code takes no part in that check.
+    for body in [
+        "if false { sleep(1); } animate(clip: 3, event_local: 1); return true;",
+        "if false { animate(clip: 3, event_local: 1); } sleep(1); return true;",
+    ] {
+        tree_of(
+            "event_local_dead.antics",
+            &obj(&format!(
+                "    @id(4300) @frame(locals: 0) tree t (sim: Sim) {{ {body} }}"
+            )),
+            4300,
+        );
+    }
+    // A raw `local x;` declaration counts toward the frame.
+    let err = compile_v2_source(
+        "event_local_decl.antics",
+        &obj(
+            "    @id(4300) @frame(locals: 0) tree t () { raw { local scratch; } animate(clip: 3, event_local: 0); return true; }",
+        ),
+        &cfg,
+    )
+    .expect_err("a declared local at the event slot must fail");
+    assert!(err.message.contains("must lie outside the frame"), "{err}");
 }
