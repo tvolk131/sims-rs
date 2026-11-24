@@ -233,6 +233,7 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
         None => ids.clone(),
     };
     let mut verdicts: BTreeMap<u16, (ResourceVerdict, Vec<String>)> = BTreeMap::new();
+    let mut to_check = Vec::new();
     for (ca, cb) in iff_a.chunks.iter().zip(&iff_b.chunks) {
         if &ca.tag == b"BHAV" && !runs_from_own_file(ca.id) && opts.tree.is_none() {
             // The VM never runs it from this file, so it is compared as bytes only.
@@ -245,12 +246,20 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
             };
             verdicts.insert(ca.id, (verdict, Vec::new()));
         } else if &ca.tag == b"BHAV" && needed.contains(&ca.id) {
-            let mut notes = Vec::new();
-            let verdict = compare_bhav(
-                ca.id, ca, cb, &iff_a, &iff_b, &ctx_a, &ctx_b, opts, &mut notes,
-            );
-            verdicts.insert(ca.id, (verdict, notes));
+            to_check.push((ca, cb));
         }
+    }
+    // Each tree is checked on its own, so the checks run in parallel; the results go
+    // back in chunk order.
+    let checked = par_map(&to_check, |&(ca, cb)| {
+        let mut notes = Vec::new();
+        let verdict = compare_bhav(
+            ca.id, ca, cb, &iff_a, &iff_b, &ctx_a, &ctx_b, opts, &mut notes,
+        );
+        (verdict, notes)
+    });
+    for ((ca, _), result) in to_check.iter().zip(checked) {
+        verdicts.insert(ca.id, result);
     }
     // As a tree in another's reach, each tree must be proven under the stricter
     // policy (see [`dependency_options`]).
@@ -263,27 +272,34 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
         domain_calls(&opts.param_domains, &iff_a, &iff_b, &ctx_a, &ctx_b);
     report.assumptions = assumptions;
     if strict.live != opts.live {
-        for (ca, cb) in iff_a.chunks.iter().zip(&iff_b.chunks) {
-            if &ca.tag == b"BHAV"
-                && runs_from_own_file(ca.id)
-                && matches!(
-                    verdicts.get(&ca.id),
-                    Some((ResourceVerdict::Equivalent { .. }, _))
-                )
-            {
-                let verdict = compare_bhav(
-                    ca.id,
-                    ca,
-                    cb,
-                    &iff_a,
-                    &iff_b,
-                    &ctx_a,
-                    &ctx_b,
-                    &strict,
-                    &mut Vec::new(),
-                );
-                dependency_verdicts.insert(ca.id, (verdict, Vec::new()));
-            }
+        let recheck: Vec<(&Chunk, &Chunk)> = iff_a
+            .chunks
+            .iter()
+            .zip(&iff_b.chunks)
+            .filter(|(ca, _)| {
+                &ca.tag == b"BHAV"
+                    && runs_from_own_file(ca.id)
+                    && matches!(
+                        verdicts.get(&ca.id),
+                        Some((ResourceVerdict::Equivalent { .. }, _))
+                    )
+            })
+            .collect();
+        let rechecked = par_map(&recheck, |&(ca, cb)| {
+            compare_bhav(
+                ca.id,
+                ca,
+                cb,
+                &iff_a,
+                &iff_b,
+                &ctx_a,
+                &ctx_b,
+                &strict,
+                &mut Vec::new(),
+            )
+        });
+        for ((ca, _), verdict) in recheck.iter().zip(rechecked) {
+            dependency_verdicts.insert(ca.id, (verdict, Vec::new()));
         }
     }
     // A tree proven equivalent only for its assumed domain is not shown the same where
@@ -495,6 +511,43 @@ fn inline_call_words(
             .map(|w| i16::from_le_bytes([w[0], w[1]]))
             .collect(),
     )
+}
+
+/// `f` of every item, in order, computed on up to `available_parallelism` threads.
+/// Items are handed out one at a time, so one slow item does not hold up a batch.
+pub(crate) fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(items.len());
+    if threads <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut done: Vec<(usize, R)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut out = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(item) = items.get(i) else {
+                            break out;
+                        };
+                        out.push((i, f(item)));
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| match w.join() {
+                Ok(out) => out,
+                Err(panic) => std::panic::resume_unwind(panic),
+            })
+            .collect()
+    });
+    done.sort_unstable_by_key(|(i, _)| *i);
+    done.into_iter().map(|(_, r)| r).collect()
 }
 
 /// Every `BHAV` of the file that lifts, by ID.

@@ -155,7 +155,9 @@ pub struct LiveOptions {
     pub max_paths: usize,
     /// Most instructions one path may execute before giving up (loops).
     pub max_steps: usize,
-    /// Most pairs of paths with different summaries checked for joint feasibility.
+    /// Most pairs of paths with different summaries checked for joint feasibility. A
+    /// pair whose conditions contain one branch with opposite outcomes is ruled out
+    /// without a check and does not count.
     pub max_pair_checks: usize,
     /// Compare the scratch-pointer state at events and at exit. A caller that reads
     /// Global 34 right after the call observes it (`expression.rs:31`).
@@ -1934,15 +1936,79 @@ struct ProductState {
 /// Per pair of nodes: visits so far, and each slot's literal if every visit had the same.
 type WidenTable = BTreeMap<((u8, u8), Vec<Cell>), (usize, Vec<Option<i16>>)>;
 
+/// Where [`bisimulate`] cuts the runs.
+#[derive(Clone, Copy)]
+enum Cuts<'h> {
+    /// After each primitive or call.
+    Primitives,
+    /// After any node that recorded an event.
+    EveryEvent,
+    /// After each primitive or call, and on reaching a loop head of this side's tree
+    /// (`.0` for A, `.1` for B; [`Explorer::loop_heads`]), so a loop that records no
+    /// event is cut too.
+    LoopHeads(&'h BTreeSet<u8>, &'h BTreeSet<u8>),
+}
+
 impl Explorer<'_> {
-    /// Runs `start` until each path has run a cut node (a primitive or call, or with
-    /// `every_event` any node that recorded an event) or has ended.
+    /// The targets of the back edges of a depth-first walk from the entry, following
+    /// the true branch first: every cycle the walk reaches passes through one. The
+    /// walk follows the graph, not the node numbers, so a tree laid out differently
+    /// has the same loop heads.
+    fn loop_heads(&self) -> BTreeSet<u8> {
+        let len = self.bhav.instructions.len().min(LAST_NODE + 1);
+        let next = |n: usize| -> Vec<usize> {
+            let ins = &self.bhav.instructions[n];
+            let mut out = Vec::new();
+            for t in [ins.on_true, ins.on_false] {
+                let t = usize::from(t);
+                if t < len && !out.contains(&t) {
+                    out.push(t);
+                }
+            }
+            out
+        };
+        let mut heads = BTreeSet::new();
+        if self.entry >= len {
+            return heads;
+        }
+        // 0 unvisited, 1 on the walk's stack, 2 finished.
+        let mut color = vec![0u8; len];
+        let mut stack: Vec<(usize, Vec<usize>)> = vec![(self.entry, next(self.entry))];
+        color[self.entry] = 1;
+        while let Some((node, succ)) = stack.last_mut() {
+            if succ.is_empty() {
+                color[*node] = 2;
+                stack.pop();
+                continue;
+            }
+            let t = succ.remove(0);
+            match color[t] {
+                0 => {
+                    color[t] = 1;
+                    stack.push((t, next(t)));
+                }
+                1 => {
+                    heads.insert(t as u8);
+                }
+                _ => {}
+            }
+        }
+        heads
+    }
+
+    /// Runs `start` until each path has run a cut node (see [`Cuts`]) or has ended.
     fn segment(
         &self,
         start: PathState,
-        every_event: bool,
+        cuts: Cuts,
+        side_b: bool,
         interner: &mut Interner,
     ) -> Result<Vec<SegmentEnd>, String> {
+        let every_event = matches!(cuts, Cuts::EveryEvent);
+        let heads = match cuts {
+            Cuts::LoopHeads(a, b) => Some(if side_b { b } else { a }),
+            _ => None,
+        };
         let mut ends = Vec::new();
         let mut stack = vec![start];
         while let Some(state) = stack.pop() {
@@ -1970,6 +2036,11 @@ impl Explorer<'_> {
                     Step::Done(summary) => ends.push(SegmentEnd::Done(summary)),
                     Step::Continue(s)
                         if s.prefix != before && (primitive || every_event) && to_node(&s) =>
+                    {
+                        ends.push(SegmentEnd::Cut(s));
+                    }
+                    Step::Continue(s)
+                        if heads.is_some_and(|h| h.contains(&s.pc)) && to_node(&s) =>
                     {
                         ends.push(SegmentEnd::Cut(s));
                     }
@@ -2132,7 +2203,7 @@ fn divergence(a: u32, b: u32, interner: &Interner) -> String {
 fn bisimulate(
     xa: &Explorer,
     xb: &Explorer,
-    every_event: bool,
+    cuts: Cuts,
     interner: &mut Interner,
 ) -> Result<(usize, usize), String> {
     let opts = xa.opts;
@@ -2144,16 +2215,22 @@ fn bisimulate(
     while let Some((sa, sb)) = work.pop() {
         segments += 1;
         let ends_a = xa
-            .segment(sa, every_event, interner)
+            .segment(sa, cuts, false, interner)
             .map_err(|e| format!("A: {e}"))?;
         let ends_b = xb
-            .segment(sb, every_event, interner)
+            .segment(sb, cuts, true, interner)
             .map_err(|e| format!("B: {e}"))?;
+        let index = ConflictIndex::new(ends_b.iter().map(SegmentEnd::cond));
         for ea in &ends_a {
-            for eb in &ends_b {
+            let conflicts = index.conflicts(ea.cond());
+            for (j, eb) in ends_b.iter().enumerate() {
                 if let (SegmentEnd::Done(pa), SegmentEnd::Done(pb)) = (ea, eb)
                     && pa.out == pb.out
                 {
+                    continue;
+                }
+                // Infeasible together (see `compare_paths`).
+                if ConflictIndex::has(&conflicts, j) {
                     continue;
                 }
                 checks += 1;
@@ -2384,11 +2461,21 @@ pub fn check_bhav_live_equivalent(
                         Explorer::new(a, ctx_a, opts, entry_a, entry_param, region),
                         Explorer::new(b, ctx_b, opts, entry_b, entry_param, region),
                     );
-                    let proof = bisimulate(&xa, &xb, false, &mut interner).or_else(|first| {
-                        bisimulate(&xa, &xb, true, &mut interner).map_err(|every| {
-                            format!("cut at primitives: {first}; cut at every event: {every}")
+                    let proof = bisimulate(&xa, &xb, Cuts::Primitives, &mut interner)
+                        .or_else(|first| {
+                            bisimulate(&xa, &xb, Cuts::EveryEvent, &mut interner)
+                                .map_err(|every| (first, every))
                         })
-                    });
+                        .or_else(|(first, every)| {
+                            let (heads_a, heads_b) = (xa.loop_heads(), xb.loop_heads());
+                            bisimulate(&xa, &xb, Cuts::LoopHeads(&heads_a, &heads_b), &mut interner)
+                                .map_err(|heads| {
+                                    format!(
+                                        "cut at primitives: {first}; cut at every event: {every}; \
+                                     cut at loop heads: {heads}"
+                                    )
+                                })
+                        });
                     match proof {
                         Ok((segments, states)) => {
                             steps += segments;
@@ -2446,6 +2533,46 @@ pub fn check_bhav_live_equivalent(
     }
 }
 
+/// For a list of path conditions, which of them take a branch the other way: a
+/// condition that holds `(atom, v)` conflicts with every one holding `(atom, !v)`.
+struct ConflictIndex {
+    /// `(atom, value)` -> bitset of the conditions holding `(atom, !value)`.
+    by_literal: BTreeMap<(Atom, bool), Vec<u64>>,
+    words: usize,
+}
+
+impl ConflictIndex {
+    fn new<'c>(conds: impl ExactSizeIterator<Item = &'c [(Atom, bool)]>) -> Self {
+        let words = conds.len().div_ceil(64);
+        let mut by_literal: BTreeMap<(Atom, bool), Vec<u64>> = BTreeMap::new();
+        for (j, cond) in conds.enumerate() {
+            for &(atom, value) in cond {
+                by_literal
+                    .entry((atom, !value))
+                    .or_insert_with(|| vec![0; words])[j / 64] |= 1 << (j % 64);
+            }
+        }
+        Self { by_literal, words }
+    }
+
+    /// The conditions that conflict with `cond`, as a bitset.
+    fn conflicts(&self, cond: &[(Atom, bool)]) -> Vec<u64> {
+        let mut out = vec![0u64; self.words];
+        for literal in cond {
+            if let Some(bits) = self.by_literal.get(literal) {
+                for (o, b) in out.iter_mut().zip(bits) {
+                    *o |= b;
+                }
+            }
+        }
+        out
+    }
+
+    fn has(bits: &[u64], j: usize) -> bool {
+        bits[j / 64] & (1 << (j % 64)) != 0
+    }
+}
+
 enum PairVerdict {
     Same,
     Differ(Vec<TraceStep>, String),
@@ -2473,6 +2600,10 @@ fn compare_paths(
     }
     let groups_a = group(paths_a);
     let groups_b = group(paths_b);
+    // Pairs that take one branch both ways are infeasible (the first test
+    // `feasibility` makes), and need neither a check nor budget.
+    let index = ConflictIndex::new(paths_b.iter().map(|p| p.cond.as_slice()));
+    let conflicts: Vec<Vec<u64>> = paths_a.iter().map(|p| index.conflicts(&p.cond)).collect();
     let mut checks = 0usize;
     let mut undecided: Option<String> = None;
     for (out_a, idx_a) in &groups_a {
@@ -2482,6 +2613,9 @@ fn compare_paths(
             }
             for &i in idx_a {
                 for &j in idx_b {
+                    if ConflictIndex::has(&conflicts[i], j) {
+                        continue;
+                    }
                     checks += 1;
                     if checks > opts.max_pair_checks {
                         return PairVerdict::Undecided(format!(

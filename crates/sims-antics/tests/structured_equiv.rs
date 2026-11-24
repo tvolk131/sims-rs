@@ -124,7 +124,11 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                         for line in source_text.lines().filter(|l| l.contains("op 0x")) {
                             let line = line.trim();
                             let shown = line.split(" -> ").next().unwrap_or(line);
-                            *raw_op_lines.entry(shown.to_owned()).or_default() += 1;
+                            let shown = format!(
+                                "{shown} [args {}, locals {}, format {:#06x}]",
+                                bhav.args, bhav.locals, bhav.format
+                            );
+                            *raw_op_lines.entry(shown).or_default() += 1;
                         }
                     } else {
                         lifted_pure_high_level += 1;
