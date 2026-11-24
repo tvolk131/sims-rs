@@ -18,6 +18,7 @@
 //! - `sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv] [--globals <Global.iff|archive.far[!member.iff]>] [--semiglobal <file.iff|archive.far!member.iff>] [--no-catalog]`
 //! - `sims-antics build <pack_dir> --out <dir>`
 //! - `sims-antics fmt [--check] [--stdout] <path...>` (canonical `.antics` v2 layout)
+//! - `sims-antics lint [--deny-warnings] [--json] <path...>` (`.antics` v2 lints)
 //! - `sims-antics lift --v2 <file.iff|archive.far> [--entry <name.iff>] [--install <dir>]` (decompile to `.antics` v2)
 
 use sims_antics::arity_catalog::{
@@ -189,7 +190,8 @@ fn print_usage() {
          sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv] [--globals <Global.iff|archive.far[!member.iff]>] [--semiglobal <file.iff|archive.far!member.iff>] [--no-catalog]   (lifts to .air Antics IR)\n  \
          sims-antics lift --v2 <file.iff|archive.far> [--entry <name.iff>] [--install <dir>] [--globals ...] [--semiglobal ...] [--no-catalog]   (decompiles an object to checked .antics v2)\n  \
          sims-antics build <pack_dir> --out <dir>\n  \
-         sims-antics fmt [--check] [--stdout] <file.antics|dir...>   (canonical .antics v2 layout; --check exits 1 if any file would change)\n\
+         sims-antics fmt [--check] [--stdout] <file.antics|dir...>   (canonical .antics v2 layout; --check exits 1 if any file would change)\n  \
+         sims-antics lint [--deny-warnings] [--json] <file.antics|dir...>   (.antics v2 lints; exits 1 on an error, or on any finding with --deny-warnings)\n\
          lift arities: inside an install, global and semi-global callee arities come from its catalog;\n  \
          --globals/--semiglobal replace one range; --no-catalog disables catalog lookup (private arities\n  \
          from the file only). Equivalent is relative to the arities shown in the `// arity sources:` header.\n  \
@@ -2064,6 +2066,7 @@ fn run() -> Result<(), CliError> {
         }
         "lift" => cmd_lift(&args),
         "fmt" => cmd_fmt(&args),
+        "lint" => cmd_lint(&args),
         "verify-equiv" => match cmd_verify_equiv(&args) {
             Err(CliError::Message(msg)) => {
                 eprintln!("error: {msg}");
@@ -2368,6 +2371,96 @@ fn cmd_fmt(args: &[OsString]) -> Result<(), CliError> {
     out.flush()?;
     if check && unformatted > 0 {
         eprintln!("{unformatted} file(s) need formatting");
+        return Err(CliError::Exit(1));
+    }
+    Ok(())
+}
+
+/// `sims-antics lint [--deny-warnings] [--json] <path...>`: `.antics` v2 lints.
+fn cmd_lint(args: &[OsString]) -> Result<(), CliError> {
+    use sims_antics::v2::lint::{
+        LintInput, Severity, diagnostics_to_json, lint_v2_sources, pack_dir_of, render_diagnostic,
+    };
+    let mut deny_warnings = false;
+    let mut json = false;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut end_of_flags = false;
+    for arg in &args[1..] {
+        if !end_of_flags && let Some(s) = arg.to_str() {
+            match s {
+                "--deny-warnings" => {
+                    deny_warnings = true;
+                    continue;
+                }
+                "--json" => {
+                    json = true;
+                    continue;
+                }
+                "--" => {
+                    end_of_flags = true;
+                    continue;
+                }
+                "-h" | "--help" => {
+                    print_usage();
+                    return Ok(());
+                }
+                other if other.starts_with('-') => {
+                    return Err(format!("unknown flag '{other}'").into());
+                }
+                _ => {}
+            }
+        }
+        paths.push(PathBuf::from(arg));
+    }
+    if paths.is_empty() {
+        return Err("lint requires at least one <file.antics|dir>"
+            .to_owned()
+            .into());
+    }
+    let files = sims_antics::v2::fmt::collect_antics_files(&paths).map_err(|e| e.to_string())?;
+    let mut inputs = Vec::new();
+    for file in files {
+        let shown = sanitize_path_display(&file);
+        let source =
+            std::fs::read_to_string(&file).map_err(|e| format!("failed to read {shown}: {e}"))?;
+        // A `.air` (Antics IR) file shares the extension; it is not v2.
+        if !sims_antics::v2::lint::is_lintable_v2(&source) {
+            eprintln!("note: skipping {shown} (not .antics v2)");
+            continue;
+        }
+        inputs.push(LintInput {
+            name: shown,
+            source,
+            pack_dir: pack_dir_of(&file),
+            path: Some(file),
+        });
+    }
+    let diagnostics = lint_v2_sources(&inputs).map_err(|e| e.to_string())?;
+    let mut out = OutWriter::stdout();
+    if json {
+        out.writeln_str(&diagnostics_to_json(&diagnostics))?;
+    } else {
+        for d in &diagnostics {
+            let source = inputs
+                .iter()
+                .find(|i| i.name == d.file)
+                .map(|i| i.source.as_str());
+            out.writeln_str(&render_diagnostic(d, source))?;
+        }
+    }
+    out.flush()?;
+    let errors = diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .count();
+    let warnings = diagnostics.len() - errors;
+    if !json && !diagnostics.is_empty() {
+        eprintln!(
+            "{} file(s) linted: {errors} error(s), {warnings} warning(s)",
+            inputs.len()
+        );
+    }
+    if errors > 0 || (deny_warnings && !diagnostics.is_empty()) {
         return Err(CliError::Exit(1));
     }
     Ok(())

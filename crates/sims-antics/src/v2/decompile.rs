@@ -190,18 +190,27 @@ pub fn decompile_iff_to_v2_report(
                 message,
             }) if plan.drop_variants(&model, &generated, None, &message) => {}
             Err(Failure::V2 { line, message }) => {
-                if !plan.lower_at_line(&model, &generated, line) {
+                let tree = line.and_then(|l| generated.tree_at_line(l.saturating_sub(1)));
+                // An extra idiom is turned off before anything is lowered: it may be what
+                // clashes with the rest of the tree.
+                let unblamed = tree.is_none() && plan.drop_all_extras(&generated);
+                if !unblamed
+                    && !tree.is_some_and(|id| plan.drop_extras(id, &generated))
+                    && !plan.lower_at_line(&model, &generated, line)
                     // A tree that fails at its lowest level is left out.
-                    let tree = line.and_then(|l| generated.tree_at_line(l.saturating_sub(1)));
-                    if !tree.is_some_and(|id| model.omit(id, &message)) {
-                        return Err(no_compile(&message));
-                    }
+                    && !tree.is_some_and(|id| model.omit(id, &message))
+                {
+                    return Err(no_compile(&message));
                 }
             }
             Err(Failure::Air { tree, message }) => {
                 let handled = match tree {
-                    Some(id) => plan.lower_tree(&model, id) || model.omit(id, &message),
-                    None => plan.lower_all(&model),
+                    Some(id) => {
+                        plan.drop_extras(id, &generated)
+                            || plan.lower_tree(&model, id)
+                            || model.omit(id, &message)
+                    }
+                    None => plan.drop_all_extras(&generated) || plan.lower_all(&model),
                 };
                 if !handled {
                     return Err(no_compile(&message));
@@ -213,7 +222,9 @@ pub fn decompile_iff_to_v2_report(
                 for t in model.trees.iter().filter(|t| t.omitted.is_none()) {
                     let check = model.check_tree(t, &recompiled, &mut cache);
                     let proven = matches!(check, TreeCheck::Identical | TreeCheck::Equivalent);
-                    if !proven && plan.lower_tree(&model, t.id) {
+                    if !proven
+                        && (plan.drop_extras(t.id, &generated) || plan.lower_tree(&model, t.id))
+                    {
                         changed = true;
                     }
                     checks.insert(t.id, check);
@@ -651,16 +662,19 @@ impl Model {
         let original_sounds = fwav_sounds(iff);
         let mut sounds = BTreeMap::new();
         let mut sounds_skipped = BTreeMap::new();
-        let mut sound_names = BTreeSet::new();
+        // Several FWAVs may share one event name (v2 PR F), but only spelled the same way.
+        let mut sound_names: BTreeMap<String, &str> = BTreeMap::new();
         for (&id, name) in &original_sounds {
-            let why = if id == 0 {
-                "v2 cannot declare it (FWAV IDs start at 1)"
-            } else if crate::manifest::validate_relative_filename(name, "sound").is_err() {
+            let why = if crate::manifest::validate_relative_filename(name, "sound").is_err() {
                 "v2 cannot spell its event name (a plain file name)"
             } else if name.len() > MAX_CHUNK_LABEL {
                 "its event name is longer than a chunk label, which v2 uses it as"
-            } else if !sound_names.insert(name.to_ascii_lowercase()) {
-                "another FWAV names the same event, which v2 does not allow"
+            } else if *sound_names
+                .entry(name.to_ascii_lowercase())
+                .or_insert(name.as_str())
+                != name.as_str()
+            {
+                "another FWAV names the same event with other letter case, which v2 does not allow"
             } else {
                 sounds.insert(id, name.clone());
                 continue;
@@ -1237,9 +1251,11 @@ fn prefers_sim_context(body: &[Stmt]) -> bool {
     walk_stmts(body, &mut |s| {
         for op in stmt_operands(s) {
             if let OperandRef::Direct(o) = op {
-                match o.scope {
-                    1 | 14 | 18 => sim += 1,
-                    0 | 3 => obj += 1,
+                match (o.scope, o.index) {
+                    // `my.id` is `sim` in one context and `self` in the other.
+                    (3, 11) => {}
+                    (1 | 14 | 16 | 18, _) => sim += 1,
+                    (0 | 3, _) => obj += 1,
                     _ => {}
                 }
             }
@@ -1276,6 +1292,8 @@ struct ForEachParts<'a> {
     saved: i16,
     /// `set_to_next` mode: 1 = people, 0 = all objects.
     mode: u8,
+    /// Whether `stack_obj` itself is the cursor (no loop local).
+    stack_cursor: bool,
     body: &'a [Stmt],
 }
 
@@ -1293,7 +1311,12 @@ fn for_each_parts<'a>(init: &Stmt, w: &'a Stmt, restore: &Stmt) -> Option<ForEac
     if !is_operand(rl, 10, 0) {
         return None;
     }
-    for_each_core(init, w, Some(saved)).map(|(mode, body)| ForEachParts { saved, mode, body })
+    for_each_core(init, w, Some(saved)).map(|(mode, stack_cursor, body)| ForEachParts {
+        saved,
+        mode,
+        stack_cursor,
+        body,
+    })
 }
 
 fn direct_local(r: &OperandRef) -> Option<i16> {
@@ -1307,9 +1330,15 @@ fn is_operand(r: &OperandRef, scope: u8, index: i16) -> bool {
     matches!(r, OperandRef::Direct(o) if o.scope == scope && o.index == index)
 }
 
-/// `local[v] := 0; while set_to_next(mode, dest: local[v]) { body }`: the mode and body,
-/// when the body names neither `local[v]` nor the local `stack_obj` is saved in.
-fn for_each_core<'a>(init: &Stmt, w: &'a Stmt, saved: Option<i16>) -> Option<(u8, &'a [Stmt])> {
+/// `local[v] := 0; while set_to_next(mode, dest: local[v]) { body }`: the mode, whether the
+/// cursor is `stack_obj` itself (v2 PR F's zero-local form, `stack_obj := 0; while
+/// set_to_next(mode, dest: stack_obj)`), and the body, when the body names neither `local[v]`
+/// nor the local `stack_obj` is saved in.
+fn for_each_core<'a>(
+    init: &Stmt,
+    w: &'a Stmt,
+    saved: Option<i16>,
+) -> Option<(u8, bool, &'a [Stmt])> {
     let local = direct_local;
     let Stmt::Assign {
         lhs: il,
@@ -1323,8 +1352,13 @@ fn for_each_core<'a>(init: &Stmt, w: &'a Stmt, saved: Option<i16>) -> Option<(u8
     let Stmt::While { cond, body, .. } = w else {
         return None;
     };
-    let var = local(il)?;
-    if !is_operand(ir, 7, 0) || saved == Some(var) {
+    // `None`: v2 PR F's zero-local form, with `stack_obj` itself as the cursor.
+    let var = if is_operand(il, 10, 0) {
+        None
+    } else {
+        Some(local(il)?)
+    };
+    if !is_operand(ir, 7, 0) || (var.is_some() && saved == var) {
         return None;
     }
     let Condition::Primitive {
@@ -1340,17 +1374,27 @@ fn for_each_core<'a>(init: &Stmt, w: &'a Stmt, saved: Option<i16>) -> Option<(u8
     else {
         return None;
     };
-    if local(dest)? != var || !matches!(mode, 0 | 1) {
+    let dest_ok = match var {
+        Some(v) => local(dest) == Some(v),
+        None => is_operand(dest, 10, 0),
+    };
+    if !dest_ok || !matches!(mode, 0 | 1) {
         return None;
     }
-    // The body must not name either local: v2 gives the loop its own slots.
+    // The body must not name either local: v2 gives the loop its own slots. A
+    // `stack_obj` cursor must not be written by a plain store either.
     let mut names_local = false;
     walk_stmts(body, &mut |s| {
         names_local |= stmt_operands(s)
             .iter()
-            .any(|r| local(r).is_some_and(|l| l == var || Some(l) == saved));
+            .any(|r| local(r).is_some_and(|l| Some(l) == var || Some(l) == saved));
+        if var.is_none()
+            && let Stmt::Assign { lhs, .. } = s
+        {
+            names_local |= is_operand(lhs, 10, 0);
+        }
     });
-    (!names_local).then_some((*mode, body.as_slice()))
+    (!names_local).then_some((*mode, var.is_none(), body.as_slice()))
 }
 
 /// The local a tree's first statement saves `stack_obj` into, when nothing but the
@@ -1387,6 +1431,19 @@ fn hoisted_self_save(body: &[Stmt], lifted: &[String]) -> Option<i16> {
     let needle = format!("local[{saved}]");
     let mentions: usize = lifted.iter().map(|l| l.matches(&needle).count()).sum();
     (loops > 0 && mentions == 1 + loops).then_some(saved)
+}
+
+/// The value of `s` when it is `scope(scope, index) := value`.
+fn assigned_to(s: &Stmt, scope: u8, index: i16) -> Option<&OperandRef> {
+    match s {
+        Stmt::Assign {
+            lhs: OperandRef::Direct(o),
+            op: AssignOp::Set,
+            rhs,
+            ..
+        } if o.scope == scope && o.index == index => Some(rhs),
+        _ => None,
+    }
 }
 
 fn walk_stmts(body: &[Stmt], f: &mut impl FnMut(&Stmt)) {
@@ -1568,6 +1625,9 @@ struct Plan {
     standalone: BTreeSet<u16>,
     /// Why the catalog variants are left out (the compiler rejected them).
     variants_off: Option<String>,
+    /// Trees written without the extra idioms (see [`Translator::extra`]), after a round
+    /// that used them was not proven.
+    plain: BTreeSet<u16>,
 }
 
 impl Plan {
@@ -1588,7 +1648,9 @@ impl Plan {
         let standalone = model
             .trees
             .iter()
-            .filter(|t| t.lifecycle.is_some() && t.original.format != 0x8002)
+            .filter(|t| {
+                t.lifecycle.is_some() && (t.original.format != 0x8002 || t.original.kind != 0)
+            })
             .map(|t| t.id)
             .collect();
         Self {
@@ -1596,7 +1658,21 @@ impl Plan {
             raw_stmts: BTreeMap::new(),
             standalone,
             variants_off: None,
+            plain: BTreeSet::new(),
         }
+    }
+
+    /// Turns off tree `id`'s extra idioms when the last round used them. `false` when it
+    /// did not, so the tree has to move down a style instead.
+    fn drop_extras(&mut self, id: u16, generated: &Generated) -> bool {
+        generated.extras.contains(&id) && self.plain.insert(id)
+    }
+
+    /// [`Self::drop_extras`] for every tree, for a failure no one tree is blamed for.
+    fn drop_all_extras(&mut self, generated: &Generated) -> bool {
+        let before = self.plain.len();
+        self.plain.extend(generated.extras.iter().copied());
+        self.plain.len() != before
     }
 
     fn level(&self, t: &TreeModel) -> Level {
@@ -1622,7 +1698,11 @@ impl Plan {
             return false;
         };
         let next = match self.level(t) {
-            Level::Idiomatic if t.sim_ctx => Level::IdiomaticObject,
+            Level::Idiomatic if t.sim_ctx => {
+                // The extra idioms get another try in the object's context.
+                self.plain.remove(&id);
+                Level::IdiomaticObject
+            }
             Level::Idiomatic | Level::IdiomaticObject if t.structured => Level::Raw,
             Level::Idiomatic | Level::IdiomaticObject | Level::Raw => Level::RawLabeled,
             Level::RawLabeled if t.lifecycle.is_some() && !self.standalone.contains(&id) => {
@@ -1732,6 +1812,8 @@ struct Generated {
     /// `(tree id, first line, last line)`, 0-based.
     tree_ranges: Vec<(u16, usize, usize)>,
     raw_counts: BTreeMap<u16, usize>,
+    /// Trees that used an extra idiom (see [`Translator::extra`]).
+    extras: BTreeSet<u16>,
     /// 0-based lines holding the `variant` members.
     variant_lines: std::ops::Range<usize>,
 }
@@ -1762,6 +1844,7 @@ impl Model {
         let mut stmt_ranges = Vec::new();
         let mut tree_ranges = Vec::new();
         let mut raw_counts = BTreeMap::new();
+        let mut extras = BTreeSet::new();
         out.line("// Decompiled by `sims-antics lift --v2`.");
         if self.extra_objds > 0 {
             out.line(format!(
@@ -1878,8 +1961,13 @@ impl Model {
                 None => {
                     let b = &t.original;
                     let ctx = if sim { " (sim: Sim)" } else { "" };
+                    let kind = if b.kind == 0 {
+                        String::new()
+                    } else {
+                        format!(", kind: {}", b.kind)
+                    };
                     out.line(format!(
-                        "@id({}) @frame(args: {}, locals: {}, format: {:#06x}, revision: {}) tree {} \"{}\"{ctx} {{",
+                        "@id({}) @frame(args: {}, locals: {}, format: {:#06x}, revision: {}{kind}) tree {} \"{}\"{ctx} {{",
                         t.id, b.args, b.locals, b.format, b.revision, t.ident, t.label
                     ));
                 }
@@ -1900,6 +1988,9 @@ impl Model {
                         loop_depth: 0,
                         in_handler: false,
                         hoisted_save: hoisted_self_save(body, &t.lifted),
+                        sims_loop: None,
+                        cursor: None,
+                        extras: std::cell::Cell::new(false),
                     };
                     let body = match tr.hoisted_save {
                         Some(_) => {
@@ -1911,6 +2002,9 @@ impl Model {
                     tr.block(body, &mut out);
                     tr.flush_raw(&mut out);
                     raw_count = tr.raw_count;
+                    if tr.extras.get() {
+                        extras.insert(t.id);
+                    }
                 }
                 _ => {
                     if level == Level::Raw {
@@ -1957,6 +2051,19 @@ impl Model {
         }
         out.indent = 0;
         out.line("}");
+        // A GUID constant only `raw` text needed (its trees went `raw`) is left out; the
+        // blank line keeps the line numbers the statement ranges use.
+        for name in self.guid_consts.values() {
+            let decl = format!("const {name} = ");
+            let is_decl = |l: &str| l.trim_start().starts_with(&decl);
+            let used = out
+                .lines
+                .iter()
+                .any(|l| !is_decl(l) && l.contains(name.as_str()));
+            if !used && let Some(l) = out.lines.iter_mut().find(|l| is_decl(l)) {
+                l.clear();
+            }
+        }
         let mut text = out.lines.join("\n");
         text.push('\n');
         Generated {
@@ -1964,6 +2071,7 @@ impl Model {
             stmt_ranges,
             tree_ranges,
             raw_counts,
+            extras,
             variant_lines,
         }
     }
@@ -2025,9 +2133,32 @@ struct Translator<'a> {
     /// The local the tree's first statement saves `stack_obj` into, when that save exists
     /// only for `for` loops to restore from (v2 writes its own save for them).
     hoisted_save: Option<i16>,
+    /// The binding of the innermost `for p in lot.sims()` (`None` outside one, or inside
+    /// a `lot.objects()` loop nested in it).
+    sims_loop: Option<String>,
+    /// The binding of the innermost `for` loop whose cursor is `stack_obj` itself: inside it,
+    /// the stack object's cells are the binding's (`o.data[i]`, `p.person[i]`).
+    cursor: Option<String>,
+    /// Whether an extra idiom was written (see [`Translator::extra`]).
+    extras: std::cell::Cell<bool>,
 }
 
 impl Translator<'_> {
+    /// Whether the extra idioms are on for this tree, noting that one is written. These are
+    /// the PR E spellings (`match`, `inc_lt` / `dec_gt`, `param[n]`, `self.slot[i]`,
+    /// `p.person[i]` / `p.kind`, `run_functional`, `set_dynamic_sprite`,
+    /// `push_interaction(object: ..)`, the padded `notify_out_of_idle()`). Some lower
+    /// differently from the original (`run_functional` and `p.person` restore `stack_obj`),
+    /// and one the checker cannot prove would cost the whole tree its style, so a tree that
+    /// is not proven with them is retried without them before it moves down a style.
+    fn extra(&self) -> bool {
+        if self.plan.plain.contains(&self.tree.id) {
+            return false;
+        }
+        self.extras.set(true);
+        true
+    }
+
     fn flush_raw(&mut self, out: &mut Out) {
         let lines = std::mem::take(&mut self.raw);
         write_raw_block(out, &lines);
@@ -2076,6 +2207,10 @@ impl Translator<'_> {
                 i += used;
                 continue;
             }
+            if let Some(used) = self.pair(&body[i..], out) {
+                i += used;
+                continue;
+            }
             self.stmt(&body[i], out);
             i += 1;
         }
@@ -2107,6 +2242,9 @@ impl Translator<'_> {
                 else_body,
                 ..
             } => {
+                if self.match_chain(id, s, out) {
+                    return;
+                }
                 let Some(c) = self.cond(cond) else {
                     self.emit_raw(s);
                     skip_children(self);
@@ -2115,19 +2253,7 @@ impl Translator<'_> {
                 self.flush_raw(out);
                 let start = out.lines.len();
                 out.line(format!("if {c} {{"));
-                out.indent += 1;
-                self.block(then_body, out);
-                self.flush_raw(out);
-                out.indent -= 1;
-                if !else_body.is_empty() {
-                    out.line("} else {");
-                    out.indent += 1;
-                    self.block(else_body, out);
-                    self.flush_raw(out);
-                    out.indent -= 1;
-                }
-                out.line("}");
-                self.record(id, start, out);
+                self.if_rest(id, start, then_body, else_body, out);
             }
             Stmt::While { cond, body, .. } => {
                 let handler = self.animate_loop(cond).is_some();
@@ -2189,6 +2315,231 @@ impl Translator<'_> {
         }
     }
 
+    /// The rest of an `if` after its header line: the body, an `else if` (when the `else`
+    /// holds just a translatable `if`) or `else`, and the closing brace.
+    fn if_rest(
+        &mut self,
+        id: usize,
+        start: usize,
+        then_body: &[Stmt],
+        else_body: &[Stmt],
+        out: &mut Out,
+    ) {
+        out.indent += 1;
+        self.block(then_body, out);
+        self.flush_raw(out);
+        out.indent -= 1;
+        if let [
+            Stmt::If {
+                cond,
+                then_body: inner_then,
+                else_body: inner_else,
+                ..
+            },
+        ] = else_body
+            && !self.forced_raw(self.next_id)
+            && let Some(c) = self.cond(cond)
+        {
+            let inner_id = self.next_id;
+            self.next_id += 1;
+            let inner_start = out.lines.len();
+            out.line(format!("}} else if {c} {{"));
+            self.if_rest(inner_id, inner_start, inner_then, inner_else, out);
+            self.record(id, start, out);
+            return;
+        }
+        if !else_body.is_empty() {
+            out.line("} else {");
+            out.indent += 1;
+            self.block(else_body, out);
+            self.flush_raw(out);
+            out.indent -= 1;
+        }
+        out.line("}");
+        self.record(id, start, out);
+    }
+
+    /// `if x == a { } else if x == b { } else if x == c { } [else { }]`, three or more
+    /// distinct literals against one operand, as `match x { a => { } ... _ => { } }`. v2
+    /// lowers a `match` to that same chain. Returns `false` (writing nothing) otherwise.
+    fn match_chain(&mut self, id: usize, s: &Stmt, out: &mut Out) -> bool {
+        // (literal, arm body) per test, and the final `else` body.
+        let mut arms: Vec<(i16, &[Stmt])> = Vec::new();
+        let mut scrutinee: Option<&OperandRef> = None;
+        let mut cur = s;
+        let fallback: &[Stmt] = loop {
+            let Stmt::If {
+                cond:
+                    Condition::Compare {
+                        lhs,
+                        op: CompareOp::Eq,
+                        rhs: OperandRef::Direct(Operand { scope: 7, index }),
+                        ..
+                    },
+                then_body,
+                else_body,
+                ..
+            } = cur
+            else {
+                return false;
+            };
+            if scrutinee.is_some_and(|x| x != lhs) || arms.iter().any(|(v, _)| v == index) {
+                return false;
+            }
+            scrutinee = Some(lhs);
+            arms.push((*index, then_body));
+            match else_body.as_slice() {
+                [next @ Stmt::If { .. }] if arms.len() < 3 || self.chain_continues(next, lhs) => {
+                    cur = next;
+                }
+                rest => break rest,
+            }
+        };
+        if arms.len() < 3 {
+            return false;
+        }
+        // Every `if` of the chain gets an arm; none may be forced raw.
+        let mut ids = Vec::with_capacity(arms.len());
+        let mut next = id + 1;
+        for (_, body) in &arms {
+            ids.push(next - 1);
+            next += count_stmts(body) + 1;
+        }
+        if ids.iter().any(|&i| self.forced_raw(i)) {
+            return false;
+        }
+        let Some(x) = scrutinee.and_then(|x| self.rvalue(x)) else {
+            return false;
+        };
+        if !self.extra() {
+            return false;
+        }
+        self.flush_raw(out);
+        let start = out.lines.len();
+        out.line(format!("match {x} {{"));
+        out.indent += 1;
+        let mut arm_starts = Vec::with_capacity(arms.len());
+        for (k, (value, body)) in arms.iter().enumerate() {
+            if k > 0 {
+                // The `if` this arm comes from.
+                self.next_id += 1;
+            }
+            arm_starts.push(out.lines.len());
+            out.line(format!("{value} => {{"));
+            out.indent += 1;
+            self.block(body, out);
+            self.flush_raw(out);
+            out.indent -= 1;
+            out.line("}");
+        }
+        if !fallback.is_empty() {
+            out.line("_ => {");
+            out.indent += 1;
+            self.block(fallback, out);
+            self.flush_raw(out);
+            out.indent -= 1;
+            out.line("}");
+        }
+        out.indent -= 1;
+        out.line("}");
+        for (k, arm_start) in arm_starts.into_iter().enumerate().skip(1) {
+            self.record(ids[k], arm_start, out);
+        }
+        self.record(id, start, out);
+        true
+    }
+
+    /// Whether `s` is another `x == literal` test of the chain on `lhs`.
+    fn chain_continues(&self, s: &Stmt, lhs: &OperandRef) -> bool {
+        matches!(s, Stmt::If {
+            cond: Condition::Compare {
+                lhs: l,
+                op: CompareOp::Eq,
+                rhs: OperandRef::Direct(Operand { scope: 7, .. }),
+                ..
+            },
+            ..
+        } if l == lhs)
+    }
+
+    /// Two-statement idioms, each the exact lowering of its v2 spelling. Returns how many
+    /// statements it consumed.
+    ///
+    /// - `local[0] := <object>; push_interaction(.., object: 0, flags: f | 2)` as
+    ///   `push_interaction(.., object: <object>, flags: f)`;
+    /// - in a Sim context, `temp[0] := i; scope(27, 0) := v` as
+    ///   `set_dynamic_sprite(index: i, value: v)`.
+    fn pair(&mut self, rest: &[Stmt], out: &mut Out) -> Option<usize> {
+        let [first, second, ..] = rest else {
+            return None;
+        };
+        let id = self.next_id;
+        if self.forced_raw(id) || self.forced_raw(id + 1) {
+            return None;
+        }
+        let set = assigned_to;
+        let text = if let Some(object) = set(first, 25, 0)
+            && let Stmt::Primitive {
+                prim:
+                    PrimitiveCall::PushInteraction {
+                        menu,
+                        object_slot: 0,
+                        priority,
+                        flags,
+                        icon_local: LocalRef::Index(0),
+                    },
+                branches: None,
+                ..
+            } = second
+            && flags & 0x03 == 0x02
+        {
+            let object = match object {
+                OperandRef::Direct(Operand {
+                    scope: 3,
+                    index: 11,
+                }) if self.sim => "sim",
+                OperandRef::Direct(Operand {
+                    scope: 3,
+                    index: 11,
+                }) => "self",
+                OperandRef::Direct(Operand {
+                    scope: 10,
+                    index: 0,
+                }) if self.sim => "self",
+                OperandRef::Direct(Operand {
+                    scope: 10,
+                    index: 0,
+                }) => "stack_obj",
+                _ => return None,
+            };
+            format!(
+                "push_interaction(menu: {menu}, object: {object}, priority: {priority}, flags: {});",
+                flags & !0x02
+            )
+        } else if self.sim
+            && let Some(index) = set(first, 8, 0)
+            && let Some(value) = set(second, 27, 0)
+        {
+            let index = self.rvalue(index)?;
+            let value = self.rvalue(value)?;
+            if index.contains("temp[0]") || value.contains("temp[0]") {
+                return None;
+            }
+            format!("set_dynamic_sprite(index: {index}, value: {value});")
+        } else {
+            return None;
+        };
+        if !self.extra() {
+            return None;
+        }
+        self.next_id += 2;
+        self.flush_raw(out);
+        let start = out.lines.len();
+        out.line(text);
+        self.record(id, start, out);
+        Some(2)
+    }
+
     /// `local[a] := stack_obj; local[v] := 0; while set_to_next(person|all, dest: local[v])
     /// { .. } stack_obj := local[a];` as `for p in lot.sims() { .. }` (or `lot.objects()`).
     /// Without its own save, the loop restores from the tree's hoisted `local[a]` save
@@ -2197,16 +2548,28 @@ impl Translator<'_> {
         // (statements before the body, whether a restore follows it, mode, body)
         let with_save = |save: &Stmt, init, w, restore| {
             let p = for_each_parts(init, w, restore)?;
-            (self_save_local(save) == Some(p.saved)).then_some((3, true, p.mode, p.body))
+            (self_save_local(save) == Some(p.saved)).then_some((
+                3,
+                true,
+                p.mode,
+                p.stack_cursor,
+                p.body,
+            ))
         };
         let hoisted = |init, w, restore| {
             let p = for_each_parts(init, w, restore)?;
-            (self.hoisted_save == Some(p.saved)).then_some((2, true, p.mode, p.body))
+            (self.hoisted_save == Some(p.saved)).then_some((
+                2,
+                true,
+                p.mode,
+                p.stack_cursor,
+                p.body,
+            ))
         };
         // v2's optimizer drops a save and restore nothing reads (a restore just before
         // `return`), leaving the bare loop.
-        let bare = |init, w| for_each_core(init, w, None).map(|(m, b)| (2, false, m, b));
-        let (head, restores, mode, body) = match rest {
+        let bare = |init, w| for_each_core(init, w, None).map(|(m, c, b)| (2, false, m, c, b));
+        let (head, restores, mode, stack_cursor, body) = match rest {
             [save, init, w, restore, ..] if self_save_local(save).is_some() => {
                 with_save(save, init, w, restore)
             }
@@ -2214,6 +2577,10 @@ impl Translator<'_> {
             [init, w, ..] => bare(init, w),
             _ => None,
         }?;
+        // The zero-local form is v2 PR F's: a tree that does not prove keeps it raw.
+        if stack_cursor && !self.extra() {
+            return None;
+        }
         let used = head + usize::from(restores);
         let id = self.next_id;
         // The save (if any), the init and the `while` come first in pre-order; the restore
@@ -2238,7 +2605,17 @@ impl Translator<'_> {
         out.line(format!("for {var_name}{suffix} in {source} {{"));
         out.indent += 1;
         self.loop_depth += 1;
+        let outer_sims = std::mem::replace(
+            &mut self.sims_loop,
+            (mode == 1).then(|| format!("{var_name}{suffix}")),
+        );
+        let outer_cursor = std::mem::replace(
+            &mut self.cursor,
+            stack_cursor.then(|| format!("{var_name}{suffix}")),
+        );
         self.block(body, out);
+        self.cursor = outer_cursor;
+        self.sims_loop = outer_sims;
         self.loop_depth -= 1;
         self.flush_raw(out);
         out.indent -= 1;
@@ -2348,7 +2725,18 @@ impl Translator<'_> {
                     CompareOp::Ge => ">=",
                     CompareOp::Le => "<=",
                     CompareOp::Ne => "!=",
-                    CompareOp::FlagTest | CompareOp::IncLt | CompareOp::DecGt => return None,
+                    CompareOp::IncLt | CompareOp::DecGt => {
+                        let name = if *op == CompareOp::IncLt {
+                            "inc_lt"
+                        } else {
+                            "dec_gt"
+                        };
+                        let (place, bound) = (self.lvalue(lhs)?, self.rvalue(rhs)?);
+                        return self
+                            .extra()
+                            .then(|| format!("{name}(&mut {place}, {bound})"));
+                    }
+                    CompareOp::FlagTest => return None,
                 };
                 Some(format!("{} {op} {}", self.rvalue(lhs)?, self.rvalue(rhs)?))
             }
@@ -2430,6 +2818,19 @@ impl Translator<'_> {
                     self.rvalue(amount)?
                 ))
             }
+            // `play_sound(sound)` targets the Sim in an object's own tree and the stack object
+            // (`self`) in an interaction; `sim` names the other target there.
+            PrimitiveCall::PlaySound { sound_id, flags }
+                if self.model.sounds.contains_key(sound_id) =>
+            {
+                let target = match (self.sim, flags) {
+                    (false, 0) | (true, 2) => "",
+                    (true, 0) => ", sim",
+                    _ => return None,
+                };
+                self.extra()
+                    .then(|| format!("play_sound(sound_{sound_id}{target})"))
+            }
             PrimitiveCall::StopAllSounds { use_stack_object } => {
                 match (self.sim, use_stack_object) {
                     (false, false) | (true, true) => Some("stop_all_sounds()".to_owned()),
@@ -2460,6 +2861,26 @@ impl Translator<'_> {
             PrimitiveCall::Drop => "drop()".to_owned(),
             PrimitiveCall::GosubFoundAction => "gosub_found_action()".to_owned(),
             PrimitiveCall::NotifyIdle => "notify_out_of_idle()".to_owned(),
+            // The spelling v2 writes for `notify_out_of_idle()`.
+            PrimitiveCall::Padded {
+                call,
+                pad: crate::ast::OperandPad::Fill(0xff),
+            } if **call == PrimitiveCall::NotifyIdle && self.extra() => {
+                "notify_out_of_idle()".to_owned()
+            }
+            // v2 restores `stack_obj` after the call (and, as a condition, carries the
+            // result through a local).
+            PrimitiveCall::RunFunctionalTree {
+                function,
+                change_icon,
+            } if *function <= 255 && self.extra() => {
+                let icon = if *change_icon {
+                    ", change_icon: true"
+                } else {
+                    ""
+                };
+                format!("stack_obj.run_functional({function}{icon})")
+            }
             PrimitiveCall::Breakpoint { cond } => format!("breakpoint({})", self.rvalue(cond)?),
             PrimitiveCall::Random { dst, range } => {
                 let range = self.rvalue(range)?;
@@ -2557,9 +2978,27 @@ impl Translator<'_> {
                     Some(format!("library_consts.{name}"))
                 }
             }
+            10 if o.index == 0 && self.cursor.is_some() => self.cursor.clone(),
             9 if o.index == 0 && self.in_handler => Some("event".to_owned()),
+            20 if !self.sim && o.index >= 0 && self.extra() => {
+                Some(format!("self.slot[{}]", o.index))
+            }
+            16 if self.sim && o.index >= 0 && self.extra() => {
+                Some(format!("self.slot[{}]", o.index))
+            }
+            19 if o.index == 65 => {
+                let p = self.person_binding()?;
+                Some(format!("{p}.kind"))
+            }
             _ => self.lvalue(r),
         }
+    }
+
+    /// The `for p in lot.sims()` binding that `stack.person[..]` reads through. v2 points
+    /// `stack_obj` at `p` around each access and restores it after.
+    fn person_binding(&self) -> Option<&str> {
+        let p = self.sims_loop.as_deref()?;
+        self.extra().then_some(p)
     }
 
     fn lvalue(&self, r: &OperandRef) -> Option<String> {
@@ -2570,6 +3009,19 @@ impl Translator<'_> {
         if i < 0 {
             return None;
         }
+        if let Some(c) = &self.cursor {
+            // Inside a `stack_obj`-cursor loop the stack object is the binding, and
+            // `stack_obj` itself may not be written.
+            match o.scope {
+                1 => return Some(format!("{c}.attr[{i}]")),
+                4 => return Some(format!("{c}.data[{i}]")),
+                16 => return Some(format!("{c}.slot[{i}]")),
+                19 if i == 65 => return Some(format!("{c}.kind")),
+                19 => return Some(format!("{c}.person[{i}]")),
+                10 | 13 | 15 | 27 => return None,
+                _ => {}
+            }
+        }
         Some(match (o.scope, self.sim) {
             (8, _) => format!("temp[{i}]"),
             (6, _) => format!("global[{i}]"),
@@ -2578,6 +3030,8 @@ impl Translator<'_> {
             (3, false) => format!("self.data[{i}]"),
             (14, true) => format!("sim.motive[{i}]"),
             (18, true) => format!("sim.person[{i}]"),
+            (9, _) if !(self.in_handler && i == 0) && self.extra() => format!("param[{i}]"),
+            (19, _) => format!("{}.person[{i}]", self.person_binding()?),
             _ => return None,
         })
     }
