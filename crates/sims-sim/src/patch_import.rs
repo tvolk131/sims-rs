@@ -214,28 +214,20 @@ pub fn pending(neighborhood: &Neighborhood, expansions: u8) -> Result<bool, Load
 }
 
 /// The scan shows each file's family before importing it (0x42bfca to
-/// 0x4e29f5), which asks after its members' GUIDs among the
-/// neighborhood's records (0x4e2a99 to 0x4e1b2b) and gets an inventory
-/// for each it finds (0x410282). That is not ported: a member GUID that
-/// some record has fails. Records only grow during the import, so the
-/// check before each import covers a preview run before all of them too.
-fn preview(neighborhood: &Neighborhood, patch: &Patch) -> Result<(), LoadError> {
-    for &guid in &patch.file.family.members {
-        if guid != 0
-            && neighborhood
-                .neighbors
-                .iter()
-                .flatten()
-                .any(|record| record.guid == guid)
-        {
-            return Err(LoadError::Neighborhood(format!(
-                "{}: member GUID {guid:#010x} has a record, so the preview (0x4e2a99) would \
-                 get it an inventory, which is not ported",
-                patch.name
-            )));
+/// 0x4e29f5). The preview reads the file's family (0x410305) and fills
+/// its panel (0x4e2a99 → 0x4e1b2b), which counts the family's MagiCoins
+/// (0x4e1b93 → 0x410282) in the open neighborhood, as the view's query
+/// of a lot does ([`count_magicoins`]): each member with a record gets an
+/// inventory, an empty one at the end of the vector when its record has
+/// none. The rest of the panel (the members' names and pictures, the
+/// lot's information, 0x4e2ada to 0x4e2b7c) is presentation.
+fn preview(neighborhood: &mut Neighborhood, patch: &Patch) -> Result<(), LoadError> {
+    count_magicoins(neighborhood, &patch.file.family.members).map_err(|error| match error {
+        LoadError::Neighborhood(message) => {
+            LoadError::Neighborhood(format!("{}: the preview (0x4e1b93): {message}", patch.name))
         }
-    }
-    Ok(())
+        other => other,
+    })
 }
 
 /// The last lot the view's set-up asks after (0x557125).
@@ -244,20 +236,14 @@ const LAST_VIEW_LOT: i32 = 80;
 /// Asks after a lot as the neighborhood view does (0x4e1d8e): the family
 /// living there, the first in the family vector whose house (+0x110) or
 /// second house (+0x13c) is the lot (0x425d95), counts its MagiCoins
-/// (0x410282). That gets each member's inventory, making an empty one at
-/// the end of the vector when the member's record has none (0x42a8a1):
-/// members in order, each by the first record with its GUID (0x42571f),
-/// skipping a member with no record. Nothing else the query reads or
-/// shows changes the neighborhood.
+/// (0x410282, [`count_magicoins`]). Nothing else the query reads or shows
+/// changes the neighborhood.
 ///
 /// - Two families on the lot fail: which is first depends on the
 ///   families' order (0x425209), which is not kept.
-/// - An empty slot in the inventory vector fails: the search (0x42a8cb)
-///   would read through its null pointer.
 /// - The caller checks that the lot's house file opens (0x4e1e04). Its
 ///   lot information's read (0x4e261f), whose failure would skip the
 ///   family, is taken to succeed.
-/// - A member whose GUID is 0 has no record (0x425723).
 fn ask_after(neighborhood: &mut Neighborhood, lot: i32) -> Result<(), LoadError> {
     if lot <= 0 {
         return Ok(());
@@ -278,7 +264,18 @@ fn ask_after(neighborhood: &mut Neighborhood, lot: i32) -> Result<(), LoadError>
         )));
     }
     let members = neighborhood.families[&id].members.clone();
-    for guid in members {
+    count_magicoins(neighborhood, &members)
+}
+
+/// A family's MagiCoins count (0x410282), as far as it changes the
+/// neighborhood: each member's inventory is found, and one made empty at
+/// the end of the vector when the member's record has none (0x42a8a1).
+/// Members go in order, each by the first record with its GUID
+/// (0x42571f); a member with no record is skipped, and so is a GUID of 0
+/// (0x425723). An empty slot in the inventory vector fails: the search
+/// (0x42a8cb) would read through its null pointer.
+fn count_magicoins(neighborhood: &mut Neighborhood, members: &[u32]) -> Result<(), LoadError> {
+    for &guid in members {
         if guid == 0 {
             continue;
         }
