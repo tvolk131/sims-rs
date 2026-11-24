@@ -5150,8 +5150,9 @@ impl NeighborhoodShell {
     }
 
     /// Where the shell keeps the open neighborhood's `Neighborhood.iff`:
-    /// `<saves>.userdata/<neighborhood id>/Neighborhood.iff`, beside the
-    /// saves file, never in the install. The original saves it to its
+    /// `<saves file name>.userdata/<neighborhood id>/Neighborhood.iff`
+    /// (`slot.redb.userdata/...`), beside the saves file, never in the
+    /// install. The original saves it to its
     /// `UserData` folder whenever the neighborhood changes
     /// (cTSNeighborhood::Save, 0x4252cc).
     pub fn neighborhood_iff_path(&self) -> PathBuf {
@@ -5159,9 +5160,11 @@ impl NeighborhoodShell {
     }
 
     fn neighborhood_iff_dir(&self) -> PathBuf {
-        self.saves_path
-            .with_extension("userdata")
-            .join(&self.neighborhood_id)
+        // The whole file name, extension and all, so `slot.redb` and
+        // `slot.backup` each have a folder of their own.
+        let mut dir = self.saves_path.clone().into_os_string();
+        dir.push(".userdata");
+        PathBuf::from(dir).join(&self.neighborhood_id)
     }
 
     /// Writes the open neighborhood's committed record as `Neighborhood.iff`

@@ -9459,6 +9459,21 @@ fn build_mode_walls_floors_wallpaper_doors_windows_and_undo_redo() {
     }
 }
 
+/// The pixel bounds (left, top, right, bottom, inclusive) each ID drew
+/// on `canvas`.
+fn drawn_bounds(canvas: &sims_render::Canvas) -> std::collections::BTreeMap<u16, [i32; 4]> {
+    let mut bounds = std::collections::BTreeMap::new();
+    for y in 0..canvas.height as i32 {
+        for x in 0..canvas.width as i32 {
+            if let Some(id) = canvas.id_at(x, y) {
+                let b = bounds.entry(id).or_insert([x, y, x, y]);
+                *b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+            }
+        }
+    }
+    bounds
+}
+
 /// A Sim draws what it carries at its right palm, not on the floor at its
 /// feet: the original draws a person's slot objects from the person's own
 /// draw (0x459dc0 → 0x59185d), slot 0 at the animator's attach point 0,
@@ -9487,6 +9502,8 @@ fn what_the_sims_carry_is_never_drawn_on_the_floor() {
     game.press(snack);
     game.release(snack);
     let mut held_frames = 0;
+    let mut drawn_frames = 0;
+    let mut lowest = 0.0f64;
     let mut carried = std::collections::BTreeSet::new();
     for _ in 0..600 {
         assert_eq!(game.run(10), 10);
@@ -9494,6 +9511,7 @@ fn what_the_sims_carry_is_never_drawn_on_the_floor() {
         let attach = game.held_attach();
         let floor = game.level();
         let world = game.lot().world();
+        let mut drawn = None;
         for object in world.objects.values() {
             let (holder, slot) = (object.data[2], object.data[3]);
             let Some(holder) = u16::try_from(holder)
@@ -9526,9 +9544,36 @@ fn what_the_sims_carry_is_never_drawn_on_the_floor() {
             );
             held_frames += 1;
             carried.insert(object.id);
+            // Where it was drawn: across its holder's figure (a plate held
+            // out sticks out beside it) and above the feet, not on the
+            // floor at its own position.
+            let drawn = drawn.get_or_insert_with(|| drawn_bounds(game.canvas()));
+            if let (Some(&[ox0, oy0, ox1, oy1]), Some(&[hx0, hy0, hx1, hy1])) =
+                (drawn.get(&object.id), drawn.get(&holder.id))
+            {
+                let centre = [(ox0 + ox1) / 2, (oy0 + oy1) / 2];
+                let tall = hy1 - hy0;
+                lowest = lowest.max(f64::from(centre[1] - hy0) / f64::from(tall));
+                drawn_frames += 1;
+                assert!(
+                    (hx0 - tall / 4..=hx1 + tall / 4).contains(&centre[0])
+                        && centre[1] >= hy0
+                        && centre[1] < hy1 - tall / 4,
+                    "tick {}: object {} in person {}'s slot {slot} is drawn at {centre:?}, \
+                     outside the upper figure {:?}",
+                    game.lot().ticks(),
+                    object.id,
+                    holder.id,
+                    [hx0, hy0, hx1, hy1]
+                );
+            }
         }
     }
-    eprintln!("{held_frames} held object-frames, objects {carried:?}, none without a point");
+    eprintln!(
+        "{held_frames} held object-frames, objects {carried:?}, none without a point; \
+         {drawn_frames} drawn, lowest centre {lowest:.2} of the holder's height"
+    );
+    assert!(drawn_frames >= 20, "{drawn_frames} held objects drawn");
     assert!(carried.contains(&263), "Mortimer never carried the snack");
     assert!(held_frames >= 20, "{held_frames} held frames");
 }

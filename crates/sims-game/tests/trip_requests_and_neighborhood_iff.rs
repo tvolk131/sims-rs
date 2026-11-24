@@ -227,8 +227,10 @@ fn a_lot_save_writes_neighborhood_iff_beside_the_saves() {
     let dir = TempDir::new("nbhd-iff-save");
     let mut shell = open_shell(root.clone(), &dir.0);
     let path = shell.neighborhood_iff_path();
+    // The folder is named for the whole saves file name, so `saves.redb`
+    // and a `saves.backup` beside it do not share one.
     assert!(
-        path.starts_with(&dir.0),
+        path.starts_with(dir.0.join("saves.redb.userdata")),
         "{} is not beside the saves",
         path.display()
     );

@@ -61,6 +61,13 @@ alone and a headless still decline the same way.
 still only latches the request (`declined_trip` with `same_trip`), as
 before. The shell refuses travel in co-op anyway.
 
+Once the session ends and the lot ticks on its own again, the next run
+drops a latched request (`Game::drop_trip_declined_in_coop`, then
+`Lot::cancel_trip_request`). Before this, the stale request stayed in the
+lot. A later routine 17 only adds to a pending request, and the latch hid
+it, so the host could not travel from that lot again until it was
+reloaded. This bug predates the change.
+
 ## Neighborhood.iff
 
 The original saves the neighborhood (`cTSNeighborhood::Save`, `0x4252cc`)
@@ -73,17 +80,24 @@ from 23 call sites. These include:
 The shell now writes the open neighborhood's committed record through
 `NeighborhoodStore::save_neighborhood_iff` (`NTemp.iff`, then renamed over
 `Neighborhood.iff`) whenever a commit has moved the record's
-`(instance_id, revision)`. That covers:
+`(instance_id, revision)`. The commits that do this are:
 - a lot save;
-- entering a lot (its reconcile commit);
 - a departure or return;
-- a co-op stage;
-- every `refresh_from_store` (family moves, evictions, CAF).
+- every commit followed by `refresh_from_store` (family moves, evictions,
+  CAF).
+
+Entering a lot and staging co-op also check, but they normally commit
+nothing. An ordinary entry boots from the snapshot and checks that the
+store's version did not change, and a co-op restage only replaces the game
+in memory. So they write only when a commit has not been written yet.
 
 Details:
-- **Where.** `<saves>.userdata/<neighborhood id>/Neighborhood.iff`
-  (`NeighborhoodShell::neighborhood_iff_path`), beside the saves file and
-  its `options.iff`. The install is never written.
+- **Where.** `<saves file name>.userdata/<neighborhood id>/Neighborhood.iff`
+  (`slot.redb.userdata/...`, `NeighborhoodShell::neighborhood_iff_path`),
+  beside the saves file. The install is never written. The folder takes the
+  whole file name, extension included, so `slot.redb` and a `slot.backup`
+  beside it do not share a folder. (`options.iff` still replaces the
+  extension, as before.)
 - **One write per revision.** The shell remembers the record it wrote, and
   opening a neighborhood counts as written. Opening alone writes nothing.
 - **REDB stays the store.** A failed write is logged and does not undo or
@@ -136,6 +150,13 @@ New install-gated integration tests in `crates/sims-game/tests/`:
   - The saved-state tokens are gone on the lot, in the store and in the
     file.
   - The file follows the family: secondary house 21, then 0.
+- `phone_go_downtown::a_trip_declined_in_coop_is_dropped_once_the_lot_plays_alone`:
+  - a phone trip is declined while hosting co-op (memory transport), so
+    the request stays in the lot;
+  - after leaving co-op, the next tick drops it with its saved state;
+  - the phone's Go Downtown then asks for a trip again.
+
+  Without the drop, the test fails at the first check after leaving.
 - `phone_go_downtown::a_declined_trip_lets_the_lot_play_on`: declining
   returns the request, the lot no longer has it, the saved state routine 17
   wrote is taken back, and the lot plays on.
@@ -148,14 +169,21 @@ that return. Only a group trip, or a kind-3 companion token, tells the two
 apart, and the VM's own tests cover both
 (`a_trip_home_from_a_group_trip_takes_back_its_own_tokens`,
 `a_trip_home_a_script_asks_for_takes_back_its_tokens`). No Magic Town lot
-offers a Go Home to test it through the shell.
+offers a Go Home to test it through the shell. A `sims-game` test cannot
+give the caller a kind-3 token either: the lot's world is not mutable
+outside `sims-vm`, which this change does not touch.
 
 Held objects:
 
-- `goth::what_the_sims_carry_is_never_drawn_on_the_floor`: Mortimer's snack,
-  then free will for 6,000 ticks, rendered every 10 ticks. 44 held
-  object-frames over objects 27, 28 and 263. Each had its holder's point
-  for the slot.
+- `goth::what_the_sims_carry_is_never_drawn_on_the_floor`: Mortimer's
+  snack, then free will for 6,000 ticks, rendered every 10 ticks.
+  - 44 held object-frames over objects 27, 28 and 263. Each had its
+    holder's point for the slot.
+  - 36 of them were drawn on screen. Each one's pixel centre lies across
+    its holder's figure, at most 0.35 of the figure's height below its
+    top. The limit is above the lowest quarter.
+  - With the attach points dropped from the held pass, the test fails: the
+    snack is drawn at the feet.
 - `sims-people` `a_held_object_is_placed_on_the_hand_that_holds_it`: at
   every zoom, rotation and level, the renderer's moved-object placement of
   `View::lot_point(hand)` lands within one fine unit of the hand vertex the

@@ -2833,7 +2833,8 @@ impl Game {
     /// stays in the lot and is only marked declined here. A later Generic
     /// Sims Call 17 does not replace a pending request; it only adds the
     /// neighbors it saved (`saved`). So the trip stays declined, whatever
-    /// later calls add, until the lot is left or reloaded.
+    /// later calls add, until the lot is left or reloaded, or until it ticks
+    /// on its own again after co-op, which drops the request.
     pub fn decline_trip(&mut self) -> Option<sims_sim::TripRequest> {
         if self.coop.is_active_or_starting() {
             self.declined_trip = self.lot.world().trip_request.clone();
@@ -2841,6 +2842,18 @@ impl Game {
         }
         self.declined_trip = None;
         self.lot.cancel_trip_request()
+    }
+
+    /// Drops a trip [`Game::decline_trip`] only marked declined during
+    /// co-op, once the lot ticks on its own again. Left in the lot, the
+    /// stale request would hide every later trip: Generic Sims Call 17 only
+    /// adds to a pending request, and the mark hides it (`same_trip`).
+    fn drop_trip_declined_in_coop(&mut self) {
+        if self.declined_trip.is_none() || self.coop.is_active_or_starting() {
+            return;
+        }
+        self.declined_trip = None;
+        self.lot.cancel_trip_request();
     }
 
     /// Enables or disables `--debug` mode (which shows the maroon top
@@ -3903,6 +3916,7 @@ impl Game {
         idle: bool,
         mut keep_going: impl FnMut(u32) -> bool,
     ) -> (u32, bool) {
+        self.drop_trip_declined_in_coop();
         let mut ran = 0;
         let mut capped = false;
         while ran < ticks && self.stopped.is_none() {
