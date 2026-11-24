@@ -38,6 +38,24 @@ impl Drop for TempDb {
     }
 }
 
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(label: &str) -> Self {
+        let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("sims-sim-save-{label}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn family(house: i32, number: i32, members: Vec<u32>) -> Family {
     Family {
         version: 9,
@@ -86,6 +104,11 @@ fn sample() -> StoredNeighborhood {
             None,
             Some(neighbor(1, "Ana", 0x2000_0001)),
             Some(neighbor(2, "Bo", 0x2000_0002)),
+            // A negative mode has person words too (0x423e8e).
+            Some(Neighbor {
+                person_mode: -1,
+                ..neighbor(3, "Cy", 0x2000_0003)
+            }),
         ],
         inventories: vec![
             None,
@@ -196,26 +219,63 @@ fn the_unset_family_is_skipped_and_a_nameless_one_has_an_empty_name() {
     assert!(iff.all(b"FAMh").next().is_none());
 }
 
-/// The import reads family 0 with a member list, which the original's
-/// reader skips for that ID (0x4105e7); the save writes it as the
-/// original would have read it.
+/// Family 0 has no member list (0x4105e7): the import reads it without
+/// one, and the save writes it the same way.
 #[test]
-fn family_zero_read_with_a_member_list_is_saved_without_one() {
+fn family_zero_is_imported_and_saved_without_a_member_list() {
     let mut neighborhood = sample();
-    // As the original wrote it: no member list, so the secondary house
-    // (0) and the version 9 words follow the fixed fields.
-    let native = family(0, 2, Vec::new());
-    let chunk = native.to_chunk(0).unwrap();
-    // As the import reads it: the secondary house taken for a count.
-    let misread = Family::parse(&chunk).unwrap();
-    assert_ne!(misread, native);
-    neighborhood.families.insert(0, misread);
+    // A secondary house of 2 and nonzero version 9 words: read with a
+    // member list, these would be two members and a short tail.
+    let mut tail = vec![0; 16];
+    tail[0..4].copy_from_slice(&2i32.to_le_bytes());
+    tail[4..8].copy_from_slice(&0x0001_0001u32.to_le_bytes());
+    tail[12..16].copy_from_slice(&0x0002_0002u32.to_le_bytes());
+    let zero = Family {
+        tail,
+        ..family(0, 2, Vec::new())
+    };
+    neighborhood.families.insert(0, zero.clone());
     let bytes = neighborhood
         .neighborhood_iff(&SaveInputs::default())
         .unwrap();
-    let iff = Iff::parse(bytes).unwrap();
-    let saved = iff.get(b"FAMI", 0).unwrap();
-    assert_eq!(iff.data(saved), chunk);
+    let iff = Iff::parse(bytes.clone()).unwrap();
+    let chunk = iff.data(iff.get(b"FAMI", 0).unwrap());
+    assert_eq!(chunk, zero.to_chunk(0).unwrap());
+    assert_eq!(Family::parse_chunk(chunk, 0).unwrap(), zero);
+
+    let folder = TempDir::new("family-zero");
+    std::fs::write(folder.0.join("Neighborhood.iff"), &bytes).unwrap();
+    let db = TempDb::new("family-zero");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store.import_directory("Zero", &folder.0, 0xff).unwrap();
+    let imported = store.load_neighborhood("Zero").unwrap().unwrap();
+    assert_eq!(imported.families[&0], zero);
+    assert_eq!(
+        imported.neighborhood_iff(&SaveInputs::default()).unwrap(),
+        bytes
+    );
+}
+
+/// NGBH option bytes other than 0 and 1 survive the store, which keeps
+/// only their truth, when the save is given the bytes it read.
+#[test]
+fn option_bytes_read_from_a_save_are_written_again() {
+    let neighborhood = sample();
+    let mut inputs = SaveInputs::default();
+    let plain = neighborhood.neighborhood_iff(&inputs).unwrap();
+    let (mut file, uninitialized) = NeighborhoodFile::parse(&plain).unwrap();
+    file.neighborhood.option_bytes[0] = 2;
+    let odd = file.to_bytes(&uninitialized).unwrap();
+    assert_ne!(odd, plain);
+
+    inputs = SaveInputs::from_saved(&odd).unwrap();
+    assert_eq!(neighborhood.neighborhood_iff(&inputs).unwrap(), odd);
+
+    // An option changed since the read is written as 0 or 1.
+    let mut changed = neighborhood.clone();
+    changed.options.as_mut().unwrap()[0] = false;
+    let (file, _) = NeighborhoodFile::parse(&changed.neighborhood_iff(&inputs).unwrap()).unwrap();
+    assert_eq!(file.neighborhood.option_bytes[0], 0);
 }
 
 /// A neighborhood with no NGBH options or TATT read still saves, with the

@@ -8,11 +8,16 @@
 //! own updates of data word 2 (+0x12c) and the current family's
 //! architecture value (+0x11c) come before its chunks. The store does not keep two things the
 //! file has: each family's FAMh, which the save copies as it is, and the
-//! bytes the save leaves uninitialized. [`SaveInputs`] carries them.
+//! bytes the save leaves uninitialized. [`SaveInputs`] carries them, with
+//! the NGBH option bytes as read (the store keeps only their truth).
+//!
+//! Family 0 is written without a member list (0x4105e7). The import reads
+//! it that way since this change; a store imported before it holds family
+//! 0 read with one, which the save drops, so such a store is re-imported.
 
 use crate::neighborhood_store::StoredNeighborhood;
 use crate::{Error, Result};
-use sims_formats::neighborhood::{Family, Neighborhood, Neighbors};
+use sims_formats::neighborhood::{Neighborhood, Neighbors};
 use sims_formats::neighborhood_file::{FamilyRecord, NeighborhoodFile, Uninitialized};
 use sims_formats::tatt::Tatt;
 use std::collections::BTreeMap;
@@ -26,6 +31,9 @@ pub struct SaveInputs {
     pub histories: BTreeMap<u16, Vec<u8>>,
     /// The bytes the save leaves uninitialized; zero by default.
     pub uninitialized: Uninitialized,
+    /// NGBH option bytes as read. Each is written as read while its truth
+    /// is the stored option's; otherwise the option is written as 0 or 1.
+    pub option_bytes: Vec<u8>,
 }
 
 impl SaveInputs {
@@ -34,6 +42,7 @@ impl SaveInputs {
     pub fn from_saved(bytes: &[u8]) -> Result<Self> {
         let (file, uninitialized) = NeighborhoodFile::parse(bytes)
             .map_err(|error| Error::Store(format!("Neighborhood.iff: {error}")))?;
+        let option_bytes = file.neighborhood.option_bytes;
         let histories = file
             .families
             .into_iter()
@@ -42,6 +51,7 @@ impl SaveInputs {
         Ok(Self {
             histories,
             uninitialized,
+            option_bytes,
         })
     }
 }
@@ -71,19 +81,16 @@ impl StoredNeighborhood {
     }
 
     /// What the neighborhood save writes for this neighborhood.
-    pub fn neighborhood_file(
-        &self,
-        histories: &BTreeMap<u16, Vec<u8>>,
-    ) -> Result<NeighborhoodFile> {
+    pub fn neighborhood_file(&self, inputs: &SaveInputs) -> Result<NeighborhoodFile> {
         let families = self
             .family_order()
             .into_iter()
             .map(|id| {
                 Ok(FamilyRecord {
                     id,
-                    family: as_read(id, &self.families[&id])?,
+                    family: self.families[&id].clone(),
                     name: self.family_surname(id).unwrap_or_default().to_owned(),
-                    history: histories.get(&id).cloned(),
+                    history: inputs.histories.get(&id).cloned(),
                 })
             })
             .collect::<Result<_>>()?;
@@ -93,7 +100,7 @@ impl StoredNeighborhood {
                 data: self.data,
                 inventories: self.inventories.clone(),
                 options: self.options.unwrap_or(DEFAULT_OPTIONS),
-                option_bytes: Vec::new(),
+                option_bytes: inputs.option_bytes.clone(),
                 tail: Vec::new(),
             },
             neighbors: Neighbors {
@@ -115,27 +122,8 @@ impl StoredNeighborhood {
     /// The bytes of `Neighborhood.iff` as the neighborhood save writes
     /// them.
     pub fn neighborhood_iff(&self, inputs: &SaveInputs) -> Result<Vec<u8>> {
-        self.neighborhood_file(&inputs.histories)?
+        self.neighborhood_file(inputs)?
             .to_bytes(&inputs.uninitialized)
             .map_err(|error| Error::Store(format!("Neighborhood.iff: {error}")))
     }
-}
-
-/// Family `id` as the original reads it. The import reads every FAMI with
-/// a member list ([`Family::parse`]), but the original reads none for
-/// family 0 (0x4105e7), so a family 0 read that way took its secondary
-/// house for a member count and is short of the words after it. Such a
-/// record is read again; any other is as stored.
-fn as_read(id: u16, family: &Family) -> Result<Family> {
-    let expected = match family.version {
-        9.. => 16,
-        8 => 4,
-        _ => 0,
-    };
-    if id != 0 || family.tail.len() >= expected {
-        return Ok(family.clone());
-    }
-    family
-        .for_chunk(0)
-        .map_err(|error| Error::Store(format!("family 0: {error}")))
 }

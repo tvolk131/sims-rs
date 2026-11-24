@@ -66,7 +66,10 @@ The payload follows.
   - int 10, then int 9 (the record's own version);
   - the name, via 0x464c3e;
   - int +0x1c, then int +0x18 (the person mode);
-  - if the mode is nonzero, 0x100 shorts from +0x74;
+  - if the mode is nonzero (0x423e8e, `je`: negative modes too),
+    0x100 shorts from +0x74. 0x423e08 is the read and write in one, so
+    the reader now reads them for any nonzero mode, not only positive
+    ones;
   - short id, int GUID (+4);
   - the relationship map (0x4650ee): −1, the count, then per entry 1,
     the target, the count, and the values.
@@ -123,18 +126,31 @@ as an input, and the save uses the recorded order as the constant
 ## What the store doesn't keep
 
 `StoredNeighborhood` is postcard-encoded with migrations, so this change
-adds no fields to it. A save needs three things the store doesn't keep:
+adds no fields to it. A save needs things the store doesn't keep:
 
 - the FAMh payloads;
-- the uninitialized bytes;
-- the map's unused bytes.
+- the uninitialized bytes and the map's unused bytes;
+- the NGBH option bytes as read. The original saves each option byte as
+  it holds it, and a read keeps any nonzero byte; the store keeps only
+  each option's truth.
 
-They go in a separate `SaveInputs`. Keeping FAMh in REDB needs a store
-migration, which is a follow-up.
+They go in a separate `SaveInputs`, which `SaveInputs::from_saved` reads
+from an earlier save. Keeping FAMh in REDB needs a store migration, which
+is a follow-up.
 
-The import reads family 0 with a member list, which the original doesn't
-(0x4105e7). The save detects a family 0 that was read this way (its
-version 8/9 tail is short) and reads it again without the list.
+## Family 0
+
+The original reads and writes family 0 without a member list (0x4105e7).
+`sims_content::Neighborhood::open` reads every FAMI with one, so family
+0's secondary house is taken for a member count. The store's import now
+reads family 0 again as the original does (`Family::for_chunk(0)`), and
+the save writes the stored record as it is. A store imported before this
+change keeps the misread record, so it should be imported again.
+
+`Neighborhood::open` itself still fails on a family 0 whose secondary
+house, taken as a count, runs past the chunk. The fix belongs in
+sims-content's reader (`Family::parse_chunk` with the chunk ID), which is
+outside this change.
 
 The lot-dependent updates in steps 2 and 5, and 0x427bd7, are
 writeback, not serialization. `StoredNeighborhood::write_back_world`

@@ -1975,10 +1975,17 @@ impl NeighborhoodStore {
             houses.insert(number, bytes);
         }
 
+        // The content reader reads every FAMI with a member list, but the
+        // original reads none for family 0 (0x4105e7): what it took for
+        // family 0's member count is the secondary house.
+        let mut families = neighborhood.families;
+        if let Some(zero) = families.get_mut(&0) {
+            *zero = zero.for_chunk(0).map_err(store)?;
+        }
         let mut stored = StoredNeighborhood {
             name: id.to_owned(),
-            family_surnames: read_family_surnames(directory, &neighborhood.families),
-            families: neighborhood.families,
+            family_surnames: read_family_surnames(directory, &families),
+            families,
             neighbors: neighborhood.neighbors,
             inventories: neighborhood.inventories,
             data: neighborhood.data,

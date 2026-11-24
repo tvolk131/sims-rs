@@ -72,7 +72,20 @@ pub fn write_new_file<'a>(
         cursor: FILE_HEADER,
         unused: 0,
     };
+    let mut keys = std::collections::BTreeSet::new();
     for &chunk in chunks {
+        // A second write of a key would replace the first and leave a
+        // hole, whose bytes are not the map's alignment bytes.
+        if !keys.insert((chunk.tag, chunk.id)) {
+            return Err(Error::new(
+                0,
+                format!(
+                    "{} #{} written twice to a new file",
+                    String::from_utf8_lossy(&chunk.tag),
+                    chunk.id
+                ),
+            ));
+        }
         file.add(chunk, &mut residue)?;
     }
     file.types.sort_by_key(|group| {

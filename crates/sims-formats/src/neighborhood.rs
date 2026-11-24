@@ -259,7 +259,8 @@ impl Neighbors {
             let unknown_zero = r.i32()?;
             let person_mode = r.i32()?;
             let mut person_data = Vec::new();
-            if person_mode > 0 {
+            // 0x423e8e: any nonzero mode, negative too.
+            if person_mode != 0 {
                 for _ in 0..if version == 4 { 80 } else { 256 } {
                     person_data.push(r.i16()?);
                 }
