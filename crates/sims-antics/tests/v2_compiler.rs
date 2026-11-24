@@ -9634,3 +9634,114 @@ fn pr_f_negative_diagnostics() {
         "push_interaction(icon:) must name",
     );
 }
+
+/// Review regressions for PR F's optimizer and cursor/push/animate lowering: each probe is
+/// expanded and its `.air` checked, and each compiles.
+#[test]
+fn pr_f_review_regressions_lower_soundly() {
+    let cfg = PackResolverConfig::default();
+    let obj = |members: &str| {
+        format!(
+            "object \"Pr F review\" {{\n    guid: 0x7F40_0240;\n    state n: i16;\n{members}\n}}\n"
+        )
+    };
+    let tree_of = |name: &str, src: &str, id: u16| -> String {
+        compile_v2_source(name, src, &cfg).unwrap_or_else(|e| panic!("{name} must compile: {e}"));
+        let expanded = sims_antics::v2::expand_v2_source_to_objects(name, src, &cfg)
+            .unwrap_or_else(|e| panic!("{name} must expand: {e}"));
+        let air = &expanded[0].air_source;
+        let start = air
+            .find(&format!("tree {id} "))
+            .unwrap_or_else(|| panic!("{name}: no tree {id} in:\n{air}"));
+        let end = air[start..].find("\n}\n").map_or(air.len(), |e| start + e);
+        air[start..end].to_owned()
+    };
+
+    // A raw block with numeric branch targets keeps the entry save, so the targets still land.
+    let t = tree_of(
+        "raw_targets.antics",
+        &obj(
+            "    @id(4300) tree t (sim: Sim) {\n        raw {\n            stack_obj := my.id;\n            random(temp[0], 1) -> true: 3, false: 3;\n            stack.attr[0] := 1;\n            return true;\n        }\n    }",
+        ),
+        4300,
+    );
+    assert!(t.contains("let __self_obj = stack_obj;"), "{t}");
+
+    // A body that writes sprite flags, or shadows the Sim, never uses `stack_obj` as the cursor.
+    let t = tree_of(
+        "cursor_sprite.antics",
+        &obj("    init { for o in lot.objects() { self.sprite_flags[0] = 1; } }"),
+        4096,
+    );
+    assert!(!t.contains("dest: stack_obj"), "{t}");
+    let t = tree_of(
+        "cursor_shadow.antics",
+        &obj("    @id(4300) tree t (sim: Sim) { for o in lot.objects() { let sim = o; sim.attr[0] = 1; } }"),
+        4300,
+    );
+    assert!(!t.contains("dest: stack_obj"), "{t}");
+
+    // Scope 27 reads the stack object, so the switch before a sprite store stays.
+    let t = tree_of(
+        "sprite_scope.antics",
+        &obj(
+            "    @id(4300) tree t (sim: Sim) { stack_obj = sim; temp[0] = 0; stack_obj.sprite_flags[0] = 1; return true; }",
+        ),
+        4300,
+    );
+    assert!(t.contains("stack_obj := my.id;"), "{t}");
+
+    // A pinned push of a local read before any write keeps the copy into the pin slot.
+    let t = tree_of(
+        "pin_uninit.antics",
+        &obj(
+            "    @id(4300) tree t (sim: Sim) { let o: ObjectId; push_interaction(object: o, menu: 0, priority: 2, icon: o); }",
+        ),
+        4300,
+    );
+    assert!(t.contains("local[0] := "), "{t}");
+
+    // The entry save is not forwarded into a local-slot operand.
+    let t = tree_of(
+        "icon_forward.antics",
+        &obj(
+            "    @id(4300) tree t (sim: Sim) { push_interaction(object: 0, menu: 0, priority: 2, icon: self); stack_obj = sim; return true; }",
+        ),
+        4300,
+    );
+    assert!(!t.contains("icon: stack_obj"), "{t}");
+
+    // A comment naming a local does not count toward the frame.
+    tree_of(
+        "frame_comment.antics",
+        &obj(
+            "    @id(4300) @frame(locals: 0) tree t () {\n        raw { /* local[0] is unused */ }\n        animate(clip: 3, event_local: 1);\n        return true;\n    }",
+        ),
+        4300,
+    );
+
+    // `icon: self` in an object's own tree is materialized from `my.id`.
+    let t = tree_of(
+        "icon_self_object.antics",
+        &obj(
+            "    @id(4300) tree t () { let o = stack_obj; push_interaction(object: o, menu: 0, priority: 2, icon: self); }",
+        ),
+        4300,
+    );
+    assert!(t.contains("= my.id;"), "{t}");
+
+    // `animate(event_local:)` and `sleep` in one tree is a v2 diagnostic, not a backend error.
+    let err = compile_v2_source(
+        "event_local_sleep.antics",
+        &obj(
+            "    @id(4300) @frame(locals: 0) tree t (sim: Sim) { animate(clip: 3, event_local: 1); sleep(1); return true; }",
+        ),
+        &cfg,
+    )
+    .expect_err("event_local with sleep must fail");
+    assert!(
+        err.message
+            .contains("a tree cannot mix raw ops with sleep()"),
+        "{err}"
+    );
+}

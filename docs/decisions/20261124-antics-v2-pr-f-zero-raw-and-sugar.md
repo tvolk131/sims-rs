@@ -41,9 +41,11 @@ Constraints:
     - `stack_obj.<field>`. This is a direct `stack.` cell; see G1.
   - So that the analysis can trust the name, binding `stack_obj` as a variable, parameter, loop variable, or event name is now a parse error.
   - The optimizer forwards the entry save: until the first node that may write `stack_obj` (an assignment to it, or any primitive except `test_object_type`, `action_string`, and `alter_budget`; subroutine calls cannot), a read of `__self_obj` / `__saved_stack_obj` is `stack_obj` itself. A restore there becomes `stack_obj := stack_obj` and goes.
-  - A save that nothing then names is dropped. It is the compiler's node, not the source's, so the tree's first statement runs on entry as written.
+    - Only value operands are forwarded. A primitive argument `.air` parses as a local slot (`icon:`, `local:`, `skin:`, `age:`, `sex:`, `dest:`), or an unlabelled one, stops the forwarding: it may name or write the save's slot.
+    - Raw scope cells count by scope number. Scope 10 is the stack object, scope 27 (sprite flags) reads the stack object's cells, and any scope not on a short stack-free list counts as a read.
+  - A save that nothing then names is dropped when the next node ignores the last result (it is an expression node, and a primitive such as `idle_for_input` may read the last result).
   - A `stack_obj := x` store goes when nothing can read the stack object before it is overwritten or the frame returns, on every path (a loop, a call, or a `stack.` read counts as a read), and the next node ignores the last result.
-  - A tree that keeps its layout (`raw`) skips the optimizer. Even there, `finish()` drops the entry save when nothing else names `__self_obj` and the next node ignores the last result.
+  - A tree that keeps its layout (`raw`) skips the optimizer. Even there, `finish()` drops the entry save when nothing else names `__self_obj` and the next node ignores the last result. It does not drop the save when the body has an explicit branch target (`->`, which may be a node number) or a raw op or `scope(25, N)` (which may name a local's frame word by number).
 - **L8: `run_functional` branches directly.**
   - `if [!]obj.run_functional(..) { A } else { B }` lowers to `if [!]run_functional_tree(..) { restore; A } else { restore; B }`.
   - `return [!]obj.run_functional(..)` lowers to `if [!]prim { restore; return true; } restore; return false;`. This applies when no cleanup is active and the tree has no value-return ABI.
@@ -56,7 +58,7 @@ Constraints:
     - `x.is_type(..)`;
     - in object trees, `self.` fields (they are `my.`).
 
-    Anything else keeps the cursor local, because it might read the stack object implicitly: calls, raw, `self` in a Sim tree, `stack_obj`, or any other handle's fields. Cursor field reads are direct `stack.` cells. The loop is followed by the usual restore, which the optimizer drops before a `return`.
+    Anything else keeps the cursor local, because it might read the stack object implicitly: calls, raw, `self` in a Sim tree, `stack_obj`, any other handle's fields, and `sprite_flags[i]` on any handle (scope 27 switches the stack object). A body `let` must not shadow a name already bound, because the whitelist resolves names as they stand outside the body. Cursor field reads are direct `stack.` cells. The loop is followed by the usual restore, which the optimizer drops before a `return`.
   - **Flat `||` / `&&` in `if` conditions** lower without a `__cond` local, through a condition-free single-pass loop (`while true` emits no node):
     - `if a || b { T } else { E }` becomes `while true { if !a { if !b { E; break; } } T; break; }`.
     - `if a && b { T } else { E }` becomes `while true { if a { if b { T; break; } } E; break; }`.
@@ -67,7 +69,8 @@ Constraints:
   - `.air` places named locals after `local[0]`;
   - a pinned tree has no `raw`;
   - only the push reads the slot;
-  - `push_interaction` does not read the last result.
+  - `push_interaction` does not read the last result;
+  - `s` is written before every read, on every path. Otherwise an early read would see whatever its frame word held, and a different word holds something else.
 
 ### 2. `raw` gaps
 
@@ -79,7 +82,8 @@ Constraints:
 - **G2.** `push_interaction(icon:)` also takes an object handle or `self`, besides an `i16` local.
   - When it is the same handle as `object:`, the icon reads the pinned `local[0]` (flags `0x01 | 0x02`), so one handle supplies both.
   - Another handle must be a plain local.
-- **G3.** `animate(.., event_local: N)` sends events to slot `N` (flag `0x20`) without binding them. It needs `@frame(locals: K)` with `N >= K`, so the slot is outside the frame and no binding can be there. After lowering, the tree's own locals are counted too: if they need more than `N` slots, it is an error. It lowers to the primitive's raw `op 0x002c (..)` form, because `.air`'s `animate(local: N)` would grow the frame to `N + 1`. It cannot be combined with `local:` or an `|event|` body.
+  - `self` is copied into a fresh local: from the stack object on entry in a Sim tree, from `my.id` in an object's own tree.
+- **G3.** `animate(.., event_local: N)` sends events to slot `N` (flag `0x20`) without binding them. It needs `@frame(locals: K)` with `N >= K`, so the slot is outside the frame and no binding can be there. After lowering, the tree's own locals are counted too: if they need more than `N` slots, it is an error. It lowers to the primitive's raw `op 0x002c (..)` form, because `.air`'s `animate(local: N)` would grow the frame to `N + 1`. It cannot be combined with `local:` or an `|event|` body. Because it is a raw op, a tree that uses it cannot also `sleep` (`.air` rejects raw ops alongside `idle()`). v2 reports that itself. The local count reads the lowered body's tokens, so comments and strings do not count: `let` names, after the highest explicit `local[N]` or `scope(25, N)`.
 
 ### 3. Decompiler gaps
 
@@ -108,6 +112,10 @@ Constraints:
   - the optimizer's identifier counts borrow the tree text instead of copying each name into a `String`;
   - "is this name mentioned" is a scan, not a count map;
   - the match chain reuses one buffer for each arm's tests.
+
+### 5. The last result is not part of v2's source semantics
+
+No v2 construct names the last result, and branch structure already decides it. For example, the body of `if !(a == 0)` starts after a false test, and an `else` body starts after a failed one. The optimizer keeps a node whose result a primitive or a branch test may read next. It does not keep a node only for the last result a frame pop sees: the VM passes that to the use-release check before the return writes its own result. Dead `stack_obj` stores before `return`, which earlier PRs already dropped, change it. So does L8's direct `return [!]run_functional(..)`, and so do the short-circuit `||` / `&&` forms, which can reach a `return` straight from a failed test. This matches the originals' code shapes, and the verifier proves the pilot trees equivalent with it.
 
 ## Consequences
 

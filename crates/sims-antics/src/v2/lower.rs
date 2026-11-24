@@ -2882,6 +2882,15 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
         header.push(format!("kind: {kind}"));
     }
     let event_local = ctx.event_local;
+    if let (Some((espan, _)), Some(sleep)) = (event_local, ctx.sleep_span) {
+        return Err(Error::at(
+            espan,
+            format!(
+                "animate(event_local:) is a raw animate op, and a tree cannot mix raw ops with sleep() (line {}): use 'local:' with a variable, or move the sleep to another tree",
+                sleep.line
+            ),
+        ));
+    }
     let body = ctx.finish();
     if let (Some((espan, slot)), Some(locals)) = (event_local, frame.locals) {
         // `.air` grows the frame to fit the named locals (after an explicit `local[0]` pin).
@@ -2911,20 +2920,43 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
     Ok(())
 }
 
-/// The frame locals `.air` allocates for a lowered tree body: one per `let` name, after slot 0
-/// when the body names `local[0]` (the pinned slot).
+/// The frame locals `.air` allocates for a lowered tree body: one per `let` name, after every
+/// explicit local (`local[N]`, `scope(25, N)`). Read from the body's tokens, so comments and
+/// strings name nothing.
 fn count_frame_locals(body: &str) -> usize {
+    use crate::lexer::{TokenKind as T, tokenize};
+    let Ok(tokens) = tokenize(body) else {
+        // `.air` rejects the body anyway.
+        return 0;
+    };
+    let kinds: Vec<&T> = tokens.iter().map(|t| &t.kind).collect();
     let mut names = BTreeSet::new();
-    for line in body.lines() {
-        if let Some(rest) = line.trim_start().strip_prefix("let ") {
-            let name = rest
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .next()
-                .unwrap_or_default();
-            names.insert(name);
+    let mut explicit: Option<i64> = None;
+    for (i, k) in kinds.iter().enumerate() {
+        let next = |n: usize| kinds.get(i + n).copied();
+        match k {
+            T::Ident(w) if w == "let" => {
+                if let Some(T::Ident(name)) = next(1) {
+                    names.insert(name.as_str());
+                }
+            }
+            T::Ident(w) if w == "local" => {
+                if let (Some(T::LBracket), Some(T::Int(n))) = (next(1), next(2)) {
+                    explicit = explicit.max(Some(*n));
+                }
+            }
+            T::Ident(w) if w == "scope" => {
+                if let (Some(T::LParen), Some(T::Int(25)), Some(T::Comma), Some(T::Int(n))) =
+                    (next(1), next(2), next(3), next(4))
+                {
+                    explicit = explicit.max(Some(*n));
+                }
+            }
+            _ => {}
         }
     }
-    names.len() + usize::from(body.contains("local[0]"))
+    let first_named = explicit.map_or(0, |m| usize::try_from(m).unwrap_or(0) + 1);
+    first_named + names.len()
 }
 
 fn sprite_decl_to_spec(sp: SpriteDecl) -> SpriteSpec {
@@ -3624,6 +3656,9 @@ struct TreeLowerer<'a> {
     frame_locals: Option<u16>,
     /// The first `animate(event_local: N)`, as `(span, N)`.
     event_local: Option<(Span, u8)>,
+    /// The first `sleep`/`idle`, which `.air` lowers through `idle()`: it cannot share a tree
+    /// with a raw op such as `animate(event_local:)`.
+    sleep_span: Option<Span>,
 }
 
 impl<'a> TreeLowerer<'a> {
@@ -3664,6 +3699,7 @@ impl<'a> TreeLowerer<'a> {
             param_words_used: 0,
             frame_locals: None,
             event_local: None,
+            sleep_span: None,
         }
     }
 
@@ -4330,8 +4366,10 @@ impl<'a> TreeLowerer<'a> {
                 .as_ref()
                 .is_none_or(|v| self.cursor_expr_ok(v, cursor)),
             V2Stmt::Break { .. } | V2Stmt::Continue { .. } | V2Stmt::ReturnError { .. } => true,
-            V2Stmt::Let { name, init, .. } => name != cursor && self.cursor_expr_ok(init, cursor),
-            V2Stmt::LetUninit { name, .. } => name != cursor,
+            V2Stmt::Let { name, init, .. } => {
+                self.cursor_fresh_name(name, cursor) && self.cursor_expr_ok(init, cursor)
+            }
+            V2Stmt::LetUninit { name, .. } => self.cursor_fresh_name(name, cursor),
             V2Stmt::Assign { target, value, .. } => {
                 let target_ok = match target {
                     V2Expr::Ident(_, name) => {
@@ -4346,6 +4384,13 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// Whether a body `let` may bind `name`: it shadows nothing. The whitelist resolves names as
+    /// they stand outside the body, so a shadowing binding (`let sim = o;`) would be checked as
+    /// the outer one.
+    fn cursor_fresh_name(&self, name: &str, cursor: &str) -> bool {
+        name != cursor && name != "self" && name != "stack_obj" && self.lookup_var(name).is_none()
+    }
+
     /// Whether `base.<field>` / `base.<group>[i]` names a cell the cursor loop may touch: the
     /// cursor's own (`stack.`), the Sim's (`my.` in an interaction), or `self`'s in an object's
     /// own tree (`my.`).
@@ -4355,8 +4400,11 @@ impl<'a> TreeLowerer<'a> {
             || (self.is_self_ident(root) && matches!(self.tree_ctx, TreeContext::ObjectSelf))
     }
 
+    /// `sprite_flags[i]` is rejected on every root: it lowers through scope 27, which reads the
+    /// current stack object, so it switches `stack_obj` and restores it.
     fn cursor_place_ok(&self, place: &V2Expr, cursor: &str) -> bool {
         match place {
+            V2Expr::Field { field, .. } if field == "sprite_flags" => false,
             V2Expr::Field { base, .. } => match base.as_ref() {
                 V2Expr::Ident(_, root) => self.cursor_cell_root_ok(root, cursor),
                 V2Expr::Field { base: inner, .. } => {
@@ -4369,8 +4417,11 @@ impl<'a> TreeLowerer<'a> {
                     V2Expr::Ident(_, name) => {
                         matches!(name.as_str(), "temp" | "param") && self.lookup_var(name).is_none()
                     }
-                    V2Expr::Field { base: root, .. } => {
-                        matches!(root.as_ref(), V2Expr::Ident(_, r) if self.cursor_cell_root_ok(r, cursor))
+                    V2Expr::Field {
+                        base: root, field, ..
+                    } => {
+                        field != "sprite_flags"
+                            && matches!(root.as_ref(), V2Expr::Ident(_, r) if self.cursor_cell_root_ok(r, cursor))
                     }
                     _ => false,
                 };
@@ -7404,13 +7455,17 @@ impl<'a> TreeLowerer<'a> {
             {
                 return Ok(air_name.clone());
             }
-            if self.is_self_ident(name) && matches!(self.tree_ctx, TreeContext::SimOnObject { .. })
-            {
+            if self.is_self_ident(name) {
                 if self.has_self_obj_local {
                     return Ok("__self_obj".to_owned());
                 }
+                // The object is the stack object on entry to a Sim tree and `my` in its own.
+                let self_air = match self.tree_ctx {
+                    TreeContext::SimOnObject { .. } => "stack_obj",
+                    TreeContext::ObjectSelf => "my.id",
+                };
                 let tmp = self.fresh("icon");
-                self.line(format!("let {tmp} = stack_obj;"));
+                self.line(format!("let {tmp} = {self_air};"));
                 return Ok(tmp);
             }
         }
@@ -7971,6 +8026,7 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
         let (ticks_air, _) = self.lower_value_expr(&args[0].value)?;
+        self.sleep_span.get_or_insert(span);
         let cancel = if self.in_defer() {
             None
         } else {
