@@ -32,11 +32,13 @@ Generic Sims Call's table is at 0x45143a and its true branch at 0x44f7f0.
     kind-3 token; on the way out it is the first kind-1 token. The token's
     GUID must name an on-lot person (0x4e9753, 0x4e9608), whose neighbor
     inventory is then used (0x4572af, 0x42571f, 0x42a8a1).
-  - **Mode 1** takes the leader's family (0x425d69(word 61)). Other modes
+  - **Mode 1** takes the leader's family (0x425d69(word 61)). A missing
+    family is null, and 0x45a4fc then writes the leader alone. Other modes
     write the leader's tokens only and ask for no trip.
   - **Saved state.** Each inventory that gets tokens first loses every kind-2
     token (0x41f4e5(2)). It then gets kind-2 tokens through 0x41f38d, with
-    counts that are `__ftol` (0x636128) of the motives or the data words:
+    counts that are `__ftol` (0x636128, a 64-bit `fistp` cut to its low
+    word) of the motives, or the data words:
 
     | GUID | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 9 | 10 | 11 | 12 |
     | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -58,14 +60,16 @@ Generic Sims Call's table is at 0x45143a and its true branch at 0x44f7f0.
   - **The arrival clock** goes into tokens GUID 7 (hour) and GUID 8 (minute)
     (0x45a785).
     - If the current lot (global 10) is zoned residential (0x40745f,
-      0x42b9e3) and the house is in 40..50, temps 1 and 2 are the absolute
-      time.
+      0x42b9e3, which gives lot 0 zoning 1 and an unlisted lot 0) and the
+      house is in 40..50, temps 1 and 2 are the absolute time.
     - Otherwise they are added to the clock (globals 0 and 5). The minutes
       carry into the hour at 60, and the hour wraps at 24.
   - The neighborhood is then saved (0x4252cc), and 0x4fc713 records the
     request:
     - mode 0 records (house, leader GUID, 0);
-    - mode 1 records (house, 0, family).
+    - mode 1 records (house, 0, family);
+    - a request while one is pending (byte +0x130) is ignored, so the
+      first stands. The tokens are written either way.
 - **Routine 20** (0x45087d) works like routine 19 but reads kind 3. Temp 0
   names a person (error 0x1c otherwise).
   - The first kind-3 token picks the person of its GUID. If there is none,
@@ -119,12 +123,17 @@ Generic Sims Call's table is at 0x45143a and its true branch at 0x44f7f0.
   - the fare is 0, because the plugin already paid it with Alter Budget;
   - the tokens are left as routine 17 wrote them.
 
+  - the leader's kind-1 token is left as the date script wrote it.
+
   Wiring the request into the game loop is a Track 1 follow-up (it lives in
   `sims-game/src`).
 - **The API Downtown departure writes the same tokens.**
   `depart_to_destination` runs the same port (mode 0, +0 h 30 min, as the
   Go Downtown plugin does) on the frozen home lot. So Downtown motives
-  arrive as the marker's routine 21 leaves them: whole numbers.
+  arrive as the marker's routine 21 leaves them: whole numbers. A traveler
+  holding the tokens keeps the motives it is made with, not the live ones,
+  because a motive cut to 0 has no token and its live fraction would
+  outlive the restore.
   - Other destinations keep the snapshot overlay for now.
   - Their plugins pass: Vacation (14, *, mode from attribute 8), absolute
     on 40..49; Old Town (0, 15, *); Studio Town (0, 30, 0); Magic Town phone
@@ -136,11 +145,19 @@ Generic Sims Call's table is at 0x45143a and its true branch at 0x44f7f0.
   the leader's link is negative, as natively). The companion's traveler
   record keeps destination object ID 0, and the trip home finds it by
   GUID.
+  - If the trip goes home before the marker makes the companion, the
+    companion comes home as it left (its departure snapshot), and the
+    leader's kind-1 token goes back with the trip, as an abort's does.
+  - A version 1 trip's departure wrote no kind-1 token. When the leader
+    holds none for the companion, the companion is made on arrival with
+    the mutual date links, as that build did.
 - **The envelope moves to version 5** (`TRIP_TOKEN_ENVELOPE_VERSION`).
-  The layout is unchanged, so v1–v4 still decode, but a v5 trip carries
-  kind-2 tokens in the travelers' inventories. The trip home and the abort
-  clear those tokens for v5+ trips only (the stand-in for the plugin tail,
-  below); older trips never had them.
+  After the arrival family it records whether the departure left kind-2
+  tokens: the API Downtown departure and `depart_from_request` do, other
+  API departures do not. Only such a trip's return or abort takes kind-2
+  tokens out (the stand-in for the plugin tail, below), so a trip that
+  wrote none leaves the ones the travelers held. Versions 1 to 4 still
+  decode, and their departures wrote none.
 - **Routine 24 is a follow-up.** It needs the outfit editor's accessors
   and commit.
 

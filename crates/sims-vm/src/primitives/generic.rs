@@ -656,6 +656,9 @@ impl Machine<'_, '_> {
     /// [`World::trip_request`], which stands for the game's byte +0x1c
     /// +0xe1 and 0x4fc713's fields. When it records none (no neighbor
     /// record, or a mode other than 0 and 1) the request stays as it was.
+    /// 0x4fc713 also ignores a request while one is pending (its byte
+    /// +0x130), so the first request stands until the shell carries it out;
+    /// a later call still writes its tokens.
     fn request_trip_from_temps(&mut self) -> Result<(), Trap> {
         let me = self.me()?;
         if me.person.is_none() {
@@ -664,7 +667,7 @@ impl Machine<'_, '_> {
         let temp = |index: usize| me.temps.get(index).copied().unwrap_or(0);
         let (house, hour, minute, mode) = (temp(0), temp(1), temp(2), temp(3));
         if let Some(request) = self.request_trip(house, hour, minute, mode)? {
-            self.world.trip_request = Some(request);
+            self.world.trip_request.get_or_insert(request);
         }
         Ok(())
     }

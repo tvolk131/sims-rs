@@ -32,7 +32,7 @@ use support::*;
 
 /// The routines the install's trees call that the port refuses.
 const RESIDUALS: &[u16] = &[
-    0, 1, 4, 5, 13, 17, 20, 22, 23, 24, 25, 27, 29, 30, 32, 33, 34, 36, 38, 39, 40, 41, 42,
+    0, 1, 4, 5, 13, 24, 27, 29, 30, 32, 33, 34, 36, 38, 39, 40, 41, 42,
 ];
 
 /// The paths in `dir`, sorted, so the scan never depends on the order the

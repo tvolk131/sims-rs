@@ -80,12 +80,15 @@ pub(crate) fn saved_field(guid: u32) -> Option<SavedField> {
 }
 
 /// `__ftol` (0x636128) of a motive, as the word 0x41f38d takes: truncated
-/// toward zero, and the "integer indefinite" 0x80000000 (whose low word is
-/// 0) for NaN or a value out of range.
+/// toward zero by a 64-bit `fistp` (0x636141) and cut to its low word, and
+/// the "integer indefinite" 0x8000_0000_0000_0000 (whose low word is 0) for
+/// NaN or a value outside the signed 64-bit range.
 #[must_use]
 pub fn ftol_word(value: f32) -> i16 {
-    if value.is_finite() && value > -2_147_483_649.0 && value < 2_147_483_648.0 {
-        (value as i64 as i32) as i16
+    if value.is_finite()
+        && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&value)
+    {
+        (value as i64) as i16
     } else {
         0
     }
@@ -221,7 +224,7 @@ impl Machine<'_, '_> {
     ///    name a person type in the interface's table (0x4e9753) and an
     ///    on-lot person of it (0x4e9608); that person's record's inventory
     ///    is used (0x4572af, 0x42571f, 0x42a8a1). Mode 1 takes the leader's
-    ///    family.
+    ///    family; a missing family writes the leader alone.
     /// 4. The companion's saved state is written (0x45a3f7). Then, with a
     ///    family, each member on the lot (0x44093d) is saved to its record
     ///    (0x425a69) and its saved state written (0x45a5f9); member 0's
@@ -229,8 +232,9 @@ impl Machine<'_, '_> {
     ///    the clock. Without one the leader's own saved state is written
     ///    and its inventory gets the clock (0x45a507).
     /// 5. The clock ([`arrival_clock`]) goes in as tokens 7 and 8. It is
-    ///    absolute when the lot in global 10 is zoned residential (the raw
-    ///    table, 0x40745f → 0x42b9e3) and `house` (as passed) is 40 to 49.
+    ///    absolute when the lot in global 10 is zoned residential (0x40745f
+    ///    → 0x42b9e3, where lot 0 is residential) and `house` (as passed)
+    ///    is 40 to 49.
     /// 6. The neighborhood is saved (0x4252cc). The world holds the
     ///    inventories, and they are written when the lot is saved, so that
     ///    is not modeled.
@@ -286,31 +290,54 @@ impl Machine<'_, '_> {
                     }
                 }
             }
-            1 => family = Some(self.trip_family(family_id)?.members.clone()),
+            // 0x45a3ef: a missing family is null, and 0x45a4fc then writes
+            // the leader alone.
+            1 => {
+                family = self
+                    .world
+                    .families
+                    .iter()
+                    .find(|f| f.id == i32::from(family_id))
+                    .map(|f| f.members.clone());
+            }
             _ => {}
         }
+
+        // The members on the lot and their records, found before anything is
+        // written: the original reads through a missing record (0x45a662)
+        // and crashes, so a trap here must leave the world as it was.
+        let members = match family {
+            Some(members) => {
+                let mut found = Vec::new();
+                for (index, &guid) in members.iter().enumerate() {
+                    let Some(person) = self.first_person_of_type(guid) else {
+                        continue;
+                    };
+                    let record = self
+                        .world
+                        .neighbors
+                        .first_of(guid)
+                        .map(|n| n.id)
+                        .ok_or_else(|| {
+                            Trap::Invalid(format!(
+                                "family member 0x{guid:08X} has no neighbor record \
+                                 (0x45a662 reads through a null record)"
+                            ))
+                        })?;
+                    found.push((index, person, record));
+                }
+                Some(found)
+            }
+            None => None,
+        };
 
         if let Some((person, inventory)) = companion {
             self.write_saved_state(person, inventory)?;
         }
-        let clock_inventory = if let Some(members) = family {
+        let clock_inventory = if let Some(members) = members {
             let mut first = leader_inventory;
-            for (index, &guid) in members.iter().enumerate() {
-                let Some(person) = self.first_person_of_type(guid) else {
-                    continue;
-                };
+            for (index, person, record) in members {
                 people::save_to_record(self.world, person)?;
-                let record = self
-                    .world
-                    .neighbors
-                    .first_of(guid)
-                    .map(|n| n.id)
-                    .ok_or_else(|| {
-                        Trap::Invalid(format!(
-                            "family member 0x{guid:08X} has no neighbor record \
-                             (0x45a662 reads through a null record)"
-                        ))
-                    })?;
                 let inventory = self.inventory_slot(record);
                 if index == 0 {
                     first = inventory;
@@ -324,8 +351,10 @@ impl Machine<'_, '_> {
         };
 
         let global = |index: usize| self.world.globals.get(index).copied().unwrap_or(0);
-        let absolute = self.program.zoning.get(&global(GLOBAL_HOUSE)) == Some(&1)
-            && ABSOLUTE_CLOCK_HOUSES.contains(&house);
+        // 0x42b9e3 gives lot 0 zoning 1 and an unlisted lot zoning 0.
+        let lot = global(GLOBAL_HOUSE);
+        let residential = lot == 0 || self.program.zoning.get(&lot) == Some(&1);
+        let absolute = residential && ABSOLUTE_CLOCK_HOUSES.contains(&house);
         let (arrival_hour, arrival_minute) = arrival_clock(
             global(GLOBAL_HOURS),
             global(GLOBAL_MINUTES),
@@ -542,7 +571,15 @@ mod tests {
         assert_eq!(ftol_word(-57.9), -57);
         assert_eq!(ftol_word(-0.4), 0);
         assert_eq!(ftol_word(f32::NAN), 0);
-        assert_eq!(ftol_word(1.0e12), 0);
+        // A 64-bit fistp cut to its low word: 2^33 + 1024 and 2^31 + 256 are
+        // exact in f32, past the signed 32-bit range, with non-zero low words.
+        assert_eq!(ftol_word(8_589_935_616.0), 1024);
+        assert_eq!(ftol_word(2_147_483_904.0), 256);
+        assert_eq!(ftol_word(-2_147_483_904.0), -256);
+        // Outside the signed 64-bit range: integer indefinite, low word 0.
+        assert_eq!(ftol_word(1.0e19), 0);
+        assert_eq!(ftol_word(-1.0e19), 0);
+        assert_eq!(ftol_word(f32::INFINITY), 0);
     }
 
     #[test]
@@ -805,6 +842,95 @@ mod live_tests {
                 "member {index}: {tokens:?}"
             );
             assert!(!guids.contains(&8), "a minute of 0 adds no token");
+        }
+    }
+
+    #[test]
+    fn routine_17_keeps_a_pending_request_and_reads_lot_0_as_residential() {
+        let Some(mut goth) = goth("r17-pending") else {
+            return;
+        };
+        let mortimer_guid = goth.members[0];
+        let mortimer = goth.person(mortimer_guid);
+        let pending = TripRequest {
+            house: 58,
+            leader_guid: 0,
+            family: 1,
+            caller: 3,
+        };
+        goth.lot.world.trip_request = Some(pending);
+        goth.lot.world.globals[0] = 9;
+        goth.lot.world.globals[5] = 10;
+        // 0x42b9e3 gives lot 0 zoning 1: leaving for 40..49 is absolute.
+        goth.lot.world.globals[10] = 0;
+        goth.set_temps(mortimer, &[40, 14, 0, 0]);
+        assert_eq!(goth.call(mortimer, 17), Ok(true));
+        assert_eq!(
+            goth.lot.world.trip_request,
+            Some(pending),
+            "0x4fc713 ignores a request while one is pending"
+        );
+        let clock = |tokens: &[(u32, i16)]| -> Vec<(u32, i16)> {
+            tokens
+                .iter()
+                .copied()
+                .filter(|&(g, _)| g == ARRIVAL_HOUR_GUID || g == ARRIVAL_MINUTE_GUID)
+                .collect()
+        };
+        let tokens = saved(&goth.tokens(mortimer_guid));
+        assert!(
+            tokens.iter().any(|&(g, _)| g == 2),
+            "the tokens are written"
+        );
+        assert_eq!(clock(&tokens), [(7, 14)]);
+
+        // A lot missing from the zoning table is zoning 0: relative, 9:10
+        // and 14 hours is 23:10.
+        goth.lot.world.trip_request = None;
+        goth.lot.world.globals[10] = 0x7f00;
+        assert!(!goth.lot.program.zoning.contains_key(&0x7f00));
+        assert_eq!(goth.call(mortimer, 17), Ok(true));
+        assert_eq!(goth.lot.world.trip_request.map(|r| r.house), Some(40));
+        let tokens = saved(&goth.tokens(mortimer_guid));
+        // The leader's saved state erased the old kind-2 tokens first
+        // (0x41f4e5(2)), the clock with them.
+        assert_eq!(clock(&tokens), [(7, 23), (8, 10)]);
+    }
+
+    #[test]
+    fn routine_17_mode_1_without_a_family_writes_the_leader_alone() {
+        let Some(mut goth) = goth("r17-no-family") else {
+            return;
+        };
+        let members = goth.members.clone();
+        let leader = goth.person(members[1]);
+        for &guid in &members {
+            goth.set_tokens(guid, Vec::new());
+        }
+        assert!(!goth.lot.world.families.iter().any(|f| f.id == 0x7ff0));
+        goth.person_mut(leader).data[61] = 0x7ff0;
+        goth.lot.world.globals[0] = 9;
+        goth.lot.world.globals[5] = 10;
+        goth.set_temps(leader, &[21, 0, 30, 1]);
+        assert_eq!(goth.call(leader, 17), Ok(true));
+        assert_eq!(
+            goth.lot.world.trip_request,
+            Some(TripRequest {
+                house: 21,
+                leader_guid: 0,
+                family: 0x7ff0,
+                caller: leader,
+            })
+        );
+        for (index, &guid) in members.iter().enumerate() {
+            let tokens = saved(&goth.tokens(guid));
+            if index == 1 {
+                assert!(tokens.iter().any(|&(g, _)| g == 2), "{tokens:?}");
+                assert!(tokens.contains(&(ARRIVAL_HOUR_GUID, 9)), "{tokens:?}");
+                assert!(tokens.contains(&(ARRIVAL_MINUTE_GUID, 40)), "{tokens:?}");
+            } else {
+                assert!(tokens.is_empty(), "member {index}: {tokens:?}");
+            }
         }
     }
 
