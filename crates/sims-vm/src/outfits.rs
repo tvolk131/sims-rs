@@ -87,7 +87,7 @@ pub(crate) fn encode_cp1252(s: &str) -> Vec<u8> {
 
 /// Returns the longest prefix of `s` whose Windows-1252 byte encoding fits
 /// within `max_bytes`.
-fn truncate_cp1252(s: &str, max_bytes: usize) -> &str {
+pub(crate) fn truncate_cp1252(s: &str, max_bytes: usize) -> &str {
     let mut used = 0usize;
     for (idx, ch) in s.char_indices() {
         let len = if cp1252_byte(ch).is_some() {
@@ -149,7 +149,7 @@ pub(crate) fn parse_row_descriptor(row: &str, second_half: bool) -> (String, Str
 }
 
 /// Parses an ASCII integer prefix the way CRT `atoi` does (`0x58a712`, `0x40cbdd`).
-fn atoi_age(s: &str) -> i32 {
+pub(crate) fn atoi_age(s: &str) -> i32 {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) {
@@ -176,7 +176,7 @@ fn atoi_age(s: &str) -> i32 {
 
 /// Native gender code returned by `0x40ccac`: `0` male, `1` female, `2`
 /// dogmale, `3` dogfemale, `4` catmale, `5` catfemale, `-1` unknown/missing.
-fn profile_gender_code(gender: Option<&str>) -> i32 {
+pub(crate) fn profile_gender_code(gender: Option<&str>) -> i32 {
     let Some(g) = gender else {
         return -1;
     };
@@ -370,7 +370,7 @@ pub(crate) fn suit_scan_order(program: &Program, world: &mut World) -> Vec<Strin
 /// Returns the texture stem list (`0x40895a` / `0x6e48b0`), falling back to
 /// `ordered_wardrobe.textures()` in synthetic fixtures where `people.textures`
 /// is empty.
-fn texture_list(program: &Program) -> Vec<String> {
+pub(crate) fn texture_list(program: &Program) -> Vec<String> {
     if !program.people.textures.is_empty() {
         return program.people.textures.clone();
     }
@@ -573,7 +573,7 @@ fn match_body_pair(
     format_generated_body_row(best_suit.name, best_tex.name)
 }
 
-fn read_character_row(
+pub(crate) fn read_character_row(
     world: &World,
     guid: u32,
     profile: Option<&sims_content::Profile>,
