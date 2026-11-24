@@ -342,24 +342,27 @@ fn return_through_a_loop_and_cancellation_keep_their_fallbacks() {
 }
 
 #[test]
-fn helper_and_caller_defers_run_after_the_bool_is_decided() {
-    assert_inlined(
+fn helpers_with_defers_decide_the_bool_before_any_cleanup() {
+    // The helper's cleanup runs after its `return` routes the branch, so a direct branch would
+    // hand the caller's arm the cleanup's last result. Such helpers keep the general path: the
+    // bool is saved, then the helper's cleanup and the caller's run, in that order.
+    let src = source(
         r#"fn choose() -> bool {
             defer { temp[0] = 9; }
             return temp[0] > 0;
         }"#,
         "",
         "defer { temp[0] = 8; } return choose();",
-        r#"if temp[0] > 0 {
-            temp[0] = 9;
-            temp[0] = 8;
-            return true;
-        }
-        temp[0] = 9;
-        temp[0] = 8;
-        return false;"#,
-        0,
     );
+    let air = expand(&src);
+    let decided = air.find("__ret_choose_1 := 1;").expect("bool saved");
+    let helper_cleanup = air.find("temp[0] := 9;").expect("helper cleanup");
+    let caller_cleanup = air.find("temp[0] := 8;").expect("caller cleanup");
+    assert!(
+        decided < helper_cleanup && helper_cleanup < caller_cleanup,
+        "{air}"
+    );
+    compile(&src);
 }
 
 #[test]

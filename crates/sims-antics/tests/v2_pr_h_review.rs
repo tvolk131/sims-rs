@@ -23,6 +23,24 @@ fn expect_err(name: &str, src: &str, needle: &str) {
     );
 }
 
+/// Tree 4300's nodes as `(opcode, operands, true exit, false exit)`, and its local count.
+type Node = (u16, [u8; 8], u8, u8);
+
+fn nodes(src: &str) -> (u16, Vec<Node>) {
+    let cfg = PackResolverConfig::default();
+    let tree = compile_v2_source("nodes.antics", src, &cfg)
+        .unwrap_or_else(|e| panic!("must compile: {e}\n{src}"))
+        .behaviors
+        .remove(&4300)
+        .expect("tree 4300");
+    let nodes = tree
+        .instructions
+        .into_iter()
+        .map(|n| (n.opcode, n.operands, n.on_true, n.on_false))
+        .collect();
+    (tree.locals, nodes)
+}
+
 /// A synthetic object around `members`.
 fn obj(members: &str) -> String {
     format!(
@@ -359,9 +377,19 @@ fn raw_consts_leave_air_words_and_targets_alone() {
         "{body}"
     );
     assert!(body.contains("true: done, false: done;"), "{body}");
-    assert!(
-        body.contains("temp[1] := 0;"),
-        "operands still resolve:\n{body}"
+    // The constant is a tree-level `.air` constant, which only operand positions resolve.
+    assert!(body.contains("const done = 0;"), "{body}");
+    assert!(body.contains("temp[1] := done;"), "{body}");
+    assert_eq!(
+        nodes(&obj(r#"    const part = 0;
+    const done = 0;
+    @id(4300) tree a {
+        raw { set_to_next(part, dest: stack_obj); temp[1] := done; }
+    }"#)),
+        nodes(&obj(r#"    @id(4300) tree a {
+        raw { set_to_next(part, dest: stack_obj); temp[1] := 0; }
+    }"#)),
+        "operands still resolve"
     );
 }
 
@@ -381,4 +409,294 @@ fn slot_rewriting_leaves_labels_alone() {
         body.contains("@__slot3_a_0: temp[0] := local[3];"),
         "{body}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Review round 2
+// ---------------------------------------------------------------------------
+
+/// A raw constant spelled like a branch target stays the target, even with a comment (holding a
+/// `;`) between the arrow and the name: the `.air` parser resolves constants only as operands.
+#[test]
+fn raw_targets_stay_labels_past_comments() {
+    let raw = r#"raw { temp[1] := 0; expr(temp[0] := 7) -> true: /* ; */ done, false: done;
+            done: temp[1] := 17;
+            temp[1] += 1; }"#;
+    assert_eq!(
+        nodes(&obj(&format!(
+            "    const done = 3;\n    @id(4300) tree a {{ {raw} }}"
+        ))),
+        nodes(&obj(&format!("    @id(4300) tree a {{ {raw} }}"))),
+    );
+}
+
+/// A helper running raw code may write any frame word, so a caller local passed by value is
+/// copied before the helper runs.
+#[test]
+fn helpers_with_raw_code_get_copied_arguments() {
+    let air = expand(
+        "raw_alias.antics",
+        &obj(r#"    fn f(a: i16) -> i16 {
+        raw { __v_x_0 := 44; }
+        return a;
+    }
+    tree a {
+        let x = 17;
+        temp[0] = f(x);
+    }"#),
+    );
+    let body = tree(&air, "a");
+    assert!(body.contains("let __arg_a_1 = __v_x_0;"), "{body}");
+    assert!(body.contains("__ret_f_2 := __arg_a_1;"), "{body}");
+}
+
+/// Splitting an inline `if` out of an argument list keeps operand order: an earlier operand is
+/// read before a selector that writes it (`inc_lt(&mut temp[0], ..)`).
+#[test]
+fn inline_operands_are_read_before_a_writing_selector() {
+    let air = expand(
+        "motive_order.antics",
+        &obj(r#"    tree a {
+        set_motive_change(hunger, temp[0], if inc_lt(&mut temp[0], 2) { 10 } else { 20 });
+    }"#),
+    );
+    let body = tree(&air, "a");
+    let ls = lines(body);
+    let read = index_of(&ls, |l| l.ends_with("= temp[0];"), body);
+    let select = index_of(&ls, |l| l.contains("inc_lt"), body);
+    assert!(read < select, "{body}");
+}
+
+/// An `@slot` store is kept even when the tree itself never reads it again (another tree using
+/// the same frame word may), and a slot must lie inside an explicit `@frame(locals: L)`.
+#[test]
+fn pinned_stores_survive_and_fit_the_frame() {
+    let air = expand(
+        "pin_reuse.antics",
+        &obj(
+            r#"    @id(4200) tree seed { @slot(10) let x = 17; temp[1] = x; }
+    @id(4201) tree read { @slot(10) let x: i16; temp[0] = x; }"#,
+        ),
+    );
+    assert!(tree(&air, "seed").contains("local[10] := 17;"), "{air}");
+    expect_err(
+        "pin_frame.antics",
+        &obj("    @frame(locals: 3) tree a { @slot(3) let x: i16; temp[0] = x; }"),
+        "gives the tree 3 local word(s)",
+    );
+}
+
+/// Slot placement pins only the locals lowering pinned, and rewrites operands only: a raw
+/// block's own `__slot..` name keeps its `.air` placement, and a bare branch target spelled like
+/// a pinned local stays a target.
+#[test]
+fn slot_placement_follows_provenance_and_tokens() {
+    let air = expand(
+        "slot_target.antics",
+        &obj(r#"    tree a {
+        @slot(3) let a = 17;
+        raw { random(temp[0], 2) -> true: __slot3_a_0, false: __slot3_a_0;
+              __slot3_a_0: temp[0] := __slot3_a_0; }
+    }"#),
+    );
+    let body = tree(&air, "a");
+    assert!(
+        body.contains("-> true: __slot3_a_0, false: __slot3_a_0;"),
+        "{body}"
+    );
+    assert!(body.contains("__slot3_a_0: temp[0] := local[3];"), "{body}");
+    let air = expand(
+        "slot_raw.antics",
+        &obj(r#"    tree a {
+        @slot(3) let a = 17;
+        raw { let __slot3_raw_99 = 44; temp[1] := __slot3_raw_99; }
+        temp[0] = a;
+    }"#),
+    );
+    let body = tree(&air, "a");
+    assert!(body.contains("let __slot3_raw_99 = 44;"), "{body}");
+    assert!(body.contains("temp[0] := local[3];"), "{body}");
+}
+
+/// `random` whose range resolves to a word pointer (global 34) draws into the range cell, so its
+/// destination is not definitely written and the entry save stays.
+#[test]
+fn random_with_a_pointer_range_is_no_definite_write() {
+    let air = expand(
+        "entry_random.antics",
+        &obj(r#"    tree a (sim: Sim) {
+        let a: i16;
+        stack_obj = sim.container;
+        raw { random(__v_a_0, global[34]); temp[1] := __v_a_0; }
+    }"#),
+    );
+    assert!(
+        tree(&air, "a").contains("let __self_obj = stack_obj;"),
+        "{air}"
+    );
+}
+
+/// A `for ... else` body that reads a field through the item moves the cursor and back, so the
+/// exhaustion block still sees the iterator's false result: no restore store before it.
+#[test]
+fn for_else_field_reads_leave_no_exhaustion_restore() {
+    let air = expand(
+        "cursor_foreign.antics",
+        &obj(r#"    tree a (sim: Sim) {
+        for item in lot.objects() {
+            if item.attr[0] == 1 { temp[1] = 1; }
+        } else { raw { gosub_found_action(); } }
+    }"#),
+    );
+    let body = tree(&air, "a");
+    let ls = lines(body);
+    let found = index_of(&ls, |l| l == "gosub_found_action();", body);
+    assert_eq!(ls[found - 1], "}", "{body}");
+}
+
+/// A bool helper with a `defer` is not branched on directly: its cleanup would run between the
+/// condition and the caller's arm, which may read the last result.
+#[test]
+fn bool_helpers_with_defers_branch_on_a_saved_flag() {
+    let air = expand(
+        "bool_cleanup.antics",
+        &obj(r#"    fn f() -> bool {
+        defer { temp[1] = 99; }
+        return false;
+    }
+    tree a (sim: Sim) {
+        if f() {} else { gosub_found_action(); }
+    }"#),
+    );
+    let body = tree(&air, "a");
+    let ls = lines(body);
+    let cleanup = index_of(&ls, |l| l == "temp[1] := 99;", body);
+    let test = index_of(&ls, |l| l.starts_with("if __cond_"), body);
+    assert!(cleanup < test, "{body}");
+}
+
+/// Const regions: a field read through a capitalized local is a variable read, a yielded name
+/// passed to a call is a read (not a write), and raw blocks that declare locals or branch to
+/// numbered nodes cannot be copied into each arm.
+#[test]
+fn const_regions_tell_reads_from_writes_and_reject_uncopyable_raw() {
+    expect_err(
+        "region_field.antics",
+        &obj(r#"    tree a {
+        let X = self.id;
+        const C = if temp[0] == 0 { X.graphic } else { 0 };
+        self.graphic = 42;
+        temp[1] = C;
+    }"#),
+        "'X' is a variable",
+    );
+    let air = expand(
+        "region_call.antics",
+        &obj(r#"    const K = 7;
+    fn f(a: i16) -> i16 { return a; }
+    tree a {
+        const C = if temp[0] == 0 { K } else { 9 };
+        temp[1] = f(K);
+        temp[2] = C;
+    }"#),
+    );
+    assert_eq!(tree(&air, "a").matches("temp[1] := 7;").count(), 2, "{air}");
+    for (name, raw, why) in [
+        (
+            "region_decl",
+            "raw { let x = 4; temp[1] := x; }",
+            "declares a local",
+        ),
+        (
+            "region_branch",
+            "raw { random(temp[2], 2) -> true: 2, false: 2; }",
+            "numbered node",
+        ),
+    ] {
+        expect_err(
+            name,
+            &obj(&format!(
+                "    tree a {{
+        const C = if temp[0] == 0 {{ 7 }} else {{ 9 }};
+        {raw}
+        temp[3] = C;
+    }}"
+            )),
+            why,
+        );
+    }
+}
+
+/// A tree formats text when a raw block runs a text primitive in any spelling (`action_string
+/// (..)` with a space, raw `op 50`) or an inlined helper's copy does; then a local declared in a
+/// const region (one frame word per arm) is an error.
+#[test]
+fn text_formatting_is_found_by_parse_not_spelling() {
+    for (name, extra) in [
+        ("text_spaced", "raw { action_string (301, 1); }"),
+        ("text_op", "raw { op 50 (45, 1, 0, 0, 1, 0, 0, 0); }"),
+    ] {
+        expect_err(
+            name,
+            &obj(&format!(
+                "    tree a {{
+        const C = if temp[0] == 0 {{ 7 }} else {{ 9 }};
+        let a = C;
+        temp[1] = a;
+        {extra}
+    }}"
+            )),
+            "formats text",
+        );
+    }
+    expect_err(
+        "text_inline.antics",
+        &obj(r#"    fn f() -> i16 { let x = 5; return x; }
+    tree a {
+        const C = if temp[0] == 0 { 7 } else { 9 };
+        temp[1] = f() + C;
+        action_label(table: 301, index: 1);
+    }"#),
+        "'x' is declared in a const binding's region",
+    );
+}
+
+/// Raw constants follow the tokens: a commented `let K` declares nothing, and an `.air` mode word
+/// spelled like a constant keeps its meaning while the operand resolves.
+#[test]
+fn raw_consts_follow_tokens_not_text() {
+    assert_eq!(
+        nodes(&obj(r#"    const K = 7;
+    @id(4300) tree a {
+        raw { // let K is an explanatory comment
+              temp[1] := K; }
+    }"#)),
+        nodes(&obj("    @id(4300) tree a { raw { temp[1] := 7; } }")),
+    );
+    assert_eq!(
+        nodes(&obj(r#"    const part = 7;
+    @id(4300) tree a { raw { set_to_next(part, dest: stack_obj); temp[0] := part; } }"#)),
+        nodes(&obj(
+            "    @id(4300) tree a { raw { set_to_next(part, dest: stack_obj); temp[0] := 7; } }"
+        )),
+    );
+}
+
+/// A raw loop nested in a `for ... else` exhaustion block, or a commented `continue`, does not
+/// exit the `for`: only parsed loop exits outside a raw loop count.
+#[test]
+fn raw_nested_loops_do_not_exit_a_for_else() {
+    for raw in [
+        "raw { while true { temp[0] := 1; break; } }",
+        "raw { temp[0] := 1; // continue\n }",
+    ] {
+        expand(
+            "for_raw.antics",
+            &obj(&format!(
+                "    tree a {{
+        for item in lot.sims() {{}} else {{ {raw} }}
+    }}"
+            )),
+        );
+    }
 }

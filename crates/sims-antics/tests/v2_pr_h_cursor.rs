@@ -130,7 +130,9 @@ fn for_else_can_fall_through_and_continue_skips_it() {
 }
 
 #[test]
-fn for_else_restores_self_on_break_and_exhaustion() {
+fn for_else_restores_self_on_break_but_not_on_unmoved_exhaustion() {
+    // Every iteration breaks after moving the cursor back, so exhaustion still has the entry
+    // object and keeps the iterator's false result (no restore store replaces it).
     compare_air(
         r#"@id(4300) tree scan (sim: Sim) {
             for item in lot.sims() {
@@ -151,7 +153,6 @@ fn for_else_restores_self_on_break_and_exhaustion() {
                 stack_obj := entry;
                 break;
             }
-            stack_obj := entry;
             stack.attr[0] := 7;
             break;
         }

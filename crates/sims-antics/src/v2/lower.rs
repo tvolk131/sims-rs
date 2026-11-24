@@ -3874,9 +3874,9 @@ enum HelperCell {
     OwnAttr(i16),
 }
 
-/// One lowering of a source declaration: the inline-helper instances around it, the defer
-/// instance, and its (line, column) (see `TreeLowerer::seen_decls`).
-type DeclInstance = (Vec<usize>, Option<usize>, (usize, usize));
+/// One lowering of a source declaration: the source call sites of the inlined helpers around
+/// it, the defer instance, and its (line, column) (see `TreeLowerer::seen_decls`).
+type DeclInstance = (Vec<(usize, usize)>, Option<usize>, (usize, usize));
 
 #[derive(Clone)]
 struct TreeLowerer<'a> {
@@ -3920,20 +3920,25 @@ struct TreeLowerer<'a> {
     /// forms (`scope(25, N)`, raw `op` operands, primitive fields) the pin placement can't see.
     pin_span: Option<Span>,
     raw_span: Option<Span>,
-    /// Names the tree's `raw` blocks declare as `.air` locals, and the `const` names they had
-    /// resolved: one name cannot be both (see `resolve_raw_consts`).
+    /// Names the tree's `raw` blocks declare as `.air` locals, and the v2 constants they name
+    /// with their `.air` values (see `collect_raw_consts`).
     raw_declared: BTreeSet<String>,
-    raw_resolved: BTreeSet<String>,
+    raw_consts: BTreeMap<String, String>,
+    /// A raw block of the tree formats text (see `raw_facts`), however it is spelled.
+    raw_formats_text: bool,
     /// The tree's first `@slot(N) let`: its pinned locals are named `__slot<N>_..` through the
     /// optimizer and placed by `opt::assign_frame_slots` when the tree is finished.
     slot_span: Option<Span>,
+    /// The `.air` names of the tree's `@slot(N) let` locals and their word numbers: the only
+    /// names `opt::assign_frame_slots` pins (a raw block's own `__slot..` name is not one).
+    pinned_locals: BTreeMap<String, usize>,
     /// Declarations lowered so far, by lowering instance (the inline-helper instances and the
     /// defer instance around them) and source span. Lowering one source declaration twice in
     /// the same instance means it was copied (a const binding's region), and each copy has its
     /// own frame word: `dup_decl` records the first, which a tree that formats text refuses.
     seen_decls: BTreeSet<DeclInstance>,
-    inline_epochs: Vec<usize>,
-    inline_epoch_seq: usize,
+    /// The source call sites of the active inlined helpers (`inline_call_stack`'s calls).
+    inline_call_sites: Vec<(usize, usize)>,
     dup_decl: Option<(Span, String)>,
     /// Set when the tree's bytes after some node matter beyond `.air` semantics, so the backend
     /// pass must leave the tree alone: a `raw` block (its literal calls and ops may read the
@@ -3988,11 +3993,12 @@ impl<'a> TreeLowerer<'a> {
             pin_span: None,
             raw_span: None,
             raw_declared: BTreeSet::new(),
-            raw_resolved: BTreeSet::new(),
+            raw_consts: BTreeMap::new(),
+            raw_formats_text: false,
             slot_span: None,
+            pinned_locals: BTreeMap::new(),
             seen_decls: BTreeSet::new(),
-            inline_epochs: Vec::new(),
-            inline_epoch_seq: 0,
+            inline_call_sites: Vec::new(),
             dup_decl: None,
             keep_layout: false,
             param_words_used: 0,
@@ -4087,8 +4093,9 @@ impl<'a> TreeLowerer<'a> {
     }
 
     fn finish(self) -> Result<String> {
+        let formats_text = self.raw_formats_text || super::opt::body_formats_text(&self.out);
         if let Some((span, name)) = &self.dup_decl
-            && super::opt::body_formats_text(&self.out)
+            && formats_text
         {
             return Err(Error::at(
                 *span,
@@ -4112,7 +4119,7 @@ impl<'a> TreeLowerer<'a> {
         }
         let out = if self.keep_layout {
             if self.has_self_obj_local
-                && let Some(trimmed) = super::opt::drop_unread_entry_save(&out)
+                && let Some(trimmed) = super::opt::drop_unread_entry_save(&out, formats_text)
             {
                 trimmed
             } else {
@@ -4126,8 +4133,16 @@ impl<'a> TreeLowerer<'a> {
                 out
             }
         };
+        // The raw blocks' constants, which no pass before this one reads.
+        let mut consts = String::new();
+        for (name, value) in &self.raw_consts {
+            if !self.raw_declared.contains(name) {
+                consts.push_str(&format!("    const {name} = {value};\n"));
+            }
+        }
+        let out = consts + &out;
         Ok(if self.slot_span.is_some() {
-            super::opt::assign_frame_slots(&out, &self.raw_declared)
+            super::opt::assign_frame_slots(&out, &self.pinned_locals, &self.raw_declared)
         } else {
             out
         })
@@ -5181,9 +5196,9 @@ impl<'a> TreeLowerer<'a> {
             return;
         }
         let depth = self.inline_call_stack.len();
-        self.inline_epochs.truncate(depth);
+        self.inline_call_sites.truncate(depth);
         let key = (
-            self.inline_epochs.clone(),
+            self.inline_call_sites.clone(),
             self.current_defer_id,
             (span.line, span.column),
         );
@@ -5867,9 +5882,24 @@ impl<'a> TreeLowerer<'a> {
                         ty: binding_ty,
                     },
                 );
+                let body_start = self.out.len();
                 let res = self.lower_stmts(body);
                 let pop_res = self.pop_scope_and_run_cleanups();
                 res.and(pop_res)?;
+                // The exhaustion block sees the iterator's false result, which a restore store
+                // would replace: restore only if an iteration may leave the stack object moved
+                // (a field read through `item` moves it back itself).
+                let restore_line = if self.has_self_obj_local {
+                    "stack_obj := __self_obj;"
+                } else {
+                    "stack_obj := __saved_stack_obj;"
+                };
+                let restore_on_exhaustion = restore_on_exhaustion
+                    && (stack_cursor
+                        || super::opt::body_may_leave_stack_obj_moved(
+                            &self.out[body_start..],
+                            restore_line,
+                        ));
                 if let Some(else_body) = else_body {
                     self.line("continue;".to_owned());
                     if parts_root_opt.is_some() {
@@ -6214,13 +6244,17 @@ impl<'a> TreeLowerer<'a> {
                         "'raw { ... }' is not allowed inside a 'defer' block",
                     ));
                 }
-                let resolved = self.resolve_raw_consts(code, *span)?;
-                let code = &resolved;
+                let prelude = self.collect_raw_consts(code, *span)?;
+                if self.checking_discarded == 0
+                    && super::raw_facts::raw_facts(code, Some(&prelude)).formats_text
+                {
+                    self.raw_formats_text = true;
+                }
                 if self.has_any_active_cleanups()
                     || !self.inline_call_stack.is_empty()
                     || self.enclosing_cancel_flag().is_some()
                 {
-                    let wrapped = format!("tree 4096 \"__raw_check\" {{\n{code}\n}}\n");
+                    let wrapped = format!("tree 4096 \"__raw_check\" {{\n{prelude}{code}\n}}\n");
                     let parsed = crate::parser::parse_module(&wrapped).map_err(|e| {
                         Error::at(
                             *span,
@@ -6236,7 +6270,7 @@ impl<'a> TreeLowerer<'a> {
                     validate_raw_air_stmts(stmts, false, &defined_labels, *span)?;
                 } else if self.checking_discarded > 0 {
                     // Discarded code is never parsed by the `.air` compiler, so check it here.
-                    let wrapped = format!("tree 4096 \"__raw_check\" {{\n{code}\n}}\n");
+                    let wrapped = format!("tree 4096 \"__raw_check\" {{\n{prelude}{code}\n}}\n");
                     crate::parser::parse_module(&wrapped).map_err(|e| {
                         Error::at(
                             *span,
@@ -6270,6 +6304,16 @@ impl<'a> TreeLowerer<'a> {
                 "'@slot(N) let' names a frame word of the tree, so it is not allowed in an inlined helper",
             ));
         }
+        if let Some(locals) = self.frame_locals
+            && u16::from(n) >= locals
+        {
+            return Err(Error::at(
+                span,
+                format!(
+                    "'@slot({n})' names local[{n}], but '@frame(locals: {locals})' gives the tree {locals} local word(s)"
+                ),
+            ));
+        }
         let prefix = format!("__slot{n}_");
         if let Some(other) = self
             .var_scopes
@@ -6294,152 +6338,88 @@ impl<'a> TreeLowerer<'a> {
                 return Err(Error::at(span, SLOT_WITH_PIN));
             }
         }
-        Ok(self.fresh(&format!("slot{n}_{name}")))
+        let air_name = self.fresh(&format!("slot{n}_{name}"));
+        self.pinned_locals.insert(air_name.clone(), usize::from(n));
+        Ok(air_name)
     }
 
-    /// `raw { }` code with the v2 names it uses replaced by their values: a `const` name by its
-    /// number (a GUID in hex) and `Table.entry` of a tuning table by its `bcon[N]` operand.
+    /// Records the v2 names a `raw { }` block uses as `.air` named constants of the tree, and
+    /// returns the block's `const NAME = value;` declarations (for checking it on its own).
     ///
-    /// Only an identifier in an operand position is a v2 name: not after `.` (a field) or `@` (a
-    /// label), not
-    /// before `.`, `[`, `(` or `:` (a cell, a call, an argument key or a label), not in a branch
-    /// target list (`-> ..;`), not an `.air` word (`my`, `temp`, ..), and not a local the raw
-    /// code declares itself (`let x`, `local x`).
+    /// A `const` name is its number (a GUID in hex) and `Table.entry` of a tuning table is its
+    /// `bcon[N]` operand. The `.air` parser resolves them only where it takes an operand or an
+    /// integer, so labels, branch targets, mode words, fields and argument keys keep their
+    /// meaning, and a local the tree declares (`let x`, `local x`, tree-wide in `.air`) wins over
+    /// a constant of the same name. [`Self::finish`] declares them at the top of the tree.
     ///
-    /// A `.air` local is in scope in every raw block of the tree, so a name that one raw block
-    /// declares stays a local in all of them, and declaring a name an earlier block resolved as
-    /// a `const` is an error rather than a silent change of meaning.
-    fn resolve_raw_consts(&mut self, code: &str, span: Span) -> Result<String> {
-        let bytes = code.as_bytes();
-        let is_ident_start = |b: u8| b.is_ascii_alphabetic() || b == b'_';
-        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-        // Names the raw code declares as its own locals.
-        {
-            let words: Vec<&str> = code
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .filter(|w| !w.is_empty())
-                .collect();
-            for pair in words.windows(2) {
-                if matches!(pair[0], "let" | "local") {
-                    if self.raw_resolved.contains(pair[1]) {
-                        return Err(Error::at(
-                            span,
-                            format!(
-                                "raw block declares local '{}', which an earlier raw block of \
-                                 this tree read as a const; rename one of them",
-                                pair[1]
-                            ),
-                        ));
-                    }
-                    self.raw_declared.insert(pair[1].to_owned());
-                }
-            }
-        }
-        let next_non_space = |from: usize| {
-            bytes[from..]
-                .iter()
-                .copied()
-                .find(|b| !matches!(b, b' ' | b'\t'))
+    /// One name must mean one value in a tree: an inlined helper's raw code may see another
+    /// module's constants.
+    fn collect_raw_consts(&mut self, code: &str, span: Span) -> Result<String> {
+        use crate::lexer::TokenKind;
+        // Code that does not lex is reported by the `.air` compiler.
+        let Ok(tokens) = crate::lexer::tokenize(code) else {
+            return Ok(String::new());
         };
-        let prev_non_space = |to: usize| {
-            bytes[..to]
-                .iter()
-                .rev()
-                .copied()
-                .find(|b| !matches!(b, b' ' | b'\t'))
-        };
-        let mut out = String::with_capacity(code.len());
-        let (mut i, mut in_targets) = (0usize, false);
-        while i < bytes.len() {
-            let b = bytes[i];
-            if b == b'"' {
-                let start = i;
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    i += if bytes[i] == b'\\' { 2 } else { 1 };
-                }
-                i = (i + 1).min(bytes.len());
-                out.push_str(&code[start..i]);
+        let mut found: Vec<(String, String)> = Vec::new();
+        for (i, tok) in tokens.iter().enumerate() {
+            let TokenKind::Ident(word) = &tok.kind else {
+                continue;
+            };
+            if i > 0 && tokens[i - 1].kind == TokenKind::Dot {
                 continue;
             }
-            if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
-                let start = i;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
+            let next = |k: usize| tokens.get(i + k).map(|t| &t.kind);
+            if matches!(word.as_str(), "let" | "local") {
+                if let Some(TokenKind::Ident(name)) = next(1) {
+                    self.raw_declared.insert(name.clone());
                 }
-                out.push_str(&code[start..i]);
                 continue;
             }
-            if b == b'-' && bytes.get(i + 1) == Some(&b'>') {
-                in_targets = true;
-            }
-            // A target list runs to its `;`, across line breaks.
-            if matches!(b, b';' | b'{' | b'}') {
-                in_targets = false;
-            }
-            if !is_ident_start(b) || (i > 0 && is_ident(bytes[i - 1])) {
-                // Copy one whole character: `code` may hold non-ASCII text.
-                let len = code[i..].chars().next().map_or(1, char::len_utf8);
-                out.push_str(&code[i..i + len]);
-                i += len;
-                continue;
-            }
-            let start = i;
-            while i < bytes.len() && is_ident(bytes[i]) {
-                i += 1;
-            }
-            let word = &code[start..i];
-            let after = next_non_space(i);
-            let before = prev_non_space(start);
-            let operand_position = !in_targets
-                && !matches!(before, Some(b'.' | b'@'))
-                && !matches!(after, Some(b'[' | b'(' | b':'))
-                && !super::air_words::is_air_word(word)
-                && !self.raw_declared.contains(word);
-            // `Table.entry` of a tuning table.
-            if operand_position && after == Some(b'.') {
-                let dot = start + bytes[start..].iter().position(|&c| c == b'.').unwrap_or(0);
-                let mut j = dot + 1;
-                while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
-                    j += 1;
-                }
-                let entry_start = j;
-                while j < bytes.len() && is_ident(bytes[j]) {
-                    j += 1;
-                }
-                let entry = &code[entry_start..j];
-                if !entry.is_empty()
-                    && let Some(found) = self.env.lookup_bcon_entry(
-                        &self.owner_module,
-                        word,
-                        entry,
-                        self.in_object_scope,
-                        span,
-                    )
-                {
-                    out.push_str(&found?.0);
-                    self.raw_resolved.insert(word.to_owned());
-                    i = j;
-                    continue;
-                }
-            }
-            if operand_position
-                && after != Some(b'.')
-                && let Some(v) =
-                    self.env
-                        .lookup_const(&self.owner_module, word, self.in_object_scope)
+            if next(1) == Some(&TokenKind::Dot)
+                && let Some(TokenKind::Ident(entry)) = next(2)
+                && let Some(entry_air) = self.env.lookup_bcon_entry(
+                    &self.owner_module,
+                    word,
+                    entry,
+                    self.in_object_scope,
+                    span,
+                )
             {
-                if i16::try_from(v).is_ok() {
-                    out.push_str(&v.to_string());
-                } else {
-                    out.push_str(&format!("{v:#010x}"));
-                }
-                self.raw_resolved.insert(word.to_owned());
+                found.push((format!("{word}.{entry}"), entry_air?.0));
                 continue;
             }
-            out.push_str(word);
+            if let Some(v) = self
+                .env
+                .lookup_const(&self.owner_module, word, self.in_object_scope)
+            {
+                let value = if i16::try_from(v).is_ok() {
+                    v.to_string()
+                } else {
+                    format!("{v:#010x}")
+                };
+                found.push((word.clone(), value));
+            }
         }
-        Ok(out)
+        let mut prelude = String::new();
+        for (name, value) in found {
+            match self.raw_consts.get(&name) {
+                Some(old) if *old != value => {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "'{name}' names {old} in one raw block of this tree and {value} in \
+                             another; rename one of the constants"
+                        ),
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    self.raw_consts.insert(name.clone(), value.clone());
+                }
+            }
+            prelude.push_str(&format!("const {name} = {value};\n"));
+        }
+        Ok(prelude)
     }
 
     /// Counted `for` loops. The VM's `inc_lt` / `dec_gt` step the cursor with i16 wrap-around and
@@ -9449,6 +9429,47 @@ impl<'a> TreeLowerer<'a> {
             && stmts_preserve_helper_cell(&decl.body, cell, self_states)
     }
 
+    /// Whether inlining `decl` (declared in `module`) can write a caller's frame word without
+    /// naming it: it, or a helper it calls (transitively), runs a `raw { }` block.
+    fn helper_may_write_frame_words(
+        &self,
+        decl: &FnDecl,
+        module: &str,
+        allow_local: bool,
+        depth: usize,
+    ) -> bool {
+        if depth > 32
+            || super::specialize::stmts_any(&decl.body, &|s| matches!(s, V2Stmt::RawAir { .. }))
+        {
+            return true;
+        }
+        let mut callees = Vec::new();
+        collect_callee_names(&decl.body, &mut callees);
+        callees.iter().any(|name| {
+            self.env
+                .lookup_fn(module, name, allow_local)
+                .is_some_and(|(m, d, l)| self.helper_may_write_frame_words(&d, &m, l, depth + 1))
+        })
+    }
+
+    /// Whether evaluating `expr` in this scope calls a helper that may write frame words (see
+    /// [`Self::helper_may_write_frame_words`]).
+    fn expr_may_write_frame_words(&self, expr: &V2Expr, depth: usize) -> bool {
+        let mut callees = Vec::new();
+        super::specialize::visit_expr(expr, &mut |e| {
+            if let V2Expr::Call { callee, .. } = e
+                && let V2Expr::Ident(_, name) = callee.as_ref()
+            {
+                callees.push(name.clone());
+            }
+        });
+        callees.iter().any(|name| {
+            self.env
+                .lookup_fn(&self.owner_module, name, self.in_object_scope)
+                .is_some_and(|(m, d, l)| self.helper_may_write_frame_words(&d, &m, l, depth + 1))
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn bind_helper_arg(
         &mut self,
@@ -9465,8 +9486,15 @@ impl<'a> TreeLowerer<'a> {
         // while the helper runs: the helper never mutates or borrows the parameter, and no
         // argument of this call borrows the local (`&mut x`, or a local-writing builtin). An
         // `@slot` local lives in an explicit frame word, which helper raw code can write as
-        // `local[N]`, so it is always copied.
+        // `local[N]`, so it is always copied. So is any local when the helper, or a helper an
+        // argument calls, runs raw code (directly or through the helpers it calls): raw code
+        // can write any frame word by number or by its `.air` name.
+        let frame_writer = self.helper_may_write_frame_words(fn_decl, fn_mod, is_local_fn, 0)
+            || call_args
+                .iter()
+                .any(|a| self.expr_may_write_frame_words(a, 0));
         let elide_local = match arg_expr {
+            _ if frame_writer => None,
             V2Expr::Ident(_, n)
                 if !matches!(param.ty, V2Type::MutRef(_))
                     && read_only
@@ -9862,8 +9890,12 @@ impl<'a> TreeLowerer<'a> {
         let Some((module, decl, local, args, span)) = self.direct_helper(call)? else {
             return Ok(false);
         };
+        // A helper's cleanup runs after its `return` routes the branch, so the caller's arm
+        // would see the cleanup's last result rather than the condition's (which a primitive
+        // such as `gosub_found_action` reads): the general path tests a flag after it.
         if !self.helper_returns_condition(&module, &decl, local)
             || stmts_return_through_loop(&decl.body)
+            || super::specialize::stmts_any(&decl.body, &|s| matches!(s, V2Stmt::Defer { .. }))
         {
             return Ok(false);
         }
@@ -10085,9 +10117,10 @@ impl<'a> TreeLowerer<'a> {
 
         // Register `fqn` on `inline_call_stack` BEFORE evaluating omitted default expressions
         // so recursive default parameters (e.g. `fn f(x: i16 = f())`) trigger cycle/depth detection.
-        self.inline_epochs.truncate(self.inline_call_stack.len());
-        self.inline_epoch_seq += 1;
-        self.inline_epochs.push(self.inline_epoch_seq);
+        self.inline_call_sites
+            .truncate(self.inline_call_stack.len());
+        self.inline_call_sites
+            .push((call_span.line, call_span.column));
         self.inline_call_stack.push(fqn);
 
         // Evaluate omitted defaulted parameters hygienically in the callee's module/object scope
@@ -15364,7 +15397,7 @@ fn stmts_exit_loop(stmts: &[V2Stmt]) -> bool {
         V2Stmt::WithLock { body, .. } | V2Stmt::Defer { body, .. } => stmts_exit_loop(body),
         V2Stmt::LetSome { else_body, .. } => stmts_exit_loop(else_body),
         V2Stmt::ForEach { else_body, .. } => else_body.as_deref().is_some_and(stmts_exit_loop),
-        V2Stmt::RawAir { code, .. } => code.contains("break") || code.contains("continue"),
+        V2Stmt::RawAir { code, .. } => super::raw_facts::raw_facts(code, None).exits_enclosing_loop,
         _ => false,
     })
 }
@@ -15440,6 +15473,24 @@ fn stmts_return_through_loop(stmts: &[V2Stmt]) -> bool {
 }
 
 /// Expressions whose evaluation cannot modify a forwarded temp, parameter, or own attribute.
+/// The names of the functions `stmts` call (with a plain name), nested statements included.
+fn collect_callee_names(stmts: &[V2Stmt], out: &mut Vec<String>) {
+    for s in stmts {
+        for e in super::specialize::stmt_exprs(s) {
+            super::specialize::visit_expr(e, &mut |x| {
+                if let V2Expr::Call { callee, .. } = x
+                    && let V2Expr::Ident(_, name) = callee.as_ref()
+                {
+                    out.push(name.clone());
+                }
+            });
+        }
+        for body in super::specialize::stmt_bodies(s) {
+            collect_callee_names(body, out);
+        }
+    }
+}
+
 fn helper_expr_has_no_writes(expr: &V2Expr) -> bool {
     match expr {
         V2Expr::Int(..)

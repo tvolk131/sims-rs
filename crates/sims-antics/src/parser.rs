@@ -13,11 +13,25 @@ const MAX_NESTING_DEPTH: usize = 64;
 
 /// Parses a `.antics` source string into a [`Module`] AST.
 pub fn parse_module(source: &str) -> Result<Module> {
+    parse_module_with(source, false)
+}
+
+/// Parses `.air` code whose named constants are declared elsewhere: a name where an integer
+/// belongs parses as 0. The values are wrong, so this is only for reading the code's shape
+/// (statements, labels, branch targets, opcodes).
+pub fn parse_module_lenient(source: &str) -> Result<Module> {
+    parse_module_with(source, true)
+}
+
+fn parse_module_with(source: &str, lenient: bool) -> Result<Module> {
     let tokens = tokenize(source)?;
     let mut parser = Parser {
         tokens,
         pos: 0,
         depth: 0,
+        consts: std::collections::BTreeMap::new(),
+        tree_locals: std::collections::BTreeSet::new(),
+        lenient,
     };
     parser.parse_module()
 }
@@ -26,6 +40,23 @@ struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     depth: usize,
+    /// The current tree's named constants (`const NAME = value;`), in scope from their
+    /// declaration to the end of the tree.
+    consts: std::collections::BTreeMap<String, ConstValue>,
+    /// Every name the current tree declares as a local (`let x`, `local x`). `.air` locals are
+    /// tree-wide, so such a name is a local everywhere in the tree, never a constant.
+    tree_locals: std::collections::BTreeSet<String>,
+    /// See [`parse_module_lenient`].
+    lenient: bool,
+}
+
+/// The value of a tree-level named constant.
+#[derive(Clone, Copy)]
+enum ConstValue {
+    /// An integer: usable wherever `.air` takes an integer literal, and as a literal operand.
+    Int(i64),
+    /// An operand (`bcon[t:e]`, ..): usable as an operand only.
+    Operand(Operand),
 }
 
 impl Parser {
@@ -101,6 +132,16 @@ impl Parser {
         let tok = self.bump();
         match tok.kind {
             TokenKind::Int(v) => Ok((v, tok.span)),
+            TokenKind::Ident(ref name) if !self.tree_locals.contains(name) => {
+                match self.consts.get(name) {
+                    Some(&ConstValue::Int(v)) => Ok((v, tok.span)),
+                    None if self.lenient => Ok((0, tok.span)),
+                    _ => Err(Error::at(
+                        tok.span,
+                        format!("expected {description}, found {:?}", tok.kind),
+                    )),
+                }
+            }
             other => Err(Error::at(
                 tok.span,
                 format!("expected {description}, found {other:?}"),
@@ -336,7 +377,11 @@ impl Parser {
                 }
             }
         }
+        self.consts.clear();
+        self.tree_locals = self.scan_tree_locals();
         let body = self.parse_block()?;
+        self.consts.clear();
+        self.tree_locals.clear();
         Ok(TreeDecl {
             span,
             is_interaction,
@@ -345,6 +390,76 @@ impl Parser {
             header,
             body,
         })
+    }
+
+    /// The names the tree body starting at the current `{` declares as locals (`let x`,
+    /// `local x`), found by scanning its tokens up to the matching `}`.
+    fn scan_tree_locals(&self) -> std::collections::BTreeSet<String> {
+        let mut names = std::collections::BTreeSet::new();
+        let mut depth = 0usize;
+        for (i, tok) in self.tokens.iter().enumerate().skip(self.pos) {
+            match &tok.kind {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                TokenKind::Ident(kw) if kw == "let" || kw == "local" => {
+                    if let Some(Token {
+                        kind: TokenKind::Ident(name),
+                        ..
+                    }) = self.tokens.get(i + 1)
+                    {
+                        names.insert(name.clone());
+                    }
+                }
+                TokenKind::Eof => break,
+                _ => {}
+            }
+        }
+        names
+    }
+
+    /// `const NAME = value;`: a named constant for the rest of the tree, where `value` is an
+    /// integer or a direct operand. It emits no node.
+    fn parse_const_decl(&mut self) -> Result<()> {
+        self.expect_ident("'const'")?;
+        let (name, nspan) = self.expect_ident("constant name")?;
+        if is_reserved_ident(&name) {
+            return Err(Error::at(
+                nspan,
+                format!("cannot use reserved keyword '{name}' as a constant name"),
+            ));
+        }
+        // `Table.entry`: a tuning entry spelled as in the source.
+        let name = if self.eat(&TokenKind::Dot) {
+            let (entry, _) = self.expect_ident("constant entry name")?;
+            format!("{name}.{entry}")
+        } else {
+            name
+        };
+        self.expect(&TokenKind::Assign, "'='")?;
+        let value = if let TokenKind::Int(v) = self.peek().kind {
+            self.bump();
+            ConstValue::Int(v)
+        } else {
+            match self.parse_operand()? {
+                OperandRef::Direct(op) => ConstValue::Operand(op),
+                _ => {
+                    return Err(Error::at(
+                        nspan,
+                        format!("constant '{name}' must be an integer or a direct operand"),
+                    ));
+                }
+            }
+        };
+        self.expect(&TokenKind::Semicolon, "';'")?;
+        if self.consts.insert(name.clone(), value).is_some() {
+            return Err(Error::at(nspan, format!("duplicate constant '{name}'")));
+        }
+        Ok(())
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>> {
@@ -361,6 +476,15 @@ impl Parser {
             if self.peek().kind == TokenKind::Eof {
                 self.depth -= 1;
                 return Err(Error::at(self.span(), "unexpected EOF inside block"));
+            }
+            if matches!(&self.peek().kind, TokenKind::Ident(kw) if kw == "const")
+                && matches!(self.peek_at(1).kind, TokenKind::Ident(_))
+            {
+                if let Err(err) = self.parse_const_decl() {
+                    self.depth -= 1;
+                    return Err(err);
+                }
+                continue;
             }
             match self.parse_stmt() {
                 Ok(stmt) => stmts.push(stmt),
@@ -2430,6 +2554,15 @@ impl Parser {
 
     fn parse_assign_stmt(&mut self) -> Result<Stmt> {
         let span = self.span();
+        if let TokenKind::Ident(name) = &self.peek().kind
+            && !self.tree_locals.contains(name)
+            && self.consts.contains_key(name)
+        {
+            return Err(Error::at(
+                span,
+                format!("'{name}' is a constant, so it cannot be assigned"),
+            ));
+        }
         let lhs = self.parse_operand()?;
         let op_tok = self.bump();
         let op = match op_tok.kind {
@@ -2671,6 +2804,21 @@ impl Parser {
                     other if is_reserved_ident(other) => {
                         Err(Error::at(span, format!("unexpected keyword '{other}'")))
                     }
+                    other if !self.tree_locals.contains(other) => {
+                        // A named constant: `Table.entry` first, then a bare name.
+                        if self.peek().kind == TokenKind::Dot
+                            && let TokenKind::Ident(entry) = &self.peek_at(1).kind
+                            && let Some(&value) = self.consts.get(&format!("{other}.{entry}"))
+                        {
+                            self.bump();
+                            self.bump();
+                            return const_operand(value, span);
+                        }
+                        match self.consts.get(other) {
+                            Some(&value) => const_operand(value, span),
+                            None => Ok(OperandRef::NamedLocal(other.to_owned())),
+                        }
+                    }
                     other => Ok(OperandRef::NamedLocal(other.to_owned())),
                 }
             }
@@ -2745,6 +2893,16 @@ impl Parser {
                 ),
             )),
         }
+    }
+}
+
+/// A named constant used as an operand: an integer is a literal (it must fit i16).
+fn const_operand(value: ConstValue, span: Span) -> Result<OperandRef> {
+    match value {
+        ConstValue::Int(v) => i16::try_from(v)
+            .map(|v| OperandRef::Direct(Operand::literal(v)))
+            .map_err(|_| Error::at(span, format!("constant {v} out of i16 operand range"))),
+        ConstValue::Operand(op) => Ok(OperandRef::Direct(op)),
     }
 }
 

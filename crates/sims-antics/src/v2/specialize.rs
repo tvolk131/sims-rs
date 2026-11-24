@@ -243,13 +243,17 @@ fn is_const_operand(e: &V2Expr) -> bool {
     }
 }
 
-/// The names an arm yields, with their spans.
+/// The names an arm yields (a bare name, or the table of `Table.entry`), with their spans.
 pub(crate) fn yielded_idents_at(binding: &ConstBinding) -> Vec<(Span, String)> {
     let mut out = Vec::new();
     let mut add = |arm: &Arm| {
         if let Arm::Values(_, values) = arm {
             for v in values {
-                if let V2Expr::Ident(span, n) = v {
+                let root = match v {
+                    V2Expr::Field { base, .. } => base.as_ref(),
+                    other => other,
+                };
+                if let V2Expr::Ident(span, n) = root {
                     out.push((*span, n.clone()));
                 }
             }
@@ -313,10 +317,10 @@ fn check_region(region: &[V2Stmt], binding: &ConstBinding, names: &[String]) -> 
             ));
         }
     }
-    if let Some(span) = find_raw_label(region) {
+    if let Some((span, why)) = find_uncopyable_raw(region) {
         return Err(Error::at(
             span,
-            "a 'raw { }' block that defines a label cannot be in a const binding's region (each arm would define it again)",
+            format!("a 'raw {{ }}' block that {why} cannot be in a const binding's region"),
         ));
     }
     for n in names {
@@ -341,12 +345,14 @@ fn check_region(region: &[V2Stmt], binding: &ConstBinding, names: &[String]) -> 
             ));
         }
     }
+    // A yielded name is never a variable (the parser refuses that), so nothing can write it,
+    // but a declaration in the region would capture the substituted name.
     for (_, n) in yielded_idents_at(binding) {
-        if let Some(span) = find_write(region, &n) {
+        if let Some(span) = find_binding_of(region, &n) {
             return Err(Error::at(
                 span,
                 format!(
-                    "a const binding yields '{n}', which this statement may change; bind a constant instead"
+                    "a const binding yields '{n}', so the statements that use it cannot declare '{n}'"
                 ),
             ));
         }
@@ -534,47 +540,14 @@ pub(super) fn visit_expr(e: &V2Expr, f: &mut dyn FnMut(&V2Expr)) {
     }
 }
 
-/// Whether `raw { }` code names the identifier `name` (outside strings and comments).
+/// Whether `raw { }` code names the identifier `name`, read from its `.air` tokens (so strings
+/// and comments do not count). Code that does not lex is assumed to.
 fn raw_names(code: &str, name: &str) -> bool {
-    let bytes = code.as_bytes();
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let mut i = 0;
-    let mut in_str = false;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_str {
-            if b == b'\\' {
-                i += 2;
-                continue;
-            }
-            in_str = b != b'"';
-            i += 1;
-            continue;
-        }
-        if b == b'"' {
-            in_str = true;
-            i += 1;
-            continue;
-        }
-        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if is_ident(b) {
-            let start = i;
-            while i < bytes.len() && is_ident(bytes[i]) {
-                i += 1;
-            }
-            if &code[start..i] == name {
-                return true;
-            }
-            continue;
-        }
-        i += 1;
-    }
-    false
+    crate::lexer::tokenize(code).map_or(true, |tokens| {
+        tokens
+            .iter()
+            .any(|t| matches!(&t.kind, crate::lexer::TokenKind::Ident(n) if n == name))
+    })
 }
 
 fn find_raw_mention(stmts: &[V2Stmt], name: &str) -> Option<Span> {
@@ -683,48 +656,33 @@ fn find_write_through(stmts: &[V2Stmt], name: &str) -> Option<Span> {
     None
 }
 
-/// A `raw { }` block in `stmts` that defines a label (`@name:`): each copy of the region would
-/// define it again.
-fn find_raw_label(stmts: &[V2Stmt]) -> Option<Span> {
+/// A `raw { }` block in `stmts` whose code cannot be copied into each arm, with the reason:
+/// a label or a local would be defined twice, and a numbered branch target would jump into the
+/// first copy.
+fn find_uncopyable_raw(stmts: &[V2Stmt]) -> Option<(Span, &'static str)> {
     for s in stmts {
-        if let V2Stmt::RawAir { span, code } = s
-            && raw_defines_label(code)
-        {
-            return Some(*span);
+        if let V2Stmt::RawAir { span, code } = s {
+            let facts = super::raw_facts::raw_facts(code, None);
+            let why = if facts.defines_label {
+                Some("defines a label (each arm would define it again)")
+            } else if facts.declares_local {
+                Some("declares a local (each arm would declare it again)")
+            } else if facts.positional_target {
+                Some("branches to a numbered node (each arm's copy would jump into the first)")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                return Some((*span, why));
+            }
         }
         for b in stmt_bodies(s) {
-            if let Some(span) = find_raw_label(b) {
-                return Some(span);
+            if let Some(found) = find_uncopyable_raw(b) {
+                return Some(found);
             }
         }
     }
     None
-}
-
-/// Whether `.air` code defines a label (`@name:` or bare `name:`). Code that does not parse is
-/// assumed to.
-fn raw_defines_label(code: &str) -> bool {
-    use crate::ast::Stmt;
-    fn any_label(stmts: &[Stmt]) -> bool {
-        stmts.iter().any(|s| match s {
-            Stmt::Label { .. } => true,
-            Stmt::If {
-                then_body,
-                else_body,
-                ..
-            } => any_label(then_body) || any_label(else_body),
-            Stmt::While { body, .. } | Stmt::Loop { body, .. } => any_label(body),
-            _ => false,
-        })
-    }
-    let wrapped = format!("tree 4096 \"__label_check\" {{\n{code}\n}}\n");
-    match crate::parser::parse_module(&wrapped)
-        .ok()
-        .and_then(|m| m.items.into_iter().next())
-    {
-        Some(crate::ast::Item::Tree(t)) => any_label(&t.body),
-        _ => true,
-    }
 }
 
 fn args_bare(args: &[CallArg], name: &str) -> bool {
@@ -949,8 +907,9 @@ fn subst_expr(e: &mut V2Expr, pairs: &[(String, V2Expr)]) -> Result<()> {
 // ---------------------------------------------------------------------------------------------
 
 /// `f(.., key: match s { P => v, .. }, ..);` → `match s { P => f(.., key: v, ..); .. }` when
-/// every arm of the first such operand is a compile-time operand and the other operands make
-/// no calls (so testing first does not reorder anything observable). `args` are the statement's
+/// every arm of the first such operand is a compile-time operand, and neither its tests nor the
+/// other operands make calls or borrow (so testing first does not reorder anything observable:
+/// a test that wrote a cell would run before an earlier operand reads it). `args` are the statement's
 /// call arguments; `rebuild` makes the statement again from rewritten arguments. `None` when no
 /// operand qualifies.
 pub(crate) fn split_inline_operand(
@@ -963,7 +922,7 @@ pub(crate) fn split_inline_operand(
         .iter()
         .enumerate()
         .all(|(i, a)| i == at || !makes_call(&a.value));
-    if !others_pure {
+    if !others_pure || !selector_tests_pure(&args[at].value) {
         return None;
     }
     // A name an arm yields must hold the same value where the statement reads it.
@@ -1067,10 +1026,26 @@ fn selector_leaves<'e>(e: &'e V2Expr, out: &mut Vec<&'e V2Expr>) {
     }
 }
 
+/// Whether the tests of an inline selector (its scrutinee, or each condition of an `if`
+/// chain) make no call and borrow nothing.
+fn selector_tests_pure(e: &V2Expr) -> bool {
+    match e {
+        V2Expr::Match { scrutinee, .. } => !makes_call(scrutinee),
+        V2Expr::If {
+            cond, else_value, ..
+        } => !makes_call(cond) && selector_tests_pure(else_value),
+        _ => true,
+    }
+}
+
+/// Whether `e` makes a call or borrows (`&mut`), either of which may write.
 fn makes_call(e: &V2Expr) -> bool {
     let mut found = false;
     visit_expr(e, &mut |x| {
-        if matches!(x, V2Expr::Call { .. } | V2Expr::MethodCall { .. }) {
+        if matches!(
+            x,
+            V2Expr::Call { .. } | V2Expr::MethodCall { .. } | V2Expr::MutRef { .. }
+        ) {
             found = true;
         }
     });

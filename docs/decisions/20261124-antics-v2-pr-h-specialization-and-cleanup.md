@@ -30,6 +30,8 @@ Constraints:
 - **Files changed.**
   - v2 changes stay in `src/v2/{ast,parser,lower,opt,specialize,mod}.rs`.
   - The `.air` compiler (`src/lower.rs`) gains one read-only query: `air_local_usage`.
+  - The `.air` parser (`src/parser.rs`) gains tree-level named constants (`const NAME = value;`) and a lenient parse for shape-only analysis (decision 5).
+  - `src/v2/raw_facts.rs` is the one parsed analysis of raw `.air` that lowering and specialization share.
   - The verifier, `fmt`, `lint` and `decompile` are untouched; parallel tracks own them.
 - **Synthetic tests.** Every test is synthetic, in `tests/v2_pr_h*.rs`. `open-pack/` builds unchanged.
 
@@ -67,17 +69,19 @@ Constraints:
 - **Inline operands.** A `match` or `if` used directly as a builtin's operand is split the same way by the lowering; its region is that one statement.
 - **Soundness rules.**
   - Arms yield compile-time operands or diverge: `break`, `continue`, `return`, or a block ending in one.
-  - A yielded name must not be a variable (any name a `let`, parameter or loop binds earlier in the file), and an arm cannot yield `stack_obj`, which primitives change. A variable's value can change inside the region, so it is not a compile-time operand; a run-time choice uses a `let` with `match` or `if`.
+  - A yielded name must not be a variable (any name a `let`, parameter or loop binds earlier in the file), and an arm cannot yield `stack_obj`, which primitives change. A field's root counts: `X.graphic` with `X` a variable is a variable read. A variable's value can change inside the region, so it is not a compile-time operand; a run-time choice uses a `let` with `match` or `if`.
   - A `match` needs `_`, and an `if` needs `else`.
   - The region runs up to the last statement that names a bound name. It extends to every later use of a `let` it declares.
   - The region may not:
     - redeclare a bound name;
-    - write a name an arm yields;
+    - declare a name an arm yields (passing it to a call reads it);
     - contain a `defer`;
     - name a bound name inside `raw { }`;
     - assign or borrow a bound name (substitution would write through it);
-    - define a label in a `raw { }` block (each arm would define it again).
-  - In a tree that formats text, the region may not declare a variable: each arm's copy takes its own frame word, so no `$Local:N` names it on every path. Declaring it before the binding works. Lowering detects the copies by declaration span per inline and defer instance.
+    - hold a `raw { }` block that defines a label, declares a local, or branches to a numbered node (each arm's copy would define it again, or jump into the first copy).
+  - In a tree that formats text, the region may not declare a variable: each arm's copy takes its own frame word, so no `$Local:N` names it on every path. Declaring it before the binding works. Lowering detects the copies by declaration span per inline call site and defer instance.
+  - A tree formats text when it runs a text primitive (Dialog 36, Action String 50) in any spelling: a builtin, raw `.air` parsed by `raw_facts` (`action_string (..)` with a space, raw `op 50`), or an inlined helper's copy.
+- **Inline operands** split only when the selector is pure (no call, no `&mut`), so no operand read before it moves after a write it makes.
 - **Other passes.** `fmt` and `lint` are token- and AST-based and see ordinary statements, so they need no change.
 
 ### 3. Tier 2: zero-cost inline helpers
@@ -93,15 +97,17 @@ Inline `fn` helpers lower directly into their caller's targets:
 - **Helper locals.** Disjoint helper locals share a word unless the tree formats text (H-3).
 - **Types.** `Guid` parameters and `fn -> Result` helpers inline.
 - **Fallback.** Cancellation, an exit from a caller loop, and layout-sensitive code keep the general path. So do:
-  - a helper with a `defer`, and a result stored into a pinned `@slot` word. The result is staged and stored after the helper's cleanup, which may read the word as `$Local:N`. A fault ends the frame, so a partial store before one is unobservable, as in ordinary code;
+  - a helper with a `defer`, in value and in bool position (its cleanup would run between the condition and the caller's arm, which may read the last result), and a result stored into a pinned `@slot` word. The result is staged and stored after the helper's cleanup, which may read the word as `$Local:N`. A fault ends the frame, so a partial store before one is unobservable, as in ordinary code;
   - a `return` in a `for … else` exhaustion block, which is lowered inside the iterator loop and needs the return flag.
 - **Pinned arguments.** An argument in a `@slot` word is always copied. A helper's raw code can write that word by number.
+- **Raw helpers.** When the helper, or a helper it or an argument calls (transitively), runs raw code, every by-value local argument is copied: raw code can write any frame word by number or by its `.air` name.
 
 ### 4. Tier 2: stack cursor
 
 - **`for … else`.** All five object iterators take an exhaustion block. Exhaustion reaches it directly, and `break` skips it.
   - This removes the Fridges 4112 flag.
-  - Exhaustion restores the stack object only when the iterator or its body moved it. A redundant store would replace the iterator's false result, which the block can read (`gosub_found_action`). Where a restore is needed it is bookkeeping, as with the entry save.
+  - Exhaustion restores the stack object only when the iterator moves it (a stack cursor) or an iteration may leave it moved: the lowered body is checked (`opt::body_may_leave_stack_obj_moved`) for a path to a `continue` or its end where a write, or a subroutine call, is not followed by the restore. A field read through the item moves the cursor and back, so it needs none. A redundant store would replace the iterator's false result, which the block can read (`gosub_found_action`). Where a restore is needed it is bookkeeping, as with the entry save.
+  - Loop exits inside a raw block are found by parsing it (`raw_facts`): a raw loop's own `break` and a commented `continue` do not exit the `for`.
 - **In-place stepping.** `while set_to_next(guid, K, dest: stack_obj) { .. }` steps the cursor in place.
   - It starts at the current object and needs no locals.
   - Modes `category` (6, reads `param[0]`) and `on_tile` (8) are available.
@@ -115,17 +121,10 @@ Inline `fn` helpers lower directly into their caller's targets:
 
 ### 5. Tier 2: `const` inside `raw { }`
 
-- **Constants.** A `const` in an operand position of raw `.air` is its number; a GUID is written in hex.
-- **Tuning entries.** A tuning table's `Table.entry` is its `bcon[N]` operand.
-- **Left alone:**
-  - labels (`@x` and bare `x:`) and branch targets, including target lists continued on later lines;
-  - `.air` words, such as the `part` mode of `set_to_next`. `src/v2/air_words.rs` lists them, and a unit test keeps the list in step with every word the `.air` parser matches;
-  - fields, cells, call names and argument keys;
-  - strings and comments;
-  - `.air` keywords.
-- **Raw locals win.**
-  - A name any raw block of the tree declares (`local x`, `let x`) stays that local in every raw block, since `.air` locals are tree-wide.
-  - Declaring a name that an earlier raw block read as a const is an error, not a silent change of meaning.
+- **`.air` named constants.** Raw `.air` keeps its own grammar: lowering lexes each raw block, and every v2 `const` (or tuning `Table.entry`) it names becomes a tree-level `.air` declaration, `const NAME = value;` (a GUID in hex, a tuning entry as its `bcon[N]` operand).
+- **Where they resolve.** The `.air` parser resolves a named constant only where it takes an operand or an integer. Labels (`@x`, bare `x:`), branch targets (also after comments or on later lines), mode words such as the `part` of `set_to_next`, fields, call names, argument keys, strings and comments keep their meaning, because the parser never looks a name up there. No text rewrite and no list of `.air` words is needed (the round-1 `air_words.rs` list is gone).
+- **Locals win.** A name the tree declares as a local (`let x`, `local x`, tree-wide in `.air`) is that local everywhere in the tree, constant or not. Assigning a constant is an `.air` error.
+- **One meaning per tree.** One name must name one value in a tree: an inlined helper's raw code may see another module's constants, and a clash is an error.
 - **Why this is safe.** A bare name that is not declared was already an `.air` error, so no previously valid raw code changes meaning.
 
 ### 6. Tier 2: `@slot(N) let`
@@ -136,7 +135,10 @@ Inline `fn` helpers lower directly into their caller's targets:
   - When the tree is finished, `opt::assign_frame_slots` rewrites it to `local[N]`.
   - It also places the tree's other generated locals first-fit, in declaration order, around every slot `.air` reports as explicit. On its own, `.air` would put them after the highest explicit slot.
   - The `.air` scan (`lower::air_local_usage`) now records explicit slots as a set, not a maximum. The allocation of trees without `@slot` is unchanged.
-- **Rewriting.** The rewrite changes local operands only. A label spelled like a pinned name stays a label.
+- **Provenance.** Only the locals lowering itself pinned (a map from `.air` name to word) are placed: a raw block's own `__slot..` name is an ordinary raw local.
+- **Rewriting.** The rewrite works on `.air` tokens and changes local operands only. A label, a branch target, a field, an argument key or a `const` name spelled like a pinned name stays what it is.
+- **Stores are kept.** The optimizer never drops, forwards or undeclares a pinned local's store: another tree reusing the frame, or raw code, can read the word by number.
+- **Inside the frame.** With `@frame(locals: L)`, `@slot(N)` needs `N < L`.
 - **Kept as `.air` places them:**
   - locals a raw block declares under its own name (even one starting `__`);
   - every unpinned local of a tree with raw `op` bytes.
@@ -189,4 +191,5 @@ Each item below is clean as its own change, so this PR leaves it out:
 - **Verifier gap 1 remains.** Cut-point bisimulation compares local slots literally. `@slot` lets a source match Maxis's slots exactly where that matters.
 - **New invariant.** Generated local names starting `__slot` are reserved for pinned locals. `merge_group` and the text liveness treat them as source locals.
 - **`$Local:N` contract.** In a tree that formats text, each source local keeps a word that holds its value. The word's number is fixed only by `@slot(N)`; an unpinned local's number is the compiler's.
-- **Review.** Codex Sol review round 1 found twelve soundness bugs. Each fix above has a synthetic regression test in `tests/v2_pr_h_review.rs`.
+- **Review.** Codex Sol review round 1 found twelve soundness bugs and round 2 fourteen more, plus an architecture finding: raw `.air` was analysed by text approximations of its grammar. Round 2 replaced those with the `.air` parser (named constants) and one parsed analysis (`raw_facts`). Each fix has a synthetic regression test in `tests/v2_pr_h_review.rs`.
+- **Random ranges.** `random` writes its destination only when its range is a literal: a range resolving to a word pointer (global 34) draws into the range cell, so the entry-save analysis does not count it as a write.

@@ -63,18 +63,18 @@ pub(crate) fn optimize_tree_body(body: &str) -> String {
 /// The save is the lowering's own bookkeeping, not part of the program: an unread save is one the
 /// lowering never needed, so it goes even before a node that observes the last result (which
 /// then sees the frame's entry state, as the source says).
-pub(crate) fn drop_unread_entry_save(body: &str) -> Option<String> {
+pub(crate) fn drop_unread_entry_save(body: &str, formats_text: bool) -> Option<String> {
     const SAVE: &str = "let __self_obj = stack_obj;";
     // Deleting the node would shift numeric branch targets (`-> true: 3`), and deleting the
     // local would move the frame words of the named locals after it, which a raw op or a
     // `scope(25, N)` cell may name by number. (`.air` places named locals after every explicit
     // `local[N]`, so those keep their words.)
-    // A tree that formats text reads frame words by number (`$Local:N`), so it sees the shift.
-    if body.contains("/*")
+    // A tree that formats text (`formats_text`, which the lowering reads from the parse of its
+    // raw blocks) reads frame words by number (`$Local:N`), so it sees the shift.
+    if formats_text
+        || body.contains("/*")
         || has_positional_targets(body)
-        || body
-            .lines()
-            .any(|l| names_local_slot(&strip_strings(l)) || formats_text(l))
+        || body.lines().any(|l| names_local_slot(&strip_strings(l)))
     {
         return None;
     }
@@ -271,17 +271,21 @@ pub(crate) fn pin_in_place(body: &str) -> String {
     out
 }
 
-/// Places a tree's `@slot(N) let` locals (named `__slot<N>_<name>_<k>`) in `local[N]` and every
-/// other generated local (`__..`) in the lowest frame word nothing else names, in declaration
-/// order. `.air` alone would put the named locals after the highest explicit slot, so pinning
-/// a high word would grow the frame by that many words.
+/// Places a tree's `@slot(N) let` locals (`pinned`, which lowering names and numbers) in
+/// `local[N]` and every other generated local (`__..`) in the lowest frame word nothing else
+/// names, in declaration order. `.air` alone would put the named locals after the highest
+/// explicit slot, so pinning a high word would grow the frame by that many words.
 ///
 /// The explicit slots come from the `.air` compiler's own scan of the tree, so no word an
 /// operand, a numeric local argument or another pinned local names is shared. Locals a `raw`
 /// block declares under its own name keep `.air`'s placement (after every explicit slot), as do
 /// all unpinned locals of a tree with raw `op` bytes, whose operands no scan can read. A body
 /// `.air` cannot parse is left alone: compiling it reports the error.
-pub(crate) fn assign_frame_slots(body: &str, raw_declared: &BTreeSet<String>) -> String {
+pub(crate) fn assign_frame_slots(
+    body: &str,
+    pinned: &BTreeMap<String, usize>,
+    raw_declared: &BTreeSet<String>,
+) -> String {
     let wrapped = format!("tree 4096 \"__slots\" {{\n{body}\n}}\n");
     let Some(usage) =
         crate::parser::parse_module(&wrapped)
@@ -293,15 +297,10 @@ pub(crate) fn assign_frame_slots(body: &str, raw_declared: &BTreeSet<String>) ->
     else {
         return body.to_owned();
     };
-    let pinned_slot = |name: &str| -> Option<usize> {
-        let rest = name.strip_prefix("__slot")?;
-        let (digits, _) = rest.split_once('_')?;
-        digits.parse().ok()
-    };
     let mut used = usage.explicit.clone();
     let mut slots: BTreeMap<String, usize> = BTreeMap::new();
     for name in &usage.lets {
-        if let Some(n) = pinned_slot(name) {
+        if let Some(&n) = pinned.get(name) {
             used.insert(n);
             slots.insert(name.clone(), n);
         }
@@ -315,97 +314,83 @@ pub(crate) fn assign_frame_slots(body: &str, raw_declared: &BTreeSet<String>) ->
             }
         }
     }
-    let mut out = String::with_capacity(body.len());
-    for line in body.lines() {
-        let rewritten = place_locals_in_line(line, &slots);
-        if rewritten.trim().is_empty() && !line.trim().is_empty() {
-            continue;
-        }
-        out.push_str(&rewritten);
-        out.push('\n');
-    }
-    out
+    place_locals(body, &slots).unwrap_or_else(|| body.to_owned())
 }
 
-/// `line` with each local of `slots` written as `local[K]`: `let x;` (or `local x;`) goes,
-/// `let x = v;` becomes `local[K] := v;`, and every other use of `x` outside strings and comments becomes `local[K]`.
-fn place_locals_in_line(line: &str, slots: &BTreeMap<String, usize>) -> String {
-    let bytes = line.as_bytes();
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let skip_spaces = |mut j: usize| {
-        while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
-            j += 1;
-        }
-        j
+/// `body` with each local of `slots` written as `local[K]`, found by the `.air` lexer: `let x;`
+/// (or `local x;`) goes, `let x = v;` becomes `local[K] := v;`, and every other operand `x`
+/// becomes `local[K]`. A name after `.` (a field), before `:` (a label or an argument key), after
+/// `const`, or among a node's branch targets (`-> .. ;`) is not an operand and stays. `None` if
+/// the body does not lex.
+fn place_locals(body: &str, slots: &BTreeMap<String, usize>) -> Option<String> {
+    use crate::lexer::TokenKind as T;
+    let tokens = crate::lexer::tokenize(body).ok()?;
+    let mut line_starts = vec![0];
+    line_starts.extend(body.match_indices('\n').map(|(i, _)| i + 1));
+    // The lexer counts columns in bytes.
+    let offset = |t: &crate::lexer::Token| line_starts[t.span.line - 1] + t.span.column - 1;
+    let ident_end = |at: usize| {
+        at + body[at..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(body.len() - at)
     };
-    let word_at = |j: usize| {
-        let mut e = j;
-        while e < bytes.len() && is_ident(bytes[e]) {
-            e += 1;
-        }
-        (&line[j..e], e)
-    };
-    let mut out = String::with_capacity(line.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'"' {
-            let start = i;
-            i += 1;
-            while i < bytes.len() && bytes[i] != b'"' {
-                i += if bytes[i] == b'\\' { 2 } else { 1 };
-            }
-            i = (i + 1).min(bytes.len());
-            out.push_str(&line[start..i]);
-            continue;
-        }
-        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
-            out.push_str(&line[i..]);
-            break;
-        }
-        if !(b.is_ascii_alphabetic() || b == b'_') || (i > 0 && is_ident(bytes[i - 1])) {
-            let len = line[i..].chars().next().map_or(1, char::len_utf8);
-            out.push_str(&line[i..i + len]);
-            i += len;
-            continue;
-        }
-        let (word, end) = word_at(i);
-        // `.air` declares with `let` or `local`.
-        if matches!(word, "let" | "local") {
-            let name_at = skip_spaces(end);
-            let (name, name_end) = word_at(name_at);
-            if let Some(k) = slots.get(name) {
-                let after = skip_spaces(name_end);
-                if bytes.get(after) == Some(&b';') {
-                    i = skip_spaces(after + 1);
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut in_targets = false;
+    for (i, t) in tokens.iter().enumerate() {
+        match &t.kind {
+            T::Arrow => in_targets = true,
+            T::Semicolon => in_targets = false,
+            T::Ident(name) if !in_targets => {
+                let Some(k) = slots.get(name) else {
+                    continue;
+                };
+                let prev = i.checked_sub(1).map(|p| &tokens[p].kind);
+                let next = tokens.get(i + 1).map(|t| &t.kind);
+                if matches!(prev, Some(T::Dot)) || matches!(next, Some(T::Colon)) {
                     continue;
                 }
-                if bytes.get(after) == Some(&b'=') && bytes.get(after + 1) != Some(&b'=') {
-                    out.push_str(&format!("local[{k}] :="));
-                    i = after + 1;
-                    continue;
+                match prev {
+                    Some(T::Ident(kw)) if kw == "const" => {}
+                    Some(T::Ident(kw)) if kw == "let" || kw == "local" => {
+                        let decl = offset(&tokens[i - 1]);
+                        match next {
+                            Some(T::Semicolon) => {
+                                let end = offset(&tokens[i + 1]) + 1;
+                                edits.push((decl, end, String::new()));
+                            }
+                            Some(T::Assign) => {
+                                let op = offset(&tokens[i + 1]);
+                                let end = op + if body[op..].starts_with(":=") { 2 } else { 1 };
+                                edits.push((decl, end, format!("local[{k}] :=")));
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {
+                        let at = offset(t);
+                        edits.push((at, ident_end(at), format!("local[{k}]")));
+                    }
                 }
             }
+            _ => {}
         }
-        // Not a field (`x.y`) or a label (`@x:`, bare `x:`, `-> true: @x`). A local followed
-        // by `:` can only be a label (`x := ..` is an assignment).
-        let after = skip_spaces(end);
-        let label_def = bytes.get(after) == Some(&b':') && bytes.get(after + 1) != Some(&b'=');
-        match slots.get(word) {
-            Some(k)
-                if !label_def
-                    && !matches!(
-                        bytes[..i].iter().rev().find(|c| !matches!(c, b' ' | b'\t')),
-                        Some(b'.' | b'@')
-                    ) =>
-            {
-                out.push_str(&format!("local[{k}]"));
-            }
-            _ => out.push_str(word),
-        }
-        i = end;
     }
-    out
+    let mut out = body.to_owned();
+    for (start, end, mut text) in edits.into_iter().rev() {
+        // Line breaks inside a removed declaration stay, so lines still pair up below.
+        text.extend(body[start..end].matches('\n'));
+        out.replace_range(start..end, &text);
+    }
+    // A declaration that was alone on its line leaves no blank line behind.
+    let mut placed = String::with_capacity(out.len());
+    for (line, orig) in out.lines().zip(body.lines()) {
+        if line.trim().is_empty() && !orig.trim().is_empty() {
+            continue;
+        }
+        placed.push_str(line);
+        placed.push('\n');
+    }
+    Some(placed)
 }
 
 /// Collects the sources of `local[0] := s;` copies; clears `ok` if `local[0]` is named in any
@@ -620,7 +605,9 @@ enum WriteExit {
 /// cell `name` through an out-operand, returns the text with that operand blanked (for the reads
 /// it still makes) and the exits on which the store happens, as the VM runs them:
 ///
-/// - `random(x, n)` stores the draw, then takes the true exit;
+/// - `random(x, n)` with a literal range stores the draw, then takes the true exit (a range
+///   that resolves to a word pointer, such as global 34, redirects the draw into the range
+///   cell, so any other range is not a write of `x`);
 /// - `animate(.., local: x)` stores an event in the local, then takes the false exit;
 /// - `relationship(.., value: x)` without flag 4 reads the number into the cell and takes the
 ///   true exit; with flag 1 a missing number takes the false exit unwritten, and without it
@@ -645,7 +632,8 @@ fn out_operand_write(text: &str, name: &str) -> Option<(String, WriteExit)> {
     let (at, exit) = match prim {
         "random" => {
             let first = args.first()?;
-            (first.trim() == name).then_some((0, WriteExit::Both))?
+            let literal_range = args.get(1).and_then(|r| parse_int(r.trim())).is_some();
+            (first.trim() == name && literal_range).then_some((0, WriteExit::Both))?
         }
         "animate" => {
             let i = named("local")?;
@@ -1418,6 +1406,56 @@ fn scope_store_lhs(stripped: &str) -> Option<u32> {
     Some(num.trim().parse::<u32>().unwrap_or(10))
 }
 
+/// Whether lowered loop-body code (`body`) may reach a `continue` or its end with `stack_obj`
+/// still moved away from its entry value: some line may write it and no later `restore` line
+/// (`stack_obj := __self_obj;`) puts it back on every path. A field read through another
+/// object moves the stack object and restores it right after, so it leaves nothing displaced.
+/// A subroutine call counts as a write. Code that does not parse may.
+pub(crate) fn body_may_leave_stack_obj_moved(body: &str, restore: &str) -> bool {
+    fn line_writes(l: &str) -> bool {
+        may_write_stack_obj(l) || callees(&strip_strings(l)).any(|c| c == "call")
+    }
+    /// `moved` after `nodes`, setting `exits` if a `continue` may see it moved.
+    fn flow(nodes: &[Node], mut moved: bool, restore: &str, exits: &mut bool) -> bool {
+        for n in nodes {
+            match n {
+                Node::Line(l) if l.trim() == restore => moved = false,
+                Node::Line(l) => {
+                    if matches!(classify(l), Kind::Continue) {
+                        *exits |= moved;
+                    }
+                    moved |= line_writes(l);
+                }
+                Node::If { arms, else_body } => {
+                    let mut out = false;
+                    for (cond, body) in arms {
+                        moved |= line_writes(cond);
+                        out |= flow(body, moved, restore, exits);
+                    }
+                    out |= match else_body {
+                        Some(body) => flow(body, moved, restore, exits),
+                        None => moved,
+                    };
+                    moved = out;
+                }
+                Node::While { cond, body } => {
+                    // Twice: the second pass starts from whatever one iteration may leave.
+                    for _ in 0..2 {
+                        moved |= cond.as_deref().is_some_and(line_writes);
+                        moved |= flow(body, moved, restore, exits);
+                    }
+                }
+            }
+        }
+        moved
+    }
+    let Some(nodes) = parse_body(body) else {
+        return true;
+    };
+    let mut exits = false;
+    flow(&nodes, false, restore, &mut exits) || exits
+}
+
 fn writes_stack_obj_anywhere(nodes: &[Node]) -> bool {
     nodes.iter().any(|n| match n {
         Node::Line(l) => may_write_stack_obj(l),
@@ -1801,9 +1839,14 @@ fn unwrap_single_pass_loops(nodes: &mut Vec<Node>) {
 /// Drops plain stores (`let x = e;`, `x := e;` from a non-faulting operand) to v2 locals that
 /// are dead after the store. A dropped `let` keeps its declaration, which emits no node.
 fn drop_dead_local_stores(nodes: &mut Vec<Node>) {
+    // An `@slot` local's stores stay: the word is pinned so a frame matches one that other
+    // code (a raw block, a later tree reusing the frame) reads by number.
     let mut names = Vec::new();
     collect_lets(nodes, &mut names);
-    let locals: BTreeSet<String> = names.into_iter().collect();
+    let locals: BTreeSet<String> = names
+        .into_iter()
+        .filter(|n| !n.starts_with("__slot"))
+        .collect();
     let mut lv = Liveness {
         locals: &locals,
         text_reads_locals: nodes_format_text(nodes),
@@ -1867,9 +1910,14 @@ fn plain_store(line: &str) -> Option<(&str, &str, bool)> {
 /// `t := e; d := t;` with `t` a v2 local that is dead afterwards becomes `d := e;`: one
 /// expression node reading `e` where two read it in turn, with nothing in between.
 fn forward_copies(nodes: &mut Vec<Node>) {
+    // An `@slot` local's stores stay: the word is pinned so a frame matches one that other
+    // code (a raw block, a later tree reusing the frame) reads by number.
     let mut names = Vec::new();
     collect_lets(nodes, &mut names);
-    let locals: BTreeSet<String> = names.into_iter().collect();
+    let locals: BTreeSet<String> = names
+        .into_iter()
+        .filter(|n| !n.starts_with("__slot"))
+        .collect();
     let mut lv = Liveness {
         locals: &locals,
         text_reads_locals: nodes_format_text(nodes),
@@ -1984,6 +2032,8 @@ fn drop_unused_decls(nodes: &mut Vec<Node>) {
         counts
             .into_iter()
             .filter(|&(name, _)| !(keep_user && is_source_local(name)))
+            // A pinned `@slot` word stays declared: dropping it would free its number.
+            .filter(|&(name, _)| !name.starts_with("__slot"))
             .filter(|&(_, (reads, writes))| reads == 0 && writes <= 1)
             .map(|(name, _)| name.to_owned())
             .collect()
@@ -2149,10 +2199,11 @@ impl Liveness<'_> {
                     Kind::Break => return brk.clone(),
                     Kind::Continue => return cont.clone(),
                     Kind::Let { init: None, .. } => return out,
+                    // A name outside `locals` (a pinned `@slot` word) is never a dead def.
                     Kind::Let {
                         name,
                         init: Some(init),
-                    } => (Some(name), init),
+                    } => (self.locals.contains(name).then_some(name), init),
                     Kind::Assign { lhs, op: ":=", rhs } if self.locals.contains(lhs) => {
                         (Some(lhs), rhs)
                     }
@@ -2488,7 +2539,7 @@ mod tests {
         );
         // Not when a local read before it is written would move to another frame word.
         let body = "    let __self_obj = stack_obj;\n    let __v_x_0;\n    temp[0] := __v_x_0;\n    call 300(temps);\n    return true;\n";
-        assert_eq!(drop_unread_entry_save(body), None);
+        assert_eq!(drop_unread_entry_save(body, false), None);
         // A raw line the structured pass cannot parse falls back to the declarations: written
         // where they come into scope, the save goes; declared without a value, it stays.
         let raw_line = "    if !call 281(0, 0) {\n    if push_interaction(menu: 2, object: 0, priority: 0, flags: 7) { return true; }\n    }\n";
@@ -2497,11 +2548,11 @@ mod tests {
         );
         assert!(parse_body(&body).is_none());
         assert_eq!(
-            drop_unread_entry_save(&body).as_deref(),
+            drop_unread_entry_save(&body, false).as_deref(),
             Some(&body["    let __self_obj = stack_obj;\n".len()..])
         );
         let body = body.replace("let __v_x_0 = 1;", "let __v_x_0;");
-        assert_eq!(drop_unread_entry_save(&body), None);
+        assert_eq!(drop_unread_entry_save(&body, false), None);
         // Scope 27 (sprite flags) reads the stack object, so the switch before it stays.
         let body = "    stack_obj := my.id;\n    temp[0] := 0;\n    scope(27, 0) := 1;\n    return true;\n";
         assert_eq!(optimize_tree_body(body), body);
@@ -2510,7 +2561,7 @@ mod tests {
         assert!(optimize_tree_body(body).contains("icon: __self_obj"));
         // Raw numeric targets keep the line-based save drop away.
         let body = "    let __self_obj = stack_obj;\n    stack_obj := my.id;\n    random(temp[0], 1) -> true: 3, false: 3;\n    return true;\n";
-        assert_eq!(drop_unread_entry_save(body), None);
+        assert_eq!(drop_unread_entry_save(body, false), None);
         // A local read before any write is not moved into the pin slot.
         let body = "    let o;\n    local[0] := o;\n    push_interaction(menu: 0, object: 0, priority: 2, flags: 3, icon: 0);\n    return true;\n";
         assert_eq!(pin_in_place(body), body);
