@@ -34,6 +34,11 @@ pub struct Font {
     /// Characters by the byte the original's code page gives them.
     encoding: std::collections::BTreeMap<char, u8>,
     pub line_height: i32,
+    /// What the original adds to every text's width (`[font+0x34]`,
+    /// set by 0x60bbc7..0x60bbda, added by 0x60b821): the glyphs' mean x
+    /// bearing, in single precision, plus a half, cut toward zero. 1 for
+    /// the 7-point font, 0 for the 8-point one.
+    width_extra: i32,
     decoded: ffn::Font,
 }
 
@@ -94,10 +99,21 @@ impl Font {
                 encoding.entry(ch).or_insert(byte);
             }
         }
+        let width_extra = if decoded.glyphs.is_empty() {
+            0
+        } else {
+            let sum = decoded
+                .glyphs
+                .iter()
+                .fold(0f32, |sum, g| sum + f32::from(g.bearing_x));
+            // `__ftol` truncates toward zero.
+            (sum / decoded.glyphs.len() as f32 + 0.5) as i32
+        };
         Self {
             metrics,
             encoding,
             line_height,
+            width_extra,
             decoded,
         }
     }
@@ -108,12 +124,45 @@ impl Font {
             .map(|&b| &self.metrics[usize::from(b)])
     }
 
-    /// The width of `text` on one line. Characters the font cannot show
-    /// take no room.
+    /// The rows `ch` inks, down from the top of its line: its first and
+    /// one past its last. `None` when nothing is drawn for it: a byte the
+    /// code page lacks, a byte the font has no glyph for, or a glyph with
+    /// no width or no height.
+    pub fn rows(&self, ch: char) -> Option<[i32; 2]> {
+        self.char_box(ch).filter(|_| {
+            self.metric(ch)
+                .is_some_and(|m| m.atlas[2] > 0 && m.atlas[3] > 0)
+        })
+    }
+
+    /// The rows of the box the original's font table gives `ch` (read by
+    /// the text box, 0x5e3f46, and the `A`-bottom method, 0x60b927): its
+    /// top, down from the line's, and that plus its height. A byte the
+    /// font has no glyph for keeps an empty slot, zero high at the
+    /// line's top as every slot is moved down with the glyphs. `None`
+    /// only for a character the code page lacks.
+    pub fn char_box(&self, ch: char) -> Option<[i32; 2]> {
+        self.metric(ch).map(|m| {
+            let top = m.bearing[1];
+            [top, top.saturating_add(i32::from(m.atlas[3]))]
+        })
+    }
+
+    /// The width of `text` on one line: the sum of its characters'
+    /// advances, how far drawing it moves. Characters the font cannot
+    /// show take no room.
     pub fn width(&self, text: &str) -> i32 {
         text.chars()
             .filter_map(|c| self.metric(c))
             .fold(0i32, |w, m| w.saturating_add(m.advance))
+    }
+
+    /// The width the original's draw-in-a-box (0x60b4a1) aligns `text`
+    /// by, through the font's measure (0x60b7e2): the advances plus the
+    /// font's `width_extra`. Dialog layout and caret placement measure
+    /// with [`Font::width`].
+    pub fn box_width(&self, text: &str) -> i32 {
+        self.width(text).saturating_add(self.width_extra)
     }
 
     /// Draws `text` on one line with its top-left corner at `at`.
@@ -346,6 +395,52 @@ pub(crate) mod tests {
         Font::new(decoded)
     }
 
+    /// [`hanging_font`] with `extra` added to the bearing of its glyph
+    /// past the single-byte codes (300), which is never drawn: every
+    /// advance the same, the mean bearing `extra / 4` higher. With 3 the
+    /// font's `width_extra` is 1 (0.25 + 0.75 + 0.5, cut), not 0.
+    pub(crate) fn hanging_font_plus(extra: i8) -> Font {
+        let mut decoded = hanging_font().decoded;
+        for glyph in &mut decoded.glyphs {
+            if glyph.code == 300 {
+                glyph.bearing_x += extra;
+            }
+        }
+        Font::new(decoded)
+    }
+
+    /// The digits, each 1 by 1 with an advance of 1, and an undrawn glyph
+    /// (300) whose bearing `extra` gives the font a `width_extra` of 1 at 6
+    /// (6 / 11 + 0.5, cut) and 0 at 0.
+    pub(crate) fn digit_font(extra: i8) -> Font {
+        let glyph = |code, bearing_x| ffn::Glyph {
+            code,
+            width: 1,
+            height: 1,
+            atlas_x: 0,
+            atlas_y: 0,
+            first_bearing: 0,
+            bearing_x,
+            bearing_y: 0,
+        };
+        let mut glyphs: Vec<ffn::Glyph> = (48..58).map(|code| glyph(code, 0)).collect();
+        glyphs.push(glyph(300, extra));
+        Font::new(ffn::Font {
+            flags: 9,
+            glyphs,
+            width: 1,
+            height: 1,
+            coverage: vec![15],
+        })
+    }
+
+    /// [`hanging_font`] without its `A`.
+    pub(crate) fn without_a() -> Font {
+        let mut decoded = hanging_font().decoded;
+        decoded.glyphs.retain(|g| g.code != 65);
+        Font::new(decoded)
+    }
+
     #[test]
     fn metrics_follow_the_original_rules() {
         let f = font();
@@ -356,6 +451,52 @@ pub(crate) mod tests {
         // The space: half the mean ink width (1.5 / 2), rounded.
         assert_eq!(f.width(" "), 1);
         assert_eq!(f.width("A\u{1F600}"), 3);
+    }
+
+    #[test]
+    fn the_box_width_adds_the_mean_bearing_rounded_and_rows_find_the_ink() {
+        // Bearings 1, 0, 0: a mean of a third, plus a half, cut to 0.
+        let f = font();
+        assert_eq!(f.box_width("AB"), f.width("AB"));
+        // With the `g` and a bearing of 1 for `B`, the mean is exactly a
+        // half: plus a half, 1 (cut without the half, it would be 0).
+        let mut decoded = hanging_font().decoded;
+        for glyph in &mut decoded.glyphs {
+            if glyph.code == 66 {
+                glyph.bearing_x = 1;
+            }
+        }
+        let shifted = Font::new(decoded);
+        assert_eq!(shifted.box_width("AB"), shifted.width("AB") + 1);
+        assert_eq!(shifted.box_width(""), 1);
+        // `A` is inked from the line's top for its 2 rows; the `g` from 2
+        // below that; a character the font lacks has no rows.
+        let hanging = hanging_font();
+        assert_eq!(hanging.rows('A'), Some([0, 2]));
+        assert_eq!(hanging.rows('g'), Some([2, 4]));
+        assert_eq!(hanging.rows('\u{1F600}'), None);
+        // A font with a `g` but no `A`: `A` is in the code page but has no
+        // glyph, so it has no rows either.
+        let without_a = without_a();
+        assert_eq!(without_a.rows('A'), None);
+        // Its slot is still there, empty, at the line's top.
+        assert_eq!(without_a.char_box('A'), Some([0, 0]));
+        assert_eq!(hanging.char_box('A'), hanging.rows('A'));
+        // A glyph with height but no width inks nothing.
+        let mut decoded = hanging_font().decoded;
+        for glyph in &mut decoded.glyphs {
+            if glyph.code == 103 {
+                glyph.width = 0;
+            }
+        }
+        let flat = Font::new(decoded);
+        assert_eq!(flat.rows('g'), None);
+        assert!(flat.char_box('g').is_some());
+        assert_eq!(hanging_font_plus(3).box_width(""), 1);
+        assert_eq!(hanging_font_plus(3).width("AgB"), hanging.width("AgB"));
+        assert_eq!(digit_font(6).box_width("7"), 2);
+        assert_eq!(digit_font(0).box_width("7"), 1);
+        assert!(without_a.rows('g').is_some());
     }
 
     #[test]

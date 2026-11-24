@@ -135,11 +135,11 @@ fn the_goths_personality_panel() {
     let mut frame = Frame::new(800, 600, [0, 0, 0]);
     let items = hud::layout([800, 600], &opened.snapshot, &controls);
     hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
-    // Pins the drawing; it has not been compared with the original's
-    // screen (see docs/decisions/).
+    // Pins the drawing. The same panel at 1024 by 768 is under the
+    // 5-6-5 step of the original's screen (ui_oracle_tour, live-personality-1024).
     assert_eq!(
         digest(&frame),
-        "71013e6ee23e578bd874a40cb0f18dd023526724999d9e5e9e41a2c26b081d9e"
+        "97eb2f0aaf0f142be0f11bd03068b8d9e703ad43d380683eaf2855120ca858c1"
     );
 }
 
@@ -184,7 +184,7 @@ fn the_goths_sign_balloon() {
     );
     assert_eq!(
         digest(&frame),
-        "595b37c19a714176053a4843977fa72417549215d58106079dbd0919e1382b57"
+        "38084d4b905bec9aa91bedcaa8497f9a65f6458310d00699fcddd1ab2025a777"
     );
 }
 
@@ -251,11 +251,11 @@ fn the_goths_job_panel() {
         hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
         digest(&frame)
     };
-    // Pins the drawing; it has not been compared with the original's
-    // screen (see docs/decisions/).
+    // Pins the drawing. The same panel at 1024 by 768 is under the
+    // 5-6-5 step of the original's screen (ui_oracle_tour, live-job-1024).
     assert_eq!(
         draw(&opened.snapshot),
-        "154e5514ced4c334513df0ea06f03c4e1b60c099263de8e25c1f69fb25fa8acd"
+        "3e1541b07e0118aa5a428ab73b57b04c30672a37efdf7894e283acce9d38cf71"
     );
     // A level up the ladder, "Field Researcher" at $320: the next level,
     // "Science Teacher", needs a point of Charisma, three of Logic, which
@@ -275,7 +275,7 @@ fn the_goths_job_panel() {
     );
     assert_eq!(
         draw(&snapshot),
-        "50cb1d1271096e777ce37692e93d4615b2642099f62dff85e66ffef2bd1ad10c"
+        "65c8cd5910abdafe1232803e9cf2faa1eec01aa54c0805eb0bd44739613fd566"
     );
     // Titles wider than the column break as the original's do: after a
     // hyphen or a space, and both lines start above the box's bottom.
@@ -295,7 +295,7 @@ fn the_goths_job_panel() {
     }
     assert_eq!(
         draw(&snapshot),
-        "0a071502ea744252fb5dbb0ed3bb20e8f8c080c05b056d95c041b6895f0005dc"
+        "bdfeafa21ecb6e81288e280989952c055bf4db944c3dec9ede2b87ccecd29455"
     );
 }
 
@@ -343,11 +343,11 @@ fn the_goths_relationship_panel() {
     let mut frame = Frame::new(800, 600, [0, 0, 0]);
     let items = hud::layout([800, 600], &opened.snapshot, &controls);
     hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
-    // Pins the drawing; it has not been compared with the original's
-    // screen (see docs/decisions/).
+    // Pins the drawing. The same panel at 1024 by 768 is under the
+    // 5-6-5 step of the original's screen (ui_oracle_tour, live-relationships-1024).
     assert_eq!(
         digest(&frame),
-        "8e50d3bb46331ffd62e455a3704fbd804c4fa0a6c52475561ef02c98a575d584"
+        "9e0ad9e6a15634fcc4d0820c7b3e822712eb8eece020760a4c44f817b6eeed7b"
     );
 }
 
@@ -423,9 +423,12 @@ fn the_goths_house_panel() {
         house::Values::read(&unsaved, &opened.kinds, &opened.prices),
         house.values
     );
+    // Layout from the five saved days of usage samples and today's
+    // (0x4166ee): 38, the three bars the original's panel shows for the
+    // Goths (ui_oracle_tour, live-house-1024).
     assert_eq!(
         house.ratings,
-        [Some(75), Some(58), Some(76), Some(100), None]
+        [Some(75), Some(58), Some(76), Some(100), Some(38)]
     );
     let controls = Controls {
         expanded: true,
@@ -435,11 +438,11 @@ fn the_goths_house_panel() {
     let mut frame = Frame::new(800, 600, [0, 0, 0]);
     let items = hud::layout([800, 600], &opened.snapshot, &controls);
     hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
-    // Pins the drawing; it has not been compared with the original's
-    // screen (see docs/decisions/).
+    // Pins the drawing. The same panel at 1024 by 768 is under the
+    // 5-6-5 step of the original's screen (ui_oracle_tour, live-house-1024).
     assert_eq!(
         digest(&frame),
-        "414dd3f98cdf74e01e7b8363dae9f59a9ac17dcb1be9736721a8d7ae8a50a77c"
+        "1ed5c01d4e95b18a1746859d2887008308465cdfbc04a57223cf903618de47fd"
     );
 }
 

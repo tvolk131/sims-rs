@@ -4377,7 +4377,7 @@ fn report_card_superstar_panel_and_help_balloons() {
     //    (`Game::leave`), or clicking directly on the lot (`Game::press`, both
     //    empty ground and an object that opens a pie menu) dismisses an open
     //    help balloon with `UI_whoosh`. At 1024x768 (`0x518f48`, `0x51f260`),
-    //    the western subpanel spans x=521..1024 so hovering (650, 700) keeps
+    //    the western subpanel spans x=520..1024 so hovering (650, 700) keeps
     //    Hunger open.
     game.resize([1024, 768]);
     game.render();
@@ -4393,7 +4393,7 @@ fn report_card_superstar_panel_and_help_balloons() {
             .then_some(i.rect)
         })
         .expect("Hunger hitbox at 1024x768");
-    assert_eq!(hunger_1024.x, 521);
+    assert_eq!(hunger_1024.x, 520);
     game.press(center(hunger_1024));
     game.render();
     let _ = game.take_sounds();
