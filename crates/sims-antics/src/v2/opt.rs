@@ -17,7 +17,7 @@
 //!
 //! The passes work on the MIR (`v2::mir`: the body parsed into structured `Stmt`s, with the
 //! typed instruction view, effects and liveness analyses there too). These passes leave a tree
-//! the MIR does not model exactly untouched: labels, explicit branch targets (`->`), comments,
+//! the MIR does not model exactly untouched: labels on their own line, explicit branch targets (`->`), comments,
 //! or more than one statement on a line (some `raw { }` blocks). The entry-save and frame-allocation passes
 //! live in `v2::mir` beside the backend pipeline that runs them.
 

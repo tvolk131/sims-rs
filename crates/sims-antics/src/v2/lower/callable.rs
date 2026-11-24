@@ -336,7 +336,7 @@ impl<'a> TreeLowerer<'a> {
                 self.line(format!("let {tmp} = 0;"));
                 self.line(format!("if {call} {{"));
                 self.em.indent();
-                self.line(format!("{tmp} := 1;"));
+                self.emit_store(&tmp, ":=", "1");
                 self.em.dedent();
                 self.line("}".to_owned());
                 Ok((tmp, ValueType::Bool))

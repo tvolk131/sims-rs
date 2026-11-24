@@ -638,22 +638,22 @@ impl<'a> TreeLowerer<'a> {
                 if let Some(neg) = self.try_lower_negated_simple_air_cond(inner)? {
                     self.line(format!("if {neg} {{"));
                     self.em.indent();
-                    self.line(format!("{dst_local} := 1;"));
+                    self.emit_store(dst_local, ":=", "1");
                     self.em.dedent();
                     self.line("} else {".to_owned());
                     self.em.indent();
-                    self.line(format!("{dst_local} := 0;"));
+                    self.emit_store(dst_local, ":=", "0");
                     self.em.dedent();
                     self.line("}".to_owned());
                 } else {
                     self.emit_bool_into_local(inner, dst_local)?;
                     self.line(format!("if {dst_local} == 0 {{"));
                     self.em.indent();
-                    self.line(format!("{dst_local} := 1;"));
+                    self.emit_store(dst_local, ":=", "1");
                     self.em.dedent();
                     self.line("} else {".to_owned());
                     self.em.indent();
-                    self.line(format!("{dst_local} := 0;"));
+                    self.emit_store(dst_local, ":=", "0");
                     self.em.dedent();
                     self.line("}".to_owned());
                 }
@@ -697,11 +697,11 @@ impl<'a> TreeLowerer<'a> {
                     };
                     self.line(format!("if {prim} {{"));
                     self.em.indent();
-                    self.line(format!("{dst_local} := 1;"));
+                    self.emit_store(dst_local, ":=", "1");
                     self.em.dedent();
                     self.line("} else {".to_owned());
                     self.em.indent();
-                    self.line(format!("{dst_local} := 0;"));
+                    self.emit_store(dst_local, ":=", "0");
                     self.em.dedent();
                     self.line("}".to_owned());
                     if let Some(saved) = saved {
@@ -718,11 +718,11 @@ impl<'a> TreeLowerer<'a> {
                 if let Some(simple) = self.try_lower_simple_air_cond(expr)? {
                     self.line(format!("if {simple} {{"));
                     self.em.indent();
-                    self.line(format!("{dst_local} := 1;"));
+                    self.emit_store(dst_local, ":=", "1");
                     self.em.dedent();
                     self.line("} else {".to_owned());
                     self.em.indent();
-                    self.line(format!("{dst_local} := 0;"));
+                    self.emit_store(dst_local, ":=", "0");
                     self.em.dedent();
                     self.line("}".to_owned());
                     return Ok(());
@@ -760,11 +760,11 @@ impl<'a> TreeLowerer<'a> {
                     .ok_or_else(|| Error::at(expr.span(), "expected boolean expression"))?;
                 self.line(format!("if {simple} {{"));
                 self.em.indent();
-                self.line(format!("{dst_local} := 1;"));
+                self.emit_store(dst_local, ":=", "1");
                 self.em.dedent();
                 self.line("} else {".to_owned());
                 self.em.indent();
-                self.line(format!("{dst_local} := 0;"));
+                self.emit_store(dst_local, ":=", "0");
                 self.em.dedent();
                 self.line("}".to_owned());
                 Ok(())

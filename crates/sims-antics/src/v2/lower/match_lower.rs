@@ -589,7 +589,7 @@ impl<'a> TreeLowerer<'a> {
                         self.line(format!("if {scrut} <= {hi} {{"));
                         self.em.indent();
                     }
-                    self.line(format!("{flag} := 1;"));
+                    self.emit_store(&flag, ":=", "1");
                     if test.is_none() {
                         self.em.dedent();
                         self.line("}".to_owned());

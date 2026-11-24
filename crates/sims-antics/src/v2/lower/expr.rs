@@ -292,7 +292,7 @@ impl<'a> TreeLowerer<'a> {
                     if declare_let {
                         self.line(format!("let {dst_air} = 0;"));
                     } else {
-                        self.line(format!("{dst_air} := 0;"));
+                        self.emit_store(dst_air, ":=", "0");
                     }
                     self.line(format!("{dst_air} -= {v_air};"));
                     ValueType::I16
@@ -431,7 +431,7 @@ impl<'a> TreeLowerer<'a> {
                             self.line(format!("let {tmp} = 0;"));
                             self.line("if param[0] == 1 {".to_owned());
                             self.em.indent();
-                            self.line(format!("{tmp} := 1;"));
+                            self.emit_store(&tmp, ":=", "1");
                             self.em.dedent();
                             self.line("}".to_owned());
                             Ok((tmp, ValueType::Bool))

@@ -802,7 +802,7 @@ impl<'a> TreeLowerer<'a> {
                 .expect("enclosing cancel_flag implies an enclosing air while loop");
             self.line("if my.person.priority == 0 {".to_owned());
             self.em.indent();
-            self.line(format!("{flag} := 1;"));
+            self.emit_store(flag, ":=", "1");
             self.emit_cleanups_down_to(target_while)?;
             self.line("break;".to_owned());
             self.em.dedent();
@@ -815,7 +815,7 @@ impl<'a> TreeLowerer<'a> {
                 .expect("enclosing cancel_flag implies an enclosing air while loop");
             self.line("if my.person.priority == 0 {".to_owned());
             self.em.indent();
-            self.line(format!("{flag} := 1;"));
+            self.emit_store(flag, ":=", "1");
             self.emit_cleanups_down_to(target_while)?;
             self.line("break;".to_owned());
             self.em.dedent();

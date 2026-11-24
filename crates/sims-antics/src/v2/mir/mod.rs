@@ -2,13 +2,14 @@
 //!
 //! A body is a control-flow tree of [`Stmt`]s: simple instructions (each with a typed view,
 //! [`InstKind`]: declaration, store, `return` / `break` / `continue` exit, or other), `if` chains and
-//! `while` loops. Every branch of the tree is a structured edge. The unstructured control flow
-//! `.air` has (labels, `->` targets, several statements per line) puts a body outside the
-//! modelled subset: `parse_body` returns `None`, and the passes that need the tree (the
-//! optimizer, `pin_in_place`) leave it untouched. The line-based passes still run on such a
-//! body: `drop_unread_entry_save` removes an unread entry save (checking definitions on a
-//! one-statement-per-line split when that parses), and `assign_frame_slots` places `@slot(N)`
-//! locals.
+//! `while` loops. Every branch of the tree is a structured edge. A body outside the modelled
+//! subset is one `parse_body` returns `None` for: one with `->` branch targets, comments, `#`, a
+//! line that is not one `;`-terminated statement or a block header, or a numbered local slot. (A
+//! same-line label such as `done: return true;` still parses, as one opaque instruction.) The
+//! passes that need the tree (the optimizer, `pin_in_place`) leave such a body untouched. The
+//! others still run on it: `drop_unread_entry_save` works line by line (checking definitions on a
+//! one-statement-per-line split when that parses), and `assign_frame_slots` uses the full `.air`
+//! parser and rewrites tokens.
 //!
 //! The modules:
 //! - [`body`]: the node tree and block walkers;

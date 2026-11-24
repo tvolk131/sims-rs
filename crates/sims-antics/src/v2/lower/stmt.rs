@@ -352,7 +352,7 @@ impl<'a> TreeLowerer<'a> {
                 if let Some(flag) = &cancel_flag {
                     self.line("if my.person.priority == 0 {".to_owned());
                     self.em.indent();
-                    self.line(format!("{flag} := 1;"));
+                    self.emit_store(flag, ":=", "1");
                     self.line("break;".to_owned());
                     self.em.dedent();
                     self.line("}".to_owned());
@@ -368,7 +368,7 @@ impl<'a> TreeLowerer<'a> {
                 {
                     self.line(format!("if {inner_flag} != 0 {{"));
                     self.em.indent();
-                    self.line(format!("{outer_flag} := 1;"));
+                    self.emit_store(&outer_flag, ":=", "1");
                     self.em.dedent();
                     self.line("}".to_owned());
                 }
@@ -436,7 +436,7 @@ impl<'a> TreeLowerer<'a> {
                     if let Some(flag) = &cancel_flag {
                         self.line("if my.person.priority == 0 {".to_owned());
                         self.em.indent();
-                        self.line(format!("{flag} := 1;"));
+                        self.emit_store(flag, ":=", "1");
                         self.line("break;".to_owned());
                         self.em.dedent();
                         self.line("}".to_owned());
@@ -462,7 +462,7 @@ impl<'a> TreeLowerer<'a> {
                     if let Some(flag) = &cancel_flag {
                         self.line("if my.person.priority == 0 {".to_owned());
                         self.em.indent();
-                        self.line(format!("{flag} := 1;"));
+                        self.emit_store(flag, ":=", "1");
                         self.line("break;".to_owned());
                         self.em.dedent();
                         self.line("}".to_owned());
@@ -500,7 +500,7 @@ impl<'a> TreeLowerer<'a> {
                 {
                     self.line(format!("if {inner_flag} != 0 {{"));
                     self.em.indent();
-                    self.line(format!("{outer_flag} := 1;"));
+                    self.emit_store(&outer_flag, ":=", "1");
                     self.em.dedent();
                     self.line("}".to_owned());
                 }
@@ -930,7 +930,7 @@ impl<'a> TreeLowerer<'a> {
                     }
                     self.emit_all_cleanups()?;
                     if let Some(ret_flag) = active_fn.ret_flag {
-                        self.line(format!("{ret_flag} := 1;"));
+                        self.emit_store(&ret_flag, ":=", "1");
                     }
                     self.line("break;".to_owned());
                     return Ok(());

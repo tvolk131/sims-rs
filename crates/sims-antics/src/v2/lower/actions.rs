@@ -187,11 +187,11 @@ impl<'a> TreeLowerer<'a> {
         if let Some(dst) = result_local {
             self.line(format!("if {prim} {{"));
             self.em.indent();
-            self.line(format!("{dst} := 1;"));
+            self.emit_store(dst, ":=", "1");
             self.em.dedent();
             self.line("} else {".to_owned());
             self.em.indent();
-            self.line(format!("{dst} := 0;"));
+            self.emit_store(dst, ":=", "0");
             self.em.dedent();
             self.line("}".to_owned());
         } else {
