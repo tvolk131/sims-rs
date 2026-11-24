@@ -213,3 +213,25 @@ fn rsmp_padding(iff: &Iff) -> BTreeSet<(usize, usize)> {
     }
     padding
 }
+
+/// A new file takes each resource once: a second write of a key would
+/// leave a hole whose bytes are not the map's alignment bytes.
+#[test]
+fn a_new_file_refuses_a_key_written_twice() {
+    use sims_formats::iff_write::write_new_file;
+    let first = ChunkWrite {
+        payload: &[7; 300],
+        ..NEW_RESOURCE
+    };
+    let second = ChunkWrite {
+        payload: b"",
+        ..NEW_RESOURCE
+    };
+    let error = write_new_file(&[first, second], &[], |_| None).unwrap_err();
+    assert!(error.to_string().contains("written twice"), "{error}");
+    let other = ChunkWrite { id: 8, ..second };
+    let bytes = write_new_file(&[first, other], &[], |_| None).unwrap();
+    let iff = Iff::parse(bytes).unwrap();
+    assert_eq!(iff.data(iff.get(b"TEST", 7).unwrap()), &[7; 300]);
+    assert_eq!(iff.data(iff.get(b"TEST", 8).unwrap()), b"");
+}

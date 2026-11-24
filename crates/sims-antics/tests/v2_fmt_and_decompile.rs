@@ -869,6 +869,76 @@ fn formatter_handles_unicode_indentation_and_raw_comments() {
 }
 
 #[test]
+fn end_of_line_comments_stay_on_the_line_they_end() {
+    // A one-line block the formatter expands keeps a trailing comment (and lint
+    // directive) on its opening line, not after the closing `}`.
+    let source = "object \"Synth Eol\" {\n    guid: 0x7E00_0005;\n    price: 1;\n    state level @ 2: i16;\n    state on: bool;\n    fn on() -> bool {\n        if !self.on { return false; } // antics-lint: allow(redundant_bool_return)\n        return true;\n    }\n    tree t \"T\" {\n        if self.level > 2 { self.level = 0; } // gap: why\n        self.on = on();\n    }\n}\n";
+    let once = format_v2_source(source).expect("format");
+    assert_eq!(format_v2_source(&once).expect("format twice"), once);
+    assert!(
+        once.contains(
+            "        if !self.on { // antics-lint: allow(redundant_bool_return)\n            return false;\n        }\n"
+        ),
+        "{once}"
+    );
+    assert!(
+        once.contains(
+            "        if self.level > 2 { // gap: why\n            self.level = 0;\n        }\n"
+        ),
+        "{once}"
+    );
+    // The directive still covers the statement, before and after formatting.
+    for text in [source, once.as_str()] {
+        let found = sims_antics::v2::lint::lint_v2_source(text, "eol.antics").expect("lint");
+        assert!(
+            found.iter().all(|d| d.rule != "redundant_bool_return"),
+            "{found:#?}\n{text}"
+        );
+    }
+    assert_eq!(
+        compile("eol.antics", source).iff_bytes,
+        compile("eol.antics", &once).iff_bytes
+    );
+}
+
+#[test]
+fn end_of_line_directives_cover_else_arms_and_follow_raw_blocks() {
+    // The directive lands in the first arm; it covers the whole `if` / `else` chain. A
+    // multi-line `raw` block earlier in the tree does not stop the relocation.
+    let source = "object \"Synth Eol\" {\n    guid: 0x7E00_0006;\n    price: 1;\n    state level @ 2: i16;\n    tree t \"T\" {\n        raw {\n            temp[0] := 1;\n        }\n        if self.level > 2 { self.level = 0; } // gap: why\n        if self.level > 1 { sleep(1); } else { while true { sleep(1); } } // antics-lint: allow(while_true)\n    }\n}\n";
+    let once = format_v2_source(source).expect("format");
+    assert_eq!(format_v2_source(&once).expect("format twice"), once);
+    assert!(
+        once.contains(
+            "        if self.level > 2 { // gap: why\n            self.level = 0;\n        }\n"
+        ),
+        "{once}"
+    );
+    assert!(
+        once.contains("        if self.level > 1 { // antics-lint: allow(while_true)\n"),
+        "{once}"
+    );
+    for text in [source, once.as_str()] {
+        let found = sims_antics::v2::lint::lint_v2_source(text, "eol.antics").expect("lint");
+        assert!(
+            found.iter().all(|d| d.rule != "while_true"),
+            "{found:#?}\n{text}"
+        );
+    }
+    // The block opens on the line a multi-line raw block ends on.
+    let source = "object \"Synth Eol\" {\n    guid: 0x7E00_0007;\n    price: 1;\n    state level @ 2: i16;\n    tree t \"T\" {\n        raw {\n            temp[0] := 1;\n        } if self.level > 1 { while true { sleep(1); } } // antics-lint: allow(while_true)\n    }\n}\n";
+    let once = format_v2_source(source).expect("format");
+    assert_eq!(format_v2_source(&once).expect("format twice"), once);
+    for text in [source, once.as_str()] {
+        let found = sims_antics::v2::lint::lint_v2_source(text, "eol.antics").expect("lint");
+        assert!(
+            found.iter().all(|d| d.rule != "while_true"),
+            "{found:#?}\n{text}"
+        );
+    }
+}
+
+#[test]
 fn formatter_refuses_invalid_source() {
     assert!(format_v2_source("object \"X\" { guid: ; }").is_err());
 }
