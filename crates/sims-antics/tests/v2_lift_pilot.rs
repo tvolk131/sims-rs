@@ -472,3 +472,266 @@ fn zero_node_trees_lift_as_frame_empty() {
         "{lifted}"
     );
 }
+
+#[test]
+fn lifts_suit_burn_and_look_primitives() {
+    let iff = compile(
+        r#"object "Fable Costume Stand" {
+    guid: 0x7E00_00B0;
+    @id(4300) tree adjust {
+        change_suit(index: 3, scope: 1, remove: true);
+        if burn(mode: 1, flags: 2) { look_towards(mode: -1); }
+    }
+    @id(4301) tree trim {
+        raw { change_suit(index: 4, scope: 1) pad(7: 0xff); }
+    }
+}"#,
+    );
+    let lifted = round_trip(&iff, &DecompileV2Options::default());
+    for spelling in [
+        "change_suit(index: 3, scope: 1, remove: true);",
+        "change_suit(index: 4, scope: 1) pad(7: 0xff);",
+        "burn(mode: 1, flags: 2)",
+        "look_towards(mode: -1);",
+    ] {
+        assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
+    }
+    assert_eq!(lifted.matches("raw {").count(), 1, "{lifted}");
+}
+
+#[test]
+fn lifts_literal_drop_slots_and_supported_routing_modes() {
+    let iff = compile(
+        r#"object "Fable Parcel Rack" {
+    guid: 0x7E00_00B1;
+    @id(4300) @frame(args: 1) tree place {
+        if route_to(0, flags: 1, source: 0) { snap(3, mode: 4); }
+        drop_onto(src: -1, dst: 2);
+    }
+    @id(4301) @frame(args: 1) tree parameter_slot {
+        raw { drop_onto(param[0], 2); }
+    }
+}"#,
+    );
+    let lifted = round_trip(&iff, &DecompileV2Options::default());
+    for spelling in [
+        "if route_to(0, flags: 1, source: 0) {",
+        "snap(3, mode: 4);",
+        "drop_onto(src: -1, dst: 2);",
+        "drop_onto(param[0], 2);",
+    ] {
+        assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
+    }
+    assert_eq!(lifted.matches("raw {").count(), 1, "{lifted}");
+}
+
+#[test]
+fn lifts_location_local_and_generic_calls() {
+    let iff = compile(
+        r#"object "Fable Survey Kit" {
+    guid: 0x7E00_00B2;
+    @id(4300) @frame(locals: 2) tree survey {
+        raw {
+            local[1] := 12;
+            if find_location(mode: 3, flags: 1, local: 1) {
+                generic_call(41);
+            }
+            find_location(mode: 1, flags: 0);
+        }
+    }
+    @id(4301) @frame(locals: 3) tree pinned {
+        raw {
+            local[1] := 12;
+            local[2] := 14;
+            find_location(mode: 1, flags: 1, local: 1);
+        }
+        temp[4] = 2;
+    }
+}"#,
+    );
+    let lifted = round_trip(&iff, &DecompileV2Options::default());
+    for spelling in [
+        "slot_1 = 12;",
+        "if find_location(mode: 3, flags: 1, local: slot_1) {",
+        "generic_call(41);",
+        "find_location(mode: 1, flags: 0);",
+        "find_location(mode: 1, flags: 1, local: 1);",
+        "temp[4] = 2;",
+    ] {
+        assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
+    }
+}
+
+#[test]
+fn lifts_relationship_locals_and_keeps_other_value_operands_raw() {
+    let iff = compile(
+        r#"object "Fable Matchbook" {
+    guid: 0x7E00_00B3;
+    @id(4300) @frame(args: 1, locals: 2) tree score {
+        raw {
+            local[0] := 11;
+            relationship(column: 1, dir: 2, flags: 0, local: 0, value: local[1]);
+            temp[3] := local[1];
+            if old_relationship(write: false, column: 2, param: 0, dir: 0, flags: 1) {
+                temp[4] := 9;
+            }
+        }
+    }
+    @id(4301) @frame(args: 1) tree nonlocals {
+        raw {
+            relationship(column: 1, dir: 0, flags: 4, value: 12);
+            relationship(column: 1, dir: 0, flags: 4, value: temp[0]);
+            relationship(column: 1, dir: 0, flags: 4, value: param[0]);
+        }
+    }
+}"#,
+    );
+    let lifted = round_trip(&iff, &DecompileV2Options::default());
+    for spelling in [
+        "relationship(column: 1, dir: 2, flags: 0, local: slot_0, value: slot_1);",
+        "temp[3] = slot_1;",
+        "old_relationship(write: false, column: 2, param: 0, dir: 0, flags: 1)",
+        "value: 12);",
+        "value: temp[0]);",
+        "value: param[0]);",
+    ] {
+        assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
+    }
+    assert_eq!(lifted.matches("raw {").count(), 2, "{lifted}");
+}
+
+#[test]
+fn lifts_flagged_sound_and_keeps_the_reserved_flags_byte_raw() {
+    let iff = compile(
+        r#"object "Fable Bell Cabinet" {
+    guid: 0x7E00_00B4;
+    sound trill = preset("ui_click", wav: "Fable-Trill", id: 6);
+    @id(4300) tree ring {
+        play_sound(trill, stack_obj, flags: 5);
+        play_sound(99, flags: 8);
+        stop_all_sounds(stack_obj);
+    }
+    @id(4301) tree reserved {
+        raw { play_sound(6, flags: 255); }
+    }
+}"#,
+    );
+    let lifted = round_trip(&iff, &DecompileV2Options::default());
+    for spelling in [
+        "play_sound(fable_trill, stack_obj, flags: 5);",
+        "play_sound(99, flags: 8);",
+        "stop_all_sounds(stack_obj);",
+        "play_sound(6, flags: 255);",
+    ] {
+        assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
+    }
+    assert_eq!(lifted.matches("raw {").count(), 1, "{lifted}");
+}
+
+#[test]
+fn lifts_job_data_with_the_staged_career_and_level() {
+    let iff = compile(
+        r#"object "Fable Ledger" {
+    guid: 0x7E00_00B5;
+    @id(4300) tree lookup {
+        temp[3] = job_data(4, 2, 5);
+        temp[4] = job_data(temp[0], 3, 6);
+    }
+}"#,
+    );
+    let lifted = round_trip(&iff, &DecompileV2Options::default());
+    for spelling in [
+        "temp[3] = job_data(4, 2, 5);",
+        "temp[4] = job_data(temp[0], 3, 6);",
+    ] {
+        assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
+    }
+    assert!(!lifted.contains("raw {"), "{lifted}");
+}
+
+#[test]
+fn lifts_distance_with_and_without_a_stack_object_move() {
+    let iff = compile(
+        r#"object "Fable Range Meter" {
+    guid: 0x7E00_00B6;
+    @id(4300) tree measure {
+        temp[7] = distance_to(stack_obj, from: self, temp: 3);
+    }
+    @id(4301) tree measure_self {
+        temp[7] = distance_to(self, temp: 2);
+        temp[6] = stack_obj;
+    }
+    @id(4302) tree keep_distance_in_temp {
+        raw { get_distance_to(temp[0]); }
+        temp[7] = 2;
+    }
+}"#,
+    );
+    let lifted = round_trip(&iff, &DecompileV2Options::default());
+    for spelling in [
+        "temp[7] = distance_to(stack_obj, from: self.id, temp: 3);",
+        "temp[7] = distance_to(self.id, temp: 2);",
+        "temp[0] = distance_to(stack_obj);",
+    ] {
+        assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
+    }
+    assert!(!lifted.contains("raw {"), "{lifted}");
+}
+
+#[test]
+fn lifts_sim_attributes_data_container_and_personality() {
+    let iff = compile(
+        r#"object "Fable Profile Card" {
+    guid: 0x7E00_00B7;
+    @id(4300) tree profile (sim: Sim) {
+        sim.attr[3] = 1;
+        sim.data[4] = sim.attr[3];
+        temp[2] = sim.container;
+        sim.personality.nice = sim.personality.active;
+        sim.personality.playful = sim.personality.outgoing;
+        sim.personality.neat = 6;
+    }
+}"#,
+    );
+    let lifted = round_trip(&iff, &DecompileV2Options::default());
+    for spelling in [
+        "sim.attr[3] = 1;",
+        "sim.data[4] = sim.attr[3];",
+        "temp[2] = sim.container;",
+        "sim.personality.nice = sim.personality.active;",
+        "sim.personality.playful = sim.personality.outgoing;",
+        "sim.personality.neat = 6;",
+    ] {
+        assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
+    }
+    assert!(!lifted.contains("raw {"), "{lifted}");
+}
+
+#[test]
+fn lifts_handle_flags_and_preserves_numeric_flag_operations() {
+    let iff = compile(
+        r#"object "Fable Switchboard" {
+    guid: 0x7E00_00B8;
+    @id(4300) tree switch {
+        stack_obj.flags = self.flags;
+        if stack_obj.flags.is_empty() { self.flags = stack_obj.flags; }
+        raw {
+            stack.data[8] flag_set 13;
+            if stack.data[8] flag_test 13 { stack.data[8] flag_clear 13; }
+        }
+    }
+}"#,
+    );
+    let lifted = round_trip(&iff, &DecompileV2Options::default());
+    for spelling in [
+        "stack_obj.flags = self.flags;",
+        "if stack_obj.flags.is_empty() {",
+        "self.flags = stack_obj.flags;",
+        "stack_obj.data[8] flag_set 13;",
+        "stack_obj.data[8] flag_test 13",
+        "stack_obj.data[8] flag_clear 13;",
+    ] {
+        assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
+    }
+    assert!(!lifted.contains("raw {"), "{lifted}");
+}

@@ -13,8 +13,8 @@
 
 use crate::arity_catalog::{bhav_arities_in_range, vm_kept_bhavs};
 use crate::ast::{
-    AssignOp, CallTarget, CompareOp, Condition, LocalRef, Operand, OperandRef, PrimitiveCall, Stmt,
-    StringRef, Target,
+    AssignOp, CallTarget, CompareOp, Condition, LocalRef, Operand, OperandRef, PrimitiveCall,
+    SlotSpec, Stmt, StringRef, Target,
 };
 use crate::error::{Error, Result};
 use crate::ir::BhavChunk;
@@ -27,8 +27,8 @@ use crate::v2::fmt::format_v2_source;
 use crate::v2::parser::snake_case_ident;
 use crate::v2::{PackResolverConfig, compile_expanded_v2_object, expand_v2_source_to_objects};
 use crate::verify::{
-    EquivOptions, EquivResult, LiveContext, LiveOptions, canonicalize_primitive_operands,
-    check_bhav_equivalent_combined, same_tree_bytes,
+    EquivOptions, EquivResult, LiveContext, LiveOptions, apply_operand_pad,
+    canonicalize_primitive_operands, check_bhav_equivalent_combined, same_tree_bytes,
 };
 use sims_formats::behavior::{InteractionTable, ObjectDefinition};
 use sims_formats::iff::{Chunk, Iff};
@@ -1968,25 +1968,63 @@ fn call_params(arity: usize) -> impl Iterator<Item = String> {
     (0..arity).map(|i| format!("arg_{i}: i16"))
 }
 
-fn animation_local(s: &Stmt) -> Option<u8> {
-    let (Stmt::If { cond, .. } | Stmt::While { cond, .. }) = s else {
-        return None;
-    };
-    let mut cond = cond;
-    while let Condition::Not(inner) = cond {
-        cond = inner;
-    }
-    match cond {
-        Condition::Primitive {
-            prim:
-                PrimitiveCall::Animate {
-                    flags,
-                    local_index: LocalRef::Index(i),
-                    ..
-                },
+/// The highest slot that needs a named declaration for a primitive's local arguments.
+fn builtin_local(s: &Stmt) -> Option<u16> {
+    let prim = match s {
+        Stmt::Primitive {
+            prim,
+            branches: None,
             ..
-        } if flags & 0x20 != 0 => Some(*i),
+        } => prim,
+        Stmt::If { cond, .. } | Stmt::While { cond, .. } => {
+            let mut cond = cond;
+            while let Condition::Not(inner) = cond {
+                cond = inner;
+            }
+            let Condition::Primitive { prim, .. } = cond else {
+                return None;
+            };
+            prim
+        }
+        _ => return None,
+    };
+    if let PrimitiveCall::Animate {
+        flags,
+        local_index: LocalRef::Index(i),
+        ..
+    } = prim
+        && flags & 0x20 != 0
+        && matches!(s, Stmt::If { .. } | Stmt::While { .. })
+    {
+        return Some(u16::from(*i));
+    }
+    match unpadded(prim) {
+        PrimitiveCall::FindLocation {
+            local: LocalRef::Index(i),
+            flags,
+            ..
+        } if flags & 1 != 0 || *i != 0 => Some(u16::from(*i)),
+        PrimitiveCall::Relationship {
+            direction,
+            local: LocalRef::Index(i),
+            value,
+            ..
+        } => {
+            let value = u16::try_from(direct_local(value)?).ok()?;
+            Some(if matches!(direction, 2 | 3) || *i != 0 {
+                value.max(u16::from(*i))
+            } else {
+                value
+            })
+        }
         _ => None,
+    }
+}
+
+fn unpadded(prim: &PrimitiveCall) -> &PrimitiveCall {
+    match prim {
+        PrimitiveCall::Padded { call, .. } => call,
+        _ => prim,
     }
 }
 
@@ -2441,13 +2479,13 @@ impl Model {
             let mut raw_count = 0;
             match &t.body {
                 Some(body) if level.idiomatic() => {
-                    let mut animate_locals = 0;
+                    let mut named_locals = 0;
                     if as_lifecycle.is_none() && !plan.plain.contains(&t.id) {
                         walk_stmts(body, &mut |s| {
-                            if let Some(index) = animation_local(s)
-                                && u16::from(index) < t.original.locals
+                            if let Some(index) = builtin_local(s)
+                                && index < t.original.locals
                             {
-                                animate_locals = animate_locals.max(u16::from(index) + 1);
+                                named_locals = named_locals.max(index + 1);
                             }
                         });
                     }
@@ -2465,16 +2503,16 @@ impl Model {
                         hoisted_save: hoisted_self_save(body, &t.lifted),
                         sims_loop: None,
                         cursor: None,
-                        animate_locals,
+                        named_locals,
                         extras: std::cell::Cell::new(false),
                     };
-                    if animate_locals > 0 && tr.extra() {
-                        if animate_locals > 1 {
+                    if named_locals > 0 && tr.extra() {
+                        if named_locals > 1 {
                             // A raw block disables v2's removal of unused declarations.
                             // The earlier slots must stay allocated even when unread.
-                            out.line("raw { /* Preserve animation local slot numbers. */ }");
+                            out.line("raw { /* Preserve builtin local slot numbers. */ }");
                         }
-                        for i in 0..animate_locals {
+                        for i in 0..named_locals {
                             out.line(format!("let slot_{i}: i16;"));
                         }
                     }
@@ -2642,8 +2680,8 @@ struct Translator<'a> {
     /// The binding of the innermost `for` loop whose cursor is `stack_obj` itself: inside it,
     /// the stack object's cells are the binding's (`o.data[i]`, `p.person[i]`).
     cursor: Option<String>,
-    /// Number of leading frame locals declared for animations that write events to a local.
-    animate_locals: u16,
+    /// Number of leading frame slots declared for builtins with named local operands.
+    named_locals: u16,
     /// Whether an extra idiom was written (see [`Translator::extra`]).
     extras: std::cell::Cell<bool>,
 }
@@ -2709,6 +2747,10 @@ impl Translator<'_> {
         let mut i = 0;
         while i < body.len() {
             if let Some(used) = self.for_each_loop(&body[i..], out) {
+                i += used;
+                continue;
+            }
+            if let Some(used) = self.value_builtin(&body[i..], out) {
                 i += used;
                 continue;
             }
@@ -3055,6 +3097,155 @@ impl Translator<'_> {
         } if l == lhs)
     }
 
+    /// Folds the setup and result store of a value builtin within one structured block.
+    fn value_builtin(&mut self, rest: &[Stmt], out: &mut Out) -> Option<usize> {
+        let id = self.next_id;
+        if self.plan.plain.contains(&self.tree.id) || self.forced_raw(id) {
+            return None;
+        }
+        let (used, text) = self.job_data(rest).or_else(|| self.distance_to(rest))?;
+        if (id + 1..id + used).any(|i| self.forced_raw(i)) || !self.extra() {
+            return None;
+        }
+        self.next_id += used;
+        self.flush_raw(out);
+        let start = out.lines.len();
+        out.line(text);
+        self.record(id, start, out);
+        Some(used)
+    }
+
+    /// `temp[0] := career; temp[1] := level; dest := scope(33, field)`.
+    fn job_data(&self, rest: &[Stmt]) -> Option<(usize, String)> {
+        let (career, rest) = if let Some(career) = assigned_to(rest.first()?, 8, 0) {
+            (Some(career), &rest[1..])
+        } else {
+            // The optimizer drops an identity career store before a plain level store.
+            (None, rest)
+        };
+        let [level, read, ..] = rest else {
+            return None;
+        };
+        let level = assigned_to(level, 8, 1)?;
+        let Stmt::Assign {
+            lhs,
+            op: AssignOp::Set,
+            rhs: OperandRef::Direct(Operand { scope: 33, index }),
+            ..
+        } = read
+        else {
+            return None;
+        };
+        if *index < 0 || is_operand(level, 8, 0) {
+            return None;
+        }
+        let (lhs, level) = (self.lvalue(lhs)?, self.rvalue(level)?);
+        let career_arg = match career {
+            Some(operand) => self.rvalue(operand)?,
+            None => "temp[0]".to_owned(),
+        };
+        Some((
+            usize::from(career.is_some()) + 2,
+            format!("{lhs} = job_data({career_arg}, {level}, {index});"),
+        ))
+    }
+
+    /// Get Distance To writes a temp. An adjacent assignment can use the builtin's return
+    /// value directly. A move can be folded when the distance is the only use of the entry save.
+    fn distance_to(&self, rest: &[Stmt]) -> Option<(usize, String)> {
+        if self.cursor.is_some() {
+            return None;
+        }
+        let (target, get, tail, used) = match rest {
+            [get @ Stmt::Primitive { prim, .. }, tail @ ..]
+                if matches!(unpadded(prim), PrimitiveCall::GetDistanceTo { .. }) =>
+            {
+                ("stack_obj".to_owned(), get, tail, 1)
+            }
+            [save, move_to, get, restore, tail @ ..] if self.next_id == 0 => {
+                let saved = self_save_local(save)?;
+                let target = self.distance_handle(assigned_to(move_to, 10, 0)?)?;
+                if target == "stack_obj" || !is_operand(assigned_to(restore, 10, 0)?, 25, saved) {
+                    return None;
+                }
+                let needle = format!("local[{saved}]");
+                if self
+                    .tree
+                    .lifted
+                    .iter()
+                    .map(|l| l.matches(&needle).count())
+                    .sum::<usize>()
+                    != 2
+                {
+                    return None;
+                }
+                (target, get, tail, 4)
+            }
+            _ => return None,
+        };
+        let Stmt::Primitive {
+            prim,
+            branches: None,
+            ..
+        } = get
+        else {
+            return None;
+        };
+        let PrimitiveCall::GetDistanceTo { temp, flags, from } = unpadded(prim) else {
+            return None;
+        };
+        let from = match (flags, from) {
+            (0, None) => String::new(),
+            (1, Some(from)) => {
+                if used > 1
+                    && matches!(from, OperandRef::Direct(o) if matches!(o.scope, 4 | 10 | 16))
+                {
+                    // With a move, v2 reads a stack-relative 'from' before changing stack_obj.
+                    return None;
+                }
+                format!(", from: {}", self.distance_handle(from)?)
+            }
+            _ => return None,
+        };
+        let temp_arg = if *temp == 0 {
+            String::new()
+        } else {
+            format!(", temp: {temp}")
+        };
+        let call = format!("distance_to({target}{from}{temp_arg})");
+        if let [
+            Stmt::Assign {
+                lhs,
+                op: AssignOp::Set,
+                rhs,
+                ..
+            },
+            ..,
+        ] = tail
+            && is_operand(rhs, 8, i16::from(*temp))
+            && let Some(lhs) = self.lvalue(lhs)
+        {
+            return Some((used + 1, format!("{lhs} = {call};")));
+        }
+        // Lowering can eliminate the resulting temp-to-itself store before an Expression.
+        Some((used, format!("temp[{temp}] = {call};")))
+    }
+
+    fn distance_handle(&self, operand: &OperandRef) -> Option<String> {
+        let OperandRef::Direct(o) = operand else {
+            return None;
+        };
+        match (o.scope, o.index, self.sim) {
+            (10, 0, _) => Some("stack_obj".to_owned()),
+            (3, 11, true) => Some("sim".to_owned()),
+            (3, 11, false) => Some("self.id".to_owned()),
+            (4, 11, true) => Some("self.id".to_owned()),
+            (3, 2, true) => Some("sim.container".to_owned()),
+            (16, 0..=255, true) | (20, 0..=255, false) => self.rvalue(operand),
+            _ => None,
+        }
+    }
+
     /// Two-statement idioms, each the exact lowering of its v2 spelling. Returns how many
     /// statements it consumed.
     ///
@@ -3272,10 +3463,7 @@ impl Translator<'_> {
             "animate(clip: {clip_id}, table: {table}, flags: {flags_without_local}, events: {events}"
         );
         if flags & 0x20 != 0 {
-            if u16::from(*local) >= self.animate_locals || !self.extra() {
-                return None;
-            }
-            text.push_str(&format!(", local: slot_{local}"));
+            text.push_str(&format!(", local: {}", self.local_name(u16::from(*local))?));
         } else if *local != 0 && !self.extra() {
             return None;
         }
@@ -3286,7 +3474,28 @@ impl Translator<'_> {
     fn simple(&self, s: &Stmt) -> Option<String> {
         match s {
             Stmt::Assign { lhs, op, rhs, .. } => {
-                let op = assign_operator(op)?;
+                if let Some(lhs) = self.flags_place(lhs)
+                    && let Some(rhs) = self.flags_place(rhs)
+                    && matches!(
+                        op,
+                        AssignOp::Set | AssignOp::BitAnd | AssignOp::BitOr | AssignOp::BitXor
+                    )
+                    && self.extra()
+                {
+                    return Some(format!("{lhs} {} {rhs};", assign_operator(op)?));
+                }
+                let op = match op {
+                    AssignOp::FlagSet | AssignOp::FlagClear
+                        if self.flags_place(lhs).is_some() && self.extra() =>
+                    {
+                        if *op == AssignOp::FlagSet {
+                            "flag_set"
+                        } else {
+                            "flag_clear"
+                        }
+                    }
+                    _ => assign_operator(op)?,
+                };
                 Some(format!("{} {op} {};", self.lvalue(lhs)?, self.rvalue(rhs)?))
             }
             Stmt::Return {
@@ -3363,6 +3572,14 @@ impl Translator<'_> {
     fn cond(&self, c: &Condition) -> Option<String> {
         match c {
             Condition::Compare { lhs, op, rhs, .. } => {
+                if matches!(op, CompareOp::Eq | CompareOp::Ne)
+                    && is_operand(rhs, 7, 0)
+                    && let Some(flags) = self.flags_place(lhs)
+                    && self.extra()
+                {
+                    let not = if *op == CompareOp::Ne { "!" } else { "" };
+                    return Some(format!("{not}{flags}.is_empty()"));
+                }
                 let op = match op {
                     CompareOp::Gt => ">",
                     CompareOp::Lt => "<",
@@ -3380,6 +3597,9 @@ impl Translator<'_> {
                         return self
                             .extra()
                             .then(|| format!("{name}(&mut {place}, {bound})"));
+                    }
+                    CompareOp::FlagTest if self.flags_place(lhs).is_some() && self.extra() => {
+                        "flag_test"
                     }
                     CompareOp::FlagTest => return None,
                 };
@@ -3463,24 +3683,23 @@ impl Translator<'_> {
                     self.rvalue(amount)?
                 ))
             }
-            // `play_sound(sound)` targets the Sim in an object's own tree and the stack object
-            // (`self`) in an interaction; `sim` names the other target there.
-            PrimitiveCall::PlaySound { sound_id, flags } => {
-                let sound = self.model.sounds.get(sound_id)?;
-                let target = match (self.sim, flags) {
-                    (false, 0) | (true, 2) => "",
-                    (true, 0) => ", sim",
-                    _ => return None,
-                };
-                self.extra()
-                    .then(|| format!("play_sound({}{target})", sound.ident))
-            }
-            PrimitiveCall::StopAllSounds { use_stack_object } => {
-                match (self.sim, use_stack_object) {
-                    (false, false) | (true, true) => Some("stop_all_sounds()".to_owned()),
-                    (true, false) => Some("stop_all_sounds(sim)".to_owned()),
-                    (false, true) => None,
+            PrimitiveCall::PlaySound { sound_id, flags } => self.play_sound(*sound_id, *flags),
+            PrimitiveCall::Padded { call, pad } => match call.as_ref() {
+                PrimitiveCall::PlaySound { sound_id, flags } => {
+                    let [lo, hi] = sound_id.to_le_bytes();
+                    let operands =
+                        apply_operand_pad(23, [lo, hi, 0, 0, *flags, 0, 0, 0], pad).ok()?;
+                    self.play_sound(*sound_id, operands[4])
                 }
+                PrimitiveCall::StopAllSounds { .. } if self.extra() => self.prim_stmt(call),
+                _ => self.builtin(p),
+            },
+            PrimitiveCall::StopAllSounds { use_stack_object } => {
+                let target = self.sound_target(*use_stack_object);
+                if !self.sim && *use_stack_object && !self.extra() {
+                    return None;
+                }
+                Some(format!("stop_all_sounds({target})"))
             }
             PrimitiveCall::RemoveObject { target, flags } => {
                 let mine = if self.sim { 1 } else { 0 };
@@ -3495,6 +3714,38 @@ impl Translator<'_> {
             }
             other => self.builtin(other),
         }
+    }
+
+    /// The empty spelling selects the running object in an object-context tree and the
+    /// stack object in a Sim-context tree.
+    fn sound_target(&self, stack: bool) -> &'static str {
+        match (self.sim, stack) {
+            (false, false) | (true, true) => "",
+            (true, false) => "sim",
+            (false, true) => "stack_obj",
+        }
+    }
+
+    fn play_sound(&self, sound_id: u16, flags: u8) -> Option<String> {
+        // v2 cannot emit 0xff, whose target bit the VM ignores.
+        if flags == 0xff || !self.extra() {
+            return None;
+        }
+        let sound = self
+            .model
+            .sounds
+            .get(&sound_id)
+            .map_or_else(|| sound_id.to_string(), |sound| sound.ident.clone());
+        let target = self.sound_target(flags & 2 != 0);
+        let mut args = vec![sound];
+        if !target.is_empty() {
+            args.push(target.to_owned());
+        }
+        let flags = flags & !2;
+        if flags != 0 {
+            args.push(format!("flags: {flags}"));
+        }
+        Some(format!("play_sound({})", args.join(", ")))
     }
 
     /// Builtins that are the same primitive as a statement or a condition.
@@ -3599,8 +3850,103 @@ impl Translator<'_> {
             } if flags & 0x20 == 0 => format!(
                 "special_effect(duration: {duration}, kind: {kind}, size: {size}, flags: {flags}, str_index: {str_index})"
             ),
-            _ => return None,
+            _ => self.pilot_builtin(p)?,
         })
+    }
+
+    fn pilot_builtin(&self, p: &PrimitiveCall) -> Option<String> {
+        let text = match unpadded(p) {
+            PrimitiveCall::ChangeSuit {
+                index,
+                scope,
+                remove,
+            } => {
+                let remove = if *remove { ", remove: true" } else { "" };
+                format!("change_suit(index: {index}, scope: {scope}{remove})")
+            }
+            PrimitiveCall::Burn { mode, flags } => format!("burn(mode: {mode}, flags: {flags})"),
+            PrimitiveCall::LookTowards { mode } => format!("look_towards(mode: {mode})"),
+            PrimitiveCall::DropOnto {
+                src: SlotSpec::Literal(src),
+                dst: SlotSpec::Literal(dst),
+            } => format!("drop_onto(src: {src}, dst: {dst})"),
+            PrimitiveCall::FindLocation {
+                mode,
+                flags,
+                local: LocalRef::Index(local),
+            } => {
+                let local = if flags & 1 != 0 || *local != 0 {
+                    format!(", local: {}", self.local_name(u16::from(*local))?)
+                } else {
+                    String::new()
+                };
+                format!("find_location(mode: {mode}, flags: {flags}{local})")
+            }
+            PrimitiveCall::Relationship {
+                column,
+                direction,
+                flags,
+                local: LocalRef::Index(local),
+                value,
+            } => {
+                let value = self.local_name(u16::try_from(direct_local(value)?).ok()?)?;
+                let local = if matches!(direction, 2 | 3) || *local != 0 {
+                    format!(", local: {}", self.local_name(u16::from(*local))?)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "relationship(column: {column}, dir: {direction}, flags: {flags}{local}, value: {value})"
+                )
+            }
+            PrimitiveCall::OldRelationship {
+                write,
+                column,
+                param,
+                direction,
+                flags,
+            } => format!(
+                "old_relationship(write: {write}, column: {column}, param: {param}, dir: {direction}, flags: {flags})"
+            ),
+            PrimitiveCall::GenericCall { routine } => format!("generic_call({routine})"),
+            PrimitiveCall::RouteTo {
+                slot,
+                source,
+                flags,
+            } if *source <= 2 => {
+                Self::slot_builtin("route_to", *slot, *flags, "source", *source, 1)
+            }
+            PrimitiveCall::Snap { slot, mode, flags } if *mode <= 4 => {
+                Self::slot_builtin("snap", *slot, *flags, "mode", *mode, 3)
+            }
+            _ => return None,
+        };
+        self.extra().then_some(text)
+    }
+
+    fn slot_builtin(
+        prim: &str,
+        slot: u16,
+        flags: u8,
+        key: &str,
+        value: u16,
+        default: u16,
+    ) -> String {
+        let flags = if flags == 0 {
+            String::new()
+        } else {
+            format!(", flags: {flags}")
+        };
+        let extra = if value == default {
+            String::new()
+        } else {
+            format!(", {key}: {value}")
+        };
+        format!("{prim}({slot}{flags}{extra})")
+    }
+
+    fn local_name(&self, slot: u16) -> Option<String> {
+        (slot < self.named_locals && self.extra()).then(|| format!("slot_{slot}"))
     }
 
     fn rvalue(&self, r: &OperandRef) -> Option<String> {
@@ -3629,6 +3975,7 @@ impl Translator<'_> {
             16 if self.sim && o.index >= 0 && self.extra() => {
                 Some(format!("self.slot[{}]", o.index))
             }
+            3 if self.sim && o.index == 2 && self.extra() => Some("sim.container".to_owned()),
             19 if o.index == 65 => {
                 let p = self.person_binding()?;
                 Some(format!("{p}.kind"))
@@ -3642,6 +3989,31 @@ impl Translator<'_> {
     fn person_binding(&self) -> Option<&str> {
         let p = self.sims_loop.as_deref()?;
         self.extra().then_some(p)
+    }
+
+    fn personality(&self, handle: &str, index: i16) -> Option<String> {
+        let trait_name = match index {
+            2 => "nice",
+            3 => "active",
+            5 => "playful",
+            6 => "outgoing",
+            7 => "neat",
+            _ => return None,
+        };
+        self.extra()
+            .then(|| format!("{handle}.personality.{trait_name}"))
+    }
+
+    /// Numeric uses of the same word keep the `.data[8]` spelling: `.flags` is typed.
+    fn flags_place(&self, r: &OperandRef) -> Option<String> {
+        let handle = if is_operand(r, 4, 8) {
+            self.cursor.as_deref().unwrap_or("stack_obj")
+        } else if !self.sim && is_operand(r, 3, 8) {
+            "self"
+        } else {
+            return None;
+        };
+        Some(format!("{handle}.flags"))
     }
 
     fn lvalue(&self, r: &OperandRef) -> Option<String> {
@@ -3660,7 +4032,11 @@ impl Translator<'_> {
                 4 => return Some(format!("{c}.data[{i}]")),
                 16 => return Some(format!("{c}.slot[{i}]")),
                 19 if i == 65 => return Some(format!("{c}.kind")),
-                19 => return Some(format!("{c}.person[{i}]")),
+                19 => {
+                    return self
+                        .personality(c, i)
+                        .or_else(|| Some(format!("{c}.person[{i}]")));
+                }
                 10 | 13 | 15 | 27 => return None,
                 _ => {}
             }
@@ -3671,11 +4047,20 @@ impl Translator<'_> {
             (10, _) if i == 0 => "stack_obj".to_owned(),
             (0, false) | (1, true) if i <= self.model.state_limit => format!("self.attr_{i}"),
             (3, false) => format!("self.data[{i}]"),
+            (0, true) if i <= 255 && self.extra() => format!("sim.attr[{i}]"),
+            (3, true) if i <= 255 && self.extra() => format!("sim.data[{i}]"),
+            (4, _) if i == 8 && self.extra() => "stack_obj.data[8]".to_owned(),
             (14, true) => format!("sim.motive[{i}]"),
-            (18, true) => format!("sim.person[{i}]"),
+            (18, true) => self
+                .personality("sim", i)
+                .unwrap_or_else(|| format!("sim.person[{i}]")),
             (9, _) if !(self.in_handler && i == 0) && self.extra() => format!("param[{i}]"),
-            (19, _) => format!("{}.person[{i}]", self.person_binding()?),
-            (25, _) if (i as u16) < self.animate_locals && self.extra() => format!("slot_{i}"),
+            (19, _) => {
+                let binding = self.person_binding();
+                self.personality(binding.unwrap_or("stack_obj"), i)
+                    .or_else(|| binding.map(|p| format!("{p}.person[{i}]")))?
+            }
+            (25, _) => self.local_name(i as u16)?,
             _ => return None,
         })
     }
