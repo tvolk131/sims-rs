@@ -112,6 +112,19 @@ impl Parser {
         }
     }
 
+    /// An identifier that introduces a binding. `stack_obj` is the running frame's stack object
+    /// and cannot be rebound: lowering and its `stack_obj` analysis read the name as that cell.
+    fn expect_binding_ident(&mut self, desc: &str) -> Result<(String, Span)> {
+        let (name, span) = self.expect_ident(desc)?;
+        if name == "stack_obj" {
+            return Err(Error::at(
+                span,
+                format!("'stack_obj' is the frame's stack object and cannot be used as a {desc}"),
+            ));
+        }
+        Ok((name, span))
+    }
+
     fn expect_string(&mut self, desc: &str) -> Result<(String, Span)> {
         let tok = self.bump();
         match tok.kind {
@@ -517,7 +530,7 @@ impl Parser {
         let mut seen_names = BTreeSet::new();
         let mut seen_default = false;
         while !self.eat(&TokenKind::RParen) {
-            let (name, span) = self.expect_ident("parameter name")?;
+            let (name, span) = self.expect_binding_ident("parameter name")?;
             if !seen_names.insert(name.clone()) {
                 return Err(Error::at(
                     span,
@@ -623,7 +636,7 @@ impl Parser {
         let mut seen_temps: BTreeSet<u8> = BTreeSet::new();
         let mut first = true;
         while !self.eat(&TokenKind::RParen) {
-            let (name, span) = self.expect_ident("parameter name")?;
+            let (name, span) = self.expect_binding_ident("parameter name")?;
             if !seen_names.insert(name.clone()) {
                 return Err(Error::at(
                     span,
@@ -950,7 +963,8 @@ impl Parser {
             ..TreeFrame::default()
         };
         while !self.eat(&TokenKind::RParen) {
-            let (key, kspan) = self.expect_ident("'args', 'locals', 'format', or 'revision'")?;
+            let (key, kspan) =
+                self.expect_ident("'args', 'locals', 'format', 'revision', or 'kind'")?;
             self.expect(&TokenKind::Colon, "':'")?;
             let dup = match key.as_str() {
                 "args" => frame
@@ -971,11 +985,17 @@ impl Parser {
                     .revision
                     .replace(self.expect_u32("BHAV revision")?)
                     .is_some(),
+                "kind" => frame
+                    .kind
+                    .replace(u8::try_from(self.expect_u16("BHAV kind")?).map_err(|_| {
+                        Error::at(kspan, "@frame kind must fit in a byte (0..=255)")
+                    })?)
+                    .is_some(),
                 other => {
                     return Err(Error::at(
                         kspan,
                         format!(
-                            "unknown @frame field '{other}' (expected args, locals, format, or revision)"
+                            "unknown @frame field '{other}' (expected args, locals, format, revision, or kind)"
                         ),
                     ));
                 }
@@ -1334,7 +1354,7 @@ impl Parser {
     }
 
     fn parse_param_member(&mut self, span: Span) -> Result<ObjectMember> {
-        let (name, _) = self.expect_ident("parameter name")?;
+        let (name, _) = self.expect_binding_ident("parameter name")?;
         if self.eat(&TokenKind::Assign) {
             // `param energy_step = 20;` binding form
             let value = self.parse_param_value()?;
@@ -2140,9 +2160,10 @@ impl Parser {
         let mut sim_binding = "sim".to_owned();
         let mut autonomous_binding: Option<String> = None;
         if self.eat(&TokenKind::LParen) && !self.eat(&TokenKind::RParen) {
-            sim_binding = self.expect_ident("guard sim parameter")?.0;
+            sim_binding = self.expect_binding_ident("guard sim parameter")?.0;
             if self.eat(&TokenKind::Comma) && self.peek().kind != TokenKind::RParen {
-                let (auto_name, aspan) = self.expect_ident("guard is_autonomous parameter")?;
+                let (auto_name, aspan) =
+                    self.expect_binding_ident("guard is_autonomous parameter")?;
                 if !allow_autonomous {
                     return Err(Error::at(
                         aspan,
@@ -2243,7 +2264,7 @@ impl Parser {
                         return Err(Error::at(fspan, "duplicate 'run' in functional block"));
                     }
                     if self.eat(&TokenKind::LParen) && !self.eat(&TokenKind::RParen) {
-                        sim_binding = self.expect_ident("sim parameter name")?.0;
+                        sim_binding = self.expect_binding_ident("sim parameter name")?.0;
                         self.expect(&TokenKind::RParen, "')'")?;
                     }
                     body = Some(self.parse_block()?);
@@ -2386,7 +2407,7 @@ impl Parser {
                         ));
                     }
                     if self.eat(&TokenKind::LParen) && !self.eat(&TokenKind::RParen) {
-                        sim_binding = self.expect_ident("sim parameter name")?.0;
+                        sim_binding = self.expect_binding_ident("sim parameter name")?.0;
                         self.expect(&TokenKind::RParen, "')'")?;
                     }
                     run_body = Some(self.parse_block()?);
@@ -2585,7 +2606,7 @@ impl Parser {
             return Err(Error::at(span, "'animate' does not take type arguments"));
         }
         if self.eat(&TokenKind::Pipe) {
-            let (event, _) = self.expect_ident("animation event binding name")?;
+            let (event, _) = self.expect_binding_ident("animation event binding name")?;
             self.expect(&TokenKind::Pipe, "'|'")?;
             let body = self.parse_block()?;
             return Ok(V2Stmt::Animate {
@@ -2631,7 +2652,7 @@ impl Parser {
         // `let Some(name [: Type]) = expr else { ... };`
         if self.eat_ident("Some") {
             self.expect(&TokenKind::LParen, "'('")?;
-            let (name, _) = self.expect_ident("binding name")?;
+            let (name, _) = self.expect_binding_ident("binding name")?;
             let ty = if self.eat(&TokenKind::Colon) {
                 Some(self.parse_type()?)
             } else {
@@ -2658,7 +2679,7 @@ impl Parser {
         }
 
         let _is_mut = self.eat_ident("mut");
-        let (name, _) = self.expect_ident("variable name")?;
+        let (name, _) = self.expect_binding_ident("variable name")?;
         let ty = if self.eat(&TokenKind::Colon) {
             Some(self.parse_type()?)
         } else {
@@ -2729,7 +2750,7 @@ impl Parser {
 
     fn parse_for_stmt(&mut self, span: Span) -> Result<V2Stmt> {
         self.bump(); // 'for'
-        let (binding, _) = self.expect_ident("loop variable name")?;
+        let (binding, _) = self.expect_binding_ident("loop variable name")?;
         if !self.eat_ident("in") {
             return Err(Error::at(self.span(), "expected 'in' in 'for' loop"));
         }
@@ -3040,7 +3061,79 @@ impl Parser {
         })
     }
 
+    /// Expression `if c { a } else { b }` (the `if` keyword is already consumed). Like a
+    /// `match` level, it counts twice against the nesting budget.
+    fn parse_if_expr(&mut self, span: Span) -> Result<V2Expr> {
+        self.enter_nesting(span)?;
+        if let Err(e) = self.enter_nesting(span) {
+            self.leave_nesting();
+            return Err(e);
+        }
+        let res = (|| {
+            let cond = self.parse_expr()?;
+            let then_value = self.parse_if_expr_branch()?;
+            if !self.eat_ident("else") {
+                return Err(Error::at(
+                    span,
+                    "an 'if' expression needs an 'else' branch (every path yields a value)",
+                ));
+            }
+            let else_value = if self.is_ident("if") {
+                let elif_span = self.bump().span;
+                self.parse_if_expr(elif_span)?
+            } else {
+                self.parse_if_expr_branch()?
+            };
+            Ok(V2Expr::If {
+                span,
+                cond: Box::new(cond),
+                then_value: Box::new(then_value),
+                else_value: Box::new(else_value),
+            })
+        })();
+        self.leave_nesting();
+        self.leave_nesting();
+        res
+    }
+
+    /// `{ value }`: one branch of an `if` expression.
+    fn parse_if_expr_branch(&mut self) -> Result<V2Expr> {
+        self.expect(&TokenKind::LBrace, "'{'")?;
+        let value = self.parse_expr()?;
+        if self.peek().kind != TokenKind::RBrace {
+            return Err(Error::at(
+                self.span(),
+                "an 'if' expression branch is one value ('{ expr }'), not a block of statements",
+            ));
+        }
+        self.bump();
+        Ok(value)
+    }
+
+    /// A match pattern, with `A | B | ..` alternatives.
     fn parse_match_pattern(&mut self) -> Result<MatchPattern> {
+        let span = self.span();
+        let first = self.parse_single_match_pattern()?;
+        if self.peek().kind != TokenKind::Pipe {
+            return Ok(first);
+        }
+        let mut alts = vec![first];
+        while self.eat(&TokenKind::Pipe) {
+            alts.push(self.parse_single_match_pattern()?);
+        }
+        // Identifiers stay: `match dialog(..)` names its buttons (`Yes | Cancel`).
+        if let Some(MatchPattern::Wildcard(s)) =
+            alts.iter().find(|a| matches!(a, MatchPattern::Wildcard(_)))
+        {
+            return Err(Error::at(
+                *s,
+                "'_' cannot be an alternative of an OR-pattern (it would match everything)",
+            ));
+        }
+        Ok(MatchPattern::Or(span, alts))
+    }
+
+    fn parse_single_match_pattern(&mut self) -> Result<MatchPattern> {
         let span = self.span();
         match &self.peek().kind {
             TokenKind::Ident(s) if s == "_" => {
@@ -3548,6 +3641,7 @@ impl Parser {
                     "true" => Ok(V2Expr::Bool(tok.span, true)),
                     "false" => Ok(V2Expr::Bool(tok.span, false)),
                     "match" => self.parse_match_expr(tok.span),
+                    "if" => self.parse_if_expr(tok.span),
                     _ => {
                         if self.peek().kind == TokenKind::ColonColon
                             && self.peek_at(1).kind != TokenKind::Lt

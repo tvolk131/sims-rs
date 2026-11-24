@@ -7629,8 +7629,9 @@ fn readability_loops_ranges_consts_fields_and_builtins_run_live() {
         "my.attr[6] := 9;",
         "__v_d_18 -= 3;\n    if __v_d_18 > 0 {\n        my.attr[7] := 1;",
         "if !test_object_type(0x7f400999, object: my.id) {",
-        "while set_to_next(person, dest: __v_p_28) {",
-        "while set_to_next(all, dest: __v_o_29) {",
+        // Loop bodies that cannot read the stack object step `stack_obj` itself.
+        "stack_obj := 0;\n    while set_to_next(person, dest: stack_obj) {",
+        "stack_obj := 0;\n    while set_to_next(all, dest: stack_obj) {",
         "my.data[8] flag_set 14;",
         "random(my.attr[14], 1);",
         "stack.attr[10] := my.person[58];",
@@ -7946,7 +7947,7 @@ fn readability_negative_diagnostics() {
     expect_err(
         "builtin_local.antics",
         &sim_tree("push_interaction(menu: 1, icon: self.n);"),
-        "push_interaction(icon:) must name an i16 local variable",
+        "push_interaction(icon:) must name an i16 local, an object-handle local",
     );
     expect_err(
         "animate_local.antics",
@@ -8667,7 +8668,8 @@ fn pr_e_zero_raw_gaps_run_live() {
         "stack_obj := __v_p_0;\n        stack.person[40] := 7;",
         "temp[0] := 2;\n    let __fdata_1 = scope(27, 0);\n    temp[0] := 3;\n    let __arith_2 = scope(27, 0);",
         "temp[0] := 2;\n    scope(27, 0) := 1;",
-        "local[0] := __v_target_",
+        // The pinned handle lives in `local[0]` itself.
+        "local[0] := stack_obj;\n    stack_obj := my.id;",
         "push_interaction(menu: 0, object: 0, priority: 2, flags: 2);",
         "while stack.attr[5] inc_lt 4 {",
         "param[0] += 5;",
@@ -8991,9 +8993,20 @@ object "Pr E Review" {
     assert!(tree("One Arm").contains("= my.person[12];"), "{air}");
     // The reference keeps the index the call saw; the helper's `*i = 0` does not move it.
     let sprite = tree("Sprite Ref");
-    assert!(sprite.contains("__ref_idx_flag"), "{sprite}");
-    assert!(sprite.contains("temp[0] := __ref_idx_flag"), "{sprite}");
-    assert!(tree("Pinned").contains("local[0] := __v_o_0;"), "{air}");
+    let select = sprite
+        .lines()
+        .find(|l| l.trim_start().starts_with("temp[0] := "))
+        .unwrap_or_else(|| panic!("{sprite}"));
+    assert!(
+        select.contains("__ref_") && !select.contains("__v_i_"),
+        "{sprite}"
+    );
+    assert!(
+        sprite.find("= stack.attr[1];").expect("snapshot")
+            < sprite.find("__v_i_0 := 0;").expect("helper write"),
+        "the index snapshot is taken before the helper runs:\n{sprite}"
+    );
+    assert!(tree("Pinned").contains("local[0] := stack_obj;"), "{air}");
     // `param[3]` is inside a functional's frame, and its header declares the four words.
     assert!(air.contains("param[3]"), "{air}");
     assert!(air.contains("(args: 4)"), "{air}");
@@ -9142,4 +9155,618 @@ fn pr_e_review_negative_diagnostics() {
         &obj(&format!("    init {{ self.n = {deep}; }}")),
         "nesting depth",
     );
+}
+
+const PR_F_SUGAR_V2: &str = r#"
+enum Tone { Off, Low, Mid, High }
+
+object "Sugar Probe" {
+    guid: 0x7F40_0210;
+    const FLAG = 1;
+    state r0: i16;
+    state r1: i16;
+    state r2: i16;
+    state r3: i16;
+    state r4: i16;
+    state r5: i16;
+    state r6: i16;
+    state r7: i16;
+
+    @id(4300) tree probe "Probe" (sim: Sim, n: i16) {
+        self.r0 = if n > 3 { 7 } else if n == 0 { 1 } else { 2 };
+        let wide = if n > 3 || n == -1 { n } else { 4 };
+        self.r1 = wide;
+        self.r2 = if n > 0 && n < 5 { 1 } else { 0 };
+        self.r3 = match n { 0 | 2 | 5 => 1, 3..=4 | 9 => 2, _ => 3 };
+        match n {
+            1 | 6 => { self.r4 = 10; }
+            7 => { self.r4 = 20; }
+            _ => { self.r4 = 30; }
+        }
+        let tone = if n > 4 { Tone::High } else { Tone::Low };
+        self.r5 = match tone { Tone::Off | Tone::Low => 1, Tone::Mid | Tone::High => 2 };
+        self.r6 = 0;
+        for i in 0..4 {
+            match i {
+                1 | 3 => { self.r6 += 1; }
+                2 => { break; }
+                _ => { }
+            }
+        }
+        self.r7 = if FLAG == 1 { 5 } else { 6 };
+    }
+}
+"#;
+
+#[test]
+fn pr_f_if_expressions_and_or_patterns_run_live() {
+    let cfg = PackResolverConfig::default();
+    let obj = compile_v2_source("sugar.antics", PR_F_SUGAR_V2, &cfg).expect("compile sugar");
+    let mut vm = V2VmFixture::from_objects(&[&obj], 5000);
+    let o = vm.spawn(0x7F40_0210, 4, 4);
+    // (n, r0, r1, r2, r3, r4, r5)
+    for (n, r0, r1, r2, r3, r4, r5) in [
+        (0, 1, 4, 0, 1, 30, 1),
+        (1, 2, 4, 1, 3, 10, 1),
+        (2, 2, 4, 1, 1, 30, 1),
+        (4, 7, 4, 1, 2, 30, 1),
+        (5, 7, 5, 0, 1, 30, 2),
+        (6, 7, 6, 0, 3, 10, 2),
+        (7, 7, 7, 0, 3, 20, 2),
+        (9, 7, 9, 0, 2, 30, 2),
+        (-1, 2, -1, 0, 3, 30, 1),
+    ] {
+        assert!(vm.try_run_tree(o, 4300, n).expect("probe runs"), "n = {n}");
+        assert_eq!(vm.obj_attr(o, 0), r0, "else-if chain (n = {n})");
+        assert_eq!(vm.obj_attr(o, 1), r1, "short-circuit || value (n = {n})");
+        assert_eq!(vm.obj_attr(o, 2), r2, "short-circuit && value (n = {n})");
+        assert_eq!(vm.obj_attr(o, 3), r3, "OR of values and ranges (n = {n})");
+        assert_eq!(vm.obj_attr(o, 4), r4, "statement OR arm (n = {n})");
+        assert_eq!(vm.obj_attr(o, 5), r5, "enum OR arms (n = {n})");
+        assert_eq!(vm.obj_attr(o, 6), 1, "OR arm beside a break arm (n = {n})");
+        assert_eq!(vm.obj_attr(o, 7), 5, "a constant condition folds (n = {n})");
+    }
+
+    let air = &sims_antics::v2::expand_v2_source_to_objects("sugar.antics", PR_F_SUGAR_V2, &cfg)
+        .expect("expand sugar")[0]
+        .air_source;
+    for needle in [
+        // `let x = if ..` writes the binding; `||` / `&&` test in place, in order.
+        "let __v_wide_",
+        "if !param[0] > 3 {\n            if !param[0] == -1 {",
+        // Single-compare OR arms test in a single-pass loop; the arm beside `break` uses a flag.
+        "if !param[0] == 1 {\n            if !param[0] == 6 {",
+        " != 0 {\n            stack.attr[6] += 1;\n        } else if __v_i_7 == 2 {",
+        "stack.attr[7] := 5;",
+    ] {
+        assert!(air.contains(needle), "missing:\n{needle}\n---\n{air}");
+    }
+    assert!(!air.contains("__cond"), "{air}");
+    assert!(!air.contains("== 1 {\n        stack.attr[7]"), "{air}");
+}
+
+const PR_F_SHELF_V2: &str = r#"
+object "Shelf F" {
+    guid: 0x7F40_0221;
+    price: 10;
+    state remaining: i16 = 2;
+
+    functional prep {
+        score: 50,
+        run(sim) {
+            if self.remaining <= 0 {
+                return false;
+            }
+            self.remaining -= 1;
+            return true;
+        }
+    }
+}
+"#;
+
+const PR_F_GAPS_V2: &str = r#"
+object "Gap Probe F" {
+    guid: 0x7F40_0220;
+    sound tick = preset("ui_click", id: 0, wav: "probe_tick");
+    sound tock = preset("ui_click", id: 7, wav: "probe_tick");
+    sound bell = preset("chime");
+    state shelves: i16;
+    state vk: i16;
+    state ran: i16;
+    state steps: i16;
+    state banner: i16;
+    state spare: i16;
+
+    interaction "Poke" {
+        run(sim) {
+            play_sound(tock);
+            return true;
+        }
+    }
+
+    init {
+        self.shelves = 0;
+        for o in lot.objects() {
+            if o.is_type(0x7F40_0221) && o.attr[0] == 2 {
+                self.shelves += 1;
+            }
+        }
+    }
+
+    @id(4300) tree people "People" (sim: Sim) {
+        self.vk = sim.visitor_kind;
+        if sim.visitor_kind == 3 {
+            self.vk += 10;
+        }
+    }
+
+    @id(4301) tree shelf "Shelf" (sim: Sim) {
+        let Some(t) = find_best_object(prep) else {
+            self.ran = -1;
+            return false;
+        };
+        if t.run_functional(prep) {
+            self.ran = 1;
+        } else {
+            self.ran = 2;
+        }
+    }
+
+    @id(4302) tree stepper "Stepper" (sim: Sim) {
+        self.steps = 0;
+        stack_obj.attr[5] = 0;
+        while inc_lt(&mut stack_obj.attr[5], 3) {
+            self.steps += 1;
+        }
+    }
+
+    @id(4303) tree pusher "Pusher" (sim: Sim) {
+        let o = stack_obj;
+        stack_obj = sim;
+        push_interaction(object: o, menu: 0, priority: 2, icon: o);
+    }
+
+    @id(4304) tree banner "Banner" (sim: Sim) {
+        advert.delta[2] = 10;
+        self.banner = 1;
+    }
+
+    @id(4305) @frame(locals: 0, kind: 3)
+    tree waves "Waves" (sim: Sim) {
+        animate(clip: 3, event_local: 21);
+        return true;
+    }
+}
+"#;
+
+#[test]
+fn pr_f_zero_raw_and_decompiler_gaps_run_live() {
+    let cfg = PackResolverConfig::default();
+    let shelf = compile_v2_source("shelf.antics", PR_F_SHELF_V2, &cfg).expect("compile shelf");
+    let obj = compile_v2_source("gaps_f.antics", PR_F_GAPS_V2, &cfg).expect("compile gaps");
+    assert!(
+        !PR_F_GAPS_V2.contains("raw"),
+        "the probe needs no raw blocks"
+    );
+
+    // Sound id 0, and two ids sharing one sound name.
+    let iff = Iff::parse(obj.iff_bytes.clone()).expect("IFF parse");
+    let mut fwavs: Vec<(u16, String)> = iff
+        .all(b"FWAV")
+        .map(|c| {
+            let d = iff.data(c);
+            let end = d.iter().position(|&b| b == 0).unwrap_or(d.len());
+            (c.id, d[..end].iter().map(|&b| char::from(b)).collect())
+        })
+        .collect();
+    fwavs.sort();
+    assert_eq!(fwavs.len(), 3, "{fwavs:?}");
+    assert_eq!(fwavs[0], (0, "probe_tick".to_owned()), "{fwavs:?}");
+    assert!(fwavs.contains(&(7, "probe_tick".to_owned())), "{fwavs:?}");
+    assert!(obj.sounds_wav.contains_key("probe_tick"));
+    assert_eq!(obj.sounds_wav.len(), 2, "{:?}", obj.sounds_wav.keys());
+    assert!(obj.sounds_wav.keys().all(|k| !k.contains("shared")));
+
+    // `@frame(kind:)` and `animate(event_local:)` outside a zero-local frame.
+    let waves =
+        Behavior::parse(iff.data(iff.get(b"BHAV", 4305).expect("BHAV"))).expect("BHAV parse");
+    assert_eq!((waves.kind, waves.locals), (3, 0));
+    // The cursor loop in `init` needs no locals.
+    assert_eq!(bhav_locals(&obj, 4096), 0);
+
+    let mut vm = V2VmFixture::from_objects(&[&shelf, &obj], 5000);
+    let s = vm.spawn(0x7F40_0221, 6, 6);
+    let o = vm.spawn(0x7F40_0220, 4, 4);
+    assert_eq!(
+        vm.obj_attr(o, 0),
+        1,
+        "lot.objects() with stack_obj as the cursor"
+    );
+    let sim = vm.sim_id;
+    vm.world
+        .objects
+        .get_mut(&sim)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .data[32] = 3;
+
+    assert!(vm.try_run_tree(o, 4300, 0).expect("people runs"));
+    assert_eq!(vm.obj_attr(o, 1), 13, "sim.visitor_kind is an i16");
+
+    for expected in [1, 1, 2] {
+        vm.try_run_tree(o, 4301, 0).expect("shelf runs");
+        assert_eq!(
+            vm.obj_attr(o, 2),
+            expected,
+            "run_functional branches directly"
+        );
+    }
+    assert_eq!(vm.obj_attr(s, 0), 0, "the functional ran twice");
+
+    assert!(vm.try_run_tree(o, 4302, 0).expect("stepper runs"));
+    assert_eq!(vm.obj_attr(o, 3), 2, "inc_lt on a stack_obj cell");
+    assert_eq!(vm.obj_attr(o, 5), 3);
+
+    assert!(vm.try_run_tree(o, 4303, 0).expect("pusher runs"));
+    let queue = &vm.world.objects[&sim].person.as_ref().unwrap().queue;
+    assert_eq!(queue.len(), 1, "one action queued");
+    assert_eq!(queue[0].target, o as i16, "the pinned handle is the target");
+    assert_eq!(queue[0].icon, o as i16, "and the icon");
+
+    assert!(vm.try_run_tree(o, 4304, 0).expect("banner runs"));
+    assert_eq!(vm.obj_attr(o, 4), 1);
+
+    let air = &sims_antics::v2::expand_v2_source_to_objects("gaps_f.antics", PR_F_GAPS_V2, &cfg)
+        .expect("expand gaps")[0]
+        .air_source;
+    let tree = |label: &str| {
+        let start = air
+            .find(&format!("\"{label}\""))
+            .unwrap_or_else(|| panic!("tree {label}:\n{air}"));
+        let end = air[start..].find("\n}\n").map_or(air.len(), |e| start + e);
+        &air[start..end]
+    };
+    for (label, needle) in [
+        (
+            "Init",
+            "stack_obj := 0;\n    while set_to_next(all, dest: stack_obj) {",
+        ),
+        ("People", "stack.attr[1] := my.person[32];"),
+        (
+            "Shelf",
+            "if run_functional_tree(prep) {\n        stack_obj := __self_obj;",
+        ),
+        ("Stepper", "while stack.attr[5] inc_lt 3 {"),
+        ("Pusher", "local[0] := stack_obj;\n    stack_obj := my.id;"),
+        ("Pusher", "flags: 3, icon: 0);"),
+        ("Banner", "scope(12, 2) := 10;\n    stack.attr[4] := 1;"),
+        ("Waves", "(locals: 0, kind: 3)"),
+        (
+            "Waves",
+            "op 0x002c (0x03, 0x00, 0x15, 0x00, 0x00, 0x20, 0x00, 0x00)",
+        ),
+    ] {
+        assert!(
+            tree(label).contains(needle),
+            "{label} missing:\n{needle}\n---\n{air}"
+        );
+    }
+    assert!(!tree("Banner").contains("stack_obj"), "{air}");
+    assert!(!tree("Init").contains("__saved_stack_obj"), "{air}");
+    assert!(!air.contains("__cond"), "{air}");
+}
+
+#[test]
+fn pr_f_negative_diagnostics() {
+    let cfg = PackResolverConfig::default();
+    let obj = |members: &str| {
+        format!(
+            "enum Tone {{ Off, Low, High }}\nobject \"Pr F\" {{\n    guid: 0x7F40_0230;\n    state n: i16;\n    state t: Tone;\n{members}\n}}\n"
+        )
+    };
+    let expect_err = |name: &str, src: &str, needle: &str| {
+        let err = compile_v2_source(name, src, &cfg).expect_err(&format!("{name} must fail"));
+        assert!(
+            err.message.contains(needle),
+            "{name}: expected '{needle}' in: {err}"
+        );
+    };
+    let init = |body: &str| obj(&format!("    init {{ {body} }}"));
+    let sim_tree = |body: &str| obj(&format!("    tree t (sim: Sim) {{ {body} }}"));
+
+    // `stack_obj` is never a binding.
+    for (name, src) in [
+        ("bind_let.antics", sim_tree("let stack_obj = 1;")),
+        (
+            "bind_for.antics",
+            sim_tree("for stack_obj in lot.sims() { }"),
+        ),
+        (
+            "bind_param.antics",
+            obj("    tree t (sim: Sim, stack_obj: i16) { }"),
+        ),
+    ] {
+        expect_err(name, &src, "'stack_obj' is the frame's stack object");
+    }
+
+    // `if` expressions.
+    expect_err(
+        "if_no_else.antics",
+        &init("self.n = if self.n > 0 { 1 };"),
+        "needs an 'else' branch",
+    );
+    expect_err(
+        "if_types.antics",
+        &init("self.n = if self.n > 0 { 1 } else { true };"),
+        "'if' expression branches have different types",
+    );
+    expect_err(
+        "if_folded_types.antics",
+        &init("self.n = if 1 == 1 { 1 } else { true };"),
+        "'if' expression branches have different types",
+    );
+    expect_err(
+        "if_block.antics",
+        &init("self.n = if self.n > 0 { self.n = 2; 1 } else { 0 };"),
+        "not a block of statements",
+    );
+
+    // OR-patterns.
+    expect_err(
+        "or_wildcard.antics",
+        &init("match self.n { 0 | _ => { } }"),
+        "'_' cannot be an alternative",
+    );
+    expect_err(
+        "or_ident.antics",
+        &init("match self.n { 0 | other => { } _ => { } }"),
+        "unexpected identifier pattern 'other'",
+    );
+    expect_err(
+        "or_duplicate.antics",
+        &init("match self.n { 0 | 1 => { } 1 => { } _ => { } }"),
+        "duplicate match arm for value 1",
+    );
+    expect_err(
+        "or_self_overlap.antics",
+        &init("match self.n { 1..=3 | 2 => { } _ => { } }"),
+        "duplicate match arm for value 2",
+    );
+    expect_err(
+        "or_enum_dup.antics",
+        &init("match self.t { Tone::Off | Tone::Off => { } _ => { } }"),
+        "duplicate match arm for 'Tone::Off'",
+    );
+    expect_err(
+        "or_enum_open.antics",
+        &init("self.n = match self.t { Tone::Off | Tone::Low => 1 };"),
+        "missing variant 'High'",
+    );
+    expect_err(
+        "or_i16_open.antics",
+        &init("self.n = match self.n { 0 | 1 => 1, 2..=9 => 2 };"),
+        "non-exhaustive",
+    );
+    expect_err(
+        "or_type.antics",
+        &init("match self.t { Tone::Off | 1 => { } _ => { } }"),
+        "integer pattern 1 cannot match",
+    );
+    expect_err(
+        "or_dialog_dup.antics",
+        &sim_tree("match dialog(message: \"Go?\") { Yes | 0 => { } No => { } }"),
+        "duplicate arm for button 1",
+    );
+    compile_v2_source(
+        "or_dialog.antics",
+        &sim_tree("match dialog(message: \"Go?\") { Yes | No => { self.n = 1; } }"),
+        &cfg,
+    )
+    .expect("dialog buttons may share an arm");
+
+    // `animate(event_local:)` sits outside a declared frame.
+    expect_err(
+        "event_local_no_frame.antics",
+        &sim_tree("animate(clip: 3, event_local: 5);"),
+        "add @frame(locals: K)",
+    );
+    expect_err(
+        "event_local_inside.antics",
+        &obj("    @frame(locals: 4)\n    tree t (sim: Sim) { animate(clip: 3, event_local: 2); }"),
+        "is inside the frame",
+    );
+    expect_err(
+        "event_local_needed.antics",
+        &obj(
+            "    @frame(locals: 1)\n    tree t (sim: Sim) { let a = self.n; let b = a + 1; self.n = b; animate(clip: 3, event_local: 1); }",
+        ),
+        "must lie outside the frame",
+    );
+    expect_err(
+        "event_local_both.antics",
+        &obj(
+            "    @frame(locals: 1)\n    tree t (sim: Sim) { let e = 0; animate(clip: 3, local: e, event_local: 4); }",
+        ),
+        "not both",
+    );
+    expect_err(
+        "event_local_body.antics",
+        &obj(
+            "    @frame(locals: 0)\n    tree t (sim: Sim) { animate(clip: 3, event_local: 4) |ev| { } }",
+        ),
+        "takes no '|event|' body",
+    );
+    expect_err(
+        "frame_kind.antics",
+        &obj("    @frame(kind: 256)\n    tree t (sim: Sim) { }"),
+        "@frame kind must fit in a byte",
+    );
+
+    // Shared sound names.
+    expect_err(
+        "sound_no_id.antics",
+        &obj(
+            "    sound a = preset(\"ui_click\", wav: \"same\");\n    sound b = preset(\"ui_click\", wav: \"same\");",
+        ),
+        "give it an explicit 'id:'",
+    );
+    expect_err(
+        "sound_preset.antics",
+        &obj(
+            "    sound a = preset(\"ui_click\", id: 1, wav: \"same\");\n    sound b = preset(\"chime\", id: 2, wav: \"same\");",
+        ),
+        "has a different preset",
+    );
+    expect_err(
+        "sound_reserved.antics",
+        &obj(
+            "    sound a = preset(\"ui_click\", id: 1, wav: \"same\");\n    sound b = preset(\"ui_click\", id: 2, wav: \"same\");\n    sound c = preset(\"chime\", id: 3, wav: \"v2-shared-sound-2\");",
+        ),
+        "reserved for shared sound names",
+    );
+
+    // `icon:` from a handle other than `object:` must be a plain local.
+    expect_err(
+        "icon_foreign.antics",
+        &sim_tree("let o = stack_obj; push_interaction(object: o, menu: 0, icon: sim.hand);"),
+        "push_interaction(icon:) must name",
+    );
+}
+
+/// Review regressions for PR F's optimizer and cursor/push/animate lowering: each probe is
+/// expanded and its `.air` checked, and each compiles.
+#[test]
+fn pr_f_review_regressions_lower_soundly() {
+    let cfg = PackResolverConfig::default();
+    let obj = |members: &str| {
+        format!(
+            "object \"Pr F review\" {{\n    guid: 0x7F40_0240;\n    state n: i16;\n{members}\n}}\n"
+        )
+    };
+    let tree_of = |name: &str, src: &str, id: u16| -> String {
+        compile_v2_source(name, src, &cfg).unwrap_or_else(|e| panic!("{name} must compile: {e}"));
+        let expanded = sims_antics::v2::expand_v2_source_to_objects(name, src, &cfg)
+            .unwrap_or_else(|e| panic!("{name} must expand: {e}"));
+        let air = &expanded[0].air_source;
+        let start = air
+            .find(&format!("tree {id} "))
+            .unwrap_or_else(|| panic!("{name}: no tree {id} in:\n{air}"));
+        let end = air[start..].find("\n}\n").map_or(air.len(), |e| start + e);
+        air[start..end].to_owned()
+    };
+
+    // A raw block with numeric branch targets keeps the entry save, so the targets still land.
+    let t = tree_of(
+        "raw_targets.antics",
+        &obj(
+            "    @id(4300) tree t (sim: Sim) {\n        raw {\n            stack_obj := my.id;\n            random(temp[0], 1) -> true: 3, false: 3;\n            stack.attr[0] := 1;\n            return true;\n        }\n    }",
+        ),
+        4300,
+    );
+    assert!(t.contains("let __self_obj = stack_obj;"), "{t}");
+
+    // A body that writes sprite flags, or shadows the Sim, never uses `stack_obj` as the cursor.
+    let t = tree_of(
+        "cursor_sprite.antics",
+        &obj("    init { for o in lot.objects() { self.sprite_flags[0] = 1; } }"),
+        4096,
+    );
+    assert!(!t.contains("dest: stack_obj"), "{t}");
+    let t = tree_of(
+        "cursor_shadow.antics",
+        &obj(
+            "    @id(4300) tree t (sim: Sim) { for o in lot.objects() { let sim = o; sim.attr[0] = 1; } }",
+        ),
+        4300,
+    );
+    assert!(!t.contains("dest: stack_obj"), "{t}");
+
+    // Scope 27 reads the stack object, so the switch before a sprite store stays.
+    let t = tree_of(
+        "sprite_scope.antics",
+        &obj(
+            "    @id(4300) tree t (sim: Sim) { stack_obj = sim; temp[0] = 0; stack_obj.sprite_flags[0] = 1; return true; }",
+        ),
+        4300,
+    );
+    assert!(t.contains("stack_obj := my.id;"), "{t}");
+
+    // A pinned push of a local read before any write keeps the copy into the pin slot.
+    let t = tree_of(
+        "pin_uninit.antics",
+        &obj(
+            "    @id(4300) tree t (sim: Sim) { let o: ObjectId; push_interaction(object: o, menu: 0, priority: 2, icon: o); }",
+        ),
+        4300,
+    );
+    assert!(t.contains("local[0] := "), "{t}");
+
+    // The entry save is not forwarded into a local-slot operand.
+    let t = tree_of(
+        "icon_forward.antics",
+        &obj(
+            "    @id(4300) tree t (sim: Sim) { push_interaction(object: 0, menu: 0, priority: 2, icon: self); stack_obj = sim; return true; }",
+        ),
+        4300,
+    );
+    assert!(!t.contains("icon: stack_obj"), "{t}");
+
+    // A comment naming a local does not count toward the frame.
+    tree_of(
+        "frame_comment.antics",
+        &obj(
+            "    @id(4300) @frame(locals: 0) tree t () {\n        raw { /* local[0] is unused */ }\n        animate(clip: 3, event_local: 1);\n        return true;\n    }",
+        ),
+        4300,
+    );
+
+    // `icon: self` in an object's own tree is materialized from `my.id`.
+    let t = tree_of(
+        "icon_self_object.antics",
+        &obj(
+            "    @id(4300) tree t () { let o = stack_obj; push_interaction(object: o, menu: 0, priority: 2, icon: self); }",
+        ),
+        4300,
+    );
+    assert!(t.contains("= my.id;"), "{t}");
+
+    // `animate(event_local:)` and `sleep` in one tree is a v2 diagnostic, not a backend error.
+    let err = compile_v2_source(
+        "event_local_sleep.antics",
+        &obj(
+            "    @id(4300) @frame(locals: 0) tree t (sim: Sim) { animate(clip: 3, event_local: 1); sleep(1); return true; }",
+        ),
+        &cfg,
+    )
+    .expect_err("event_local with sleep must fail");
+    assert!(
+        err.message
+            .contains("a tree cannot mix raw ops with sleep()"),
+        "{err}"
+    );
+    // Folded-away code takes no part in that check.
+    for body in [
+        "if false { sleep(1); } animate(clip: 3, event_local: 1); return true;",
+        "if false { animate(clip: 3, event_local: 1); } sleep(1); return true;",
+    ] {
+        tree_of(
+            "event_local_dead.antics",
+            &obj(&format!(
+                "    @id(4300) @frame(locals: 0) tree t (sim: Sim) {{ {body} }}"
+            )),
+            4300,
+        );
+    }
+    // A raw `local x;` declaration counts toward the frame.
+    let err = compile_v2_source(
+        "event_local_decl.antics",
+        &obj(
+            "    @id(4300) @frame(locals: 0) tree t () { raw { local scratch; } animate(clip: 3, event_local: 0); return true; }",
+        ),
+        &cfg,
+    )
+    .expect_err("a declared local at the event slot must fail");
+    assert!(err.message.contains("must lie outside the frame"), "{err}");
 }

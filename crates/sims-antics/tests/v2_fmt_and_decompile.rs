@@ -221,7 +221,13 @@ fn synthetic_counter_round_trips() {
     assert!(source.contains("while self.attr_3 > 0"), "{source}");
     assert!(source.contains("state attr_3 @ 3: i16;"), "{source}");
     assert!(source.contains("Limits.e1"), "{source}");
-    assert!(source.contains("for o in lot.objects() {"), "{source}");
+    // The census loop's cursor is `stack_obj` itself since PR F; the decompiler lifts that
+    // shape as the `set_to_next` loop until it learns the `for` form.
+    assert!(
+        source.contains("for o in lot.objects() {")
+            || source.contains("while set_to_next(0, guid: 0x00000000, dest: stack_obj)"),
+        "{source}"
+    );
     assert!(source.contains("@id(4096) init {"), "{source}");
 }
 

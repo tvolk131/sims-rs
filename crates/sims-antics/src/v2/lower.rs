@@ -41,6 +41,9 @@ pub struct ExpandedV2Object {
     /// Extra catalog variants (`variant "Name" { ... }`), each one more OBJD/OBJf/CTSS in the
     /// same IFF sharing the object's resources. Empty for single-variant objects.
     pub variants: Vec<VariantSpec>,
+    /// FWAV chunks that share another declaration's sound name, as `(id, placeholder, name)`:
+    /// the manifest carries the unique placeholder, and the compiled FWAV gets `name` back.
+    pub shared_sound_names: Vec<(u16, String, String)>,
 }
 
 /// One extra catalog variant of an object: the primary OBJD with these words replaced.
@@ -1443,24 +1446,21 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
     // 5. Assign FWAV sound IDs (`1..`, honoring explicit IDs).
     let mut used_sound_ids: BTreeSet<u16> = BTreeSet::new();
     for sname in &sound_order {
-        if let Some(eid) = raw_sounds[sname].explicit_id {
-            if eid == 0 {
-                return Err(Error::at(
-                    raw_sounds[sname].span,
-                    format!("sound '{sname}' id must be >= 1"),
-                ));
-            }
-            if !used_sound_ids.insert(eid) {
-                return Err(Error::at(
-                    raw_sounds[sname].span,
-                    format!("duplicate sound id {eid}"),
-                ));
-            }
+        if let Some(eid) = raw_sounds[sname].explicit_id
+            && !used_sound_ids.insert(eid)
+        {
+            return Err(Error::at(
+                raw_sounds[sname].span,
+                format!("duplicate sound id {eid}"),
+            ));
         }
     }
     let mut next_sound_id = 1u16;
     let mut sounds = BTreeMap::new();
     let mut sound_specs = Vec::with_capacity(sound_order.len());
+    // Sound names already used (lowercased, as the compiler compares them) -> (preset, name).
+    let mut sound_names: BTreeMap<String, (crate::audio::SoundPreset, String)> = BTreeMap::new();
+    let mut shared_sound_names = Vec::new();
     for sname in &sound_order {
         let s = &raw_sounds[sname];
         let id = if let Some(eid) = s.explicit_id {
@@ -1483,11 +1483,47 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         crate::manifest::validate_relative_filename(&wav_name, "sound wav name")
             .map_err(|e| Error::at(s.span, e.message))?;
         sounds.insert(sname.clone(), ResolvedSound { id });
+        // Several FWAV ids may name one sound: the later ones get a unique placeholder in the
+        // manifest, and the compiled chunk is renamed back.
+        let manifest_name = match sound_names.get(&wav_name.to_ascii_lowercase()) {
+            Some((preset, first)) => {
+                if s.explicit_id.is_none() {
+                    return Err(Error::at(
+                        s.span,
+                        format!(
+                            "sound '{sname}' shares the name '{first}' with an earlier sound: give it an explicit 'id:'"
+                        ),
+                    ));
+                }
+                if *preset != s.preset {
+                    return Err(Error::at(
+                        s.span,
+                        format!(
+                            "sound '{sname}' shares the name '{first}' with an earlier sound but has a different preset"
+                        ),
+                    ));
+                }
+                let placeholder = format!("v2-shared-sound-{id}");
+                shared_sound_names.push((id, placeholder.clone(), wav_name.clone()));
+                placeholder
+            }
+            None => {
+                sound_names.insert(wav_name.to_ascii_lowercase(), (s.preset, wav_name.clone()));
+                wav_name
+            }
+        };
         sound_specs.push(SoundSpec {
             id,
-            name: wav_name,
+            name: manifest_name,
             preset: s.preset,
         });
+    }
+    for (_, placeholder, _) in &shared_sound_names {
+        if sound_names.contains_key(placeholder) {
+            return Err(Error::new(format!(
+                "sound name '{placeholder}' is reserved for shared sound names"
+            )));
+        }
     }
 
     // 6. Build slot table (routing_ordinal counts ONLY kind == 3 routing slots, matching sims-vm).
@@ -2274,6 +2310,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         manifest,
         air_source: air,
         variants,
+        shared_sound_names,
     })
 }
 
@@ -2736,6 +2773,7 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
         None => (TreeContext::ObjectSelf, false),
     };
     let mut ctx = TreeLowerer::new(env, tree_ctx, &t.owner_module, needs_self_save);
+    ctx.frame_locals = d.frame.and_then(|f| f.locals);
     ctx.frame_args = d.frame.and_then(|f| f.args).map_or_else(
         || {
             sig.params
@@ -2840,6 +2878,33 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
     if let Some(revision) = frame.revision {
         header.push(format!("revision: {revision}"));
     }
+    if let Some(kind) = frame.kind {
+        header.push(format!("kind: {kind}"));
+    }
+    let event_local = ctx.event_local;
+    if let (Some((espan, _)), Some(sleep)) = (event_local, ctx.sleep_span) {
+        return Err(Error::at(
+            espan,
+            format!(
+                "animate(event_local:) is a raw animate op, and a tree cannot mix raw ops with sleep() (line {}): use 'local:' with a variable, or move the sleep to another tree",
+                sleep.line
+            ),
+        ));
+    }
+    let body = ctx.finish();
+    if let (Some((espan, slot)), Some(locals)) = (event_local, frame.locals) {
+        // `.air` grows the frame to fit the named locals (after an explicit `local[0]` pin).
+        let used = count_frame_locals(&body);
+        if used > usize::from(locals) || usize::from(slot) < used {
+            return Err(Error::at(
+                espan,
+                format!(
+                    "animate(event_local: {slot}) must lie outside the frame, but tree '{}' needs {used} local(s) and declares @frame(locals: {locals})",
+                    d.ident
+                ),
+            ));
+        }
+    }
     if header.is_empty() {
         let _ = writeln!(trees_air, "tree {} \"{label}\" {{", sig.id);
     } else {
@@ -2850,9 +2915,50 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
             header.join(", ")
         );
     }
-    trees_air.push_str(&ctx.finish());
+    trees_air.push_str(&body);
     trees_air.push_str("}\n\n");
     Ok(())
+}
+
+/// The frame locals `.air` allocates for a lowered tree body: one per `let` / `local` name,
+/// after every explicit local (`local[N]`, `scope(25, N)`). Read from the body's tokens, so
+/// comments and strings name nothing. This only words the diagnostic: the `.air` compiler
+/// rejects a tree whose locals outgrow its `@frame(locals: K)`, and `K <= N` is checked when
+/// lowering, so a slot it misses (a raw primitive's numeric local operand) is still caught.
+fn count_frame_locals(body: &str) -> usize {
+    use crate::lexer::{TokenKind as T, tokenize};
+    let Ok(tokens) = tokenize(body) else {
+        // `.air` rejects the body anyway.
+        return 0;
+    };
+    let kinds: Vec<&T> = tokens.iter().map(|t| &t.kind).collect();
+    let mut names = BTreeSet::new();
+    let mut explicit: Option<i64> = None;
+    for (i, k) in kinds.iter().enumerate() {
+        let next = |n: usize| kinds.get(i + n).copied();
+        match k {
+            T::Ident(w) if w == "let" || (w == "local" && matches!(next(1), Some(T::Ident(_)))) => {
+                if let Some(T::Ident(name)) = next(1) {
+                    names.insert(name.as_str());
+                }
+            }
+            T::Ident(w) if w == "local" => {
+                if let (Some(T::LBracket), Some(T::Int(n))) = (next(1), next(2)) {
+                    explicit = explicit.max(Some(*n));
+                }
+            }
+            T::Ident(w) if w == "scope" => {
+                if let (Some(T::LParen), Some(T::Int(25)), Some(T::Comma), Some(T::Int(n))) =
+                    (next(1), next(2), next(3), next(4))
+                {
+                    explicit = explicit.max(Some(*n));
+                }
+            }
+            _ => {}
+        }
+    }
+    let first_named = explicit.map_or(0, |m| usize::try_from(m).unwrap_or(0) + 1);
+    first_named + names.len()
 }
 
 fn sprite_decl_to_spec(sp: SpriteDecl) -> SpriteSpec {
@@ -3548,6 +3654,13 @@ struct TreeLowerer<'a> {
     /// One past the highest `param[n]` the tree names, so a functional's header can declare
     /// the words it reads.
     param_words_used: usize,
+    /// The tree's `@frame(locals: K)`, which `animate(event_local:)` must stay outside.
+    frame_locals: Option<u16>,
+    /// The first `animate(event_local: N)`, as `(span, N)`.
+    event_local: Option<(Span, u8)>,
+    /// The first `sleep`/`idle`, which `.air` lowers through `idle()`: it cannot share a tree
+    /// with a raw op such as `animate(event_local:)`.
+    sleep_span: Option<Span>,
 }
 
 impl<'a> TreeLowerer<'a> {
@@ -3586,6 +3699,9 @@ impl<'a> TreeLowerer<'a> {
             raw_span: None,
             keep_layout: false,
             param_words_used: 0,
+            frame_locals: None,
+            event_local: None,
+            sleep_span: None,
         }
     }
 
@@ -3615,9 +3731,19 @@ impl<'a> TreeLowerer<'a> {
             out = replace_outside_strings(&out, PIN_SLOT, "0");
         }
         if self.keep_layout {
+            if self.has_self_obj_local
+                && let Some(trimmed) = super::opt::drop_unread_entry_save(&out)
+            {
+                return trimmed;
+            }
             out
         } else {
-            super::opt::optimize_tree_body(&out)
+            let out = super::opt::optimize_tree_body(&out);
+            if self.pin_span.is_some() {
+                super::opt::pin_in_place(&out)
+            } else {
+                out
+            }
         }
     }
 
@@ -4221,6 +4347,132 @@ impl<'a> TreeLowerer<'a> {
         Ok(())
     }
 
+    /// Whether a `for` body statement keeps `stack_obj` free to be the loop cursor `cursor`: it
+    /// neither writes `stack_obj` nor reads the stack object other than through `cursor`'s own
+    /// cells. A conservative syntactic whitelist (no calls, no `raw`, no other handles).
+    fn cursor_stmt_ok(&self, stmt: &V2Stmt, cursor: &str) -> bool {
+        match stmt {
+            V2Stmt::If {
+                cond,
+                then_body,
+                else_body,
+                ..
+            } => {
+                self.cursor_expr_ok(cond, cursor)
+                    && then_body
+                        .iter()
+                        .chain(else_body)
+                        .all(|s| self.cursor_stmt_ok(s, cursor))
+            }
+            V2Stmt::Return { value, .. } => value
+                .as_ref()
+                .is_none_or(|v| self.cursor_expr_ok(v, cursor)),
+            V2Stmt::Break { .. } | V2Stmt::Continue { .. } | V2Stmt::ReturnError { .. } => true,
+            V2Stmt::Let { name, init, .. } => {
+                self.cursor_fresh_name(name, cursor) && self.cursor_expr_ok(init, cursor)
+            }
+            V2Stmt::LetUninit { name, .. } => self.cursor_fresh_name(name, cursor),
+            V2Stmt::Assign { target, value, .. } => {
+                let target_ok = match target {
+                    V2Expr::Ident(_, name) => {
+                        name != cursor
+                            && matches!(self.lookup_var(name), Some(Binding::Local { .. }))
+                    }
+                    other => self.cursor_place_ok(other, cursor),
+                };
+                target_ok && self.cursor_expr_ok(value, cursor)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a body `let` may bind `name`: it shadows nothing. The whitelist resolves names as
+    /// they stand outside the body, so a shadowing binding (`let sim = o;`) would be checked as
+    /// the outer one.
+    fn cursor_fresh_name(&self, name: &str, cursor: &str) -> bool {
+        name != cursor && name != "self" && name != "stack_obj" && self.lookup_var(name).is_none()
+    }
+
+    /// Whether `base.<field>` / `base.<group>[i]` names a cell the cursor loop may touch: the
+    /// cursor's own (`stack.`), the Sim's (`my.` in an interaction), or `self`'s in an object's
+    /// own tree (`my.`).
+    fn cursor_cell_root_ok(&self, root: &str, cursor: &str) -> bool {
+        root == cursor
+            || self.is_sim_ident(root)
+            || (self.is_self_ident(root) && matches!(self.tree_ctx, TreeContext::ObjectSelf))
+    }
+
+    /// `sprite_flags[i]` is rejected on every root: it lowers through scope 27, which reads the
+    /// current stack object, so it switches `stack_obj` and restores it.
+    fn cursor_place_ok(&self, place: &V2Expr, cursor: &str) -> bool {
+        match place {
+            V2Expr::Field { field, .. } if field == "sprite_flags" => false,
+            V2Expr::Field { base, .. } => match base.as_ref() {
+                V2Expr::Ident(_, root) => self.cursor_cell_root_ok(root, cursor),
+                V2Expr::Field { base: inner, .. } => {
+                    matches!(inner.as_ref(), V2Expr::Ident(_, root) if self.cursor_cell_root_ok(root, cursor))
+                }
+                _ => false,
+            },
+            V2Expr::Index { base, index, .. } => {
+                let base_ok = match base.as_ref() {
+                    V2Expr::Ident(_, name) => {
+                        matches!(name.as_str(), "temp" | "param") && self.lookup_var(name).is_none()
+                    }
+                    V2Expr::Field {
+                        base: root, field, ..
+                    } => {
+                        field != "sprite_flags"
+                            && matches!(root.as_ref(), V2Expr::Ident(_, r) if self.cursor_cell_root_ok(r, cursor))
+                    }
+                    _ => false,
+                };
+                base_ok && self.cursor_expr_ok(index, cursor)
+            }
+            _ => false,
+        }
+    }
+
+    fn cursor_expr_ok(&self, expr: &V2Expr, cursor: &str) -> bool {
+        match expr {
+            V2Expr::Int(..) | V2Expr::Bool(..) | V2Expr::Path(..) => true,
+            V2Expr::Ident(_, name) => {
+                if name == "stack_obj" {
+                    return false;
+                }
+                match self.lookup_var(name) {
+                    Some(Binding::MutRef { .. } | Binding::SelfHandle) => false,
+                    Some(_) => true,
+                    None => name != "self",
+                }
+            }
+            V2Expr::Unary { inner, .. } => self.cursor_expr_ok(inner, cursor),
+            V2Expr::Binary { lhs, rhs, .. } => {
+                self.cursor_expr_ok(lhs, cursor) && self.cursor_expr_ok(rhs, cursor)
+            }
+            V2Expr::Field { .. } if self.bcon_field_ref(expr).is_some() => true,
+            V2Expr::Field { .. } | V2Expr::Index { .. } => self.cursor_place_ok(expr, cursor),
+            V2Expr::MethodCall {
+                receiver,
+                method,
+                type_args,
+                args,
+                ..
+            } => {
+                method == "is_type"
+                    && type_args.is_empty()
+                    && matches!(receiver.as_ref(), V2Expr::Ident(_, r) if r == cursor)
+                    && args.iter().all(|a| {
+                        matches!(
+                            a.value,
+                            V2Expr::Int(..) | V2Expr::Ident(..) | V2Expr::Path(..)
+                        )
+                    })
+            }
+            _ => false,
+        }
+    }
+
     fn is_sim_ident(&self, name: &str) -> bool {
         matches!(self.lookup_var(name), Some(Binding::SimHandle))
     }
@@ -4235,6 +4487,10 @@ impl<'a> TreeLowerer<'a> {
     /// The `.air` operand holding an object-handle binding (`ObjectId`/typed locals, params, and
     /// `Object` helper params), plus whether it may be a Sim (only untyped handles may).
     fn object_handle_air(&self, name: &str) -> Option<(String, bool)> {
+        // `stack_obj` is the frame's stack object (it cannot be bound as a name).
+        if name == "stack_obj" {
+            return Some(("stack_obj".to_owned(), true));
+        }
         match self.lookup_var(name)? {
             Binding::Local { air_name, ty } if ty.is_object_handle() => {
                 Some((air_name.clone(), *ty == ValueType::ObjectId))
@@ -4257,6 +4513,7 @@ impl<'a> TreeLowerer<'a> {
             "age" => Some(("stack.person[58]", ValueType::I16)),
             "priority" => Some(("stack.person.priority", ValueType::I16)),
             "is_visitor" => Some(("stack.person[32]", ValueType::Bool)),
+            "visitor_kind" => Some(("stack.person[32]", ValueType::I16)),
             "kind" => Some(("stack.person[65]", ValueType::I16)),
             _ => None,
         }
@@ -4504,6 +4761,17 @@ impl<'a> TreeLowerer<'a> {
                     // The arms write the binding directly (`let x;` emits no node).
                     self.line(format!("let {air_name};"));
                     self.lower_match_expr(*mspan, scrutinee, arms, Some(&air_name))?
+                        .1
+                } else if let V2Expr::If {
+                    span: ispan,
+                    cond,
+                    then_value,
+                    else_value,
+                } = init
+                {
+                    // The branches write the binding directly.
+                    self.line(format!("let {air_name};"));
+                    self.lower_if_expr(*ispan, cond, then_value, else_value, Some(&air_name))?
                         .1
                 } else if is_compound_arith_or_neg(init) {
                     self.lower_arith_into_dest(init, &air_name, true)?
@@ -4957,13 +5225,31 @@ impl<'a> TreeLowerer<'a> {
                 {
                     return self.lower_range_for(binding, start, end, *inclusive, *rev, body);
                 }
-                let iter_var = self.fresh(&format!("v_{binding}"));
+                // `stack_obj` itself is the cursor when the body provably never reads the stack
+                // object any other way: the loop then needs no local.
+                let stack_cursor = matches!(
+                    iter,
+                    ForEachIter::ObjectsByGuid(_) | ForEachIter::LotSims | ForEachIter::LotObjects
+                ) && self.active_inline_fn.is_none()
+                    && !self.in_defer()
+                    && !self.has_active_cleanups()
+                    && body.iter().all(|s| self.cursor_stmt_ok(s, binding));
+                let iter_var = if stack_cursor {
+                    "stack_obj".to_owned()
+                } else {
+                    self.fresh(&format!("v_{binding}"))
+                };
+                let init_line = if stack_cursor {
+                    "stack_obj := 0;".to_owned()
+                } else {
+                    format!("let {iter_var} = 0;")
+                };
                 let mut parts_root_opt = None;
                 let binding_ty = match iter {
                     ForEachIter::Range { .. } => unreachable!("handled above"),
                     ForEachIter::ObjectsByGuid(guid_expr) => {
                         let guid = self.resolve_guid_expr(guid_expr)?;
-                        self.line(format!("let {iter_var} = 0;"));
+                        self.line(init_line);
                         self.line(format!(
                             "while set_to_next(guid, {guid:#010x}, dest: {iter_var}) {{"
                         ));
@@ -4975,7 +5261,7 @@ impl<'a> TreeLowerer<'a> {
                         } else {
                             "all"
                         };
-                        self.line(format!("let {iter_var} = 0;"));
+                        self.line(init_line);
                         self.line(format!("while set_to_next({mode}, dest: {iter_var}) {{"));
                         ValueType::ObjectId
                     }
@@ -5084,6 +5370,44 @@ impl<'a> TreeLowerer<'a> {
                     let r = self.lower_stmts(chosen);
                     let p = self.pop_scope_and_run_cleanups();
                     return r.and(p);
+                }
+
+                // `if [!]obj.run_functional(..)` branches on the primitive itself; each arm
+                // restores `stack_obj` first.
+                if let Some((negated, receiver, args, rspan)) = run_functional_test(cond) {
+                    let (prim, _, _) = self.prepare_run_functional(receiver, args, rspan)?;
+                    let bang = if negated { "!" } else { "" };
+                    self.line(format!("if {bang}{prim} {{"));
+                    self.indent += 1;
+                    self.emit_restore_stack_obj();
+                    self.push_scope(ScopeFrame::block());
+                    let r1 = self.lower_stmts(then_body);
+                    let p1 = self.pop_scope_and_run_cleanups();
+                    self.indent -= 1;
+                    let mark = self.out.len();
+                    self.line("} else {".to_owned());
+                    self.indent += 1;
+                    let restore_at = self.out.len();
+                    self.emit_restore_stack_obj();
+                    let restored = self.out.len() != restore_at;
+                    self.push_scope(ScopeFrame::block());
+                    let r2 = self.lower_stmts(else_body);
+                    let p2 = self.pop_scope_and_run_cleanups();
+                    self.indent -= 1;
+                    if else_body.is_empty() && !restored {
+                        self.out.truncate(mark);
+                    }
+                    self.line("}".to_owned());
+                    return r1.and(p1).and(r2).and(p2);
+                }
+
+                if self.try_lower_short_circuit_if(
+                    cond,
+                    ArmBody::Stmts(then_body),
+                    ArmBody::Stmts(else_body),
+                    None,
+                )? {
+                    return Ok(());
                 }
 
                 let cond_text = if let Some(simple) = self.try_lower_simple_air_cond(cond)? {
@@ -5531,12 +5855,15 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
 
-        let arms_have_third = arms.iter().any(|a| {
-            matches!(
-                &a.pattern,
-                MatchPattern::Ident(_, n) if matches!(n.as_str(), "Button3" | "Cancel")
-            ) || matches!(&a.pattern, MatchPattern::Int(_, 2))
-        });
+        let arms_have_third = arms
+            .iter()
+            .flat_map(|a| pattern_alternatives(&a.pattern))
+            .any(|p| {
+                matches!(
+                    p,
+                    MatchPattern::Ident(_, n) if matches!(n.as_str(), "Button3" | "Cancel")
+                ) || matches!(p, MatchPattern::Int(_, 2))
+            });
         let is_three_way = match opts.kind_num {
             Some(1) => false,
             Some(2) => true,
@@ -5577,74 +5904,79 @@ impl<'a> TreeLowerer<'a> {
                     "unreachable arm after '_' wildcard in 'match dialog'",
                 ));
             }
-            let slot: Option<usize> = match &arm.pattern {
-                MatchPattern::Wildcard(_) => {
-                    wildcard_body = Some(arm.body.as_slice());
-                    None
-                }
-                MatchPattern::Range(pspan, ..) => {
-                    return Err(Error::at(
-                        *pspan,
-                        "range patterns cannot match a 'dialog(...)' result",
-                    ));
-                }
-                MatchPattern::Ident(pspan, name) => match name.as_str() {
-                    "Button1" | "Yes" => Some(0),
-                    "Button2" | "No" => Some(1),
-                    "Button3" | "Cancel" => {
-                        if !is_three_way {
+            for alt in pattern_alternatives(&arm.pattern) {
+                let slot: Option<usize> = match alt {
+                    MatchPattern::Wildcard(_) => {
+                        wildcard_body = Some(arm.body.as_slice());
+                        None
+                    }
+                    MatchPattern::Range(pspan, ..) => {
+                        return Err(Error::at(
+                            *pspan,
+                            "range patterns cannot match a 'dialog(...)' result",
+                        ));
+                    }
+                    MatchPattern::Ident(pspan, name) => match name.as_str() {
+                        "Button1" | "Yes" => Some(0),
+                        "Button2" | "No" => Some(1),
+                        "Button3" | "Cancel" => {
+                            if !is_three_way {
+                                return Err(Error::at(
+                                    *pspan,
+                                    format!(
+                                        "arm '{name}' is invalid for 2-button 'yes_no' dialog (expected Button1/Yes or Button2/No)"
+                                    ),
+                                ));
+                            }
+                            Some(2)
+                        }
+                        other => {
                             return Err(Error::at(
                                 *pspan,
                                 format!(
-                                    "arm '{name}' is invalid for 2-button 'yes_no' dialog (expected Button1/Yes or Button2/No)"
+                                    "invalid 'match dialog' arm '{other}' (expected Button1/Yes, Button2/No{}{})",
+                                    if is_three_way { ", Button3/Cancel" } else { "" },
+                                    ", 0/1/2, or _"
                                 ),
                             ));
                         }
-                        Some(2)
+                    },
+                    MatchPattern::Int(pspan, v) => match *v {
+                        0 => Some(0),
+                        1 => Some(1),
+                        2 if is_three_way => Some(2),
+                        other => {
+                            return Err(Error::at(
+                                *pspan,
+                                format!(
+                                    "invalid 'match dialog' button index {other} (expected {})",
+                                    if is_three_way { "0, 1, or 2" } else { "0 or 1" }
+                                ),
+                            ));
+                        }
+                    },
+                    MatchPattern::Or(pspan, _) => {
+                        return Err(Error::at(*pspan, "nested OR-pattern in 'match dialog'"));
                     }
-                    other => {
+                    MatchPattern::Path(pspan, segs) => {
                         return Err(Error::at(
                             *pspan,
                             format!(
-                                "invalid 'match dialog' arm '{other}' (expected Button1/Yes, Button2/No{}{})",
-                                if is_three_way { ", Button3/Cancel" } else { "" },
-                                ", 0/1/2, or _"
+                                "unexpected path pattern '{}' in 'match dialog' (expected Button1/Button2/Button3, Yes/No/Cancel, 0/1/2, or _)",
+                                segs.join("::")
                             ),
                         ));
                     }
-                },
-                MatchPattern::Int(pspan, v) => match *v {
-                    0 => Some(0),
-                    1 => Some(1),
-                    2 if is_three_way => Some(2),
-                    other => {
+                };
+                if let Some(idx) = slot {
+                    if arm_bodies[idx].is_some() {
                         return Err(Error::at(
-                            *pspan,
-                            format!(
-                                "invalid 'match dialog' button index {other} (expected {})",
-                                if is_three_way { "0, 1, or 2" } else { "0 or 1" }
-                            ),
+                            arm.span,
+                            format!("duplicate arm for button {} in 'match dialog'", idx + 1),
                         ));
                     }
-                },
-                MatchPattern::Path(pspan, segs) => {
-                    return Err(Error::at(
-                        *pspan,
-                        format!(
-                            "unexpected path pattern '{}' in 'match dialog' (expected Button1/Button2/Button3, Yes/No/Cancel, 0/1/2, or _)",
-                            segs.join("::")
-                        ),
-                    ));
+                    arm_bodies[idx] = Some(arm.body.as_slice());
                 }
-            };
-            if let Some(idx) = slot {
-                if arm_bodies[idx].is_some() {
-                    return Err(Error::at(
-                        arm.span,
-                        format!("duplicate arm for button {} in 'match dialog'", idx + 1),
-                    ));
-                }
-                arm_bodies[idx] = Some(arm.body.as_slice());
             }
         }
 
@@ -5838,6 +6170,7 @@ impl<'a> TreeLowerer<'a> {
         let mut result = MatchResult {
             dest: dest.clone(),
             ty: None,
+            if_expr: false,
         };
         self.lower_match_core(span, scrutinee, &arms, Some(&mut result))?;
         let ty = result
@@ -5937,6 +6270,15 @@ impl<'a> TreeLowerer<'a> {
                 {
                     self.lower_match_expr(*span, scrutinee, arms, Some(&dest))?
                         .1
+                } else if let V2Expr::If {
+                    span,
+                    cond,
+                    then_value,
+                    else_value,
+                } = expr
+                {
+                    self.lower_if_expr(*span, cond, then_value, else_value, Some(&dest))?
+                        .1
                 } else {
                     let (air, ty) = self.lower_value_expr(expr)?;
                     self.line(format!("{dest} := {air};"));
@@ -5952,7 +6294,12 @@ impl<'a> TreeLowerer<'a> {
                             return Err(Error::at(
                                 expr.span(),
                                 format!(
-                                    "'match' arms have different types: '{}' and '{}'",
+                                    "{} have different types: '{}' and '{}'",
+                                    if result.if_expr {
+                                        "'if' expression branches"
+                                    } else {
+                                        "'match' arms"
+                                    },
                                     self.env.display_value_type(first),
                                     self.env.display_value_type(&ty)
                                 ),
@@ -5988,10 +6335,11 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
 
-        // Arms as inclusive ranges (`lo == hi` for a single value).
-        let mut cases: Vec<(i16, i16, ArmBody<'_>)> = Vec::new();
+        // Each arm's alternatives as inclusive ranges (`lo == hi` for a single value).
+        let mut cases: Vec<MatchCase<'_>> = Vec::new();
         let mut wildcard: Option<ArmBody<'_>> = None;
         let mut seen_vals = BTreeSet::new();
+        let mut alts_scratch: Vec<(i16, i16)> = Vec::new();
 
         for &(arm_span, pattern, body) in arms {
             if wildcard.is_some() {
@@ -6000,105 +6348,20 @@ impl<'a> TreeLowerer<'a> {
                     "unreachable match arm after '_' wildcard",
                 ));
             }
-            match pattern {
-                MatchPattern::Wildcard(_) => {
-                    wildcard = Some(body);
-                }
-                MatchPattern::Int(pspan, v) => {
-                    if val_ty != ValueType::I16 {
-                        return Err(Error::at(
-                            *pspan,
-                            format!(
-                                "integer pattern {v} cannot match '{}'",
-                                self.env.display_value_type(&val_ty)
-                            ),
-                        ));
-                    }
-                    if !seen_vals.insert(*v)
-                        || cases.iter().any(|&(lo, hi, _)| (lo..=hi).contains(v))
-                    {
-                        return Err(Error::at(
-                            *pspan,
-                            format!("duplicate match arm for value {v}"),
-                        ));
-                    }
-                    cases.push((*v, *v, body));
-                }
-                MatchPattern::Range(pspan, lo, hi) => {
-                    if val_ty != ValueType::I16 {
-                        return Err(Error::at(
-                            *pspan,
-                            format!(
-                                "range pattern {lo}..={hi} cannot match '{}'",
-                                self.env.display_value_type(&val_ty)
-                            ),
-                        ));
-                    }
-                    if cases.iter().any(|&(a, b, _)| a <= *hi && *lo <= b) {
-                        return Err(Error::at(
-                            *pspan,
-                            format!("range pattern {lo}..={hi} overlaps an earlier match arm"),
-                        ));
-                    }
-                    cases.push((*lo, *hi, body));
-                }
-                MatchPattern::Path(pspan, segs) => {
-                    let ValueType::Enum(ref expected_key) = val_ty else {
-                        return Err(Error::at(
-                            *pspan,
-                            format!(
-                                "enum pattern '{}' cannot match '{}'",
-                                segs.join("::"),
-                                self.env.display_value_type(&val_ty)
-                            ),
-                        ));
-                    };
-                    if segs.len() != 2 {
-                        return Err(Error::at(
-                            *pspan,
-                            format!(
-                                "expected 'Enum::Variant' pattern, found '{}'",
-                                segs.join("::")
-                            ),
-                        ));
-                    }
-                    let e = self
-                        .env
-                        .lookup_enum(&self.owner_module, &segs[0], self.in_object_scope)
-                        .ok_or_else(|| Error::at(*pspan, format!("unknown enum '{}'", segs[0])))?;
-                    if &e.canonical_key != expected_key {
-                        return Err(Error::at(
-                            *pspan,
-                            format!(
-                                "mismatched enum pattern '{}': expected '{}'",
-                                e.display_name,
-                                self.env.display_value_type(&val_ty)
-                            ),
-                        ));
-                    }
-                    let Some(&v) = e.variants.get(&segs[1]) else {
-                        return Err(Error::at(
-                            *pspan,
-                            format!("enum '{}' has no variant '{}'", e.display_name, segs[1]),
-                        ));
-                    };
-                    if !seen_vals.insert(v) {
-                        return Err(Error::at(
-                            *pspan,
-                            format!("duplicate match arm for '{}::{}'", e.display_name, segs[1]),
-                        ));
-                    }
-                    cases.push((v, v, body));
-                }
-                MatchPattern::Ident(pspan, name) => {
-                    return Err(Error::at(
-                        *pspan,
-                        format!(
-                            "unexpected identifier pattern '{name}' in match (use 'Enum::Variant', integer literal, or '_')"
-                        ),
-                    ));
-                }
+            if let MatchPattern::Wildcard(_) = pattern {
+                wildcard = Some(body);
+                continue;
             }
+            alts_scratch.clear();
+            for alt in pattern_alternatives(pattern) {
+                let range =
+                    self.match_alt_range(alt, &val_ty, &mut seen_vals, &cases, &alts_scratch)?;
+                alts_scratch.push(range);
+            }
+            cases.push(MatchCase {
+                alts: alts_scratch.clone(),
+                body,
+            });
         }
 
         // Enforce exhaustiveness for enum matches when no `_` fallback is provided.
@@ -6123,7 +6386,8 @@ impl<'a> TreeLowerer<'a> {
         if val_ty == ValueType::I16 && wildcard.is_none() {
             let mut ranges: Vec<(i32, i32)> = cases
                 .iter()
-                .map(|&(lo, hi, _)| (i32::from(lo), i32::from(hi)))
+                .flat_map(|c| c.alts.iter())
+                .map(|&(lo, hi)| (i32::from(lo), i32::from(hi)))
                 .collect();
             ranges.sort_unstable();
             let mut next = i32::from(i16::MIN);
@@ -6147,12 +6411,12 @@ impl<'a> TreeLowerer<'a> {
 
         // A constant scrutinee selects one arm; the others are only checked.
         if let Some((v, _)) = folded {
-            let selected = cases.iter().position(|&(lo, hi, _)| (lo..=hi).contains(&v));
-            for (idx, &(_, _, body)) in cases.iter().enumerate() {
+            let selected = cases.iter().position(|c| c.contains(v));
+            for (idx, case) in cases.iter().enumerate() {
                 if Some(idx) == selected {
-                    self.lower_match_arm(body, result.as_deref_mut())?;
+                    self.lower_match_arm(case.body, result.as_deref_mut())?;
                 } else {
-                    self.check_match_arm(body, result.as_deref_mut())?;
+                    self.check_match_arm(case.body, result.as_deref_mut())?;
                 }
             }
             if let Some(wc) = wildcard {
@@ -6169,7 +6433,7 @@ impl<'a> TreeLowerer<'a> {
         // is a local or a literal.
         let single_arm = match wildcard {
             Some(wc) if cases.is_empty() => Some(wc),
-            None if exhaustive_without_wildcard && cases.len() == 1 => Some(cases[0].2),
+            None if exhaustive_without_wildcard && cases.len() == 1 => Some(cases[0].body),
             _ => None,
         };
         if let Some(arm) = single_arm {
@@ -6194,50 +6458,232 @@ impl<'a> TreeLowerer<'a> {
             self.line(format!("let {l} = {val_air};"));
             l
         };
+        self.emit_match_chain(
+            &scrut_local,
+            &cases,
+            wildcard,
+            exhaustive_without_wildcard,
+            result,
+        )
+    }
 
-        let last_idx = cases.len().saturating_sub(1);
-        // A bounded range needs two compares: its test is computed into a flag inside the
-        // previous arm's `else`, which nests (but never duplicates) the rest of the chain.
-        let mut extra_closes = 0usize;
-        for (idx, &(lo, hi, body)) in cases.iter().enumerate() {
-            let single = if lo == hi {
-                Some(format!("{scrut_local} == {lo}"))
-            } else if lo == i16::MIN {
-                Some(format!("{scrut_local} <= {hi}"))
-            } else if hi == i16::MAX {
-                Some(format!("{scrut_local} >= {lo}"))
-            } else {
-                None
+    /// One non-`_` match alternative as an inclusive range, after its type, duplicate and
+    /// overlap checks against every earlier alternative (`prior` arms and this arm's `current`).
+    fn match_alt_range(
+        &self,
+        pattern: &MatchPattern,
+        val_ty: &ValueType,
+        seen_vals: &mut BTreeSet<i16>,
+        prior: &[MatchCase<'_>],
+        current: &[(i16, i16)],
+    ) -> Result<(i16, i16)> {
+        let overlaps = |lo: i16, hi: i16| {
+            prior
+                .iter()
+                .flat_map(|c| c.alts.iter())
+                .chain(current)
+                .any(|&(a, b)| a <= hi && lo <= b)
+        };
+        match pattern {
+            MatchPattern::Int(pspan, v) => {
+                if *val_ty != ValueType::I16 {
+                    return Err(Error::at(
+                        *pspan,
+                        format!(
+                            "integer pattern {v} cannot match '{}'",
+                            self.env.display_value_type(val_ty)
+                        ),
+                    ));
+                }
+                if !seen_vals.insert(*v) || overlaps(*v, *v) {
+                    return Err(Error::at(
+                        *pspan,
+                        format!("duplicate match arm for value {v}"),
+                    ));
+                }
+                Ok((*v, *v))
+            }
+            MatchPattern::Range(pspan, lo, hi) => {
+                if *val_ty != ValueType::I16 {
+                    return Err(Error::at(
+                        *pspan,
+                        format!(
+                            "range pattern {lo}..={hi} cannot match '{}'",
+                            self.env.display_value_type(val_ty)
+                        ),
+                    ));
+                }
+                if overlaps(*lo, *hi) {
+                    return Err(Error::at(
+                        *pspan,
+                        format!("range pattern {lo}..={hi} overlaps an earlier match arm"),
+                    ));
+                }
+                Ok((*lo, *hi))
+            }
+            MatchPattern::Path(pspan, segs) => {
+                let ValueType::Enum(expected_key) = val_ty else {
+                    return Err(Error::at(
+                        *pspan,
+                        format!(
+                            "enum pattern '{}' cannot match '{}'",
+                            segs.join("::"),
+                            self.env.display_value_type(val_ty)
+                        ),
+                    ));
+                };
+                if segs.len() != 2 {
+                    return Err(Error::at(
+                        *pspan,
+                        format!(
+                            "expected 'Enum::Variant' pattern, found '{}'",
+                            segs.join("::")
+                        ),
+                    ));
+                }
+                let e = self
+                    .env
+                    .lookup_enum(&self.owner_module, &segs[0], self.in_object_scope)
+                    .ok_or_else(|| Error::at(*pspan, format!("unknown enum '{}'", segs[0])))?;
+                if &e.canonical_key != expected_key {
+                    return Err(Error::at(
+                        *pspan,
+                        format!(
+                            "mismatched enum pattern '{}': expected '{}'",
+                            e.display_name,
+                            self.env.display_value_type(val_ty)
+                        ),
+                    ));
+                }
+                let Some(&v) = e.variants.get(&segs[1]) else {
+                    return Err(Error::at(
+                        *pspan,
+                        format!("enum '{}' has no variant '{}'", e.display_name, segs[1]),
+                    ));
+                };
+                if !seen_vals.insert(v) {
+                    return Err(Error::at(
+                        *pspan,
+                        format!("duplicate match arm for '{}::{}'", e.display_name, segs[1]),
+                    ));
+                }
+                Ok((v, v))
+            }
+            MatchPattern::Ident(pspan, name) => Err(Error::at(
+                *pspan,
+                format!(
+                    "unexpected identifier pattern '{name}' in match (use 'Enum::Variant', integer literal, or '_')"
+                ),
+            )),
+            // The parser flattens OR-patterns and keeps `_` out of them.
+            MatchPattern::Wildcard(pspan) | MatchPattern::Or(pspan, _) => Err(Error::at(
+                *pspan,
+                "'_' and nested OR-patterns cannot be OR-pattern alternatives",
+            )),
+        }
+    }
+
+    /// Emits the test chain for `cases` (then `wildcard`) on `scrut`. A case whose
+    /// alternatives are all single compares, and whose body and later arms cannot leave an
+    /// enclosing loop, tests them in a condition-free single-pass loop:
+    /// `while true { if !a { if !b { <later arms>; break; } } <body>; break; }`. Other
+    /// multi-compare cases compute a flag first, inside the previous arm's `else`.
+    fn emit_match_chain(
+        &mut self,
+        scrut: &str,
+        cases: &[MatchCase<'_>],
+        wildcard: Option<ArmBody<'_>>,
+        exhaustive: bool,
+        mut result: Option<&mut MatchResult>,
+    ) -> Result<()> {
+        if cases.is_empty() {
+            return match wildcard {
+                Some(wc) => self.lower_match_arm(wc, result),
+                None => Ok(()),
             };
-            let is_last_exhaustive = exhaustive_without_wildcard && idx == last_idx && idx > 0;
-            match single {
-                _ if is_last_exhaustive => {
+        }
+        if wildcard.is_none() && exhaustive && cases.len() == 1 {
+            return self.lower_match_arm(cases[0].body, result);
+        }
+        let last_idx = cases.len() - 1;
+        let mut extra_closes = 0usize;
+        let mut tests: Vec<Option<String>> = Vec::new();
+        for (idx, case) in cases.iter().enumerate() {
+            tests.clear();
+            tests.extend(
+                case.alts
+                    .iter()
+                    .map(|&(lo, hi)| single_range_test(scrut, lo, hi)),
+            );
+            let is_last_exhaustive = exhaustive && wildcard.is_none() && idx == last_idx && idx > 0;
+            if is_last_exhaustive {
+                self.line("} else {".to_owned());
+            } else if let [Some(cond)] = tests.as_slice() {
+                if idx == 0 {
+                    self.line(format!("if {cond} {{"));
+                } else {
+                    self.line(format!("}} else if {cond} {{"));
+                }
+            } else {
+                if idx > 0 {
                     self.line("} else {".to_owned());
+                    self.indent += 1;
+                    extra_closes += 1;
                 }
-                Some(cond) if idx == 0 => self.line(format!("if {cond} {{")),
-                Some(cond) => self.line(format!("}} else if {cond} {{")),
-                None => {
-                    if idx > 0 {
-                        self.line("} else {".to_owned());
+                if tests.len() > 1
+                    && tests.iter().all(Option::is_some)
+                    && self.match_loop_form_ok(&cases[idx..], wildcard)
+                {
+                    self.line("while true {".to_owned());
+                    self.indent += 1;
+                    for cond in tests.iter().flatten() {
+                        self.line(format!("if {} {{", negate_air_cond(cond)));
                         self.indent += 1;
-                        extra_closes += 1;
                     }
-                    let flag = self.fresh("in_range");
-                    self.line(format!("let {flag} = 0;"));
-                    self.line(format!("if {scrut_local} >= {lo} {{"));
-                    self.indent += 1;
-                    self.line(format!("if {scrut_local} <= {hi} {{"));
-                    self.indent += 1;
-                    self.line(format!("{flag} := 1;"));
+                    let rest = self.emit_match_chain(
+                        scrut,
+                        &cases[idx + 1..],
+                        wildcard,
+                        exhaustive,
+                        result.as_deref_mut(),
+                    );
+                    self.line("break;".to_owned());
+                    for _ in &tests {
+                        self.indent -= 1;
+                        self.line("}".to_owned());
+                    }
+                    rest?;
+                    let r = self.lower_match_arm(case.body, result);
+                    self.line("break;".to_owned());
                     self.indent -= 1;
                     self.line("}".to_owned());
-                    self.indent -= 1;
-                    self.line("}".to_owned());
-                    self.line(format!("if {flag} != 0 {{"));
+                    self.close_match_chain(extra_closes);
+                    return r;
                 }
+                let flag = self.fresh("in_range");
+                self.line(format!("let {flag} = 0;"));
+                for (&(lo, hi), test) in case.alts.iter().zip(&tests) {
+                    if let Some(cond) = test {
+                        self.line(format!("if {cond} {{"));
+                        self.indent += 1;
+                    } else {
+                        self.line(format!("if {scrut} >= {lo} {{"));
+                        self.indent += 1;
+                        self.line(format!("if {scrut} <= {hi} {{"));
+                        self.indent += 1;
+                    }
+                    self.line(format!("{flag} := 1;"));
+                    if test.is_none() {
+                        self.indent -= 1;
+                        self.line("}".to_owned());
+                    }
+                    self.indent -= 1;
+                    self.line("}".to_owned());
+                }
+                self.line(format!("if {flag} != 0 {{"));
             }
             self.indent += 1;
-            let r = self.lower_match_arm(body, result.as_deref_mut());
+            let r = self.lower_match_arm(case.body, result.as_deref_mut());
             self.indent -= 1;
             r?;
         }
@@ -6256,6 +6702,18 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// Whether `cases` (and `wildcard`) may sit inside a single-pass loop (see
+    /// [`Self::single_pass_loop_ok`]).
+    fn match_loop_form_ok(&self, cases: &[MatchCase<'_>], wildcard: Option<ArmBody<'_>>) -> bool {
+        let bodies: Vec<&[V2Stmt]> = cases
+            .iter()
+            .map(|c| c.body)
+            .chain(wildcard)
+            .map(arm_stmts)
+            .collect();
+        self.single_pass_loop_ok(&bodies)
+    }
+
     /// Checks an arm that a constant scrutinee never selects (lowered, then discarded).
     fn check_match_arm(
         &mut self,
@@ -6269,6 +6727,7 @@ impl<'a> TreeLowerer<'a> {
                 let mut scratch = MatchResult {
                     dest: result.dest.clone(),
                     ty: result.ty.clone(),
+                    if_expr: result.if_expr,
                 };
                 self.check_discarded(|c| c.lower_match_arm(body, Some(&mut scratch)))?;
                 if result.ty.is_none() {
@@ -6978,6 +7437,49 @@ impl<'a> TreeLowerer<'a> {
     }
 
     /// `.air` local name of a v2 `i16` local variable used as a primitive's local slot.
+    /// The local `push_interaction(icon:)` reads: an `i16` local, or an object handle. The handle
+    /// given as `object:` too is the pinned slot itself; another handle is a local (`self` in an
+    /// interaction is the entry save, or a copy of `stack_obj` when the tree never changes it).
+    fn push_icon_local(
+        &mut self,
+        icon: &V2Expr,
+        object: Option<&CallArg>,
+        pinned_object: bool,
+    ) -> Result<String> {
+        if let V2Expr::Ident(_, name) = icon {
+            if pinned_object
+                && matches!(object.map(|o| &o.value), Some(V2Expr::Ident(_, o)) if o == name)
+            {
+                return Ok(PIN_SLOT.to_owned());
+            }
+            if let Some(Binding::Local { air_name, ty }) = self.lookup_var(name)
+                && ty.is_object_handle()
+            {
+                return Ok(air_name.clone());
+            }
+            if self.is_self_ident(name) {
+                if self.has_self_obj_local {
+                    return Ok("__self_obj".to_owned());
+                }
+                // The object is the stack object on entry to a Sim tree and `my` in its own.
+                let self_air = match self.tree_ctx {
+                    TreeContext::SimOnObject { .. } => "stack_obj",
+                    TreeContext::ObjectSelf => "my.id",
+                };
+                let tmp = self.fresh("icon");
+                self.line(format!("let {tmp} = {self_air};"));
+                return Ok(tmp);
+            }
+        }
+        self.builtin_local_arg(icon, "push_interaction(icon:)")
+            .map_err(|_| {
+                Error::at(
+                    icon.span(),
+                    "push_interaction(icon:) must name an i16 local, an object-handle local, 'self', or the 'object:' handle",
+                )
+            })
+    }
+
     fn builtin_local_arg(&self, expr: &V2Expr, what: &str) -> Result<String> {
         self.builtin_local_arg_typed(expr, what, true)
     }
@@ -7045,11 +7547,11 @@ impl<'a> TreeLowerer<'a> {
 
     /// Formats `animate(clip:, table:, flags:, events:, local:)` and returns the `.air` primitive
     /// text plus the event local's `.air` name (`local:` sets flag `0x20`).
-    fn format_animate(&self, args: &[CallArg]) -> Result<(String, Option<String>)> {
+    fn format_animate(&mut self, args: &[CallArg]) -> Result<(String, Option<String>)> {
         let named = self.builtin_named_args(
             "animate",
             args,
-            &["clip", "table", "flags", "events", "local"],
+            &["clip", "table", "flags", "events", "local", "event_local"],
         )?;
         let int = |key: &str, lo: i64, hi: i64| -> Result<i64> {
             match named.get(key) {
@@ -7061,6 +7563,40 @@ impl<'a> TreeLowerer<'a> {
         let table = int("table", 0, 255)?;
         let mut flags = int("flags", 0, 255)?;
         let events = int("events", -128, 127)?;
+        // `event_local: N`: events go to slot N outside the frame, unbound. `.air`'s
+        // `animate(local: N)` would grow the frame to N + 1, so this is the primitive's raw form.
+        if let Some(a) = named.get("event_local") {
+            if let Some(l) = named.get("local") {
+                return Err(Error::at(
+                    l.span,
+                    "animate takes 'local:' or 'event_local:', not both",
+                ));
+            }
+            let slot = self.eval_builtin_int(&a.value, "animate event_local", 0, 255)?;
+            let Some(locals) = self.frame_locals else {
+                return Err(Error::at(
+                    a.span,
+                    "animate(event_local:) needs the tree's frame size: add @frame(locals: K) with K <= the slot",
+                ));
+            };
+            if slot < i64::from(locals) {
+                return Err(Error::at(
+                    a.span,
+                    format!(
+                        "animate(event_local: {slot}) is inside the frame (@frame(locals: {locals})); use 'local:' with a variable instead"
+                    ),
+                ));
+            }
+            let slot = slot as u8;
+            self.event_local.get_or_insert((a.span, slot));
+            flags |= 0x20;
+            let [c0, c1] = (clip as u16).to_le_bytes();
+            let text = format!(
+                "op 0x002c ({c0:#04x}, {c1:#04x}, {slot:#04x}, 0x00, {table:#04x}, {flags:#04x}, {:#04x}, 0x00)",
+                events as u8
+            );
+            return Ok((text, None));
+        }
         let local = match named.get("local") {
             Some(a) => {
                 flags |= 0x20;
@@ -7099,6 +7635,16 @@ impl<'a> TreeLowerer<'a> {
             return Err(Error::at(
                 span,
                 format!("the animation event '{name}' is read-only"),
+            ));
+        }
+        if let Some(a) = args
+            .iter()
+            .find(|a| a.name.as_deref() == Some("event_local"))
+            && (event.is_some() || !body.is_empty())
+        {
+            return Err(Error::at(
+                a.span,
+                "animate(event_local:) leaves events unbound: it takes no '|event|' body",
             ));
         }
         let (prim, local) = self.format_animate(args)?;
@@ -7413,6 +7959,9 @@ impl<'a> TreeLowerer<'a> {
                 PrimArg::Int(lo, hi) => self.eval_builtin_int(&a.value, &what, lo, hi)?.to_string(),
                 PrimArg::Bool => self.eval_const_bool_required(&a.value, a.span)?.to_string(),
                 PrimArg::Guid => format!("{:#010x}", self.resolve_guid_expr(&a.value)?),
+                PrimArg::Local if fname == "push_interaction" && key == "icon" => {
+                    self.push_icon_local(&a.value, named.get("object").copied(), pinned_object)?
+                }
                 PrimArg::Local => self.builtin_local_arg(&a.value, &format!("{fname}({key}:)"))?,
                 // `refresh` names the running frame's object (`me`) or its stack object. In a
                 // Sim-on-object tree `me` is the Sim and the object is the stack object.
@@ -7479,6 +8028,7 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
         let (ticks_air, _) = self.lower_value_expr(&args[0].value)?;
+        self.sleep_span.get_or_insert(span);
         let cancel = if self.in_defer() {
             None
         } else {
@@ -8459,7 +9009,29 @@ impl<'a> TreeLowerer<'a> {
         Ok(())
     }
 
+    /// Resolves an assignable place. A foreign cell of `stack_obj` itself is the direct `stack.`
+    /// cell: nothing is switched around it.
     fn resolve_lvalue(&mut self, expr: &V2Expr) -> Result<LValue> {
+        Ok(match self.resolve_lvalue_inner(expr)? {
+            LValue::ForeignAttr {
+                obj_air,
+                attr_index,
+                ty,
+            } if obj_air == "stack_obj" => LValue::Direct {
+                air: format!("stack.attr[{attr_index}]"),
+                ty,
+            },
+            LValue::ForeignCell {
+                obj_air,
+                cell,
+                setup: None,
+                ty,
+            } if obj_air == "stack_obj" => LValue::Direct { air: cell, ty },
+            other => other,
+        })
+    }
+
+    fn resolve_lvalue_inner(&mut self, expr: &V2Expr) -> Result<LValue> {
         match expr {
             V2Expr::Deref { span, inner } => {
                 let V2Expr::Ident(_, pname) = inner.as_ref() else {
@@ -8742,7 +9314,7 @@ impl<'a> TreeLowerer<'a> {
                                 Error::at(
                                     *span,
                                     format!(
-                                        "unknown field '{bname}.{other}' on an object handle (expected graphic, hand, room, age, priority, is_visitor, kind, motive.<name>, skill.<name>, attr[i], data[i], person[i], motive[m], slot[i], or sprite_flags[i])"
+                                        "unknown field '{bname}.{other}' on an object handle (expected graphic, hand, room, age, priority, is_visitor, visitor_kind, kind, motive.<name>, skill.<name>, attr[i], data[i], person[i], motive[m], slot[i], or sprite_flags[i])"
                                     ),
                                 )
                             })?,
@@ -8947,6 +9519,14 @@ impl<'a> TreeLowerer<'a> {
                                 format!("cannot index 'self.{other}[...]'"),
                             )),
                         };
+                    }
+                    // The stack object's own cells: no switch.
+                    if rname == "stack_obj" && matches!(field.as_str(), "attr" | "data") {
+                        let idx = self.eval_const_i16(index)?;
+                        return Ok(LValue::Direct {
+                            air: format!("stack.{field}[{idx}]"),
+                            ty: ValueType::I16,
+                        });
                     }
                     // Foreign ObjectId / ObjectRef variable: `plate.attr[0] = nutrition;`
                     if let Some(binding) = self.lookup_var(rname).cloned() {
@@ -9296,7 +9876,8 @@ impl<'a> TreeLowerer<'a> {
             V2Expr::Call { .. }
             | V2Expr::MethodCall { .. }
             | V2Expr::Try { .. }
-            | V2Expr::Match { .. } => true,
+            | V2Expr::Match { .. }
+            | V2Expr::If { .. } => true,
             V2Expr::Int(..)
             | V2Expr::Bool(..)
             | V2Expr::Str(..)
@@ -9416,6 +9997,7 @@ impl<'a> TreeLowerer<'a> {
                             "room" => "my.data[29]",
                             "hand" => "my.slot[0]",
                             "age" => "my.person[58]",
+                            "visitor_kind" => "my.person[32]",
                             _ => return true,
                         };
                         return sim_air == canon_target;
@@ -9487,7 +10069,8 @@ impl<'a> TreeLowerer<'a> {
             V2Expr::Call { .. }
             | V2Expr::MethodCall { .. }
             | V2Expr::Try { .. }
-            | V2Expr::Match { .. } => true,
+            | V2Expr::Match { .. }
+            | V2Expr::If { .. } => true,
         }
     }
 
@@ -9778,10 +10361,11 @@ impl<'a> TreeLowerer<'a> {
                             "room" => Ok(("my.room".to_owned(), ValueType::I16)),
                             "hand" => Ok(("my.slot[0]".to_owned(), ValueType::ObjectId)),
                             "age" => Ok(("my.person[58]".to_owned(), ValueType::I16)),
+                            "visitor_kind" => Ok(("my.person[32]".to_owned(), ValueType::I16)),
                             other => Err(Error::at(
                                 *span,
                                 format!(
-                                    "unknown Sim property '{bname}.{other}' (expected motive, skill, id, priority, room, hand, age, slot[i], or person[i]; use 'self.<state>' for object state)"
+                                    "unknown Sim property '{bname}.{other}' (expected motive, skill, id, priority, room, hand, age, visitor_kind, slot[i], or person[i]; use 'self.<state>' for object state)"
                                 ),
                             )),
                         };
@@ -9822,6 +10406,12 @@ impl<'a> TreeLowerer<'a> {
                 scrutinee,
                 arms,
             } => self.lower_match_expr(*span, scrutinee, arms, None),
+            V2Expr::If {
+                span,
+                cond,
+                then_value,
+                else_value,
+            } => self.lower_if_expr(*span, cond, then_value, else_value, None),
             V2Expr::Unary { span, op, inner } => match op {
                 V2UnaryOp::Not => {
                     let tmp = self.fresh("not");
@@ -10290,6 +10880,7 @@ impl<'a> TreeLowerer<'a> {
         let out_len = self.out.len();
         let indent = self.indent;
         let used_saved = self.used_saved_stack_obj;
+        let (event_local, sleep_span) = (self.event_local, self.sleep_span);
         let expansions = self.inline_expansions;
         let next_id = self.next_id;
         let defer_generation = self.defer_generation;
@@ -10300,6 +10891,7 @@ impl<'a> TreeLowerer<'a> {
         self.out.truncate(out_len);
         self.indent = indent;
         self.used_saved_stack_obj = used_saved;
+        (self.event_local, self.sleep_span) = (event_local, sleep_span);
         self.inline_expansions = expansions;
         self.next_id = next_id;
         self.defer_generation = defer_generation;
@@ -10459,10 +11051,12 @@ impl<'a> TreeLowerer<'a> {
                 }
             }
             V2Expr::Field { base, .. } => match base.as_ref() {
+                // `stack_obj.<field>` is the stack object's own cell (no switch).
                 V2Expr::Ident(_, bname) => {
                     self.is_self_ident(bname)
                         || self.is_sim_ident(bname)
                         || self.is_bcon_table_ref(bname)
+                        || bname == "stack_obj"
                 }
                 V2Expr::Field { base: root, .. } => {
                     matches!(root.as_ref(), V2Expr::Ident(_, rname) if self.is_sim_ident(rname))
@@ -10484,7 +11078,9 @@ impl<'a> TreeLowerer<'a> {
                         field != "sprite_flags"
                             && matches!(
                                 root.as_ref(),
-                                V2Expr::Ident(_, rname) if self.is_self_ident(rname) || self.is_sim_ident(rname)
+                                V2Expr::Ident(_, rname) if self.is_self_ident(rname)
+                                    || self.is_sim_ident(rname)
+                                    || rname == "stack_obj"
                             )
                     }
                     _ => false,
@@ -11156,6 +11752,164 @@ impl<'a> TreeLowerer<'a> {
 
     /// Emits direct, zero-temporary short-circuit `return true` / `return false` for
     /// `guard(sim) => <expr>` and cleanup-free `return <expr>;`.
+    /// Lowers a block in its own scope.
+    fn lower_block(&mut self, stmts: &[V2Stmt]) -> Result<()> {
+        self.push_scope(ScopeFrame::block());
+        let r = self.lower_stmts(stmts);
+        let p = self.pop_scope_and_run_cleanups();
+        r.and(p)
+    }
+
+    /// One branch of an `if` statement (a block) or `if` expression (a value into `result`).
+    fn lower_branch(&mut self, body: ArmBody<'_>, result: Option<&mut MatchResult>) -> Result<()> {
+        match body {
+            ArmBody::Stmts(stmts) => self.lower_block(stmts),
+            ArmBody::Value(_) => self.lower_match_arm(body, result),
+        }
+    }
+
+    /// `if c { a } else { b }` as a value, written to `dest` (or a fresh local). The condition
+    /// takes the `if` statement's paths: constant fold (the untaken branch is still checked),
+    /// short-circuit `||` / `&&`, a simple test, or a `__cond` local.
+    fn lower_if_expr(
+        &mut self,
+        span: Span,
+        cond: &V2Expr,
+        then_value: &V2Expr,
+        else_value: &V2Expr,
+        dest: Option<&str>,
+    ) -> Result<(String, ValueType)> {
+        let dest = match dest {
+            Some(d) => d.to_owned(),
+            None => {
+                let d = self.fresh("ifv");
+                self.line(format!("let {d};"));
+                d
+            }
+        };
+        let mut result = MatchResult {
+            dest: dest.clone(),
+            ty: None,
+            if_expr: true,
+        };
+        let (then_b, else_b) = (ArmBody::Value(then_value), ArmBody::Value(else_value));
+        if let Some(const_b) = self
+            .try_eval_const_bool(cond)
+            .or_else(|| self.try_fold_literal_cond(cond))
+        {
+            self.check_folded_cond(cond)?;
+            if const_b {
+                self.lower_match_arm(then_b, Some(&mut result))?;
+                self.check_match_arm(else_b, Some(&mut result))?;
+            } else {
+                self.check_match_arm(then_b, Some(&mut result))?;
+                self.lower_match_arm(else_b, Some(&mut result))?;
+            }
+        } else if !self.try_lower_short_circuit_if(cond, then_b, else_b, Some(&mut result))? {
+            let cond_text = if let Some(simple) = self.try_lower_simple_air_cond(cond)? {
+                simple
+            } else {
+                let c = self.fresh("cond");
+                self.line(format!("let {c} = 0;"));
+                self.emit_bool_into_local(cond, &c)?;
+                format!("{c} != 0")
+            };
+            self.line(format!("if {cond_text} {{"));
+            self.indent += 1;
+            let r1 = self.lower_match_arm(then_b, Some(&mut result));
+            self.indent -= 1;
+            r1?;
+            self.line("} else {".to_owned());
+            self.indent += 1;
+            let r2 = self.lower_match_arm(else_b, Some(&mut result));
+            self.indent -= 1;
+            r2?;
+            self.line("}".to_owned());
+        }
+        let ty = result
+            .ty
+            .ok_or_else(|| Error::at(span, "'if' expression has no value"))?;
+        Ok((dest, ty))
+    }
+
+    /// Whether `if` bodies may sit inside a condition-free single-pass loop: nothing in them,
+    /// or in what lowering adds, may `break` / `continue` an enclosing loop.
+    fn single_pass_loop_ok(&self, bodies: &[&[V2Stmt]]) -> bool {
+        self.active_inline_fn.is_none()
+            && !self.in_defer()
+            && self.enclosing_cancel_flag().is_none()
+            && !bodies.iter().any(|b| stmts_exit_loop(b))
+    }
+
+    /// `if` on a flat `a || b || ..` or `a && b && ..` of simple conditions, without a `__cond`
+    /// local. Each test keeps its place in evaluation order:
+    /// - `a || b`: `while true { if !a { if !b { E; break; } } T; break; }`
+    /// - `a && b` with `else`: `while true { if a { if b { T; break; } } E; break; }`
+    /// - `a && b` without `else`: `if a { if b { T } }`
+    ///
+    /// Returns `false`, with nothing emitted, when the shape does not apply.
+    fn try_lower_short_circuit_if(
+        &mut self,
+        cond: &V2Expr,
+        then_body: ArmBody<'_>,
+        else_body: ArmBody<'_>,
+        mut result: Option<&mut MatchResult>,
+    ) -> Result<bool> {
+        let V2Expr::Binary { op, .. } = cond else {
+            return Ok(false);
+        };
+        let op = *op;
+        if !matches!(op, V2BinOp::And | V2BinOp::Or) {
+            return Ok(false);
+        }
+        let mut leaves = Vec::new();
+        flatten_logic_chain(cond, op, &mut leaves);
+        let has_else = !matches!(else_body, ArmBody::Stmts(s) if s.is_empty());
+        let looped = op == V2BinOp::Or || has_else;
+        if looped && !self.single_pass_loop_ok(&[arm_stmts(then_body), arm_stmts(else_body)]) {
+            return Ok(false);
+        }
+        let (mark, indent) = (self.out.len(), self.indent);
+        if looped {
+            self.line("while true {".to_owned());
+            self.indent += 1;
+        }
+        for leaf in &leaves {
+            let Some(text) = self.try_lower_simple_air_cond(leaf)? else {
+                self.out.truncate(mark);
+                self.indent = indent;
+                return Ok(false);
+            };
+            let text = if op == V2BinOp::Or {
+                negate_air_cond(&text)
+            } else {
+                text
+            };
+            self.line(format!("if {text} {{"));
+            self.indent += 1;
+        }
+        let (inner, outer) = if op == V2BinOp::Or {
+            (else_body, then_body)
+        } else {
+            (then_body, else_body)
+        };
+        self.lower_branch(inner, result.as_deref_mut())?;
+        if looped {
+            self.line("break;".to_owned());
+        }
+        for _ in &leaves {
+            self.indent -= 1;
+            self.line("}".to_owned());
+        }
+        if looped {
+            self.lower_branch(outer, result)?;
+            self.line("break;".to_owned());
+            self.indent -= 1;
+            self.line("}".to_owned());
+        }
+        Ok(true)
+    }
+
     fn emit_return_bool_expr(&mut self, expr: &V2Expr) -> Result<()> {
         if let Some(b) = self.try_eval_const_bool(expr) {
             self.line(if b {
@@ -11217,6 +11971,19 @@ impl<'a> TreeLowerer<'a> {
                 }
             }
             _ => {
+                if let Some((negated, receiver, args, rspan)) = run_functional_test(expr) {
+                    let (prim, _, _) = self.prepare_run_functional(receiver, args, rspan)?;
+                    let bang = if negated { "!" } else { "" };
+                    self.line(format!("if {bang}{prim} {{"));
+                    self.indent += 1;
+                    self.emit_restore_stack_obj();
+                    self.line("return true;".to_owned());
+                    self.indent -= 1;
+                    self.line("}".to_owned());
+                    self.emit_restore_stack_obj();
+                    self.line("return false;".to_owned());
+                    return Ok(());
+                }
                 if let Some(neg) = self.try_lower_negated_simple_air_cond(expr)? {
                     self.line(format!("if {neg} {{"));
                     self.indent += 1;
@@ -12322,10 +13089,78 @@ enum ArmBody<'a> {
     Value(&'a V2Expr),
 }
 
-/// Where an expression `match` writes its arms' values, and their common type.
+/// One non-`_` match arm: its alternatives as inclusive ranges, and its body.
+struct MatchCase<'a> {
+    alts: Vec<(i16, i16)>,
+    body: ArmBody<'a>,
+}
+
+impl MatchCase<'_> {
+    fn contains(&self, v: i16) -> bool {
+        self.alts.iter().any(|&(lo, hi)| (lo..=hi).contains(&v))
+    }
+}
+
+/// An arm's statements (none for a value arm).
+fn arm_stmts(b: ArmBody<'_>) -> &[V2Stmt] {
+    match b {
+        ArmBody::Stmts(s) => s,
+        ArmBody::Value(_) => &[],
+    }
+}
+
+/// A pattern's alternatives: itself, or an OR-pattern's members.
+fn pattern_alternatives(p: &MatchPattern) -> &[MatchPattern] {
+    match p {
+        MatchPattern::Or(_, alts) => alts,
+        other => std::slice::from_ref(other),
+    }
+}
+
+/// `scrut` in `lo..=hi` as one compare, when one suffices.
+fn single_range_test(scrut: &str, lo: i16, hi: i16) -> Option<String> {
+    if lo == hi {
+        Some(format!("{scrut} == {lo}"))
+    } else if lo == i16::MIN {
+        Some(format!("{scrut} <= {hi}"))
+    } else if hi == i16::MAX {
+        Some(format!("{scrut} >= {lo}"))
+    } else {
+        None
+    }
+}
+
+/// Where an expression `match` / `if` writes its arms' values, and their common type.
 struct MatchResult {
     dest: String,
     ty: Option<ValueType>,
+    /// `if` expression (for diagnostics): its arms are "branches".
+    if_expr: bool,
+}
+
+/// `obj.run_functional(..)` or `!obj.run_functional(..)` without type arguments, as
+/// `(negated, receiver, args, span)`.
+fn run_functional_test(expr: &V2Expr) -> Option<(bool, &V2Expr, &[CallArg], Span)> {
+    let (negated, inner) = match expr {
+        V2Expr::Unary {
+            op: V2UnaryOp::Not,
+            inner,
+            ..
+        } => (true, inner.as_ref()),
+        e => (false, e),
+    };
+    match inner {
+        V2Expr::MethodCall {
+            span,
+            receiver,
+            method,
+            type_args,
+            args,
+        } if method == "run_functional" && type_args.is_empty() => {
+            Some((negated, receiver.as_ref(), args.as_slice(), *span))
+        }
+        _ => None,
+    }
 }
 
 /// An integer literal, possibly under unary minus (no names, so nothing tunable).
@@ -12532,6 +13367,14 @@ fn expr_borrows_ident_in(expr: &V2Expr, target_name: &str, w: &[&str]) -> bool {
                     .iter()
                     .any(|a| expr_borrows_ident_in(&a.value, target_name, w))
         }
+        V2Expr::If {
+            cond,
+            then_value,
+            else_value,
+            ..
+        } => [cond, then_value, else_value]
+            .iter()
+            .any(|e| expr_borrows_ident_in(e, target_name, w)),
         V2Expr::Call { callee, args, .. } => {
             expr_borrows_ident_in(callee, target_name, w)
                 || matches!(callee.as_ref(), V2Expr::Ident(_, f) if builtin_args_write_ident(f, args, target_name, w))
@@ -12584,8 +13427,8 @@ fn match_is_exhaustive(
     // and every declared variant discriminant is covered, the match is exhaustive!
     let mut enum_key: Option<String> = None;
     let mut covered = BTreeSet::new();
-    for arm in arms {
-        let MatchPattern::Path(_, segs) = &arm.pattern else {
+    for pattern in arms.iter().flat_map(|a| pattern_alternatives(&a.pattern)) {
+        let MatchPattern::Path(_, segs) = pattern else {
             return false;
         };
         if segs.len() != 2 {
@@ -12674,6 +13517,44 @@ fn loop_body_breaks(stmts: &[V2Stmt]) -> bool {
         V2Stmt::LetSome { else_body, .. } => loop_body_breaks(else_body),
         _ => false,
     })
+}
+
+/// Whether `stmts` may `break` or `continue` the loop they sit in (nested loops own theirs).
+fn stmts_exit_loop(stmts: &[V2Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        V2Stmt::Break { .. } | V2Stmt::Continue { .. } => true,
+        V2Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => stmts_exit_loop(then_body) || stmts_exit_loop(else_body),
+        V2Stmt::Match { arms, .. } => arms.iter().any(|a| stmts_exit_loop(&a.body)),
+        V2Stmt::WithLock { body, .. } | V2Stmt::Defer { body, .. } => stmts_exit_loop(body),
+        V2Stmt::LetSome { else_body, .. } => stmts_exit_loop(else_body),
+        V2Stmt::RawAir { code, .. } => code.contains("break") || code.contains("continue"),
+        _ => false,
+    })
+}
+
+/// The operands of a flat `a op b op ..` chain (`op` is `&&` or `||`), in evaluation order.
+fn flatten_logic_chain<'e>(expr: &'e V2Expr, op: V2BinOp, out: &mut Vec<&'e V2Expr>) {
+    match expr {
+        V2Expr::Binary {
+            lhs, op: o, rhs, ..
+        } if *o == op => {
+            flatten_logic_chain(lhs, op, out);
+            flatten_logic_chain(rhs, op, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// The `.air` condition with its exits swapped: `!c`, or `c` for `!c`.
+fn negate_air_cond(text: &str) -> String {
+    match text.strip_prefix('!') {
+        Some(rest) => rest.to_owned(),
+        None => format!("!{text}"),
+    }
 }
 
 fn stmts_have_return(stmts: &[V2Stmt]) -> bool {
@@ -13020,11 +13901,26 @@ fn expr_may_clobber_stack_obj(
             if let V2Expr::Field {
                 base: root, field, ..
             } = base.as_ref()
-                && matches!(field.as_str(), "attr" | "data")
                 && let V2Expr::Ident(_, rname) = root.as_ref()
-                && rname != "self"
             {
-                return true;
+                // Advertisement cells (scope 12 / 28 / 29) and the stack object's own cells
+                // never switch `stack_obj` (`stack_obj` cannot be rebound as a name).
+                let direct = (rname == "advert"
+                    && matches!(field.as_str(), "delta" | "personality" | "minimum"))
+                    || rname == "stack_obj";
+                if direct {
+                    return expr_may_clobber_stack_obj(
+                        index,
+                        env,
+                        owner_mod,
+                        allow_local_fns,
+                        sim_name,
+                        depth,
+                    );
+                }
+                if matches!(field.as_str(), "attr" | "data") && rname != "self" {
+                    return true;
+                }
             }
             expr_may_clobber_stack_obj(base, env, owner_mod, allow_local_fns, sim_name, depth)
                 || expr_may_clobber_stack_obj(
@@ -13041,6 +13937,7 @@ fn expr_may_clobber_stack_obj(
             // (Named BCON table entries such as `LampTuning.a` are plain constant reads.)
             if let V2Expr::Ident(_, rname) = base.as_ref()
                 && rname != "self"
+                && rname != "stack_obj"
                 && Some(rname.as_str()) != sim_name
                 && !env.is_bcon_table_name(owner_mod, rname, allow_local_fns)
             {
@@ -13072,6 +13969,14 @@ fn expr_may_clobber_stack_obj(
             .any(|e| {
                 expr_may_clobber_stack_obj(e, env, owner_mod, allow_local_fns, sim_name, depth)
             }),
+        V2Expr::If {
+            cond,
+            then_value,
+            else_value,
+            ..
+        } => [cond, then_value, else_value].iter().any(|e| {
+            expr_may_clobber_stack_obj(e, env, owner_mod, allow_local_fns, sim_name, depth)
+        }),
         _ => false,
     }
 }
