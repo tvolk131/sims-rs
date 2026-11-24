@@ -8994,8 +8994,79 @@ object "Pr E Review" {
     assert!(sprite.contains("__ref_idx_flag"), "{sprite}");
     assert!(sprite.contains("temp[0] := __ref_idx_flag"), "{sprite}");
     assert!(tree("Pinned").contains("local[0] := __v_o_0;"), "{air}");
-    // `param[3]` is inside a functional's frame.
+    // `param[3]` is inside a functional's frame, and its header declares the four words.
     assert!(air.contains("param[3]"), "{air}");
+    assert!(air.contains("(args: 4)"), "{air}");
+    compile_v2_source("review.antics", src, &PackResolverConfig::default())
+        .expect("the functional's header covers param[3]");
+
+    // A helper argument bound to a tunable template param is a BCON read, not a constant: the
+    // match inside the helper stays a run-time test.
+    let tuned = r#"
+fn pick(value: i16) -> i16 {
+    return match value { 3 => 31, _ => 17 };
+}
+
+template Tuned {
+    param cycles: i16 = 3;
+    state n: i16;
+    init {
+        self.n = pick(cycles);
+    }
+}
+
+object "Pr E Tuned" from Tuned {
+    guid: 0x7F40_0171;
+}
+"#;
+    let expanded = sims_antics::v2::expand_v2_source_to_objects(
+        "tuned.antics",
+        tuned,
+        &PackResolverConfig::default(),
+    )
+    .expect("expand tuned probe");
+    let air = &expanded[0].air_source;
+    assert!(air.contains(":= 31;") && air.contains(":= 17;"), "{air}");
+
+    // Trees whose bytes matter beyond `.air` semantics skip the backend pass: a raw block
+    // (its literal calls may read the next instruction), or a literal call to a wide frame.
+    let layout = r#"
+object "Pr E Layout" {
+    guid: 0x7F40_0172;
+    state n: i16;
+
+    @id(4410) @frame(args: 6, format: 0x8002) tree wide "Wide" (a: i16) {
+        self.n = param[5] + a;
+    }
+
+    @id(4411) tree with_raw "With Raw" () {
+        let unused = 5;
+        raw { my.attr[0] := 1; }
+    }
+
+    @id(4412) tree caller "Caller" () {
+        wide(1);
+        let unused = 5;
+    }
+}
+"#;
+    let expanded = sims_antics::v2::expand_v2_source_to_objects(
+        "layout.antics",
+        layout,
+        &PackResolverConfig::default(),
+    )
+    .expect("expand layout probe");
+    let air = &expanded[0].air_source;
+    let tree = |label: &str| {
+        let start = air
+            .find(&format!("\"{label}\""))
+            .unwrap_or_else(|| panic!("tree {label}:\n{air}"));
+        let end = air[start..].find("\n}\n").map_or(air.len(), |e| start + e);
+        air[start..end].to_owned()
+    };
+    assert!(tree("With Raw").contains(" = 5;"), "{air}");
+    assert!(tree("Caller").contains("call 4410(1)"), "{air}");
+    assert!(tree("Caller").contains(" = 5;"), "{air}");
 }
 
 #[test]
@@ -9045,6 +9116,21 @@ fn pr_e_review_negative_diagnostics() {
         &obj("    variant \"Pr E Review\" { guid: 0x7F40_0181 }"),
         "primary object's name",
     );
+    // A variant tree may not read more argument words than the VM's four.
+    expect_err(
+        "variant_wide_frame.antics",
+        &obj(
+            "    @frame(args: 5, format: 0x8002)\n    tree v () { }\n    variant \"V\" { guid: 0x7F40_0181, main: v }",
+        ),
+        "object-self tree with no parameters",
+    );
+    // A raw block in folded-away code emits nothing, so it does not conflict with the pin.
+    compile_v2_source(
+        "pin_discarded_raw.antics",
+        &obj("    tree t (sim: Sim) { match 0 { 1 => { raw { my.attr[0] := 1; } } _ => { } } let o = stack_obj; o.push_interaction(menu: 0); }"),
+        &cfg,
+    )
+    .expect("discarded raw and a pinned push may share a tree");
     // Nested match scrutinees are bounded like every other nesting.
     let deep = format!(
         "{}self.n{}",

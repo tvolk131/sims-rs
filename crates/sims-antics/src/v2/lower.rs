@@ -180,6 +180,10 @@ struct CallableSig {
     sim_context: Option<bool>,
     params: Vec<ResolvedAbiParam>,
     ret: ResolvedReturnAbi,
+    /// Argument words the callee's frame reads: `@frame(args:)` for a standalone tree, else
+    /// the positional parameter count (an `extern` is trusted to declare its whole frame).
+    /// `None` when unknown.
+    frame_args: Option<usize>,
 }
 
 /// Private named BCON table (`bcon 4097 "LampTuning" { ... }`) resolved to operand addresses.
@@ -696,6 +700,9 @@ impl<'a> ObjectEnv<'a> {
             sim_context,
             params: out_params,
             ret,
+            // An `extern` declares its callee's whole frame; standalone trees refine this from
+            // `@frame(args:)`.
+            frame_args: Some(positional),
         })
     }
 
@@ -1893,13 +1900,15 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             ctx.emit_all_cleanups()?;
             ctx.line("return true;".to_owned());
         }
-        if func.decl.params.is_empty() {
+        // The header declares the declared parameters, or every `param[n]` word the body
+        // names, whichever is more (the engine's frame has four).
+        let header_args = func.decl.params.len().max(ctx.param_words_used);
+        if header_args == 0 {
             let _ = writeln!(trees_air, "tree {action_id} \"{action_label}\" {{");
         } else {
             let _ = writeln!(
                 trees_air,
-                "tree {action_id} \"{action_label}\" (args: {}) {{",
-                func.decl.params.len()
+                "tree {action_id} \"{action_label}\" (args: {header_args}) {{"
             );
         }
         trees_air.push_str(&ctx.finish());
@@ -2320,7 +2329,10 @@ fn resolve_variants(
                     })?;
                     // The VM runs a catalog entry's init/main as the object itself, with no
                     // arguments, like the primary's.
-                    if sig.sim_context != Some(false) || !sig.params.is_empty() {
+                    if sig.sim_context != Some(false)
+                        || !sig.params.is_empty()
+                        || sig.frame_args.unwrap_or(0) > 4
+                    {
                         return Err(Error::at(
                             *tspan,
                             format!(
@@ -2686,6 +2698,12 @@ fn resolve_tree_sigs(
         if sig.ret == ResolvedReturnAbi::Void {
             sig.ret = ResolvedReturnAbi::Bool;
         }
+        let positional = sig
+            .params
+            .iter()
+            .filter(|p| matches!(p.slot, AbiParamSlot::Positional))
+            .count();
+        sig.frame_args = Some(d.frame.and_then(|f| f.args).map_or(positional, usize::from));
         out.insert(d.ident.clone(), sig);
     }
     Ok(out)
@@ -3522,6 +3540,14 @@ struct TreeLowerer<'a> {
     /// forms (`scope(25, N)`, raw `op` operands, primitive fields) the pin placement can't see.
     pin_span: Option<Span>,
     raw_span: Option<Span>,
+    /// Set when the tree's bytes after some node matter beyond `.air` semantics, so the backend
+    /// pass must leave the tree alone: a `raw` block (its literal calls and ops may read the
+    /// following instruction's bytes), or a literal-argument call whose callee frame may read
+    /// more than the four words in the call's own operands.
+    keep_layout: bool,
+    /// One past the highest `param[n]` the tree names, so a functional's header can declare
+    /// the words it reads.
+    param_words_used: usize,
 }
 
 impl<'a> TreeLowerer<'a> {
@@ -3558,6 +3584,8 @@ impl<'a> TreeLowerer<'a> {
             frame_args: 0,
             pin_span: None,
             raw_span: None,
+            keep_layout: false,
+            param_words_used: 0,
         }
     }
 
@@ -3580,13 +3608,17 @@ impl<'a> TreeLowerer<'a> {
         } else {
             self.out
         };
-        if out.contains(PIN_SLOT) {
-            // The pinned `push_interaction` slot sits one past every explicit `local[N]` the
-            // tree spells (raw blocks); `.air` allocates named locals after it.
-            let next = explicit_local_slots(&out).max().map_or(0, |m| m + 1);
-            out = replace_outside_strings(&out, PIN_SLOT, &next.to_string());
+        if self.pin_span.is_some() {
+            // A tree with a pinned `push_interaction` has no raw block (that is an error), so
+            // nothing else names an explicit local: the pin takes slot 0, and `.air` allocates
+            // the named locals after it.
+            out = replace_outside_strings(&out, PIN_SLOT, "0");
         }
-        super::opt::optimize_tree_body(&out)
+        if self.keep_layout {
+            out
+        } else {
+            super::opt::optimize_tree_body(&out)
+        }
     }
 
     fn fresh(&mut self, prefix: &str) -> String {
@@ -3861,6 +3893,11 @@ impl<'a> TreeLowerer<'a> {
             // the callee sees the caller's temps as its arguments (the temps pass-through ABI).
             Some(l) if l.is_empty() => format!("call {}(temps)", sig.id),
             Some(l) => {
+                // A callee frame wider than the call's four operand words reads the rest from
+                // the instructions after the call, so the tree's layout must stay as lowered.
+                if sig.frame_args.is_none_or(|n| n > 4) {
+                    self.keep_layout = true;
+                }
                 let parts: Vec<String> = l.iter().map(i16::to_string).collect();
                 format!("call {}({})", sig.id, parts.join(", "))
             }
@@ -5236,9 +5273,13 @@ impl<'a> TreeLowerer<'a> {
             }
             V2Stmt::Expr { span: _, expr } => self.lower_expr_stmt(expr),
             V2Stmt::RawAir { span, code } => {
-                self.raw_span.get_or_insert(*span);
-                if self.pin_span.is_some() {
-                    return Err(Error::at(*span, RAW_WITH_PIN));
+                // Discarded code emits nothing, so only emitted raw blocks count.
+                if self.checking_discarded == 0 {
+                    self.raw_span.get_or_insert(*span);
+                    self.keep_layout = true;
+                    if self.pin_span.is_some() {
+                        return Err(Error::at(*span, RAW_WITH_PIN));
+                    }
                 }
                 if self.in_defer() {
                     return Err(Error::at(
@@ -5819,14 +5860,19 @@ impl<'a> TreeLowerer<'a> {
                 Some(Binding::ConstEnum { key, value }) => {
                     Some((*value, ValueType::Enum(key.clone())))
                 }
-                Some(Binding::ConstI16 { value, .. }) => Some((*value, ValueType::I16)),
+                // A helper argument folds only when it lowered to a literal: one bound to a
+                // tunable `param` (a BCON read) stays a run-time test.
+                Some(Binding::ConstI16 { air, value }) if air.parse::<i16>().is_ok() => {
+                    Some((*value, ValueType::I16))
+                }
                 Some(_) => None,
+                // `const` items fold; a tunable `param` does not.
                 None => self
-                    .eval_const_i16(scrutinee)
-                    .ok()
+                    .const_item(name)
+                    .and_then(|v| i16::try_from(v).ok())
                     .map(|v| (v, ValueType::I16)),
             },
-            V2Expr::Int(..) | V2Expr::Unary { .. } => self
+            V2Expr::Int(..) | V2Expr::Unary { .. } if is_int_literal_expr(scrutinee) => self
                 .eval_const_i16(scrutinee)
                 .ok()
                 .map(|v| (v, ValueType::I16)),
@@ -7282,9 +7328,11 @@ impl<'a> TreeLowerer<'a> {
                         .eval_builtin_int(&a.value, "push_interaction object", 0, 255)
                         .is_err() =>
             {
-                self.pin_span.get_or_insert(a.span);
-                if self.raw_span.is_some() {
-                    return Err(Error::at(a.span, RAW_WITH_PIN));
+                if self.checking_discarded == 0 {
+                    self.pin_span.get_or_insert(a.span);
+                    if self.raw_span.is_some() {
+                        return Err(Error::at(a.span, RAW_WITH_PIN));
+                    }
                 }
                 let (obj, ty) = self.lower_value_expr(&a.value)?;
                 if !ty.is_object_handle() {
@@ -8743,6 +8791,7 @@ impl<'a> TreeLowerer<'a> {
                                     ),
                                 ));
                             }
+                            self.param_words_used = self.param_words_used.max(idx as usize + 1);
                             return Ok(LValue::Direct {
                                 air: format!("param[{idx}]"),
                                 ty: ValueType::I16,
@@ -12279,6 +12328,19 @@ struct MatchResult {
     ty: Option<ValueType>,
 }
 
+/// An integer literal, possibly under unary minus (no names, so nothing tunable).
+fn is_int_literal_expr(e: &V2Expr) -> bool {
+    match e {
+        V2Expr::Int(..) => true,
+        V2Expr::Unary {
+            op: V2UnaryOp::Neg,
+            inner,
+            ..
+        } => is_int_literal_expr(inner),
+        _ => false,
+    }
+}
+
 const RAW_WITH_PIN: &str = "push_interaction(object: <handle>) and 'raw { ... }' cannot share a tree: raw .air may name local slots the pinned object slot could collide with; pass a constant parameter index or move the raw block to its own tree";
 
 /// Placeholder for the per-tree pinned local slot of `push_interaction(object: <handle>)`,
@@ -12315,23 +12377,6 @@ fn replace_outside_strings(text: &str, pat: &str, with: &str) -> String {
         i += c.len_utf8();
     }
     out
-}
-
-/// The `N` of every `local[N]` spelled in `.air` text.
-fn explicit_local_slots(air: &str) -> impl Iterator<Item = u32> + '_ {
-    air.match_indices("local[").filter_map(|(i, m)| {
-        let rest = &air[i + m.len()..];
-        let end = rest.find(']')?;
-        let prev_ok = air[..i]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
-        if prev_ok {
-            rest[..end].trim().parse().ok()
-        } else {
-            None
-        }
-    })
 }
 
 /// The builtins whose arguments can name a local they write (see [`builtin_args_write_ident`]).

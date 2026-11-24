@@ -451,16 +451,12 @@ fn rename_idents(text: &str, map: &BTreeMap<String, String>) -> String {
     out
 }
 
-/// An operand whose read cannot fault and has no side effects: a named local, an integer
-/// literal, `stack_obj`, `my.id`, or an explicit `local[N]`. Cells of objects, temps, params,
-/// and globals stay: their reads can fault (an index past the data, or past the frame).
+/// An operand whose read cannot fault and has no side effects: a named local (v2 writes every
+/// named local before reading it), an integer literal, `stack_obj`, or `my.id`. Cells of
+/// objects, temps, params, and globals stay: their reads can fault (an index past the data, or
+/// past the frame), and so can an explicit `local[N]` the tree never wrote.
 fn is_safe_operand(s: &str) -> bool {
-    is_ident(s)
-        || s.parse::<i32>().is_ok()
-        || s == "my.id"
-        || s.strip_prefix("local[")
-            .and_then(|r| r.strip_suffix(']'))
-            .is_some_and(|n| n.parse::<u16>().is_ok())
+    is_ident(s) || s.parse::<i32>().is_ok() || s == "my.id"
 }
 
 /// Whether running `next` first cannot observe the previous node's result: assignments and
@@ -602,6 +598,10 @@ fn drop_dead_stack_obj_stores(nodes: &mut Vec<Node>) {
                     op: ":=",
                     rhs: "stack_obj",
                 } if is_ident(lhs) => known = Some(lhs.to_owned()),
+                // Any other write to `stack_obj` (`+=`, ...) leaves its value unknown.
+                Kind::Assign {
+                    lhs: "stack_obj", ..
+                } => known = None,
                 Kind::Let { name, .. } | Kind::Assign { lhs: name, .. } => {
                     if known.as_deref() == Some(name) {
                         known = None;
@@ -1208,6 +1208,13 @@ mod tests {
     }
 
     #[test]
+    fn compound_stack_obj_writes_forget_its_value() {
+        let body = "    let __o_1 = my.id;\n    stack_obj := __o_1;\n    stack_obj += 1;\n    stack_obj := __o_1;\n    my.attr[0] := stack.attr[0];\n    return true;\n";
+        let out = optimize_tree_body(body);
+        assert_eq!(out.matches("stack_obj := __o_1;").count(), 2, "{out}");
+    }
+
+    #[test]
     fn faulting_reads_stay() {
         // An object cell, temp, param, or global read can fault, so its unread store stays.
         for operand in [
@@ -1216,6 +1223,7 @@ mod tests {
             "param[3]",
             "global[2]",
             "stack.attr[0]",
+            "local[0]",
         ] {
             let body = format!("    let __a_1 = {operand};\n    return true;\n");
             assert_eq!(optimize_tree_body(&body), body, "{operand}");

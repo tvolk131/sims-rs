@@ -2982,8 +2982,14 @@ impl Parser {
 
     /// Expression `match s { P => value, ... }` (the `match` keyword is already consumed).
     fn parse_match_expr(&mut self, span: Span) -> Result<V2Expr> {
-        // Entered before the scrutinee, so `match match match ... x {..} {..}` is bounded too.
+        // Entered before the scrutinee, so `match match match ... x {..} {..}` is bounded too. A
+        // match level costs about two expression levels of stack (scrutinee and arm parses), so
+        // it counts twice: the depth budget is sized for the default 2 MiB test-thread stack.
         self.enter_nesting(span)?;
+        if let Err(e) = self.enter_nesting(span) {
+            self.leave_nesting();
+            return Err(e);
+        }
         let mut arms = Vec::new();
         let mut scrutinee = None;
         let res = (|| {
@@ -3020,6 +3026,7 @@ impl Parser {
                 }
             }
         })();
+        self.leave_nesting();
         self.leave_nesting();
         res?;
         let scrutinee = scrutinee.expect("set before the arms parse");
