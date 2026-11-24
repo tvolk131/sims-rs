@@ -898,3 +898,122 @@ fn cli_lift_v2_prints_compiling_source() {
         );
     }
 }
+
+/// PR E spellings the decompiler writes back: `match` chains, `else if`, `inc_lt` /
+/// `dec_gt`, `self.slot[i]`, `param[n]`, `notify_out_of_idle()`, `set_dynamic_sprite`,
+/// and `push_interaction(object: ..)`.
+const PR_E_IDIOMS: &str = r#"object "Synth Switchboard" {
+    guid: 0x7E00_0007;
+    price: 5;
+    sprite: Sprite::procedural("floor_lamp", primary: #101010, accent: #202020, trim: #303030);
+    state level @ 2: i16;
+    state mode @ 3: i16;
+
+    @id(4400) tree chain "Chain" {
+        if self.level == 1 {
+            self.mode = 4;
+        } else if self.level == 2 {
+            self.mode = 5;
+        } else if self.level == -7 {
+            self.mode = 6;
+        } else {
+            self.mode = 9;
+        }
+        if self.mode == 1 {
+            self.level = 1;
+        } else if self.level > 2 {
+            self.level = 2;
+        } else {
+            self.level = 0;
+        }
+        self.mode = 0;
+    }
+
+    @id(4401) tree counted "Counted" {
+        temp[0] = 0;
+        while inc_lt(&mut temp[0], 5) {
+            self.level += 1;
+        }
+        while dec_gt(&mut temp[1], 0) {
+            self.level -= 1;
+        }
+    }
+
+    @id(4402) @frame(args: 2) tree slots "Slots" {
+        self.level = self.slot[0];
+        notify_out_of_idle();
+        param[1] = 3;
+        self.mode = param[0];
+    }
+
+    @id(4403) tree sim_side "Sim Side" (sim: Sim) {
+        set_dynamic_sprite(index: 2, value: 1);
+        self.level = self.slot[1];
+        push_interaction(menu: 2, object: self, priority: 50, flags: 0);
+        push_interaction(menu: 3, object: sim, priority: 40, flags: 4);
+    }
+
+    @id(4404) tree pushes "Pushes" {
+        push_interaction(menu: 2, object: self, priority: 50, flags: 0);
+        push_interaction(menu: 2, object: stack_obj, priority: 50, flags: 0);
+    }
+}
+"#;
+
+#[test]
+fn pr_e_idioms_round_trip() {
+    let source = assert_round_trip("synth-switchboard.antics", PR_E_IDIOMS);
+    for idiom in [
+        "match self.attr_2 {\n            1 => {\n                self.attr_3 = 4;",
+        "            -7 => {\n",
+        "            _ => {\n                self.attr_3 = 9;",
+        "} else if self.attr_2 > 2 {",
+        "while inc_lt(&mut temp[0], 5) {",
+        "while dec_gt(&mut temp[1], 0) {",
+        "self.attr_2 = self.slot[0];",
+        "notify_out_of_idle();",
+        "param[1] = 3;",
+        "self.attr_3 = param[0];",
+        "set_dynamic_sprite(index: 2, value: 1);",
+        "self.attr_2 = self.slot[1];",
+        "push_interaction(menu: 2, object: self, priority: 50, flags: 0);",
+        "push_interaction(menu: 3, object: sim, priority: 40, flags: 4);",
+        "push_interaction(menu: 2, object: stack_obj, priority: 50, flags: 0);",
+    ] {
+        assert!(source.contains(idiom), "missing `{idiom}` in:\n{source}");
+    }
+    let iff = parse_iff(&compile("synth-switchboard.antics", PR_E_IDIOMS).iff_bytes);
+    let report =
+        decompile_iff_to_v2_report(&iff, &DecompileV2Options::default()).expect("decompile");
+    for t in report.trees.iter().filter(|t| (4400..=4404).contains(&t.id)) {
+        assert_eq!(t.style, TreeStyle::Idiomatic, "tree {}\n{source}", t.id);
+        assert_eq!(t.raw_statements, 0, "tree {}\n{source}", t.id);
+    }
+}
+
+#[test]
+fn a_relowering_idiom_that_is_not_proven_falls_back_inside_the_tree() {
+    // `run_functional_tree` as written by hand: v2's `stack_obj.run_functional(4)` adds a
+    // `stack_obj` restore, so the decompiler may only keep it if the checker proves it;
+    // either way the tree stays idiomatic around it.
+    const SOURCE: &str = r#"object "Synth Relay" {
+    guid: 0x7E00_0008;
+    price: 5;
+    sprite: Sprite::procedural("floor_lamp", primary: #101010, accent: #202020, trim: #303030);
+    state level @ 2: i16;
+
+    @id(4410) tree relay "Relay" {
+        stack_obj = 0;
+        raw { run_functional_tree(4); }
+        self.level = 3;
+    }
+}
+"#;
+    let iff = parse_iff(&compile("synth-relay.antics", SOURCE).iff_bytes);
+    let report =
+        decompile_iff_to_v2_report(&iff, &DecompileV2Options::default()).expect("decompile");
+    let relay = report.trees.iter().find(|t| t.id == 4410).unwrap();
+    assert!(proven(&relay.check), "{:?}\n{}", relay.check, report.source);
+    assert_eq!(relay.style, TreeStyle::Idiomatic, "{}", report.source);
+    assert!(report.source.contains("self.attr_2 = 3;"), "{}", report.source);
+}
