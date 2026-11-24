@@ -3555,27 +3555,94 @@ through their public interfaces only; the simulation never depends on it.
     - The lost captures `goth-ticks-20261114-long` and `-to1000` are not
       re-recorded: `goth-day-20261115` and `goth-rng-4155-20261118` cover
       them.
+- **Done (Batch 16 — UI Honesty Waves 3–4, Held-in-Hand Rendering, Off-Lot
+  Travel & Phone Go Downtown, Neighborhood Import/Pools, `.antics` v2 PRs C–F,
+  Behavioral Verifier, `fmt`/`lint`/`lift --v2`, #402, #405–#407, #411–#428):**
+  - **UI Honesty Waves 3 & 4 Part 1, Held-in-Hand Rendering (#405, #413, #428):**
+    - Hand-carried object rendering (#413): draws held objects at Sim
+      body-string attach points (`R_HAND`/`Palm`, `HEAD`/`Top`, `PELVIS`)
+      rather than on the floor.
+    - UI Wave 3 (#405): native catalog order, rendered object thumbnails,
+      choice dialogs, photo album, roof arrows, and phone book.
+    - UI Wave 4 Part 1 (#428): all four expanded Live-mode subpanels
+      (Relationships, Job, Personality, House) reach `1.0000` parity against
+      native 1.91 oracle captures at `1024×768`, adding `Font::box_width`,
+      `Font::char_box`, and House `Layout` rating from `World::usage`.
+  - **Off-Lot Travel & Phone "Go Downtown" (#411, #414, #426):**
+    - Generic Sims Call 19 (#411): Downtown arrivals spawn and bring back the
+      date companion.
+    - Traveler-led destination family & off-lot placement (#414):
+      `ArrivalFamily` and `TRVL` v4 stop travelers snapping back after marker
+      placement.
+    - Phone "Go Downtown" (`0x2075`, #426): ports Generic Sims Calls 17, 20,
+      22, 23, and 25, kind-2/7/8 departure tokens, `World::trip_request`,
+      `travel::depart_from_request`, native routine-19 companion spawning, and
+      envelope v5 (`phone_go_downtown` integration test; Goth 43,200-tick
+      strict hash `df6eb544…` unchanged).
+  - **Legacy Backlog & Neighborhood Pools (#407, #423):**
+    - `sims-vm` legacy backlog (#407): community lot reseed, indicator queues,
+      named icons, sort, career titles, and `cAverageHistory`.
+    - Neighborhood open & Sim pools (#423): neighborhood open consumes
+      imported `.FAM` files, fixes import-preview inventory
+      (`sims-sim/src/patch_import.rs`), ports celebrity sex and Townie
+      specialty pool rules, and adds lazy `.ndx` skeletons.
+  - **`.air` & Symbolic Equivalence Verifier (#402, #406, #412, #416, #417,
+    #419, #420, #425):**
+    - Live-output BHAV equivalence and whole-file `verify-equiv` (#402),
+      install-catalog callee arities in `lift` (#406, #412), and `--global` /
+      `--semi-global` argument-free library wiring (#419).
+    - `.air` parser/lifter deduplication (-905 net lines, #416) and `.air`
+      `pad` clauses slashing raw-op corpus trees from 4,793 to 54 (#417, #425).
+    - `verify-equiv --behavioral` with cut-point bisimulation (#420), opt-in
+      `--param-domain` / `--v2-enum-domains`, wider bisimulation (23,838 /
+      23,974 reversed-layout behavioral proofs, 0 counterexamples), and 2–7×
+      faster verification (#425).
+  - **`.antics` v2 Compiler, Formatter, Linter & Decompiler (#415, #418, #421,
+    #422, #424, #427):**
+    - Interop and language PRs C–F (#415, #418, #422, #427): `extern mod`
+      `@ temp[N]`, `?`/`return error`, sparse `state @ slot`, `bcon`/`extern
+      bcon`, standalone `tree`, `destroy_self`, `loop`, counted `for`,
+      `animate |event|`, range/OR patterns, `if`/`match` expressions,
+      multi-variant IFF (`variant "..."`), backend `.air` optimizer
+      (`src/v2/opt.rs`), `stack_obj.<field>`, `push_interaction(icon:)`,
+      `animate(..., event_local:)`, `sound id: 0`, shared FWAVs, `@frame(kind:)`,
+      and `p.visitor_kind`.
+    - Tooling (#421, #424): comment-preserving idempotent `sims-antics fmt`,
+      validated high-level decompiler `sims-antics lift --v2` (2,708 / 2,722 =
+      99.5% base-game behavioral round-trip, 0 different), and `sims-antics
+      lint` (13 rules, `// antics-lint: allow(...)`, non-suppressible
+      `enum_wildcard_all_covered`).
+    - Local multi-archetype `.antics` v2 behavioral pilot (13 diverse object
+      archetypes, 472 BHAVs, uncommitted): 448 / 472 (94.9%) isolated
+      `--behavioral` `EQUIVALENT`, 4 full-file `EQUIVALENT`, 0 `DIFFERENT` / 0
+      counterexamples, identifying concrete compiler/verifier/linter gaps for the
+      next wave.
 - **Next (in flight, in order of player impact):**
-  - **Travel:**
-    - Downtown arrival (Generic Sims Call 19, companion token, abort
-      revokes it).
-    - The traveler snapping back after a marker places it (Find Location
-      mode 0 skips the person's `0x74` refresh, `0x45e519`).
-    - A traveler-led destination family: Generic Sims Call 18 takes member
-      0, so a solo trip by a non-first member is never placed.
-    - The phone's Go Downtown dropping out of the queue (routines 17, 20,
-      22 and 23).
-    - Downtown townies (routine 25).
-    - Routine 24 (dresser).
-  - **Carried objects drawn at the Sim's hand:** the person draw
-    (`0x459dc0`) draws held objects at body-string attach points
-    (`R_HAND`/`Palm`, `HEAD`/`Top`, `PELVIS`). Today they draw on the
-    floor.
-  - **Open PRs:**
-    - UI Honesty Wave 3 (#405).
-    - The `sims-vm` legacy backlog with co-op `PROTOCOL_VERSION` 2 (#407).
-    - `lift` install-catalog arities (#406).
-    - The live-output equivalence verifier (#402).
+  - **UI Wave 4 Part 2 & Game-Loop Travel Wiring (Track 1):** live subpanel
+    portraits and polish, wiring `World::trip_request` →
+    `travel::depart_from_request` into `sims-game`, and dialog release latch
+    (`0x5e45e1`).
+  - **Travel (Track 2):** remaining expansion destination API departures via
+    Generic Sims Call routine 17, plus routine 24 (outfit editor).
+  - **Neighborhood Writer (Track 4):** `Neighborhood.iff` writer (`0x4252cc`,
+    chunk writers, `TATT`, pool family names).
+  - **`.antics` Pilot Fix & Ergonomics Wave (Tracks 7, 8, 9):**
+    - Track 7 (verifier): concrete `DIFFERENT` on reached primitive operand
+      mismatches, `set_to_next(dest: stack_obj)` normalization, behavioral
+      local-slot alpha-renaming, error-exit `last_result`, conditioned
+      whole-file verdicts / `--assume-equiv`, unbounded loop widening.
+    - Track 8 (v2 PR G): strict named-arg validation + `route_to(source:)` /
+      `snap(mode:)`, eliding dead `__self_obj` saves (`raw_opcode_keeps_stack_obj`),
+      polarity-preserving `return a <op> b`, 0-node BHAVs, missing core
+      primitives, zero-cost inline helpers (`Guid` params, `fn -> Result`,
+      copy-elision, slot reuse), context polymorphism, `@slot(N)` pinning,
+      `const` in `raw {}`/`match`, labeled `break`/`continue`.
+    - Track 9 (`fmt`/`lint`/`lift --v2`): fix detached trailing `allow(...)`
+      comments in `fmt`, split `uninitialized_local_read` / fix `unused_decl`,
+      `stack_obj_clobber_after_self`, and polarity lints, add
+      `dialog_local_slot_mismatch` / `raw_bare_call_false_exit` /
+      `missing_sim_frame_args`, upgrade `frame_headroom`, and improve `lift
+      --v2` naming, multi-OBJD `variant` lifting, and v2 idiom coverage.
   - **Co-op:** a build identity in `Hello`, so that mixed builds are
     rejected even when the save format is unchanged.
   - **Legacy mining backlog:** see
