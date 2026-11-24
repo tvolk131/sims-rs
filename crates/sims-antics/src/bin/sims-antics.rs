@@ -14,6 +14,8 @@
 //!   exhausts the VM's instruction budget.
 //! - `sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv] [--globals <Global.iff|archive.far[!member.iff]>] [--semiglobal <file.iff|archive.far!member.iff>] [--no-catalog]`
 //! - `sims-antics build <pack_dir> --out <dir>`
+//! - `sims-antics fmt [--check] [--stdout] <path...>` (canonical `.antics` v2 layout)
+//! - `sims-antics lift --v2 <file.iff|archive.far> [--entry <name.iff>] [--install <dir>]` (decompile to `.antics` v2)
 
 use sims_antics::arity_catalog::{
     AritySource, FileArities, FileIdentity, GLOBAL_TREES, KeptBhavs, ResolvedArities,
@@ -29,7 +31,7 @@ use sims_antics::{
     lift::{format_bhav_labeled_air_with_context, format_bhav_raw_air, lift_bhav},
     lift_bhav_structured_with_arities, lift_bhav_structured_with_context,
     structured_lift_header_check,
-    v2::is_v2_source,
+    v2::{DecompileV2Options, TreeCheck, decompile_iff_to_v2_report, is_v2_source},
     verify::{
         check_tree_with_callees, extract_bhav_from_iff, library_argless_from_iff,
         library_arities_from_iff, single_file_problem,
@@ -176,7 +178,9 @@ fn print_usage() {
               --my-attributes is the attribute count of whatever runs as me, which call_as may make another\n    \
               object than the one whose file holds the tree: give the smallest count of anything that runs it)\n  \
          sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv] [--globals <Global.iff|archive.far[!member.iff]>] [--semiglobal <file.iff|archive.far!member.iff>] [--no-catalog]   (lifts to .air Antics IR)\n  \
-         sims-antics build <pack_dir> --out <dir>\n\
+         sims-antics lift --v2 <file.iff|archive.far> [--entry <name.iff>] [--install <dir>] [--globals ...] [--semiglobal ...] [--no-catalog]   (decompiles an object to checked .antics v2)\n  \
+         sims-antics build <pack_dir> --out <dir>\n  \
+         sims-antics fmt [--check] [--stdout] <file.antics|dir...>   (canonical .antics v2 layout; --check exits 1 if any file would change)\n\
          lift arities: inside an install, global and semi-global callee arities come from its catalog;\n  \
          --globals/--semiglobal replace one range; --no-catalog disables catalog lookup (private arities\n  \
          from the file only). Equivalent is relative to the arities shown in the `// arity sources:` header.\n  \
@@ -414,6 +418,8 @@ fn short_lift_reason(
 #[derive(Default)]
 struct ArityOptions {
     no_catalog: bool,
+    /// `--install <dir>`: the install whose catalog to use instead of one found above the input.
+    install: Option<PathBuf>,
     globals: Option<String>,
     semi_global: Option<String>,
 }
@@ -432,7 +438,7 @@ fn resolve_lift_arities(
     let mut resolved = if opts.no_catalog {
         FileArities::private_only(iff, "--no-catalog")
     } else {
-        catalog_arities(input_path, input_identity, member)
+        catalog_arities(input_path, input_identity, member, opts.install.as_deref())
     };
     if let Some(spec) = &opts.globals {
         let (globals_iff, label) = read_override_iff(spec, Some("Global.iff"), "--globals")?;
@@ -457,9 +463,14 @@ fn catalog_arities(
     input_path: &Path,
     input_identity: Result<&FileIdentity, &str>,
     member: Option<(&str, u64)>,
+    install: Option<&Path>,
 ) -> FileArities {
     use sims_antics::arity_catalog::InstallArityCatalog;
-    match InstallArityCatalog::find_install_root(input_path) {
+    let root = match install {
+        Some(dir) => Some(dir.to_path_buf()),
+        None => InstallArityCatalog::find_install_root(input_path),
+    };
+    match root {
         Some(root) => match InstallArityCatalog::load(&root) {
             Ok(mut catalog) => match input_identity {
                 Ok(identity) => {
@@ -486,6 +497,7 @@ fn catalog_arities(
     _input_path: &Path,
     _input_identity: Result<&FileIdentity, &str>,
     _member: Option<(&str, u64)>,
+    _install: Option<&Path>,
 ) -> FileArities {
     FileArities::no_role("built without the install-catalog feature")
 }
@@ -981,6 +993,7 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
     let mut relax_padding = false;
     let mut no_comments = false;
     let mut verify_equiv = false;
+    let mut v2 = false;
     let mut arity_opts = ArityOptions::default();
     let mut end_of_flags = false;
 
@@ -1062,6 +1075,22 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
                         i += 1;
                         continue;
                     }
+                    "--v2" => {
+                        v2 = true;
+                        i += 1;
+                        continue;
+                    }
+                    "--install" => {
+                        if arity_opts.install.is_some() {
+                            return Err("duplicate --install flag".to_owned().into());
+                        }
+                        let val = args
+                            .get(i + 1)
+                            .ok_or_else(|| "missing directory after --install".to_owned())?;
+                        arity_opts.install = Some(PathBuf::from(val));
+                        i += 2;
+                        continue;
+                    }
                     "--globals" | "--semiglobal" => {
                         let slot = if s == "--globals" {
                             &mut arity_opts.globals
@@ -1103,6 +1132,26 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
         "lift requires <file.iff|archive.far>".to_owned()
     })?;
 
+    if v2
+        && (list
+            || tree_id.is_some()
+            || filter.is_some()
+            || raw
+            || relax_padding
+            || no_comments
+            || verify_equiv)
+    {
+        return Err(
+            "--v2 cannot be combined with --list, --tree, --filter, --raw, --relax-padding, --no-comments, or --verify-equiv (it checks every tree itself)"
+                .to_owned()
+                .into(),
+        );
+    }
+    if arity_opts.install.is_some() && (raw || arity_opts.no_catalog) {
+        return Err("--install cannot be combined with --raw or --no-catalog"
+            .to_owned()
+            .into());
+    }
     if list && (tree_id.is_some() || raw || verify_equiv) {
         return Err(
             "--list cannot be combined with --tree, --raw, or --verify-equiv"
@@ -1238,6 +1287,11 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
         )
         .map(Some)
     };
+
+    if v2 {
+        let resolved = resolve_arities()?;
+        return lift_v2(&iff, resolved.as_ref(), &source_label, &mut out);
+    }
 
     if list {
         let resolved = resolve_arities()?;
@@ -2000,6 +2054,7 @@ fn run() -> Result<(), CliError> {
             }
         }
         "lift" => cmd_lift(&args),
+        "fmt" => cmd_fmt(&args),
         "verify-equiv" => match cmd_verify_equiv(&args) {
             Err(CliError::Message(msg)) => {
                 eprintln!("error: {msg}");
@@ -2147,6 +2202,161 @@ fn run() -> Result<(), CliError> {
 }
 
 /// `sims-antics verify-equiv <a.iff> <b.iff>`: whole-file resource and BHAV equivalence.
+/// `sims-antics fmt [--check] [--stdout] <path...>`: canonical `.antics` v2 layout.
+/// `lift --v2`: prints the object as checked `.antics` v2 and a per-tree summary on
+/// stderr. Exits 1 when a tree differs even written as `raw`.
+fn lift_v2(
+    iff: &Iff,
+    resolved: Option<&FileArities>,
+    source_label: &str,
+    out: &mut OutWriter<impl Write>,
+) -> Result<(), CliError> {
+    // Library arities are the same for every private caller; private ones come from the file.
+    let library_arities = resolved
+        .map(|r| {
+            r.for_tree(4096)
+                .arities
+                .iter()
+                .filter(|&(id, _)| !(4096..=8191).contains(id))
+                .map(|(&id, &n)| (id, n))
+                .collect()
+        })
+        .unwrap_or_default();
+    let options = DecompileV2Options {
+        library_arities,
+        ..DecompileV2Options::default()
+    };
+    let report = decompile_iff_to_v2_report(iff, &options)
+        .map_err(|e| format!("failed to decompile {source_label}: {e}"))?;
+    out.write_str(&report.source)?;
+    out.flush()?;
+    let mut counts: [usize; 5] = [0; 5];
+    let (mut idiomatic, mut raw_statements) = (0usize, 0usize);
+    for t in &report.trees {
+        let slot = match &t.check {
+            TreeCheck::Identical => 0,
+            TreeCheck::Equivalent => 1,
+            TreeCheck::Inconclusive(_) | TreeCheck::NotChecked => 2,
+            TreeCheck::Omitted(_) => 3,
+            TreeCheck::Different(_) => 4,
+        };
+        counts[slot] += 1;
+        if t.style == sims_antics::v2::TreeStyle::Idiomatic {
+            idiomatic += 1;
+            raw_statements += t.raw_statements;
+        }
+    }
+    eprintln!(
+        "decompiled {} tree(s) from {source_label}: {} identical, {} equivalent, {} inconclusive, {} omitted, {} different; {idiomatic} idiomatic ({raw_statements} raw statement(s)), {} raw; {} init/main tree(s) written as plain trees",
+        report.trees.len(),
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3],
+        counts[4],
+        report.trees.len() - idiomatic - counts[3],
+        report
+            .trees
+            .iter()
+            .filter(|t| t.standalone_lifecycle)
+            .count(),
+    );
+    for t in &report.trees {
+        let why = match &t.check {
+            TreeCheck::Inconclusive(why) => format!("inconclusive: {why}"),
+            TreeCheck::Omitted(why) => format!("omitted: {why}"),
+            TreeCheck::Different(why) => format!("different: {why}"),
+            _ => continue,
+        };
+        eprintln!("  tree {}: {}", t.id, sanitize_single_line(&why));
+    }
+    if report.counterexamples() > 0 {
+        return Err(CliError::Exit(1));
+    }
+    Ok(())
+}
+
+fn cmd_fmt(args: &[OsString]) -> Result<(), CliError> {
+    let mut check = false;
+    let mut to_stdout = false;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut end_of_flags = false;
+    for arg in &args[1..] {
+        if !end_of_flags && let Some(s) = arg.to_str() {
+            match s {
+                "--check" => {
+                    check = true;
+                    continue;
+                }
+                "--stdout" => {
+                    to_stdout = true;
+                    continue;
+                }
+                "--" => {
+                    end_of_flags = true;
+                    continue;
+                }
+                "-h" | "--help" => {
+                    print_usage();
+                    return Ok(());
+                }
+                other if other.starts_with('-') => {
+                    return Err(format!("unknown flag '{other}'").into());
+                }
+                _ => {}
+            }
+        }
+        paths.push(PathBuf::from(arg));
+    }
+    if paths.is_empty() {
+        return Err("fmt requires at least one <file.antics|dir>"
+            .to_owned()
+            .into());
+    }
+    if check && to_stdout {
+        return Err("--check cannot be combined with --stdout".to_owned().into());
+    }
+    let files = sims_antics::v2::fmt::collect_antics_files(&paths).map_err(|e| e.to_string())?;
+    if to_stdout && files.len() != 1 {
+        return Err(format!("--stdout needs exactly one file ({} given)", files.len()).into());
+    }
+    let mut out = OutWriter::stdout();
+    let mut unformatted = 0usize;
+    for file in &files {
+        let shown = sanitize_path_display(file);
+        let source =
+            std::fs::read_to_string(file).map_err(|e| format!("failed to read {shown}: {e}"))?;
+        let formatted = match sims_antics::v2::format_v2_source(&source) {
+            Ok(f) => f,
+            // A `.air` (Antics IR) file shares the extension; it is not v2 and is left alone.
+            Err(_) if !is_v2_source(&source) => {
+                eprintln!("note: skipping {shown} (not .antics v2)");
+                continue;
+            }
+            Err(e) => return Err(format!("{shown}: {e}").into()),
+        };
+        if to_stdout {
+            out.write_str(&formatted)?;
+            continue;
+        }
+        if formatted == source {
+            continue;
+        }
+        unformatted += 1;
+        if check {
+            out.writeln_str(&shown)?;
+        } else {
+            std::fs::write(file, formatted).map_err(|e| format!("failed to write {shown}: {e}"))?;
+        }
+    }
+    out.flush()?;
+    if check && unformatted > 0 {
+        eprintln!("{unformatted} file(s) need formatting");
+        return Err(CliError::Exit(1));
+    }
+    Ok(())
+}
+
 fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
     let mut paths: Vec<PathBuf> = Vec::new();
     // Library files and whether each is a semi-global one.
