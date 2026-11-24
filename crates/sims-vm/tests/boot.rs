@@ -622,6 +622,7 @@ fn an_opened_neighborhood_matches_the_originals_import() {
     assert_eq!(opened.pools.townie_draws, 44_096);
     assert_eq!(opened.pools.tourist_draws, 97_027);
     assert_eq!(crt.state(), 0x0d1a_a553);
+    assert!(opened.pools.loaded_skeletons.is_empty() && opened.pools.skeleton_files.is_empty());
 
     // The five house files, byte for byte, given the original's leftover
     // heap bytes.
@@ -677,6 +678,38 @@ fn an_opened_neighborhood_matches_the_originals_import() {
     assert_eq!(digest(&format_31_bytes(lot.world())), IMPORTED_69_31);
     assert_eq!(digest(&format_30_bytes(lot.world())), IMPORTED_69_30);
     std::fs::remove_dir_all(&output).unwrap();
+
+    // Run 2's pools found `adult` and `child` loaded. Loaded on first use
+    // instead (0x5a03cd), their catalogs' builds draw before the first
+    // celebrity's copy, so the next pool person's GUID draw is off.
+    let lazy = output.with_extension("lazy");
+    if lazy.exists() {
+        std::fs::remove_dir_all(&lazy).unwrap();
+    }
+    copy_directory(&root.join("UserData2"), &lazy);
+    let mut pools = recorded_pools(&original, &theirs);
+    pools.loaded_skeletons.clear();
+    let mut guids = theirs
+        .iter()
+        .filter(|(number, _)| (2..FIRST_POOL_FILE).contains(number))
+        .map(|(_, path)| recorded_character(path).1);
+    let mut crt = CrtRng::from_state(1);
+    for _ in 0..OPEN_DRAWS {
+        crt.next_u15();
+    }
+    let error = open_neighborhood(
+        &root,
+        &root.join("UserData2"),
+        &lazy,
+        &mut || guids.next().expect("the original drew no more GUIDs"),
+        &|house| std::fs::read(after.join(format!("Houses/House{house:02}.iff"))).ok(),
+        &pools,
+        &mut crt,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("0x4725ff: User00031 "), "{error}");
+    std::fs::remove_dir_all(&lazy).unwrap();
 }
 
 #[test]

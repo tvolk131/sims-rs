@@ -29,7 +29,8 @@ pub use pools::{LotTransition, OpenedPools, PoolInput, PoolPerson};
 use crate::boot::BootError;
 use sims_content::family_import::{clone_character, refresh_outfits};
 use sims_content::{
-    AvatarRegistry, Catalog, ImportWardrobe, Index, Install, Neighborhood, skeleton_name,
+    ArchivePool, AvatarRegistry, Catalog, ImportWardrobe, Index, Install, Neighborhood, People,
+    skeleton_name,
 };
 use sims_core::CrtRng;
 use sims_formats::family_file::FamilyFile;
@@ -326,6 +327,20 @@ fn pool_skeletons(
         skeletons.templates.insert(entry.guid, name);
     }
     let mut avatars = AvatarRegistry::load(install)?;
+    // The registry as the startup scan left it (0x59f844, 0x584562), before
+    // the lookups below load anything: which skeletons are loaded, and
+    // which an `.ndx` names for loading on first use (0x5a03cd).
+    let startup = People::load_each_with_registry(
+        index,
+        catalog,
+        std::iter::empty(),
+        &avatars,
+        &ArchivePool::new(),
+    )?
+    .0;
+    skeletons.eager = startup.skeletons_by_name.into_keys().collect();
+    skeletons.indexed = startup.indexed_skeletons;
+    skeletons.catalogs = startup.indexed_catalogs;
     for name in names {
         let scales = avatars
             .skeleton_scales(&name)

@@ -5,7 +5,7 @@ use crate::boot::BootError;
 use crate::objects::{Draws, PERSON_WORDS};
 use crate::people::{SAVED_REVISION, field, reload_profile};
 use sims_content::family_import::reserve_character_file;
-use sims_content::{Neighborhood, Profile};
+use sims_content::{Neighborhood, Profile, Skeleton};
 use sims_core::CrtRng;
 use sims_formats::behavior::ObjectDefinition;
 use sims_formats::iff::Iff;
@@ -28,10 +28,11 @@ pub struct PoolInput {
     /// The later lot or toolbar dispatch. A view open alone stops after
     /// Magic Town (0x5580e9, 0x55fb4c).
     pub transition: Option<LotTransition>,
-    /// The skeletons, by name, already loaded when the pools run. A
-    /// temporary actor's skeleton not among them would be loaded on first
-    /// use (0x5a03cd), whose draws are not ported, so it fails. Both UD2
-    /// captures fit `adult` and `child` loaded; that is fitted, not traced.
+    /// The `.ndx` skeletons, by name, that earlier work loaded before the
+    /// pools run. A temporary actor's skeleton that neither the startup
+    /// scan nor that work loaded is loaded on first use (0x5a03cd), with
+    /// its draws. `adult` and `child` come from `Animation.ndx`; both UD2
+    /// captures fit them loaded already. That is fitted, not traced.
     pub loaded_skeletons: BTreeSet<String>,
 }
 
@@ -68,6 +69,13 @@ pub struct OpenedPools {
     pub tourist_draws: u32,
     /// Neighborhood +0x160 after the last attempt.
     pub next_file: i32,
+    /// The `.ndx` skeletons the pools loaded on first use (0x5a03cd), each
+    /// with its catalog, as the World keeps them
+    /// (`World::loaded_indexed_skeletons`), and the skeleton files that
+    /// read (`World::skeleton_files`). Both are empty for the UD2
+    /// captures, whose `adult` and `child` were loaded before the pools.
+    pub loaded_skeletons: BTreeMap<String, Option<String>>,
+    pub skeleton_files: BTreeSet<String>,
 }
 
 const CELEBRITY_WORDS: &[usize] = &[10, 11, 12, 15, 17, 18, 80, 81, 82];
@@ -154,6 +162,12 @@ pub(super) struct Skeletons {
     /// Each skeleton's own bone scales, by name: the templates' and a
     /// second actor's (`adult` or `child`).
     pub scales: BTreeMap<String, Result<Vec<i32>, String>>,
+    /// The skeletons the startup scan loaded (0x59f844 → 0x59f132).
+    pub eager: BTreeSet<String>,
+    /// The skeletons an `.ndx` names, each with its catalog or why it
+    /// cannot load (0x584562 → 0x59fc48), and each catalog's skeletons.
+    pub indexed: BTreeMap<String, Result<String, String>>,
+    pub catalogs: BTreeMap<String, (Vec<Skeleton>, Option<String>)>,
 }
 
 pub(super) struct FilledPools<'a> {
@@ -187,10 +201,13 @@ pub(super) fn fill<'a>(
         },
         next_file: imported.next_file,
         skeletons,
-        loaded_skeletons: &input.loaded_skeletons,
+        lazy: LazySkeletons::default(),
         files,
         made: Vec::new(),
     };
+    // What earlier work loaded registers the same way, without draws
+    // here: they were made before the pool boundary `crt` starts at.
+    fills.lazy = LazySkeletons::loaded_before(skeletons, &input.loaded_skeletons)?;
     // The setup update (0x5580a2–0x5580e9, also 0x55fb05–0x55fb4c).
     for pool in [CELEBRITIES, FANS, MAGIC_TOWN] {
         fills.run(pool)?;
@@ -221,6 +238,8 @@ pub(super) fn fill<'a>(
         townie_draws,
         tourist_draws,
         next_file: fills.next_file,
+        loaded_skeletons: fills.lazy.loaded,
+        skeleton_files: fills.lazy.files,
     };
     Ok(FilledPools {
         report,
@@ -235,7 +254,7 @@ struct Fills<'a, 'b> {
     draws: Draws<'b>,
     next_file: i32,
     skeletons: &'b Skeletons,
-    loaded_skeletons: &'a BTreeSet<String>,
+    lazy: LazySkeletons,
     files: BTreeSet<i32>,
     made: Vec<(i32, &'a Iff)>,
 }
@@ -505,29 +524,16 @@ impl<'a, 'b> Fills<'a, 'b> {
                     .into());
                 }
             };
-            if !self.loaded_skeletons.contains(name) {
-                return Err(format!(
-                    "0x5a03cd: the skeleton {name:?} for User{file:05} is not loaded yet; \
-                     loading it on first use is unported"
-                )
-                .into());
-            }
-            copies.push(scales);
+            let load = self
+                .lazy
+                .load(self.skeletons, name)
+                .map_err(|error| format!("{error} (User{file:05})"))?;
+            copies.push((load, scales));
         }
         let (age, gender) = (data[field::AGE], data[field::GENDER]);
-        // A celebrity's sex follows its place in the family (0x42c6d7): the
-        // first seven are women, named from table 0xa6 ("Nora" by
-        // default), the rest men, from table 0xa5 ("Nomad"); the editor
-        // sets it (0x42cf5d → 0x4eaaba).
         if pool.done == CELEBRITIES.done {
-            let female = i16::from(ordinal <= 6);
-            if gender != female {
-                return Err(format!(
-                    "0x42c6d7: celebrity {ordinal} (User{file:05}) has sex {gender}; its place \
-                     makes it {female}"
-                )
-                .into());
-            }
+            check_celebrity_sex(ordinal, gender)
+                .map_err(|error| format!("{error} (User{file:05})"))?;
         }
         let editor_words = match pool.done {
             done if done == CELEBRITIES.done => CELEBRITY_WORDS,
@@ -548,7 +554,11 @@ impl<'a, 'b> Fills<'a, 'b> {
         // The skeleton's file is taken as already read (0x598af7), so
         // only the actor's own copy draws (0x598da3). The final pass
         // survives 0x4ea538 → 0x425a69.
-        for scales in copies {
+        for (load, scales) in copies {
+            // The lookup's load, if any, comes before the actor's copy.
+            for scales in load {
+                self.draws.skeleton(&scales);
+            }
             self.draws.skeleton(scales);
             self.draws.default_traits();
             for (word, value) in self.draws.default_traits() {
@@ -573,6 +583,110 @@ impl<'a, 'b> Fills<'a, 'b> {
         )?;
         self.made.push((file, iff));
         Ok((guid, age, gender))
+    }
+}
+
+/// The `.ndx` skeletons loaded after the startup scan.
+#[derive(Debug, Default)]
+struct LazySkeletons {
+    /// Those the pools loaded on first use, as [`OpenedPools`] reports:
+    /// each with its catalog, or `None` for a load that failed.
+    loaded: BTreeMap<String, Option<String>>,
+    /// The same, for the loads of [`PoolInput::loaded_skeletons`].
+    before: BTreeMap<String, Option<String>>,
+    /// The skeleton files the pools' loads read.
+    files: BTreeSet<String>,
+}
+
+impl LazySkeletons {
+    /// Registers `names`, loaded by earlier work, as their loads would,
+    /// leaving their draws out: they were made before the pool boundary.
+    fn loaded_before(skeletons: &Skeletons, names: &BTreeSet<String>) -> Result<Self, BootError> {
+        let mut lazy = Self::default();
+        for name in names {
+            lazy.load(skeletons, name)
+                .map_err(|error| format!("{error} (loaded before the pools)"))?;
+        }
+        Ok(Self {
+            before: lazy.loaded,
+            ..Self::default()
+        })
+    }
+
+    /// Looks up the skeleton `name` (0x5a0384) and, if the startup scan
+    /// did not load it and no earlier lookup has, loads it now (0x5a03cd
+    /// → 0x5a3810). Returns the bone scales whose builds the load draws,
+    /// in order, to come before the actor's copy.
+    ///
+    /// The load reads the skeleton's `.ndx` catalog (0x59e60e → 0x59f087),
+    /// which builds every skeleton in it, each drawing (0x59f107 →
+    /// 0x598af7), and registers those not already registered (0x59f18c);
+    /// this is `people::load_indexed_bcf_catalog_into`, the World's lazy
+    /// load. A lookup that fails marks the skeleton (0x5a389b).
+    fn load(&mut self, skeletons: &Skeletons, name: &str) -> Result<Vec<Vec<i32>>, String> {
+        if skeletons.eager.contains(name) {
+            return Ok(Vec::new());
+        }
+        let earlier = self.before.get(name).or(self.loaded.get(name));
+        match earlier {
+            Some(Some(_)) => return Ok(Vec::new()),
+            Some(None) => {
+                return Err(format!("0x5a389b: an earlier load of the skeleton {name:?} failed"));
+            }
+            None => {}
+        }
+        let failed = |loaded: &mut BTreeMap<String, Option<String>>, reason: String| {
+            loaded.insert(name.to_owned(), None);
+            Err(reason)
+        };
+        let location = match skeletons.indexed.get(name) {
+            Some(Ok(location)) => location,
+            Some(Err(reason)) => return failed(&mut self.loaded, reason.clone()),
+            None => return Err(format!("0x5a03c0: no skeleton {name:?} is registered")),
+        };
+        let Some((items, error)) = skeletons.catalogs.get(location) else {
+            return failed(
+                &mut self.loaded,
+                format!("0x5a3810: the catalog {location} for skeleton {name:?} is unavailable"),
+            );
+        };
+        if let Some(first) = items.first() {
+            self.files.insert(first.file.clone());
+        }
+        let builds = items
+            .iter()
+            .filter_map(|item| item.scales.get(item.place).cloned())
+            .collect();
+        for item in items {
+            if !skeletons.eager.contains(&item.name) && !self.before.contains_key(&item.name) {
+                self.loaded
+                    .entry(item.name.clone())
+                    .or_insert_with(|| Some(location.clone()));
+            }
+        }
+        if matches!(self.loaded.get(name), Some(Some(_))) {
+            return Ok(builds);
+        }
+        let reason = match error {
+            Some(error) => format!("0x5a3810: the skeletons of {location} do not decode ({error})"),
+            None => format!("0x5a03c0: {location} does not define skeleton {name:?}"),
+        };
+        failed(&mut self.loaded, reason)
+    }
+}
+
+/// A celebrity's sex follows its place in the family (0x42c6d7): the
+/// first seven are women, named from table 0xa6 ("Nora" by default), the
+/// rest men, from table 0xa5 ("Nomad"); the editor sets it (0x42cf5d →
+/// 0x4eaaba). Sex 1 is female.
+fn check_celebrity_sex(ordinal: usize, gender: i16) -> Result<(), String> {
+    let female = i16::from(ordinal <= 6);
+    if gender == female {
+        Ok(())
+    } else {
+        Err(format!(
+            "0x42c6d7: celebrity {ordinal} has sex {gender}; its place makes it {female}"
+        ))
     }
 }
 
@@ -675,4 +789,122 @@ fn read_profile(
     };
     reload_profile(data, &profile).map_err(|error| format!("0x5888d3: {error}"))?;
     Ok(skeleton)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_first_seven_celebrities_are_women() {
+        for ordinal in 0..=6 {
+            assert!(check_celebrity_sex(ordinal, 1).is_ok());
+            assert!(check_celebrity_sex(ordinal, 0).unwrap_err().starts_with("0x42c6d7"));
+        }
+        for ordinal in [7, 8, 20] {
+            assert!(check_celebrity_sex(ordinal, 0).is_ok());
+            assert!(check_celebrity_sex(ordinal, 1).is_err());
+        }
+    }
+
+    const A: u32 = 0x0a;
+    const B: u32 = 0x0b;
+    const GENERIC: u32 = 0x99;
+
+    fn specialties(new_family: bool) -> Specialties {
+        Specialties {
+            remaining: vec![A, B, A],
+            new_family,
+        }
+    }
+
+    #[test]
+    fn a_new_townie_family_takes_specialties_first() {
+        let mut townies = specialties(true);
+        let error = townies.take(GENERIC, 0, true, true).unwrap_err().to_string();
+        assert!(error.starts_with("0x42ac96"), "{error}");
+        // Duplicates are separate candidates, each used up once.
+        townies.take(A, 0, false, true).unwrap();
+        townies.take(A, 1, false, true).unwrap();
+        townies.take(B, 2, false, true).unwrap();
+        // With none left, the generic template fills the rest.
+        townies.take(GENERIC, 3, true, true).unwrap();
+        let error = townies.take(A, 4, false, true).unwrap_err().to_string();
+        assert!(error.starts_with("0x42ae8f"), "{error}");
+    }
+
+    #[test]
+    fn a_used_or_unresolved_specialty_is_not_picked_again() {
+        let mut townies = specialties(false);
+        // An existing family runs only the second phase: generic or a
+        // remaining specialty.
+        townies.take(GENERIC, 0, true, true).unwrap();
+        townies.take(B, 1, false, true).unwrap();
+        let error = townies.take(B, 2, false, true).unwrap_err().to_string();
+        assert!(error.starts_with("0x42ae8f"), "{error}");
+        assert!(townies.take(A, 3, false, false).is_err());
+    }
+
+    fn skeleton(name: &str, file: &str, place: usize, scales: &[Vec<i32>]) -> Skeleton {
+        Skeleton {
+            name: name.to_owned(),
+            file: file.to_owned(),
+            place,
+            scales: scales.to_vec(),
+            bones: Vec::new(),
+        }
+    }
+
+    /// `kat` and `dog` share an `.ndx` catalog; `adult` is eager.
+    fn registry() -> Skeletons {
+        let scales = [vec![1, 2], vec![1]];
+        let pets = vec![
+            skeleton("kat", "pets.bcf", 0, &scales),
+            skeleton("dog", "pets.bcf", 1, &scales),
+        ];
+        Skeletons {
+            eager: ["adult".to_owned()].into(),
+            indexed: [
+                ("kat".to_owned(), Ok("pets".to_owned())),
+                ("dog".to_owned(), Ok("pets".to_owned())),
+                ("bad".to_owned(), Err("blocked".to_owned())),
+            ]
+            .into(),
+            catalogs: [("pets".to_owned(), (pets, None))].into(),
+            ..Skeletons::default()
+        }
+    }
+
+    #[test]
+    fn a_skeleton_is_loaded_on_first_use_with_its_catalogs_draws() {
+        let skeletons = registry();
+        let mut lazy = LazySkeletons::default();
+        assert!(lazy.load(&skeletons, "adult").unwrap().is_empty());
+        // The first use builds every skeleton in the catalog, in order.
+        assert_eq!(lazy.load(&skeletons, "dog").unwrap(), [vec![1, 2], vec![1]]);
+        // Its sibling came with it, and neither loads again.
+        assert!(lazy.load(&skeletons, "kat").unwrap().is_empty());
+        assert!(lazy.load(&skeletons, "dog").unwrap().is_empty());
+        assert_eq!(lazy.files, BTreeSet::from(["pets.bcf".to_owned()]));
+        assert_eq!(lazy.loaded["kat"].as_deref(), Some("pets"));
+        // A blocked one fails, and is marked so it fails the same way after.
+        assert_eq!(lazy.load(&skeletons, "bad").unwrap_err(), "blocked");
+        assert!(lazy.load(&skeletons, "bad").unwrap_err().starts_with("0x5a389b"));
+        assert!(lazy.load(&skeletons, "nobody").unwrap_err().starts_with("0x5a03c0"));
+    }
+
+    #[test]
+    fn a_skeleton_loaded_before_the_pools_draws_nothing_there() {
+        let skeletons = registry();
+        let mut lazy =
+            LazySkeletons::loaded_before(&skeletons, &["kat".to_owned()].into()).unwrap();
+        assert!(lazy.load(&skeletons, "dog").unwrap().is_empty());
+        assert!(lazy.loaded.is_empty() && lazy.files.is_empty());
+    }
+
+    #[test]
+    fn a_new_family_past_ten_members_may_use_the_generic_template() {
+        let mut townies = specialties(true);
+        townies.take(GENERIC, 10, true, true).unwrap();
+    }
 }
