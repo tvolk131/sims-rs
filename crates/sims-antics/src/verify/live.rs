@@ -2786,8 +2786,8 @@ fn witnesses(
             let range = range_of(cond, id);
             let clamp = |v: i32| v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
             let low_end = match seed {
-                4 => nth_input % 2 == 0,
-                _ => nth_input % 2 == 1,
+                4 => nth_input.is_multiple_of(2),
+                _ => !nth_input.is_multiple_of(2),
             };
             nth_input += 1;
             let base = match seed {
