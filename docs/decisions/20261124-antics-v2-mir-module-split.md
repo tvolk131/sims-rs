@@ -117,7 +117,7 @@ Turning the remaining text emission sites (about 300 `self.line` calls in `lower
 
 That PR starts from the seams added here:
 
-- **`Emitter`.** `TreeLowerer` writes the lowered body (the text before the backend passes) through it, so it can start building `mir::Stmt` instead of text. Two kinds of text can be prepended outside it, both conditionally: the `__saved_stack_obj` entry save (in `finish`, when the body uses it), and zero or more `const` lines for constants that the emitted raw blocks reference (in `finish_body`). Which constants get a line is decided by a token scan in `lower/raw_consts.rs` and the filter in `finish_body`, unchanged from the base; this ADR does not restate those rules.
+- **`Emitter`.** `TreeLowerer` writes the lowered body (the text before the backend passes) through it, so it can start building `mir::Stmt` instead of text. Two kinds of text can be prepended outside it, both conditionally: the `__saved_stack_obj` entry save (in `finish`, when the body uses it), and zero or more `const` lines for constants whose names appear in the emitted raw blocks (in `finish_body`). Which constants get a line is decided by a token scan in `lower/raw_consts.rs` and the filter in `finish_body`, unchanged from the base; this ADR does not restate those rules.
 - **`InstKind`.** Today a view over the text; it can become a stored typed instruction.
 - **`StackObjOp`.** Generated `let X = stack_obj;` saves and plain `:=` writes of the stack object are already typed (raw `.air` and compound writes excepted).
 - **`FrameFacts`.** It carries the frame metadata.
