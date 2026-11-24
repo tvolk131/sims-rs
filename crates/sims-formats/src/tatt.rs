@@ -1,5 +1,6 @@
 //! Neighborhood TATT: GUID-keyed resource-global words (native 0x43e0f0).
-use crate::{Error, Result, field::Fields, reader::Reader};
+use crate::field::{FieldWriter, Fields};
+use crate::{Error, Result, reader::Reader};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,4 +90,30 @@ impl Tatt {
             consumed: stream.position(),
         })
     }
+
+    /// TATT #1 as the neighborhood save writes it (0x43e0be → 0x43f114,
+    /// version 0, serializer 0x43e0f0): the packed flag (always 1, set at
+    /// 0x43e105), then in packed fields the entry count, and for each
+    /// entry its GUID, its word count and its words. `version`, `packed`
+    /// and the reader's positions are not written.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut bytes = vec![0; 8];
+        bytes.extend(b"TTAT");
+        bytes.push(1);
+        let mut fields = FieldWriter::new();
+        fields.i32(count(self.entries.len())?);
+        for entry in &self.entries {
+            fields.u32(entry.guid);
+            fields.i32(count(entry.values.len())?);
+            for &value in &entry.values {
+                fields.i16(value);
+            }
+        }
+        bytes.extend(fields.finish());
+        Ok(bytes)
+    }
+}
+
+fn count(len: usize) -> Result<i32> {
+    i32::try_from(len).map_err(|_| Error::new(0, "TATT count exceeds 31 bits"))
 }

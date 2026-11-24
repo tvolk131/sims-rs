@@ -1,8 +1,8 @@
 //! Original family membership, neighbor identities, traits and relationships.
 //! Unknown fields are retained, including all 256 person words in newer saves.
 use crate::Result;
-use crate::lot::{header, padded_string};
-use crate::reader::Reader;
+use crate::lot::header;
+use crate::reader::{Out, Reader, western};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,7 +103,67 @@ impl Family {
         }
         true
     }
+    /// Reads a FAMI record as if it lists members. The original's reader
+    /// (0x4104ce) reads the member list only for a family whose ID is not
+    /// zero (0x4105e7), so for family 0 use [`Family::parse_chunk`].
     pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::parse_members(bytes, true)
+    }
+
+    /// Reads FAMI chunk `id` as the original does (0x410655 sets the
+    /// family's ID before 0x4104ce reads it): family 0 has no member list
+    /// (0x4105e7), so its record goes straight on to the secondary house.
+    pub fn parse_chunk(bytes: &[u8], id: u16) -> Result<Self> {
+        Self::parse_members(bytes, id != 0)
+    }
+
+    /// The record [`Family::parse_chunk`] would read for chunk `id` from
+    /// the bytes `self` was read from by [`Family::parse`]. Only family 0
+    /// differs: its "member count" was really the secondary house.
+    pub fn for_chunk(&self, id: u16) -> Result<Self> {
+        if id != 0 {
+            return Ok(self.clone());
+        }
+        let mut out = Out::header(self.version, b"IMAF");
+        self.fixed_fields(&mut out);
+        out.len32(self.members.len())?;
+        for &member in &self.members {
+            out.u32(member);
+        }
+        out.0.extend(&self.tail);
+        Self::parse_chunk(&out.0, 0)
+    }
+
+    /// FAMI chunk `id` as 0x410696 saves it: always version 9 (0x4106eb),
+    /// the member list only for a nonzero ID (0x4105e7), then the secondary
+    /// house (+0x13c) and the six magic words (+0x14e). A record of an
+    /// older version is upgraded as [`Family::upgrade_to_v9`] does, and tail
+    /// bytes past the magic words are not saved.
+    pub fn to_chunk(&self, id: u16) -> Result<Vec<u8>> {
+        let mut family = self.clone();
+        family.upgrade_to_v9();
+        let mut out = Out::header(9, b"IMAF");
+        family.fixed_fields(&mut out);
+        if id != 0 {
+            out.len32(family.members.len())?;
+            for &member in &family.members {
+                out.u32(member);
+            }
+        }
+        out.0.extend(&family.tail[..16]);
+        Ok(out.0)
+    }
+
+    fn fixed_fields(&self, out: &mut Out) {
+        out.i32(self.house);
+        out.i32(self.number);
+        out.i32(self.budget);
+        out.i32(self.architecture_value);
+        out.i32(self.friends);
+        out.u32(self.flags);
+    }
+
+    fn parse_members(bytes: &[u8], has_members: bool) -> Result<Self> {
         let mut r = Reader::new(bytes);
         let version = header(&mut r, b"IMAF")?;
         if !(7..=9).contains(&version) {
@@ -115,11 +175,14 @@ impl Family {
         let architecture_value = r.i32()?;
         let friends = r.i32()?;
         let flags = r.u32()?;
-        let count = r.u32()? as usize;
-        r.count(count, 4)?;
-        let mut members = Vec::with_capacity(count);
-        for _ in 0..count {
-            members.push(r.u32()?);
+        let mut members = Vec::new();
+        if has_members {
+            let count = r.u32()? as usize;
+            r.count(count, 4)?;
+            members.reserve(count);
+            for _ in 0..count {
+                members.push(r.u32()?);
+            }
         }
         let tail = r.take(r.remaining())?.to_vec();
         Ok(Self {
@@ -162,6 +225,14 @@ pub struct Neighbors {
 }
 impl Neighbors {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Ok(Self::parse_with_padding(bytes)?.0)
+    }
+
+    /// Reads NBRS and also returns each name's padding byte, in record
+    /// order, for a name that needed one. The writer leaves those bytes
+    /// uninitialized (0x464cd7).
+    pub fn parse_with_padding(bytes: &[u8]) -> Result<(Self, Vec<u8>)> {
+        let mut padding = Vec::new();
         let mut r = Reader::new(bytes);
         let version = header(&mut r, b"SRBN")?;
         let count = r.u32()? as usize;
@@ -181,7 +252,10 @@ impl Neighbors {
                 return r.fail(format!("unsupported neighbor version {version}"));
             }
             let version_extra = if version == 10 { Some(r.i32()?) } else { None };
-            let name = padded_string(&mut r)?;
+            let name = western(r.cstr()?);
+            if r.pos & 1 != 0 {
+                padding.push(r.u8()?);
+            }
             let unknown_zero = r.i32()?;
             let person_mode = r.i32()?;
             let mut person_data = Vec::new();
@@ -223,11 +297,70 @@ impl Neighbors {
             }));
         }
         let tail = r.take(r.remaining())?.to_vec();
-        Ok(Self {
-            version,
-            entries,
-            tail,
-        })
+        Ok((
+            Self {
+                version,
+                entries,
+                tail,
+            },
+            padding,
+        ))
+    }
+
+    /// NBRS as the neighborhood save writes it (0x43071e, serializer
+    /// 0x430ad6) at stream version 0x49: the slot count, then for each slot
+    /// a presence word and the record (0x423e08). Every record is written
+    /// at the current layout whatever version it was read at: the words 10
+    /// and 9 (0x423e1a, 0x423e34), the name, the word at +0x1c, the person
+    /// mode, 256 person words when the mode is nonzero (0x423e99; a record
+    /// read with 80 has the rest zero), the ID, the GUID, and the
+    /// relationship map in its new form (0x4650ee writes -1, then
+    /// 0x465543). `version` and `tail` are not written. Name padding
+    /// bytes are zero; see [`Neighbors::to_bytes_with_padding`].
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        self.to_bytes_with_padding(&[])
+    }
+
+    /// [`Neighbors::to_bytes`] with the bytes the writer leaves
+    /// uninitialized after the names that need padding, in record order
+    /// (zero past the end of `padding`).
+    pub fn to_bytes_with_padding(&self, padding: &[u8]) -> Result<Vec<u8>> {
+        let mut pads = padding.iter().copied();
+        let mut out = Out::header(0x49, b"SRBN");
+        out.len32(self.entries.len())?;
+        for entry in &self.entries {
+            let Some(neighbor) = entry else {
+                out.i32(0);
+                continue;
+            };
+            out.i32(1);
+            out.u32(10);
+            out.i32(9);
+            out.padded_string(&neighbor.name, || pads.next().unwrap_or(0))?;
+            out.i32(neighbor.unknown_zero);
+            out.i32(neighbor.person_mode);
+            if neighbor.person_mode != 0 {
+                if neighbor.person_data.len() > 256 {
+                    return Err(crate::Error::new(out.0.len(), "more than 256 person words"));
+                }
+                for index in 0..256 {
+                    out.i16(neighbor.person_data.get(index).copied().unwrap_or(0));
+                }
+            }
+            out.i16(neighbor.id);
+            out.u32(neighbor.guid);
+            out.i32(-1);
+            out.len32(neighbor.relationships.len())?;
+            for relationship in &neighbor.relationships {
+                out.u32(1);
+                out.i32(relationship.target);
+                out.len32(relationship.values.len())?;
+                for &value in &relationship.values {
+                    out.i32(value);
+                }
+            }
+        }
+        Ok(out.0)
     }
 }
 
@@ -295,14 +428,8 @@ impl Neighborhood {
             false, true, false, true, false, true, false, true, false, true, true,
         ];
         let mut option_bytes = Vec::new();
-        for (minimum, indices) in [
-            (66, &[0, 1][..]),
-            (68, &[2, 3][..]),
-            (69, &[10][..]),
-            (70, &[4, 5, 6, 7][..]),
-            (73, &[8, 9][..]),
-        ] {
-            if layout_version >= minimum {
+        for (minimum, indices) in OPTION_ORDER {
+            if layout_version >= minimum as i32 {
                 for &index in indices {
                     let value = r.u8()?;
                     options[index] = value != 0;
@@ -319,5 +446,60 @@ impl Neighborhood {
             option_bytes,
             tail,
         })
+    }
+}
+
+/// The option bytes in stream order with the NGBH version that added them
+/// (0x4254f6).
+const OPTION_ORDER: [(u32, &[usize]); 5] = [
+    (66, &[0, 1]),
+    (68, &[2, 3]),
+    (69, &[10]),
+    (70, &[4, 5, 6, 7]),
+    (73, &[8, 9]),
+];
+
+impl Neighborhood {
+    /// NGBH #1 as the neighborhood save writes it (0x4252cc passes its
+    /// version argument, 0x49, to the two-way serializer 0x4254f6): the
+    /// sixteen data words, the inventory vector (0x42feb2: a presence word
+    /// per slot, then the neighbor ID and the items), and the eleven
+    /// option bytes in stream order. The serializer writes the bytes in
+    /// memory, which are the bytes it read, so a byte from `option_bytes`
+    /// that still agrees with `options` is written as read; otherwise the
+    /// option is written as 0 or 1. `version` and `tail` are not written.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut out = Out::header(0x49, b"HBGN");
+        for &word in &self.data {
+            out.i16(word);
+        }
+        out.len32(self.inventories.len())?;
+        for slot in &self.inventories {
+            let Some(inventory) = slot else {
+                out.i32(0);
+                continue;
+            };
+            out.i32(1);
+            out.i16(inventory.neighbor);
+            out.len32(inventory.items.len())?;
+            for item in &inventory.items {
+                out.i32(item.kind);
+                out.u32(item.guid);
+                out.u16(item.count);
+            }
+        }
+        let mut read = self.option_bytes.iter();
+        for (_, indices) in OPTION_ORDER {
+            for &index in indices {
+                let option = self.options[index];
+                let byte = read
+                    .next()
+                    .copied()
+                    .filter(|&byte| (byte != 0) == option)
+                    .unwrap_or(u8::from(option));
+                out.u8(byte);
+            }
+        }
+        Ok(out.0)
     }
 }

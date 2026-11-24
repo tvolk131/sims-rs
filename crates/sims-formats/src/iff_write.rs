@@ -1,4 +1,5 @@
-//! One add or replacement on a freshly opened IFFResFile2, followed by close.
+//! Adds or replacements on an IFFResFile2, followed by close: one on an
+//! existing file, or a sequence into a newly created one.
 
 use crate::iff::{DELETED, Iff};
 use crate::reader::Reader;
@@ -39,51 +40,47 @@ pub fn write_chunk_with_residue<'a>(
     chunk: ChunkWrite<'_>,
     mut residue: impl FnMut(Range<usize>) -> Option<&'a [u8]>,
 ) -> Result<Vec<u8>> {
-    if chunk.tag == MAP || chunk.flags & !(0xff00 | CONVERTED) != 0 {
-        return Err(Error::new(
-            0,
-            "unsupported resource tag or flags at 0x419ed8",
-        ));
-    }
     let mut file = OpenFile::parse(bytes)?;
-    let label_end = chunk.label.iter().take(63).position(|&byte| byte == 0);
-    let label = &chunk.label[..label_end.unwrap_or(chunk.label.len().min(63))];
+    file.add(chunk, &mut residue)?;
+    file.finish(&mut residue)
+}
 
-    // 0x419ed8 searches the requested variant, then variant zero. It
-    // discards even a same-size old resource and keeps its slot in the table.
-    let group = file.types.iter().position(|group| group.tag == chunk.tag);
-    let slot = group.and_then(|group| {
-        let entries = &file.types[group].entries;
-        let find = |variant| {
-            entries
-                .iter()
-                .position(|entry| entry.id == chunk.id && entry.flags >> 8 == variant)
-        };
-        find(chunk.flags >> 8).or_else(|| find(0))
-    });
-    if let (Some(group), Some(slot)) = (group, slot) {
-        file.erase(file.types[group].entries[slot].offset)?;
-    }
-    if file.map_offset != 0 {
-        file.erase(file.map_offset)?;
-    }
-    let offset = file.reserve(chunk.payload.len(), &mut residue)?;
-    file.write(offset, ChunkWrite { label, ..chunk });
-
-    let entry = Entry {
-        offset,
-        id: chunk.id,
-        flags: chunk.flags,
-        label: label.to_vec(),
+/// Writes a new file the way a save into a freshly created IFFResFile2
+/// does (0x465949 creates it, each resource is added in turn, and the close
+/// at 0x46b6d2 writes the resource map). The file starts empty, so every
+/// resource lands at the end in the order given, and the map follows them.
+/// `residue` supplies the bytes the original leaves uninitialized, as for
+/// [`write_chunk_with_residue`]; a fresh file's only ones are the map's
+/// alignment bytes.
+///
+/// The map lists the types in `type_order` first, in that order, then any
+/// others in the order they were first added. The original's order for a
+/// new file is not insertion order (see
+/// [`crate::neighborhood_file`]), and its rule is untraced, so a caller
+/// that knows the order passes it.
+pub fn write_new_file<'a>(
+    chunks: &[ChunkWrite<'_>],
+    type_order: &[[u8; 4]],
+    mut residue: impl FnMut(Range<usize>) -> Option<&'a [u8]>,
+) -> Result<Vec<u8>> {
+    let mut bytes = SIGNATURE.to_vec();
+    bytes.resize(FILE_HEADER, 0);
+    let mut file = OpenFile {
+        bytes,
+        types: Vec::new(),
+        map_offset: 0,
+        cursor: FILE_HEADER,
+        unused: 0,
     };
-    match (group, slot) {
-        (Some(group), Some(slot)) => file.types[group].entries[slot] = entry,
-        (Some(group), None) => file.types[group].entries.push(entry),
-        _ => file.types.push(ResourceType {
-            tag: chunk.tag,
-            entries: vec![entry],
-        }),
+    for &chunk in chunks {
+        file.add(chunk, &mut residue)?;
     }
+    file.types.sort_by_key(|group| {
+        type_order
+            .iter()
+            .position(|&tag| tag == group.tag)
+            .unwrap_or(type_order.len())
+    });
     file.finish(&mut residue)
 }
 
@@ -108,6 +105,60 @@ struct OpenFile {
 }
 
 impl OpenFile {
+    /// One add or replacement (0x419ed8), without the close.
+    fn add<'a>(
+        &mut self,
+        chunk: ChunkWrite<'_>,
+        residue: &mut impl FnMut(Range<usize>) -> Option<&'a [u8]>,
+    ) -> Result<()> {
+        if chunk.tag == MAP || chunk.flags & !(0xff00 | CONVERTED) != 0 {
+            return Err(Error::new(
+                0,
+                "unsupported resource tag or flags at 0x419ed8",
+            ));
+        }
+        let label_end = chunk.label.iter().take(63).position(|&byte| byte == 0);
+        let label = &chunk.label[..label_end.unwrap_or(chunk.label.len().min(63))];
+
+        // 0x419ed8 searches the requested variant, then variant zero. It
+        // discards even a same-size old resource and keeps its slot in the table.
+        let group = self.types.iter().position(|group| group.tag == chunk.tag);
+        let slot = group.and_then(|group| {
+            let entries = &self.types[group].entries;
+            let find = |variant| {
+                entries
+                    .iter()
+                    .position(|entry| entry.id == chunk.id && entry.flags >> 8 == variant)
+            };
+            find(chunk.flags >> 8).or_else(|| find(0))
+        });
+        if let (Some(group), Some(slot)) = (group, slot) {
+            self.erase(self.types[group].entries[slot].offset)?;
+        }
+        if self.map_offset != 0 {
+            self.erase(self.map_offset)?;
+            self.map_offset = 0;
+        }
+        let offset = self.reserve(chunk.payload.len(), residue)?;
+        self.write(offset, ChunkWrite { label, ..chunk });
+
+        let entry = Entry {
+            offset,
+            id: chunk.id,
+            flags: chunk.flags,
+            label: label.to_vec(),
+        };
+        match (group, slot) {
+            (Some(group), Some(slot)) => self.types[group].entries[slot] = entry,
+            (Some(group), None) => self.types[group].entries.push(entry),
+            _ => self.types.push(ResourceType {
+                tag: chunk.tag,
+                entries: vec![entry],
+            }),
+        }
+        Ok(())
+    }
+
     fn parse(bytes: &[u8]) -> Result<Self> {
         let iff = Iff::parse(bytes.to_vec())?;
         let mut signature: [u8; 60] = iff.bytes[..60].try_into().unwrap();
