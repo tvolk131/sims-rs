@@ -175,14 +175,21 @@ struct ResolvedAbiParam {
     slot: AbiParamSlot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallContext {
+    ObjectSelf,
+    SimOnObject,
+    Inherit,
+    Extern,
+}
+
 /// Fully resolved call signature of an `extern mod` fn or a sibling standalone `tree`.
 #[derive(Debug, Clone)]
 struct CallableSig {
     /// Human-readable name for diagnostics (`light_globals::init_floor`, `tree 'is_fridge'`).
     display: String,
     id: u16,
-    /// `Some(true)` for Sim-on-object trees, `Some(false)` for object-self trees, `None` for externs.
-    sim_context: Option<bool>,
+    context: CallContext,
     params: Vec<ResolvedAbiParam>,
     ret: ResolvedReturnAbi,
     /// Argument words the callee's frame reads: `@frame(args:)` for a standalone tree, else
@@ -631,7 +638,7 @@ impl<'a> ObjectEnv<'a> {
         &self,
         display: String,
         id: u16,
-        sim_context: Option<bool>,
+        context: CallContext,
         params: &[AbiParam],
         ret: &ReturnAbi,
         decl_module: &str,
@@ -702,7 +709,7 @@ impl<'a> ObjectEnv<'a> {
         Ok(CallableSig {
             display,
             id,
-            sim_context,
+            context,
             params: out_params,
             ret,
             // An `extern` declares its callee's whole frame; standalone trees refine this from
@@ -2385,7 +2392,7 @@ fn resolve_variants(
                     })?;
                     // The VM runs a catalog entry's init/main as the object itself, with no
                     // arguments, like the primary's.
-                    if sig.sim_context != Some(false)
+                    if sig.context != CallContext::ObjectSelf
                         || !sig.params.is_empty()
                         || sig.frame_args.unwrap_or(0) > 4
                     {
@@ -2830,7 +2837,13 @@ fn resolve_tree_sigs(
         let mut sig = env.resolve_callable_sig(
             format!("tree '{}'", d.ident),
             0,
-            Some(d.sim_binding.is_some()),
+            if d.inherit_context {
+                CallContext::Inherit
+            } else if d.sim_binding.is_some() {
+                CallContext::SimOnObject
+            } else {
+                CallContext::ObjectSelf
+            },
             &d.params,
             &d.ret,
             &t.owner_module,
@@ -2855,6 +2868,33 @@ fn resolve_tree_sigs(
 
 /// Lowers and emits one standalone `tree` member as a real (non-inlined) BHAV.
 fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTree) -> Result<()> {
+    let air = lower_standalone_tree(env, t, false)?;
+    if t.decl.inherit_context {
+        // A private call inherits the runner and the current stack object. Check that lowering
+        // in either caller context selects the same physical cells, primitives, and callees.
+        // Both passes share the names of interned strings. Only the emitted pass adds entries.
+        let strings = env.dialog_strings.borrow().clone();
+        let sim_air = lower_standalone_tree(env, t, true);
+        *env.dialog_strings.borrow_mut() = strings;
+        let context_error = || {
+            format!(
+                "@context(inherit) tree '{}' depends on the caller's context (use explicit 'me' cells or 'stack_obj')",
+                t.decl.ident
+            )
+        };
+        if sim_air.map_err(|e| e.with_context(context_error()))? != air {
+            return Err(Error::at(t.decl.span, context_error()));
+        }
+    }
+    trees_air.push_str(&air);
+    Ok(())
+}
+
+fn lower_standalone_tree(
+    env: &ObjectEnv<'_>,
+    t: &OwnedTree,
+    checking_inherited_sim: bool,
+) -> Result<String> {
     let d = &t.decl;
     let sig = &env.trees[&d.ident];
     let frame = d.frame.unwrap_or_default();
@@ -2881,17 +2921,30 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
             ),
         ));
     }
-    let (tree_ctx, needs_self_save) = match &d.sim_binding {
+    // The check has no source-visible Sim binding. Track any use of an implicit saved self
+    // through the usual lowering, but omit the entry save itself. An inherited tree has no
+    // implicit entry save and may use raw code with pinned locals or numeric branch targets.
+    let sim_binding = if checking_inherited_sim {
+        Some("")
+    } else {
+        d.sim_binding.as_deref()
+    };
+    let (tree_ctx, needs_self_save) = match sim_binding {
         Some(sim) => (
             TreeContext::SimOnObject {
-                sim_name: sim.clone(),
+                sim_name: sim.to_owned(),
             },
             stmts_may_clobber_stack_obj(&d.body, env, &t.owner_module, true, Some(sim), 0),
         ),
         None => (TreeContext::ObjectSelf, false),
     };
     let mut ctx = TreeLowerer::new(env, tree_ctx, &t.owner_module, needs_self_save);
-    ctx.begin_body(ExplicitStackOps::default().in_stmts(&d.body, env, &t.owner_module, true));
+    let explicit = ExplicitStackOps::default().in_stmts(&d.body, env, &t.owner_module, true);
+    if checking_inherited_sim {
+        ctx.track_stack_obj(explicit);
+    } else {
+        ctx.begin_body(explicit);
+    }
     ctx.frame_locals = d.frame.and_then(|f| f.locals);
     ctx.frame_args = d.frame.and_then(|f| f.args).map_or_else(
         || {
@@ -3025,6 +3078,7 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
             ));
         }
     }
+    let mut trees_air = String::new();
     if header.is_empty() {
         let _ = writeln!(trees_air, "tree {} \"{label}\" {{", sig.id);
     } else {
@@ -3037,7 +3091,7 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
     }
     trees_air.push_str(&body);
     trees_air.push_str("}\n\n");
-    Ok(())
+    Ok(trees_air)
 }
 
 /// The frame locals `.air` allocates for a lowered tree body: one per `let` / `local` name,
@@ -3892,12 +3946,16 @@ impl<'a> TreeLowerer<'a> {
     }
 
     fn begin_body(&mut self, explicit_stack_obj: bool) {
-        self.explicit_stack_obj = explicit_stack_obj;
-        self.has_self_obj_local |=
-            explicit_stack_obj && matches!(self.tree_ctx, TreeContext::SimOnObject { .. });
+        self.track_stack_obj(explicit_stack_obj);
         if self.has_self_obj_local {
             self.line("let __self_obj = stack_obj;".to_owned());
         }
+    }
+
+    fn track_stack_obj(&mut self, explicit_stack_obj: bool) {
+        self.explicit_stack_obj = explicit_stack_obj;
+        self.has_self_obj_local |=
+            explicit_stack_obj && matches!(self.tree_ctx, TreeContext::SimOnObject { .. });
     }
 
     fn in_defer(&self) -> bool {
@@ -4087,7 +4145,7 @@ impl<'a> TreeLowerer<'a> {
                     .resolve_callable_sig(
                         format!("{}::{}", segs[0], segs[1]),
                         f.id,
-                        None,
+                        CallContext::Extern,
                         &f.params,
                         &f.ret,
                         &decl_mod,
@@ -4109,8 +4167,8 @@ impl<'a> TreeLowerer<'a> {
         span: Span,
     ) -> Result<String> {
         let mut args = args;
-        match sig.sim_context {
-            Some(true) => {
+        match sig.context {
+            CallContext::SimOnObject => {
                 if !matches!(self.tree_ctx, TreeContext::SimOnObject { .. }) {
                     return Err(Error::at(
                         span,
@@ -4135,7 +4193,7 @@ impl<'a> TreeLowerer<'a> {
                 }
                 args = &args[1..];
             }
-            Some(false) if !matches!(self.tree_ctx, TreeContext::ObjectSelf) => {
+            CallContext::ObjectSelf if !matches!(self.tree_ctx, TreeContext::ObjectSelf) => {
                 return Err(Error::at(
                     span,
                     format!(
@@ -4144,7 +4202,7 @@ impl<'a> TreeLowerer<'a> {
                     ),
                 ));
             }
-            Some(false) | None => {}
+            CallContext::ObjectSelf | CallContext::Inherit | CallContext::Extern => {}
         }
 
         // Match arguments to parameters (positional first, then by name).
@@ -4739,6 +4797,10 @@ impl<'a> TreeLowerer<'a> {
 
     fn is_sim_ident(&self, name: &str) -> bool {
         matches!(self.lookup_var(name), Some(Binding::SimHandle))
+    }
+
+    fn is_frame_me(&self, name: &str) -> bool {
+        name == "me" && self.lookup_var(name).is_none()
     }
 
     fn is_self_ident(&self, name: &str) -> bool {
@@ -10549,7 +10611,8 @@ impl<'a> TreeLowerer<'a> {
                             "'sim' is not available in init/main (object lifecycle context)",
                         ));
                     }
-                    if self.is_sim_ident(rname) && field == "motive" {
+                    let is_my_cell = self.is_sim_ident(rname) || self.is_frame_me(rname);
+                    if is_my_cell && field == "motive" {
                         let m = self.resolve_motive_expr(index)?;
                         return Ok(LValue::Direct {
                             air: format!("my.motive[{m}]"),
@@ -10563,9 +10626,7 @@ impl<'a> TreeLowerer<'a> {
                             ty: ValueType::I16,
                         });
                     }
-                    if self.is_sim_ident(rname)
-                        && matches!(field.as_str(), "slot" | "person" | "attr" | "data")
-                    {
+                    if is_my_cell && matches!(field.as_str(), "slot" | "person" | "attr" | "data") {
                         let idx = self.eval_builtin_int(
                             index,
                             &format!("{rname}.{field} index"),
@@ -12434,6 +12495,7 @@ impl<'a> TreeLowerer<'a> {
                                 root.as_ref(),
                                 V2Expr::Ident(_, rname) if self.is_self_ident(rname)
                                     || self.is_sim_ident(rname)
+                                    || self.is_frame_me(rname)
                                     || rname == "stack_obj"
                             )
                     }
