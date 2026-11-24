@@ -2676,6 +2676,17 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
                 ),
             ));
         }
+        // Formats 0x8000 and 0x8001 give a call frame at most four arguments.
+        let args = frame.args.map_or(positional, usize::from);
+        if format != 0x8002 && args > 4 {
+            return Err(Error::at(
+                frame.span,
+                format!(
+                    "@frame(format: {format:#06x}) on tree '{}' allows at most 4 arguments, not {args}",
+                    d.ident
+                ),
+            ));
+        }
         header.push(format!("format: {format:#06x}"));
     }
     if let Some(revision) = frame.revision {
@@ -3288,7 +3299,21 @@ struct ScopeFrame {
     /// a defer-local loop from breaks attempting to escape out of a `defer` block).
     owner_defer_id: Option<usize>,
     cancel_flag: Option<String>,
-    repeat_counter: Option<String>,
+    /// What `continue` must do before jumping back to the loop head.
+    continue_step: Option<ContinueStep>,
+}
+
+/// Work a `continue` emits before it jumps back to the loop head.
+#[derive(Debug, Clone)]
+enum ContinueStep {
+    /// `repeat`: bump the iteration counter.
+    Counter(String),
+    /// Edge-safe range loop: leave after the last value, otherwise step the cursor.
+    Range {
+        var: String,
+        last: String,
+        step: &'static str,
+    },
 }
 
 impl ScopeFrame {
@@ -3300,7 +3325,7 @@ impl ScopeFrame {
             is_air_while: false,
             owner_defer_id: None,
             cancel_flag: None,
-            repeat_counter: None,
+            continue_step: None,
         }
     }
 }
@@ -3431,6 +3456,16 @@ impl<'a> TreeLowerer<'a> {
     }
 
     /// Resolves a `tree_ident(...)` / `extern_mod::fn_name(...)` call target, if `callee` is one.
+    /// Whether a user `fn`, `tree`, or `extern` answers to `callee` (it then wins over a builtin
+    /// of the same name).
+    fn user_callable_named(&self, callee: &V2Expr, span: Span) -> Result<bool> {
+        if self.resolve_callable(callee, span)?.is_some() {
+            return Ok(true);
+        }
+        Ok(matches!(callee, V2Expr::Ident(_, name)
+            if self.env.lookup_fn(&self.owner_module, name, self.in_object_scope).is_some()))
+    }
+
     fn resolve_callable(&self, callee: &V2Expr, span: Span) -> Result<Option<CallableSig>> {
         match callee {
             V2Expr::Ident(_, name) => {
@@ -4103,10 +4138,24 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
         self.emit_cleanups_down_to(loop_idx)?;
-        if is_continue && let Some(counter) = self.cleanup_scopes[loop_idx].repeat_counter.clone() {
-            self.line(format!("{counter} += 1;"));
+        if is_continue && let Some(step) = self.cleanup_scopes[loop_idx].continue_step.clone() {
+            self.emit_continue_step(&step);
         }
         Ok(())
+    }
+
+    fn emit_continue_step(&mut self, step: &ContinueStep) {
+        match step {
+            ContinueStep::Counter(counter) => self.line(format!("{counter} += 1;")),
+            ContinueStep::Range { var, last, step } => {
+                self.line(format!("if {var} == {last} {{"));
+                self.indent += 1;
+                self.line("break;".to_owned());
+                self.indent -= 1;
+                self.line("}".to_owned());
+                self.line(format!("{var} {step} 1;"));
+            }
+        }
     }
 
     fn emit_cancel_propagation(&mut self) -> Result<()> {
@@ -4247,17 +4296,39 @@ impl<'a> TreeLowerer<'a> {
                 Ok(())
             }
             V2Stmt::Animate {
-                span: _,
+                span,
                 args,
                 event,
                 body,
-            } => self.lower_animate_stmt(args, event.as_deref(), body),
+            } => {
+                // A user `fn`/`tree`/`extern` named `animate` wins over the builtin.
+                let callee = V2Expr::Ident(*span, "animate".to_owned());
+                if self.user_callable_named(&callee, *span)? {
+                    if event.is_some() {
+                        return Err(Error::at(
+                            *span,
+                            "'animate(...) |event| { ... }' is the builtin form, but a user function named 'animate' shadows it",
+                        ));
+                    }
+                    return self.lower_stmt(&V2Stmt::Expr {
+                        span: *span,
+                        expr: V2Expr::Call {
+                            span: *span,
+                            callee: Box::new(callee),
+                            type_args: Vec::new(),
+                            args: args.clone(),
+                        },
+                    });
+                }
+                self.lower_animate_stmt(*span, args, event.as_deref(), body)
+            }
             V2Stmt::Assign {
                 span,
                 target,
                 op,
                 value,
             } => {
+                self.reject_read_only_sim_slot(target)?;
                 let lval = self.resolve_lvalue(target)?;
                 let target_ty = lval.value_type().clone();
                 // Handle bitflags `flag_set` / `flag_clear` explicitly (1-based bit index!).
@@ -4378,7 +4449,7 @@ impl<'a> TreeLowerer<'a> {
                     is_air_while: false,
                     owner_defer_id: self.current_defer_id,
                     cancel_flag: None,
-                    repeat_counter: None,
+                    continue_step: None,
                 });
                 let res = self.lower_stmts(body);
                 let pop_res = if stmts_always_return(
@@ -4451,7 +4522,7 @@ impl<'a> TreeLowerer<'a> {
                     is_air_while: true,
                     owner_defer_id: self.current_defer_id,
                     cancel_flag: cancel_flag.clone(),
-                    repeat_counter: Some(counter.clone()),
+                    continue_step: Some(ContinueStep::Counter(counter.clone())),
                 });
                 if let Some(flag) = &cancel_flag {
                     self.line("if my.person.priority == 0 {".to_owned());
@@ -4498,6 +4569,13 @@ impl<'a> TreeLowerer<'a> {
                         "'cancel_on_abort' is not allowed inside a 'defer' block",
                     ));
                 }
+                let folded = self
+                    .try_eval_const_bool_inner(cond, true)
+                    .or_else(|| self.try_fold_literal_cond(cond));
+                // A constant-false loop never runs: its body is only checked.
+                if folded == Some(false) {
+                    return self.check_dead_branch_as(body, true);
+                }
                 let cancel_flag = if *cancel_on_abort {
                     let f = self.fresh("abort");
                     self.line(format!("let {f} = 0;"));
@@ -4505,9 +4583,9 @@ impl<'a> TreeLowerer<'a> {
                 } else {
                     None
                 };
-                // `loop { }` / `while true { }` lower to `.air` `while true`, which has no
-                // condition node at all.
-                let header = if self.try_eval_const_bool_inner(cond, true) == Some(true) {
+                // `loop { }` / `while true { }` (or a literal-true comparison) lower to `.air`
+                // `while true`, which has no condition node at all.
+                let header = if folded == Some(true) {
                     Some("true".to_owned())
                 } else if self.is_pure_simple_air_cond(cond) {
                     self.try_lower_simple_air_cond(cond)?
@@ -4524,7 +4602,7 @@ impl<'a> TreeLowerer<'a> {
                         is_air_while: true,
                         owner_defer_id: self.current_defer_id,
                         cancel_flag: cancel_flag.clone(),
-                        repeat_counter: None,
+                        continue_step: None,
                     });
                     if let Some(flag) = &cancel_flag {
                         self.line("if my.person.priority == 0 {".to_owned());
@@ -4549,7 +4627,7 @@ impl<'a> TreeLowerer<'a> {
                         is_air_while: true,
                         owner_defer_id: self.current_defer_id,
                         cancel_flag: cancel_flag.clone(),
-                        repeat_counter: None,
+                        continue_step: None,
                     });
                     if let Some(flag) = &cancel_flag {
                         self.line("if my.person.priority == 0 {".to_owned());
@@ -4685,7 +4763,7 @@ impl<'a> TreeLowerer<'a> {
                     is_air_while: true,
                     owner_defer_id: self.current_defer_id,
                     cancel_flag: None,
-                    repeat_counter: None,
+                    continue_step: None,
                 });
                 self.bind_var(
                     binding.clone(),
@@ -4710,17 +4788,13 @@ impl<'a> TreeLowerer<'a> {
                 then_body,
                 else_body,
             } => {
-                // Constant-fold literal boolean conditions (e.g. from `bool` params!).
-                if let Some(const_b) = self.try_eval_const_bool(cond) {
-                    let chosen = if const_b { then_body } else { else_body };
-                    self.push_scope(ScopeFrame::block());
-                    let r = self.lower_stmts(chosen);
-                    let p = self.pop_scope_and_run_cleanups();
-                    return r.and(p);
-                }
-                // Literal comparisons (`kind == Menu::Meal` with a constant helper argument) fold
-                // too; the untaken branch is still lowered (and discarded) so it stays checked.
-                if let Some(const_b) = self.try_fold_literal_cond(cond) {
+                // Constant-fold literal boolean conditions (e.g. from `bool` params) and literal
+                // comparisons (`kind == Menu::Meal` with a constant helper argument). The
+                // untaken branch is still lowered (and discarded) so it stays checked.
+                if let Some(const_b) = self
+                    .try_eval_const_bool(cond)
+                    .or_else(|| self.try_fold_literal_cond(cond))
+                {
                     let (chosen, dead) = if const_b {
                         (then_body, else_body)
                     } else {
@@ -4956,9 +5030,18 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
-    /// `for i in a..b` → `i := a - 1; while i inc_lt b { ... }` and `(a..b).rev()` →
-    /// `i := b; while i dec_gt a - 1 { ... }` (one node per iteration). Non-literal bounds are
-    /// read once, before the loop; the loop variable is read-only.
+    /// Counted `for` loops. The VM's `inc_lt` / `dec_gt` step the cursor with i16 wrap-around and
+    /// then compare, so a range whose adjusted bounds stay inside i16 lowers to one node per
+    /// iteration:
+    /// - `a..b` → `i := a - 1; while i inc_lt b { ... }` (`a - 1` may wrap; still exact);
+    /// - `a..=b` → the same with `b + 1` (literal `b < 32767` only);
+    /// - `(a..b).rev()` → `i := b; while i dec_gt a - 1 { ... }` (literal bounds above -32768);
+    /// - `(a..=b).rev()` → the same with `b + 1` (literal `b < 32767` too).
+    ///
+    /// Every other range (a run-time inclusive or reversed bound, or a literal one at the i16
+    /// edge) uses the edge-safe form `if a < b { i := first; while true { ...; if i == last {
+    /// break; } i ±= 1; } }`, which never steps past the last value. Non-literal bounds are read
+    /// once, start first; the loop variable is read-only.
     fn lower_range_for(
         &mut self,
         binding: &str,
@@ -4974,16 +5057,15 @@ impl<'a> TreeLowerer<'a> {
                 format!("the range loop variable '{binding}' is read-only"),
             ));
         }
-        // `start` is evaluated before `end` (Rust's order). Each bound becomes either a literal
-        // (adjusted at compile time) or a fresh local (adjusted at run time).
-        let bound = |c: &mut Self, expr: &V2Expr, delta: i16| -> Result<String> {
+        enum Bound {
+            Lit(i16),
+            Local(String),
+        }
+        let snapshot = |c: &mut Self, expr: &V2Expr| -> Result<Bound> {
             if let Some((air, v)) = c.try_const_i16_air_operand(expr)?
                 && air.parse::<i16>().is_ok()
             {
-                return v
-                    .checked_add(delta)
-                    .map(|n| n.to_string())
-                    .ok_or_else(|| Error::at(expr.span(), "range bound overflows i16"));
+                return Ok(Bound::Lit(v));
             }
             let (air, ty) = c.lower_value_expr(expr)?;
             if ty != ValueType::I16 {
@@ -4997,25 +5079,82 @@ impl<'a> TreeLowerer<'a> {
             }
             let local = c.fresh("range");
             c.line(format!("let {local} = {air};"));
-            match delta {
-                0 => {}
-                d if d > 0 => c.line(format!("{local} += {d};")),
-                d => c.line(format!("{local} -= {};", -d)),
-            }
-            Ok(local)
+            Ok(Bound::Local(local))
         };
+        let lo = snapshot(self, start)?;
+        let hi = snapshot(self, end)?;
         let iter_var = self.fresh(&format!("v_{binding}"));
-        if rev {
-            // Counts down from the last value; the cursor starts one past it.
-            let lo = bound(self, start, -1)?;
-            let hi = bound(self, end, i16::from(inclusive))?;
-            self.line(format!("let {iter_var} = {hi};"));
-            self.line(format!("while {iter_var} dec_gt {lo} {{"));
+        let one_node = match (&lo, &hi, rev) {
+            (_, _, false) if !inclusive => true,
+            (_, Bound::Lit(h), false) => *h < i16::MAX,
+            (Bound::Lit(l), Bound::Lit(h), true) => {
+                *l > i16::MIN
+                    && (if inclusive {
+                        *h < i16::MAX
+                    } else {
+                        *h > i16::MIN
+                    })
+            }
+            _ => false,
+        };
+        // Adjusts a bound by ±1 for the one-node form (wrapping, like the VM's own step).
+        let adjust = |c: &mut Self, b: &Bound, delta: i16| -> String {
+            match b {
+                Bound::Lit(v) => v.wrapping_add(delta).to_string(),
+                Bound::Local(local) => {
+                    match delta {
+                        0 => {}
+                        1 => c.line(format!("{local} += 1;")),
+                        _ => c.line(format!("{local} -= 1;")),
+                    }
+                    local.clone()
+                }
+            }
+        };
+        let air = |b: &Bound| match b {
+            Bound::Lit(v) => v.to_string(),
+            Bound::Local(l) => l.clone(),
+        };
+        let mut edge_step = None;
+        if one_node {
+            let lo_adj = adjust(self, &lo, -1);
+            let hi_adj = adjust(self, &hi, i16::from(inclusive));
+            if rev {
+                self.line(format!("let {iter_var} = {hi_adj};"));
+                self.line(format!("while {iter_var} dec_gt {lo_adj} {{"));
+            } else {
+                self.line(format!("let {iter_var} = {lo_adj};"));
+                self.line(format!("while {iter_var} inc_lt {hi_adj} {{"));
+            }
         } else {
-            let lo = bound(self, start, -1)?;
-            let hi = bound(self, end, i16::from(inclusive))?;
-            self.line(format!("let {iter_var} = {lo};"));
-            self.line(format!("while {iter_var} inc_lt {hi} {{"));
+            let (lo_air, hi_air) = (air(&lo), air(&hi));
+            let cmp = if inclusive { "<=" } else { "<" };
+            self.line(format!("if {lo_air} {cmp} {hi_air} {{"));
+            self.indent += 1;
+            // Inside the guard the range is non-empty, so `b - 1` cannot wrap.
+            let last_hi = if inclusive {
+                hi_air
+            } else {
+                match &hi {
+                    Bound::Lit(v) => v.wrapping_sub(1).to_string(),
+                    Bound::Local(local) => {
+                        self.line(format!("{local} -= 1;"));
+                        local.clone()
+                    }
+                }
+            };
+            let (first, last, step) = if rev {
+                (last_hi, lo_air, "-=")
+            } else {
+                (lo_air, last_hi, "+=")
+            };
+            self.line(format!("let {iter_var} = {first};"));
+            self.line("while true {".to_owned());
+            edge_step = Some(ContinueStep::Range {
+                var: iter_var.clone(),
+                last,
+                step,
+            });
         }
         self.indent += 1;
         self.push_scope(ScopeFrame {
@@ -5025,7 +5164,7 @@ impl<'a> TreeLowerer<'a> {
             is_air_while: true,
             owner_defer_id: self.current_defer_id,
             cancel_flag: None,
-            repeat_counter: None,
+            continue_step: edge_step.clone(),
         });
         self.bind_var(
             binding.to_owned(),
@@ -5036,8 +5175,15 @@ impl<'a> TreeLowerer<'a> {
         );
         let res = self.lower_stmts(body);
         let pop_res = self.pop_scope_and_run_cleanups();
+        if let Some(step) = &edge_step {
+            self.emit_continue_step(step);
+        }
         self.indent -= 1;
         self.line("}".to_owned());
+        if edge_step.is_some() {
+            self.indent -= 1;
+            self.line("}".to_owned());
+        }
         res.and(pop_res)?;
         self.emit_inline_fn_return_propagation()?;
         self.emit_cancel_propagation()?;
@@ -5965,11 +6111,15 @@ impl<'a> TreeLowerer<'a> {
             } => {
                 if let V2Expr::Ident(_, fname) = callee.as_ref()
                     && fname == "create_object"
+                    && !self.user_callable_named(callee, *span)?
                 {
-                    // Both edges continue; the new object is dropped and `stack_obj` restored.
+                    // Both edges continue; the new object is dropped and `stack_obj` gets back
+                    // the value it had before the call.
                     let (prim, _) = self.format_create_object(type_args, args, *span)?;
+                    let pre = self.fresh("pre_stack_obj");
+                    self.line(format!("let {pre} = stack_obj;"));
                     self.line(format!("{prim};"));
-                    self.emit_restore_stack_obj();
+                    self.line(format!("stack_obj := {pre};"));
                     return Ok(());
                 }
                 if !type_args.is_empty() {
@@ -6241,7 +6391,17 @@ impl<'a> TreeLowerer<'a> {
             V2Expr::Ident(_, name)
                 if self.lookup_var(name).is_none() && self.const_item(name).is_some() =>
             {
-                self.const_item(name).unwrap_or_default()
+                // A `const` that does not fit in i16 is a GUID, not a number.
+                let v = self.const_item(name).unwrap_or_default();
+                if i16::try_from(v).is_err() {
+                    return Err(Error::at(
+                        expr.span(),
+                        format!(
+                            "const '{name}' ({v:#x}) does not fit in i16; use it where a GUID is expected"
+                        ),
+                    ));
+                }
+                v
             }
             _ => match self.literal_compare_operand(expr) {
                 Some((_, v)) => i64::from(v),
@@ -6340,6 +6500,13 @@ impl<'a> TreeLowerer<'a> {
                 flags |= 0x20;
                 Some(self.builtin_local_arg(&a.value, "animate(local:)")?)
             }
+            None if flags & 0x20 != 0 => {
+                let a = named.get("flags").expect("flags were given");
+                return Err(Error::at(
+                    a.span,
+                    "animate flags 0x20 store events in a local; name it with 'local:' instead",
+                ));
+            }
             None => None,
         };
         let mut text =
@@ -6355,10 +6522,19 @@ impl<'a> TreeLowerer<'a> {
     /// (runs the body once per event). Both lower to `while !animate(...) { ... }`.
     fn lower_animate_stmt(
         &mut self,
+        span: Span,
         args: &[CallArg],
         event: Option<&str>,
         body: &[V2Stmt],
     ) -> Result<()> {
+        if let Some(name) = event
+            && stmts_mutate_or_borrow_ident(body, name)
+        {
+            return Err(Error::at(
+                span,
+                format!("the animation event '{name}' is read-only"),
+            ));
+        }
         let (prim, local) = self.format_animate(args)?;
         self.line(format!("while !{prim} {{"));
         self.indent += 1;
@@ -6369,7 +6545,7 @@ impl<'a> TreeLowerer<'a> {
             is_air_while: true,
             owner_defer_id: self.current_defer_id,
             cancel_flag: None,
-            repeat_counter: None,
+            continue_step: None,
         });
         if let Some(name) = event {
             let binding = match local {
@@ -6437,13 +6613,21 @@ impl<'a> TreeLowerer<'a> {
                         "random_into(x, n) expects 2 positional arguments",
                     ));
                 }
-                let (range_air, range_ty) = self.lower_value_expr(&range.value)?;
+                let (mut range_air, range_ty) = self.lower_value_expr(&range.value)?;
                 if range_ty != ValueType::I16 {
                     return Err(Error::at(
                         range.span,
                         "random_into(x, n): 'n' must be an i16",
                     ));
                 }
+                // The VM's Random Number writes the draw into a global range operand (the
+                // original's pointer aliasing on global 34), so a global range is copied first.
+                if range_air.starts_with("global[") {
+                    let tmp = self.fresh("rnd_range");
+                    self.line(format!("let {tmp} = {range_air};"));
+                    range_air = tmp;
+                }
+                self.reject_read_only_sim_slot(&dst.value)?;
                 let lval = self.resolve_lvalue(&dst.value)?;
                 let LValue::Direct { air, ty } = lval else {
                     return Err(Error::at(
@@ -6469,21 +6653,74 @@ impl<'a> TreeLowerer<'a> {
         };
         let allowed: Vec<&str> = spec.keys.iter().map(|(k, _, _)| *k).collect();
         let named = self.builtin_named_args(fname, args, &allowed)?;
+        // Flag bits that make the VM read an operand as a local slot index. `icon:` names its
+        // local by variable and sets its bit; operand forms v2 cannot spell by name are rejected.
+        let (local_bits, implied_bits): (&[(i64, &str)], i64) = match fname {
+            "push_interaction" => (
+                &[
+                    (
+                        0x01,
+                        "reads the icon from a local; name it with 'icon:' instead",
+                    ),
+                    (
+                        0x02,
+                        "reads the object from a local slot, which v2 cannot name; 'object:' is a parameter index",
+                    ),
+                ],
+                if named.contains_key("icon") { 0x01 } else { 0 },
+            ),
+            "special_effect" => (
+                &[(
+                    0x20,
+                    "reads the duration from a local slot, which v2 cannot name",
+                )],
+                0,
+            ),
+            _ => (&[], 0),
+        };
+        if let Some(a) = named.get("flags") {
+            let flags = self.eval_builtin_int(&a.value, &format!("{fname} flags"), 0, 65535)?;
+            for &(bit, why) in local_bits {
+                if flags & bit != 0 && implied_bits & bit == 0 {
+                    return Err(Error::at(a.span, format!("{fname} flags {bit:#04x} {why}")));
+                }
+            }
+        }
         let mut parts = Vec::new();
         for &(key, air_key, kind) in spec.keys {
             let Some(a) = named.get(key) else {
+                if key == "flags" && implied_bits != 0 {
+                    parts.push(format!("{air_key}: {implied_bits}"));
+                }
                 continue;
             };
             let what = format!("{fname} {key}");
             let text = match kind {
+                PrimArg::Int(lo, hi) if key == "flags" && implied_bits != 0 => {
+                    (self.eval_builtin_int(&a.value, &what, lo, hi)? | implied_bits).to_string()
+                }
                 PrimArg::Int(lo, hi) => self.eval_builtin_int(&a.value, &what, lo, hi)?.to_string(),
                 PrimArg::Bool => self.eval_const_bool_required(&a.value, a.span)?.to_string(),
                 PrimArg::Guid => format!("{:#010x}", self.resolve_guid_expr(&a.value)?),
                 PrimArg::Local => self.builtin_local_arg(&a.value, &format!("{fname}({key}:)"))?,
-                PrimArg::RefreshTarget => match &a.value {
-                    V2Expr::Ident(_, n) if self.is_self_ident(n) => "me".to_owned(),
-                    V2Expr::Ident(_, n) if n == "stack_obj" => "stack_obj".to_owned(),
-                    other => self.eval_builtin_int(other, &what, 0, 1)?.to_string(),
+                // `refresh` names the running frame's object (`me`) or its stack object. In a
+                // Sim-on-object tree `me` is the Sim and the object is the stack object.
+                PrimArg::RefreshTarget => match (&a.value, &self.tree_ctx) {
+                    (V2Expr::Ident(_, n), TreeContext::ObjectSelf) if self.is_self_ident(n) => {
+                        "me".to_owned()
+                    }
+                    (V2Expr::Ident(_, n), TreeContext::SimOnObject { .. })
+                        if self.is_self_ident(n) =>
+                    {
+                        "stack_obj".to_owned()
+                    }
+                    (V2Expr::Ident(_, n), TreeContext::SimOnObject { .. })
+                        if self.is_sim_ident(n) =>
+                    {
+                        "me".to_owned()
+                    }
+                    (V2Expr::Ident(_, n), _) if n == "stack_obj" => "stack_obj".to_owned(),
+                    (other, _) => self.eval_builtin_int(other, &what, 0, 1)?.to_string(),
                 },
             };
             parts.push(format!("{air_key}: {text}"));
@@ -6926,7 +7163,10 @@ impl<'a> TreeLowerer<'a> {
             }
             V2Type::MutRef(inner) => {
                 let mut lval = match arg_expr {
-                    V2Expr::MutRef { inner: place, .. } => self.resolve_lvalue(place)?,
+                    V2Expr::MutRef { inner: place, .. } => {
+                        self.reject_read_only_sim_slot(place)?;
+                        self.resolve_lvalue(place)?
+                    }
                     V2Expr::Ident(_, pname) => match self.lookup_var(pname).cloned() {
                         Some(Binding::MutRef { target }) => target,
                         _ => {
@@ -7283,7 +7523,7 @@ impl<'a> TreeLowerer<'a> {
                     is_air_while: false,
                     owner_defer_id: c.current_defer_id,
                     cancel_flag: None,
-                    repeat_counter: None,
+                    continue_step: None,
                 });
                 let r = c.lower_stmts(prefix).and_then(|()| {
                     if let Some(text) = c.try_lower_simple_air_cond(tail)? {
@@ -7346,7 +7586,7 @@ impl<'a> TreeLowerer<'a> {
                     is_air_while: true,
                     owner_defer_id: c.current_defer_id,
                     cancel_flag: None,
-                    repeat_counter: None,
+                    continue_step: None,
                 });
                 let r = c.lower_stmts(&fn_decl.body);
                 let p = c.pop_scope_and_run_cleanups();
@@ -7362,7 +7602,7 @@ impl<'a> TreeLowerer<'a> {
                     is_air_while: false,
                     owner_defer_id: c.current_defer_id,
                     cancel_flag: None,
-                    repeat_counter: None,
+                    continue_step: None,
                 });
                 let r = c.lower_stmts(&fn_decl.body);
                 let p = c.pop_scope_and_run_cleanups();
@@ -7386,6 +7626,32 @@ impl<'a> TreeLowerer<'a> {
             };
             (rv, vty)
         }))
+    }
+
+    /// A Sim's slots (`sim.hand`, `sim.slot[i]`) can be read but not written: the VM's slot
+    /// scope has no write path.
+    fn reject_read_only_sim_slot(&self, target: &V2Expr) -> Result<()> {
+        let (span, name, what) = match target {
+            V2Expr::Field { span, base, field } if field == "hand" => match base.as_ref() {
+                V2Expr::Ident(_, n) => (*span, n, "hand"),
+                _ => return Ok(()),
+            },
+            V2Expr::Index { span, base, .. } => match base.as_ref() {
+                V2Expr::Field { base, field, .. } if field == "slot" => match base.as_ref() {
+                    V2Expr::Ident(_, n) => (*span, n, "slot[i]"),
+                    _ => return Ok(()),
+                },
+                _ => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        if self.is_sim_ident(name) {
+            return Err(Error::at(
+                span,
+                format!("'{name}.{what}' is read-only (a Sim's slots cannot be written)"),
+            ));
+        }
+        Ok(())
     }
 
     fn resolve_lvalue(&mut self, expr: &V2Expr) -> Result<LValue> {
@@ -7554,7 +7820,7 @@ impl<'a> TreeLowerer<'a> {
                             _ => Err(Error::at(
                                 *span,
                                 format!(
-                                    "cannot assign to '{bname}.{field}' (use '{bname}.motive.<name>', '{bname}.skill.<name>', '{bname}.hand', '{bname}.age', '{bname}.slot[i]', or '{bname}.person[i]'; use 'self.<state>' for object state)"
+                                    "cannot assign to '{bname}.{field}' (use '{bname}.motive.<name>', '{bname}.skill.<name>', '{bname}.age', or '{bname}.person[i]'; use 'self.<state>' for object state)"
                                 ),
                             )),
                         };
@@ -8643,7 +8909,13 @@ impl<'a> TreeLowerer<'a> {
                         if args.len() != 1 || args[0].name.is_some() {
                             return Err(Error::at(*span, "random(range) expects 1 argument"));
                         }
-                        let (range_air, _) = self.lower_value_expr(&args[0].value)?;
+                        let (mut range_air, _) = self.lower_value_expr(&args[0].value)?;
+                        // See `random_into`: a global range would receive the draw.
+                        if range_air.starts_with("global[") {
+                            let copy = self.fresh("rnd_range");
+                            self.line(format!("let {copy} = {range_air};"));
+                            range_air = copy;
+                        }
                         let tmp = self.fresh("rnd");
                         self.line(format!("let {tmp} = 0;"));
                         self.line(format!("random({tmp}, {range_air});"));
@@ -8918,6 +9190,11 @@ impl<'a> TreeLowerer<'a> {
                 if lk != rk {
                     return None;
                 }
+                // Enums are only compared for equality; ordering takes the checked path (and
+                // its error).
+                if lk.is_some() && !matches!(op, V2BinOp::Eq | V2BinOp::Ne) {
+                    return None;
+                }
                 match op {
                     V2BinOp::Eq => Some(l == r),
                     V2BinOp::Ne => Some(l != r),
@@ -8957,6 +9234,11 @@ impl<'a> TreeLowerer<'a> {
     /// Lowers a constant-folded-away branch into a discarded buffer so it is still type- and
     /// symbol-checked, then restores the lowering state.
     fn check_dead_branch(&mut self, stmts: &[V2Stmt]) -> Result<()> {
+        self.check_dead_branch_as(stmts, false)
+    }
+
+    /// [`Self::check_dead_branch`], optionally as a loop body (so `break`/`continue` resolve).
+    fn check_dead_branch_as(&mut self, stmts: &[V2Stmt], loop_body: bool) -> Result<()> {
         if stmts.is_empty() {
             return Ok(());
         }
@@ -8965,7 +9247,16 @@ impl<'a> TreeLowerer<'a> {
         let used_saved = self.used_saved_stack_obj;
         let expansions = self.inline_expansions;
         let strings = self.env.dialog_strings.borrow().clone();
-        self.push_scope(ScopeFrame::block());
+        self.push_scope(if loop_body {
+            ScopeFrame {
+                is_loop_body: true,
+                is_air_while: true,
+                owner_defer_id: self.current_defer_id,
+                ..ScopeFrame::block()
+            }
+        } else {
+            ScopeFrame::block()
+        });
         let r = self.lower_stmts(stmts);
         let p = self.pop_scope_and_run_cleanups();
         self.out.truncate(out_len);
@@ -9697,11 +9988,14 @@ impl<'a> TreeLowerer<'a> {
             } => {
                 if let V2Expr::Ident(_, fname) = callee.as_ref()
                     && fname == "create_object"
-                    && self.resolve_callable(callee, *span)?.is_none()
+                    && !self.user_callable_named(callee, *span)?
                 {
-                    // `if create_object(...)`: success flag only; `stack_obj` is restored on
-                    // both edges (bind the new object with `let Some(x) = create_object(...)`).
+                    // `if create_object(...)`: success flag only; `stack_obj` gets back its
+                    // pre-call value on both edges (bind the new object with
+                    // `let Some(x) = create_object(...)`).
                     let (prim, _) = self.format_create_object(type_args, args, *span)?;
+                    let pre = self.fresh("pre_stack_obj");
+                    self.line(format!("let {pre} = stack_obj;"));
                     self.line(format!("if {prim} {{"));
                     self.indent += 1;
                     self.line(format!("{dst_local} := 1;"));
@@ -9711,7 +10005,7 @@ impl<'a> TreeLowerer<'a> {
                     self.line(format!("{dst_local} := 0;"));
                     self.indent -= 1;
                     self.line("}".to_owned());
-                    self.emit_restore_stack_obj();
+                    self.line(format!("stack_obj := {pre};"));
                     return Ok(());
                 }
                 if !type_args.is_empty() {
@@ -10730,7 +11024,14 @@ fn raw_opcode_keeps_stack_obj(opcode: u16) -> bool {
 
 fn raw_condition_clobbers_stack_obj(cond: &crate::ast::Condition) -> bool {
     match cond {
-        crate::ast::Condition::Compare { .. } | crate::ast::Condition::Call { .. } => false,
+        // `inc_lt` / `dec_gt` store the stepped value back into their left operand.
+        crate::ast::Condition::Compare { lhs, op, .. } => {
+            matches!(
+                op,
+                crate::ast::CompareOp::IncLt | crate::ast::CompareOp::DecGt
+            ) && is_stack_obj_operand(lhs)
+        }
+        crate::ast::Condition::Call { .. } => false,
         crate::ast::Condition::Primitive { prim, .. } => raw_primitive_clobbers_stack_obj(prim),
         crate::ast::Condition::RawOp { opcode, .. } => !raw_opcode_keeps_stack_obj(*opcode),
         crate::ast::Condition::Not(inner) => raw_condition_clobbers_stack_obj(inner),
@@ -10941,8 +11242,22 @@ fn stmts_mutate_or_borrow_ident(stmts: &[V2Stmt], target_name: &str) -> bool {
         V2Stmt::While { cond, body, .. } => {
             expr_borrows_ident(cond, target_name) || stmts_mutate_or_borrow_ident(body, target_name)
         }
-        V2Stmt::ForEach { binding, body, .. } => {
-            binding == target_name || stmts_mutate_or_borrow_ident(body, target_name)
+        V2Stmt::ForEach {
+            binding,
+            iter,
+            body,
+            ..
+        } => {
+            binding == target_name
+                || match iter {
+                    ForEachIter::Range { start, end, .. } => {
+                        expr_borrows_ident(start, target_name)
+                            || expr_borrows_ident(end, target_name)
+                    }
+                    ForEachIter::ObjectsByGuid(e) => expr_borrows_ident(e, target_name),
+                    _ => false,
+                }
+                || stmts_mutate_or_borrow_ident(body, target_name)
         }
         V2Stmt::If {
             cond,
@@ -10970,6 +11285,7 @@ fn stmts_mutate_or_borrow_ident(stmts: &[V2Stmt], target_name: &str) -> bool {
             args, event, body, ..
         } => {
             event.as_deref() == Some(target_name)
+                || builtin_args_write_ident("animate", args, target_name)
                 || args
                     .iter()
                     .any(|a| expr_borrows_ident(&a.value, target_name))
@@ -10981,6 +11297,22 @@ fn stmts_mutate_or_borrow_ident(stmts: &[V2Stmt], target_name: &str) -> bool {
         | V2Stmt::ReturnError { .. }
         | V2Stmt::RawAir { .. } => false,
     })
+}
+
+/// Whether a call to the builtin `fname` names `target_name` as a local it may write (or, for the
+/// local-slot arguments of `set_headline`/`push_interaction`, hand to the VM by slot). This is
+/// conservative: a user function with the same name is treated the same way.
+fn builtin_args_write_ident(fname: &str, args: &[CallArg], target_name: &str) -> bool {
+    let is_target = |e: &V2Expr| matches!(e, V2Expr::Ident(_, n) if n == target_name);
+    match fname {
+        "random_into" => args
+            .first()
+            .is_some_and(|a| a.name.is_none() && is_target(&a.value)),
+        "animate" | "set_headline" | "push_interaction" => args
+            .iter()
+            .any(|a| matches!(a.name.as_deref(), Some("local" | "icon")) && is_target(&a.value)),
+        _ => false,
+    }
 }
 
 fn expr_borrows_ident(expr: &V2Expr, target_name: &str) -> bool {
@@ -11002,6 +11334,7 @@ fn expr_borrows_ident(expr: &V2Expr, target_name: &str) -> bool {
         V2Expr::Tuple(_, elems) => elems.iter().any(|e| expr_borrows_ident(e, target_name)),
         V2Expr::Call { callee, args, .. } => {
             expr_borrows_ident(callee, target_name)
+                || matches!(callee.as_ref(), V2Expr::Ident(_, f) if builtin_args_write_ident(f, args, target_name))
                 || args
                     .iter()
                     .any(|a| expr_borrows_ident(&a.value, target_name))
@@ -11115,8 +11448,10 @@ fn stmts_unconditionally_diverge(
         Some(V2Stmt::WithLock { body, .. }) => {
             stmts_unconditionally_diverge(body, env, owner_module, allow_local)
         }
+        // A `cancel_on_abort` loop leaves (with a `break`) when the interaction is cancelled.
         Some(V2Stmt::While {
             cond: V2Expr::Bool(_, true),
+            cancel_on_abort: false,
             body,
             ..
         }) => !loop_body_breaks(body),
@@ -11200,9 +11535,11 @@ fn stmts_always_return(
             {
                 return true;
             }
-            // `loop { }` / `while true { }` without a `break` never falls through.
+            // `loop { }` / `while true { }` without a `break` (or a cancel exit) never falls
+            // through.
             V2Stmt::While {
                 cond: V2Expr::Bool(_, true),
+                cancel_on_abort: false,
                 body,
                 ..
             } if !loop_body_breaks(body) => return true,
@@ -11509,6 +11846,10 @@ fn expr_may_clobber_stack_obj(
                 return true;
             }
             expr_may_clobber_stack_obj(base, env, owner_mod, allow_local_fns, sim_name, depth)
+        }
+        // A `&mut stack_obj` borrow lets the callee write the running frame's stack object.
+        V2Expr::MutRef { inner, .. } if matches!(inner.as_ref(), V2Expr::Ident(_, n) if n == "stack_obj") => {
+            true
         }
         V2Expr::Deref { inner: base, .. }
         | V2Expr::MutRef { inner: base, .. }

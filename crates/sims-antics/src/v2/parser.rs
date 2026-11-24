@@ -2514,7 +2514,10 @@ impl Parser {
             args, type_args, ..
         } = call
         else {
-            return Err(Error::at(span, "expected 'animate(...)'"));
+            // `animate(...)?;` or another postfix form: an ordinary expression statement (only
+            // meaningful when a user function named `animate` exists).
+            self.expect(&TokenKind::Semicolon, "';'")?;
+            return Ok(V2Stmt::Expr { span, expr: call });
         };
         if !type_args.is_empty() {
             return Err(Error::at(span, "'animate' does not take type arguments"));
@@ -2752,30 +2755,47 @@ impl Parser {
     /// than the built-in object iterators).
     fn try_parse_range_iter(&mut self) -> Result<Option<ForEachIter>> {
         if self.peek().kind == TokenKind::LParen {
+            // `(a..b).rev()`, or a range whose start is parenthesized (`(n + 1)..m`).
+            let (saved_pos, saved_depth) = (self.pos, self.depth);
             self.bump();
-            let (start, end, inclusive) = self.parse_range_bounds()?;
-            self.expect(&TokenKind::RParen, "')'")?;
-            self.expect(&TokenKind::Dot, "'.rev()'")?;
-            let (m, mspan) = self.expect_ident("'rev'")?;
-            if m != "rev" {
-                return Err(Error::at(
-                    mspan,
-                    format!("unknown range adapter '.{m}()' (expected '.rev()')"),
-                ));
+            let rev = match self.parse_range_bounds() {
+                Ok(bounds) if self.peek().kind == TokenKind::RParen => Some(bounds),
+                _ => None,
+            };
+            if let Some((start, end, inclusive)) = rev {
+                self.expect(&TokenKind::RParen, "')'")?;
+                self.expect(&TokenKind::Dot, "'.rev()'")?;
+                let (m, mspan) = self.expect_ident("'rev'")?;
+                if m != "rev" {
+                    return Err(Error::at(
+                        mspan,
+                        format!("unknown range adapter '.{m}()' (expected '.rev()')"),
+                    ));
+                }
+                self.expect(&TokenKind::LParen, "'('")?;
+                self.expect(&TokenKind::RParen, "')'")?;
+                return Ok(Some(ForEachIter::Range {
+                    start,
+                    end,
+                    inclusive,
+                    rev: true,
+                }));
             }
-            self.expect(&TokenKind::LParen, "'('")?;
-            self.expect(&TokenKind::RParen, "')'")?;
-            return Ok(Some(ForEachIter::Range {
-                start,
-                end,
-                inclusive,
-                rev: true,
-            }));
+            self.pos = saved_pos;
+            self.depth = saved_depth;
         }
+        // The builtin iterators: `objects_by_guid(...)`, `objects_of::<T>()`, and the method
+        // forms `lot.sims()`, `lot.objects()`, `self.parts()` (another `lot.x()`/`self.x()` gets
+        // the iterator diagnostic). Anything else, such as `self.count..3`, is a range start.
+        let is_method_call = |p: &Self| {
+            p.peek_at(1).kind == TokenKind::Dot
+                && matches!(p.peek_at(2).kind, TokenKind::Ident(_))
+                && p.peek_at(3).kind == TokenKind::LParen
+        };
         let builtin = match &self.peek().kind {
             TokenKind::Ident(s) => match s.as_str() {
                 "objects_by_guid" | "objects_of" => true,
-                "lot" | "self" => self.peek_at(1).kind == TokenKind::Dot,
+                "lot" | "self" => is_method_call(self),
                 _ => false,
             },
             _ => false,
