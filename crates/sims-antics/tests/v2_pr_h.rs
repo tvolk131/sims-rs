@@ -703,15 +703,20 @@ fn raw_locals_shadow_consts_tree_wide() {
 // Tier 2: `@slot(N) let`
 // ---------------------------------------------------------------------------------------------
 
-/// The local count of BHAV `id` in the compiled object.
-fn bhav_locals(name: &str, src: &str, id: u16) -> u16 {
+/// BHAV `id` of the compiled object.
+fn bhav(name: &str, src: &str, id: u16) -> sims_formats::behavior::Behavior {
     use sims_formats::behavior::Behavior;
     use sims_formats::iff::Iff;
     let obj = compile_v2_source(name, src, &PackResolverConfig::default())
         .unwrap_or_else(|e| panic!("{name} must compile: {e}"));
     let iff = Iff::parse(obj.iff_bytes.clone()).expect("IFF parse");
     let chunk = iff.get(b"BHAV", id).expect("BHAV present");
-    Behavior::parse(iff.data(chunk)).expect("BHAV parse").locals
+    Behavior::parse(iff.data(chunk)).expect("BHAV parse")
+}
+
+/// The local count of BHAV `id` in the compiled object.
+fn bhav_locals(name: &str, src: &str, id: u16) -> u16 {
+    bhav(name, src, id).locals
 }
 
 /// A pinned variable lives in `local[N]`, and the tree's other locals take the lowest words
@@ -853,4 +858,60 @@ fn slot_lets_reuse_across_scopes_and_survive_fmt() {
     let air = expand("slot_fmt.antics", &formatted);
     let t = tree(&air, "t");
     assert!(t.contains("my.attr[0] := local[2];"), "{t}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tier 2: `@frame(...)` on lifecycle blocks
+// ---------------------------------------------------------------------------------------------
+
+/// `init`, `main` and the OBJf hooks take `@frame(...)` like a standalone tree, so an object
+/// whose main declares four arguments is written as `main { }` (no extra stub tree), and
+/// `param[N]` below the declared count is addressable.
+#[test]
+fn lifecycle_blocks_take_frames() {
+    let src = obj(r#"    @id(4100) @frame(args: 4, locals: 2) main {
+        loop {
+            sleep(10);
+            self.n += param[3];
+        }
+    }
+    @frame(locals: 1, revision: 3) init {
+        self.n = 5;
+    }
+    @frame(locals: 0) load { self.n = 0; }
+"#);
+    let air = expand("lifeframe.antics", &src);
+    let headers: Vec<&str> = air.lines().filter(|l| l.starts_with("tree ")).collect();
+    assert_eq!(
+        headers,
+        [
+            "tree 4096 \"Init\" (locals: 1, revision: 3) {",
+            "tree 4100 \"Main\" (args: 4, locals: 2) {",
+            "tree 4097 \"Load\" (locals: 0) {",
+        ],
+        "{air}"
+    );
+    let main = bhav("lifeframe.antics", &src, 4100);
+    assert_eq!((main.args, main.locals), (4, 2));
+    let init = bhav("lifeframe.antics", &src, 4096);
+    assert_eq!((init.locals, init.revision), (1, 3));
+}
+
+#[test]
+fn lifecycle_frames_are_checked() {
+    expect_err(
+        "lifeempty.antics",
+        &obj("    @frame(empty) main { }\n"),
+        "@frame(empty) is only allowed on a standalone 'tree'",
+    );
+    expect_err(
+        "lifeparam.antics",
+        &obj("    main { self.n = param[0]; }\n"),
+        "param",
+    );
+    expect_err(
+        "lifeconst.antics",
+        &obj("    @frame(locals: 1) const K = 1;\n"),
+        "@frame(...) is only allowed on a standalone 'tree' or on init, main",
+    );
 }

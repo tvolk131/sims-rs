@@ -1130,11 +1130,14 @@ impl Parser {
                 ));
             }
             if let Some(f) = &frame
-                && kw != "tree"
+                && !matches!(
+                    kw.as_str(),
+                    "tree" | "init" | "main" | "load" | "reset" | "cleanup"
+                )
             {
                 return Err(Error::at(
                     f.span,
-                    "@frame(...) is only allowed on a standalone 'tree'",
+                    "@frame(...) is only allowed on a standalone 'tree' or on init, main, load, reset, or cleanup",
                 ));
             }
             if pinned_guard_id.is_some() && !matches!(kw.as_str(), "functional" | "interaction") {
@@ -1181,6 +1184,7 @@ impl Parser {
                     members.push(ObjectMember::Init(LifecycleBlock {
                         span: kw_span,
                         pinned_id,
+                        frame,
                         body,
                     }));
                 }
@@ -1189,6 +1193,7 @@ impl Parser {
                     members.push(ObjectMember::Main(LifecycleBlock {
                         span: kw_span,
                         pinned_id,
+                        frame,
                         body,
                     }));
                 }
@@ -1197,6 +1202,7 @@ impl Parser {
                     members.push(ObjectMember::Load(LifecycleBlock {
                         span: kw_span,
                         pinned_id,
+                        frame,
                         body,
                     }));
                 }
@@ -1205,6 +1211,7 @@ impl Parser {
                     members.push(ObjectMember::Reset(LifecycleBlock {
                         span: kw_span,
                         pinned_id,
+                        frame,
                         body,
                     }));
                 }
@@ -1213,6 +1220,7 @@ impl Parser {
                     members.push(ObjectMember::Cleanup(LifecycleBlock {
                         span: kw_span,
                         pinned_id,
+                        frame,
                         body,
                     }));
                 }

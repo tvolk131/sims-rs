@@ -17,8 +17,8 @@ use crate::v2::ast::{
     ExternBconDecl, ExternModDecl, FnDecl, ForEachIter, FunctionalDecl, GuardBody, GuardDecl,
     InteractionDecl, MatchArm, MatchExprArm, MatchPattern, MetaField, MetaFieldKind, ObjectDecl,
     ObjectMember, ParamType, ParamValue, ReturnAbi, SlotDecl, SoundDecl, SpriteDecl, StateDecl,
-    StateInitValue, StateType, StringsDecl, TemplateDecl, TileDecl, TreeMemberDecl, V2AssignOp,
-    V2BinOp, V2Expr, V2Stmt, V2Type, V2UnaryOp, VariantDecl, object_type_ident,
+    StateInitValue, StateType, StringsDecl, TemplateDecl, TileDecl, TreeFrame, TreeMemberDecl,
+    V2AssignOp, V2BinOp, V2Expr, V2Stmt, V2Type, V2UnaryOp, VariantDecl, object_type_ident,
 };
 use crate::v2::loader::{ModuleScope, ResolvedModule};
 use crate::v2::parser::snake_case_ident;
@@ -800,6 +800,26 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
     let mut reset_pinned_id: Option<u16> = None;
     let mut cleanup_blocks: Vec<OwnedStmtBlock> = Vec::new();
     let mut cleanup_pinned_id: Option<u16> = None;
+    // `@frame(...)` per lifecycle tree ("Init", "Main", "Load", "Reset", "Cleanup").
+    let mut lifecycle_frames: BTreeMap<&'static str, TreeFrame> = BTreeMap::new();
+    let mut note_lifecycle_frame = |label: &'static str, frame: Option<TreeFrame>| -> Result<()> {
+        let Some(f) = frame else {
+            return Ok(());
+        };
+        if f.empty {
+            return Err(Error::at(
+                f.span,
+                "@frame(empty) is only allowed on a standalone 'tree' (a lifecycle tree always has nodes)",
+            ));
+        }
+        if lifecycle_frames.insert(label, f).is_some() {
+            return Err(Error::at(
+                f.span,
+                format!("@frame(...) on more than one block of the '{label}' tree"),
+            ));
+        }
+        Ok(())
+    };
 
     let mut local_enums_raw: BTreeMap<String, (String, EnumDecl)> = BTreeMap::new();
     let mut local_bitflags_raw: BTreeMap<String, (String, BitflagsDecl)> = BTreeMap::new();
@@ -1016,6 +1036,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
                     local_bitflags_raw.insert(b.name.clone(), (owner_mod.to_owned(), b.clone()));
                 }
                 ObjectMember::Init(b) => {
+                    note_lifecycle_frame("Init", b.frame)?;
                     if let Some(pid) = b.pinned_id {
                         init_pinned_id = Some(pid);
                     }
@@ -1025,6 +1046,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
                     });
                 }
                 ObjectMember::Main(b) => {
+                    note_lifecycle_frame("Main", b.frame)?;
                     if let Some(pid) = b.pinned_id {
                         main_pinned_id = Some(pid);
                     }
@@ -1034,6 +1056,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
                     });
                 }
                 ObjectMember::Load(b) => {
+                    note_lifecycle_frame("Load", b.frame)?;
                     if let Some(pid) = b.pinned_id {
                         load_pinned_id = Some(pid);
                     }
@@ -1043,6 +1066,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
                     });
                 }
                 ObjectMember::Reset(b) => {
+                    note_lifecycle_frame("Reset", b.frame)?;
                     if let Some(pid) = b.pinned_id {
                         reset_pinned_id = Some(pid);
                     }
@@ -1052,6 +1076,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
                     });
                 }
                 ObjectMember::Cleanup(b) => {
+                    note_lifecycle_frame("Cleanup", b.frame)?;
                     if let Some(pid) = b.pinned_id {
                         cleanup_pinned_id = Some(pid);
                     }
@@ -1698,6 +1723,8 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
     // 8c. Init tree.
     {
         let mut ctx = TreeLowerer::new(&env, TreeContext::ObjectSelf, &resolved.module_id, false);
+        let frame = lifecycle_frames.get("Init").copied().unwrap_or_default();
+        ctx.set_lifecycle_frame(&frame);
         let mut stack_ops = ExplicitStackOps::default();
         ctx.explicit_stack_obj = init_blocks
             .iter()
@@ -1794,14 +1821,14 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             ctx.emit_all_cleanups()?;
             ctx.line("return true;".to_owned());
         }
-        let _ = writeln!(trees_air, "tree {init_id} \"Init\" {{");
-        trees_air.push_str(&ctx.finish());
-        trees_air.push_str("}\n\n");
+        write_framed_tree(&mut trees_air, ctx, init_id, "Init", &frame, 0, "Init")?;
     }
 
     // 8d. Main tree.
     {
         let mut ctx = TreeLowerer::new(&env, TreeContext::ObjectSelf, &resolved.module_id, false);
+        let frame = lifecycle_frames.get("Main").copied().unwrap_or_default();
+        ctx.set_lifecycle_frame(&frame);
         ctx.explicit_stack_obj = main_block.as_ref().is_some_and(|b| {
             ExplicitStackOps::default().in_stmts(&b.stmts, &env, &b.owner_module, true)
         });
@@ -1824,9 +1851,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         } else {
             ctx.line("return true;".to_owned());
         }
-        let _ = writeln!(trees_air, "tree {main_id} \"Main\" {{");
-        trees_air.push_str(&ctx.finish());
-        trees_air.push_str("}\n\n");
+        write_framed_tree(&mut trees_air, ctx, main_id, "Main", &frame, 0, "Main")?;
     }
 
     // 8d2. Optional OBJf lifecycle hooks: `load` (OBJf 2), `reset` (OBJf 3), `cleanup` (OBJf 4).
@@ -1841,6 +1866,11 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         }
         let tid = alloc_tree_id(pinned_id, None, obj.span)?;
         let mut ctx = TreeLowerer::new(&env, TreeContext::ObjectSelf, &resolved.module_id, false);
+        let frame = lifecycle_frames
+            .get(tree_label)
+            .copied()
+            .unwrap_or_default();
+        ctx.set_lifecycle_frame(&frame);
         let mut stack_ops = ExplicitStackOps::default();
         ctx.explicit_stack_obj = blocks
             .iter()
@@ -1865,9 +1895,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             ctx.emit_all_cleanups()?;
             ctx.line("return true;".to_owned());
         }
-        let _ = writeln!(trees_air, "tree {tid} \"{tree_label}\" {{");
-        trees_air.push_str(&ctx.finish());
-        trees_air.push_str("}\n\n");
+        write_framed_tree(&mut trees_air, ctx, tid, tree_label, &frame, 0, tree_label)?;
         callback_specs.push(CallbackSpec {
             index: cb_index,
             action: Some(TreeRef::Id(tid)),
@@ -2948,15 +2976,31 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
         ctx.emit_all_cleanups()?;
         ctx.line("return true;".to_owned());
     }
-    let label = escape_str(&d.label);
+    write_framed_tree(
+        trees_air, ctx, sig.id, &d.label, &frame, positional, &d.ident,
+    )
+}
+
+/// Finishes `ctx` and writes it as tree `id` with the `.air` header of its `@frame(...)`
+/// (`frame` is the default when there is none), checked against its `positional` parameter
+/// count. `name` is the tree's name in diagnostics.
+fn write_framed_tree(
+    trees_air: &mut String,
+    ctx: TreeLowerer<'_>,
+    id: u16,
+    label: &str,
+    frame: &TreeFrame,
+    positional: usize,
+    name: &str,
+) -> Result<()> {
+    let label = escape_str(label);
     let mut header: Vec<String> = Vec::new();
     match frame.args {
         Some(args) if usize::from(args) < positional => {
             return Err(Error::at(
                 frame.span,
                 format!(
-                    "@frame(args: {args}) on tree '{}' is below its {positional} positional parameter(s)",
-                    d.ident
+                    "@frame(args: {args}) on tree '{name}' is below its {positional} positional parameter(s)"
                 ),
             ));
         }
@@ -2972,8 +3016,7 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
             return Err(Error::at(
                 frame.span,
                 format!(
-                    "@frame(format: {format:#06x}) on tree '{}' is not a supported BHAV format (0x8000, 0x8001, or 0x8002)",
-                    d.ident
+                    "@frame(format: {format:#06x}) on tree '{name}' is not a supported BHAV format (0x8000, 0x8001, or 0x8002)"
                 ),
             ));
         }
@@ -2983,8 +3026,7 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
             return Err(Error::at(
                 frame.span,
                 format!(
-                    "@frame(format: {format:#06x}) on tree '{}' allows at most 4 arguments, not {args}",
-                    d.ident
+                    "@frame(format: {format:#06x}) on tree '{name}' allows at most 4 arguments, not {args}"
                 ),
             ));
         }
@@ -3019,19 +3061,17 @@ fn emit_standalone_tree(trees_air: &mut String, env: &ObjectEnv<'_>, t: &OwnedTr
             return Err(Error::at(
                 espan,
                 format!(
-                    "animate(event_local: {slot}) must lie outside the frame, but tree '{}' needs {used} local(s) and declares @frame(locals: {locals})",
-                    d.ident
+                    "animate(event_local: {slot}) must lie outside the frame, but tree '{name}' needs {used} local(s) and declares @frame(locals: {locals})"
                 ),
             ));
         }
     }
     if header.is_empty() {
-        let _ = writeln!(trees_air, "tree {} \"{label}\" {{", sig.id);
+        let _ = writeln!(trees_air, "tree {id} \"{label}\" {{");
     } else {
         let _ = writeln!(
             trees_air,
-            "tree {} \"{label}\" ({}) {{",
-            sig.id,
+            "tree {id} \"{label}\" ({}) {{",
             header.join(", ")
         );
     }
@@ -4004,6 +4044,13 @@ impl<'a> TreeLowerer<'a> {
         } else {
             out
         }
+    }
+
+    /// A lifecycle tree's `@frame(...)`: `param[0..args]` become addressable and `locals` bounds
+    /// the frame, as on a standalone `tree`.
+    fn set_lifecycle_frame(&mut self, frame: &TreeFrame) {
+        self.frame_locals = frame.locals;
+        self.frame_args = frame.args.map_or(0, usize::from);
     }
 
     fn fresh(&mut self, prefix: &str) -> String {

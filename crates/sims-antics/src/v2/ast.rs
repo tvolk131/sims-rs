@@ -477,6 +477,8 @@ pub struct StringsDecl {
 pub struct LifecycleBlock {
     pub span: Span,
     pub pinned_id: Option<u16>,
+    /// `@frame(...)`: the lifecycle tree's BHAV header, as on a standalone `tree`.
+    pub frame: Option<TreeFrame>,
     pub body: Vec<V2Stmt>,
 }
 
