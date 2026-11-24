@@ -4019,17 +4019,10 @@ pub(crate) fn canonicalize_primitive_operands(opcode: u16, ops: [u8; 8]) -> [u8;
         }
         // SpecialEffect: bytes 0..6 (duration, kind, size, flags, str_index); bytes 6..8 unread (`special_effect.rs:5-7`).
         35 => [ops[0], ops[1], ops[2], ops[3], ops[4], ops[5], 0, 0],
-        // Dialog: kind is low 7 bits of byte 5 (`dialog.rs:569`).
-        36 => [
-            ops[0],
-            ops[1],
-            ops[2],
-            ops[3],
-            ops[4],
-            ops[5] & 0x7F,
-            ops[6],
-            ops[7],
-        ],
+        // Dialog: every byte is kept. The kind is the low 7 bits of byte 5
+        // (`dialog.rs:569`), but the record the dialog leaves in the world copies all
+        // eight operands (`dialog.rs:593`, `dialog.rs:641`).
+        36 => ops,
         // TestSimInteractingWith: byte 0 == 1 reads scope/index (1..4); otherwise ignores all (`interacting.rs:27-39`).
         37 => {
             if ops[0] == 1 {

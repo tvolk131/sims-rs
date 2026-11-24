@@ -2598,15 +2598,70 @@ fn calls_that_read_operands_keep_them() {
         call_verdict(0, 0, global([0xFF; 8]), global([0; 8]), &opts),
         IffVerdict::Equivalent
     );
-    // ... unless the caller states the library tree takes no arguments.
-    let library = IffEquivOptions {
-        extra_argless: [256].into_iter().collect(),
+    // ... unless the caller states the library tree takes no arguments, in both the
+    // argument counts and the argument-free set.
+    let library = |argless: &[u16], arity: Option<usize>| IffEquivOptions {
+        extra_argless: argless.iter().copied().collect(),
+        extra_arities: arity.map(|n| (256, n)).into_iter().collect(),
         ..IffEquivOptions::default()
     };
     assert_eq!(
-        call_verdict(0, 0, global([0xFF; 8]), global([0; 8]), &library),
+        call_verdict(
+            0,
+            0,
+            global([0xFF; 8]),
+            global([0; 8]),
+            &library(&[256], Some(0))
+        ),
         IffVerdict::Equivalent
     );
+    // A tree listed as argument-free but with no stated count, or a count that
+    // contradicts it, still reads its operands.
+    for arity in [None, Some(1)] {
+        assert_ne!(
+            call_verdict(
+                0,
+                0,
+                global([0xFF; 8]),
+                global([0; 8]),
+                &library(&[256], arity)
+            ),
+            IffVerdict::Equivalent,
+            "{arity:?}"
+        );
+    }
+}
+
+/// A library supplies only its own range of tree IDs: the global file 256 to 4095, a
+/// semi-global file 8192 and up. A tree in the other range is not the one a call runs.
+#[test]
+fn library_argless_trees_come_from_their_own_range() {
+    let none = |id| tree(id, 0, 0, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)]);
+    let file = write_iff(&[
+        bhav_chunk(&none(256), "Low"),
+        bhav_chunk(&none(8192), "High"),
+    ])
+    .expect("write");
+    let global = sims_antics::verify::library_argless_from_iff(&file, false).expect("global");
+    assert_eq!(global, [256].into_iter().collect());
+    let semi = sims_antics::verify::library_argless_from_iff(&file, true).expect("semi");
+    assert_eq!(semi, [8192].into_iter().collect());
+}
+
+/// A local named like the `invalid_scope:` keyword stays an ordinary operand.
+#[test]
+fn breakpoint_on_a_local_named_invalid_scope() {
+    let named = air(
+        "tree 4096 \"Named\" {\n    let invalid_scope = 0;\n    breakpoint(invalid_scope);\n    return true;\n}\n",
+        4096,
+    );
+    let breakpoint = named
+        .instructions
+        .iter()
+        .find(|i| i.opcode == 15)
+        .expect("a breakpoint node");
+    // Local 0 (scope 25), not a scope word.
+    assert_eq!(breakpoint.operands, [0, 0, 25, 0, 0, 0, 0, 0]);
 }
 
 /// A call with more than four arguments reads the instructions after it as

@@ -40,8 +40,9 @@ pub struct IffEquivOptions {
     /// compare exactly. Entries for private IDs are ignored: those come from the file.
     pub extra_arities: BTreeMap<u16, usize>,
     /// Trees of those libraries that take no arguments and are not indexed
-    /// ([`library_argless_from_iff`], [`LiveContext::argless_callees`]). Private IDs are
-    /// ignored here too.
+    /// ([`library_argless_from_iff`], [`LiveContext::argless_callees`]). An ID counts
+    /// only when `extra_arities` also gives it 0 arguments. Private IDs are ignored
+    /// here too.
     pub extra_argless: BTreeSet<u16>,
 }
 
@@ -203,7 +204,7 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
         callee_arities: Some(arities(iff, &opts.extra_arities)),
         my_attribute_count: opts.my_attribute_count,
         local_bcons: Some(bcons(iff)),
-        argless_callees: Some(argless(iff, &opts.extra_argless)),
+        argless_callees: Some(argless(iff, &opts.extra_argless, &opts.extra_arities)),
     };
     let (ctx_a, ctx_b) = (ctx(&iff_a), ctx(&iff_b));
     // The structure check leaves the same chunks, in the same order, on both sides.
@@ -655,12 +656,18 @@ fn loaded_argless(iff: &Iff) -> BTreeSet<u16> {
 }
 
 /// The callees of a file's trees that read no call operand bytes: its own private
-/// trees, and the libraries' from `extra`.
-fn argless(iff: &Iff, extra: &BTreeSet<u16>) -> BTreeSet<u16> {
+/// trees, and the library trees in `extra` that `extra_arities` also gives no
+/// arguments (a library tree the two disagree on, or one with no stated count, is
+/// treated as reading its operands).
+fn argless(
+    iff: &Iff,
+    extra: &BTreeSet<u16>,
+    extra_arities: &BTreeMap<u16, usize>,
+) -> BTreeSet<u16> {
     let mut set: BTreeSet<u16> = extra
         .iter()
         .copied()
-        .filter(|&id| !runs_from_own_file(id))
+        .filter(|&id| !runs_from_own_file(id) && extra_arities.get(&id) == Some(&0))
         .collect();
     set.extend(
         loaded_argless(iff)
@@ -670,14 +677,26 @@ fn argless(iff: &Iff, extra: &BTreeSet<u16>) -> BTreeSet<u16> {
     set
 }
 
-/// [`loaded_argless`] of a library file (`--global`, `--semi-global`), for
-/// [`IffEquivOptions::extra_argless`].
+/// [`loaded_argless`] of a library file, for [`IffEquivOptions::extra_argless`],
+/// limited to the IDs the VM takes from that library (`program.rs:1015`): 256 to 4095
+/// from the global file, 8192 and up from a semi-global one. The same ID in the other
+/// library's range names a different tree.
 ///
 /// # Errors
 ///
 /// When the file is not an IFF.
-pub fn library_argless_from_iff(iff_bytes: &[u8]) -> Result<BTreeSet<u16>> {
-    Ok(loaded_argless(&Iff::parse(iff_bytes.to_vec())?))
+pub fn library_argless_from_iff(iff_bytes: &[u8], semi_global: bool) -> Result<BTreeSet<u16>> {
+    let in_range = |id: u16| {
+        if semi_global {
+            id >= 8192
+        } else {
+            (256..=4095).contains(&id)
+        }
+    };
+    Ok(loaded_argless(&Iff::parse(iff_bytes.to_vec())?)
+        .into_iter()
+        .filter(|&id| in_range(id))
+        .collect())
 }
 
 /// [`loaded_arities`] of a library file (`--global`, `--semi-global`, or the file a

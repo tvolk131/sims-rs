@@ -57,10 +57,17 @@ rebuilds the raw bytes. It prefers `pad 0xNN`.
 So padding has **no per-opcode table**. `canonicalize_primitive_operands` stays the
 single statement of which bits the VM reads. It is the function the lockstep and
 live checkers, and relaxed lifting, already use, and each of its arms cites its
-`sims-vm` source line. The one change to it:
+`sims-vm` source line. Two changes to it:
 
 - **Expression byte 4** is now masked. `expression.rs` reads words 0 and 1 and bytes
-  5 to 7, and nothing in `sims-vm` reads byte 4.
+  5 to 7; no primitive reads byte 4. The one other reader is a call with more than
+  four arguments, which reads the instructions after it as argument bytes. Both
+  checkers compare those spilled bytes raw, never canonicalized, and `pad` rebuilds
+  them exactly.
+- **Dialog byte 5 bit 7** is no longer masked (review fix). The kind is only the low 7
+  bits, but the dialog record left in the world copies all eight operand bytes
+  (`dialog.rs`), and the world comparison includes those records. The earlier mask
+  let the lockstep checker equate two dialogs that leave different records.
 
 Because it is generic, the clause also spells padding on opcodes outside the five
 above. The install round trip checks every such instruction byte for byte.
@@ -105,8 +112,13 @@ The list is the intersection of the two sides' lists. For a whole file
 (`check_iff_equivalent`), it holds:
 
 - the file's own private trees that the VM keeps (the last copy wins);
-- any library trees the caller names in `IffEquivOptions::extra_argless`
-  (`library_argless_from_iff` builds that set from a library file).
+- library trees the caller names in `IffEquivOptions::extra_argless`, and only those
+  that `extra_arities` also gives 0 arguments. A tree with no stated count, or a
+  count that disagrees, still reads its operands.
+
+`library_argless_from_iff(bytes, semi_global)` keeps only the library's own ID range:
+256 to 4095 for the global file, 8192 and up for a semi-global one. The same ID in
+the other range names a different tree, which may be indexed (review fix).
 
 Arguments that **spill** are unaffected. A call with more than four arguments reads
 the instructions after it, and those raw bytes are still compared, even when the
@@ -122,6 +134,11 @@ Index 1 and above still fault (native error 0xf) and stay events.
 
 Frame residue is unchanged. A frame written to storage keeps its stack object, and
 that comparison stays as it was.
+
+Dropping a dead read, like dropping any dead node, changes how many instructions run.
+That relies on the existing assumption that no run exhausts the VM's instruction
+budget, which the live checker's contract states and
+`instruction_budget_is_a_model_assumption` pins.
 
 ## Decision 4: no node renumbering (c)
 

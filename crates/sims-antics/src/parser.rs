@@ -1206,7 +1206,9 @@ impl Parser {
                 }
                 PrimitiveCall::GetDirectionTo { dst, flags, from }
             }
-            "breakpoint" if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "invalid_scope") =>
+            "breakpoint"
+                if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "invalid_scope")
+                    && self.peek_at(1).kind == TokenKind::Colon =>
             {
                 self.bump();
                 self.expect(&TokenKind::Colon, "':'")?;
