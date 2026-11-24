@@ -438,9 +438,9 @@ pub struct Game {
     /// for how the trip goes.
     pending_travel_lot: Option<(SpecialPanelRequest, u32)>,
     /// The trip a script asked for ([`sims_sim::World::trip_request`]) that
-    /// the host could not carry out ([`Game::decline_trip`]). The lot keeps
-    /// it, as `sims_vm` clears a request only on departure, so ticks go on
-    /// while the pending request is this one.
+    /// the host declined in co-op ([`Game::decline_trip`]). Co-op cannot drop
+    /// the request from one peer's world without the lockstep, so the lot
+    /// keeps it and ticks go on while the pending request is this one.
     declined_trip: Option<sims_sim::TripRequest>,
     /// Neighborhood / destination lot metadata passed by `NeighborhoodShell`
     /// (populated lazily from `Install` on standalone launches).
@@ -2821,16 +2821,51 @@ impl Game {
 
     /// Lets the lot go on without carrying out the pending trip
     /// ([`Game::trip_request`]): a lot without a neighborhood, or a trip the
-    /// host refused.
+    /// host refused. Returns the request dropped, if any.
     ///
-    /// The lot keeps the request: `sims_vm` clears it only on departure. A
-    /// later Generic Sims Call 17 does not replace a pending request; it only
-    /// adds the neighbors it saved (`saved`). So the trip stays declined,
-    /// whatever later calls add, until the lot is left or reloaded. A retry
-    /// needs the VM to drop the request (a `Lot::cancel_trip_request`, not
-    /// yet in sims-vm).
-    pub fn decline_trip(&mut self) {
-        self.declined_trip = self.lot.world().trip_request.clone();
+    /// The lot drops the request ([`Lot::cancel_trip_request`]) and takes
+    /// back the saved-state tokens routine 17 wrote for it, so the script's
+    /// tail on this lot restores nothing from them and a later Generic Sims
+    /// Call 17 asks again. The original has no refusal: its main loop always
+    /// leaves the house (0x4fc713).
+    ///
+    /// In co-op the world changes only through the lockstep, so the request
+    /// stays in the lot and is only marked declined here. A later Generic
+    /// Sims Call 17 does not replace a pending request; it only adds the
+    /// neighbors it saved (`saved`). So the trip stays declined, whatever
+    /// later calls add, until the lot is left or reloaded, or until it ticks
+    /// on its own again after co-op, which drops the request.
+    pub fn decline_trip(&mut self) -> Option<sims_sim::TripRequest> {
+        if self.coop.is_active_or_starting() {
+            self.declined_trip = self.lot.world().trip_request.clone();
+            return self.declined_trip.clone();
+        }
+        self.declined_trip = None;
+        self.lot.cancel_trip_request()
+    }
+
+    /// Drops a trip [`Game::decline_trip`] only marked declined during
+    /// co-op, just before the lot's next tick of its own. Left in the lot,
+    /// the stale request would hide every later trip: Generic Sims Call 17
+    /// only adds to a pending request, and the mark hides it (`same_trip`).
+    /// A different request pending by then is not the one declined, so it
+    /// stays and only the mark goes.
+    fn drop_trip_declined_in_coop(&mut self) {
+        if self.coop.is_active_or_starting() {
+            return;
+        }
+        let Some(declined) = self.declined_trip.take() else {
+            return;
+        };
+        if self
+            .lot
+            .world()
+            .trip_request
+            .as_ref()
+            .is_some_and(|trip| same_trip(&declined, trip))
+        {
+            self.lot.cancel_trip_request();
+        }
     }
 
     /// Enables or disables `--debug` mode (which shows the maroon top
@@ -3908,6 +3943,7 @@ impl Game {
                 capped = true;
                 break;
             }
+            self.drop_trip_declined_in_coop();
             let speed_before = (self.lot.world().speed(), self.lot.world().return_speed());
             let step = if self.play {
                 self.lot.step_play()
@@ -4250,11 +4286,7 @@ impl Game {
         // What a Sim holds is drawn at the Sim's attach points (a carried
         // plate in the right palm), after the people and depth-tested, as
         // the person's own draw does (0x459dc0 → 0x59185d).
-        let attach = if self.open_pack_mode {
-            std::collections::BTreeMap::new()
-        } else {
-            self.people.held_attach(&self.view.camera)
-        };
+        let attach = self.held_attach();
         sims_render::draw_held_with_attach(
             world,
             draw_shape,
@@ -4514,6 +4546,17 @@ impl Game {
     /// The canvas last drawn.
     pub fn canvas(&self) -> &Canvas {
         &self.canvas
+    }
+
+    /// Where each person the last [`Game::render`] drew draws what they
+    /// hold: their attach points ([`sims_render::PersonAttach`]), as the
+    /// held pass took them. Empty in open-pack mode, whose sprite Sims have
+    /// no hands.
+    pub fn held_attach(&self) -> BTreeMap<u16, sims_render::PersonAttach> {
+        if self.open_pack_mode {
+            return BTreeMap::new();
+        }
+        self.people.held_attach(&self.drawn_camera)
     }
 
     /// Passes the house view's screen-centre pick (`0x4a7b58` over the active

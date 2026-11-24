@@ -1021,6 +1021,29 @@ fn forget_family_save_inputs_in_txn(
     Ok(())
 }
 
+/// A change to a neighborhood's save inputs made in a commit's transaction.
+type SaveInputsChange<'c> = Box<dyn FnOnce(&mut SaveInputs) + 'c>;
+
+/// Changes `id`'s save inputs, as they stand in `txn`, with `change`.
+fn update_save_inputs_in_txn(
+    txn: &redb::WriteTransaction,
+    id: &str,
+    change: impl FnOnce(&mut SaveInputs),
+) -> Result<()> {
+    let mut table = txn.open_table(NEIGHBORHOOD_SAVE_INPUTS).map_err(store)?;
+    let mut inputs = table
+        .get(id)
+        .map_err(store)?
+        .map(|value| SaveInputs::decode(value.value()))
+        .transpose()?
+        .unwrap_or_default();
+    change(&mut inputs);
+    table
+        .insert(id, inputs.encode().as_slice())
+        .map_err(store)?;
+    Ok(())
+}
+
 /// `id`'s save inputs as of `txn`; none if there are none.
 fn save_inputs_in(txn: &redb::ReadTransaction, id: &str) -> Result<SaveInputs> {
     let table = match txn.open_table(NEIGHBORHOOD_SAVE_INPUTS) {
@@ -2547,6 +2570,57 @@ impl NeighborhoodStore {
     where
         I: IntoIterator<Item = (&'a str, &'a [u8])>,
     {
+        self.commit_characters_and_neighborhood(
+            id,
+            expected_instance_id,
+            expected_revision,
+            character_files,
+            state,
+            None,
+        )
+    }
+
+    /// [`Self::save_characters_and_neighborhood_checked`], also changing
+    /// `id`'s save inputs with `change` in the same transaction, for
+    /// instance [`SaveInputs::move_in_family`] when a `.FAM` file moves in
+    /// (0x4291e6, 0x4107a8). The change runs before the commit forgets the
+    /// entries of the families `state` drops, so it can also carry a
+    /// renumbered family's entries to its new ID
+    /// ([`SaveInputs::renumber_family`]). On a mismatch nothing changes.
+    pub fn save_characters_neighborhood_and_save_inputs_checked<'a, I>(
+        &self,
+        id: &str,
+        expected_instance_id: u128,
+        expected_revision: u64,
+        character_files: I,
+        state: &StoredNeighborhood,
+        change: impl FnOnce(&mut SaveInputs),
+    ) -> Result<std::result::Result<(u128, u64), CheckedCommitError>>
+    where
+        I: IntoIterator<Item = (&'a str, &'a [u8])>,
+    {
+        self.commit_characters_and_neighborhood(
+            id,
+            expected_instance_id,
+            expected_revision,
+            character_files,
+            state,
+            Some(Box::new(change)),
+        )
+    }
+
+    fn commit_characters_and_neighborhood<'a, 'c, I>(
+        &self,
+        id: &str,
+        expected_instance_id: u128,
+        expected_revision: u64,
+        character_files: I,
+        state: &StoredNeighborhood,
+        change: Option<SaveInputsChange<'c>>,
+    ) -> Result<std::result::Result<(u128, u64), CheckedCommitError>>
+    where
+        I: IntoIterator<Item = (&'a str, &'a [u8])>,
+    {
         let mut files: Vec<(&str, &[u8])> = Vec::new();
         let mut seen_names: BTreeSet<&str> = BTreeSet::new();
         for (filename, bytes) in character_files {
@@ -2594,6 +2668,9 @@ impl NeighborhoodStore {
             committed.instance_id = next_instance;
             committed.revision = next_rev;
             committed_version = (next_instance, next_rev);
+            if let Some(change) = change {
+                update_save_inputs_in_txn(&txn, id, change)?;
+            }
             purge_removed_family_albums_in_txn(&txn, id, &current, &committed)?;
             let encoded = committed.encode();
             if !files.is_empty() {
@@ -2884,17 +2961,7 @@ impl NeighborhoodStore {
             if !exists {
                 return Err(Error::Store(format!("no neighborhood {id:?}")));
             }
-            let mut table = txn.open_table(NEIGHBORHOOD_SAVE_INPUTS).map_err(store)?;
-            let mut inputs = table
-                .get(id)
-                .map_err(store)?
-                .map(|value| SaveInputs::decode(value.value()))
-                .transpose()?
-                .unwrap_or_default();
-            change(&mut inputs);
-            table
-                .insert(id, inputs.encode().as_slice())
-                .map_err(store)?;
+            update_save_inputs_in_txn(&txn, id, change)?;
         }
         txn.commit().map_err(store)
     }
