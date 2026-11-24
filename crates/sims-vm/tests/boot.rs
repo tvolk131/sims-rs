@@ -642,6 +642,7 @@ fn an_opened_neighborhood_matches_the_originals_import() {
     )]
     let left = std::fs::read_dir(output.join("Patch")).unwrap().count();
     assert_eq!(left, 0);
+    assert!(opened.patch_left.is_empty(), "{:?}", opened.patch_left);
     // The inventories the view's set-up and each housed import made, which
     // the pools leave alone.
     assert_eq!(

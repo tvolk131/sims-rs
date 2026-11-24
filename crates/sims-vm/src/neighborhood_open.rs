@@ -59,6 +59,10 @@ static ZEROS: [u8; 4096] = [0; 4096];
 pub struct Opened {
     pub patch: patch_import::Opened,
     pub pools: OpenedPools,
+    /// The imported `Patch` files the open could not use up, each with
+    /// why. The original does not check the deletion (0x429a87), so this
+    /// does not fail the open.
+    pub patch_left: Vec<(PathBuf, String)>,
 }
 
 /// Opens the neighborhood at `directory` of the install at `root`, as the
@@ -165,7 +169,7 @@ pub fn open_neighborhood(
     )?;
     // Before anything is written, so that removing them can fail only on
     // an I/O error.
-    let used_up = imported_copies(&patch, &patches, &patch_files, output)?;
+    let (used_up, canonical_output) = imported_copies(&patch, &patches, &patch_files, output)?;
     write_imports(
         &install, &index, &catalog, &patches, &patch, output, captured,
     )?;
@@ -190,12 +194,13 @@ pub fn open_neighborhood(
     }
     // Last, once every file is written, so a failure above leaves the
     // copy's `Patch` folder as it was.
-    use_up_imported(&used_up)?;
+    let patch_left = use_up_imported(&used_up, &canonical_output);
     neighborhood.directory = output.to_path_buf();
     *crt = pool_crt;
     Ok((
         neighborhood,
         Opened {
+            patch_left,
             patch,
             pools: filled.report,
         },
@@ -271,18 +276,19 @@ struct PatchFile {
     bytes: Vec<u8>,
 }
 
-/// The output copies of the imported `*.FAM` files, to be used up once
-/// the open has written everything else. Each must be a plain file inside
-/// `output`, not the source file itself (through a link), and hold the
-/// bytes that were imported; anything else is refused before the open
-/// writes a file. A copy that is missing is left out: the original does
-/// not check the deletion (0x429a87).
-fn imported_copies(
+/// The imported `*.FAM` files whose output copies the open uses up once
+/// it has written everything else, with the canonical `output`. Each copy
+/// must be a plain file inside `output`, not the source file itself
+/// (through a link), and hold the bytes that were imported
+/// ([`check_copy`]); anything else is refused before the open writes a
+/// file. A copy that is missing is left out: the original does not check
+/// the deletion (0x429a87).
+fn imported_copies<'f>(
     opened: &patch_import::Opened,
     patches: &[Patch],
-    files: &[PatchFile],
+    files: &'f [PatchFile],
     output: &Path,
-) -> Result<Vec<PathBuf>, BootError> {
+) -> Result<(Vec<&'f PatchFile>, PathBuf), BootError> {
     let output =
         std::fs::canonicalize(output).map_err(|error| format!("{}: {error}", output.display()))?;
     let mut copies = Vec::new();
@@ -291,11 +297,11 @@ fn imported_copies(
             .iter()
             .position(|patch| &patch.name == name)
             .ok_or("an import names no Patch file")?;
-        if let Some(copy) = check_copy(&files[at], &output)? {
-            copies.push(copy);
+        if check_copy(&files[at], &output)?.is_some() {
+            copies.push(&files[at]);
         }
     }
-    Ok(copies)
+    Ok((copies, output))
 }
 
 /// One file for [`imported_copies`]: its canonical path, or `None` when
@@ -326,24 +332,29 @@ fn check_copy(file: &PatchFile, output: &Path) -> Result<Option<PathBuf>, String
 /// 0x429a82), as [`imported_copies`] listed them. A housed family's file
 /// was moved onto its house file, which [`write_imports`] has written in
 /// its place; a houseless family's was deleted (0x429a75 → 0x5b98d5).
-/// Either way the file is gone from `Patch`. As in the original, a
-/// failure partway leaves the earlier ones used up; the error names them.
-fn use_up_imported(copies: &[PathBuf]) -> Result<(), BootError> {
-    for (done, path) in copies.iter().enumerate() {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "0x429a82: {}: {error}; already used up: {:?}",
-                    path.display(),
-                    &copies[..done]
-                )
-                .into());
+/// Either way the file is gone from `Patch`.
+///
+/// Each copy is checked again just before its deletion, so a `Patch`
+/// folder swapped for a link (or a file replaced) since the first check
+/// is left alone; only a swap in the moment between that check and the
+/// deletion is not caught. A copy that cannot be used up is returned with
+/// why, not failed: the original does not check the deletion (0x429a87).
+fn use_up_imported(copies: &[&PatchFile], output: &Path) -> Vec<(PathBuf, String)> {
+    let mut left = Vec::new();
+    for file in copies {
+        match check_copy(file, output) {
+            Ok(None) => {}
+            Ok(Some(path)) => {
+                if let Err(error) = std::fs::remove_file(&path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    left.push((path, format!("0x429a82: {error}")));
+                }
             }
+            Err(reason) => left.push((file.copy.clone(), reason)),
         }
     }
-    Ok(())
+    left
 }
 
 /// The skeletons a pool person's temporary actors copy (0x598da3).
@@ -439,12 +450,34 @@ mod tests {
         std::fs::write(output.join("Patch/A.FAM"), b"family").unwrap();
         let copy = check_copy(&file(output.join("Patch/A.FAM")), &canonical).unwrap();
         assert_eq!(copy, Some(canonical.join("Patch/A.FAM")));
-        // The source, named as if it were in the output, is refused.
+        // The source, named as if it were in the output, is refused: by
+        // containment here, and by equality when the output holds it.
         let error = check_copy(&file(source.join("Patch/A.FAM")), &canonical).unwrap_err();
         assert!(
             error.ends_with("not a separate copy inside the output"),
             "{error}"
         );
+        let around = std::fs::canonicalize(&root).unwrap();
+        let error = check_copy(&file(source.join("Patch/A.FAM")), &around).unwrap_err();
+        assert!(
+            error.ends_with("not a separate copy inside the output"),
+            "{error}"
+        );
+        // Used up: gone, and the source kept.
+        let copies = [file(output.join("Patch/A.FAM"))];
+        let left = use_up_imported(&[&copies[0]], &canonical);
+        assert!(left.is_empty(), "{left:?}");
+        assert!(!output.join("Patch/A.FAM").exists() && source.join("Patch/A.FAM").exists());
+        // A `Patch` folder swapped for a link to the source after the first
+        // check: the second check refuses it, and the source is kept.
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(output.join("Patch")).unwrap();
+            std::os::unix::fs::symlink(source.join("Patch"), output.join("Patch")).unwrap();
+            let left = use_up_imported(&[&copies[0]], &canonical);
+            assert_eq!(left.len(), 1, "{left:?}");
+            assert!(source.join("Patch/A.FAM").exists());
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

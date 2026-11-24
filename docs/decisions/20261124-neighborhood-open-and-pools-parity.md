@@ -30,10 +30,16 @@ copy must be a plain file inside the output (after resolving links), not
 the source file, and must hold the bytes that were imported; otherwise
 the open is refused. A copy that is missing is accepted, as 0x429a87
 accepts a failed deletion. The deletions (`std::fs::remove_file`) run
-last, after every character file is written. So a refused open leaves
-the copy's `Patch` folder as it was, and only an I/O error during the
-deletions can leave some used up; the error names them. The UD2 open
-test checks that the folder ends empty.
+last, after every character file is written, so a refused open leaves
+the copy's `Patch` folder as it was. Each copy is checked again just
+before its deletion, so a folder swapped for a link since the first check
+is left alone; only a swap between that check and the deletion itself
+is not caught. A copy that cannot be used up does not fail the open: it
+is reported in `Opened::patch_left`, as the original ignores a failed
+deletion. (The original restores the old house when a housed family's
+move fails and fails that import; the port has already written the house
+file, so it reports the leftover instead.) The UD2 open test checks that
+the folder ends empty.
 
 ## The import preview gives members an inventory
 
