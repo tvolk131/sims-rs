@@ -133,9 +133,9 @@ impl<'a> TreeLowerer<'a> {
             ContinueStep::Counter(counter) => self.line(format!("{counter} += 1;")),
             ContinueStep::Range { var, last, step } => {
                 self.line(format!("if {var} == {last} {{"));
-                self.indent += 1;
+                self.em.indent();
                 self.line("break;".to_owned());
-                self.indent -= 1;
+                self.em.dedent();
                 self.line("}".to_owned());
                 self.line(format!("{var} {step} 1;"));
             }
@@ -153,13 +153,13 @@ impl<'a> TreeLowerer<'a> {
             .nearest_air_while_idx()
             .expect("enclosing cancel_flag implies an enclosing air while loop");
         self.line(format!("if {flag} != 0 {{"));
-        self.indent += 1;
+        self.em.indent();
         self.emit_cleanups_down_to(target_while)?;
         if restore_stack {
             self.emit_entry_stack_restore();
         }
         self.line("break;".to_owned());
-        self.indent -= 1;
+        self.em.dedent();
         self.line("}".to_owned());
         Ok(())
     }

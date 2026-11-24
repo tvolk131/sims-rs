@@ -201,7 +201,7 @@ impl<'a> TreeLowerer<'a> {
         let dlg_air = self.format_dialog(&effective_args, call_span)?;
         let body0 = arm_bodies[0].unwrap();
         self.line(format!("if {dlg_air} {{"));
-        self.indent += 1;
+        self.em.indent();
         self.push_scope(ScopeFrame::block());
         let r0 = self.lower_stmts(body0);
         let p0 = if stmts_always_return(body0, self.env, &self.owner_module, self.in_object_scope) {
@@ -210,13 +210,13 @@ impl<'a> TreeLowerer<'a> {
         } else {
             self.pop_scope_and_run_cleanups()
         };
-        self.indent -= 1;
+        self.em.dedent();
         r0.and(p0)?;
 
         let body1 = arm_bodies[1].unwrap();
         if !is_three_way {
             self.line("} else {".to_owned());
-            self.indent += 1;
+            self.em.indent();
             self.push_scope(ScopeFrame::block());
             let r1 = self.lower_stmts(body1);
             let p1 =
@@ -226,18 +226,18 @@ impl<'a> TreeLowerer<'a> {
                 } else {
                     self.pop_scope_and_run_cleanups()
                 };
-            self.indent -= 1;
+            self.em.dedent();
             self.line("}".to_owned());
             r1.and(p1)
         } else if let Some(saved_t) = saved_temp_local {
             // Restore implicit temp[0] BEFORE executing Button2/Button3 user code or defers!
             self.line("} else {".to_owned());
-            self.indent += 1;
+            self.em.indent();
             let choice = self.fresh("dlg_choice");
             self.line(format!("let {choice} = temp[{temp_slot}];"));
             self.line(format!("temp[{temp_slot}] := {saved_t};"));
             self.line(format!("if {choice} == 0 {{"));
-            self.indent += 1;
+            self.em.indent();
             self.push_scope(ScopeFrame::block());
             let r1 = self.lower_stmts(body1);
             let p1 =
@@ -247,11 +247,11 @@ impl<'a> TreeLowerer<'a> {
                 } else {
                     self.pop_scope_and_run_cleanups()
                 };
-            self.indent -= 1;
+            self.em.dedent();
             r1.and(p1)?;
             let body2 = arm_bodies[2].unwrap();
             self.line("} else {".to_owned());
-            self.indent += 1;
+            self.em.indent();
             self.push_scope(ScopeFrame::block());
             let r2 = self.lower_stmts(body2);
             let p2 =
@@ -261,14 +261,14 @@ impl<'a> TreeLowerer<'a> {
                 } else {
                     self.pop_scope_and_run_cleanups()
                 };
-            self.indent -= 1;
+            self.em.dedent();
             self.line("}".to_owned());
-            self.indent -= 1;
+            self.em.dedent();
             self.line("}".to_owned());
             r2.and(p2)
         } else {
             self.line(format!("}} else if temp[{temp_slot}] == 0 {{"));
-            self.indent += 1;
+            self.em.indent();
             self.push_scope(ScopeFrame::block());
             let r1 = self.lower_stmts(body1);
             let p1 =
@@ -278,11 +278,11 @@ impl<'a> TreeLowerer<'a> {
                 } else {
                     self.pop_scope_and_run_cleanups()
                 };
-            self.indent -= 1;
+            self.em.dedent();
             r1.and(p1)?;
             let body2 = arm_bodies[2].unwrap();
             self.line("} else {".to_owned());
-            self.indent += 1;
+            self.em.indent();
             self.push_scope(ScopeFrame::block());
             let r2 = self.lower_stmts(body2);
             let p2 =
@@ -292,7 +292,7 @@ impl<'a> TreeLowerer<'a> {
                 } else {
                     self.pop_scope_and_run_cleanups()
                 };
-            self.indent -= 1;
+            self.em.dedent();
             self.line("}".to_owned());
             r2.and(p2)
         }

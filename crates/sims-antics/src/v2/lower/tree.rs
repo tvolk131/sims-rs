@@ -23,8 +23,7 @@ impl<'a> TreeLowerer<'a> {
             explicit_stack_obj: false,
             used_saved_stack_obj: false,
             value_return: None,
-            out: String::new(),
-            indent: 1,
+            em: mir::Emitter::new(1),
             next_id: 0,
             var_scopes: vec![root_vars],
             cleanup_scopes: vec![ScopeFrame::block()],
@@ -68,7 +67,7 @@ impl<'a> TreeLowerer<'a> {
     }
 
     pub(super) fn finish(self) -> Result<String> {
-        let formats_text = self.raw_formats_text || super::opt::body_formats_text(&self.out);
+        let formats_text = self.raw_formats_text || mir::body_formats_text(self.em.text());
         if let Some((span, name)) = &self.dup_decl
             && formats_text
         {
@@ -81,10 +80,21 @@ impl<'a> TreeLowerer<'a> {
                 ),
             ));
         }
+        let facts = mir::FrameFacts {
+            formats_text,
+            keep_layout: self.keep_layout,
+            has_self_obj_local: self.has_self_obj_local,
+            pinned: self.pin_span.is_some(),
+            raw_consts: &self.raw_consts,
+            raw_declared: &self.raw_declared,
+            has_slots: self.slot_span.is_some(),
+            pinned_locals: &self.pinned_locals,
+        };
+        let body = self.em.into_text();
         let mut out = if self.used_saved_stack_obj {
-            format!("    let __saved_stack_obj = stack_obj;\n{}", self.out)
+            format!("    let __saved_stack_obj = stack_obj;\n{body}")
         } else {
-            self.out
+            body
         };
         if self.pin_span.is_some() {
             // A tree with a pinned `push_interaction` has no raw block (that is an error), so
@@ -92,35 +102,7 @@ impl<'a> TreeLowerer<'a> {
             // the named locals after it.
             out = replace_outside_strings(&out, PIN_SLOT, "0");
         }
-        let out = if self.keep_layout {
-            if self.has_self_obj_local
-                && let Some(trimmed) = super::opt::drop_unread_entry_save(&out, formats_text)
-            {
-                trimmed
-            } else {
-                out
-            }
-        } else {
-            let out = super::opt::optimize_tree_body(&out);
-            if self.pin_span.is_some() {
-                super::opt::pin_in_place(&out)
-            } else {
-                out
-            }
-        };
-        // The raw blocks' constants, which no pass before this one reads.
-        let mut consts = String::new();
-        for (name, value) in &self.raw_consts {
-            if !self.raw_declared.contains(name) {
-                consts.push_str(&format!("    const {name} = {value};\n"));
-            }
-        }
-        let out = consts + &out;
-        Ok(if self.slot_span.is_some() {
-            super::opt::assign_frame_slots(&out, &self.pinned_locals, &self.raw_declared)
-        } else {
-            out
-        })
+        Ok(mir::finish_body(out, &facts))
     }
 
     /// A lifecycle tree's `@frame(...)`: `param[0..args]` become addressable and `locals` bounds
@@ -151,11 +133,7 @@ impl<'a> TreeLowerer<'a> {
     }
 
     pub(super) fn line(&mut self, text: String) {
-        for _ in 0..self.indent {
-            self.out.push_str("    ");
-        }
-        self.out.push_str(&text);
-        self.out.push('\n');
+        self.em.line(&text);
     }
 
     pub(super) fn with_owner_module<T>(

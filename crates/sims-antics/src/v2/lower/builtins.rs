@@ -373,7 +373,7 @@ impl<'a> TreeLowerer<'a> {
         }
         let (prim, local) = self.format_animate(args)?;
         self.line(format!("while !{prim} {{"));
-        self.indent += 1;
+        self.em.indent();
         self.push_scope(ScopeFrame {
             cleanups: Vec::new(),
             is_loop_body: true,
@@ -399,7 +399,7 @@ impl<'a> TreeLowerer<'a> {
         }
         let res = self.lower_stmts(body);
         let pop_res = self.pop_scope_and_run_cleanups();
-        self.indent -= 1;
+        self.em.dedent();
         self.line("}".to_owned());
         res.and(pop_res)?;
         self.emit_inline_fn_return_propagation(false)?;
@@ -801,11 +801,11 @@ impl<'a> TreeLowerer<'a> {
                 .nearest_air_while_idx()
                 .expect("enclosing cancel_flag implies an enclosing air while loop");
             self.line("if my.person.priority == 0 {".to_owned());
-            self.indent += 1;
+            self.em.indent();
             self.line(format!("{flag} := 1;"));
             self.emit_cleanups_down_to(target_while)?;
             self.line("break;".to_owned());
-            self.indent -= 1;
+            self.em.dedent();
             self.line("}".to_owned());
         }
         self.line(format!("idle({ticks_air});"));
@@ -814,11 +814,11 @@ impl<'a> TreeLowerer<'a> {
                 .nearest_air_while_idx()
                 .expect("enclosing cancel_flag implies an enclosing air while loop");
             self.line("if my.person.priority == 0 {".to_owned());
-            self.indent += 1;
+            self.em.indent();
             self.line(format!("{flag} := 1;"));
             self.emit_cleanups_down_to(target_while)?;
             self.line("break;".to_owned());
-            self.indent -= 1;
+            self.em.dedent();
             self.line("}".to_owned());
         }
         Ok(())

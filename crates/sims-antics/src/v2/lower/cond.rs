@@ -609,9 +609,9 @@ impl<'a> TreeLowerer<'a> {
                 // Short-circuit `lhs && rhs`: evaluate rhs ONLY when lhs is true!
                 self.emit_bool_into_local(lhs, dst_local)?;
                 self.line(format!("if {dst_local} != 0 {{"));
-                self.indent += 1;
+                self.em.indent();
                 self.emit_bool_into_local(rhs, dst_local)?;
-                self.indent -= 1;
+                self.em.dedent();
                 self.line("}".to_owned());
                 Ok(())
             }
@@ -624,9 +624,9 @@ impl<'a> TreeLowerer<'a> {
                 // Short-circuit `lhs || rhs`: evaluate rhs ONLY when lhs is false!
                 self.emit_bool_into_local(lhs, dst_local)?;
                 self.line(format!("if {dst_local} == 0 {{"));
-                self.indent += 1;
+                self.em.indent();
                 self.emit_bool_into_local(rhs, dst_local)?;
-                self.indent -= 1;
+                self.em.dedent();
                 self.line("}".to_owned());
                 Ok(())
             }
@@ -637,24 +637,24 @@ impl<'a> TreeLowerer<'a> {
             } => {
                 if let Some(neg) = self.try_lower_negated_simple_air_cond(inner)? {
                     self.line(format!("if {neg} {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.line(format!("{dst_local} := 1;"));
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("} else {".to_owned());
-                    self.indent += 1;
+                    self.em.indent();
                     self.line(format!("{dst_local} := 0;"));
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                 } else {
                     self.emit_bool_into_local(inner, dst_local)?;
                     self.line(format!("if {dst_local} == 0 {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.line(format!("{dst_local} := 1;"));
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("} else {".to_owned());
-                    self.indent += 1;
+                    self.em.indent();
                     self.line(format!("{dst_local} := 0;"));
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                 }
                 Ok(())
@@ -696,13 +696,13 @@ impl<'a> TreeLowerer<'a> {
                         Some(pre)
                     };
                     self.line(format!("if {prim} {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.line(format!("{dst_local} := 1;"));
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("} else {".to_owned());
-                    self.indent += 1;
+                    self.em.indent();
                     self.line(format!("{dst_local} := 0;"));
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                     if let Some(saved) = saved {
                         self.line(format!("stack_obj := {saved};"));
@@ -717,13 +717,13 @@ impl<'a> TreeLowerer<'a> {
                 }
                 if let Some(simple) = self.try_lower_simple_air_cond(expr)? {
                     self.line(format!("if {simple} {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.line(format!("{dst_local} := 1;"));
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("} else {".to_owned());
-                    self.indent += 1;
+                    self.em.indent();
                     self.line(format!("{dst_local} := 0;"));
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                     return Ok(());
                 }
@@ -759,13 +759,13 @@ impl<'a> TreeLowerer<'a> {
                     .try_lower_simple_air_cond(expr)?
                     .ok_or_else(|| Error::at(expr.span(), "expected boolean expression"))?;
                 self.line(format!("if {simple} {{"));
-                self.indent += 1;
+                self.em.indent();
                 self.line(format!("{dst_local} := 1;"));
-                self.indent -= 1;
+                self.em.dedent();
                 self.line("} else {".to_owned());
-                self.indent += 1;
+                self.em.indent();
                 self.line(format!("{dst_local} := 0;"));
-                self.indent -= 1;
+                self.em.dedent();
                 self.line("}".to_owned());
                 Ok(())
             }
@@ -841,14 +841,14 @@ impl<'a> TreeLowerer<'a> {
                 format!("{c} != 0")
             };
             self.line(format!("if {cond_text} {{"));
-            self.indent += 1;
+            self.em.indent();
             let r1 = self.lower_match_arm(then_b, Some(&mut result));
-            self.indent -= 1;
+            self.em.dedent();
             r1?;
             self.line("} else {".to_owned());
-            self.indent += 1;
+            self.em.indent();
             let r2 = self.lower_match_arm(else_b, Some(&mut result));
-            self.indent -= 1;
+            self.em.dedent();
             r2?;
             self.line("}".to_owned());
         }
@@ -895,15 +895,15 @@ impl<'a> TreeLowerer<'a> {
         if looped && !self.single_pass_loop_ok(&[arm_stmts(then_body), arm_stmts(else_body)]) {
             return Ok(false);
         }
-        let (mark, indent) = (self.out.len(), self.indent);
+        let (mark, indent) = (self.em.mark(), self.em.depth());
         if looped {
             self.line("while true {".to_owned());
-            self.indent += 1;
+            self.em.indent();
         }
         for leaf in &leaves {
             let Some(text) = self.try_lower_simple_air_cond(leaf)? else {
-                self.out.truncate(mark);
-                self.indent = indent;
+                self.em.truncate(mark);
+                self.em.set_depth(indent);
                 return Ok(false);
             };
             let text = if op == V2BinOp::Or {
@@ -912,7 +912,7 @@ impl<'a> TreeLowerer<'a> {
                 text
             };
             self.line(format!("if {text} {{"));
-            self.indent += 1;
+            self.em.indent();
         }
         let (inner, outer) = if op == V2BinOp::Or {
             (else_body, then_body)
@@ -924,13 +924,13 @@ impl<'a> TreeLowerer<'a> {
             self.line("break;".to_owned());
         }
         for _ in &leaves {
-            self.indent -= 1;
+            self.em.dedent();
             self.line("}".to_owned());
         }
         if looped {
             self.lower_branch(outer, result)?;
             self.line("break;".to_owned());
-            self.indent -= 1;
+            self.em.dedent();
             self.line("}".to_owned());
         }
         Ok(true)
@@ -997,26 +997,26 @@ impl<'a> TreeLowerer<'a> {
             (format!("{local} != 0"), None)
         };
         self.line(format!("if {test} {{"));
-        self.indent += 1;
+        self.em.indent();
         if let Some(saved) = &restore {
             self.emit_restore_stack_obj(saved.as_deref());
         }
         edge(self, true)?;
-        self.indent -= 1;
+        self.em.dedent();
         if terminal {
             self.line("}".to_owned());
         } else {
-            let else_at = self.out.len();
+            let else_at = self.em.mark();
             self.line("} else {".to_owned());
-            self.indent += 1;
-            let arm_at = self.out.len();
+            self.em.indent();
+            let arm_at = self.em.mark();
             if let Some(saved) = &restore {
                 self.emit_restore_stack_obj(saved.as_deref());
             }
             edge(self, false)?;
-            self.indent -= 1;
-            if self.out.len() == arm_at {
-                self.out.truncate(else_at);
+            self.em.dedent();
+            if self.em.mark() == arm_at {
+                self.em.truncate(else_at);
             }
             self.line("}".to_owned());
             return Ok(());
@@ -1047,9 +1047,9 @@ impl<'a> TreeLowerer<'a> {
                 // `!` swaps the test's exits, so the false exit still ends on `lhs`'s own result.
                 if let Some(pos_lhs) = self.try_lower_simple_air_cond(lhs)? {
                     self.line(format!("if {} {{", swap_exits(&pos_lhs)));
-                    self.indent += 1;
+                    self.em.indent();
                     self.line("return false;".to_owned());
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                     self.emit_return_bool_expr(rhs)
                 } else {
@@ -1057,9 +1057,9 @@ impl<'a> TreeLowerer<'a> {
                     self.line(format!("let {tmp} = 0;"));
                     self.emit_bool_into_local(lhs, &tmp)?;
                     self.line(format!("if {tmp} == 0 {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.line("return false;".to_owned());
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                     self.emit_return_bool_expr(rhs)
                 }
@@ -1072,9 +1072,9 @@ impl<'a> TreeLowerer<'a> {
             } => {
                 if let Some(pos_lhs) = self.try_lower_simple_air_cond(lhs)? {
                     self.line(format!("if {pos_lhs} {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.line("return true;".to_owned());
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                     self.emit_return_bool_expr(rhs)
                 } else {
@@ -1082,9 +1082,9 @@ impl<'a> TreeLowerer<'a> {
                     self.line(format!("let {tmp} = 0;"));
                     self.emit_bool_into_local(lhs, &tmp)?;
                     self.line(format!("if {tmp} != 0 {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.line("return true;".to_owned());
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                     self.emit_return_bool_expr(rhs)
                 }
@@ -1098,10 +1098,10 @@ impl<'a> TreeLowerer<'a> {
                     } = self.prepare_run_functional(receiver, args, rspan)?;
                     let bang = if negated { "!" } else { "" };
                     self.line(format!("if {bang}{prim} {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.emit_restore_stack_obj(saved_stack_obj.as_deref());
                     self.line("return true;".to_owned());
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                     self.emit_restore_stack_obj(saved_stack_obj.as_deref());
                     self.line("return false;".to_owned());
@@ -1111,9 +1111,9 @@ impl<'a> TreeLowerer<'a> {
                 // result at each return is the test's own (a flipped `a != b` would invert it).
                 if let Some(pos) = self.try_lower_simple_air_cond(expr)? {
                     self.line(format!("if {pos} {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.line("return true;".to_owned());
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                     self.line("return false;".to_owned());
                     Ok(())
@@ -1122,13 +1122,13 @@ impl<'a> TreeLowerer<'a> {
                     self.line(format!("let {tmp} = 0;"));
                     self.emit_bool_into_local(expr, &tmp)?;
                     self.line(format!("if {tmp} != 0 {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.line("return true;".to_owned());
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("} else {".to_owned());
-                    self.indent += 1;
+                    self.em.indent();
                     self.line("return false;".to_owned());
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                     Ok(())
                 }

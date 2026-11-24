@@ -456,8 +456,8 @@ impl<'a> TreeLowerer<'a> {
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<()>,
     ) -> Result<()> {
-        let out_len = self.out.len();
-        let indent = self.indent;
+        let out_len = self.em.mark();
+        let indent = self.em.depth();
         let used_saved = self.used_saved_stack_obj;
         let (event_local, sleep_span) = (self.event_local, self.sleep_span);
         let expansions = self.inline_expansions;
@@ -467,8 +467,8 @@ impl<'a> TreeLowerer<'a> {
         self.checking_discarded += 1;
         let r = f(self);
         self.checking_discarded -= 1;
-        self.out.truncate(out_len);
-        self.indent = indent;
+        self.em.truncate(out_len);
+        self.em.set_depth(indent);
         self.used_saved_stack_obj = used_saved;
         (self.event_local, self.sleep_span) = (event_local, sleep_span);
         self.inline_expansions = expansions;

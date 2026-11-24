@@ -23,7 +23,7 @@ use crate::v2::ast::{
 use crate::v2::loader::{ModuleScope, ResolvedModule};
 use crate::v2::parser::snake_case_ident;
 use crate::v2::specialize;
-use crate::v2::{opt, raw_facts};
+use crate::v2::{mir, raw_facts};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -607,8 +607,8 @@ struct TreeLowerer<'a> {
     /// Non-`None` when lowering a body that returns a value in `temp[N]` (typed
     /// `functional kind(...) -> T` or a standalone `tree ... -> T @ temp[N]`).
     value_return: Option<ValueReturnAbi>,
-    out: String,
-    indent: usize,
+    /// The body being written.
+    em: mir::Emitter,
     next_id: usize,
     var_scopes: Vec<BTreeMap<String, Binding>>,
     cleanup_scopes: Vec<ScopeFrame>,

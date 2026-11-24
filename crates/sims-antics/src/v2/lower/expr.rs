@@ -430,9 +430,9 @@ impl<'a> TreeLowerer<'a> {
                             let tmp = self.fresh("auto");
                             self.line(format!("let {tmp} = 0;"));
                             self.line("if param[0] == 1 {".to_owned());
-                            self.indent += 1;
+                            self.em.indent();
                             self.line(format!("{tmp} := 1;"));
-                            self.indent -= 1;
+                            self.em.dedent();
                             self.line("}".to_owned());
                             Ok((tmp, ValueType::Bool))
                         }

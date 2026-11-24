@@ -544,7 +544,7 @@ impl<'a> TreeLowerer<'a> {
             } else {
                 if idx > 0 {
                     self.line("} else {".to_owned());
-                    self.indent += 1;
+                    self.em.indent();
                     extra_closes += 1;
                 }
                 if tests.len() > 1
@@ -552,10 +552,10 @@ impl<'a> TreeLowerer<'a> {
                     && self.match_loop_form_ok(&cases[idx..], wildcard)
                 {
                     self.line("while true {".to_owned());
-                    self.indent += 1;
+                    self.em.indent();
                     for cond in tests.iter().flatten() {
                         self.line(format!("if {} {{", negate_air_cond(cond)));
-                        self.indent += 1;
+                        self.em.indent();
                     }
                     let rest = self.emit_match_chain(
                         scrut,
@@ -566,13 +566,13 @@ impl<'a> TreeLowerer<'a> {
                     );
                     self.line("break;".to_owned());
                     for _ in &tests {
-                        self.indent -= 1;
+                        self.em.dedent();
                         self.line("}".to_owned());
                     }
                     rest?;
                     let r = self.lower_match_arm(case.body, result);
                     self.line("break;".to_owned());
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                     self.close_match_chain(extra_closes);
                     return r;
@@ -582,33 +582,33 @@ impl<'a> TreeLowerer<'a> {
                 for (&(lo, hi), test) in case.alts.iter().zip(&tests) {
                     if let Some(cond) = test {
                         self.line(format!("if {cond} {{"));
-                        self.indent += 1;
+                        self.em.indent();
                     } else {
                         self.line(format!("if {scrut} >= {lo} {{"));
-                        self.indent += 1;
+                        self.em.indent();
                         self.line(format!("if {scrut} <= {hi} {{"));
-                        self.indent += 1;
+                        self.em.indent();
                     }
                     self.line(format!("{flag} := 1;"));
                     if test.is_none() {
-                        self.indent -= 1;
+                        self.em.dedent();
                         self.line("}".to_owned());
                     }
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                 }
                 self.line(format!("if {flag} != 0 {{"));
             }
-            self.indent += 1;
+            self.em.indent();
             let r = self.lower_match_arm(case.body, result.as_deref_mut());
-            self.indent -= 1;
+            self.em.dedent();
             r?;
         }
         if let Some(wc) = wildcard {
             self.line("} else {".to_owned());
-            self.indent += 1;
+            self.em.indent();
             let r = self.lower_match_arm(wc, result);
-            self.indent -= 1;
+            self.em.dedent();
             self.line("}".to_owned());
             self.close_match_chain(extra_closes);
             r
@@ -661,7 +661,7 @@ impl<'a> TreeLowerer<'a> {
 
     pub(super) fn close_match_chain(&mut self, extra_closes: usize) {
         for _ in 0..extra_closes {
-            self.indent -= 1;
+            self.em.dedent();
             self.line("}".to_owned());
         }
     }

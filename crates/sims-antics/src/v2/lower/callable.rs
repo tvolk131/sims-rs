@@ -259,10 +259,10 @@ impl<'a> TreeLowerer<'a> {
             return Err(Error::at(span, "'?' cannot exit out of a 'defer' block"));
         }
         self.line(format!("if !{call} {{"));
-        self.indent += 1;
+        self.em.indent();
         self.emit_cleanups_down_to(0)?;
         self.line("return error;".to_owned());
-        self.indent -= 1;
+        self.em.dedent();
         self.line("}".to_owned());
         Ok(())
     }
@@ -335,9 +335,9 @@ impl<'a> TreeLowerer<'a> {
                 let tmp = self.fresh("call");
                 self.line(format!("let {tmp} = 0;"));
                 self.line(format!("if {call} {{"));
-                self.indent += 1;
+                self.em.indent();
                 self.line(format!("{tmp} := 1;"));
-                self.indent -= 1;
+                self.em.dedent();
                 self.line("}".to_owned());
                 Ok((tmp, ValueType::Bool))
             }

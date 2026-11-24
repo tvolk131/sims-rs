@@ -523,11 +523,11 @@ impl<'a> TreeLowerer<'a> {
         body: &[V2Stmt],
         declarations: &mut Vec<String>,
     ) -> Result<String> {
-        let old_indent = std::mem::replace(&mut self.indent, 0);
-        let start = self.out.len();
+        let old_indent = self.em.set_depth(0);
+        let start = self.em.mark();
         let result = self.lower_block(body);
-        let arm = self.out.split_off(start);
-        self.indent = old_indent;
+        let arm = self.em.split_off(start);
+        self.em.set_depth(old_indent);
         result?;
         let mut code = String::new();
         for line in arm.lines() {
@@ -595,9 +595,9 @@ impl<'a> TreeLowerer<'a> {
 
         // Check a trial emission for raw code, pinned slots and calls that depend on the
         // layout of adjacent nodes. These need the ordinary single-copy branch lowering.
-        let prefix = std::mem::take(&mut self.out);
+        let prefix = self.em.take_text();
         let mut trial = self.clone();
-        self.out = prefix;
+        self.em.set_text(prefix);
         let strings = self.env.dialog_strings.borrow().clone();
         let mut declarations = Vec::new();
         let then_air = trial.capture_inline_arm(then_body, &mut declarations)?;
@@ -629,8 +629,8 @@ impl<'a> TreeLowerer<'a> {
         for decl in declarations {
             trial.line(decl);
         }
-        self.out.push_str(&trial.out);
-        trial.out = std::mem::take(&mut self.out);
+        self.em.append(trial.em.text());
+        trial.em.set_text(self.em.take_text());
         *self = trial;
         Ok(true)
     }
@@ -1004,7 +1004,7 @@ impl<'a> TreeLowerer<'a> {
         let res = self.with_owner_module(fn_mod, |c| {
             if needs_wrapper {
                 c.line("while true {".to_owned());
-                c.indent += 1;
+                c.em.indent();
             }
             c.push_scope(ScopeFrame {
                 is_fn_root: true,
@@ -1016,7 +1016,7 @@ impl<'a> TreeLowerer<'a> {
             let p = c.pop_scope_and_run_cleanups();
             if needs_wrapper {
                 c.line("break;".to_owned());
-                c.indent -= 1;
+                c.em.dedent();
                 c.line("}".to_owned());
             }
             r.and(p)

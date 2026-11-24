@@ -186,13 +186,13 @@ impl<'a> TreeLowerer<'a> {
         } = self.prepare_run_functional(receiver, args, span)?;
         if let Some(dst) = result_local {
             self.line(format!("if {prim} {{"));
-            self.indent += 1;
+            self.em.indent();
             self.line(format!("{dst} := 1;"));
-            self.indent -= 1;
+            self.em.dedent();
             self.line("} else {".to_owned());
-            self.indent += 1;
+            self.em.indent();
             self.line(format!("{dst} := 0;"));
-            self.indent -= 1;
+            self.em.dedent();
             self.line("}".to_owned());
         } else {
             self.line(format!("{prim};"));
@@ -290,12 +290,12 @@ impl<'a> TreeLowerer<'a> {
         }
 
         self.line(format!("if !{prim} {{"));
-        self.indent += 1;
+        self.em.indent();
         self.emit_restore_stack_obj(saved_stack_obj.as_deref());
         self.push_scope(ScopeFrame::block());
         let r = self.lower_stmts(else_body);
         let p = self.pop_scope_and_run_cleanups();
-        self.indent -= 1;
+        self.em.dedent();
         self.line("}".to_owned());
         r.and(p)?;
         Ok((final_ty, saved_stack_obj))

@@ -338,7 +338,7 @@ impl<'a> TreeLowerer<'a> {
                 let counter = self.fresh("rep");
                 self.line(format!("let {counter} = 0;"));
                 self.line(format!("while {counter} < {limit_air} {{"));
-                self.indent += 1;
+                self.em.indent();
                 self.push_scope(ScopeFrame {
                     cleanups: Vec::new(),
                     is_loop_body: true,
@@ -351,25 +351,25 @@ impl<'a> TreeLowerer<'a> {
                 });
                 if let Some(flag) = &cancel_flag {
                     self.line("if my.person.priority == 0 {".to_owned());
-                    self.indent += 1;
+                    self.em.indent();
                     self.line(format!("{flag} := 1;"));
                     self.line("break;".to_owned());
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                 }
                 let res = self.lower_stmts(body);
                 let pop_res = self.pop_scope_and_run_cleanups();
                 self.line(format!("{counter} += 1;"));
-                self.indent -= 1;
+                self.em.dedent();
                 self.line("}".to_owned());
                 res.and(pop_res)?;
                 if let Some(inner_flag) = &cancel_flag
                     && let Some((_, outer_flag)) = self.enclosing_cancel_flag()
                 {
                     self.line(format!("if {inner_flag} != 0 {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.line(format!("{outer_flag} := 1;"));
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                 }
                 self.emit_inline_fn_return_propagation(false)?;
@@ -422,7 +422,7 @@ impl<'a> TreeLowerer<'a> {
                 };
                 if let Some(simple_cond) = header {
                     self.line(format!("while {simple_cond} {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.push_scope(ScopeFrame {
                         cleanups: Vec::new(),
                         is_loop_body: true,
@@ -435,20 +435,20 @@ impl<'a> TreeLowerer<'a> {
                     });
                     if let Some(flag) = &cancel_flag {
                         self.line("if my.person.priority == 0 {".to_owned());
-                        self.indent += 1;
+                        self.em.indent();
                         self.line(format!("{flag} := 1;"));
                         self.line("break;".to_owned());
-                        self.indent -= 1;
+                        self.em.dedent();
                         self.line("}".to_owned());
                     }
                     let res = self.lower_stmts(body);
                     let pop_res = self.pop_scope_and_run_cleanups();
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                     res.and(pop_res)?;
                 } else {
                     self.line("while true {".to_owned());
-                    self.indent += 1;
+                    self.em.indent();
                     self.push_scope(ScopeFrame {
                         cleanups: Vec::new(),
                         is_loop_body: true,
@@ -461,10 +461,10 @@ impl<'a> TreeLowerer<'a> {
                     });
                     if let Some(flag) = &cancel_flag {
                         self.line("if my.person.priority == 0 {".to_owned());
-                        self.indent += 1;
+                        self.em.indent();
                         self.line(format!("{flag} := 1;"));
                         self.line("break;".to_owned());
-                        self.indent -= 1;
+                        self.em.dedent();
                         self.line("}".to_owned());
                     }
                     // The condition is tested at the top of every pass. One that lowers to a
@@ -485,13 +485,13 @@ impl<'a> TreeLowerer<'a> {
                         }
                         Err(e) => Err(e),
                     };
-                    self.indent += 1;
+                    self.em.indent();
                     self.line("break;".to_owned());
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                     let body_res = cond_res.and_then(|()| self.lower_stmts(body));
                     let pop_res = self.pop_scope_and_run_cleanups();
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                     body_res.and(pop_res)?;
                 }
@@ -499,9 +499,9 @@ impl<'a> TreeLowerer<'a> {
                     && let Some((_, outer_flag)) = self.enclosing_cancel_flag()
                 {
                     self.line(format!("if {inner_flag} != 0 {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.line(format!("{outer_flag} := 1;"));
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                 }
                 self.emit_inline_fn_return_propagation(false)?;
@@ -642,14 +642,14 @@ impl<'a> TreeLowerer<'a> {
                 } else {
                     self.line(format!("while {step} {{"));
                 }
-                self.indent += 1;
+                self.em.indent();
                 if let Some(root_expr) = &parts_root_opt
                     && else_body.is_none()
                 {
                     self.line(format!("if {iter_var} == {root_expr} {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.line("break;".to_owned());
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                 }
                 self.push_scope(ScopeFrame {
@@ -666,10 +666,10 @@ impl<'a> TreeLowerer<'a> {
                     // A successful iteration goes back to the test. Falling through the test
                     // (or wrapping to the root part) reaches the single exhaustion block.
                     self.line(format!("if {step} {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     if let Some(root_expr) = &parts_root_opt {
                         self.line(format!("if !{iter_var} == {root_expr} {{"));
-                        self.indent += 1;
+                        self.em.indent();
                     }
                 }
                 self.bind_var(
@@ -679,7 +679,7 @@ impl<'a> TreeLowerer<'a> {
                         ty: binding_ty,
                     },
                 );
-                let body_start = self.out.len();
+                let body_start = self.em.mark();
                 let res = self.lower_stmts(body);
                 let pop_res = self.pop_scope_and_run_cleanups();
                 res.and(pop_res)?;
@@ -693,17 +693,17 @@ impl<'a> TreeLowerer<'a> {
                 };
                 let restore_on_exhaustion = restore_on_exhaustion
                     && (stack_cursor
-                        || super::opt::body_may_leave_stack_obj_moved(
-                            &self.out[body_start..],
+                        || super::mir::body_may_leave_stack_obj_moved(
+                            self.em.since(body_start),
                             restore_line,
                         ));
                 if let Some(else_body) = else_body {
                     self.line("continue;".to_owned());
                     if parts_root_opt.is_some() {
-                        self.indent -= 1;
+                        self.em.dedent();
                         self.line("}".to_owned());
                     }
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                     if restore_on_exhaustion {
                         self.emit_entry_stack_restore();
@@ -719,7 +719,7 @@ impl<'a> TreeLowerer<'a> {
                     res.and(pop_res)?;
                     self.line("break;".to_owned());
                 }
-                self.indent -= 1;
+                self.em.dedent();
                 self.line("}".to_owned());
                 if else_body.is_none() || (restore_on_exhaustion && else_diverges) {
                     self.emit_restore_stack_obj(None);
@@ -764,24 +764,24 @@ impl<'a> TreeLowerer<'a> {
                     } = self.prepare_run_functional(receiver, args, rspan)?;
                     let bang = if negated { "!" } else { "" };
                     self.line(format!("if {bang}{prim} {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.emit_restore_stack_obj(saved_stack_obj.as_deref());
                     self.push_scope(ScopeFrame::block());
                     let r1 = self.lower_stmts(then_body);
                     let p1 = self.pop_scope_and_run_cleanups();
-                    self.indent -= 1;
-                    let mark = self.out.len();
+                    self.em.dedent();
+                    let mark = self.em.mark();
                     self.line("} else {".to_owned());
-                    self.indent += 1;
-                    let restore_at = self.out.len();
+                    self.em.indent();
+                    let restore_at = self.em.mark();
                     self.emit_restore_stack_obj(saved_stack_obj.as_deref());
-                    let restored = self.out.len() != restore_at;
+                    let restored = self.em.mark() != restore_at;
                     self.push_scope(ScopeFrame::block());
                     let r2 = self.lower_stmts(else_body);
                     let p2 = self.pop_scope_and_run_cleanups();
-                    self.indent -= 1;
+                    self.em.dedent();
                     if else_body.is_empty() && !restored {
-                        self.out.truncate(mark);
+                        self.em.truncate(mark);
                     }
                     self.line("}".to_owned());
                     return r1.and(p1).and(r2).and(p2);
@@ -810,21 +810,21 @@ impl<'a> TreeLowerer<'a> {
                 };
 
                 self.line(format!("if {cond_text} {{"));
-                self.indent += 1;
+                self.em.indent();
                 self.push_scope(ScopeFrame::block());
                 let r1 = self.lower_stmts(then_body);
                 let p1 = self.pop_scope_and_run_cleanups();
-                self.indent -= 1;
+                self.em.dedent();
                 if else_body.is_empty() {
                     self.line("}".to_owned());
                     r1.and(p1)
                 } else {
                     self.line("} else {".to_owned());
-                    self.indent += 1;
+                    self.em.indent();
                     self.push_scope(ScopeFrame::block());
                     let r2 = self.lower_stmts(else_body);
                     let p2 = self.pop_scope_and_run_cleanups();
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                     r1.and(p1).and(r2).and(p2)
                 }
@@ -987,13 +987,13 @@ impl<'a> TreeLowerer<'a> {
                                 self.emit_bool_into_local(expr, &ret_loc)?;
                                 self.emit_all_cleanups()?;
                                 self.line(format!("if {ret_loc} != 0 {{"));
-                                self.indent += 1;
+                                self.em.indent();
                                 self.line("return true;".to_owned());
-                                self.indent -= 1;
+                                self.em.dedent();
                                 self.line("} else {".to_owned());
-                                self.indent += 1;
+                                self.em.indent();
                                 self.line("return false;".to_owned());
-                                self.indent -= 1;
+                                self.em.dedent();
                                 self.line("}".to_owned());
                                 Ok(())
                             }
@@ -1196,7 +1196,7 @@ impl<'a> TreeLowerer<'a> {
             let (lo_air, hi_air) = (air(&lo), air(&hi));
             let cmp = if inclusive { "<=" } else { "<" };
             self.line(format!("if {lo_air} {cmp} {hi_air} {{"));
-            self.indent += 1;
+            self.em.indent();
             // Inside the guard the range is non-empty, so `b - 1` cannot wrap.
             let last_hi = if inclusive {
                 hi_air
@@ -1222,7 +1222,7 @@ impl<'a> TreeLowerer<'a> {
                 step,
             });
         }
-        self.indent += 1;
+        self.em.indent();
         self.push_scope(ScopeFrame {
             cleanups: Vec::new(),
             is_loop_body: true,
@@ -1245,10 +1245,10 @@ impl<'a> TreeLowerer<'a> {
         if let Some(step) = &edge_step {
             self.emit_continue_step(step);
         }
-        self.indent -= 1;
+        self.em.dedent();
         self.line("}".to_owned());
         if edge_step.is_some() {
-            self.indent -= 1;
+            self.em.dedent();
             self.line("}".to_owned());
         }
         res.and(pop_res)?;
@@ -1267,12 +1267,12 @@ impl<'a> TreeLowerer<'a> {
             // own wrapper loop is at `fn_scope_depth`!), breaking out of an inner loop needs to
             // propagate upward until we exit the wrapper loop.
             self.line(format!("if {ret_flag} != 0 {{"));
-            self.indent += 1;
+            self.em.indent();
             if restore_stack {
                 self.emit_entry_stack_restore();
             }
             self.line("break;".to_owned());
-            self.indent -= 1;
+            self.em.dedent();
             self.line("}".to_owned());
         }
         Ok(())
@@ -1392,7 +1392,7 @@ impl<'a> TreeLowerer<'a> {
             self.line(format!("let {found_var} = 0;"));
             let saved_stack_obj = self.save_stack_obj_for_move();
             self.line(format!("if {} {{", plan.prim_air));
-            self.indent += 1;
+            self.em.indent();
             self.line(format!("let {raw_var} = stack_obj;"));
             self.line(format!("let {cand_var} = 0;"));
             let best_var = if allow_fallback && score_field.is_some() {
@@ -1406,23 +1406,23 @@ impl<'a> TreeLowerer<'a> {
                 "while set_to_next(guid, {:#010x}, dest: {cand_var}) {{",
                 schema.lead_guid
             ));
-            self.indent += 1;
+            self.em.indent();
             self.line(format!("if {cand_var} == {raw_var} {{"));
-            self.indent += 1;
+            self.em.indent();
             self.line(format!("{found_var} := {cand_var};"));
             self.line("break;".to_owned());
-            self.indent -= 1;
+            self.em.dedent();
             self.line("}".to_owned());
             if allow_fallback {
                 self.line(format!("stack_obj := {cand_var};"));
                 self.line("if stack.in_use == 0 {".to_owned());
-                self.indent += 1;
+                self.em.indent();
                 self.line("if !stack.data[8] flag_test 10 {".to_owned());
-                self.indent += 1;
+                self.em.indent();
                 let mut extra_blocks = 0usize;
                 if (plan.flags & 4) != 0 {
                     self.line("if stack.room == my.room {".to_owned());
-                    self.indent += 1;
+                    self.em.indent();
                     extra_blocks += 1;
                 }
                 if let FunctionalGuardSummary::AttrBool {
@@ -1436,42 +1436,42 @@ impl<'a> TreeLowerer<'a> {
                         format!("stack.attr[{attr_index}] == 0")
                     };
                     self.line(format!("if {cond} {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     extra_blocks += 1;
                 }
                 if let (Some(sf), Some(bvar)) = (score_field, &best_var) {
                     self.line(format!("if {sf} > 0 {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.line(format!("if {found_var} == 0 {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.line(format!("{found_var} := {cand_var};"));
                     self.line(format!("{bvar} := {sf};"));
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line(format!("}} else if {sf} > {bvar} {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.line(format!("{found_var} := {cand_var};"));
                     self.line(format!("{bvar} := {sf};"));
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                 } else {
                     self.line(format!("if {found_var} == 0 {{"));
-                    self.indent += 1;
+                    self.em.indent();
                     self.line(format!("{found_var} := {cand_var};"));
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                 }
                 for _ in 0..extra_blocks {
-                    self.indent -= 1;
+                    self.em.dedent();
                     self.line("}".to_owned());
                 }
-                self.indent -= 1;
+                self.em.dedent();
                 self.line("}".to_owned());
-                self.indent -= 1;
+                self.em.dedent();
                 self.line("}".to_owned());
             }
-            self.indent -= 1;
+            self.em.dedent();
             self.line("}".to_owned());
 
             // Multi-tile object support: if the VM's winner was a non-lead tile of T, accept it too.
@@ -1481,33 +1481,33 @@ impl<'a> TreeLowerer<'a> {
                 }
                 let tchk = self.fresh("fbo_tile");
                 self.line(format!("if {found_var} != {raw_var} {{"));
-                self.indent += 1;
+                self.em.indent();
                 self.line(format!("let {tchk} = 0;"));
                 self.line(format!(
                     "while set_to_next(guid, {tile_guid:#010x}, dest: {tchk}) {{"
                 ));
-                self.indent += 1;
+                self.em.indent();
                 self.line(format!("if {tchk} == {raw_var} {{"));
-                self.indent += 1;
+                self.em.indent();
                 self.line(format!("{found_var} := {raw_var};"));
                 self.line("break;".to_owned());
-                self.indent -= 1;
+                self.em.dedent();
                 self.line("}".to_owned());
-                self.indent -= 1;
+                self.em.dedent();
                 self.line("}".to_owned());
-                self.indent -= 1;
+                self.em.dedent();
                 self.line("}".to_owned());
             }
-            self.indent -= 1;
+            self.em.dedent();
             self.line("}".to_owned());
 
             self.line(format!("if {found_var} == 0 {{"));
-            self.indent += 1;
+            self.em.indent();
             self.emit_restore_stack_obj(saved_stack_obj.as_deref());
             self.push_scope(ScopeFrame::block());
             let r = self.lower_stmts(else_body);
             let p = self.pop_scope_and_run_cleanups();
-            self.indent -= 1;
+            self.em.dedent();
             self.line("}".to_owned());
             r.and(p)?;
 
@@ -1564,12 +1564,12 @@ impl<'a> TreeLowerer<'a> {
 
         let saved_stack_obj = self.save_stack_obj_for_move();
         self.line(format!("if !{prim_air} {{"));
-        self.indent += 1;
+        self.em.indent();
         self.emit_restore_stack_obj(saved_stack_obj.as_deref());
         self.push_scope(ScopeFrame::block());
         let r = self.lower_stmts(else_body);
         let p = self.pop_scope_and_run_cleanups();
-        self.indent -= 1;
+        self.em.dedent();
         self.line("}".to_owned());
         r.and(p)?;
 
