@@ -882,7 +882,9 @@ fn end_of_line_comments_stay_on_the_line_they_end() {
         "{once}"
     );
     assert!(
-        once.contains("        if self.level > 2 { // gap: why\n            self.level = 0;\n        }\n"),
+        once.contains(
+            "        if self.level > 2 { // gap: why\n            self.level = 0;\n        }\n"
+        ),
         "{once}"
     );
     // The directive still covers the statement, before and after formatting.

@@ -463,7 +463,10 @@ fn restored_or_object_context_self_is_fine() {
         "        stack_obj = sim;\n        let other = stack_obj;\n        stack_obj = other;\n        self.level = 1;",
     );
     let d = one(&late, "stack_obj_clobber_after_self");
-    assert!(d.help.as_deref().unwrap().contains("stack_obj.<field>"), "{d:?}");
+    assert!(
+        d.help.as_deref().unwrap().contains("stack_obj.<field>"),
+        "{d:?}"
+    );
     // A restore inside a nested block ends the clobber.
     none(
         &sim_tree(
@@ -583,7 +586,9 @@ fn builtins_that_write_a_local_assign_it() {
     none(&source, "uninitialized_local_read");
     none(&source, "unused_decl");
     // A read in another argument of the same call still counts as a read.
-    let source = tree("        let roll: i16;\n        random_into(roll, roll)?;\n        self.level = roll;");
+    let source = tree(
+        "        let roll: i16;\n        random_into(roll, roll)?;\n        self.level = roll;",
+    );
     one(&source, "uninitialized_local_read");
 }
 
@@ -609,7 +614,10 @@ fn a_local_read_only_by_a_string_token_is_used() {
     let source = dialog_tree("you got $Local:0", body);
     let d = one(&source, "unused_decl");
     assert!(d.message.contains("`shown`"), "{d:?}");
-    assert!(d.note.as_deref().unwrap().contains("`shown` is on slot 1"), "{d:?}");
+    assert!(
+        d.note.as_deref().unwrap().contains("`shown` is on slot 1"),
+        "{d:?}"
+    );
 }
 
 #[test]
@@ -617,7 +625,11 @@ fn a_string_token_past_the_frame_is_flagged() {
     let source = dialog_tree("you got $Local:4", "        let shown = random(7);");
     let d = one(&source, "dialog_local_slot_mismatch");
     assert_eq!(d.line, line_of(&source, "dialog("));
-    assert!(d.message.contains("`$Local:4` in string `hi` reads local slot 4"), "{d:?}");
+    assert!(
+        d.message
+            .contains("`$Local:4` in string `hi` reads local slot 4"),
+        "{d:?}"
+    );
     assert!(d.note.as_deref().unwrap().contains("1 `shown`"), "{d:?}");
     // Slot 0 holds the `random` temporary, not a `let`.
     let source = dialog_tree("you got $Local:0", "        let shown = random(7);");
@@ -642,7 +654,13 @@ fn a_raw_block_ending_in_a_bare_call_before_more_code_is_flagged() {
     );
     let d = one(&source, "raw_bare_call_false_exit");
     assert_eq!(d.line, line_of(&source, "call 4301(temps);"));
-    assert!(d.help.as_deref().unwrap().contains("if call 4301(temps) {}"), "{d:?}");
+    assert!(
+        d.help
+            .as_deref()
+            .unwrap()
+            .contains("if call 4301(temps) {}"),
+        "{d:?}"
+    );
 }
 
 #[test]
@@ -672,7 +690,10 @@ fn a_sim_tree_reading_param_in_raw_without_frame_args_is_flagged() {
     let source = sim_tree("        raw { temp[0] := param[1]; }\n        sim.motive[1] = 1;");
     let d = one(&source, "missing_sim_frame_args");
     assert!(d.message.contains("`param[1]`"), "{d:?}");
-    assert!(d.help.as_deref().unwrap().contains("@frame(args: 2)"), "{d:?}");
+    assert!(
+        d.help.as_deref().unwrap().contains("@frame(args: 2)"),
+        "{d:?}"
+    );
     // Pinned arguments, an object-context tree, or declared parameters: fine.
     none(
         &obj(
@@ -821,9 +842,7 @@ fn if_returning_bool_literals_is_flagged() {
         "    state on: bool;\n    fn on() -> bool {\n        if !self.on { return false; }\n        return true;\n    }",
     );
     assert_eq!(
-        one(&negated, "redundant_bool_return")
-            .suggestion
-            .as_deref(),
+        one(&negated, "redundant_bool_return").suggestion.as_deref(),
         Some("return self.on;")
     );
 }
@@ -831,7 +850,11 @@ fn if_returning_bool_literals_is_flagged() {
 #[test]
 fn if_returning_a_comparison_keeps_its_last_result() {
     // `return a op b;` lowers with the opposite last result: not reported.
-    for cond in ["self.level > 3", "!(self.level > 3)", "self.on && self.level == 2"] {
+    for cond in [
+        "self.level > 3",
+        "!(self.level > 3)",
+        "self.on && self.level == 2",
+    ] {
         none(
             &obj(&format!(
                 "    state on: bool;\n    fn high() -> bool {{\n        if {cond} {{ return true; }}\n        return false;\n    }}"

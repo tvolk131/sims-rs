@@ -119,10 +119,7 @@ pub const LINT_RULES: &[LintRule] = &[
         STACK_OBJ_CLOBBER_AFTER_SELF,
         "`self` in a Sim-context body after `stack_obj` was reassigned",
     ),
-    warn(
-        UNUSED_DECL,
-        "unused local, state, constant or BCON entry",
-    ),
+    warn(UNUSED_DECL, "unused local, state, constant or BCON entry"),
     warn(
         UNINITIALIZED_LOCAL_READ,
         "a read of a `let x: T;` local before anything assigns it",
@@ -1525,7 +1522,9 @@ impl FileLinter<'_> {
                 .or_else(|| frames.values().next().filter(|_| frames.len() == 1))?;
             id.and_then(|id| list.iter().find(|f| f.id == id))
                 .or_else(|| {
-                    let mut named = list.iter().filter(|f| !label.is_empty() && f.label == label);
+                    let mut named = list
+                        .iter()
+                        .filter(|f| !label.is_empty() && f.label == label);
                     named.next().filter(|_| named.next().is_none())
                 })
                 .cloned()
@@ -1553,9 +1552,10 @@ impl FileLinter<'_> {
             for e in stmt_exprs(s) {
                 walk_expr(e, &mut |x| match x {
                     V2Expr::Str(span, text) => note(*span, text, "this string".to_owned()),
-                    V2Expr::Ident(span, name) | V2Expr::Field { span, field: name, .. }
-                        if strings.contains_key(name) =>
-                    {
+                    V2Expr::Ident(span, name)
+                    | V2Expr::Field {
+                        span, field: name, ..
+                    } if strings.contains_key(name) => {
                         note(*span, &strings[name], format!("string `{name}`"));
                     }
                     V2Expr::Path(span, segments) => {
@@ -1606,7 +1606,10 @@ impl FileLinter<'_> {
         let read: Vec<String> = t
             .tokens
             .iter()
-            .filter_map(|(slot, uses)| uses.first().map(|(_, token, _)| format!("`{token}` (slot {slot})")))
+            .filter_map(|(slot, uses)| {
+                uses.first()
+                    .map(|(_, token, _)| format!("`{token}` (slot {slot})"))
+            })
             .collect();
         let on = frame
             .slots
@@ -1651,7 +1654,9 @@ impl FileLinter<'_> {
                 Some(s) if s.starts_with("local[") => continue,
                 Some(s) => match let_source_name(s) {
                     Some(name) if t.lets.contains(name) => continue,
-                    Some(name) => format!("`{name}`, which is not a `let` of this tree (an inlined helper's local)"),
+                    Some(name) => format!(
+                        "`{name}`, which is not a `let` of this tree (an inlined helper's local)"
+                    ),
                     None => format!("the compiler temporary `{s}`"),
                 },
             };
@@ -2304,18 +2309,16 @@ impl FileLinter<'_> {
             }
             let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
             // Point at the call's own line when the block spans several.
-            let at = code
-                .find(t.as_str())
-                .map_or(span, |pos| {
-                    let before = &code[..pos];
-                    let lines = before.matches('\n').count();
-                    if lines == 0 {
-                        span
-                    } else {
-                        let col = before.len() - before.rfind('\n').map_or(0, |n| n + 1);
-                        Span::new(span.line + lines, col + 1)
-                    }
-                });
+            let at = code.find(t.as_str()).map_or(span, |pos| {
+                let before = &code[..pos];
+                let lines = before.matches('\n').count();
+                if lines == 0 {
+                    span
+                } else {
+                    let col = before.len() - before.rfind('\n').map_or(0, |n| n + 1);
+                    Span::new(span.line + lines, col + 1)
+                }
+            });
             self.emit(
                 RAW_BARE_CALL_FALSE_EXIT,
                 at,
@@ -2738,7 +2741,10 @@ fn raw_index_words(code: &str) -> Vec<(&str, i64)> {
             continue;
         };
         let inner = code[pos + 1..pos + 1 + len].trim();
-        let n = match inner.strip_prefix("0x").or_else(|| inner.strip_prefix("0X")) {
+        let n = match inner
+            .strip_prefix("0x")
+            .or_else(|| inner.strip_prefix("0X"))
+        {
             Some(hex) => i64::from_str_radix(&hex.replace('_', ""), 16).ok(),
             None => inner.replace('_', "").parse().ok(),
         };
