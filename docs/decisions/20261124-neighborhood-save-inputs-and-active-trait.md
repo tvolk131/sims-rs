@@ -46,8 +46,12 @@ of it, including those in sims-vm. A separate table changes neither, so
 - A neighborhood imported before this change has no entry. Its save then
   writes no FAMh and zeros for the uninitialized bytes.
 - `NeighborhoodStore::save_save_inputs` replaces the entry. Callers use
-  it, for example, when a family moves in from a `.FAM` file: 0x4107cf
-  copies that file's FAMh.
+  it, for example, when a family moves in from a `.FAM` file: when the
+  family has one (+0x140), 0x4107a8 copies that file's FAMh. Only
+  otherwise does 0x4107cf test the stored history (+0x144).
+- When a commit drops a family, its entries go too: its FAMh, its name
+  and its name's stray byte. A family that later takes the same ID then
+  gets none of the old family's.
 
 ## Saving to a folder
 
@@ -57,17 +61,21 @@ same with the stored record and inputs. Both follow the end of 0x4252cc:
 
 1. The chunks are written into `NTemp.iff` (0x6c2608) and the file is
    closed (0x46b6d2).
-2. If the close succeeded:
+2. 0x46b6d2's result is not checked. 0x425474 tests the status the save
+   kept, `[ebp-0x10]`. If it is 0:
    - 0x46b42a deletes `Neighborhood.iff` (0x425481). A result of 0 or
      −0x28 ("not found") continues; any other result is returned.
    - 0x5b9988 moves `NTemp.iff` onto the name (0x4254a2). If the move
      fails, the save returns −1.
-3. If the close failed, 0x46b42a deletes `NTemp.iff` (0x4254bd).
+3. Otherwise 0x46b42a deletes `NTemp.iff` (0x4254bd).
 
 The port renames `NTemp.iff` over `Neighborhood.iff` in one step. That
 leaves the same files, and the folder is never without a
 `Neighborhood.iff`. An existing file whose name differs only in case is
-replaced under its own name. A failed write deletes `NTemp.iff`.
+replaced under its own name. A failed write or rename deletes
+`NTemp.iff`. `NeighborhoodStore::save_neighborhood_iff` reads the record
+and the inputs in one read transaction. Like the original's fixed
+`NTemp.iff`, the save assumes one writer per folder.
 
 Saving each of the three UD2 captures from the store gives the recorded
 `Neighborhood.iff` byte for byte. Each was imported, and then saved from

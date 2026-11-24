@@ -478,3 +478,60 @@ fn a_file_the_save_did_not_write_gives_what_reads() {
     assert_eq!(inputs.uninitialized.family_names[&6], 0x33);
     assert!(inputs.option_bytes.is_empty());
 }
+
+/// A family the store drops takes its FAMh and name with it, so a family
+/// that later takes its ID saves none of them.
+#[test]
+fn a_dropped_family_takes_its_history_and_name_with_it() {
+    let mut inputs = SaveInputs::default();
+    inputs.histories.insert(1, vec![1, 1]);
+    inputs.histories.insert(3, vec![3, 3, 3]);
+    inputs.family_names.insert(3, " Gamma ".to_owned());
+    inputs.uninitialized.family_names.insert(3, 0x44);
+    let bytes = sample().neighborhood_iff(&inputs).unwrap();
+
+    let folder = TempDir::new("dropped");
+    std::fs::write(folder.0.join("Neighborhood.iff"), &bytes).unwrap();
+    let db = TempDb::new("dropped");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store.import_directory("Hood", &folder.0, 0xff).unwrap();
+    assert!(
+        store
+            .load_save_inputs("Hood")
+            .unwrap()
+            .histories
+            .contains_key(&3)
+    );
+
+    // Dropped: family 3's entries go; family 1's stay.
+    let mut state = store.load_neighborhood("Hood").unwrap().unwrap();
+    let gamma = state.families.remove(&3).unwrap();
+    store.save_neighborhood("Hood", &state).unwrap();
+    let kept = store.load_save_inputs("Hood").unwrap();
+    assert!(!kept.histories.contains_key(&3));
+    assert!(!kept.family_names.contains_key(&3));
+    assert!(!kept.uninitialized.family_names.contains_key(&3));
+    assert_eq!(kept.histories[&1], [1, 1]);
+
+    // A new family 3 saves no FAMh.
+    let mut state = store.load_neighborhood("Hood").unwrap().unwrap();
+    state.families.insert(3, gamma);
+    store.save_neighborhood("Hood", &state).unwrap();
+    let out = TempDir::new("dropped-out");
+    let path = store.save_neighborhood_iff("Hood", &out.0).unwrap();
+    let iff = Iff::parse(std::fs::read(&path).unwrap()).unwrap();
+    assert!(iff.get(b"FAMh", 3).is_none());
+    assert!(iff.get(b"FAMh", 1).is_some());
+}
+
+/// A rename that fails (here onto a folder named `Neighborhood.iff`)
+/// leaves no `NTemp.iff` behind.
+#[test]
+fn a_failed_save_leaves_no_temporary_file() {
+    let out = TempDir::new("failed-save");
+    std::fs::create_dir(out.0.join("Neighborhood.iff")).unwrap();
+    let result = sample().save_neighborhood_iff(&out.0, &SaveInputs::default());
+    assert!(result.is_err());
+    assert!(!out.0.join(TEMPORARY_FILE).exists());
+    assert!(out.0.join("Neighborhood.iff").is_dir());
+}

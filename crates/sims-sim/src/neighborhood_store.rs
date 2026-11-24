@@ -959,12 +959,15 @@ fn purge_lot_thumbnails_in_txn(txn: &redb::WriteTransaction, id: &str) -> Result
 /// preexisting orphan album rows for newly allocated non-zero families in
 /// `next` (e.g. from older databases before transactional family-delete album
 /// cleanup), inside the same REDB write transaction as the neighborhood commit.
+/// It also forgets the save inputs of those families
+/// ([`forget_family_save_inputs_in_txn`]).
 fn purge_removed_family_albums_in_txn(
     txn: &redb::WriteTransaction,
     id: &str,
     previous: &StoredNeighborhood,
     next: &StoredNeighborhood,
 ) -> Result<()> {
+    forget_family_save_inputs_in_txn(txn, id, previous, next)?;
     for &family_id in previous.families.keys() {
         if family_id != 0 && !next.families.contains_key(&family_id) {
             crate::album_store::purge_family_in_txn(txn, id, family_id)?;
@@ -976,6 +979,65 @@ fn purge_removed_family_albums_in_txn(
         }
     }
     Ok(())
+}
+
+/// Forgets the FAMh, name and name byte kept for each family that is in
+/// one of `previous` and `next` but not the other: a removed family's are
+/// stale, and so are any left under the ID of a family new in `next`,
+/// which a family deleted earlier may have held. A new family's own FAMh
+/// (one moved in from a `.FAM` file) is stored after its commit
+/// ([`NeighborhoodStore::save_save_inputs`]).
+fn forget_family_save_inputs_in_txn(
+    txn: &redb::WriteTransaction,
+    id: &str,
+    previous: &StoredNeighborhood,
+    next: &StoredNeighborhood,
+) -> Result<()> {
+    let changed: Vec<u16> = previous
+        .families
+        .keys()
+        .filter(|family| !next.families.contains_key(family))
+        .chain(
+            next.families
+                .keys()
+                .filter(|family| !previous.families.contains_key(family)),
+        )
+        .copied()
+        .collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let mut table = txn.open_table(NEIGHBORHOOD_SAVE_INPUTS).map_err(store)?;
+    let Some(mut inputs) = table
+        .get(id)
+        .map_err(store)?
+        .map(|value| SaveInputs::decode(value.value()))
+        .transpose()?
+    else {
+        return Ok(());
+    };
+    for family in changed {
+        inputs.histories.remove(&family);
+        inputs.family_names.remove(&family);
+        inputs.uninitialized.family_names.remove(&family);
+    }
+    table
+        .insert(id, inputs.encode().as_slice())
+        .map_err(store)?;
+    Ok(())
+}
+
+/// `id`'s save inputs as of `txn`; none if there are none.
+fn save_inputs_in(txn: &redb::ReadTransaction, id: &str) -> Result<SaveInputs> {
+    let table = match txn.open_table(NEIGHBORHOOD_SAVE_INPUTS) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(SaveInputs::default()),
+        Err(error) => return Err(store(error)),
+    };
+    table.get(id).map_err(store)?.map_or_else(
+        || Ok(SaveInputs::default()),
+        |value| SaveInputs::decode(value.value()),
+    )
 }
 
 /// Store-level metadata (e.g. active neighborhood ID).
@@ -2812,20 +2874,12 @@ impl NeighborhoodStore {
     /// the save then writes no FAMh and zeros.
     pub fn load_save_inputs(&self, id: &str) -> Result<SaveInputs> {
         let txn = self.db.begin_read().map_err(store)?;
-        let table = match txn.open_table(NEIGHBORHOOD_SAVE_INPUTS) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(SaveInputs::default()),
-            Err(error) => return Err(store(error)),
-        };
-        table.get(id).map_err(store)?.map_or_else(
-            || Ok(SaveInputs::default()),
-            |value| SaveInputs::decode(value.value()),
-        )
+        save_inputs_in(&txn, id)
     }
 
     /// Replaces `id`'s save inputs, for instance with a family's FAMh when
-    /// a `.FAM` file moves in (0x4107cf copies it from the file). `id` must
-    /// be an imported neighborhood.
+    /// a `.FAM` file moves in (the save copies such a family's FAMh from
+    /// its file, 0x4107a8). `id` must be an imported neighborhood.
     pub fn save_save_inputs(&self, id: &str, inputs: &SaveInputs) -> Result<()> {
         let txn = self.db.begin_write().map_err(store)?;
         {
@@ -2850,10 +2904,21 @@ impl NeighborhoodStore {
     /// ([`StoredNeighborhood::save_neighborhood_iff`]) with its stored save
     /// inputs, and returns the file's path.
     pub fn save_neighborhood_iff(&self, id: &str, directory: &Path) -> Result<PathBuf> {
-        let neighborhood = self
-            .load_neighborhood(id)?
+        // The record and its inputs from one snapshot of the store.
+        let (neighborhood, inputs) = {
+            let txn = self.db.begin_read().map_err(store)?;
+            let neighborhood = match txn.open_table(NEIGHBORHOODS) {
+                Ok(table) => table
+                    .get(id)
+                    .map_err(store)?
+                    .map(|value| StoredNeighborhood::decode(id, value.value()))
+                    .transpose()?,
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(error) => return Err(store(error)),
+            }
             .ok_or_else(|| Error::Store(format!("no neighborhood {id:?}")))?;
-        let inputs = self.load_save_inputs(id)?;
+            (neighborhood, save_inputs_in(&txn, id)?)
+        };
         neighborhood.save_neighborhood_iff(directory, &inputs)
     }
 

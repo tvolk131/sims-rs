@@ -92,10 +92,17 @@ impl SaveInputs {
         let iff = Iff::parse(bytes.to_vec())
             .map_err(|error| Error::Store(format!("Neighborhood.iff: {error}")))?;
         let mut inputs = Self::default();
+        // Each ID's resource as the original finds it ([`Iff::get`]), as
+        // the strict reader takes it.
         for chunk in iff.all(b"FAMh") {
-            inputs.histories.insert(chunk.id, iff.data(chunk).to_vec());
+            if let Some(chunk) = iff.get(b"FAMh", chunk.id) {
+                inputs.histories.insert(chunk.id, iff.data(chunk).to_vec());
+            }
         }
         for chunk in iff.all(b"FAMs") {
+            let Some(chunk) = iff.get(b"FAMs", chunk.id) else {
+                continue;
+            };
             if let Ok((name, stray)) = parse_family_name(iff.data(chunk)) {
                 inputs.family_names.insert(chunk.id, name);
                 inputs.uninitialized.family_names.insert(chunk.id, stray);
@@ -233,24 +240,33 @@ impl StoredNeighborhood {
     /// Saves this neighborhood into `directory` as 0x4252cc does: the file
     /// is written as `NTemp.iff`, then moved onto `Neighborhood.iff`.
     ///
-    /// The original deletes the old `Neighborhood.iff` (0x425481, 0x46b42a;
-    /// "not found", -0x28, is no error) and then moves the new file onto
-    /// its name (0x5b9988). The port renames over it in one step, which
-    /// leaves the same files and never leaves the folder without one. A
-    /// `Neighborhood.iff` of another case is replaced under its own name.
-    /// If the write fails the temporary file is deleted, as the original
-    /// deletes it when the close fails (0x4254bd).
+    /// When its status is still clear after the close (0x425474 tests the
+    /// status the save kept, `[ebp-0x10]`), the original deletes the old
+    /// `Neighborhood.iff` (0x425481 → 0x46b42a; "not found", -0x28, is no
+    /// error) and moves the new file onto its name (0x4254a2 → 0x5b9988).
+    /// Otherwise it deletes `NTemp.iff` (0x4254bd). The port renames over
+    /// the old file in one step, which leaves the same files and never
+    /// leaves the folder without one; a `Neighborhood.iff` of another case
+    /// is replaced under its own name. If the write or the rename fails,
+    /// `NTemp.iff` is deleted.
+    ///
+    /// Like the original, one save at a time writes a folder: two at once
+    /// share `NTemp.iff`.
     pub fn save_neighborhood_iff(&self, directory: &Path, inputs: &SaveInputs) -> Result<PathBuf> {
         let bytes = self.neighborhood_iff(inputs)?;
         let temporary = directory.join(TEMPORARY_FILE);
         let target =
             neighborhood_iff_path(directory).unwrap_or_else(|| directory.join("Neighborhood.iff"));
-        if let Err(error) = std::fs::write(&temporary, &bytes) {
+        let saved = std::fs::write(&temporary, &bytes)
+            .map_err(|error| format!("{}: {error}", temporary.display()))
+            .and_then(|()| {
+                std::fs::rename(&temporary, &target)
+                    .map_err(|error| format!("{}: {error}", target.display()))
+            });
+        if let Err(error) = saved {
             let _ = std::fs::remove_file(&temporary);
-            return Err(Error::Store(format!("{}: {error}", temporary.display())));
+            return Err(Error::Store(error));
         }
-        std::fs::rename(&temporary, &target)
-            .map_err(|error| Error::Store(format!("{}: {error}", target.display())))?;
         Ok(target)
     }
 }
