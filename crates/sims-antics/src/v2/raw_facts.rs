@@ -8,8 +8,8 @@ use crate::ast::{Branches, Condition, Item, PrimitiveCall, Stmt, Target};
 /// (`$Local:N`): Dialog (36) and Add/Change Action String (50).
 const TEXT_OPCODES: [u16; 2] = [36, 50];
 
-/// Facts about one raw block. Code that does not parse gets every fact but the loop exit, which
-/// its tokens decide (the `.air` compiler reports the error later).
+/// Facts about one raw block. Code that not even the shape-only parse reads gets every fact but
+/// the loop exits, which its tokens decide (the `.air` compiler reports the error later).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RawFacts {
     /// It defines a label (`@x:` or bare `x:`).
@@ -18,20 +18,28 @@ pub(crate) struct RawFacts {
     pub declares_local: bool,
     /// A branch target names a node by number (`4`, `raw(4)`), which depends on the layout.
     pub positional_target: bool,
-    /// A `break` or `continue` outside every loop of the block, which exits the loop the block
-    /// sits in.
-    pub exits_enclosing_loop: bool,
+    /// A `break` outside every loop of the block, which leaves the loop the block sits in.
+    pub breaks_enclosing_loop: bool,
+    /// A `continue` outside every loop of the block, which jumps to the head of the loop the
+    /// block sits in.
+    pub continues_enclosing_loop: bool,
     /// It runs a primitive that formats text.
     pub formats_text: bool,
 }
 
 impl RawFacts {
+    /// A `break` or `continue` that exits the loop the block sits in.
+    pub fn exits_enclosing_loop(&self) -> bool {
+        self.breaks_enclosing_loop || self.continues_enclosing_loop
+    }
+
     fn all() -> Self {
         Self {
             defines_label: true,
             declares_local: true,
             positional_target: true,
-            exits_enclosing_loop: true,
+            breaks_enclosing_loop: true,
+            continues_enclosing_loop: true,
             formats_text: true,
         }
     }
@@ -44,8 +52,11 @@ pub(crate) fn raw_facts(code: &str, prelude: Option<&str>) -> RawFacts {
         "tree 4096 \"__raw_facts\" {{\n{}{code}\n}}\n",
         prelude.unwrap_or("")
     );
+    // A strict parse needs every name declared; when that fails (a constant an earlier raw block
+    // declared, which this block cannot see), the shape-only parse still reads the structure.
     let parsed = match prelude {
-        Some(_) => crate::parser::parse_module(&wrapped),
+        Some(_) => crate::parser::parse_module(&wrapped)
+            .or_else(|_| crate::parser::parse_module_lenient(&wrapped)),
         None => crate::parser::parse_module_lenient(&wrapped),
     };
     match parsed.ok().and_then(|m| m.items.into_iter().next()) {
@@ -63,11 +74,11 @@ pub(crate) fn raw_facts(code: &str, prelude: Option<&str>) -> RawFacts {
             let mut facts = RawFacts::all();
             if let Ok(tokens) = crate::lexer::tokenize(code) {
                 use crate::lexer::TokenKind as T;
-                facts.exits_enclosing_loop = tokens.iter().any(|t| match &t.kind {
-                    T::Ident(w) => w == "break" || w == "continue",
-                    T::Arrow => true,
-                    _ => false,
-                });
+                let has = |pred: &dyn Fn(&T) -> bool| tokens.iter().any(|t| pred(&t.kind));
+                facts.breaks_enclosing_loop =
+                    has(&|k| matches!(k, T::Ident(w) if w == "break") || *k == T::Arrow);
+                facts.continues_enclosing_loop =
+                    has(&|k| matches!(k, T::Ident(w) if w == "continue") || *k == T::Arrow);
             }
             facts
         }
@@ -115,9 +126,8 @@ fn scan(stmts: &[Stmt], loops: usize, facts: &mut RawFacts) {
                 scan(body, loops + 1, facts);
             }
             Stmt::Loop { body, .. } => scan(body, loops + 1, facts),
-            Stmt::Break { .. } | Stmt::Continue { .. } => {
-                facts.exits_enclosing_loop |= loops == 0;
-            }
+            Stmt::Break { .. } => facts.breaks_enclosing_loop |= loops == 0,
+            Stmt::Continue { .. } => facts.continues_enclosing_loop |= loops == 0,
             Stmt::Assign { .. } | Stmt::Idle { .. } => {}
         }
     }
@@ -155,12 +165,12 @@ mod tests {
     #[test]
     fn facts_follow_the_parse_not_the_text() {
         let f = raw_facts("// let x; break; dialog(\ntemp[0] := 1; /* @a: */", None);
-        assert!(!f.declares_local && !f.exits_enclosing_loop && !f.defines_label);
+        assert!(!f.declares_local && !f.exits_enclosing_loop() && !f.defines_label);
         assert!(!f.formats_text && !f.positional_target);
         let f = raw_facts("while true { temp[0] := 1; break; }", None);
-        assert!(!f.exits_enclosing_loop);
+        assert!(!f.exits_enclosing_loop());
         let f = raw_facts("if temp[0] == 1 { continue; }", None);
-        assert!(f.exits_enclosing_loop);
+        assert!(f.exits_enclosing_loop());
         let f = raw_facts("action_string (301, 1);", None);
         assert!(f.formats_text);
         let f = raw_facts("op 50 (0, 0, 0, 0, 0, 0, 0, 0);", None);

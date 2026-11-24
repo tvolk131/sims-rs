@@ -1331,7 +1331,16 @@ fn callees(stripped: &str) -> impl Iterator<Item = &str> {
         let start = before
             .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .map_or(0, |i| i + 1);
-        let word = &before[start..];
+        let mut word = &before[start..];
+        let mut start = start;
+        // A quoted target (`call "name"(..)`): the word before the string.
+        if word.is_empty()
+            && before.ends_with('"')
+            && let Some(open) = before[..before.len() - 1].rfind('"')
+        {
+            start = open;
+            word = &before[open..];
+        }
         // `call N(..)`, `call name(..)`, `subroutine N(..)`: the word before the target.
         let rest = before[..start].trim_end();
         let kw_at = rest
@@ -1410,32 +1419,35 @@ fn may_write_stack_obj(text: &str) -> bool {
 
 /// Whether an `.air` expression has the stack object as its target, read from the tokens: the
 /// stack object (`stack_obj`, or `scope(S, ..)` with `S` 10 or not a literal) followed by anything
-/// but the end of an operand or a comparison (`stack_obj:=9`, `scope (10, 0) += 1`,
-/// `stack_obj sqrt 9`, the writing condition `stack_obj inc_lt 9`). Text that does not lex may.
+/// but the end of an operand, a comparison or `flag_test` (`stack_obj:=9`,
+/// `scope (10, 0) += 1`, `stack_obj sqrt 9`, the writing condition `stack_obj inc_lt 9`). Text
+/// that does not lex may.
 fn names_stack_obj_as_target(text: &str) -> bool {
     use crate::lexer::TokenKind as T;
     let Ok(tokens) = crate::lexer::tokenize(text) else {
         return true;
     };
     let kinds: Vec<&T> = tokens.iter().map(|t| &t.kind).collect();
+    // The end of an operand, or a reading operator (a comparison, `flag_test`).
     let ends_operand = |k: Option<&&T>| {
-        matches!(
-            k,
-            None | Some(
-                T::Semicolon
-                    | T::RParen
-                    | T::Comma
-                    | T::RBracket
-                    | T::LBrace
-                    | T::Eof
-                    | T::EqEq
-                    | T::BangEq
-                    | T::Lt
-                    | T::LtEq
-                    | T::Gt
-                    | T::GtEq
+        matches!(k, Some(T::Ident(w)) if w == "flag_test")
+            || matches!(
+                k,
+                None | Some(
+                    T::Semicolon
+                        | T::RParen
+                        | T::Comma
+                        | T::RBracket
+                        | T::LBrace
+                        | T::Eof
+                        | T::EqEq
+                        | T::BangEq
+                        | T::Lt
+                        | T::LtEq
+                        | T::Gt
+                        | T::GtEq
+                )
             )
-        )
     };
     (0..kinds.len()).any(|i| match kinds[i] {
         T::Ident(n) if n == "stack_obj" => !ends_operand(kinds.get(i + 1)),
@@ -1469,54 +1481,61 @@ fn names_stack_obj_as_target(text: &str) -> bool {
 /// Precision matters both ways: a missing restore leaves the exhaustion block on the wrong
 /// object, and a needless one replaces the iterator's false result, which the block may read.
 pub(crate) fn body_may_leave_stack_obj_moved(body: &str, restore: &str) -> bool {
-    /// Where the innermost loop's exits may leave `stack_obj` moved.
+    /// A path's state: `None` when no path reaches the point, else whether `stack_obj` may be
+    /// moved there.
+    type State = Option<bool>;
+    fn join(a: State, b: State) -> State {
+        match (a, b) {
+            (None, x) | (x, None) => x,
+            (Some(a), Some(b)) => Some(a || b),
+        }
+    }
+    /// The states the innermost loop's `break`s and `continue`s carry.
     #[derive(Default)]
     struct Exits {
-        brk: bool,
-        cont: bool,
+        brk: State,
+        cont: State,
     }
-    /// `moved` after falling off the end of `nodes`. A path that jumps away is not reachable
-    /// past its jump, which `false` (the identity of the join) stands for.
-    fn flow(nodes: &[Node], mut moved: bool, restore: &str, exits: &mut Exits) -> bool {
+    /// The state after falling off the end of `nodes`, entered in state `st`.
+    fn flow(nodes: &[Node], mut st: State, restore: &str, exits: &mut Exits) -> State {
         for n in nodes {
             match n {
-                Node::Line(l) if l.trim() == restore => moved = false,
+                Node::Line(l) if l.trim() == restore => st = st.map(|_| false),
                 Node::Line(l) => match classify(l) {
-                    Kind::Continue => {
-                        exits.cont |= moved;
-                        moved = false;
-                    }
-                    Kind::Break => {
-                        exits.brk |= moved;
-                        moved = false;
-                    }
-                    Kind::Return => moved = false,
-                    _ => moved |= may_write_stack_obj(l),
+                    Kind::Continue => exits.cont = join(exits.cont, st.take()),
+                    Kind::Break => exits.brk = join(exits.brk, st.take()),
+                    Kind::Return => st = None,
+                    _ => st = st.map(|m| m || may_write_stack_obj(l)),
                 },
                 Node::If { arms, else_body } => {
-                    let mut out = false;
+                    let mut out = None;
                     for (cond, body) in arms {
-                        moved |= may_write_stack_obj(cond);
-                        out |= flow(body, moved, restore, exits);
+                        st = st.map(|m| m || may_write_stack_obj(cond));
+                        out = join(out, flow(body, st, restore, exits));
                     }
-                    out |= match else_body {
-                        Some(body) => flow(body, moved, restore, exits),
-                        None => moved,
-                    };
-                    moved = out;
+                    out = join(
+                        out,
+                        match else_body {
+                            Some(body) => flow(body, st, restore, exits),
+                            None => st,
+                        },
+                    );
+                    st = out;
                 }
                 Node::While { cond, body } => {
                     // Iterate to the fixed point: the head joins the entry state with every
                     // path back to it (the body's end and its `continue`s).
-                    let mut head = moved;
+                    let mut head = st;
                     let mut inner = Exits::default();
                     loop {
-                        let tested = head || cond.as_deref().is_some_and(may_write_stack_obj);
+                        let tested =
+                            head.map(|m| m || cond.as_deref().is_some_and(may_write_stack_obj));
                         let back = flow(body, tested, restore, &mut inner);
-                        let next = head || back || inner.cont;
+                        let next = join(join(head, back), inner.cont);
                         if next == head {
                             // `while true` leaves only through a `break`.
-                            moved = (cond.is_some() && tested) || inner.brk;
+                            let falls = if cond.is_some() { tested } else { None };
+                            st = join(falls, inner.brk);
                             break;
                         }
                         head = next;
@@ -1524,13 +1543,14 @@ pub(crate) fn body_may_leave_stack_obj_moved(body: &str, restore: &str) -> bool 
                 }
             }
         }
-        moved
+        st
     }
     let Some(nodes) = parse_body(body) else {
         return true;
     };
     let mut exits = Exits::default();
-    flow(&nodes, false, restore, &mut exits) || exits.cont
+    let end = flow(&nodes, Some(false), restore, &mut exits);
+    end == Some(true) || exits.cont == Some(true)
 }
 
 fn writes_stack_obj_anywhere(nodes: &[Node]) -> bool {

@@ -1008,3 +1008,115 @@ fn air_constants_index_strings_and_stay_read_only() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Review round 5
+// ---------------------------------------------------------------------------
+
+/// The exhaustion restore skips what cannot leave the cursor moved: `flag_test` reads the stack
+/// object, code after a `return` is unreachable, and a quoted subroutine call runs in its own
+/// frame.
+#[test]
+fn exhaustion_restores_skip_reads_unreachable_code_and_calls() {
+    for body in [
+        "temp[0] = item.attr[0];\n            raw {\n                if scope (10, 0) flag_test 1 {\n                    temp[1] := 1;\n                }\n            }",
+        "raw {\n                return true;\n                stack_obj := 9;\n            }",
+        "if item.attr[0] == 1 { temp[1] = 1; } raw { call \"b\"(); }",
+    ] {
+        let air = expand(
+            "cursor_quiet.antics",
+            &obj(&format!(
+                "    @id(4300) tree b {{ return true; }}
+    tree a (sim: Sim) {{
+        for item in lot.objects() {{
+            {body}
+        }} else {{ gosub_found_action(); }}
+    }}"
+            )),
+        );
+        let body = tree(&air, "a");
+        let ls = lines(body);
+        let found = index_of(&ls, |l| l == "op 0x001e (0, 0, 0, 0, 0, 0, 0, 0);", body);
+        assert_ne!(ls[found - 1], "stack_obj := __self_obj;", "{body}");
+    }
+}
+
+/// Raw loop exits are judged per edge: a raw `break` out of `repeat` (whose work is the
+/// `continue` step) and a raw `continue` in a `for ... else` (whose restore is on `break` and
+/// exhaustion) skip nothing; a raw `continue` out of `repeat` would skip the counter step. A raw
+/// block that names a constant an earlier raw block declared is still read by its shape.
+#[test]
+fn raw_loop_exits_are_judged_per_edge() {
+    expand(
+        "repeat_break.antics",
+        &obj("    tree a { repeat 2 { raw { break; } } temp[0] = 1; }"),
+    );
+    assert!(restore_before(
+        r#"    tree a (sim: Sim) {
+        for item in lot.objects() { raw { stack_obj := 9; continue; } }
+        else { raw { temp[2] := stack_obj; } }
+    }"#,
+        "temp[2] := stack_obj;",
+    ));
+    expect_err(
+        "repeat_continue.antics",
+        &obj("    tree a { repeat 2 { raw { temp[0] := 1; continue; } } }"),
+        "cannot break/continue out of a loop whose exits do work",
+    );
+    expand(
+        "repeat_inner.antics",
+        &obj(r#"    tree a {
+        repeat 2 {
+            raw { const K = 0; }
+            raw { while temp[K] != 0 { break; } }
+        }
+    }"#),
+    );
+}
+
+/// A raw block's own constant is owned by its full name: it moves no `@slot` binding, hides no
+/// tuning entry (`Tuning.dear` with an own `Tuning`), and a helper inlined twice declares it twice
+/// with the same value, which `.air` accepts.
+#[test]
+fn raw_own_constants_are_owned_by_full_name() {
+    let (locals, _) = nodes(&obj(r#"    @id(4300) tree a {
+        @slot(3) let x = 1;
+        raw { const __slot3_x_0 = 2; }
+        temp[0] = x;
+    }"#));
+    assert_eq!(locals, 4);
+    let air = expand(
+        "own_tuning.antics",
+        &obj(r#"    bcon 4097 "Tuning" { dear = 25 }
+    tree a { raw { const Tuning = 9; temp[0] := Tuning.dear; } }"#),
+    );
+    assert!(tree(&air, "a").contains("const Tuning.dear = "), "{air}");
+    assert_eq!(
+        nodes(&obj(r#"    fn f() { raw { const K = 2; temp[0] := K; } }
+    @id(4300) tree a { f(); f(); }"#)),
+        nodes(&obj(
+            "    @id(4300) tree a { raw { temp[0] := 2; temp[0] := 2; } }"
+        )),
+    );
+}
+
+/// `.air` constants: a comparison in `expr` reads its left side, `relationship(value:)` writes
+/// it unless flag 4 is set, and a dotted integer constant is a string index.
+#[test]
+fn air_constants_follow_each_operands_direction() {
+    let air = |body: &str| {
+        sims_antics::compile_air(&format!("tree 4096 \"Probe\" {{ {body} return true; }}"))
+            .map(|m| m.behaviors[&4096].instructions[0].operands)
+    };
+    assert_eq!(
+        air("const K = 2; expr(K == temp[0]) -> true: true, false: false;").expect("reads"),
+        air("expr(2 == temp[0]) -> true: true, false: false;").expect("reads"),
+    );
+    let err = air("const K = 2; relationship(value: K);").expect_err("output");
+    assert!(err.to_string().contains("is a constant"), "{err}");
+    air("const K = 2; relationship(flags: 4, value: K);").expect("input");
+    assert_eq!(
+        air("const Labels.Message = 1; dialog(message: Labels.Message);").expect("index"),
+        air("dialog(message: 1);").expect("index"),
+    );
+}

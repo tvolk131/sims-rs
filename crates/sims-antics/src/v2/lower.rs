@@ -5063,10 +5063,11 @@ impl<'a> TreeLowerer<'a> {
             .any(|f| !f.cleanups.is_empty())
     }
 
-    /// Whether a `break` or `continue` of the innermost loop emits code besides cleanups (which
-    /// `has_any_active_cleanups` covers): a counter or range step, or the stack-object restore of
-    /// a `for ... else`. A raw block's own loop exit would skip it.
-    fn loop_exit_has_work(&self) -> bool {
+    /// Whether a `break` (when `brk`) or a `continue` (when `cont`) of the innermost loop emits
+    /// code besides cleanups (which `has_any_active_cleanups` covers): a `continue`'s counter or
+    /// range step, or a `break`'s stack-object restore in a `for ... else`. A raw block's own
+    /// loop exit would skip it.
+    fn loop_exit_has_work(&self, brk: bool, cont: bool) -> bool {
         let floor = self.fn_scope_floor();
         let Some(frame) = self.cleanup_scopes[floor..]
             .iter()
@@ -5075,8 +5076,9 @@ impl<'a> TreeLowerer<'a> {
         else {
             return false;
         };
-        frame.continue_step.is_some()
-            || (frame.restore_stack_on_break
+        (cont && frame.continue_step.is_some())
+            || (brk
+                && frame.restore_stack_on_break
                 && (self.has_self_obj_local || matches!(self.tree_ctx, TreeContext::ObjectSelf)))
     }
 
@@ -6296,8 +6298,10 @@ impl<'a> TreeLowerer<'a> {
                     self.raw_formats_text = true;
                 }
                 if self.checking_discarded == 0
-                    && facts.exits_enclosing_loop
-                    && self.loop_exit_has_work()
+                    && self.loop_exit_has_work(
+                        facts.breaks_enclosing_loop,
+                        facts.continues_enclosing_loop,
+                    )
                 {
                     return Err(Error::at(
                         *span,
@@ -6418,28 +6422,34 @@ impl<'a> TreeLowerer<'a> {
         };
         // Discarded code (a dead branch) emits nothing, so it declares nothing in the tree.
         let live = self.checking_discarded == 0;
-        // The block's own `.air` constants (`const K = ..;`) are its own: they shadow nothing
-        // v2 would declare, and no other declaration of the name goes into the tree.
-        let own_consts: BTreeSet<&str> = tokens
-            .windows(2)
-            .filter_map(|w| match (&w[0].kind, &w[1].kind) {
-                (TokenKind::Ident(kw), TokenKind::Ident(name)) if kw == "const" => {
-                    Some(name.as_str())
+        // The block's own `.air` constants (`const K = ..;`, `const T.e = ..;`), by full name:
+        // v2 declares none of them for this block. (A v2 constant of the same name that another
+        // block uses is declared tree-wide, and `.air` rejects the clash unless the values agree.)
+        let own_consts: BTreeSet<String> = tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| {
+                let kind = |k: usize| tokens.get(i + k).map(|t| &t.kind);
+                if !matches!(&t.kind, TokenKind::Ident(kw) if kw == "const") {
+                    return None;
                 }
-                _ => None,
+                let Some(TokenKind::Ident(name)) = kind(1) else {
+                    return None;
+                };
+                match (kind(2), kind(3)) {
+                    (Some(TokenKind::Dot), Some(TokenKind::Ident(entry))) => {
+                        Some(format!("{name}.{entry}"))
+                    }
+                    _ => Some(name.clone()),
+                }
             })
             .collect();
-        if live {
-            self.raw_declared
-                .extend(own_consts.iter().map(|n| (*n).to_owned()));
-        }
         let mut found: Vec<(String, String)> = Vec::new();
         for (i, tok) in tokens.iter().enumerate() {
             let TokenKind::Ident(word) = &tok.kind else {
                 continue;
             };
-            if (i > 0 && tokens[i - 1].kind == TokenKind::Dot) || own_consts.contains(word.as_str())
-            {
+            if i > 0 && tokens[i - 1].kind == TokenKind::Dot {
                 continue;
             }
             let next = |k: usize| tokens.get(i + k).map(|t| &t.kind);
@@ -6455,6 +6465,12 @@ impl<'a> TreeLowerer<'a> {
             }
             if next(1) == Some(&TokenKind::Dot)
                 && let Some(TokenKind::Ident(entry)) = next(2)
+                && own_consts.contains(&format!("{word}.{entry}"))
+            {
+                continue;
+            }
+            if next(1) == Some(&TokenKind::Dot)
+                && let Some(TokenKind::Ident(entry)) = next(2)
                 && let Some(entry_air) = self.env.lookup_bcon_entry(
                     &self.owner_module,
                     word,
@@ -6464,6 +6480,9 @@ impl<'a> TreeLowerer<'a> {
                 )
             {
                 found.push((format!("{word}.{entry}"), entry_air?.0));
+                continue;
+            }
+            if own_consts.contains(word.as_str()) {
                 continue;
             }
             if let Some(v) = self
@@ -15485,7 +15504,9 @@ fn stmts_exit_loop(stmts: &[V2Stmt]) -> bool {
         V2Stmt::WithLock { body, .. } | V2Stmt::Defer { body, .. } => stmts_exit_loop(body),
         V2Stmt::LetSome { else_body, .. } => stmts_exit_loop(else_body),
         V2Stmt::ForEach { else_body, .. } => else_body.as_deref().is_some_and(stmts_exit_loop),
-        V2Stmt::RawAir { code, .. } => super::raw_facts::raw_facts(code, None).exits_enclosing_loop,
+        V2Stmt::RawAir { code, .. } => {
+            super::raw_facts::raw_facts(code, None).exits_enclosing_loop()
+        }
         _ => false,
     })
 }

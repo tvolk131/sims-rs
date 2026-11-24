@@ -51,7 +51,7 @@ struct Parser {
 }
 
 /// The value of a tree-level named constant.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ConstValue {
     /// An integer: usable wherever `.air` takes an integer literal, and as a literal operand.
     Int(i64),
@@ -461,7 +461,12 @@ impl Parser {
             }
         };
         self.expect(&TokenKind::Semicolon, "';'")?;
-        if self.consts.insert(name.clone(), value).is_some() {
+        // Declaring a name again with the same value (a raw block inlined twice) is harmless.
+        if self
+            .consts
+            .insert(name.clone(), value)
+            .is_some_and(|old| old != value)
+        {
             return Err(Error::at(nspan, format!("duplicate constant '{name}'")));
         }
         Ok(())
@@ -942,12 +947,22 @@ impl Parser {
                 let (name, _) = self.expect_ident("string entry name")?;
                 Ok(StringRef::Named(name))
             }
-            // A named integer constant is the index; a tree local is no index.
-            TokenKind::Ident(name)
-                if !self.tree_locals.contains(name)
-                    && matches!(self.consts.get(name), Some(ConstValue::Int(_))) =>
-            {
-                Ok(StringRef::Index(self.expect_u8(description)?))
+            // A named integer constant (`K`, `Table.entry`) is the index; a tree local is none.
+            TokenKind::Ident(_) if self.peek_const_name().is_some() => {
+                let name = self.peek_const_name().expect("checked");
+                let span = self.span();
+                for _ in 0..if name.contains('.') { 3 } else { 1 } {
+                    self.bump();
+                }
+                match self.consts.get(&name) {
+                    Some(&ConstValue::Int(v)) => u8::try_from(v)
+                        .map(StringRef::Index)
+                        .map_err(|_| Error::at(span, format!("{description} {v} out of u8 range"))),
+                    _ => Err(Error::at(
+                        span,
+                        format!("expected {description}: constant '{name}' is not an integer"),
+                    )),
+                }
             }
             other => Err(Error::at(
                 self.span(),
@@ -1175,8 +1190,18 @@ impl Parser {
                 PrimitiveCall::GenericCall { routine }
             }
             "expr" => {
-                let lhs = self.parse_target_operand()?;
+                let lhs_const = self.peek_const_name();
+                let lhs = self.parse_operand()?;
                 let operator = self.parse_any_expr_op()?;
+                // Comparisons and `flag_test` read the left side; every other operator writes it.
+                if let Some(name) = lhs_const
+                    && !matches!(operator, 0 | 1 | 2 | 8 | 14 | 15 | 16)
+                {
+                    return Err(Error::at(
+                        span,
+                        format!("'{name}' is a constant, so it cannot be assigned"),
+                    ));
+                }
                 let rhs = self.parse_operand()?;
                 PrimitiveCall::ExprRaw { lhs, operator, rhs }
             }
@@ -1828,6 +1853,7 @@ impl Parser {
                 let mut flags = 0u8;
                 let mut local = LocalRef::Index(0);
                 let mut value: Option<OperandRef> = None;
+                let mut value_const: Option<String> = None;
                 self.parse_args(
                     "relationship",
                     &["column", "dir", "flags", "value", "local"],
@@ -1839,7 +1865,10 @@ impl Parser {
                             }
                             "flags" => flags = p.expect_u8("relationship flags")?,
                             "local" => local = p.parse_local_ref("relationship local")?,
-                            "value" => value = Some(p.parse_operand()?),
+                            "value" => {
+                                value_const = p.peek_const_name();
+                                value = Some(p.parse_operand()?);
+                            }
                             _ => return Ok(false),
                         }
                         Ok(true)
@@ -1847,6 +1876,15 @@ impl Parser {
                 )?;
                 let value = value
                     .ok_or_else(|| Error::at(span, "relationship() requires a 'value' operand"))?;
+                // Without flag 4 the primitive stores the number into `value:`.
+                if let Some(name) = value_const
+                    && flags & 4 == 0
+                {
+                    return Err(Error::at(
+                        span,
+                        format!("'{name}' is a constant, so it cannot be assigned"),
+                    ));
+                }
                 PrimitiveCall::Relationship {
                     column,
                     direction,
