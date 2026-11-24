@@ -2057,9 +2057,25 @@ fn lower_tree(tree: &TreeDecl, symbols: &ModuleSymbols) -> Result<BhavChunk> {
         ));
     }
 
-    // Deterministically assign named `let`/`local` variables after any explicit `local[N]`.
+    // Deterministically assign named `let`/`local` variables after any explicit `local[N]` and
+    // the header's `min_locals`.
     let mut named_locals = BTreeMap::new();
-    let mut next_local = usage.explicit_locals.last().map_or(0, |m| m + 1);
+    let min_locals = usize::from(tree.header.min_locals);
+    if min_locals > max_allowed_locals {
+        return Err(Error::at(
+            tree.span,
+            format!(
+                "tree '{}' asks for min_locals {min_locals}, exceeding format {:#06x}'s limit of \
+                 {max_allowed_locals}",
+                tree.label, tree.header.format
+            ),
+        ));
+    }
+    let mut next_local = usage
+        .explicit_locals
+        .last()
+        .map_or(0, |m| m + 1)
+        .max(min_locals);
     for (span, name) in &usage.let_decls {
         if named_locals.contains_key(name) {
             return Err(Error::at(

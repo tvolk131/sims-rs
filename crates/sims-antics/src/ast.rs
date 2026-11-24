@@ -53,6 +53,9 @@ pub struct TreeHeader {
     pub kind: u8,
     pub args: Option<u8>,
     pub locals: Option<u16>,
+    /// `min_locals: N`: the frame holds at least `N` locals even when the body names fewer (a
+    /// word a raw primitive or text reads by number). The named locals go after them.
+    pub min_locals: u16,
     pub flags: u16,
     pub revision: u32,
     pub trailing: Vec<u8>,
@@ -65,6 +68,7 @@ impl Default for TreeHeader {
             kind: 0,
             args: None,
             locals: None,
+            min_locals: 0,
             flags: 0,
             revision: 0,
             trailing: Vec::new(),

@@ -1990,14 +1990,16 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         // The header declares the declared parameters, or every `param[n]` word the body
         // names, whichever is more (the engine's frame has four).
         let header_args = func.decl.params.len().max(ctx.param_words_used);
-        if header_args == 0 {
-            let _ = writeln!(trees_air, "tree {action_id} \"{action_label}\" {{");
-        } else {
-            let _ = writeln!(
-                trees_air,
-                "tree {action_id} \"{action_label}\" (args: {header_args}) {{"
-            );
+        let mut header = Vec::new();
+        if header_args > 0 {
+            header.push(format!("args: {header_args}"));
         }
+        ctx.push_frame_floor(&mut header);
+        let _ = writeln!(
+            trees_air,
+            "tree {action_id} \"{action_label}\"{} {{",
+            air_header(&header)
+        );
         trees_air.push_str(&ctx.finish()?);
         trees_air.push_str("}\n\n");
 
@@ -2147,7 +2149,13 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
             ctx.emit_all_cleanups()?;
             ctx.line("return true;".to_owned());
         }
-        let _ = writeln!(trees_air, "interaction {action_id} \"{base_ident}\" {{");
+        let mut header = Vec::new();
+        ctx.push_frame_floor(&mut header);
+        let _ = writeln!(
+            trees_air,
+            "interaction {action_id} \"{base_ident}\"{} {{",
+            air_header(&header)
+        );
         trees_air.push_str(&ctx.finish()?);
         trees_air.push_str("}\n\n");
 
@@ -3036,6 +3044,15 @@ fn lower_standalone_tree(
     Ok(air)
 }
 
+/// ` (a, b)` for the `.air` header fields `parts`, or nothing when there are none.
+fn air_header(parts: &[String]) -> String {
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
 /// Finishes `ctx` and writes it as tree `id` with the `.air` header of its `@frame(...)`
 /// (`frame` is the default when there is none), checked against its `positional` parameter
 /// count. `name` is the tree's name in diagnostics.
@@ -3065,6 +3082,8 @@ fn write_framed_tree(
     }
     if let Some(locals) = frame.locals {
         header.push(format!("locals: {locals}"));
+    } else {
+        ctx.push_frame_floor(&mut header);
     }
     if let Some(format) = frame.format {
         if !(0x8000..=0x8002).contains(&format) {
@@ -3609,11 +3628,12 @@ fn emit_guard_tree(
     } else {
         func_params.len()
     };
+    let mut header = Vec::new();
     if arg_count > 0 {
-        let _ = writeln!(air, "tree {tree_id} \"{label}\" (args: {arg_count}) {{");
-    } else {
-        let _ = writeln!(air, "tree {tree_id} \"{label}\" {{");
+        header.push(format!("args: {arg_count}"));
     }
+    ctx.push_frame_floor(&mut header);
+    let _ = writeln!(air, "tree {tree_id} \"{label}\"{} {{", air_header(&header));
     air.push_str(&ctx.finish()?);
     air.push_str("}\n\n");
     Ok(())
@@ -4153,6 +4173,15 @@ impl<'a> TreeLowerer<'a> {
     fn set_lifecycle_frame(&mut self, frame: &TreeFrame) {
         self.frame_locals = frame.locals;
         self.frame_args = frame.args.map_or(0, usize::from);
+    }
+
+    /// Adds `min_locals: N` to a tree header when an `@slot(N - 1)` word must be in the frame:
+    /// the tree may never name it again (an uninitialized slot a raw primitive or text reads by
+    /// number), and `.air` sizes the frame by the words the body names.
+    fn push_frame_floor(&self, header: &mut Vec<String>) {
+        if let Some(top) = self.pinned_locals.values().max() {
+            header.push(format!("min_locals: {}", top + 1));
+        }
     }
 
     fn fresh(&mut self, prefix: &str) -> String {
@@ -5032,6 +5061,23 @@ impl<'a> TreeLowerer<'a> {
         self.cleanup_scopes[floor..]
             .iter()
             .any(|f| !f.cleanups.is_empty())
+    }
+
+    /// Whether a `break` or `continue` of the innermost loop emits code besides cleanups (which
+    /// `has_any_active_cleanups` covers): a counter or range step, or the stack-object restore of
+    /// a `for ... else`. A raw block's own loop exit would skip it.
+    fn loop_exit_has_work(&self) -> bool {
+        let floor = self.fn_scope_floor();
+        let Some(frame) = self.cleanup_scopes[floor..]
+            .iter()
+            .rev()
+            .find(|f| f.is_loop_body)
+        else {
+            return false;
+        };
+        frame.continue_step.is_some()
+            || (frame.restore_stack_on_break
+                && (self.has_self_obj_local || matches!(self.tree_ctx, TreeContext::ObjectSelf)))
     }
 
     fn has_any_active_cleanups(&self) -> bool {
@@ -6245,10 +6291,18 @@ impl<'a> TreeLowerer<'a> {
                     ));
                 }
                 let prelude = self.collect_raw_consts(code, *span)?;
-                if self.checking_discarded == 0
-                    && super::raw_facts::raw_facts(code, Some(&prelude)).formats_text
-                {
+                let facts = super::raw_facts::raw_facts(code, Some(&prelude));
+                if self.checking_discarded == 0 && facts.formats_text {
                     self.raw_formats_text = true;
+                }
+                if self.checking_discarded == 0
+                    && facts.exits_enclosing_loop
+                    && self.loop_exit_has_work()
+                {
+                    return Err(Error::at(
+                        *span,
+                        "'raw { ... }' cannot break/continue out of a loop whose exits do work (a counter step, or restoring the stack object a 'for' moved): use 'break'/'continue' outside the raw block",
+                    ));
                 }
                 if self.has_any_active_cleanups()
                     || !self.inline_call_stack.is_empty()
@@ -6364,12 +6418,28 @@ impl<'a> TreeLowerer<'a> {
         };
         // Discarded code (a dead branch) emits nothing, so it declares nothing in the tree.
         let live = self.checking_discarded == 0;
+        // The block's own `.air` constants (`const K = ..;`) are its own: they shadow nothing
+        // v2 would declare, and no other declaration of the name goes into the tree.
+        let own_consts: BTreeSet<&str> = tokens
+            .windows(2)
+            .filter_map(|w| match (&w[0].kind, &w[1].kind) {
+                (TokenKind::Ident(kw), TokenKind::Ident(name)) if kw == "const" => {
+                    Some(name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        if live {
+            self.raw_declared
+                .extend(own_consts.iter().map(|n| (*n).to_owned()));
+        }
         let mut found: Vec<(String, String)> = Vec::new();
         for (i, tok) in tokens.iter().enumerate() {
             let TokenKind::Ident(word) = &tok.kind else {
                 continue;
             };
-            if i > 0 && tokens[i - 1].kind == TokenKind::Dot {
+            if (i > 0 && tokens[i - 1].kind == TokenKind::Dot) || own_consts.contains(word.as_str())
+            {
                 continue;
             }
             let next = |k: usize| tokens.get(i + k).map(|t| &t.kind);
@@ -6414,8 +6484,9 @@ impl<'a> TreeLowerer<'a> {
             if !declared.insert(name.clone()) {
                 continue;
             }
+            // Discarded code emits nothing, so its constants neither register nor clash.
             match self.raw_consts.get(&name) {
-                Some(old) if *old != value => {
+                Some(old) if live && *old != value => {
                     return Err(Error::at(
                         span,
                         format!(
@@ -9903,12 +9974,16 @@ impl<'a> TreeLowerer<'a> {
         let Some((module, decl, local, args, span)) = self.direct_helper(call)? else {
             return Ok(false);
         };
-        // A helper's cleanup runs after its `return` routes the branch, so the caller's arm
-        // would see the cleanup's last result rather than the condition's (which a primitive
-        // such as `gosub_found_action` reads): the general path tests a flag after it.
+        // A helper's cleanup (`defer`, `with lock`'s unlock) runs after its `return` routes the
+        // branch, so the caller's arm would see the cleanup's last result rather than the
+        // condition's (which a primitive such as `gosub_found_action` reads): the general path
+        // tests a flag after it.
         if !self.helper_returns_condition(&module, &decl, local)
             || stmts_return_through_loop(&decl.body)
-            || super::specialize::stmts_any(&decl.body, &|s| matches!(s, V2Stmt::Defer { .. }))
+            || super::specialize::stmts_any(&decl.body, &|s| {
+                // Every statement that registers a cleanup (`CleanupAction`).
+                matches!(s, V2Stmt::Defer { .. } | V2Stmt::WithLock { .. })
+            })
         {
             return Ok(false);
         }

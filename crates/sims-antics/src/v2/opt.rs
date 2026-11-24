@@ -322,9 +322,9 @@ pub(crate) fn assign_frame_slots(
 
 /// `body` with each local of `slots` written as `local[K]`, found by the `.air` lexer: `let x;`
 /// (or `local x;`) goes, `let x = v;` becomes `local[K] := v;`, and every other operand `x`
-/// becomes `local[K]`. A name after `.` (a field), before `:` (a label or an argument key), after
-/// `const`, or among a node's branch targets (`-> .. ;`) is not an operand and stays. `None` if
-/// the body does not lex.
+/// becomes `local[K]`. A name after `.` (a field), before `:` (a label or an argument key), a
+/// called name (`call x(`, `x(`, `subroutine(x)`), a name after `const`, or among a node's
+/// branch targets (`-> .. ;`) is not an operand and stays. `None` if the body does not lex.
 fn place_locals(body: &str, slots: &BTreeMap<String, usize>) -> Option<String> {
     use crate::lexer::TokenKind as T;
     let tokens = crate::lexer::tokenize(body).ok()?;
@@ -349,10 +349,14 @@ fn place_locals(body: &str, slots: &BTreeMap<String, usize>) -> Option<String> {
                 };
                 let prev = i.checked_sub(1).map(|p| &tokens[p].kind);
                 let next = tokens.get(i + 1).map(|t| &t.kind);
-                // A field, a label or argument key, or a called name.
+                // A field, a label or argument key, or a called name (`call x(..)`,
+                // `subroutine x(..)`, `subroutine(x)`).
+                let prev2 = i.checked_sub(2).map(|p| &tokens[p].kind);
                 if matches!(prev, Some(T::Dot))
                     || matches!(next, Some(T::Colon | T::LParen))
                     || matches!(prev, Some(T::Ident(kw)) if kw == "call" || kw == "subroutine")
+                    || (matches!(prev, Some(T::LParen))
+                        && matches!(prev2, Some(T::Ident(kw)) if kw == "subroutine"))
                 {
                     continue;
                 }
@@ -1318,8 +1322,9 @@ fn drop_dead_stack_obj_stores(nodes: &mut Vec<Node>) {
 /// Primitives that never write the stack object, as v2 spells them.
 const STACK_OBJ_KEEPING_PRIMS: &[&str] = &["test_object_type", "action_string", "alter_budget"];
 
-/// Each call-like `name(` in a (string-stripped) text: `call N` for a subroutine call, the
-/// primitive's name, `scope`, or `""` for a bare parenthesis.
+/// Each call-like `name(` in a (string-stripped) text: `call` for a subroutine call (`call N(`,
+/// `call name(`, `subroutine N(`), `subroutine` for `subroutine(N)`, the primitive's name,
+/// `scope`, or `""` for a bare parenthesis.
 fn callees(stripped: &str) -> impl Iterator<Item = &str> {
     stripped.match_indices('(').map(move |(at, _)| {
         let before = stripped[..at].trim_end();
@@ -1327,11 +1332,13 @@ fn callees(stripped: &str) -> impl Iterator<Item = &str> {
             .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .map_or(0, |i| i + 1);
         let word = &before[start..];
-        if !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()) {
-            let rest = before[..start].trim_end();
-            if rest.ends_with("call") {
-                return "call";
-            }
+        // `call N(..)`, `call name(..)`, `subroutine N(..)`: the word before the target.
+        let rest = before[..start].trim_end();
+        let kw_at = rest
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |i| i + 1);
+        if !word.is_empty() && matches!(&rest[kw_at..], "call" | "subroutine") {
+            return "call";
         }
         word
     })
@@ -1396,23 +1403,25 @@ fn may_write_stack_obj(text: &str) -> bool {
     let stripped = strip_strings(text);
     names_stack_obj_as_target(&stripped)
         || stripped.contains("dest: stack_obj")
-        || scope_store_lhs(&stripped).is_some_and(|n| n == 10)
-        || callees(&stripped)
-            .any(|c| !matches!(c, "call" | "scope") && !STACK_OBJ_KEEPING_PRIMS.contains(&c))
+        || callees(&stripped).any(|c| {
+            !matches!(c, "call" | "subroutine" | "scope") && !STACK_OBJ_KEEPING_PRIMS.contains(&c)
+        })
 }
 
-/// `stack_obj` is the target of an `.air` expression, by token: followed by anything but the end
-/// of an operand or a comparison (`stack_obj:=9`, `stack_obj += 1`, `stack_obj sqrt 9`, the
-/// writing condition `stack_obj inc_lt 9`). Text that does not lex may.
+/// Whether an `.air` expression has the stack object as its target, read from the tokens: the
+/// stack object (`stack_obj`, or `scope(S, ..)` with `S` 10 or not a literal) followed by anything
+/// but the end of an operand or a comparison (`stack_obj:=9`, `scope (10, 0) += 1`,
+/// `stack_obj sqrt 9`, the writing condition `stack_obj inc_lt 9`). Text that does not lex may.
 fn names_stack_obj_as_target(text: &str) -> bool {
     use crate::lexer::TokenKind as T;
     let Ok(tokens) = crate::lexer::tokenize(text) else {
         return true;
     };
-    tokens.windows(2).any(|w| {
-        matches!(&w[0].kind, T::Ident(n) if n == "stack_obj")
-            && !matches!(
-                w[1].kind,
+    let kinds: Vec<&T> = tokens.iter().map(|t| &t.kind).collect();
+    let ends_operand = |k: Option<&&T>| {
+        matches!(
+            k,
+            None | Some(
                 T::Semicolon
                     | T::RParen
                     | T::Comma
@@ -1426,25 +1435,33 @@ fn names_stack_obj_as_target(text: &str) -> bool {
                     | T::Gt
                     | T::GtEq
             )
+        )
+    };
+    (0..kinds.len()).any(|i| match kinds[i] {
+        T::Ident(n) if n == "stack_obj" => !ends_operand(kinds.get(i + 1)),
+        T::Ident(n) if n == "scope" && matches!(kinds.get(i + 1), Some(T::LParen)) => {
+            let stack = !matches!(kinds.get(i + 2), Some(T::Int(s)) if *s != 10);
+            // The token after the operand's closing parenthesis.
+            let mut depth = 0usize;
+            let close = (i + 1..kinds.len()).find(|&j| {
+                match kinds[j] {
+                    T::LParen => depth += 1,
+                    T::RParen => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            });
+            stack && close.is_none_or(|j| !ends_operand(kinds.get(j + 1)))
+        }
+        _ => false,
     })
-}
-
-/// The scope number of a `scope(S, I) op ..` store's target.
-fn scope_store_lhs(stripped: &str) -> Option<u32> {
-    let rest = stripped.trim_start().strip_prefix("scope(")?;
-    let (num, after) = rest.split_once(',')?;
-    let (_, after) = after.split_once(')')?;
-    let op = after.trim_start().split(' ').next()?;
-    if !ASSIGN_OPS.contains(&op) {
-        return None;
-    }
-    // A non-literal scope number counts as the stack object, to stay conservative.
-    Some(num.trim().parse::<u32>().unwrap_or(10))
 }
 
 /// Whether lowered loop-body code (`body`) may reach a `continue` or its end with `stack_obj`
 /// still moved away from its entry value: some line may write it and no later `restore` line
-/// (`stack_obj := __self_obj;`) puts it back on every path. A field read through another
+/// (`stack_obj := __self_obj;`) puts it back on that path. The paths follow the control flow:
+/// a `break` leaves its own loop (a nested one's exit carries its state; the body's own `break`
+/// skips the exhaustion block), and a `return` leaves the tree. A field read through another
 /// object moves the stack object and restores it right after, so it leaves nothing displaced.
 /// A subroutine runs in its own frame with its own stack object, so a call writes none here.
 /// Code that does not parse may.
@@ -1452,24 +1469,34 @@ fn scope_store_lhs(stripped: &str) -> Option<u32> {
 /// Precision matters both ways: a missing restore leaves the exhaustion block on the wrong
 /// object, and a needless one replaces the iterator's false result, which the block may read.
 pub(crate) fn body_may_leave_stack_obj_moved(body: &str, restore: &str) -> bool {
-    fn line_writes(l: &str) -> bool {
-        may_write_stack_obj(l)
+    /// Where the innermost loop's exits may leave `stack_obj` moved.
+    #[derive(Default)]
+    struct Exits {
+        brk: bool,
+        cont: bool,
     }
-    /// `moved` after `nodes`, setting `exits` if a `continue` may see it moved.
-    fn flow(nodes: &[Node], mut moved: bool, restore: &str, exits: &mut bool) -> bool {
+    /// `moved` after falling off the end of `nodes`. A path that jumps away is not reachable
+    /// past its jump, which `false` (the identity of the join) stands for.
+    fn flow(nodes: &[Node], mut moved: bool, restore: &str, exits: &mut Exits) -> bool {
         for n in nodes {
             match n {
                 Node::Line(l) if l.trim() == restore => moved = false,
-                Node::Line(l) => {
-                    if matches!(classify(l), Kind::Continue) {
-                        *exits |= moved;
+                Node::Line(l) => match classify(l) {
+                    Kind::Continue => {
+                        exits.cont |= moved;
+                        moved = false;
                     }
-                    moved |= line_writes(l);
-                }
+                    Kind::Break => {
+                        exits.brk |= moved;
+                        moved = false;
+                    }
+                    Kind::Return => moved = false,
+                    _ => moved |= may_write_stack_obj(l),
+                },
                 Node::If { arms, else_body } => {
                     let mut out = false;
                     for (cond, body) in arms {
-                        moved |= line_writes(cond);
+                        moved |= may_write_stack_obj(cond);
                         out |= flow(body, moved, restore, exits);
                     }
                     out |= match else_body {
@@ -1479,10 +1506,20 @@ pub(crate) fn body_may_leave_stack_obj_moved(body: &str, restore: &str) -> bool 
                     moved = out;
                 }
                 Node::While { cond, body } => {
-                    // Twice: the second pass starts from whatever one iteration may leave.
-                    for _ in 0..2 {
-                        moved |= cond.as_deref().is_some_and(line_writes);
-                        moved |= flow(body, moved, restore, exits);
+                    // Iterate to the fixed point: the head joins the entry state with every
+                    // path back to it (the body's end and its `continue`s).
+                    let mut head = moved;
+                    let mut inner = Exits::default();
+                    loop {
+                        let tested = head || cond.as_deref().is_some_and(may_write_stack_obj);
+                        let back = flow(body, tested, restore, &mut inner);
+                        let next = head || back || inner.cont;
+                        if next == head {
+                            // `while true` leaves only through a `break`.
+                            moved = (cond.is_some() && tested) || inner.brk;
+                            break;
+                        }
+                        head = next;
                     }
                 }
             }
@@ -1492,8 +1529,8 @@ pub(crate) fn body_may_leave_stack_obj_moved(body: &str, restore: &str) -> bool 
     let Some(nodes) = parse_body(body) else {
         return true;
     };
-    let mut exits = false;
-    flow(&nodes, false, restore, &mut exits) || exits
+    let mut exits = Exits::default();
+    flow(&nodes, false, restore, &mut exits) || exits.cont
 }
 
 fn writes_stack_obj_anywhere(nodes: &[Node]) -> bool {

@@ -341,6 +341,7 @@ impl Parser {
                     "kind" => header.kind = self.expect_u8("BHAV kind")?,
                     "args" => header.args = Some(self.expect_u8("BHAV args")?),
                     "locals" => header.locals = Some(self.expect_u16("BHAV locals")?),
+                    "min_locals" => header.min_locals = self.expect_u16("BHAV min_locals")?,
                     "flags" => header.flags = self.expect_u16("BHAV flags")?,
                     "revision" => header.revision = self.expect_u32("BHAV revision")?,
                     "trailing" => {
@@ -941,6 +942,13 @@ impl Parser {
                 let (name, _) = self.expect_ident("string entry name")?;
                 Ok(StringRef::Named(name))
             }
+            // A named integer constant is the index; a tree local is no index.
+            TokenKind::Ident(name)
+                if !self.tree_locals.contains(name)
+                    && matches!(self.consts.get(name), Some(ConstValue::Int(_))) =>
+            {
+                Ok(StringRef::Index(self.expect_u8(description)?))
+            }
             other => Err(Error::at(
                 self.span(),
                 format!("expected {description} (u8 or str.<name>), found {other:?}"),
@@ -1167,7 +1175,7 @@ impl Parser {
                 PrimitiveCall::GenericCall { routine }
             }
             "expr" => {
-                let lhs = self.parse_operand()?;
+                let lhs = self.parse_target_operand()?;
                 let operator = self.parse_any_expr_op()?;
                 let rhs = self.parse_operand()?;
                 PrimitiveCall::ExprRaw { lhs, operator, rhs }
@@ -1208,7 +1216,7 @@ impl Parser {
                 PrimitiveCall::Refresh { target, mode }
             }
             "random" => {
-                let dst = self.parse_operand()?;
+                let dst = self.parse_target_operand()?;
                 self.expect(&TokenKind::Comma, "','")?;
                 let range = self.parse_operand()?;
                 PrimitiveCall::Random { dst, range }
@@ -1306,7 +1314,7 @@ impl Parser {
                 PrimitiveCall::GetDistanceTo { temp, flags, from }
             }
             "get_direction_to" => {
-                let dst = self.parse_operand()?;
+                let dst = self.parse_target_operand()?;
                 let mut flags = 0u8;
                 let mut from = None;
                 let mut saw_named = false;
@@ -1934,7 +1942,7 @@ impl Parser {
                         self.expect(&TokenKind::Colon, "':'")?;
                         match k.as_str() {
                             "guid" => guid = self.expect_u32("GUID")?,
-                            "dest" | "into" => dest = Some(self.parse_operand()?),
+                            "dest" | "into" => dest = Some(self.parse_target_operand()?),
                             "local" => local = self.parse_local_ref("set_to_next local")?,
                             other => {
                                 return Err(Error::at(
@@ -2564,21 +2572,42 @@ impl Parser {
         }
     }
 
+    /// The named constant (`NAME` or `Table.entry`) the next operand spells, if any.
+    fn peek_const_name(&self) -> Option<String> {
+        let TokenKind::Ident(name) = &self.peek().kind else {
+            return None;
+        };
+        if self.tree_locals.contains(name) {
+            return None;
+        }
+        if self.peek_at(1).kind == TokenKind::Dot
+            && let TokenKind::Ident(entry) = &self.peek_at(2).kind
+            && self.consts.contains_key(&format!("{name}.{entry}"))
+        {
+            return Some(format!("{name}.{entry}"));
+        }
+        self.consts.contains_key(name).then(|| name.clone())
+    }
+
+    fn const_target_error(&self, name: &str) -> Error {
+        Error::at(
+            self.span(),
+            format!("'{name}' is a constant, so it cannot be assigned"),
+        )
+    }
+
+    /// An operand the primitive writes (an assignment's or `expr`'s left side, a destination):
+    /// a named constant there is an error, since constants are read-only.
+    fn parse_target_operand(&mut self) -> Result<OperandRef> {
+        if let Some(name) = self.peek_const_name() {
+            return Err(self.const_target_error(&name));
+        }
+        self.parse_operand()
+    }
+
     fn parse_assign_stmt(&mut self) -> Result<Stmt> {
         let span = self.span();
-        if let TokenKind::Ident(name) = &self.peek().kind
-            && !self.tree_locals.contains(name)
-            && (self.consts.contains_key(name)
-                || (self.peek_at(1).kind == TokenKind::Dot
-                    && matches!(&self.peek_at(2).kind, TokenKind::Ident(entry)
-                        if self.consts.contains_key(&format!("{name}.{entry}")))))
-        {
-            return Err(Error::at(
-                span,
-                format!("'{name}' is a constant, so it cannot be assigned"),
-            ));
-        }
-        let lhs = self.parse_operand()?;
+        let lhs = self.parse_target_operand()?;
         let op_tok = self.bump();
         let op = match op_tok.kind {
             TokenKind::Assign => AssignOp::Set,
@@ -2701,8 +2730,18 @@ impl Parser {
     }
 
     fn parse_compare_condition(&mut self, span: Span) -> Result<Condition> {
+        let lhs_const = self.peek_const_name();
         let lhs = self.parse_operand()?;
         let op_tok = self.bump();
+        // `inc_lt` and `dec_gt` write their left side.
+        if let Some(name) = lhs_const
+            && matches!(&op_tok.kind, TokenKind::Ident(s) if s == "inc_lt" || s == "dec_gt")
+        {
+            return Err(Error::at(
+                span,
+                format!("'{name}' is a constant, so it cannot be assigned"),
+            ));
+        }
         let op = match op_tok.kind {
             TokenKind::Gt => CompareOp::Gt,
             TokenKind::Lt => CompareOp::Lt,

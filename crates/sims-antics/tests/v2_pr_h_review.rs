@@ -848,3 +848,163 @@ fn unparsed_raw_exhaustion_blocks_keep_the_loop_shape() {
     let raw = index_of(&ls, |l| l == "refresh(target: K);", body);
     assert_eq!(ls[raw + 1], "break;", "{body}");
 }
+
+// ---------------------------------------------------------------------------
+// Review round 4
+// ---------------------------------------------------------------------------
+
+/// The `stack_obj := __self_obj;` line right before the exhaustion block's first line `first`
+/// in tree `a` of `members`.
+fn restore_before(members: &str, first: &str) -> bool {
+    let air = expand("cursor.antics", &obj(members));
+    let body = tree(&air, "a");
+    let ls = lines(body);
+    let at = index_of(&ls, |l| l == first, body);
+    ls[at - 1] == "stack_obj := __self_obj;"
+}
+
+/// An `@slot` word stays in the frame even when nothing in the tree names it again (`.air`'s
+/// `min_locals` header): a raw primitive or text may read it by number.
+#[test]
+fn uninitialized_slots_keep_their_frame_word() {
+    let (locals, _) = nodes(&obj(r#"    @id(4300) tree a {
+        @slot(3) let x: i16;
+        raw { op 2 (0, 0, 3, 0, 0, 5, 8, 25); }
+    }"#));
+    assert_eq!(locals, 4);
+}
+
+/// The exhaustion restore follows the control flow: a raw `scope (10, ..)` write in any spacing
+/// moves the cursor, a nested loop's `break` carries the moved cursor out past a later restore,
+/// and a path that returns or only calls a subroutine leaves nothing to restore.
+#[test]
+fn exhaustion_restores_follow_writes_and_paths() {
+    assert!(restore_before(
+        r#"    tree a (sim: Sim) {
+        for item in lot.objects() { raw { scope (10, 0):=9; } }
+        else { raw { temp[1] := stack_obj; } }
+    }"#,
+        "temp[1] := stack_obj;",
+    ));
+    assert!(restore_before(
+        r#"    tree a (sim: Sim) {
+        for item in lot.objects() {
+            while temp[0] != 0 {
+                if temp[1] != 0 {
+                    stack_obj = item;
+                    break;
+                }
+                temp[2] = item.attr[0];
+                temp[0] = 0;
+            }
+        } else { raw { temp[3] := stack_obj; } }
+    }"#,
+        "temp[3] := stack_obj;",
+    ));
+    for body in [
+        "raw { stack_obj := 9; } return true;",
+        "if item.attr[0] == 1 { temp[1] = 1; } raw { subroutine(4300); }",
+    ] {
+        let air = expand(
+            "cursor_quiet.antics",
+            &obj(&format!(
+                "    @id(4300) tree b {{ return true; }}
+    tree a (sim: Sim) {{
+        for item in lot.objects() {{ {body} }} else {{ gosub_found_action(); }}
+    }}"
+            )),
+        );
+        let body = tree(&air, "a");
+        let ls = lines(body);
+        let found = index_of(&ls, |l| l == "op 0x001e (0, 0, 0, 0, 0, 0, 0, 0);", body);
+        assert_ne!(ls[found - 1], "stack_obj := __self_obj;", "{body}");
+    }
+}
+
+/// A raw `break` or `continue` cannot leave a loop whose exits do work, such as restoring the
+/// cursor a `for ... else` moved: the raw jump would skip it.
+#[test]
+fn raw_loop_exits_cannot_skip_loop_work() {
+    expect_err(
+        "raw_break.antics",
+        &obj(r#"    tree a (sim: Sim) {
+        for item in lot.objects() { raw { stack_obj := 9; break; } } else { temp[2] = 1; }
+        temp[1] = self.attr[0];
+    }"#),
+        "cannot break/continue out of a loop whose exits do work",
+    );
+}
+
+/// A bool helper whose `with lock` unlocks after its `return` is tested on a saved flag, like a
+/// `defer`: the unlock would otherwise replace the result the caller's arm reads.
+#[test]
+fn lock_helpers_branch_on_a_saved_flag() {
+    let air = expand(
+        "lock_result.antics",
+        &obj(r#"    state occupied: bool;
+    fn f() -> bool {
+        with lock(self.occupied) { return temp[0] == 0; }
+    }
+    tree a (sim: Sim) {
+        if f() {} else { gosub_found_action(); }
+    }"#),
+    );
+    let body = tree(&air, "a");
+    let ls = lines(body);
+    let unlock = index_of(&ls, |l| l.ends_with(":= 0;") && l.contains("attr"), body);
+    let test = index_of(&ls, |l| l.starts_with("if __cond_"), body);
+    assert!(unlock < test, "{body}");
+}
+
+/// `subroutine(x)` names a tree, so slot placement leaves `x` alone.
+#[test]
+fn subroutine_targets_keep_slot_names() {
+    let air = expand(
+        "slot_subroutine.antics",
+        &obj(r#"    tree __slot3_x_0 { return true; }
+    tree a {
+        @slot(3) let x = 1;
+        raw { subroutine(__slot3_x_0); }
+    }"#),
+    );
+    let body = tree(&air, "a");
+    assert!(body.contains("subroutine(__slot3_x_0);"), "{body}");
+    assert!(body.contains("local[3] := 1;"), "{body}");
+}
+
+/// `.air` constants: an integer constant is a string index (`dialog(message: K)`), a raw block's
+/// own `const` is its own (no second declaration from v2), and every write position rejects a
+/// constant.
+#[test]
+fn air_constants_index_strings_and_stay_read_only() {
+    let strings = r#"    strings 302 "More" { other = "Message" }
+"#;
+    assert_eq!(
+        nodes(&obj(&format!(
+            "{strings}    const MSG = 1;\n    @id(4300) tree a {{ raw {{ dialog(message: MSG); }} }}"
+        ))),
+        nodes(&obj(&format!(
+            "{strings}    @id(4300) tree a {{ raw {{ dialog(message: 1); }} }}"
+        ))),
+    );
+    assert_eq!(
+        nodes(&obj(r#"    const K = 7;
+    fn f() { raw { const K = 9; temp[0] := K; } }
+    @id(4300) tree a { f(); }"#)),
+        nodes(&obj("    @id(4300) tree a { raw { temp[0] := 9; } }")),
+    );
+    for stmt in [
+        "expr(X := 17);",
+        "if X inc_lt 5 { return true; }",
+        "random(X, 7);",
+        "set_to_next(all, dest: X);",
+    ] {
+        let src = format!("tree 4096 \"Probe\" {{ const X = 2; {stmt} return true; }}");
+        let err = sims_antics::compile_air(&src).expect_err("a constant target must fail");
+        assert!(
+            err.to_string()
+                .contains("is a constant, so it cannot be assigned"),
+            "{stmt}: {err}"
+        );
+    }
+}
