@@ -521,6 +521,7 @@ impl Parser {
             "Skill" => Ok(V2Type::Skill),
             "Sound" => Ok(V2Type::Sound),
             "Slot" => Ok(V2Type::Slot),
+            "Guid" => Ok(V2Type::Guid),
             other => Ok(V2Type::Named(other.to_owned())),
         }
     }

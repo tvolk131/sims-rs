@@ -12,8 +12,8 @@
 //!   operand loses those writes. Its `let` stays only while something else names it.
 //! - **Duplicate tails.** `if c { A; T } else { B; T }` becomes `if c { A } else { B } T`.
 //! - **Local coalescing.** Locals whose live ranges never overlap share one `.air` local:
-//!   compiler temps with compiler temps, and a source binding only with another binding of the
-//!   same source name. A merged `let y = e;` becomes `x := e;`, the same expression node.
+//!   compiler temps with each other, source bindings of the same name, and bindings of different
+//!   names that belong to inline helpers. A merged `let y = e;` becomes `x := e;`, the same node.
 //!
 //! The pass works on the structured text. It leaves a tree untouched when it meets anything it
 //! does not model exactly: labels, explicit branch targets (`->`), comments, or more than one
@@ -1831,7 +1831,7 @@ fn drop_unused_decls(nodes: &mut Vec<Node>) {
         mention_counts(nodes, &mut counts);
         counts
             .into_iter()
-            .filter(|&(name, _)| !(keep_user && name.starts_with("__v_")))
+            .filter(|&(name, _)| !(keep_user && is_source_local(name)))
             .filter(|&(_, (reads, writes))| reads == 0 && writes <= 1)
             .map(|(name, _)| name.to_owned())
             .collect()
@@ -1941,7 +1941,7 @@ type Set = BTreeSet<String>;
 struct Liveness<'a> {
     locals: &'a BTreeSet<String>,
     /// The tree formats text (a dialog or action string), which reads frame locals by number
-    /// (`$Local:N`, `$TimeLocal:N`): every such node reads every user local (`__v_`).
+    /// (`$Local:N`, `$TimeLocal:N`): every such node reads every source local.
     text_reads_locals: bool,
     edges: BTreeSet<(String, String)>,
     /// For each plain store to a v2 local (`__...`): whether the local is dead after it. Loops
@@ -1959,12 +1959,7 @@ impl Liveness<'_> {
             .map(str::to_owned)
             .collect();
         if self.text_reads_locals && formats_text(text) {
-            out.extend(
-                self.locals
-                    .iter()
-                    .filter(|l| l.starts_with("__v_"))
-                    .cloned(),
-            );
+            out.extend(self.locals.iter().filter(|l| is_source_local(l)).cloned());
         }
         out
     }
@@ -2071,6 +2066,10 @@ impl Liveness<'_> {
     }
 }
 
+fn is_source_local(name: &str) -> bool {
+    name.starts_with("__v_") || name.starts_with("__inline_v_")
+}
+
 /// The coalescing class of a local, or `None` when it must keep its own slot.
 fn merge_group(name: &str) -> Option<String> {
     if matches!(name, "__self_obj" | "__saved_stack_obj") {
@@ -2080,7 +2079,10 @@ fn merge_group(name: &str) -> Option<String> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    if let Some(base) = stem.strip_prefix("__v_") {
+    if let Some(base) = stem
+        .strip_prefix("__v_")
+        .or_else(|| stem.strip_prefix("__inline_v_"))
+    {
         return Some(format!("v:{base}"));
     }
     stem.starts_with("__").then(|| "temp".to_owned())
@@ -2116,11 +2118,21 @@ fn coalesce_locals(nodes: &mut Vec<Node>) {
         if entry_live.contains(name) {
             continue;
         }
+        let fits = |members: &[String]| members.iter().all(|m| !interferes(m, name));
         let target = classes
-            .iter_mut()
-            .find(|(g, members)| *g == group && members.iter().all(|m| !interferes(m, name)));
+            .iter()
+            .position(|(g, members)| *g == group && fits(members))
+            .or_else(|| {
+                if lv.text_reads_locals || !name.starts_with("__inline_v_") {
+                    return None;
+                }
+                classes.iter().position(|(_, members)| {
+                    members.iter().all(|m| m.starts_with("__inline_v_")) && fits(members)
+                })
+            });
         match target {
-            Some((_, members)) => {
+            Some(index) => {
+                let members = &mut classes[index].1;
                 rename.insert(name.clone(), members[0].clone());
                 members.push(name.clone());
             }

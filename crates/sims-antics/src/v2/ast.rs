@@ -210,6 +210,7 @@ pub enum V2Type {
     Skill,
     Sound,
     Slot,
+    Guid,
     Named(String),
     MutRef(Box<V2Type>),
 }
@@ -227,6 +228,7 @@ impl V2Type {
             Self::Skill => "Skill".to_owned(),
             Self::Sound => "Sound".to_owned(),
             Self::Slot => "Slot".to_owned(),
+            Self::Guid => "Guid".to_owned(),
             Self::Named(name) => name.clone(),
             Self::MutRef(inner) => format!("&mut {}", inner.display_name()),
         }
@@ -242,7 +244,7 @@ pub struct FnParam {
     pub default: Option<V2Expr>,
 }
 
-/// Reusable helper function declaration (`[pub] fn name(...) [-> bool | -> i16] { ... }`).
+/// Reusable helper function declaration (`[pub] fn name(...) [-> bool | -> Result | -> i16] { ... }`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnDecl {
     pub span: Span,
@@ -893,6 +895,7 @@ pub(crate) fn is_reserved_type_name(name: &str) -> bool {
             | "Skill"
             | "Sound"
             | "Slot"
+            | "Guid"
             | "Height"
             | "Placement"
             | "Self"
