@@ -135,8 +135,8 @@ fn the_goths_personality_panel() {
     let mut frame = Frame::new(800, 600, [0, 0, 0]);
     let items = hud::layout([800, 600], &opened.snapshot, &controls);
     hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
-    // Pins the drawing. The same panel at 1024 by 768 is within 7 a
-    // channel of the original's screen (ui_oracle_tour, live-personality-1024).
+    // Pins the drawing. The same panel at 1024 by 768 is under the
+    // 5-6-5 step of the original's screen (ui_oracle_tour, live-personality-1024).
     assert_eq!(
         digest(&frame),
         "97eb2f0aaf0f142be0f11bd03068b8d9e703ad43d380683eaf2855120ca858c1"
@@ -251,8 +251,8 @@ fn the_goths_job_panel() {
         hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
         digest(&frame)
     };
-    // Pins the drawing. The same panel at 1024 by 768 is within 7 a
-    // channel of the original's screen (ui_oracle_tour, live-job-1024).
+    // Pins the drawing. The same panel at 1024 by 768 is under the
+    // 5-6-5 step of the original's screen (ui_oracle_tour, live-job-1024).
     assert_eq!(
         draw(&opened.snapshot),
         "3e1541b07e0118aa5a428ab73b57b04c30672a37efdf7894e283acce9d38cf71"
@@ -343,8 +343,8 @@ fn the_goths_relationship_panel() {
     let mut frame = Frame::new(800, 600, [0, 0, 0]);
     let items = hud::layout([800, 600], &opened.snapshot, &controls);
     hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
-    // Pins the drawing. The same panel at 1024 by 768 is within 7 a
-    // channel of the original's screen (ui_oracle_tour, live-relationships-1024).
+    // Pins the drawing. The same panel at 1024 by 768 is under the
+    // 5-6-5 step of the original's screen (ui_oracle_tour, live-relationships-1024).
     assert_eq!(
         digest(&frame),
         "9e0ad9e6a15634fcc4d0820c7b3e822712eb8eece020760a4c44f817b6eeed7b"
@@ -438,8 +438,8 @@ fn the_goths_house_panel() {
     let mut frame = Frame::new(800, 600, [0, 0, 0]);
     let items = hud::layout([800, 600], &opened.snapshot, &controls);
     hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
-    // Pins the drawing. The same panel at 1024 by 768 is within 7 a
-    // channel of the original's screen (ui_oracle_tour, live-house-1024).
+    // Pins the drawing. The same panel at 1024 by 768 is under the
+    // 5-6-5 step of the original's screen (ui_oracle_tour, live-house-1024).
     assert_eq!(
         digest(&frame),
         "1ed5c01d4e95b18a1746859d2887008308465cdfbc04a57223cf903618de47fd"

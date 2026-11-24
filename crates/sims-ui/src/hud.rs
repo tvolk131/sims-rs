@@ -1621,7 +1621,7 @@ fn draw_personality(frame: &mut Frame, art: &Art, panel: Rect, values: &[i16; 5]
     // 0x5214e1, 0x52152f: the font's 0x70 method (0x60b927), the row
     // under an "A", not the line's height.
     let line = font
-        .rows('A')
+        .char_box('A')
         .map_or(font.line_height, |[_, bottom]| bottom);
     let (text_y, bar_y) = if line < empty_h {
         ((empty_h - line) / 2, 0)
@@ -1684,10 +1684,11 @@ fn draw_zodiac(frame: &mut Frame, art: &Art, panel: Rect, sign: u8) {
 }
 
 /// Where the original's text box (0x5e3f3c..0x5e3f78) draws its line in
-/// a box `height` high from `top`: centred by the rows an "A" inks, not
-/// by the line, the odd pixel truncated toward zero.
+/// a box `height` high from `top`: centred by the box the font gives an
+/// "A" ([`Font::char_box`]), not by the line, the odd pixel truncated
+/// toward zero.
 fn text_box_y(font: &Font, top: i32, height: i32) -> i32 {
-    let [a_top, a_bottom] = font.rows('A').unwrap_or([0, font.line_height]);
+    let [a_top, a_bottom] = font.char_box('A').unwrap_or([0, font.line_height]);
     top.saturating_add((height - (a_bottom - a_top)) / 2 - a_top)
 }
 
@@ -3442,10 +3443,18 @@ pub fn covers(items: &[Item], point: [i32; 2]) -> bool {
 /// out of the window) dismisses an open help balloon with `UI_whoosh`
 /// (`0x51f1f2..0x51f3e5`, `0x51d2ee..0x51d359`).
 pub fn in_subpanel(items: &[Item], [x, y]: [i32; 2]) -> bool {
-    let Some(gadget) = items.iter().find(|i| i.kind == Kind::Image(id::GAUGE)) else {
+    let find = |kind: Kind| items.iter().find(|i| i.kind == kind).map(|i| i.rect);
+    let (Some(gadget), Some(strip)) = (
+        find(Kind::Image(id::GAUGE)),
+        find(Kind::Stretched(id::STRIP)),
+    ) else {
         return false;
     };
-    x >= gadget.rect.x.saturating_add(SUBPANEL_FROM_GADGET) && y >= gadget.rect.y
+    // The subpanel as `live_strip` lays it out: from the gadget to the
+    // strip's right end, as high as the gadget.
+    let left = gadget.x.saturating_add(SUBPANEL_FROM_GADGET);
+    let right = strip.x.saturating_add(strip.width);
+    Rect::new(left, gadget.y, right.saturating_sub(left), gadget.height).contains(x, y)
 }
 
 /// Whether `point` lies inside the expanded Options panel (`cWinOptions`,
@@ -4138,12 +4147,10 @@ mod tests {
         assert_eq!(text_box_y(&font, 10, 12), 15);
         // The odd pixel is cut toward zero, not floored: (1 - 2) / 2 is 0.
         assert_eq!(text_box_y(&font, 10, 1), 10);
-        // Without an `A` the whole line is centred.
+        // Without an `A` glyph its slot is empty, zero high at the line's
+        // top, as the original's table keeps it: 10 + 13 / 2.
         let without_a = crate::font::tests::without_a();
-        assert_eq!(
-            text_box_y(&without_a, 10, 13),
-            10 + (13 - without_a.line_height) / 2
-        );
+        assert_eq!(text_box_y(&without_a, 10, 13), 16);
     }
 
     #[test]
@@ -5866,8 +5873,15 @@ mod tests {
                 .expect("the needs panel")
                 .rect;
             assert_eq!(panel.x, x, "{size:?}");
+            let [right, bottom] = [panel.x + panel.width, panel.y + panel.height];
+            assert_eq!(right, size[0], "{size:?}");
+            assert_eq!(bottom, size[1], "{size:?}");
             assert!(in_subpanel(&items, [panel.x, panel.y]), "{size:?}");
+            assert!(in_subpanel(&items, [right - 1, bottom - 1]), "{size:?}");
             assert!(!in_subpanel(&items, [panel.x - 1, panel.y]), "{size:?}");
+            assert!(!in_subpanel(&items, [panel.x, panel.y - 1]), "{size:?}");
+            assert!(!in_subpanel(&items, [right, panel.y]), "{size:?}");
+            assert!(!in_subpanel(&items, [panel.x, bottom]), "{size:?}");
         }
     }
 

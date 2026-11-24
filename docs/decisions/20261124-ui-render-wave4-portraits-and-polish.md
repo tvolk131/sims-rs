@@ -9,9 +9,10 @@ Their tour strips scored .9555, .9598, .9673 and .9495. The tour's diff
 masks and a per-region shift fit traced every miss to one of six native
 rules that we did not follow. Each rule below was read from the exe.
 With all six in place the four strips score 1.0000 in the tour at
-1024 by 768 (per-channel tolerance 40). Compared exactly, every pixel of
-the four subpanels is within 7 of the original's in each channel. That
-is under the step of the original's 16-bit 5-6-5 screen.
+1024 by 768 (per-channel tolerance 40). Compared exactly, the four subpanels
+differ from the original by at most (7, 3, 7) in red, green and blue.
+Each is under its channel's step on the original's 16-bit 5-6-5
+screen, (8, 4, 8).
 
 ## Changes
 
@@ -50,9 +51,11 @@ is under the step of the original's 16-bit 5-6-5 screen.
 3. **The text box's vertical centring.** The text box (`0x5e3f3c..0x5e3f78`)
    centres by the rows an `A` inks, not by the line:
    y = top + (H − (A bottom − A top)) / 2 − A top, truncated toward
-   zero. New `Font::rows` returns those rows, or `None` for a character
-   the font has no glyph for. `hud::text_box_y` applies the formula and
-   centres the whole line when there is no `A`. It is used for:
+   zero. New `Font::char_box` returns the box the font's table gives a
+   character. A byte with no glyph keeps an empty slot, zero high at
+   the line's top. `hud::text_box_y` applies the formula. `Font::rows`
+   gives only the rows actually inked: `None` for a missing glyph or
+   one with no width or height. It is used for:
    - the zodiac sign, a box of text width by line height at
      (5, H − line − 5) (`0x51cd11..0x51cdfe`);
    - the house facts;
@@ -88,18 +91,21 @@ The table that sizes those boxes was not found.
   .94–.96 to .999.
 - The install-gated HUD digests (`crates/sims-ui/tests/hud.rs`) are
   repinned. Each one that had no native comparison now cites the tour
-  shot that matches at 1024, within 7 a channel.
+  shot it matches at 1024, under the 5-6-5 step.
 - The sign balloon's rect is unchanged and `balloon.rs` is untouched. Its
   digest moves only because the personality panel under it does.
 - Unit tests. Each fails with its fix reverted, which was checked by
-  reverting each fix in turn:
+  reverting each fix in turn (the round-2 edge cases have tests but
+  were not reverted one by one):
   - `Font::box_width`, with a mean bearing of exactly a half;
-  - `Font::rows`, including a font without an `A`;
-  - `text_box_y`, including truncation toward zero and no `A`;
+  - `Font::rows` and `Font::char_box`, including a font without an `A`
+    and a glyph with no width;
+  - `text_box_y`, including truncation toward zero and an empty `A` slot;
   - with a font whose extra is 1, the house facts and labels and the
     skill labels move a pixel left, and a centred "7" one pixel;
   - a personality label centred by the `A`-bottom;
-  - the subpanel and its hit test agree at 640, 800 and 1024;
+  - the subpanel and its hit test agree on all four edges at 640, 800
+    and 1024;
   - the relationships title and button column;
   - `house::layout`: the single-precision 90 at 18/20, a wrapped sum,
     and a wrapped 2R.

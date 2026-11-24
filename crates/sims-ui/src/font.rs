@@ -125,12 +125,24 @@ impl Font {
     }
 
     /// The rows `ch` inks, down from the top of its line: its first and
-    /// one past its last (the box the original's font gives a character,
-    /// read by 0x5e3f46 and 0x60b927). `None` when the font has no ink
-    /// for it: a byte the code page lacks, or one the font has no glyph
-    /// for (its metric is left empty).
+    /// one past its last. `None` when nothing is drawn for it: a byte the
+    /// code page lacks, a byte the font has no glyph for, or a glyph with
+    /// no width or no height.
     pub fn rows(&self, ch: char) -> Option<[i32; 2]> {
-        self.metric(ch).filter(|m| m.atlas[3] > 0).map(|m| {
+        self.char_box(ch).filter(|_| {
+            self.metric(ch)
+                .is_some_and(|m| m.atlas[2] > 0 && m.atlas[3] > 0)
+        })
+    }
+
+    /// The rows of the box the original's font table gives `ch` (read by
+    /// the text box, 0x5e3f46, and the `A`-bottom method, 0x60b927): its
+    /// top, down from the line's, and that plus its height. A byte the
+    /// font has no glyph for keeps an empty slot, zero high at the
+    /// line's top as every slot is moved down with the glyphs. `None`
+    /// only for a character the code page lacks.
+    pub fn char_box(&self, ch: char) -> Option<[i32; 2]> {
+        self.metric(ch).map(|m| {
             let top = m.bearing[1];
             [top, top.saturating_add(i32::from(m.atlas[3]))]
         })
@@ -467,6 +479,19 @@ pub(crate) mod tests {
         // glyph, so it has no rows either.
         let without_a = without_a();
         assert_eq!(without_a.rows('A'), None);
+        // Its slot is still there, empty, at the line's top.
+        assert_eq!(without_a.char_box('A'), Some([0, 0]));
+        assert_eq!(hanging.char_box('A'), hanging.rows('A'));
+        // A glyph with height but no width inks nothing.
+        let mut decoded = hanging_font().decoded;
+        for glyph in &mut decoded.glyphs {
+            if glyph.code == 103 {
+                glyph.width = 0;
+            }
+        }
+        let flat = Font::new(decoded);
+        assert_eq!(flat.rows('g'), None);
+        assert!(flat.char_box('g').is_some());
         assert_eq!(hanging_font_plus(3).box_width(""), 1);
         assert_eq!(hanging_font_plus(3).width("AgB"), hanging.width("AgB"));
         assert_eq!(digit_font(6).box_width("7"), 2);
