@@ -642,9 +642,11 @@ impl NeedsTrend {
         self.bars.iter().any(|b| b.animating(now))
     }
 
-    /// Milliseconds after `now` until the next sample is due.
-    pub fn due_in(&self, now: u32) -> u32 {
-        self.pacer.due_in(now)
+    /// Milliseconds after `now` until the next sample is due, once a frame
+    /// has run: the first frame's sample needs no frame of its own, as the
+    /// first frame takes it whenever it comes.
+    pub fn due_in(&self, now: u32) -> Option<u32> {
+        self.started.then(|| self.pacer.due_in(now))
     }
 }
 

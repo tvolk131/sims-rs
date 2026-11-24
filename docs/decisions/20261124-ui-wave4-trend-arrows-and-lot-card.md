@@ -45,6 +45,25 @@ The HUD runs this on the presentation clock: `Hud::step_needs_trend`, plus
 `needs_sample_due` so the window loop draws a frame when a sample is due.
 Static frames (`clock_us == 0`) neither sample nor draw.
 
+A restored save or a newly entered lot starts with empty histories and
+bars (`Hud::forget`), as the original builds a new live panel for it. The
+window loop asks for a frame for a due sample only once the panel's clock
+has run a frame, and leaves a sample that is already due to the redraw
+pacer rather than waking at once.
+
+**Native behaviour kept on purpose.**
+- A zero trend sets `+0xdd` (`0x50c6b6`), and a later nonzero one does not
+  clear it (`0x50c6a1` sets only `+0xdc` and `+0xde`). A zero trend also
+  counts as a flip (`0x50c6ce..0x50c6ea`), so every slot goes back to the
+  blue at once and the bar stops on its next draw. A later falling sample
+  lights it again from the blue.
+- The histories are kept by member place (`0x4e97dc(i)` at `0x513bac`), and
+  a bar holds the history it was pointed at (`0x513b18` passes the pointer
+  to `0x50c5da`). If the household shrinks while a Sim stays selected, the
+  bar keeps reading the history it had, as the original does.
+- The fades compare the 32-bit millisecond clock without a wrap
+  (`0x473390`), as the original does.
+
 **Kept differences.**
 - The native panel keeps a second bar set for pets (`+0x134`). Ours shows
   the same eight motives for both, so one set is kept.
@@ -99,9 +118,14 @@ Against the 1.91 neighborhood oracle shots (`02-nb-hover-goth`,
 
    The source is `0x4e9556` → `0x4e9260(person, 0x7d4)`, which is BMP_ 2004.
    That is the character's 25×25 thumbnail, framed on black. `Faces` now
-   loads it (`household::THUMBNAIL`). The face icon is the fallback.
+   loads it (`household::THUMBNAIL`). The face icon is the fallback, also
+   for a thumbnail that does not decode, so a bad one cannot stop a lot or
+   the neighborhood from loading.
 
 **Kept differences.**
+- A card as wide or tall as the screen stays at 0, where the original's
+  clamp would put it at -1. Only a window smaller than 800 by 600 allows
+  one.
 - The hover delay stays 275 ms. Native `+0xa4` is 0, but its trigger path
   differs.
 - Native draws a second portrait row without a bound. Ours caps it at the
@@ -120,6 +144,10 @@ Against the 1.91 neighborhood oracle shots (`02-nb-hover-goth`,
   three red arrows and the blue unlit slots, pixel for pixel.
 - `needs_trend_arrows_show_as_the_lot_runs`: arrows light and settle to the
   darker red as the window loop runs.
+- `needs_trend_arrows_fade_on_frames_the_loop_asks_for`: the loop wakes as
+  `next_wake_us` says and draws only on the HUD's own signals. A lit bar
+  never goes more than 40 ms without a frame, and the fade reaches full red.
+  Without the bars in `is_ui_animating`, the gap is 48 ms and the test fails.
 - `ui_oracle_tour::neighborhood_lot_cards_match_the_oracle`, compared at
   ±1 per 5-6-5 channel:
   - lot 5: card .9845, portraits .9568;

@@ -768,6 +768,11 @@ impl Hud {
         self.buy_layout = BuyLayout::default();
         self.build_state.reset();
         self.build_layout = BuildLayout::default();
+        // A restored or newly entered lot gets a new live panel, so its
+        // need histories and bars start empty.
+        self.needs_trend = NeedsTrend::default();
+        self.needs_trend_shown = false;
+        self.controls.trends = [None; 8];
     }
 
     /// Loads the residential Buy Mode catalog on first use and returns it.
@@ -1139,7 +1144,7 @@ impl Hud {
     pub fn needs_sample_due(&self, clock_us: u64) -> bool {
         clock_us > 0
             && self.controls.mode == Mode::Live
-            && self.needs_trend.due_in((clock_us / 1_000) as u32) == 0
+            && self.needs_trend.due_in((clock_us / 1_000) as u32) == Some(0)
     }
 
     /// Current Live help-balloon fade state (`BalloonFadeState`).
@@ -1904,9 +1909,15 @@ impl Hud {
             consider(us);
         }
         // The live panel samples the needs on its own clock, paused or not
-        // (`0x4ce390`).
-        if clock_us > 0 && self.controls.mode == Mode::Live {
-            let ms = u64::from(self.needs_trend.due_in((clock_us / 1_000) as u32));
+        // (`0x4ce390`). A sample already due made the advance at this clock
+        // mark the frame dirty (`needs_sample_due`), so the redraw pacer owns
+        // that deadline; only a later one needs a wakeup.
+        if clock_us > 0
+            && self.controls.mode == Mode::Live
+            && let Some(ms) = self.needs_trend.due_in((clock_us / 1_000) as u32)
+            && ms > 0
+        {
+            let ms = u64::from(ms);
             consider((ms * 1_000).saturating_sub(clock_us % 1_000).max(1_000));
         }
         best

@@ -601,6 +601,8 @@ fn the_lot_card_hangs_from_its_lot_like_the_original_tooltip() {
         cursor_x: -30,
     };
     assert_eq!(tooltip_origin(low, [100, 80], screen), [0, 519]);
+    // A card the screen's full height stays on it.
+    assert_eq!(tooltip_origin(low, [100, 600], screen), [0, 0]);
 }
 
 /// `0x54f939`: level = ftol(fade * 255.0 + 0.5) - 0x145, clamped to -255..255.

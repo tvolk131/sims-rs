@@ -257,6 +257,8 @@ pub fn popup_alpha_shift(fade: f32) -> i32 {
 /// or 2 below its bottom when that row is above 3. `0x5da2b0..0x5da31b`
 /// then moves a card crossing the screen's left or top edge back to 0, and
 /// one reaching its right or bottom edge back to end a pixel short of it.
+/// A card as wide or tall as the screen (only a compact window, smaller
+/// than the original's 800 by 600, allows one) is kept at 0, not -1.
 pub fn tooltip_origin(owner: TooltipOwner, size: [i32; 2], screen: [i32; 2]) -> [i32; 2] {
     let r = owner.rect;
     let mut x = owner.cursor_x.max(r.x).min(r.x + r.width - 1);
@@ -267,12 +269,12 @@ pub fn tooltip_origin(owner: TooltipOwner, size: [i32; 2], screen: [i32; 2]) -> 
     if x < 0 {
         x = 0;
     } else if x + size[0] >= screen[0] {
-        x = screen[0] - size[0] - 1;
+        x = (screen[0] - size[0] - 1).max(0);
     }
     if y < 0 {
         y = 0;
     } else if y + size[1] >= screen[1] {
-        y = screen[1] - size[1] - 1;
+        y = (screen[1] - size[1] - 1).max(0);
     }
     [x, y]
 }

@@ -647,6 +647,75 @@ fn needs_trend_arrows_show_as_the_lot_runs() {
     assert!(dark, "no arrow settled to the darker red");
 }
 
+/// Lit arrows fade on the frames the HUD itself asks for: the loop wakes
+/// when `next_wake_us` says, and draws only when the HUD animates or a blink
+/// or need sample is due (ticks and the plumb bob's spin, which would also
+/// draw, are left out). While a bar is lit, the HUD asks for a frame well
+/// inside the 48 ms sampling period at ultra speed, so the 500 ms fades run
+/// smoothly up to full red. A due sample leaves its deadline to the redraw,
+/// so the loop never asks to wake at once.
+#[test]
+fn needs_trend_arrows_fade_on_frames_the_loop_asks_for() {
+    use sims_ui::needs_history::{DARK_RED, RED};
+    let Some(install) = env_dir("SIMS_INSTALL") else {
+        eprintln!("skipping: set SIMS_INSTALL to run the trend arrows on the Goth house");
+        return;
+    };
+    let lit = |game: &Game| -> Vec<sims_ui::needs_history::Arrows> {
+        game.hud_items()
+            .iter()
+            .filter_map(|i| match &i.kind {
+                sims_ui::hud::Kind::Trend(a) => Some(*a),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut game = open_goth(&install, [800, 600]);
+    if !game.panel_expanded() {
+        game.hotkey_mode(Mode::Live);
+    }
+    game.render();
+    game.set_speed(sims_ui::command::Speed::Ultra);
+    // The window's first timed frame, which starts the panel's clock.
+    game.advance_while(16_667, 16_667, |_| true);
+    game.render();
+    let mut clock = 0u64;
+    let mut last_drawn: Option<(u64, bool)> = None;
+    let mut widest_lit_gap = 0;
+    let (mut drawn, mut lit_frames, mut full) = (0, 0, false);
+    while clock < 3_000_000 {
+        let wake = game
+            .next_wake_us(false, 16_667)
+            .expect("the live panel asks for a wakeup");
+        assert!(wake > 0, "a wakeup of 0 us spins");
+        clock += wake;
+        game.advance_while(wake, wake, |_| true);
+        if !(game.ui_animating() || game.blink_due()) {
+            continue;
+        }
+        game.render();
+        drawn += 1;
+        if let Some((at, true)) = last_drawn {
+            widest_lit_gap = widest_lit_gap.max(clock - at);
+        }
+        let arrows = lit(&game);
+        lit_frames += usize::from(!arrows.is_empty());
+        full |= arrows
+            .iter()
+            .any(|a| a.colours.iter().any(|c| [RED, DARK_RED].contains(c)));
+        last_drawn = Some((clock, !arrows.is_empty()));
+    }
+    assert!(
+        drawn > 0 && lit_frames > 0,
+        "no arrows drawn: {drawn} frames"
+    );
+    assert!(
+        widest_lit_gap <= 40_000,
+        "a lit bar went {widest_lit_gap} us without a frame"
+    );
+    assert!(full, "no arrow faded up to full red");
+}
+
 /// The 1.91 neighborhood captures (`SIMS_NB_ORACLE` overrides).
 const DEFAULT_NB_ORACLE: &str =
     "/Users/tommyvolk/Desktop/sims-rs/cache/nb-save-movein-evict-20261121/shots";

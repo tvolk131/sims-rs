@@ -1461,10 +1461,11 @@ impl Faces {
                 Some(chunk) => Some(bitmap::bmp(iff.data(chunk)).map_err(Error::Format)?),
                 None => None,
             };
-            let thumbnail = match iff.get(b"BMP_", THUMBNAIL) {
-                Some(chunk) => Some(bitmap::bmp(iff.data(chunk)).map_err(Error::Format)?),
-                None => None,
-            };
+            // The thumbnail only serves the lot card, which falls back to
+            // the face: one that does not decode is taken as missing.
+            let thumbnail = iff
+                .get(b"BMP_", THUMBNAIL)
+                .and_then(|chunk| bitmap::bmp(iff.data(chunk)).ok());
             let face = match iff.get(b"BMP_", FACES) {
                 Some(chunk) => {
                     let image = bitmap::bmp(iff.data(chunk)).map_err(Error::Format)?;
