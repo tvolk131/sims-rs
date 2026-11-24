@@ -2611,6 +2611,24 @@ const OP_BUILTINS: &[(&str, u16)] = &[
 /// Bitflags key of `self.flags`: an untyped bitfield that accepts any `bitflags` value.
 const ANY_BITFLAGS: &str = "builtin::AnyFlags";
 
+/// The person-data word behind `sim.personality.<trait>` (the same words the character file
+/// stores the five personality traits in).
+fn personality_trait(span: Span, name: &str) -> Result<u8> {
+    match name {
+        "nice" => Ok(2),
+        "active" => Ok(3),
+        "playful" => Ok(5),
+        "outgoing" => Ok(6),
+        "neat" => Ok(7),
+        other => Err(Error::at(
+            span,
+            format!(
+                "unknown personality trait '{other}' (expected nice, active, playful, outgoing, or neat)"
+            ),
+        )),
+    }
+}
+
 /// Builtins added after user helpers could already use these names: a user `fn`, `tree`, or
 /// `extern` with the same name takes precedence.
 fn is_prim_builtin_name(name: &str) -> bool {
@@ -4584,11 +4602,15 @@ impl<'a> TreeLowerer<'a> {
     }
 
     /// The object or Sim cell behind `handle.<field>` that every handle shares: `hand`, `room`,
-    /// and (untyped handles only) the person words `age`, `priority`, `is_visitor`, and `kind`.
+    /// `flags` (object data word 8), and (untyped handles only) the person words `age`, `priority`, `is_visitor`, and `kind`.
     fn handle_field_cell(field: &str, maybe_sim: bool) -> Option<(&'static str, ValueType)> {
         match field {
             "hand" => Some(("stack.slot[0]", ValueType::ObjectId)),
             "room" => Some(("stack.room", ValueType::I16)),
+            "flags" => Some((
+                "stack.data[8]",
+                ValueType::Bitflags(ANY_BITFLAGS.to_owned()),
+            )),
             _ if !maybe_sim => None,
             "age" => Some(("stack.person[58]", ValueType::I16)),
             "priority" => Some(("stack.person.priority", ValueType::I16)),
@@ -9282,6 +9304,10 @@ impl<'a> TreeLowerer<'a> {
                                     ty: ValueType::I16,
                                 })
                             }
+                            "personality" => Ok(LValue::Direct {
+                                air: format!("my.person[{}]", personality_trait(*span, field)?),
+                                ty: ValueType::I16,
+                            }),
                             other => Err(Error::at(
                                 *span,
                                 format!("unknown Sim member '{rname}.{other}.{field}'"),
@@ -9317,6 +9343,9 @@ impl<'a> TreeLowerer<'a> {
                                     Error::at(*span, format!("unknown skill '{field}'"))
                                 })?;
                                 format!("stack.skill.{field}")
+                            }
+                            "personality" => {
+                                format!("stack.person[{}]", personality_trait(*span, field)?)
                             }
                             other => {
                                 return Err(Error::at(
@@ -9393,10 +9422,14 @@ impl<'a> TreeLowerer<'a> {
                                 air: "my.person[58]".to_owned(),
                                 ty: ValueType::I16,
                             }),
+                            "priority" => Ok(LValue::Direct {
+                                air: "my.person.priority".to_owned(),
+                                ty: ValueType::I16,
+                            }),
                             _ => Err(Error::at(
                                 *span,
                                 format!(
-                                    "cannot assign to '{bname}.{field}' (use '{bname}.motive.<name>', '{bname}.skill.<name>', '{bname}.age', or '{bname}.person[i]'; use 'self.<state>' for object state)"
+                                    "cannot assign to '{bname}.{field}' (use '{bname}.motive.<name>', '{bname}.skill.<name>', '{bname}.personality.<trait>', '{bname}.age', '{bname}.priority', '{bname}.attr[i]', '{bname}.data[i]', or '{bname}.person[i]'; use 'self.<state>' for object state)"
                                 ),
                             )),
                         };
@@ -9560,7 +9593,9 @@ impl<'a> TreeLowerer<'a> {
                             ty: ValueType::I16,
                         });
                     }
-                    if self.is_sim_ident(rname) && matches!(field.as_str(), "slot" | "person") {
+                    if self.is_sim_ident(rname)
+                        && matches!(field.as_str(), "slot" | "person" | "attr" | "data")
+                    {
                         let idx = self.eval_builtin_int(
                             index,
                             &format!("{rname}.{field} index"),
@@ -10525,10 +10560,12 @@ impl<'a> TreeLowerer<'a> {
                             "hand" => Ok(("my.slot[0]".to_owned(), ValueType::ObjectId)),
                             "age" => Ok(("my.person[58]".to_owned(), ValueType::I16)),
                             "visitor_kind" => Ok(("my.person[32]".to_owned(), ValueType::I16)),
+                            // Object data word 2: the object whose slot holds the Sim (read-only).
+                            "container" => Ok(("my.data[2]".to_owned(), ValueType::ObjectId)),
                             other => Err(Error::at(
                                 *span,
                                 format!(
-                                    "unknown Sim property '{bname}.{other}' (expected motive, skill, id, priority, room, hand, age, visitor_kind, slot[i], or person[i]; use 'self.<state>' for object state)"
+                                    "unknown Sim property '{bname}.{other}' (expected motive, skill, personality, id, priority, room, hand, age, visitor_kind, container, attr[i], data[i], slot[i], or person[i]; use 'self.<state>' for object state)"
                                 ),
                             )),
                         };
@@ -10661,6 +10698,14 @@ impl<'a> TreeLowerer<'a> {
                         self.line(format!("random({tmp}, {range_air});"));
                         return Ok((tmp, ValueType::I16));
                     }
+                    if fname == "job_data"
+                        && self
+                            .env
+                            .lookup_fn(&self.owner_module, fname, self.in_object_scope)
+                            .is_none()
+                    {
+                        return self.lower_job_data(args, *span);
+                    }
                     if matches!(
                         fname.as_str(),
                         "can_afford"
@@ -10757,6 +10802,44 @@ impl<'a> TreeLowerer<'a> {
                 "expression cannot be evaluated as a value",
             )),
         }
+    }
+
+    /// `job_data(career, level, field)`: scope 33 reads a field of a career level, the career
+    /// taken from `temp[0]` and the level from `temp[1]`. Both temps are overwritten.
+    fn lower_job_data(&mut self, args: &[CallArg], span: Span) -> Result<(String, ValueType)> {
+        let bound = self.bind_builtin_args("job_data", args, &["career", "level", "field"], &[])?;
+        let mut operand = |key: &str| -> Result<(String, Span)> {
+            let arg = bound
+                .get(key)
+                .ok_or_else(|| Error::at(span, format!("job_data() requires '{key}'")))?;
+            let (air, ty) = self.lower_value_expr(&arg.value)?;
+            if ty != ValueType::I16 {
+                return Err(Error::at(
+                    arg.span,
+                    format!("job_data {key} must be an i16"),
+                ));
+            }
+            Ok((air, arg.span))
+        };
+        let (career, _) = operand("career")?;
+        let (mut level, _) = operand("level")?;
+        let field = {
+            let arg = bound
+                .get("field")
+                .ok_or_else(|| Error::at(span, "job_data() requires 'field'"))?;
+            self.eval_builtin_int(&arg.value, "job_data field", 0, 32767)?
+        };
+        // `temp[0]` is written first: a level read from it is copied before that store.
+        if level.contains("temp[0]") {
+            let copy = self.fresh("job_level");
+            self.line(format!("let {copy} = {level};"));
+            level = copy;
+        }
+        self.line(format!("temp[0] := {career};"));
+        self.line(format!("temp[1] := {level};"));
+        let tmp = self.fresh("job");
+        self.line(format!("let {tmp} = scope(33, {field});"));
+        Ok((tmp, ValueType::I16))
     }
 
     fn read_lvalue(&mut self, lval: &LValue) -> Result<(String, ValueType)> {

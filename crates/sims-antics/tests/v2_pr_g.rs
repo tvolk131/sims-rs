@@ -353,3 +353,73 @@ fn tier2_primitives_lower_to_their_opcodes() {
         expect_err(name, &sim_tree(body), needle);
     }
 }
+
+#[test]
+fn tier2_sim_and_handle_fields() {
+    let air = expand(
+        "fields.antics",
+        &obj("    bitflags Marks { High = 3 }\n    tree t (sim: Sim) { \
+             sim.attr[1] = 4; \
+             sim.data[3] = sim.attr[1]; \
+             sim.priority = 50; \
+             sim.personality.neat = sim.personality.nice + 1; \
+             let c = sim.container; \
+             if c == stack_obj { sim.data[4] = 1; } \
+             if stack_obj.flags.contains(Marks::High) { self.n = 2; } \
+             stack_obj.flags.set(Marks::High); }"),
+    );
+    for needle in [
+        "my.attr[1] := 4;",
+        "my.data[3] := my.attr[1];",
+        "my.person.priority := 50;",
+        "= my.person[2];",
+        "my.person[7] := __arith_0;",
+        "my.data[2]",
+        "stack.data[8]",
+    ] {
+        assert!(air.contains(needle), "missing '{needle}':\n{air}");
+    }
+    for (name, body, needle) in [
+        (
+            "container_write.antics",
+            "sim.container = 0;",
+            "cannot assign to 'sim.container'",
+        ),
+        (
+            "trait_unknown.antics",
+            "self.n = sim.personality.grumpy;",
+            "unknown personality trait 'grumpy'",
+        ),
+    ] {
+        expect_err(name, &sim_tree(body), needle);
+    }
+}
+
+#[test]
+fn tier2_job_data_reads_scope_33_through_the_temps() {
+    let src = obj(
+        "    extern mod g { @id(300) fn rate(a: i16, b: i16) -> bool; }\n    \
+         tree t (sim: Sim) { \
+             let career = 3; \
+             self.n = job_data(career, level: 2, field: 5); \
+             temp[0] = 7; \
+             self.n = job_data(career: 1, level: temp[0], field: 0); \
+             if g::rate(self.n, job_data(4, 1, 2)) { self.n = 1; } \
+         }",
+    );
+    let air = expand("job.antics", &src);
+    assert!(
+        air.contains("temp[1] := 2;") && air.contains("scope(33, 5)"),
+        "{air}"
+    );
+    // A level read from `temp[0]` survives the career store.
+    let at = air.find("scope(33, 0)").expect("second read");
+    let before = &air[..at];
+    let copy = before.rfind("= temp[0];").expect("level copied first");
+    assert!(before[copy..].contains("temp[0] := 1;"), "{air}");
+    expect_err(
+        "job_named.antics",
+        &sim_tree("self.n = job_data(career: 1, level: 0, row: 1);"),
+        "unknown job_data() argument 'row'",
+    );
+}
