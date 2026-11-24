@@ -1301,7 +1301,13 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
 
     if v2 {
         let resolved = resolve_arities()?;
-        return lift_v2(&iff, resolved.as_ref(), &source_label, &mut out);
+        return lift_v2(
+            &iff,
+            resolved.as_ref(),
+            &arity_opts,
+            &source_label,
+            &mut out,
+        );
     }
 
     if list {
@@ -2220,6 +2226,7 @@ fn run() -> Result<(), CliError> {
 fn lift_v2(
     iff: &Iff,
     resolved: Option<&FileArities>,
+    arity_opts: &ArityOptions,
     source_label: &str,
     out: &mut OutWriter<impl Write>,
 ) -> Result<(), CliError> {
@@ -2236,6 +2243,7 @@ fn lift_v2(
         .unwrap_or_default();
     let options = DecompileV2Options {
         library_arities,
+        library_names: lift_v2_library_names(arity_opts, resolved),
         ..DecompileV2Options::default()
     };
     let report = decompile_iff_to_v2_report(iff, &options)
@@ -2293,6 +2301,73 @@ fn lift_v2(
         return Err(CliError::Exit(1));
     }
     Ok(())
+}
+
+fn lift_v2_library_names(
+    opts: &ArityOptions,
+    resolved: Option<&FileArities>,
+) -> std::collections::BTreeMap<u16, String> {
+    let mut names = std::collections::BTreeMap::new();
+    let mut add_names = |iff: &Iff, range: std::ops::RangeInclusive<u16>| {
+        names.extend(
+            vm_kept_bhavs(iff)
+                .chunks
+                .into_iter()
+                .filter(|c| range.contains(&c.id))
+                .map(|c| (c.id, c.label.clone())),
+        );
+    };
+    for (spec, default_member, flag, range) in [
+        (&opts.globals, Some("Global.iff"), "--globals", GLOBAL_TREES),
+        (&opts.semi_global, None, "--semiglobal", SEMI_GLOBAL_TREES),
+    ] {
+        // The overrides were already read and validated during arity resolution.
+        if let Some(spec) = spec
+            && let Ok((iff, _)) = read_override_iff(spec, default_member, flag)
+        {
+            add_names(&iff, range);
+        }
+    }
+
+    #[cfg(feature = "install-catalog")]
+    if !opts.no_catalog
+        && (opts.globals.is_none() || opts.semi_global.is_none())
+        && let Some(root) = opts.install.as_deref()
+        && let Ok(install) = sims_content::Install::detect(root)
+        && let Ok(index) = sims_content::Index::build(&install)
+    {
+        let global = opts
+            .globals
+            .is_none()
+            .then(|| {
+                index
+                    .named("Global.iff")
+                    .find(|(_, r)| r.mount == 0 && r.name().eq_ignore_ascii_case("Global.iff"))
+                    .map(|(_, r)| r)
+            })
+            .flatten();
+        let semi_global = resolved
+            .map(|r| &r.for_tree(4096).semi_global.source)
+            .and_then(|source| match source {
+                AritySource::Catalog(location) => index
+                    .resources
+                    .iter()
+                    .find(|r| r.location(&index.root) == *location),
+                _ => None,
+            });
+        for (resource, range) in [(global, GLOBAL_TREES), (semi_global, SEMI_GLOBAL_TREES)] {
+            if let Some(resource) = resource
+                && std::fs::metadata(&resource.path).is_ok_and(|m| m.is_file())
+                && let Ok(bytes) = resource.read()
+                && let Ok(iff) = Iff::parse(bytes)
+            {
+                add_names(&iff, range);
+            }
+        }
+    }
+    #[cfg(not(feature = "install-catalog"))]
+    let _ = resolved;
+    names
 }
 
 fn cmd_fmt(args: &[OsString]) -> Result<(), CliError> {

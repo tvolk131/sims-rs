@@ -14,7 +14,7 @@
 use crate::arity_catalog::{bhav_arities_in_range, vm_kept_bhavs};
 use crate::ast::{
     AssignOp, CallTarget, CompareOp, Condition, LocalRef, Operand, OperandRef, PrimitiveCall, Stmt,
-    Target,
+    StringRef, Target,
 };
 use crate::error::{Error, Result};
 use crate::ir::BhavChunk;
@@ -27,12 +27,13 @@ use crate::v2::fmt::format_v2_source;
 use crate::v2::parser::snake_case_ident;
 use crate::v2::{PackResolverConfig, compile_expanded_v2_object, expand_v2_source_to_objects};
 use crate::verify::{
-    EquivOptions, EquivResult, LiveContext, LiveOptions, check_bhav_equivalent_combined,
-    same_tree_bytes,
+    EquivOptions, EquivResult, LiveContext, LiveOptions, canonicalize_primitive_operands,
+    check_bhav_equivalent_combined, same_tree_bytes,
 };
 use sims_formats::behavior::{InteractionTable, ObjectDefinition};
 use sims_formats::iff::{Chunk, Iff};
 use sims_formats::strings::StringTable;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Private BHAV IDs a decompiled object declares as its own trees.
@@ -54,6 +55,8 @@ pub struct DecompileV2Options {
     /// semi-global `8192+`), e.g. from an install's arity catalog. Private trees' counts
     /// always come from the file itself.
     pub library_arities: BTreeMap<u16, usize>,
+    /// Optional BHAV labels for the same global and semi-global libraries.
+    pub library_names: BTreeMap<u16, String>,
     /// Compile the generated source and check every tree against the original, falling
     /// back to `raw` where needed (default `true`). Without it the output is the most
     /// readable translation, unchecked.
@@ -64,6 +67,7 @@ impl Default for DecompileV2Options {
     fn default() -> Self {
         Self {
             library_arities: BTreeMap::new(),
+            library_names: BTreeMap::new(),
             validate: true,
         }
     }
@@ -317,7 +321,12 @@ struct VariantModel {
 struct BconModel {
     id: u16,
     label: String,
-    values: Vec<i16>,
+    entries: Vec<(String, i16)>,
+}
+
+struct SoundModel {
+    ident: String,
+    wav: String,
 }
 
 struct Model {
@@ -333,8 +342,6 @@ struct Model {
     primary_init: u16,
     primary_main: u16,
     bcons: Vec<BconModel>,
-    /// Private BCON chunk id -> reference name.
-    bcon_names: BTreeMap<u16, String>,
     /// Library constant operand address -> entry name in `extern bcon library_consts`.
     extern_bcons: BTreeMap<u16, String>,
     /// Attribute slots referenced as `my.attr` / `stack.attr`.
@@ -345,12 +352,14 @@ struct Model {
     state_limit: i16,
     /// GUIDs used more than once -> `const` name.
     guid_consts: BTreeMap<u32, String>,
-    /// Library trees called with the caller's temps (`call N(temps)`).
-    extern_calls: BTreeSet<u16>,
+    /// Library trees referenced by a structured call, by ID and source identifier.
+    extern_calls: BTreeMap<u16, String>,
+    /// Callable trees with a known arity and a structured inline call.
+    literal_calls: BTreeMap<u16, usize>,
     trees: Vec<TreeModel>,
     interactions: Vec<String>,
-    /// FWAV chunks written as `sound` declarations: chunk id -> sound event name.
-    sounds: BTreeMap<u16, String>,
+    /// FWAV chunks written as `sound` declarations, by chunk ID.
+    sounds: BTreeMap<u16, SoundModel>,
     /// FWAV chunks v2 cannot declare, and why.
     sounds_skipped: BTreeMap<u16, &'static str>,
     /// Original-side checker context.
@@ -383,7 +392,7 @@ impl Model {
         });
         let primary_name = primary_object_name(&objd_chunk.label);
         let mut variants: Vec<VariantModel> = Vec::new();
-        for c in &objds[1..] {
+        for c in objds[1..].iter().filter(|_| objd.master_id == 0) {
             let data = iff.data(c);
             let name = clean_label(&c.label);
             let Some(v) = variant_words(objd_data, data) else {
@@ -432,7 +441,6 @@ impl Model {
 
         // BCON tables.
         let mut bcons = Vec::new();
-        let mut bcon_names = BTreeMap::new();
         // `library_consts` is the extern table's name.
         let mut used_names = BTreeSet::from([name_key("library_consts")]);
         // The VM keeps the last chunk of an ID.
@@ -471,11 +479,10 @@ impl Model {
                     format!("{base}{}_{n}", c.id)
                 };
             }
-            bcon_names.insert(c.id, label.clone());
             bcons.push(BconModel {
                 id: c.id,
                 label,
-                values,
+                entries: bcon_entries(iff, c.id, values),
             });
         }
 
@@ -586,6 +593,7 @@ impl Model {
         let mut states = BTreeSet::new();
         let mut guid_uses: BTreeMap<u32, usize> = BTreeMap::new();
         let mut extern_calls = BTreeSet::new();
+        let mut literal_calls = BTreeMap::new();
         let mut extern_bcons = BTreeMap::new();
         for t in &trees {
             let Some(body) = &t.body else { continue };
@@ -606,10 +614,20 @@ impl Model {
                 for g in stmt_guids(s) {
                     *guid_uses.entry(g).or_default() += 1;
                 }
-                if let Some(id) = stmt_temps_call(s)
-                    && !PRIVATE_TREES.contains(&id)
-                {
-                    extern_calls.insert(id);
+                if let Some((id, pass_temps)) = stmt_call(s) {
+                    if !pass_temps
+                        && let Some(&arity @ 1..=4) = lift_arities.get(&id)
+                        && (!PRIVATE_TREES.contains(&id)
+                            || (!variants.iter().any(|v| v.init == id || v.main == id)
+                                && trees.iter().any(|callee| {
+                                    callee.id == id && usize::from(callee.original.args) >= arity
+                                })))
+                    {
+                        literal_calls.insert(id, arity);
+                    }
+                    if id >= 256 && !PRIVATE_TREES.contains(&id) {
+                        extern_calls.insert(id);
+                    }
                 }
             });
         }
@@ -627,15 +645,13 @@ impl Model {
                 .find(|t| t.id == id)
                 .map_or_else(|| format!("tree {id}"), |t| t.ident.clone())
         };
-        for c in iff.chunks.iter().filter(|c| &c.tag == b"TTAB") {
+        for c in iff.all(b"TTAB") {
             let Ok(table) = InteractionTable::parse(iff.data(c)) else {
                 continue;
             };
             let names = iff
-                .chunks
-                .iter()
-                .find(|s| &s.tag == b"TTAs" && s.id == c.id)
-                .and_then(|s| StringTable::parse(iff.data(s)).ok());
+                .get(b"TTAs", c.id)
+                .and_then(|s| StringTable::parse_chunk(iff.data(s), s.flags).ok());
             for (i, it) in table.interactions.iter().enumerate() {
                 let name = names
                     .as_ref()
@@ -664,6 +680,14 @@ impl Model {
         let mut sounds_skipped = BTreeMap::new();
         // Several FWAVs may share one event name (v2 PR F), but only spelled the same way.
         let mut sound_names: BTreeMap<String, &str> = BTreeMap::new();
+        let mut event_counts = BTreeMap::new();
+        for name in original_sounds.values() {
+            *event_counts.entry(name).or_insert(0) += 1;
+        }
+        let mut sound_idents: BTreeSet<String> = original_sounds
+            .keys()
+            .map(|id| format!("sound_{id}"))
+            .collect();
         for (&id, name) in &original_sounds {
             let why = if crate::manifest::validate_relative_filename(name, "sound").is_err() {
                 "v2 cannot spell its event name (a plain file name)"
@@ -676,11 +700,55 @@ impl Model {
             {
                 "another FWAV names the same event with other letter case, which v2 does not allow"
             } else {
-                sounds.insert(id, name.clone());
+                let fallback = format!("sound_{id}");
+                let label = name
+                    .rsplit_once('.')
+                    .filter(|(_, ext)| ext.eq_ignore_ascii_case("wav"))
+                    .map_or(name.as_str(), |(stem, _)| stem);
+                let ident = if event_counts[name] == 1 {
+                    unique_metadata_ident(label, id, &mut sound_idents).unwrap_or(fallback)
+                } else {
+                    // An event shared by multiple chunks has no single source identifier.
+                    fallback
+                };
+                sounds.insert(
+                    id,
+                    SoundModel {
+                        ident,
+                        wav: name.clone(),
+                    },
+                );
                 continue;
             };
             sounds_skipped.insert(id, why);
         }
+
+        let mut global_idents = BTreeSet::new();
+        let mut semi_global_idents = BTreeSet::new();
+        for &id in &extern_calls {
+            if id >= 8192 {
+                semi_global_idents.insert(format!("semi_global_{id}"));
+            } else {
+                global_idents.insert(format!("global_{id}"));
+            }
+        }
+        let extern_calls = extern_calls
+            .into_iter()
+            .map(|id| {
+                let (prefix, used) = if id >= 8192 {
+                    ("semi_global", &mut semi_global_idents)
+                } else {
+                    ("global", &mut global_idents)
+                };
+                let fallback = format!("{prefix}_{id}");
+                let ident = options
+                    .library_names
+                    .get(&id)
+                    .and_then(|label| unique_metadata_ident(label, id, used))
+                    .unwrap_or(fallback);
+                (id, ident)
+            })
+            .collect();
 
         let ctx_original = live_context(iff, &options.library_arities);
         Ok(Self {
@@ -692,13 +760,13 @@ impl Model {
             primary_init,
             primary_main,
             bcons,
-            bcon_names,
             extern_bcons,
             states,
             attributes,
             state_limit,
             guid_consts,
             extern_calls,
+            literal_calls,
             trees,
             interactions,
             sounds,
@@ -752,7 +820,6 @@ impl Model {
             sounds: fwav_sounds(&iff),
             resources: resource_chunks(&iff),
             attributes: objd_attributes(&iff),
-            variants: objd_entries(&iff),
         })
     }
 
@@ -774,22 +841,26 @@ impl Model {
         }
         // Byte comparisons prove nothing when the tree runs against different constants
         // or callees; the checker takes both contexts into account.
-        if self.same_context_for(&t.original, recompiled) {
-            if same_tree_bytes(&t.original, b) {
-                return TreeCheck::Identical;
-            }
-            if same_but_unreachable_tail(&t.original, b, &self.ctx_original) {
-                return TreeCheck::Equivalent;
-            }
+        let same_context = self.same_context_for(&t.original, recompiled);
+        if same_context && same_tree_bytes(&t.original, b) {
+            return TreeCheck::Identical;
+        }
+        let original = without_unused_operands(&t.original, &self.ctx_original);
+        let candidate = without_unused_operands(b, &recompiled.ctx);
+        if same_context
+            && (same_tree_bytes(&original, &candidate)
+                || same_but_unreachable_tail(&original, &candidate, &self.ctx_original))
+        {
+            return TreeCheck::Equivalent;
         }
         let key = (t.id, format!("{b:?}"), format!("{:?}", recompiled.ctx));
         if let Some(hit) = cache.get(&key) {
             return hit.clone();
         }
         let (_, result) = check_bhav_equivalent_combined(
-            &t.original,
+            &original,
             &self.ctx_original,
-            b,
+            &candidate,
             &recompiled.ctx,
             &EquivOptions::default(),
             &LiveOptions::default(),
@@ -839,26 +910,18 @@ impl Model {
     }
 
     fn resources_not_reproduced(&self, recompiled: &RecompiledFile) -> Vec<String> {
-        let mut out: Vec<String> = self
-            .original_resources
+        self.original_resources
             .iter()
             .filter(|(key, data)| recompiled.resources.get(key) != Some(*data))
-            .map(|((tag, id), _)| format!("{} {id}", String::from_utf8_lossy(tag)))
-            .collect();
-        // A variant is reproduced when the recompiled object defines its GUID with the same
-        // price and the same init/main tree IDs.
-        for v in &self.variants {
-            let same = recompiled
-                .variants
-                .get(&v.guid)
-                .is_some_and(|&(price, init, main)| {
-                    (price, init, main) == (v.price, v.init, v.main)
-                });
-            if !same {
-                out.push(format!("OBJD {} (variant \"{}\")", v.objd_id, v.name));
-            }
-        }
-        out
+            .map(|((tag, id), _)| {
+                if tag == b"OBJD"
+                    && let Some(v) = self.variants.iter().find(|v| v.objd_id == *id)
+                {
+                    return format!("OBJD {id} (variant \"{}\")", v.name);
+                }
+                format!("{} {id}", String::from_utf8_lossy(tag))
+            })
+            .collect()
     }
 
     /// The fields of a `variant` member, or why it cannot be written this round.
@@ -950,22 +1013,6 @@ fn variant_words(primary: &[u8], other: &[u8]) -> Option<[u16; 6]> {
             .enumerate()
             .all(|(w, (x, y))| x == y || VARIANT_WORDS.contains(&w));
     same_rest.then(|| VARIANT_WORDS.map(|w| b[w]))
-}
-
-/// GUID -> (price, init, main) for every OBJD of `iff`.
-fn objd_entries(iff: &Iff) -> BTreeMap<u32, (u16, u16, u16)> {
-    let mut out = BTreeMap::new();
-    for c in iff.chunks.iter().filter(|c| &c.tag == b"OBJD") {
-        let data = iff.data(c);
-        let word = |w: usize| {
-            data.get(4 + w * 2..6 + w * 2)
-                .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
-        };
-        let guid = u32::from(word(12)) | (u32::from(word(13)) << 16);
-        out.entry(guid)
-            .or_insert((word(16), word(OBJD_INIT_WORD), word(OBJD_MAIN_WORD)));
-    }
-    out
 }
 
 /// The `object "..."` name written for an OBJD label.
@@ -1063,8 +1110,8 @@ fn fwav_sounds(iff: &Iff) -> BTreeMap<u16, String> {
 /// Non-code chunks a tree can read through a primitive, keyed by tag and ID (last
 /// chunk of a key wins).
 fn resource_chunks(iff: &Iff) -> BTreeMap<([u8; 4], u16), Vec<u8>> {
-    const TAGS: [&[u8; 4]; 8] = [
-        b"STR#", b"CTSS", b"TTAB", b"TTAs", b"SLOT", b"FCNS", b"GLOB", b"TPRP",
+    const TAGS: [&[u8; 4]; 9] = [
+        b"STR#", b"CTSS", b"TTAB", b"TTAs", b"SLOT", b"FCNS", b"GLOB", b"TPRP", b"OBJD",
     ];
     let mut out = BTreeMap::new();
     for c in iff.chunks.iter().filter(|c| TAGS.contains(&&c.tag)) {
@@ -1079,8 +1126,39 @@ struct RecompiledFile {
     sounds: BTreeMap<u16, String>,
     resources: BTreeMap<([u8; 4], u16), Vec<u8>>,
     attributes: Option<u16>,
-    /// GUID -> (price, init, main) for every OBJD.
-    variants: BTreeMap<u32, (u16, u16, u16)>,
+}
+
+/// Removes bytes that these v2 spellings drop and the VM never reads. Leave the
+/// tree unchanged when any record could hold the extended arguments to an inline call.
+fn without_unused_operands<'a>(tree: &'a BhavChunk, ctx: &LiveContext) -> Cow<'a, BhavChunk> {
+    let canonical = |i: &sims_formats::behavior::Instruction| {
+        let mut operands = i.operands;
+        match i.opcode {
+            // Animate reads byte 2 only with flag 0x20 (the VM's store_event).
+            44 if operands[5] & 0x20 == 0 => operands[2] = 0,
+            50 => operands = canonicalize_primitive_operands(i.opcode, operands),
+            _ => {}
+        }
+        operands
+    };
+    if !tree.instructions.iter().any(|i| canonical(i) != i.operands)
+        || tree.instructions.iter().any(|i| {
+            i.opcode >= 256
+                && i.operands != [0xFF; 8]
+                && ctx
+                    .callee_arities
+                    .as_ref()
+                    .and_then(|arities| arities.get(&i.opcode))
+                    .is_none_or(|&arity| arity > 4)
+        })
+    {
+        return Cow::Borrowed(tree);
+    }
+    let mut tree = tree.clone();
+    for i in &mut tree.instructions {
+        i.operands = canonical(i);
+    }
+    Cow::Owned(tree)
 }
 
 enum Failure {
@@ -1214,6 +1292,101 @@ fn unique_ident(label: &str, id: u16, used: &mut BTreeSet<String>) -> String {
         ident.push('_');
     }
     ident
+}
+
+fn metadata_ident(label: &str) -> Option<String> {
+    let ident = snake_case_ident(label.trim_end_matches('\0'));
+    if ident == "tree_" {
+        return None;
+    }
+    let ident = match ident.as_str() {
+        "true" | "false" | "if" | "match" | "self" | "sim" | "temp" | "stack_obj" => {
+            format!("{ident}_")
+        }
+        _ => ident,
+    };
+    Some(ident)
+}
+
+fn unique_metadata_ident(label: &str, id: u16, used: &mut BTreeSet<String>) -> Option<String> {
+    let mut ident = metadata_ident(label)?;
+    if !used.insert(ident.clone()) {
+        ident.push_str(&format!("_{id}"));
+        while !used.insert(ident.clone()) {
+            ident.push('_');
+        }
+    }
+    Some(ident)
+}
+
+fn bcon_entries(iff: &Iff, id: u16, values: Vec<i16>) -> Vec<(String, i16)> {
+    let str_labels = iff
+        .get(b"STR#", id)
+        .and_then(|c| StringTable::parse_chunk(iff.data(c), c.flags).ok());
+    let trcn_labels = iff
+        .get(b"TRCN", id)
+        .and_then(|c| trcn_labels(iff.data(c), values.len()))
+        .unwrap_or_default();
+    let mut used: BTreeSet<String> = (0..values.len()).map(|i| format!("e{i}")).collect();
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(i, value)| {
+            let trcn = trcn_labels.get(i).and_then(|s| metadata_ident(s));
+            let name = trcn
+                .or_else(|| metadata_ident(str_labels.as_ref()?.get(i, 1)?))
+                .filter(|ident| used.insert(ident.clone()))
+                .unwrap_or_else(|| format!("e{i}"));
+            (name, value)
+        })
+        .collect()
+}
+
+/// TRCN stores an ordered label and comment per BCON entry. Version 2 uses
+/// length-prefixed strings. Earlier versions use padded C strings.
+fn trcn_labels(data: &[u8], limit: usize) -> Option<Vec<String>> {
+    fn string<'a>(data: &mut &'a [u8], version: u32, pad_even: bool) -> Option<&'a [u8]> {
+        if version < 2 {
+            let len = data.iter().position(|&b| b == 0)?;
+            let padded = (len % 2 == 0) == pad_even;
+            let (field, rest) = data.split_at_checked(len + 1 + usize::from(padded))?;
+            *data = rest;
+            return field.get(..len);
+        }
+        let mut len = 0u32;
+        for shift in (0..=28).step_by(7) {
+            let (&byte, rest) = data.split_first()?;
+            *data = rest;
+            if shift == 28 && byte > 7 {
+                return None;
+            }
+            len |= u32::from(byte & 0x7f) << shift;
+            if byte < 0x80 {
+                let (field, rest) = data.split_at_checked(len as usize)?;
+                *data = rest;
+                return Some(field);
+            }
+        }
+        None
+    }
+
+    let (header, mut data) = data.split_at_checked(16)?;
+    let version = u32::from_le_bytes(header[4..8].try_into().ok()?);
+    if header[..4] != [0; 4] || version > 2 {
+        return None;
+    }
+    let count = u32::from_le_bytes(header[12..16].try_into().ok()?) as usize;
+    let mut labels = Vec::new();
+    for i in 0..count.min(limit) {
+        data = data.get(8..)?; // flags, unknown
+        let label = string(&mut data, version, i == 0 || version == 0)?;
+        string(&mut data, version, true)?;
+        if version > 0 {
+            data = data.get(5..)?; // range flag and bounds
+        }
+        labels.push(sims_formats::strings::decode(label, 1));
+    }
+    Some(labels)
 }
 
 /// A chunk label as a v2 string body: printable ASCII only, quotes and backslashes dropped.
@@ -1562,19 +1735,16 @@ fn stmt_guids(s: &Stmt) -> Vec<u32> {
     out
 }
 
-/// The callee of a `call N(temps)` statement or condition.
-fn stmt_temps_call(s: &Stmt) -> Option<u16> {
-    let temps_call = |target: &CallTarget, args: &[i16], pass_temps: bool| match target {
-        CallTarget::Id(id) if pass_temps && args.is_empty() => Some(*id),
+/// The callee and argument encoding of a structured call.
+fn stmt_call(s: &Stmt) -> Option<(u16, bool)> {
+    let call = |target: &CallTarget, pass_temps: bool| match target {
+        CallTarget::Id(id) => Some((*id, pass_temps)),
         _ => None,
     };
     match s {
         Stmt::Call {
-            target,
-            args,
-            pass_temps,
-            ..
-        } => temps_call(target, args, *pass_temps),
+            target, pass_temps, ..
+        } => call(target, *pass_temps),
         Stmt::If { cond, .. } | Stmt::While { cond, .. } => {
             let mut c = cond;
             while let Condition::Not(inner) = c {
@@ -1582,14 +1752,37 @@ fn stmt_temps_call(s: &Stmt) -> Option<u16> {
             }
             match c {
                 Condition::Call {
-                    target,
-                    args,
-                    pass_temps,
-                    ..
-                } => temps_call(target, args, *pass_temps),
+                    target, pass_temps, ..
+                } => call(target, *pass_temps),
                 _ => None,
             }
         }
+        _ => None,
+    }
+}
+
+fn call_params(arity: usize) -> impl Iterator<Item = String> {
+    (0..arity).map(|i| format!("arg_{i}: i16"))
+}
+
+fn animation_local(s: &Stmt) -> Option<u8> {
+    let (Stmt::If { cond, .. } | Stmt::While { cond, .. }) = s else {
+        return None;
+    };
+    let mut cond = cond;
+    while let Condition::Not(inner) = cond {
+        cond = inner;
+    }
+    match cond {
+        Condition::Primitive {
+            prim:
+                PrimitiveCall::Animate {
+                    flags,
+                    local_index: LocalRef::Index(i),
+                    ..
+                },
+            ..
+        } if flags & 0x20 != 0 => Some(*i),
         _ => None,
     }
 }
@@ -1848,7 +2041,7 @@ impl Model {
         out.line("// Decompiled by `sims-antics lift --v2`.");
         if self.extra_objds > 0 {
             out.line(format!(
-                "// The file has {} more OBJD chunks (a multi-tile object); only the first is written.",
+                "// The file has {} additional OBJD chunks that v2 cannot write as catalog variants.",
                 self.extra_objds
             ));
         }
@@ -1856,28 +2049,34 @@ impl Model {
 
         let mut lib_globals: Vec<u16> = Vec::new();
         let mut lib_semis: Vec<u16> = Vec::new();
-        for &id in &self.extern_calls {
+        for &id in self.extern_calls.keys() {
             if id >= 8192 {
                 lib_semis.push(id);
             } else if id >= 256 {
                 lib_globals.push(id);
             }
         }
-        for (module, ids, prefix) in [
-            ("globals", &lib_globals, "global"),
-            ("semi_globals", &lib_semis, "semi_global"),
-        ] {
+        for (module, ids) in [("globals", &lib_globals), ("semi_globals", &lib_semis)] {
             if ids.is_empty() {
                 continue;
             }
             out.line(format!("extern mod {module} {{"));
             out.indent += 1;
             for id in ids {
-                let args = match self.library_arities.get(id) {
-                    Some(n) => format!(" // {n} argument(s), passed in temps"),
-                    None => String::new(),
-                };
-                out.line(format!("@id({id}) fn {prefix}_{id}() -> bool;{args}"));
+                let (params, comment) =
+                    match (self.literal_calls.get(id), self.library_arities.get(id)) {
+                        (Some(&arity), _) => (
+                            call_params(arity).collect::<Vec<_>>().join(", "),
+                            String::new(),
+                        ),
+                        (None, Some(n)) => (
+                            String::new(),
+                            format!(" // {n} argument(s), passed in temps"),
+                        ),
+                        _ => (String::new(), String::new()),
+                    };
+                let ident = &self.extern_calls[id];
+                out.line(format!("@id({id}) fn {ident}({params}) -> bool;{comment}"));
             }
             out.indent -= 1;
             out.line("}");
@@ -1919,8 +2118,8 @@ impl Model {
         for b in &self.bcons {
             out.line(format!("bcon {} \"{}\" {{", b.id, b.label));
             out.indent += 1;
-            for (i, v) in b.values.iter().enumerate() {
-                out.line(format!("e{i} = {v},"));
+            for (name, value) in &b.entries {
+                out.line(format!("{name} = {value},"));
             }
             out.indent -= 1;
             out.line("}");
@@ -1932,9 +2131,10 @@ impl Model {
         if !self.sounds.is_empty() {
             out.line("");
         }
-        for (id, name) in &self.sounds {
+        for (id, sound) in &self.sounds {
             out.line(format!(
-                "sound sound_{id} = preset(\"ui_click\", wav: \"{name}\", id: {id});"
+                "sound {} = preset(\"ui_click\", wav: \"{}\", id: {id});",
+                sound.ident, sound.wav
             ));
         }
         if !self.states.is_empty() {
@@ -1960,7 +2160,18 @@ impl Model {
                 }
                 None => {
                     let b = &t.original;
-                    let ctx = if sim { " (sim: Sim)" } else { "" };
+                    let mut params = Vec::new();
+                    if sim {
+                        params.push("sim: Sim".to_owned());
+                    }
+                    if let Some(&arity) = self.literal_calls.get(&t.id) {
+                        params.extend(call_params(arity));
+                    }
+                    let ctx = if params.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", params.join(", "))
+                    };
                     let kind = if b.kind == 0 {
                         String::new()
                     } else {
@@ -1976,6 +2187,16 @@ impl Model {
             let mut raw_count = 0;
             match &t.body {
                 Some(body) if level.idiomatic() => {
+                    let mut animate_locals = 0;
+                    if as_lifecycle.is_none() && !plan.plain.contains(&t.id) {
+                        walk_stmts(body, &mut |s| {
+                            if let Some(index) = animation_local(s)
+                                && u16::from(index) < t.original.locals
+                            {
+                                animate_locals = animate_locals.max(u16::from(index) + 1);
+                            }
+                        });
+                    }
                     let mut tr = Translator {
                         model: self,
                         plan,
@@ -1990,8 +2211,19 @@ impl Model {
                         hoisted_save: hoisted_self_save(body, &t.lifted),
                         sims_loop: None,
                         cursor: None,
+                        animate_locals,
                         extras: std::cell::Cell::new(false),
                     };
+                    if animate_locals > 0 && tr.extra() {
+                        if animate_locals > 1 {
+                            // A raw block disables v2's removal of unused declarations.
+                            // The earlier slots must stay allocated even when unread.
+                            out.line("raw { /* Preserve animation local slot numbers. */ }");
+                        }
+                        for i in 0..animate_locals {
+                            out.line(format!("let slot_{i}: i16;"));
+                        }
+                    }
                     let body = match tr.hoisted_save {
                         Some(_) => {
                             tr.next_id += 1;
@@ -2139,6 +2371,8 @@ struct Translator<'a> {
     /// The binding of the innermost `for` loop whose cursor is `stack_obj` itself: inside it,
     /// the stack object's cells are the binding's (`o.data[i]`, `p.person[i]`).
     cursor: Option<String>,
+    /// Number of leading frame locals declared for animations that write events to a local.
+    animate_locals: u16,
     /// Whether an extra idiom was written (see [`Translator::extra`]).
     extras: std::cell::Cell<bool>,
 }
@@ -2242,6 +2476,9 @@ impl Translator<'_> {
                 else_body,
                 ..
             } => {
+                if self.try_dialog(id, cond, then_body, else_body, out) {
+                    return;
+                }
                 if self.match_chain(id, s, out) {
                     return;
                 }
@@ -2256,8 +2493,9 @@ impl Translator<'_> {
                 self.if_rest(id, start, then_body, else_body, out);
             }
             Stmt::While { cond, body, .. } => {
-                let handler = self.animate_loop(cond).is_some();
-                let header = match self.animate_loop(cond) {
+                let animate = self.animate_loop(cond, body.is_empty());
+                let handler = animate.is_some();
+                let header = match animate {
                     Some(prim) if body.is_empty() => {
                         self.flush_raw(out);
                         let start = out.lines.len();
@@ -2313,6 +2551,90 @@ impl Translator<'_> {
                 None => self.emit_raw(s),
             },
         }
+    }
+
+    fn try_dialog(
+        &mut self,
+        id: usize,
+        cond: &Condition,
+        then_body: &[Stmt],
+        else_body: &[Stmt],
+        out: &mut Out,
+    ) -> bool {
+        let (cond, success, failure, failure_id, failure_first) =
+            if let Condition::Not(inner) = cond {
+                (inner.as_ref(), else_body, then_body, id + 1, true)
+            } else {
+                (
+                    cond,
+                    then_body,
+                    else_body,
+                    id + 1 + count_stmts(then_body),
+                    false,
+                )
+            };
+        if self.forced_raw(failure_id)
+            || !matches!(
+                failure,
+                [Stmt::Return {
+                    target: Target::Error,
+                    ..
+                }]
+            )
+        {
+            return false;
+        }
+        let Condition::Primitive {
+            prim:
+                PrimitiveCall::Dialog {
+                    kind,
+                    message,
+                    title,
+                    button1,
+                    button2,
+                    button3,
+                    mode4_str,
+                    flags,
+                },
+            ..
+        } = cond
+        else {
+            return false;
+        };
+        let mut fields = vec![format!("kind: {kind}")];
+        for (name, value) in [
+            ("message", message),
+            ("title", title),
+            ("button1", button1),
+            ("button2", button2),
+            ("button3", button3),
+            ("mode4_str", mode4_str),
+        ] {
+            let StringRef::Index(index) = value else {
+                return false;
+            };
+            if *index != 0 || matches!(name, "message" | "title") {
+                fields.push(format!("{name}: {index}"));
+            }
+        }
+        if *flags != 0 {
+            fields.push(format!("flags: {flags}"));
+        }
+        if !self.extra() {
+            return false;
+        }
+        self.flush_raw(out);
+        let start = out.lines.len();
+        out.line(format!("dialog({})?;", fields.join(", ")));
+        self.record(id, start, out);
+        if failure_first {
+            self.next_id += 1;
+            self.block(success, out);
+        } else {
+            self.block(success, out);
+            self.next_id += 1;
+        }
+        true
     }
 
     /// The rest of an `if` after its header line: the body, an `else if` (when the `else`
@@ -2526,6 +2848,27 @@ impl Translator<'_> {
                 return None;
             }
             format!("set_dynamic_sprite(index: {index}, value: {value});")
+        } else if self.cursor.is_none()
+            && let Some(index) = set(first, 8, 0)
+            && let Stmt::Assign { lhs, op, rhs, .. } = second
+        {
+            let index = self.rvalue(index)?;
+            let sprite = format!("stack_obj.sprite_flags[{index}]");
+            let op = assign_operator(op)?;
+            let (dest, source) = if is_operand(lhs, 27, 0) {
+                let source = self.rvalue(rhs)?;
+                // The source is read after temp[0] is set. The compiler would
+                // snapshot a temp[0] operand before setting it.
+                if is_operand(rhs, 8, 0) {
+                    return None;
+                }
+                (sprite, source)
+            } else if is_operand(rhs, 27, 0) {
+                (self.lvalue(lhs)?, sprite)
+            } else {
+                return None;
+            };
+            format!("{dest} {op} {source};")
         } else {
             return None;
         };
@@ -2627,14 +2970,18 @@ impl Translator<'_> {
         Some(used)
     }
 
-    /// `while !animate(...)` with the events left in `param[0]`.
-    fn animate_loop(&self, cond: &Condition) -> Option<String> {
+    /// `while !animate(...)` whose events can be exposed through a v2 handler.
+    fn animate_loop(&self, cond: &Condition, empty_body: bool) -> Option<String> {
         let Condition::Not(inner) = cond else {
             return None;
         };
         let Condition::Primitive { prim, .. } = inner.as_ref() else {
             return None;
         };
+        if !empty_body && matches!(prim, PrimitiveCall::Animate { flags, .. } if flags & 0x20 != 0)
+        {
+            return None;
+        }
         self.animate(prim)
     }
 
@@ -2644,31 +2991,31 @@ impl Translator<'_> {
             table,
             flags,
             events,
-            local_index: LocalRef::Index(0),
+            local_index: LocalRef::Index(local),
         } = prim
         else {
             return None;
         };
-        (flags & 0x20 == 0).then(|| {
-            format!("animate(clip: {clip_id}, table: {table}, flags: {flags}, events: {events})")
-        })
+        let flags_without_local = flags & !0x20;
+        let mut text = format!(
+            "animate(clip: {clip_id}, table: {table}, flags: {flags_without_local}, events: {events}"
+        );
+        if flags & 0x20 != 0 {
+            if u16::from(*local) >= self.animate_locals || !self.extra() {
+                return None;
+            }
+            text.push_str(&format!(", local: slot_{local}"));
+        } else if *local != 0 && !self.extra() {
+            return None;
+        }
+        text.push(')');
+        Some(text)
     }
 
     fn simple(&self, s: &Stmt) -> Option<String> {
         match s {
             Stmt::Assign { lhs, op, rhs, .. } => {
-                let op = match op {
-                    AssignOp::Set => "=",
-                    AssignOp::Add => "+=",
-                    AssignOp::Sub => "-=",
-                    AssignOp::Mul => "*=",
-                    AssignOp::Div => "/=",
-                    AssignOp::Mod => "%=",
-                    AssignOp::BitAnd => "&=",
-                    AssignOp::BitOr => "|=",
-                    AssignOp::BitXor => "^=",
-                    AssignOp::FlagSet | AssignOp::FlagClear | AssignOp::Sqrt => return None,
-                };
+                let op = assign_operator(op)?;
                 Some(format!("{} {op} {};", self.lvalue(lhs)?, self.rvalue(rhs)?))
             }
             Stmt::Return {
@@ -2684,10 +3031,18 @@ impl Translator<'_> {
             Stmt::Call {
                 target: CallTarget::Id(id),
                 args,
-                pass_temps: true,
+                pass_temps,
                 branches: None,
                 ..
-            } if args.is_empty() => Some(format!("{};", self.call(*id)?)),
+            } => {
+                let call = self.call(*id, args, *pass_temps)?;
+                if *pass_temps {
+                    Some(format!("{call};"))
+                } else {
+                    // A standalone AIR call exits false on failure.
+                    Some(format!("if !{call} {{ return false; }}"))
+                }
+            }
             Stmt::Primitive {
                 prim,
                 branches: None,
@@ -2697,22 +3052,41 @@ impl Translator<'_> {
         }
     }
 
-    fn call(&self, id: u16) -> Option<String> {
-        if PRIVATE_TREES.contains(&id) {
+    fn call(&self, id: u16, args: &[i16], pass_temps: bool) -> Option<String> {
+        let mut params = Vec::new();
+        let name = if PRIVATE_TREES.contains(&id) {
             let callee = self.model.tree(id)?;
             let standalone = callee.lifecycle.is_none() || self.plan.standalone.contains(&id);
             let callee_sim = self.plan.sim(callee);
             if callee.omitted.is_some() || !standalone || callee_sim != self.sim {
                 return None;
             }
-            Some(format!("{}()", callee.ident))
-        } else if id >= 8192 {
-            Some(format!("semi_globals::semi_global_{id}()"))
-        } else if id >= 256 {
-            Some(format!("globals::global_{id}()"))
+            if self.sim && !pass_temps {
+                params.push("sim".to_owned());
+            }
+            callee.ident.clone()
         } else {
-            None
+            let ident = self.model.extern_calls.get(&id)?;
+            let module = if id >= 8192 {
+                "semi_globals"
+            } else {
+                "globals"
+            };
+            format!("{module}::{ident}")
+        };
+        if pass_temps {
+            if self.model.literal_calls.contains_key(&id) {
+                return None;
+            }
+        } else {
+            let arity = *self.model.literal_calls.get(&id)?;
+            let args = args.get(..arity)?;
+            if !self.extra() {
+                return None;
+            }
+            params.extend(args.iter().map(i16::to_string));
         }
+        Some(format!("{name}({})", params.join(", ")))
     }
 
     fn cond(&self, c: &Condition) -> Option<String> {
@@ -2743,9 +3117,9 @@ impl Translator<'_> {
             Condition::Call {
                 target: CallTarget::Id(id),
                 args,
-                pass_temps: true,
+                pass_temps,
                 ..
-            } if args.is_empty() => self.call(*id),
+            } => self.call(*id, args, *pass_temps),
             Condition::Primitive { prim, .. } => self.prim_cond(prim),
             Condition::Not(inner) => {
                 let text = self.cond(inner)?;
@@ -2820,16 +3194,15 @@ impl Translator<'_> {
             }
             // `play_sound(sound)` targets the Sim in an object's own tree and the stack object
             // (`self`) in an interaction; `sim` names the other target there.
-            PrimitiveCall::PlaySound { sound_id, flags }
-                if self.model.sounds.contains_key(sound_id) =>
-            {
+            PrimitiveCall::PlaySound { sound_id, flags } => {
+                let sound = self.model.sounds.get(sound_id)?;
                 let target = match (self.sim, flags) {
                     (false, 0) | (true, 2) => "",
                     (true, 0) => ", sim",
                     _ => return None,
                 };
                 self.extra()
-                    .then(|| format!("play_sound(sound_{sound_id}{target})"))
+                    .then(|| format!("play_sound({}{target})", sound.ident))
             }
             PrimitiveCall::StopAllSounds { use_stack_object } => {
                 match (self.sim, use_stack_object) {
@@ -2843,11 +3216,11 @@ impl Translator<'_> {
                 if *target != mine {
                     return None;
                 }
-                if *flags == 0 {
-                    Some("destroy_self()".to_owned())
-                } else {
-                    Some(format!("destroy_self(flags: {flags})"))
-                }
+                Some(match flags {
+                    0 => "destroy_self()".to_owned(),
+                    1 if *target == 0 && self.extra() => "destroy_self(no_yield: true)".to_owned(),
+                    _ => format!("destroy_self(flags: {flags})"),
+                })
             }
             other => self.builtin(other),
         }
@@ -2891,6 +3264,11 @@ impl Translator<'_> {
             }
             PrimitiveCall::ActionString { table, index } => {
                 format!("action_label(table: {table}, index: {index})")
+            }
+            PrimitiveCall::Padded { call, .. }
+                if matches!(call.as_ref(), PrimitiveCall::ActionString { .. }) && self.extra() =>
+            {
+                return self.builtin(call);
             }
             PrimitiveCall::ShowString { table, index } => {
                 format!("show_string(table: {table}, index: {index})")
@@ -2964,15 +3342,9 @@ impl Translator<'_> {
                 let addr = o.index as u16;
                 let (table, entry) = (addr >> 7, addr & 0x7F);
                 if table < 64 {
-                    let name = self.model.bcon_names.get(&(4096 + table))?;
-                    let len = self
-                        .model
-                        .bcons
-                        .iter()
-                        .find(|b| b.id == 4096 + table)?
-                        .values
-                        .len();
-                    (usize::from(entry) < len).then(|| format!("{name}.e{entry}"))
+                    let bcon = self.model.bcons.iter().find(|b| b.id == 4096 + table)?;
+                    let (field, _) = bcon.entries.get(usize::from(entry))?;
+                    Some(format!("{}.{field}", bcon.label))
                 } else {
                     let name = self.model.extern_bcons.get(&addr)?;
                     Some(format!("library_consts.{name}"))
@@ -3032,9 +3404,25 @@ impl Translator<'_> {
             (18, true) => format!("sim.person[{i}]"),
             (9, _) if !(self.in_handler && i == 0) && self.extra() => format!("param[{i}]"),
             (19, _) => format!("{}.person[{i}]", self.person_binding()?),
+            (25, _) if (i as u16) < self.animate_locals && self.extra() => format!("slot_{i}"),
             _ => return None,
         })
     }
+}
+
+fn assign_operator(op: &AssignOp) -> Option<&'static str> {
+    Some(match op {
+        AssignOp::Set => "=",
+        AssignOp::Add => "+=",
+        AssignOp::Sub => "-=",
+        AssignOp::Mul => "*=",
+        AssignOp::Div => "/=",
+        AssignOp::Mod => "%=",
+        AssignOp::BitAnd => "&=",
+        AssignOp::BitOr => "|=",
+        AssignOp::BitXor => "^=",
+        AssignOp::FlagSet | AssignOp::FlagClear | AssignOp::Sqrt => return None,
+    })
 }
 
 #[cfg(test)]
