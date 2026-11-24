@@ -49,7 +49,8 @@ Checked over 689 pilot `.antics` files:
 
 - **`unused_const`:** a `const` named in a `raw { }` block counts as used, and the "raw does not resolve const" advice is gone.
   - A raw block's own `.air` `const K = ..;` declares that block's `K`, so a bare `K` in the block is not a use of a v2 `const K`.
-  - `const[K]` reads `K`. `const K.e = ..` declares no `K`, so another bare `K` in that block still counts.
+  - `const[K]` reads `K`, and `x.const` declares nothing.
+  - `const K.e = ..` declares the block's `K.e`: a `K.e` in that block is not the v2 `K`, but a bare `K` still is.
   - A field after `.` (`my.room`) is not a use of a v2 `const room`.
 - **`@slot(N) let`:** a pinned local (with or without an initializer) is neither `unused_decl` nor `uninitialized_local_read`, since a raw primitive or text reads it by number.
 
@@ -57,18 +58,33 @@ Checked over 689 pilot `.antics` files:
 
 Every idiom stays behind the decompiler's existing proof loop. A tree whose recompile is not proven `IDENTICAL`/`EQUIVALENT` drops the idiom, then lowers.
 
-The code check compares frames and code but not two header fields the game reads, so the lift now checks those itself:
+### Object-level checks the code check does not make
 
-- **The label:** Run Tree By Name finds a tree by it.
-- **The revision:** saved objects are matched against it.
+The code check compares a tree's frame and code. It does not compare four things the game reads, so the lift now checks them itself:
 
-A rebuilt tree whose label or revision differs is never proven (`header_gap`). Tree labels keep their exact spaces: `"Grill "` is no longer trimmed to `"Grill"`.
+- **The revision** (saved objects are matched against it). A mismatch leaves the tree unproven (`header_gap`), and `@frame` fixes it.
+- **The label** (Run Tree By Name finds a tree by it). A rebuilt tree labelled differently is reported inconclusive (`Model::object_gap`).
+  - Labels are written verbatim and escaped: quotes, backslashes, Windows-1252 letters and trailing or all-blank spaces are kept.
+  - A label the compiler cannot store (a control character, a character outside Windows-1252, more than 63 bytes) is cleaned and cut to fit. The lift goes on and that tree is reported inconclusive.
+- **The names a Run Tree By Name finds.**
+  - The lift now writes the `STR#` 303 table such a call reads its name from; before, it dropped the table.
+  - Each call naming an entry of this file's table is resolved in the original's and the rebuilt file's labels, the VM's way: exact name, then ignoring case, two matches an error. A different result leaves the caller inconclusive.
+  - A name from the global file's table is not known here, so any label change in the file leaves that caller inconclusive.
+- **The object's `init`/`main` entries.** A lifecycle tree the rebuilt object's entry does not run (a plain tree written for it gets a compiler-made block) is reported inconclusive.
 
-This also closes a gap on main: a lifecycle block was reported proven although the compiler names a block after its kind (`Main`), whatever the original label was.
+These gaps are settled: no other spelling of the tree closes them, so the tree is not lowered for them. A caller of an unproven tree stays unproven as before.
+
+They also close soundness gaps on main, which reported these trees proven:
+
+- every lifecycle block (named after its kind, `Main`/`Init`);
+- every plain-tree `init`/`main` (whose entry ran a generated stub);
+- every Run Tree By Name (whose rebuilt object had no names table).
+
+v2 has no way to label a lifecycle block, so a block labelled e.g. `main loop` cannot be proven. A label on blocks would be a compiler change (Track 8).
 
 1. **Lifecycle blocks keep their header.**
    - An `init`/`main`/... block the default header does not reproduce is written `@id(N) @frame(args, locals, format, revision[, kind]) main {`, instead of a plain tree plus a generated stub. A block whose default header is proven is still written bare.
-   - A block whose label the compiler would change (`Tick` written as `main` becomes `Main`) is written as a plain tree instead, since the plain-tree header keeps the label. That round lowers nothing else.
+   - A block whose label the compiler changes (`Tick` written as `main` becomes `Main`) stays a block and is reported inconclusive. A plain tree would keep the label, but the object's `main` entry would then run a compiler-made stub.
    - Order of adding `@frame`:
      - Formats other than 0x8002, nonzero kinds and nonzero revisions start framed.
      - Any other block gets `@frame` before anything else is tried, when it fails to compile (for example `param[0]` outside a zero-argument frame) or is not proven.
@@ -103,13 +119,24 @@ Not lifted: the rare raw `sleep` statements.
 
 | | main (b3758a7c) | this change |
 |---|---|---|
-| proven (identical + equivalent) | 2699 (367 + 2332) | 2699 (367 + 2332) |
-| inconclusive / omitted / DIFFERENT | 22 / 1 / **0** | 22 / 1 / **0** |
+| proven (identical + equivalent) | 2699 (367 + 2332)* | 2385 (342 + 2043) |
+| inconclusive / omitted / DIFFERENT | 22 / 1 / **0** | 336 / 1 / **0** |
 | idiomatic trees | 870 | 891 |
-| raw statements inside idiomatic trees | 1119 | 738 (−34%) |
+| raw statements inside idiomatic trees | 1119 | 768 (−31%) |
 | raw trees | 1851 | 1830 |
-| init/main written as plain trees | 101 (format/kind) | 103 (label/empty; main reported renamed blocks proven) |
+| init/main written as plain trees | 101 | 0 |
 | lint warnings on the lifted files | 29 | 17 (`magic_guid_literal` 11 → 0) |
+
+\* Main's count is not sound. It does not check labels, entries or tree names (see *Object-level checks*).
+
+The 336 inconclusive trees, by the first reason reported:
+
+- 103 lifecycle trees whose label a block cannot keep;
+- 47 Run Tree By Name callers whose name may resolve differently (mostly global-table names, not known here);
+- 182 trees that call an unproven tree;
+- 4 trees that read a `STR#` table the lift does not reproduce.
+
+Writing `STR#` 303 recovered 187 by-name trees and callers that the checks alone would also have left unproven.
 
 - **Open Starter Pack:** 116/116 trees proven, 0 DIFFERENT. The lifted files lint clean and pass `fmt --check`, and are byte-identical to main's lift.
 - **`fmt --check open-pack`:** clean. `lint open-pack` reports the same 2 `unused_decl` warnings as on main (`state reserved` in two objects). Those files are outside this track.
@@ -123,5 +150,6 @@ Not lifted: the rare raw `sleep` statements.
   - the path cap.
 - A single-value ladder needs its binding in the arm's last statement (see Decision 3.5).
 - A block call stays `raw` (see Decision 3.1).
-- Most base-game lifecycle trees carry labels other than the compiler's block names, so they stay plain trees. A v2 way to label a block would belong to the compiler track.
+- 101 base-game lifecycle trees carry labels other than the compiler's block names (`main loop`, ...). They and their by-name callers stay inconclusive until v2 can label a block (Track 8 follow-up, e.g. `main "main loop" { }`).
+- Run Tree By Name from the global file's names table is checked conservatively. Resolving it would need the global file's `STR#` 303 in the lift options.
 - `@slot(N) let x: T;` is exempt from `uninitialized_local_read` as a whole. A pinned slot exists so raw code or text can use it by number, and lint does not model raw writes by slot number.

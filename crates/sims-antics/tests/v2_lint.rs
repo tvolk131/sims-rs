@@ -997,6 +997,20 @@ fn a_const_named_in_raw_is_used() {
             "unused_decl",
         );
     }
+    // `K.e` after the block's own `const K.e` is not the v2 `K`; a `.const` field declares
+    // nothing.
+    one(
+        &obj(
+            "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { const LEVEL_SLOT.e = 2; temp[0] := LEVEL_SLOT.e; }\n    }",
+        ),
+        "unused_decl",
+    );
+    none(
+        &obj(
+            "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { const Tune.const = LEVEL_SLOT; temp[0] := Tune.const; }\n    }",
+        ),
+        "unused_decl",
+    );
     // A field after `.` is not the constant.
     one(
         &obj(

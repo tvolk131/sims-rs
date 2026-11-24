@@ -45,6 +45,9 @@ const MAX_STATE_SLOT: i16 = 255;
 /// OBJD words holding the main and init tree IDs (after the 32-bit version).
 const OBJD_MAIN_WORD: usize = 3;
 const OBJD_INIT_WORD: usize = 41;
+/// The Run Tree By Name primitive, and the string table its names are in.
+const RUN_TREE_BY_NAME: u16 = 28;
+const TREE_NAMES_TABLE: u16 = 303;
 /// OBJD word (after the version) holding how many attributes an instance gets.
 const OBJD_ATTRIBUTES_WORD: usize = 56;
 
@@ -228,24 +231,20 @@ pub fn decompile_iff_to_v2_report(
                 let mut checks = BTreeMap::new();
                 let mut unproven = Vec::new();
                 for t in model.trees.iter().filter(|t| t.omitted.is_none()) {
-                    let check = model.check_tree(t, &recompiled, &mut cache);
+                    let mut check = model.check_tree(t, &recompiled, &mut cache);
                     if !matches!(check, TreeCheck::Identical | TreeCheck::Equivalent) {
                         unproven.push(t.id);
+                    } else if let Some(gap) = model.object_gap(t, &recompiled) {
+                        // Settled: no other spelling of the tree closes it.
+                        check = TreeCheck::Inconclusive(gap);
                     }
                     checks.insert(t.id, check);
                 }
                 // A block given its header may be all its callers were missing (a caller is
                 // proven only with its callees), so such a round lowers nothing else.
-                // A block the compiler renames is written as a plain tree, which keeps the
-                // label; that round too lowers nothing else.
                 let mut changed = false;
                 for &id in &unproven {
-                    if model.renames_block(&plan, &recompiled, id) {
-                        plan.standalone.insert(id);
-                        changed = true;
-                    } else {
-                        changed |= plan.add_frame(&model, id);
-                    }
+                    changed |= plan.add_frame(&model, id);
                 }
                 if !changed {
                     for &id in &unproven {
@@ -401,6 +400,10 @@ struct Model {
     original_resources: BTreeMap<([u8; 4], u16), Vec<u8>>,
     /// The original's string tables, as the VM reads their text.
     original_strings: BTreeMap<([u8; 4], u16), StringTexts>,
+    /// Every tree's label in the original, as Run Tree By Name reads it.
+    original_names: BTreeMap<u16, Vec<u8>>,
+    /// The original's `init` and `main` entries.
+    original_entries: [Option<u16>; 2],
     library_arities: BTreeMap<u16, usize>,
 }
 
@@ -812,6 +815,8 @@ impl Model {
             original_sounds,
             original_resources: resource_chunks(iff),
             original_strings: string_texts(iff),
+            original_names: tree_names(iff),
+            original_entries: lifecycle_entries(iff),
             library_arities: options.library_arities.clone(),
         })
     }
@@ -858,6 +863,8 @@ impl Model {
             sounds: fwav_sounds(&iff),
             resources: resource_chunks(&iff),
             strings: string_texts(&iff),
+            names: tree_names(&iff),
+            entries: lifecycle_entries(&iff),
             attributes: objd_attributes(&iff),
         })
     }
@@ -921,17 +928,80 @@ impl Model {
         check
     }
 
-    /// Whether lifecycle block `id` must be written as a plain tree to keep its label:
-    /// the compiler names a block after its kind.
-    fn renames_block(&self, plan: &Plan, recompiled: &RecompiledFile, id: u16) -> bool {
-        self.tree(id).is_some_and(|t| {
-            t.lifecycle.is_some()
-                && !plan.standalone.contains(&id)
-                && recompiled
-                    .trees
-                    .get(&id)
-                    .is_some_and(|b| b.label != t.original.label)
+    /// Why tree `t`, proven by its code, still may not behave the same in the rebuilt
+    /// object, where no other spelling of it helps:
+    /// - it is labelled differently (a lifecycle block is named after its kind), which
+    ///   Run Tree By Name may see;
+    /// - it runs a tree by name, and the rebuilt file's tree labels differ;
+    /// - it is the object's `init`/`main`, and the rebuilt object's entry runs another
+    ///   tree (a plain tree written for it gets a compiler-made block).
+    fn object_gap(&self, t: &TreeModel, recompiled: &RecompiledFile) -> Option<String> {
+        let b = recompiled.trees.get(&t.id)?;
+        if b.label != t.original.label {
+            return Some(format!(
+                "the rebuilt tree is labelled {:?}, not {:?}, which Run Tree By Name may see",
+                b.label, t.original.label
+            ));
+        }
+        if recompiled.names != self.original_names
+            && t.original
+                .instructions
+                .iter()
+                .filter(|i| i.opcode == RUN_TREE_BY_NAME)
+                .any(|i| !self.same_named_tree(&i.operands, recompiled))
+        {
+            return Some(
+                "runs a tree by name that the rebuilt object's tree labels may resolve differently"
+                    .to_owned(),
+            );
+        }
+        let entry = |entries: [Option<u16>; 2], kind: Lifecycle| match kind {
+            Lifecycle::Init => entries[0],
+            Lifecycle::Main => entries[1],
+        };
+        let kind = t.lifecycle?;
+        let rebuilt = entry(recompiled.entries, kind);
+        (rebuilt != entry(self.original_entries, kind)).then(|| {
+            format!(
+                "the rebuilt object's {} entry runs tree {}, not this one",
+                kind.keyword(),
+                rebuilt.unwrap_or(0)
+            )
         })
+    }
+
+    /// Whether a Run Tree By Name with `operands` finds the same tree of this object in
+    /// the rebuilt file, when the stack object is this object (another object's file is
+    /// the same file either way). The name is this file's `STR#` 303 entry; one from the
+    /// global file's table is not known here.
+    fn same_named_tree(&self, operands: &[u8; 8], recompiled: &RecompiledFile) -> bool {
+        let table = u16::from_le_bytes([operands[0], operands[1]]);
+        if table != TREE_NAMES_TABLE || operands[2] & 1 != 0 {
+            return false;
+        }
+        let key = (*b"STR#", TREE_NAMES_TABLE);
+        let name = |strings: &BTreeMap<([u8; 4], u16), StringTexts>| match strings.get(&key) {
+            None => Some(None),
+            Some(Ok(texts)) => Some(
+                usize::from(operands[4])
+                    .checked_sub(1)
+                    .and_then(|i| texts.get(i))
+                    .filter(|n| !n.is_empty())
+                    .cloned(),
+            ),
+            Some(Err(_)) => None,
+        };
+        let (Some(before), Some(after)) = (name(&self.original_strings), name(&recompiled.strings))
+        else {
+            return false;
+        };
+        match (before, after) {
+            (None, None) => true,
+            (Some(a), Some(b)) if a == b => {
+                find_named_tree(&self.original_names, &a) == find_named_tree(&recompiled.names, &a)
+            }
+            _ => false,
+        }
     }
 
     /// Whether `tree` sees the same constants, attribute count and callee shapes in the
@@ -1157,6 +1227,53 @@ impl Model {
     }
 }
 
+/// Every BHAV's label bytes, as Run Tree By Name compares them (the last chunk of an ID
+/// wins).
+fn tree_names(iff: &Iff) -> BTreeMap<u16, Vec<u8>> {
+    iff.all(b"BHAV")
+        .map(|c| (c.id, iff.label_bytes(c).to_vec()))
+        .collect()
+}
+
+/// The tree Run Tree By Name finds for `name` among one file's trees: by the exact
+/// name, else ignoring ASCII case; `Err` when two trees have it (the VM's
+/// `Program::named_tree`, one file).
+fn find_named_tree(
+    names: &BTreeMap<u16, Vec<u8>>,
+    name: &[u8],
+) -> std::result::Result<Option<u16>, ()> {
+    for exact in [true, false] {
+        let mut found = names.iter().filter(|(_, label)| {
+            if exact {
+                label.as_slice() == name
+            } else {
+                label.eq_ignore_ascii_case(name)
+            }
+        });
+        if let Some((&id, _)) = found.next() {
+            return if found.next().is_some() {
+                Err(())
+            } else {
+                Ok(Some(id))
+            };
+        }
+    }
+    Ok(None)
+}
+
+/// The first OBJD's `init` and `main` entries.
+fn lifecycle_entries(iff: &Iff) -> [Option<u16>; 2] {
+    let Some(objd) = iff.chunks.iter().find(|c| &c.tag == b"OBJD") else {
+        return [None, None];
+    };
+    let data = iff.data(objd);
+    let word = |w: usize| {
+        data.get(4 + w * 2..6 + w * 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    };
+    [word(OBJD_INIT_WORD), word(OBJD_MAIN_WORD)]
+}
+
 /// The first OBJD's attribute count.
 fn objd_attributes(iff: &Iff) -> Option<u16> {
     let objd = iff.chunks.iter().find(|c| &c.tag == b"OBJD")?;
@@ -1203,6 +1320,8 @@ struct RecompiledFile {
     resources: BTreeMap<([u8; 4], u16), Vec<u8>>,
     strings: BTreeMap<([u8; 4], u16), StringTexts>,
     attributes: Option<u16>,
+    names: BTreeMap<u16, Vec<u8>>,
+    entries: [Option<u16>; 2],
 }
 
 /// A string table as the VM reads it: its US English texts in order when the VM's
@@ -1219,6 +1338,11 @@ type StringTexts = std::result::Result<Vec<Vec<u8>>, Vec<(u16, Vec<u8>)>>;
 fn string_table_read(i: &sims_formats::behavior::Instruction) -> Option<u16> {
     match i.opcode {
         21 | 50 => Some(u16::from_le_bytes([i.operands[0], i.operands[1]])),
+        // Run Tree By Name reads its name from this file's table unless byte 2 bit 0
+        // picks the global file's.
+        RUN_TREE_BY_NAME if i.operands[2] & 1 == 0 => {
+            Some(u16::from_le_bytes([i.operands[0], i.operands[1]]))
+        }
         36 if i.operands[5] & 0x7f <= 4
             && [0, 1, 2, 3, 4, 6].iter().any(|&k| i.operands[k] != 0) =>
         {
@@ -1704,24 +1828,24 @@ fn trcn_labels(data: &[u8], limit: usize) -> Option<Vec<String>> {
     Some(labels)
 }
 
-/// A tree's label as a v2 string body: [`clean_label`] without trimming, since Run Tree
-/// By Name compares the whole label (one the string cannot spell is left unproven).
+/// A tree's label as written (escaped by [`v2_string_literal`]): the whole label, since
+/// Run Tree By Name compares all of it. One the compiler cannot store (a control
+/// character, a character outside Windows-1252, more than 63 bytes) is cleaned and cut to
+/// fit, and the tree is left unproven by its label.
 fn tree_label(label: &str) -> String {
-    let cleaned = clean_label_untrimmed(label);
-    if cleaned.trim().is_empty() {
-        String::new()
-    } else {
-        cleaned
+    let fits = !label.chars().any(char::is_control)
+        && sims_formats::far::encode_name(label).is_some_and(|b| b.len() <= 63);
+    if fits {
+        return label.to_owned();
     }
+    let mut cleaned = clean_label(label);
+    cleaned.truncate(63);
+    cleaned
 }
 
 /// A chunk label as a v2 string body: printable ASCII only, quotes and backslashes dropped.
 fn clean_label(label: &str) -> String {
-    clean_label_untrimmed(label).trim().to_owned()
-}
-
-fn clean_label_untrimmed(label: &str) -> String {
-    label
+    let cleaned: String = label
         .chars()
         .map(|c| {
             if c.is_ascii_graphic() || c == ' ' {
@@ -1731,7 +1855,8 @@ fn clean_label_untrimmed(label: &str) -> String {
             }
         })
         .filter(|&c| c != '"' && c != '\\')
-        .collect()
+        .collect();
+    cleaned.trim().to_owned()
 }
 
 /// The `extern bcon library_consts` entry name for a non-private constant address.
@@ -2624,7 +2749,8 @@ impl Model {
             if let Some(why) = &t.omitted {
                 out.line(format!(
                     "// tree {} \"{}\" is not written: {why}.",
-                    t.id, t.label
+                    t.id,
+                    clean_label(&t.label)
                 ));
                 out.line("");
                 continue;
@@ -2692,7 +2818,13 @@ impl Model {
                     };
                     out.line(format!(
                         "@id({}) @frame(args: {}, locals: {}, format: {:#06x}, revision: {}{kind}){context} tree {} \"{}\"{ctx} {{",
-                        t.id, b.args, b.locals, b.format, b.revision, t.ident, t.label
+                        t.id,
+                        b.args,
+                        b.locals,
+                        b.format,
+                        b.revision,
+                        t.ident,
+                        v2_string_literal(&t.label)
                     ));
                 }
             }
@@ -4621,16 +4753,10 @@ fn assign_operator(op: &AssignOp) -> Option<&'static str> {
     })
 }
 
-/// The parts of a tree's header the code checker does not compare but the game reads: the
-/// label (Run Tree By Name finds a tree by it) and the revision (saved objects are matched
-/// against it).
+/// The part of a tree's header the code checker does not compare but the game reads and
+/// `@frame` writes: the revision (saved objects are matched against it). The label is
+/// [`Model::object_gap`]'s.
 fn header_gap(original: &BhavChunk, rebuilt: &BhavChunk) -> Option<String> {
-    if original.label != rebuilt.label {
-        return Some(format!(
-            "the rebuilt tree is labelled {:?}, not {:?}, which Run Tree By Name may see",
-            rebuilt.label, original.label
-        ));
-    }
     (original.revision != rebuilt.revision).then(|| {
         format!(
             "the rebuilt tree has revision {}, not {}",

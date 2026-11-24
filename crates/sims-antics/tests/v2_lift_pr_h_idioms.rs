@@ -222,9 +222,28 @@ fn argless_calls_between_sim_trees_name_the_sim() {
     assert!(!lifted.contains("raw"), "{lifted}");
 }
 
+/// `iff`'s lift report, every tree checked.
+fn report(iff: &Iff) -> sims_antics::v2::DecompileV2Report {
+    let report = decompile_iff_to_v2_report(iff, &DecompileV2Options::default()).expect("lift");
+    assert!(report.compiled);
+    compile(&report.source);
+    report
+}
+
+fn check_of(report: &sims_antics::v2::DecompileV2Report, id: u16) -> &TreeCheck {
+    &report
+        .trees
+        .iter()
+        .find(|t| t.id == id)
+        .expect("tree")
+        .check
+}
+
 #[test]
-fn a_lifecycle_tree_the_compiler_would_rename_is_written_plain() {
-    // Run Tree By Name finds a tree by its label: a block would be relabelled `Main`.
+fn a_lifecycle_tree_the_compiler_would_rename_is_not_proven() {
+    // Run Tree By Name finds a tree by its label, and v2 names a block after its kind;
+    // written as a plain tree instead, the object's `main` entry would run a compiler-made
+    // tree. The block keeps the entry and is left unproven.
     let iff = relabel(
         &compile(
             r#"object "Fable Clock" {
@@ -236,11 +255,45 @@ fn a_lifecycle_tree_the_compiler_would_rename_is_written_plain() {
         4200,
         "Tick",
     );
-    let (lifted, trees) = lift_iff(&iff);
-    has(&lifted, &["\"Tick\" {", "@id(4201) init {"]);
+    let report = report(&iff);
     assert!(
-        trees.iter().any(|t| t.id == 4200 && t.standalone_lifecycle),
-        "{trees:?}"
+        report.source.contains("@id(4200) main {"),
+        "{}",
+        report.source
+    );
+    assert!(
+        matches!(check_of(&report, 4200), TreeCheck::Inconclusive(why) if why.contains("labelled")),
+        "{:?}",
+        report.trees
+    );
+    assert!(
+        matches!(check_of(&report, 4201), TreeCheck::Identical),
+        "{:?}",
+        report.trees
+    );
+}
+
+#[test]
+fn labels_keep_quotes_spaces_and_western_letters() {
+    let source = r#"object "Fable Clock" {
+    guid: 0x7E00_012D;
+    @id(4300) @frame(locals: 0) tree a "A" { temp[0] = 1; }
+}"#;
+    for label in ["Caf\u{e9} \"Test\"", "Grill ", "   "] {
+        let (lifted, _) = lift_iff(&relabel(&compile(source), 4300, label));
+        let written = label.replace('"', "\\\"");
+        assert!(
+            lifted.contains(&format!("\"{written}\" {{")),
+            "{label:?}:\n{lifted}"
+        );
+    }
+    // A label the compiler cannot store (64 bytes) is cut to fit; the lift goes on.
+    let long = format!("T{}", " ".repeat(62)) + "X";
+    let report = report(&relabel(&compile(source), 4300, &long));
+    assert!(
+        matches!(check_of(&report, 4300), TreeCheck::Inconclusive(why) if why.contains("labelled")),
+        "{:?}",
+        report.trees
     );
 }
 
@@ -320,4 +373,39 @@ fn a_beside_step_names_its_local() {
         ],
     );
     assert!(!lifted.contains("raw {"), "{lifted}");
+}
+
+#[test]
+fn a_tree_run_by_name_keeps_its_name_table() {
+    // Run Tree By Name reads the name from this file's `STR#` 303: the lift writes the
+    // table, and a renamed tree the name finds leaves the caller unproven.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_012E;
+    strings 303 "Tree names" {
+        pump = "Pump",
+    }
+    @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 1; }
+    @id(4301) @frame(locals: 0) tree caller "Caller" {
+        raw { run_tree_by_name(table: 303, index: 1, mode: 0); }
+    }
+}"#;
+    let (lifted, _) = lift(source);
+    has(&lifted, &["strings 303", "= \"Pump\","]);
+    // `main` labelled `Tick` is rebuilt as `Main`: a name `Tick` no longer finds it.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_012F;
+    strings 303 "Tree names" {
+        tick = "Tick",
+    }
+    @id(4200) main { temp[0] = 1; }
+    @id(4301) @frame(locals: 0) tree caller "Caller" {
+        raw { run_tree_by_name(table: 303, index: 1, mode: 0); }
+    }
+}"#;
+    let report = report(&relabel(&compile(source), 4200, "Tick"));
+    assert!(
+        matches!(check_of(&report, 4301), TreeCheck::Inconclusive(why) if why.contains("by name")),
+        "{:?}",
+        report.trees
+    );
 }

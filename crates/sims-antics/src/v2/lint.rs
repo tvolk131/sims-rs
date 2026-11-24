@@ -1510,8 +1510,9 @@ fn air_code_only(code: &str) -> String {
 /// The identifier-like words of `.air` text.
 /// The names `.air` code may read a v2 constant by: every word except a field (after
 /// `.`) and the block's own constant declarations. `const K = ..;` declares the block's
-/// own `K`, which every bare `K` in the block then means; `const K.e = ..` and
-/// `const[K]` declare nothing of that name.
+/// own `K`, which every bare `K` in the block then means; `const K.e = ..` declares the
+/// block's `K.e` (so `K.e` there is not the v2 `K`, but a bare `K` is); `const[K]` and
+/// `x.const` declare nothing.
 fn air_name_uses(code: &str) -> Vec<&str> {
     let bytes = code.as_bytes();
     let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
@@ -1529,16 +1530,31 @@ fn air_name_uses(code: &str) -> Vec<&str> {
             i += 1;
         }
     }
+    // The member after `K.`, if any.
+    let member = |at: usize, name: &str| {
+        let rest = code[at + name.len()..]
+            .trim_start()
+            .strip_prefix('.')?
+            .trim_start();
+        let end = rest.bytes().position(|c| !is_word(c)).unwrap_or(rest.len());
+        (end > 0).then(|| &rest[..end])
+    };
     let mut own = BTreeSet::new();
+    let mut own_members = BTreeSet::new();
     let mut declaring = BTreeSet::new();
     for pair in words.windows(2) {
-        let [(_, keyword), (name_at, name)] = pair else {
+        let [(keyword_at, keyword), (name_at, name)] = pair else {
             continue;
         };
-        if *keyword != "const" || prev(*name_at) == Some(b'[') {
+        // `x.const` is a field, and `const[K]` reads `K`.
+        if *keyword != "const" || prev(*keyword_at) == Some(b'.') || prev(*name_at) == Some(b'[') {
             continue;
         }
         declaring.insert(*name_at);
+        if let Some(m) = member(*name_at, name) {
+            own_members.insert((*name, m));
+            continue;
+        }
         let rest = code[name_at + name.len()..].trim_start();
         if rest.starts_with('=') && !rest.starts_with("==") {
             own.insert(*name);
@@ -1546,7 +1562,12 @@ fn air_name_uses(code: &str) -> Vec<&str> {
     }
     words
         .into_iter()
-        .filter(|(at, w)| prev(*at) != Some(b'.') && !declaring.contains(at) && !own.contains(w))
+        .filter(|(at, w)| {
+            prev(*at) != Some(b'.')
+                && !declaring.contains(at)
+                && !own.contains(w)
+                && !member(*at, w).is_some_and(|m| own_members.contains(&(*w, m)))
+        })
         .map(|(_, w)| w)
         .collect()
 }
