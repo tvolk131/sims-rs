@@ -11926,8 +11926,9 @@ impl<'a> TreeLowerer<'a> {
                 rhs,
                 ..
             } => {
-                if let Some(neg_lhs) = self.try_lower_negated_simple_air_cond(lhs)? {
-                    self.line(format!("if {neg_lhs} {{"));
+                // `!` swaps the test's exits, so the false exit still ends on `lhs`'s own result.
+                if let Some(pos_lhs) = self.try_lower_simple_air_cond(lhs)? {
+                    self.line(format!("if {} {{", swap_exits(&pos_lhs)));
                     self.indent += 1;
                     self.line("return false;".to_owned());
                     self.indent -= 1;
@@ -11984,13 +11985,15 @@ impl<'a> TreeLowerer<'a> {
                     self.line("return false;".to_owned());
                     return Ok(());
                 }
-                if let Some(neg) = self.try_lower_negated_simple_air_cond(expr)? {
-                    self.line(format!("if {neg} {{"));
+                // `return a == b;` tests `a == b` itself and returns on its exits, so the last
+                // result at each return is the test's own (a flipped `a != b` would invert it).
+                if let Some(pos) = self.try_lower_simple_air_cond(expr)? {
+                    self.line(format!("if {pos} {{"));
                     self.indent += 1;
-                    self.line("return false;".to_owned());
+                    self.line("return true;".to_owned());
                     self.indent -= 1;
                     self.line("}".to_owned());
-                    self.line("return true;".to_owned());
+                    self.line("return false;".to_owned());
                     Ok(())
                 } else {
                     let tmp = self.fresh("ret");
@@ -12829,6 +12832,15 @@ fn single_bit_of_mask(mask: i16) -> Option<u8> {
         Some((bits.trailing_zeros() as u8) + 1)
     } else {
         None
+    }
+}
+
+/// An `.air` simple condition with its exits swapped: the same test node (and so the same
+/// last result), taking the other branch. `.air` `!c` swaps a node's exits.
+fn swap_exits(cond: &str) -> String {
+    match cond.strip_prefix('!') {
+        Some(inner) => inner.to_owned(),
+        None => format!("!{cond}"),
     }
 }
 

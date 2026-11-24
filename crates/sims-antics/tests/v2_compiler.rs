@@ -3999,7 +3999,8 @@ object "Declarative Lock Probe" {
         .find(|s| s.contains("Can_LockRedundantGuard"))
         .expect("Can_LockRedundantGuard tree");
     assert_eq!(
-        redundant_tree.matches("stack.attr[0] != 0").count(),
+        redundant_tree.matches("stack.attr[0] == 0").count()
+            + redundant_tree.matches("stack.attr[0] != 0").count(),
         1,
         "redundant leading !self.occupied must be deduplicated:\n{redundant_tree}"
     );
