@@ -2440,6 +2440,10 @@ enum PrimArg {
     Local,
     /// `self` / `stack_obj` (or `0` / `1`).
     RefreshTarget,
+    /// Relationship's `value:`. With flag 4 the VM reads it, so any `i16` value (a constant, a
+    /// local, a parameter, a cell); otherwise the VM writes the number into it, so a writable
+    /// direct `i16` cell (a local, `temp[i]`, an attribute, a `&mut` parameter's cell).
+    RelValue,
 }
 
 /// A v2 builtin that lowers one-to-one onto a named-argument `.air` primitive.
@@ -2570,8 +2574,8 @@ const PRIM_BUILTINS: &[PrimBuiltin] = &[
             ("local", "local", PrimArg::Local),
         ],
     },
-    // Relationship (opcode 26): `value:` is the local the number is read into or written from
-    // (flag 4 writes); `local:` holds the other person for directions 2 and 3.
+    // Relationship (opcode 26): `value:` is the cell the number is read into, or (flag 4) the
+    // value written; `local:` holds the other person for directions 2 and 3.
     PrimBuiltin {
         v2: "relationship",
         air: "relationship",
@@ -2580,7 +2584,7 @@ const PRIM_BUILTINS: &[PrimBuiltin] = &[
             ("dir", "dir", U8),
             ("flags", "flags", U8),
             ("local", "local", PrimArg::Local),
-            ("value", "value", PrimArg::Local),
+            ("value", "value", PrimArg::RelValue),
         ],
     },
     // Old Relationship (opcode 24): the number goes through parameter `param`.
@@ -7623,6 +7627,53 @@ impl<'a> TreeLowerer<'a> {
             })
     }
 
+    /// Relationship's `value:` operand: a value the VM reads (`writes`), or the direct `i16`
+    /// cell it stores the number into. A value that needs lowering lines is computed into a
+    /// temporary before the primitive.
+    fn relationship_value_arg(&mut self, expr: &V2Expr, writes: bool) -> Result<String> {
+        if writes {
+            let (air, ty) = self.lower_value_expr(expr)?;
+            if ty != ValueType::I16 {
+                return Err(Error::at(
+                    expr.span(),
+                    format!(
+                        "relationship(value:) must be an i16, found '{}'",
+                        self.env.display_value_type(&ty)
+                    ),
+                ));
+            }
+            return Ok(air);
+        }
+        self.reject_read_only_sim_slot(expr)?;
+        let lval = match self.resolve_lvalue(expr) {
+            Ok(l) => l,
+            Err(_) if self.eval_const_i16(expr).is_ok() => {
+                return Err(Error::at(
+                    expr.span(),
+                    "relationship(value:) without flag 4 stores the number into a cell, so a constant is not allowed (flag 4 writes the value instead)",
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+        match lval {
+            LValue::Direct {
+                air,
+                ty: ValueType::I16,
+            } => Ok(air),
+            LValue::Direct { ty, .. } => Err(Error::at(
+                expr.span(),
+                format!(
+                    "relationship(value:) must be an i16 cell, found '{}'",
+                    self.env.display_value_type(&ty)
+                ),
+            )),
+            _ => Err(Error::at(
+                expr.span(),
+                "relationship(value:) must be a local, temp, attribute, or other direct i16 cell of this object or the stack object",
+            )),
+        }
+    }
+
     fn builtin_local_arg(&self, expr: &V2Expr, what: &str) -> Result<String> {
         self.builtin_local_arg_typed(expr, what, true)
     }
@@ -8189,6 +8240,13 @@ impl<'a> TreeLowerer<'a> {
                     self.push_icon_local(&a.value, named.get("object").copied(), pinned_object)?
                 }
                 PrimArg::Local => self.builtin_local_arg(&a.value, &format!("{fname}({key}:)"))?,
+                PrimArg::RelValue => {
+                    let flags = match named.get("flags") {
+                        Some(f) => self.eval_builtin_int(&f.value, "relationship flags", 0, 255)?,
+                        None => 0,
+                    };
+                    self.relationship_value_arg(&a.value, flags & 4 != 0)?
+                }
                 // `refresh` names the running frame's object (`me`) or its stack object. In a
                 // Sim-on-object tree `me` is the Sim and the object is the stack object.
                 PrimArg::RefreshTarget => match (&a.value, &self.tree_ctx) {
@@ -13714,8 +13772,13 @@ fn replace_outside_strings(text: &str, pat: &str, with: &str) -> String {
 }
 
 /// The builtins whose arguments can name a local they write (see [`builtin_args_write_ident`]).
-const LOCAL_WRITING_BUILTINS: &[&str] =
-    &["random_into", "animate", "set_headline", "push_interaction"];
+const LOCAL_WRITING_BUILTINS: &[&str] = &[
+    "random_into",
+    "animate",
+    "set_headline",
+    "push_interaction",
+    "relationship",
+];
 
 fn stmts_mutate_or_borrow_ident(stmts: &[V2Stmt], target_name: &str) -> bool {
     stmts_mutate_or_borrow_ident_in(stmts, target_name, LOCAL_WRITING_BUILTINS)
@@ -13834,6 +13897,10 @@ fn builtin_args_write_ident(
         "animate" | "set_headline" | "push_interaction" => args
             .iter()
             .any(|a| matches!(a.name.as_deref(), Some("local" | "icon")) && is_target(&a.value)),
+        // Without flag 4 the VM stores the number into `value:`.
+        "relationship" => args
+            .iter()
+            .any(|a| a.name.as_deref() == Some("value") && is_target(&a.value)),
         _ => false,
     }
 }
@@ -14427,7 +14494,12 @@ fn expr_may_clobber_stack_obj(
                         depth,
                     );
                 }
-                if matches!(field.as_str(), "attr" | "data") && rname != "self" {
+                // A Sim tree's own Sim (`sim.attr[i]`, `sim.data[i]`) is `my.`, not a foreign
+                // object reached through `stack_obj`.
+                if matches!(field.as_str(), "attr" | "data")
+                    && rname != "self"
+                    && Some(rname.as_str()) != sim_name
+                {
                     return true;
                 }
             }

@@ -625,18 +625,19 @@ fn dialog_tree(text: &str, body: &str) -> String {
 #[test]
 fn a_local_read_only_by_a_string_token_is_used() {
     let body = "        let first = random(5);\n        self.level = first;\n        let shown = random(7);";
-    // Lowered: the `random` temporary is slot 0 (`first` folds into it), `shown` slot 1.
-    let source = dialog_tree("you got $Local:1", body);
+    // Lowered: the `random` temporary is slot 0, `first` slot 1 and `shown` slot 2 (a tree that
+    // formats text keeps every `let` in its own slot).
+    let source = dialog_tree("you got $Local:2", body);
     none(&source, "unused_decl");
     none(&source, "dialog_local_slot_mismatch");
-    let source = dialog_tree("you got $TimeLocal:1", body);
+    let source = dialog_tree("you got $TimeLocal:2", body);
     none(&source, "unused_decl");
     // A token reading another slot leaves `shown` unread, and says where it is.
     let source = dialog_tree("you got $Local:0", body);
     let d = one(&source, "unused_decl");
     assert!(d.message.contains("`shown`"), "{d:?}");
     assert!(
-        d.note.as_deref().unwrap().contains("`shown` is on slot 1"),
+        d.note.as_deref().unwrap().contains("`shown` is on slot 2"),
         "{d:?}"
     );
 }

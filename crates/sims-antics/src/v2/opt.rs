@@ -70,7 +70,7 @@ pub(crate) fn drop_unread_entry_save(body: &str) -> Option<String> {
     // `scope(25, N)` cell may name by number. (`.air` places named locals after every explicit
     // `local[N]`, so those keep their words.)
     if body.contains("/*")
-        || body.contains("->")
+        || has_positional_targets(body)
         || body.lines().any(|l| names_local_slot(&strip_strings(l)))
     {
         return None;
@@ -91,33 +91,41 @@ pub(crate) fn drop_unread_entry_save(body: &str) -> Option<String> {
         return None;
     }
     // Every named local after the save moves down one frame word, which keeps whatever an
-    // earlier frame left there: none may be read before it is written. A body the structured
-    // pass cannot parse (a raw block with several statements on a line) is checked by its
-    // lines: every local the lowering declares without a value (`let x;`) might be read first,
-    // while `let x = e;` writes it where it comes into scope. Each statement of a line counts.
-    // A raw block may also spell a declaration `local x;`, which neither check models: any such
-    // statement keeps the save.
-    let statements = || {
-        body.lines()
-            .flat_map(|l| {
-                strip_strings(l)
-                    .split([';', '{', '}'])
-                    .map(|stmt| stmt.trim().to_owned())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-    };
-    if statements().iter().any(|stmt| {
+    // earlier frame left there: none may be read before it is written. The flow analysis runs on
+    // the body with one statement per line, so raw blocks written on one line parse too. A body
+    // it still cannot parse (a raw node graph with labels) is checked statement by statement:
+    // a local the lowering declares without a value (`let x;`) must not be read anywhere, while
+    // `let x = e;` writes it where it comes into scope. A raw `local x;` declaration, which
+    // neither check models, keeps the save.
+    let split = one_statement_per_line(body);
+    let statements: Vec<&str> = split.lines().map(str::trim).collect();
+    if statements.iter().any(|stmt| {
         stmt.strip_prefix("local")
             .is_some_and(|r| r.starts_with(char::is_whitespace))
     }) {
         return None;
     }
-    let defined = match parse_body(body) {
+    let defined = match parse_body(&split) {
         Some(nodes) => locals_defined_before_reads(&nodes),
-        None => !statements()
-            .iter()
-            .any(|stmt| matches!(classify(stmt), Kind::Let { init: None, .. })),
+        None => statements.iter().all(|stmt| {
+            let Kind::Let { name, init: None } = classify(stmt) else {
+                return true;
+            };
+            statements.iter().all(|other| {
+                let other = other.strip_suffix(';').unwrap_or(other);
+                match classify(other) {
+                    Kind::Let { name: n, .. } if n == name => true,
+                    Kind::Assign { lhs, op: ":=", rhs } if lhs == name => {
+                        !idents(rhs).contains(&name)
+                    }
+                    _ => {
+                        let other = other.trim_start_matches(['!', ' ']);
+                        let rest = out_operand_write(other, name).map(|(rest, _)| rest);
+                        !idents(rest.as_deref().unwrap_or(other)).contains(&name)
+                    }
+                }
+            })
+        }),
     };
     if !defined {
         return None;
@@ -130,6 +138,88 @@ pub(crate) fn drop_unread_entry_save(body: &str) -> Option<String> {
         }
     }
     Some(out)
+}
+
+/// Whether a node graph names a branch target by position (`-> true: 3`, `raw(1)`), which
+/// deleting a node would shift. Labels and `true` / `false` / `error` do not move.
+fn has_positional_targets(body: &str) -> bool {
+    body.lines().any(|l| {
+        let stripped = strip_strings(l);
+        let Some((_, targets)) = stripped.split_once("->") else {
+            return false;
+        };
+        targets.split([',', ';']).any(|t| {
+            let target = t.split_once(':').map_or(t, |(_, v)| v).trim();
+            target.starts_with("raw") || target.starts_with(|c: char| c.is_ascii_digit())
+        })
+    })
+}
+
+/// The body with one statement per line, for analysis only: `a; b;` and `if c { a; }` written
+/// on one line (as raw blocks often are) are split, `}` and a following `else` rejoin, and `//`
+/// comments go.
+fn one_statement_per_line(body: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let mut cur = String::new();
+        let (mut in_str, mut escaped) = (false, false);
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if in_str {
+                cur.push(c);
+                match c {
+                    _ if escaped => escaped = false,
+                    '\\' => escaped = true,
+                    '"' => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => {
+                    in_str = true;
+                    cur.push(c);
+                }
+                '/' if chars.peek() == Some(&'/') => break,
+                ';' => {
+                    cur.push(';');
+                    parts.push(std::mem::take(&mut cur));
+                }
+                '{' => {
+                    let head = cur.trim().to_owned();
+                    parts.push(if head.is_empty() {
+                        "{".to_owned()
+                    } else {
+                        format!("{head} {{")
+                    });
+                    cur.clear();
+                }
+                '}' => {
+                    parts.push(std::mem::take(&mut cur));
+                    parts.push("}".to_owned());
+                }
+                _ => cur.push(c),
+            }
+        }
+        parts.push(cur);
+    }
+    let mut out: Vec<String> = Vec::new();
+    for p in parts {
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if p.starts_with("else") && out.last().is_some_and(|l| l == "}") {
+            let last = out.last_mut().expect("checked");
+            last.push(' ');
+            last.push_str(p);
+        } else {
+            out.push(p.to_owned());
+        }
+    }
+    let mut text = out.join("\n");
+    text.push('\n');
+    text
 }
 
 /// Whether `text` (an `.air` statement or `if` condition) starts with a `push_interaction`
@@ -227,10 +317,32 @@ fn check_pins(nodes: &[Node], copied: &mut BTreeSet<String>, ok: &mut bool) {
     }
 }
 
-/// Whether every read of `name` in `nodes` comes after a plain write of it on every path
-/// (`defined` says it is written on entry). A local read before any write reads whatever its
-/// frame word held, so moving it to another word would change the value read.
+/// Whether every read of `name` in `nodes` comes after a write of it on every path (`defined`
+/// says it is written on entry). A local read before any write reads whatever its frame word
+/// held, so moving it to another word would change the value read. Writes are plain stores and
+/// primitives' out-operands ([`out_operand_write`]) on the exits that write them.
 fn defined_before_reads(nodes: &[Node], name: &str, defined: &mut bool) -> bool {
+    // A `break` outside any loop has no loop exit to reach; the parser never produces one.
+    let mut breaks = None;
+    flow_defined(nodes, name, defined, &mut breaks)
+}
+
+/// The `&&` of two path states where either may be absent (no path reaches the join that way).
+fn meet(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a && b),
+        (a, None) => a,
+        (None, b) => b,
+    }
+}
+
+/// [`defined_before_reads`] inside the innermost loop: `breaks` collects the state on every
+/// `break` (the loop exit's state, with the condition's false exit), `None` until one is seen.
+///
+/// After `return`, `break` or `continue` nothing in the block runs, so the state that falls
+/// through is vacuous (`true`, the identity of the join). `continue` returns to the loop head,
+/// whose state is the one on entry: a back edge only carries more writes.
+fn flow_defined(nodes: &[Node], name: &str, defined: &mut bool, breaks: &mut Option<bool>) -> bool {
     let reads = |text: &str| idents(text).contains(&name);
     for n in nodes {
         match n {
@@ -249,45 +361,213 @@ fn defined_before_reads(nodes: &[Node], name: &str, defined: &mut bool) -> bool 
                     }
                     *defined = true;
                 }
-                _ => {
+                kind @ (Kind::Return | Kind::Break | Kind::Continue) => {
                     if !*defined && reads(l) {
                         return false;
                     }
+                    if matches!(kind, Kind::Break) {
+                        *breaks = meet(*breaks, Some(*defined));
+                    }
+                    *defined = true;
                 }
+                _ => match out_operand_write(l, name) {
+                    // A bare primitive's false exit leaves the tree, so the next line runs on
+                    // its true exit.
+                    Some((rest, exit)) => {
+                        if !*defined && reads(&rest) {
+                            return false;
+                        }
+                        *defined |= exit != WriteExit::False;
+                    }
+                    None => {
+                        if !*defined && reads(l) {
+                            return false;
+                        }
+                    }
+                },
             },
             Node::If { arms, else_body } => {
-                let mut all = else_body.is_some();
-                for (cond, body) in arms {
-                    if !*defined && reads(cond) {
-                        return false;
-                    }
-                    let mut d = *defined;
-                    if !defined_before_reads(body, name, &mut d) {
-                        return false;
-                    }
-                    all &= d;
+                if !if_chain_defined(arms, else_body.as_deref(), name, defined, breaks) {
+                    return false;
                 }
-                if let Some(body) = else_body {
-                    let mut d = *defined;
-                    if !defined_before_reads(body, name, &mut d) {
-                        return false;
-                    }
-                    all &= d;
-                }
-                *defined |= all;
             }
             Node::While { cond, body } => {
-                if !*defined && cond.as_deref().is_some_and(reads) {
+                let (mut d, exit) = match cond {
+                    Some(c) => match cond_defines(c, name, *defined) {
+                        Some((on_true, on_false)) => (on_true, Some(on_false)),
+                        None => return false,
+                    },
+                    None => (*defined, None),
+                };
+                let mut inner = None;
+                if !flow_defined(body, name, &mut d, &mut inner) {
                     return false;
                 }
-                let mut d = *defined;
-                if !defined_before_reads(body, name, &mut d) {
-                    return false;
-                }
+                // A loop nothing leaves never falls through.
+                *defined = meet(exit, inner).unwrap_or(true);
             }
         }
     }
     true
+}
+
+/// `if`/`else if`/`else` from arm `0`: each condition runs only when the ones before it were
+/// false, so a write on a condition's false exit reaches the arms after it.
+fn if_chain_defined(
+    arms: &[(String, Vec<Node>)],
+    else_body: Option<&[Node]>,
+    name: &str,
+    defined: &mut bool,
+    breaks: &mut Option<bool>,
+) -> bool {
+    let Some(((cond, body), rest)) = arms.split_first() else {
+        return match else_body {
+            // No `else`: control falls through with what the conditions defined.
+            None => true,
+            Some(body) => flow_defined(body, name, defined, breaks),
+        };
+    };
+    let Some((on_true, on_false)) = cond_defines(cond, name, *defined) else {
+        return false;
+    };
+    let mut d_then = on_true;
+    if !flow_defined(body, name, &mut d_then, breaks) {
+        return false;
+    }
+    let mut d_else = on_false;
+    if !if_chain_defined(rest, else_body, name, &mut d_else, breaks) {
+        return false;
+    }
+    *defined = d_then && d_else;
+    true
+}
+
+/// What a branch condition leaves defined on its true and false exits, or `None` when it reads
+/// `name` before anything writes it.
+fn cond_defines(cond: &str, name: &str, defined: bool) -> Option<(bool, bool)> {
+    let reads = |text: &str| idents(text).contains(&name);
+    let (negated, inner) = match cond.trim_start().strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, cond),
+    };
+    let Some((rest, exit)) = out_operand_write(inner, name) else {
+        return (defined || !reads(cond)).then_some((defined, defined));
+    };
+    if !defined && reads(&rest) {
+        return None;
+    }
+    let (prim_true, prim_false) = (
+        defined || exit != WriteExit::False,
+        defined || exit != WriteExit::True,
+    );
+    Some(if negated {
+        (prim_false, prim_true)
+    } else {
+        (prim_true, prim_false)
+    })
+}
+
+/// Which exits of a primitive write its out-operand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteExit {
+    Both,
+    True,
+    False,
+}
+
+/// When `text` (a statement or condition, no leading `!`) is a primitive that stores into the
+/// cell `name` through an out-operand, returns the text with that operand blanked (for the reads
+/// it still makes) and the exits on which the store happens, as the VM runs them:
+///
+/// - `random(x, n)` stores the draw, then takes the true exit;
+/// - `animate(.., local: x)` stores an event in the local, then takes the false exit;
+/// - `relationship(.., value: x)` without flag 4 reads the number into the cell and takes the
+///   true exit (flag 1 takes the false exit, unwritten, when the number is missing).
+fn out_operand_write(text: &str, name: &str) -> Option<(String, WriteExit)> {
+    let t = text.trim();
+    let t = t.strip_suffix(';').unwrap_or(t).trim_end();
+    let open = t.find('(')?;
+    let prim = &t[..open];
+    if !t.ends_with(')') || !is_ident(prim) {
+        return None;
+    }
+    let inner = &t[open + 1..t.len() - 1];
+    let args = split_top_level(inner);
+    let named = |key: &str| {
+        args.iter().position(|a| {
+            a.split_once(':')
+                .is_some_and(|(k, _)| k.trim() == key && !k.contains('('))
+        })
+    };
+    let value_of = |i: usize| args[i].split_once(':').map_or("", |(_, v)| v.trim());
+    let (at, exit) = match prim {
+        "random" => {
+            let first = args.first()?;
+            (first.trim() == name).then_some((0, WriteExit::Both))?
+        }
+        "animate" => {
+            let i = named("local")?;
+            (value_of(i) == name).then_some((i, WriteExit::False))?
+        }
+        "relationship" => {
+            let i = named("value")?;
+            let flags = match named("flags") {
+                Some(f) => parse_int(value_of(f))?,
+                None => 0,
+            };
+            (value_of(i) == name && flags & 4 == 0).then_some((i, WriteExit::True))?
+        }
+        _ => return None,
+    };
+    let mut rest = format!("{prim}(");
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            rest.push_str(", ");
+        }
+        if i != at {
+            rest.push_str(a.trim());
+        }
+    }
+    rest.push(')');
+    Some((rest, exit))
+}
+
+/// `a, b(c, d), e` → `["a", " b(c, d)", " e"]`: commas outside brackets and strings.
+fn split_top_level(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start, mut in_str, mut escaped) = (0i32, 0usize, false, false);
+    for (i, c) in text.char_indices() {
+        if in_str {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&text[start..]);
+    out
+}
+
+/// A decimal or `0x` integer.
+fn parse_int(text: &str) -> Option<i64> {
+    let t = text.trim();
+    match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(hex) => i64::from_str_radix(hex, 16).ok(),
+        None => t.parse().ok(),
+    }
 }
 
 fn drop_pins(nodes: &mut Vec<Node>) {
@@ -1374,6 +1654,7 @@ fn drop_dead_local_stores(nodes: &mut Vec<Node>) {
     let locals: BTreeSet<String> = names.into_iter().collect();
     let mut lv = Liveness {
         locals: &locals,
+        text_reads_locals: nodes_format_text(nodes),
         edges: BTreeSet::new(),
         dead_defs: BTreeMap::new(),
         live_out: BTreeMap::new(),
@@ -1439,6 +1720,7 @@ fn forward_copies(nodes: &mut Vec<Node>) {
     let locals: BTreeSet<String> = names.into_iter().collect();
     let mut lv = Liveness {
         locals: &locals,
+        text_reads_locals: nodes_format_text(nodes),
         edges: BTreeSet::new(),
         dead_defs: BTreeMap::new(),
         live_out: BTreeMap::new(),
@@ -1540,12 +1822,16 @@ fn next_is_plain_expression(rest: &[Node]) -> bool {
 
 /// Drops `let x;` declarations of names nothing else mentions.
 fn drop_unused_decls(nodes: &mut Vec<Node>) {
+    // A tree that formats text may read a user local's frame word by number, so its user
+    // locals keep their declarations (and so their words) even when nothing names them.
+    let keep_user = nodes_format_text(nodes);
     // Only the names to drop are copied out of the borrowed counts.
     let unused: BTreeSet<String> = {
         let mut counts = BTreeMap::new();
         mention_counts(nodes, &mut counts);
         counts
             .into_iter()
+            .filter(|&(name, _)| !(keep_user && name.starts_with("__v_")))
             .filter(|&(_, (reads, writes))| reads == 0 && writes <= 1)
             .map(|(name, _)| name.to_owned())
             .collect()
@@ -1622,10 +1908,41 @@ fn merge_duplicate_tails(nodes: &mut Vec<Node>) {
 // Liveness and coalescing
 // ---------------------------------------------------------------------------
 
+/// Whether `text` runs a primitive that formats text (Dialog, Action String), which reads frame
+/// locals by number through `$Local:N`, `$TimeLocal:N` and similar tokens.
+fn formats_text(text: &str) -> bool {
+    let stripped = strip_strings(text);
+    ["dialog(", "action_string("].iter().any(|prim| {
+        stripped.match_indices(prim).any(|(at, _)| {
+            !stripped[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        })
+    })
+}
+
+fn nodes_format_text(nodes: &[Node]) -> bool {
+    nodes.iter().any(|n| match n {
+        Node::Line(l) => formats_text(l),
+        Node::If { arms, else_body } => {
+            arms.iter()
+                .any(|(c, body)| formats_text(c) || nodes_format_text(body))
+                || else_body.as_deref().is_some_and(nodes_format_text)
+        }
+        Node::While { cond, body } => {
+            cond.as_deref().is_some_and(formats_text) || nodes_format_text(body)
+        }
+    })
+}
+
 type Set = BTreeSet<String>;
 
 struct Liveness<'a> {
     locals: &'a BTreeSet<String>,
+    /// The tree formats text (a dialog or action string), which reads frame locals by number
+    /// (`$Local:N`, `$TimeLocal:N`): every such node reads every user local (`__v_`).
+    text_reads_locals: bool,
     edges: BTreeSet<(String, String)>,
     /// For each plain store to a v2 local (`__...`): whether the local is dead after it. Loops
     /// revisit their bodies with growing live sets; the last visit, with the final sets, wins.
@@ -1636,11 +1953,20 @@ struct Liveness<'a> {
 
 impl Liveness<'_> {
     fn mentions(&self, text: &str) -> Set {
-        idents(text)
+        let mut out: Set = idents(text)
             .into_iter()
             .filter(|t| self.locals.contains(*t))
             .map(str::to_owned)
-            .collect()
+            .collect();
+        if self.text_reads_locals && formats_text(text) {
+            out.extend(
+                self.locals
+                    .iter()
+                    .filter(|l| l.starts_with("__v_"))
+                    .cloned(),
+            );
+        }
+        out
     }
 
     /// Records that every mentioned local interferes with every local live around the point.
@@ -1768,6 +2094,7 @@ fn coalesce_locals(nodes: &mut Vec<Node>) {
     let locals: BTreeSet<String> = order.iter().cloned().collect();
     let mut lv = Liveness {
         locals: &locals,
+        text_reads_locals: nodes_format_text(nodes),
         edges: BTreeSet::new(),
         dead_defs: BTreeMap::new(),
         live_out: BTreeMap::new(),
