@@ -20,8 +20,9 @@
 //! conservative token scan that errs towards rejecting. Roughly, it rejects any `op` token that
 //! is not a `.field` or an `op:` argument name (so even `let op = 1;`), except the operand-free
 //! spelling `op N (0, 0, 0, 0, 0, 0, 0, 0)` of the opcodes in `OPERAND_FREE_OPS`. It also rejects
-//! a `scope(N, ...)` unless `N` is a decimal or lowercase-`0x` literal other than 25 (the locals
-//! scope).
+//! a `scope(N, ...)` unless its first argument parses as an integer other than 25 (the locals
+//! scope); that parse is the function's own (a decimal parse, then a base-16 parse after a
+//! `0x` prefix), looser than the `.air` lexer's.
 //!
 //! An accepted statement keeps its whole line as text, and [`classify`] gives its typed view of
 //! that whole line. A numbered-local operand is not rejected and takes part in that view like
