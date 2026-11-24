@@ -120,7 +120,7 @@ Turning the remaining text emission sites (about 300 `self.line` calls in `lower
 
 That PR starts from the seams added here:
 
-- **`Emitter`.** Every lowered line already goes through it, so it can start building `mir::Stmt` instead of text.
+- **`Emitter`.** `TreeLowerer` writes its body text through it (only the `__saved_stack_obj` entry save is prepended later, in `finish`), so it can start building `mir::Stmt` instead of text.
 - **`InstKind`.** Today a view over the text; it can become a stored typed instruction.
 - **`StackObjOp`.** Generated `let X = stack_obj;` saves and plain `:=` writes of the stack object are already typed (raw `.air` and compound writes excepted).
 - **`FrameFacts`.** It carries the frame metadata.
