@@ -37,9 +37,11 @@ without them `verify-equiv` is unconditional, as before.
     declaring module. An inherited tree's enum is the template module's, even when the
     object's own module has another enum of the same name. A name that does not resolve
     to an enum there gets no domain, which only assumes less.
-  - Trees are matched to BHAVs by label in the lowered object. Both files compared must
-    give that BHAV the same label, or `verify-equiv` stops with an error. Without that
-    check a domain could land on a different tree that took the same ID.
+  - Trees are matched to BHAVs by label in the lowered object, and a tree pinned with
+    `@id` keeps that ID. Both files compared must define an object with the source
+    object's GUID and give that BHAV the same label, or `verify-equiv` stops with an
+    error. Without that check a domain could land on another object's tree, or on a
+    different tree that took the same ID.
 
   The v2 compiler does not export its resolved tree signatures, so these rules are
   mirrored, not shared. Tests cover inherited, overriding and `@frame`-widened trees.
@@ -121,7 +123,9 @@ Changes:
   misaligned cut (one side at a head, the other at an event or exit) fails the proof;
   it is never a counterexample.
 
-Result: with library arities and pair indexing, 23,785 of 23,974 trees prove; loop-head cuts bring it to 23,838 (136 inconclusive, 0 counterexamples). Nearly all of the rest call a tree whose argument count the object does not know. New tests
+Result: with library arities and pair indexing, 23,785 of 23,974 trees prove. Loop-head
+cuts bring it to 23,838 (136 inconclusive, 0 counterexamples). Nearly all of the rest
+call a tree whose argument count the object does not know. New tests
 cover event-free loops: a positive that needs the loop-head cut, and negatives
 (another increment, `<=` for `<`, an extra or different temp write, a renumbered wrong
 loop) that must never prove.
@@ -175,10 +179,10 @@ reversed-layout sweep is the same before and after.
 
 | Measured (14-core laptop, release) | Before | After |
 | --- | ---: | ---: |
-| `live_equiv_corpus` | 555 s | CORPUS_AFTER |
-| reversed-layout sweep | 307 s | SWEEP_AFTER |
-| whole-object `verify-equiv`, strict | 0.24 s | STRICT_AFTER |
-| whole-object `verify-equiv --behavioral` | 0.25 s | BEH_AFTER |
+| `live_equiv_corpus` | 555 s | 407 s |
+| reversed-layout sweep | 307 s | 43 s |
+| whole-object `verify-equiv`, strict | 0.24 s | 0.09 s |
+| whole-object `verify-equiv --behavioral` | 0.25 s | 0.09 s |
 
 `lift` and `compile` were already fast (well under a tenth of a second for a whole
 object), so they are unchanged. The single-threaded corpus test is not owned by this
