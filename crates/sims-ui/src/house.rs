@@ -11,7 +11,7 @@ use sims_formats::strings::StringTable;
 use sims_formats::tuning::Constants;
 use sims_sim::load::ExpandedWall;
 use sims_sim::motives::Curve;
-use sims_sim::{FULL_SIZE, World};
+use sims_sim::{FULL_SIZE, HouseUsage, World};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -363,8 +363,8 @@ impl House {
     ///
     /// - Furnishings (0x416851) weighs the lot's values as the simulation
     ///   keeps them ([`Values::stored`]): see [`furnishings`].
-    ///
-    /// Not ported: Layout (its routing history, lot +0x3c to +0x64).
+    /// - Layout (0x4166ee..0x41674f) weighs the house's usage counts
+    ///   ([`World::usage`]): see [`layout`].
     pub fn read(world: &World, tuning: &Tuning, kinds: &Kinds) -> Self {
         let mut house = Self::default();
         for room in world.rooms.rooms.values() {
@@ -408,6 +408,7 @@ impl House {
         house.ratings[UPKEEP] = Some(upkeep(world, tuning, kinds));
         house.values = Values::stored(world);
         house.ratings[FURNISHINGS] = Some(furnishings(house.values, &tuning.furnishings));
+        house.ratings[LAYOUT] = Some(layout(&world.usage));
         house
     }
 }
@@ -892,6 +893,36 @@ pub fn furnishings(values: Values, curve: &Curve) -> i32 {
     curve.weight(ratio).to_i32_truncate()
 }
 
+/// The Layout rating (0x4166ee..0x41674f): the five earlier days' and
+/// today's samples summed, and those spent following a route; the
+/// samples less twice the routing ones, over the samples (at least 1),
+/// kept to 0 to 1, times 100, cut toward zero. The sums wrap at 32 bits
+/// and the arithmetic is single precision, as the original's FPU is set.
+pub fn layout(usage: &HouseUsage) -> i32 {
+    let (total, routing) = usage
+        .history
+        .iter()
+        .chain(std::iter::once(&usage.today))
+        .fold((0i32, 0i32), |(t, r), day| {
+            (t.wrapping_add(day.total), r.wrapping_add(day.routing))
+        });
+    let total = Ext::from_i32(total.max(1));
+    let twice = Ext::from_i32(routing.wrapping_mul(2));
+    let ratio = ((total - twice).single() / total).single();
+    let ratio = if ratio.partial_cmp(&Ext::ZERO).is_some_and(Ordering::is_ge) {
+        ratio
+    } else {
+        Ext::ZERO
+    };
+    let one = Ext::from_i32(1);
+    let ratio = if ratio.partial_cmp(&one) == Some(Ordering::Greater) {
+        one
+    } else {
+        ratio
+    };
+    (ratio * Ext::from_i32(100)).single().to_i32_truncate()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1026,7 +1057,11 @@ mod tests {
         // yard's 132 is kept to 100.
         // Nothing counts for Upkeep: 0.
         // No objects: Furnishings weighs 100 on a missing curve, 0.
-        assert_eq!(house.ratings, [Some(20), Some(0), Some(100), Some(0), None]);
+        // No usage samples: Layout 100 (`0x4166ee`).
+        assert_eq!(
+            house.ratings,
+            [Some(20), Some(0), Some(100), Some(0), Some(100)]
+        );
 
         // No family: Size 0. A negative or unordered yard score: 0.
         world.globals[9] = 8;
@@ -1500,6 +1535,33 @@ mod tests {
             }
         );
         assert_eq!(house.ratings[FURNISHINGS], Some(75));
+    }
+
+    #[test]
+    fn layout_weighs_the_samples_spent_routing() {
+        use sims_sim::Usage;
+        let usage = |days: [(i32, i32); 6]| {
+            let day = |(total, routing)| Usage { total, routing };
+            HouseUsage {
+                history: [days[0], days[1], days[2], days[3], days[4]].map(day),
+                today: day(days[5]),
+            }
+        };
+        // Six days summed: 40 samples, 7 routing: (40 - 14) / 40.
+        let week = usage([(10, 2), (5, 1), (5, 0), (5, 1), (5, 1), (10, 2)]);
+        assert_eq!(layout(&week), 65);
+        // No samples: 0 over at least 1, so full.
+        assert_eq!(layout(&HouseUsage::default()), 100);
+        // More than half routing: kept to 0.
+        assert_eq!(
+            layout(&usage([(0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (4, 3)])),
+            0
+        );
+        // A third routing: 1/3 in single precision, times 100, cut.
+        assert_eq!(
+            layout(&usage([(0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (3, 1)])),
+            33
+        );
     }
 
     #[test]

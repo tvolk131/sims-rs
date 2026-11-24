@@ -38,10 +38,10 @@ const FLOORS: &[(&str, &str, f64)] = &[
     ("live-expanded-needs-800", "strip", 0.99),
     ("live-expanded-needs-1024", "puck", 0.86),
     ("live-expanded-needs-1024", "strip", 0.99),
-    ("live-relationships-1024", "strip", 0.95),
-    ("live-job-1024", "strip", 0.95),
-    ("live-personality-1024", "strip", 0.96),
-    ("live-house-1024", "strip", 0.94),
+    ("live-relationships-1024", "strip", 0.999),
+    ("live-job-1024", "strip", 0.999),
+    ("live-personality-1024", "strip", 0.999),
+    ("live-house-1024", "strip", 0.999),
     ("view-roof-on", "view-radio", 0.99),
     ("view-walls-up", "view-radio", 0.99),
     ("view-cutaway", "view-radio", 0.99),
@@ -237,6 +237,22 @@ fn open_goth(root: &Path, size: [i32; 2]) -> Game {
     game
 }
 
+/// The relationships capture shows the lot running (manifest: AM 6:30,
+/// "Bella 100/100, Cassandra 75/75"): the save's rows hold one or two
+/// values, and the household's first ticks fill each row's lifetime
+/// (value 2) from its daily one. Runs the lot to the second tick, where
+/// ours has filled them, and pauses again.
+fn run_until_relationships_settle(game: &mut Game) {
+    if game.paused() {
+        game.toggle_pause();
+    }
+    let mut ticks = 0;
+    while ticks < 2 {
+        ticks += game.advance(10_000);
+    }
+    game.toggle_pause();
+}
+
 fn click(game: &mut Game, point: [i32; 2]) {
     game.hover(point);
     game.press(point);
@@ -325,6 +341,9 @@ fn ui_oracle_tour_ratchet() {
         let mut game = open_goth(&install, size);
         if !game.panel_expanded() {
             game.hotkey_mode(Mode::Live);
+        }
+        if shot == "live-relationships-1024" {
+            run_until_relationships_settle(&mut game);
         }
         click(&mut game, point);
         let oracle = load(shot);

@@ -34,6 +34,11 @@ pub struct Font {
     /// Characters by the byte the original's code page gives them.
     encoding: std::collections::BTreeMap<char, u8>,
     pub line_height: i32,
+    /// What the original adds to every text's width (`[font+0x34]`,
+    /// set by 0x60bbc7..0x60bbda, added by 0x60b821): the glyphs' mean x
+    /// bearing, in single precision, plus a half, cut toward zero. 1 for
+    /// the 7-point font, 0 for the 8-point one.
+    width_extra: i32,
     decoded: ffn::Font,
 }
 
@@ -94,10 +99,21 @@ impl Font {
                 encoding.entry(ch).or_insert(byte);
             }
         }
+        let width_extra = if decoded.glyphs.is_empty() {
+            0
+        } else {
+            let sum = decoded
+                .glyphs
+                .iter()
+                .fold(0f32, |sum, g| sum + f32::from(g.bearing_x));
+            // `__ftol` truncates toward zero.
+            (sum / decoded.glyphs.len() as f32 + 0.5) as i32
+        };
         Self {
             metrics,
             encoding,
             line_height,
+            width_extra,
             decoded,
         }
     }
@@ -108,12 +124,31 @@ impl Font {
             .map(|&b| &self.metrics[usize::from(b)])
     }
 
-    /// The width of `text` on one line. Characters the font cannot show
-    /// take no room.
+    /// The rows `ch` inks, down from the top of its line: its first and
+    /// one past its last (the box the original's font gives a character,
+    /// read by 0x5e3f46 and 0x60b927). `None` when the font lacks it.
+    pub fn rows(&self, ch: char) -> Option<[i32; 2]> {
+        self.metric(ch).map(|m| {
+            let top = m.bearing[1];
+            [top, top.saturating_add(i32::from(m.atlas[3]))]
+        })
+    }
+
+    /// The width of `text` on one line: the sum of its characters'
+    /// advances, how far drawing it moves. Characters the font cannot
+    /// show take no room.
     pub fn width(&self, text: &str) -> i32 {
         text.chars()
             .filter_map(|c| self.metric(c))
             .fold(0i32, |w, m| w.saturating_add(m.advance))
+    }
+
+    /// The width the original's draw-in-a-box (0x60b4a1) aligns `text`
+    /// by, through the font's measure (0x60b7e2): the advances plus the
+    /// font's `width_extra`. Dialog layout and caret placement measure
+    /// with [`Font::width`].
+    pub fn box_width(&self, text: &str) -> i32 {
+        self.width(text).saturating_add(self.width_extra)
     }
 
     /// Draws `text` on one line with its top-left corner at `at`.
@@ -356,6 +391,28 @@ pub(crate) mod tests {
         // The space: half the mean ink width (1.5 / 2), rounded.
         assert_eq!(f.width(" "), 1);
         assert_eq!(f.width("A\u{1F600}"), 3);
+    }
+
+    #[test]
+    fn the_box_width_adds_the_mean_bearing_rounded_and_rows_find_the_ink() {
+        // Bearings 1, 0, 0: a mean of a third, plus a half, cut to 0.
+        let f = font();
+        assert_eq!(f.box_width("AB"), f.width("AB"));
+        // With the `g` (bearing 0) as well the mean falls; raise every
+        // bearing by one and the mean is 1.25, plus a half, cut to 1.
+        let mut decoded = hanging_font().decoded;
+        for glyph in &mut decoded.glyphs {
+            glyph.bearing_x += 1;
+        }
+        let shifted = Font::new(decoded);
+        assert_eq!(shifted.box_width("AB"), shifted.width("AB") + 1);
+        assert_eq!(shifted.box_width(""), 1);
+        // `A` is inked from the line's top for its 2 rows; the `g` from 2
+        // below that; a character the font lacks has no rows.
+        let hanging = hanging_font();
+        assert_eq!(hanging.rows('A'), Some([0, 2]));
+        assert_eq!(hanging.rows('g'), Some([2, 4]));
+        assert_eq!(hanging.rows('\u{1F600}'), None);
     }
 
     #[test]
