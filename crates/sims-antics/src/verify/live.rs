@@ -67,6 +67,7 @@ use super::{
 use crate::ir::BhavChunk;
 use crate::lower::{TARGET_ERROR, TARGET_FALSE, TARGET_TRUE};
 use sims_formats::behavior::Instruction;
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Attributes every object has, whatever its definition says (`sims-vm/src/factory.rs:314`,
@@ -387,13 +388,15 @@ impl Interner {
     }
 
     fn sym(&mut self, key: SymKey) -> Val {
-        if let Some(&id) = self.syms.get(&key) {
-            return Val::Sym(id);
+        // One search, hit or miss: keys can be long to compare.
+        match self.syms.entry(key) {
+            Entry::Occupied(e) => Val::Sym(*e.get()),
+            Entry::Vacant(e) => {
+                let id = self.sym_keys.len() as u32;
+                self.sym_keys.push(e.key().clone());
+                Val::Sym(*e.insert(id))
+            }
         }
-        let id = self.sym_keys.len() as u32;
-        self.syms.insert(key.clone(), id);
-        self.sym_keys.push(key);
-        Val::Sym(id)
     }
 
     fn lookup(&self, key: &SymKey) -> Option<Val> {
@@ -421,13 +424,14 @@ impl Interner {
     }
 
     fn prefix(&mut self, node: PrefixNode) -> u32 {
-        if let Some(&id) = self.prefixes.get(&node) {
-            return id;
+        match self.prefixes.entry(node) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                let id = self.prefix_nodes.len() as u32;
+                self.prefix_nodes.push(e.key().clone());
+                *e.insert(id)
+            }
         }
-        let id = self.prefix_nodes.len() as u32;
-        self.prefixes.insert(node.clone(), id);
-        self.prefix_nodes.push(node);
-        id
     }
 
     /// The events (with branch outcomes) leading to `prefix`, oldest first, back to the
@@ -653,36 +657,36 @@ enum Feasibility {
 }
 
 fn feasibility(conds: &[&[(Atom, bool)]], interner: &Interner) -> Feasibility {
-    let mut decided: BTreeMap<Atom, bool> = BTreeMap::new();
+    // Sorted, an atom taken both ways is two neighbours with the same atom.
+    let mut literals: Vec<(Atom, bool)> = conds.iter().flat_map(|c| c.iter().copied()).collect();
+    literals.sort_unstable();
+    literals.dedup();
+    if literals.windows(2).any(|w| w[0].0 == w[1].0) {
+        return Feasibility::Unsat;
+    }
     let mut ranges: BTreeMap<u32, Range> = BTreeMap::new();
     let mut exact = true;
-    for cond in conds {
-        for &(atom, value) in *cond {
-            if let Some(prev) = decided.insert(atom, value)
-                && prev != value
-            {
-                return Feasibility::Unsat;
-            }
-            if let Some(v) = eval_atom(atom)
-                && v != value
-            {
-                return Feasibility::Unsat;
-            }
-            match atom {
-                Atom::Outcome(_) => {}
-                _ => match atom_sym_vs_const(atom) {
-                    Some(sym) => {
-                        ranges
-                            .entry(sym)
-                            .or_insert_with(Range::full)
-                            .apply(atom, value, sym);
-                        if !interner.is_input(sym) {
-                            exact = false;
-                        }
+    // Ranges only narrow, so the order literals are applied in does not matter.
+    for &(atom, value) in &literals {
+        if let Some(v) = eval_atom(atom)
+            && v != value
+        {
+            return Feasibility::Unsat;
+        }
+        match atom {
+            Atom::Outcome(_) => {}
+            _ => match atom_sym_vs_const(atom) {
+                Some(sym) => {
+                    ranges
+                        .entry(sym)
+                        .or_insert_with(Range::full)
+                        .apply(atom, value, sym);
+                    if !interner.is_input(sym) {
+                        exact = false;
                     }
-                    None => exact = false,
-                },
-            }
+                }
+                None => exact = false,
+            },
         }
     }
     if ranges.values().any(|r| r.count() <= 0) {
