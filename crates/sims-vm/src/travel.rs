@@ -1108,6 +1108,43 @@ pub fn validate_travel_plan(
     stored: &StoredNeighborhood,
     request: &TravelRequest,
 ) -> Result<ValidatedTravelPlan, TravelError> {
+    validate_plan(
+        home_world,
+        home_house,
+        home_family_id,
+        installed_expansions,
+        stored,
+        request,
+        PartyRules::Api,
+    )
+}
+
+/// Which parties a destination takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PartyRules {
+    /// [`depart_to_destination`]'s: each destination's own parties and
+    /// who may lead them.
+    Api,
+    /// A trip a script asked for with Generic Sims Call 17: the engine
+    /// takes whatever party the routine's mode names, to any destination
+    /// (0x45a22d checks only that the caller is a person). Who may go was
+    /// the tree's to decide: Vacation Island's and Old Town's phone plugins
+    /// pass their dialog's choice (attribute 8) as the mode, Studio Town's
+    /// mode 0, the Magic Town phone mode 1 and its hole and beanstalk
+    /// mode 0, so a lone traveler or date goes to any of them.
+    Native,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_plan(
+    home_world: &World,
+    home_house: u32,
+    home_family_id: u16,
+    installed_expansions: u16,
+    stored: &StoredNeighborhood,
+    request: &TravelRequest,
+    rules: PartyRules,
+) -> Result<ValidatedTravelPlan, TravelError> {
     let dest_house = request.destination_house;
     if dest_house == home_house {
         return Err(TravelError::SameHouse { house: home_house });
@@ -1288,6 +1325,40 @@ pub fn validate_travel_plan(
     let leader = lookup_member(leader_guid, true)?;
 
     let mut members: Vec<ValidatedMember> = Vec::new();
+    if rules == PartyRules::Native {
+        members.push(leader);
+        match &request.party {
+            TravelParty::Single { .. } => {}
+            TravelParty::Date { companion_guid, .. } => {
+                if *companion_guid == leader_guid {
+                    return Err(TravelError::InvalidParty(
+                        "a date's companion must be distinct from the leader".into(),
+                    ));
+                }
+                members.push(lookup_member(*companion_guid, false)?);
+            }
+            TravelParty::WholeFamily { .. } => {
+                for &guid in &home_members_present {
+                    if guid != leader_guid {
+                        members.push(lookup_member(guid, true)?);
+                    }
+                }
+            }
+            TravelParty::HouseholdGroup { .. } => {
+                return Err(TravelError::InvalidParty(
+                    "Generic Sims Call 17 asks for no household group".into(),
+                ));
+            }
+        }
+        return Ok(ValidatedTravelPlan {
+            destination,
+            transport,
+            accommodation: request.accommodation,
+            fare,
+            leader_guid,
+            members,
+        });
+    }
     match (&destination, &request.party) {
         (TravelDestination::Downtown, TravelParty::Single { .. }) => {
             if !is_adult_human(leader.age, leader.kind) {
@@ -1795,9 +1866,36 @@ enum DepartureTokens {
     AlreadyWritten(Vec<i16>),
 }
 
-/// The hour and minute the Go Downtown plugin adds to the clock for the
-/// arrival (GUID 0xA6F31853, tree 0x1004: temp 1 = 0, temp 2 = 30, mode 0).
-const DOWNTOWN_ARRIVAL_DELAY: (i16, i16) = (0, 30);
+/// The arrival hour and minute (temps 1 and 2) the destination's
+/// travel tree passes Generic Sims Call 17, read from the trees that call
+/// it (`Sims.exe` 1.91's 0x45a785 adds them to the clock, or takes them as
+/// the time itself for houses 40 to 49 asked from a residential lot):
+///
+/// - Downtown's Go Downtown plugin (tree 0x1004, node 13) and Studio
+///   Town's phone plugin (tree 0x1004, node 12): 0 and 30.
+/// - Old Town's phone plugin (tree 0x1004, node 13): 0 and 15.
+/// - Vacation Island's and Magic Town's phone plugins (tree 0x1004, node
+///   12) and the Magic Town hole (tree 0x1001, node 6): hour 14 and a
+///   draw of Random Number below 41 on the lot's stream; a draw of 20 or
+///   more takes the hour to 13 and 20 off the minute (13:00 to 13:20),
+///   a smaller one adds 40 to it (14:40 to 14:59).
+///
+/// The Magic Town hole's tree is the [`TravelTransport::MagicHole`]
+/// departure; its party gives the mode as the phone plugins' do.
+fn arrival_time(destination: TravelDestination, lot_rng: &mut sims_core::GameRng) -> (i16, i16) {
+    match destination {
+        TravelDestination::Downtown | TravelDestination::StudioTown => (0, 30),
+        TravelDestination::OldTown => (0, 15),
+        TravelDestination::VacationIsland | TravelDestination::MagicTown => {
+            let draw = (lot_rng.next_u32() % 41) as i16;
+            if draw >= 20 {
+                (13, draw - 20)
+            } else {
+                (14, draw + 40)
+            }
+        }
+    }
+}
 
 /// Carries out the trip a script asked for with Generic Sims Call 17
 /// ([`World::trip_request`]), as the main loop does when it finds the
@@ -1964,13 +2062,18 @@ fn depart(
 
     let home_house = home_lot.load.house;
     let home_family = home_lot.load.family;
-    let plan = validate_travel_plan(
+    let rules = match tokens {
+        DepartureTokens::Write => PartyRules::Api,
+        DepartureTokens::AlreadyWritten(_) => PartyRules::Native,
+    };
+    let plan = validate_plan(
         &home_lot.world,
         home_house,
         home_family,
         effective_expansions,
         &dest_snapshot.neighborhood,
         request,
+        rules,
     )?;
 
     // Capture live traveler snapshots before mutating or freezing anything.
@@ -2028,33 +2131,76 @@ fn depart(
         );
     }
 
-    // The Go Downtown plugin then runs Generic Sims Call 17 (0x45a22d):
-    // the leader's, and the companion's, saved state and the arrival clock
-    // go into their inventories as kind-2 tokens, which the middle ped
-    // marker's routine 21 reads back. A departure a script asked for
-    // already has them.
+    // The destination's travel tree then runs Generic Sims Call 17
+    // (0x45a22d): the travelers' saved state and the arrival clock go into
+    // their inventories as kind-2 tokens, which the arrival marker's
+    // routine 21 reads back. Mode 0 is a lone traveler or a date and mode 1
+    // the whole family; a trip with no native arrival has no tree to run
+    // it. A departure a script asked for already has them.
     let mut departure_tokens = match &tokens {
         DepartureTokens::AlreadyWritten(saved) => saved.clone(),
         DepartureTokens::Write => Vec::new(),
     };
+    let mode = match ArrivalFamily::of(
+        &request.party,
+        plan.destination,
+        request.destination_house,
+        &dest_snapshot.neighborhood.zoning,
+    ) {
+        ArrivalFamily::Solo => Some(0),
+        ArrivalFamily::Family => Some(1),
+        ArrivalFamily::Group => None,
+    };
     if tokens == DepartureTokens::Write
-        && plan.destination == TravelDestination::Downtown
-        && matches!(
-            request.party,
-            TravelParty::Single { .. } | TravelParty::Date { .. }
-        )
+        && let Some(mode) = mode
     {
         let leader = plan.members[0].home_object_id.ok_or_else(|| {
             TravelError::InvalidParty("the trip's leader is not on the home lot".into())
         })?;
         let house = i16::try_from(request.destination_house)
             .map_err(|e| TravelError::Lot(e.to_string()))?;
-        let (hour, minute) = DOWNTOWN_ARRIVAL_DELAY;
-        let asked = Interpreter::new(&home_lot.program, &home_lot.catalog, Stream::Global)
+        let (hour, minute) = arrival_time(plan.destination, &mut frozen_home.world.lot_rng);
+        let asked = Interpreter::new(&home_lot.program, &home_lot.catalog, Stream::Lot)
             .machine(&mut frozen_home.world, leader, 0, true)
-            .request_trip(house, hour, minute, 0)
+            .request_trip(house, hour, minute, mode)
             .map_err(|e| TravelError::Lot(format!("writing the departure tokens: {e}")))?;
         if let Some(asked) = asked {
+            // Mode 0 takes along whoever the leader's first kind-1 token
+            // names (0x45a34b), so a lone traveler holding a companion's
+            // token from another trip would rewrite that Sim's saved state
+            // without taking it. The API asked for the party it validated,
+            // so any other inventory written refuses the trip; the staged
+            // snapshot is dropped and nothing changes.
+            if let Some(&stray) = asked
+                .saved
+                .iter()
+                .find(|&&nid| !plan.members.iter().any(|m| m.neighbor_id == nid))
+            {
+                let why = if mode == 0 {
+                    "the leader holds a companion's kind-1 token"
+                } else {
+                    "the live household differs from the saved one"
+                };
+                return Err(TravelError::InvalidParty(format!(
+                    "routine 17 would also write the saved state of neighbor {stray}, who is \
+                     not in the party: {why}"
+                )));
+            }
+            // A whole family is the live household's members on the lot
+            // (0x45a3ef); the plan took the saved household's. A member the
+            // live household no longer has would travel without its tokens.
+            if mode == 1
+                && let Some(missing) = plan
+                    .members
+                    .iter()
+                    .find(|m| !asked.saved.contains(&m.neighbor_id))
+            {
+                return Err(TravelError::InvalidParty(format!(
+                    "Sim 0x{:08X} is in the saved household but not the live one, so routine \
+                     17 writes no saved state for it",
+                    missing.guid
+                )));
+            }
             departure_tokens = asked.saved;
         }
     }
@@ -4373,12 +4519,15 @@ fn boot_destination_lot(
             .iter()
             .find(|snap| snap.guid == leader_guid)
             .map(|snap| snap.neighbor_id);
-        // Routine 21 on Downtown's middle ped marker restores the saved
-        // state the departure wrote, so a traveler holding it keeps the
-        // motives it is made with rather than the live ones: a motive cut to
-        // 0 has no token, and the live fraction would outlive the restore.
-        let tokens_restored = TravelDestination::classify(dest_house, &program.zoning)
-            == Some(TravelDestination::Downtown);
+        // Routine 21 on the arrival marker restores the saved state the
+        // departure wrote (Downtown's and Studio Town's middle ped markers,
+        // tree 0x100e; the Vacation Island and Old Town markers' Family
+        // Spawn, tree 0x1020; Magic Town's middle ped marker, tree 0x100e),
+        // so a traveler holding it keeps the motives it is made with rather
+        // than the live ones: a motive cut to 0 has no token, and the live
+        // fraction would outlive the restore. A trip with no native
+        // arrival meets no marker.
+        let tokens_restored = arrival != ArrivalFamily::Group;
 
         for snap in ordered {
             // A date's companion is not made here when the leader holds its
@@ -7813,8 +7962,9 @@ mod tests {
     }
 
     /// Only a trip whose departure wrote saved-state tokens takes kind-2
-    /// tokens back out: an Old Town trip writes none, so the abort leaves
-    /// the ones Mortimer already held.
+    /// tokens back out: a trip to a residential Magic Town lot has no
+    /// native arrival and writes none, so the abort leaves the ones the
+    /// leader already held.
     #[test]
     fn a_trip_that_wrote_no_tokens_leaves_the_travelers_saved_state() {
         let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
@@ -7822,34 +7972,312 @@ mod tests {
         };
         let (store, _guard) = live_store(&root, "no-tokens");
         let nh = store.load_neighborhood("UserData").unwrap().unwrap();
-        let mortimer_guid = nh.family_in(5).unwrap().1.members[0];
+        let leader_guid = nh.family_in(5).unwrap().1.members[0];
         let mut goth =
             crate::lifecycle::enter_lot(&root, &store, "UserData", 5, &[3], Frames::default())
                 .unwrap();
-        let mortimer_nid = goth.world.neighbors.first_of(mortimer_guid).unwrap().id;
-        set_neighbor_token_count(&mut goth.world, mortimer_nid, trip::SAVED_STATE_KIND, 3, 7);
+        let leader_nid = goth.world.neighbors.first_of(leader_guid).unwrap().id;
+        set_neighbor_token_count(&mut goth.world, leader_nid, trip::SAVED_STATE_KIND, 3, 7);
         depart_to_destination(
             &root,
             &store,
             "UserData",
             &mut goth,
-            &TravelRequest::old_town(58, mortimer_guid),
+            &TravelRequest::magic_town(
+                90,
+                TravelParty::WholeFamily {
+                    leader_guid: leader_guid,
+                },
+                TravelTransport::MagicHole,
+            ),
         )
         .unwrap();
         let snapshot = store.load_lot_snapshot("UserData", 5).unwrap().unwrap();
         let record = decode_travel_envelope(snapshot.saved_lot.as_deref().unwrap()).unwrap();
         assert_eq!(record.version, TRAVEL_ENVELOPE_VERSION);
+        assert_eq!(record.arrival, Some(ArrivalFamily::Group));
         assert!(
             record.departure_tokens.is_empty(),
-            "Old Town's departure writes none"
+            "a trip with no native arrival writes none"
         );
 
         abort_active_trip(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
         let after = store.load_neighborhood("UserData").unwrap().unwrap();
         assert_eq!(
-            stored_tokens(&after, mortimer_nid, trip::SAVED_STATE_KIND),
+            stored_tokens(&after, leader_nid, trip::SAVED_STATE_KIND),
             [(3, 7)],
             "the abort took a token the trip never wrote"
+        );
+    }
+
+    /// The arrival times the destinations' travel trees pass routine 17:
+    /// fixed delays for Downtown, Studio Town and Old Town, and for Vacation
+    /// Island and Magic Town one lot draw below 41 that lands on 13:00 to
+    /// 13:20 or 14:40 to 14:59. A fixed delay draws nothing.
+    #[test]
+    fn arrival_times_follow_the_travel_trees() {
+        let mut rng = sims_core::GameRng::from_state(0x1234_5678);
+        for (destination, time) in [
+            (TravelDestination::Downtown, (0, 30)),
+            (TravelDestination::StudioTown, (0, 30)),
+            (TravelDestination::OldTown, (0, 15)),
+        ] {
+            assert_eq!(arrival_time(destination, &mut rng), time);
+        }
+        assert_eq!(rng.state(), 0x1234_5678, "a fixed delay draws nothing");
+        let (mut early, mut late) = (false, false);
+        for state in 0..200u32 {
+            for destination in [
+                TravelDestination::VacationIsland,
+                TravelDestination::MagicTown,
+            ] {
+                let mut rng = sims_core::GameRng::from_state(state);
+                let draw = (sims_core::GameRng::from_state(state).next_u32() % 41) as i16;
+                let time = arrival_time(destination, &mut rng);
+                assert_eq!(rng.state(), {
+                    let mut once = sims_core::GameRng::from_state(state);
+                    once.next_u32();
+                    once.state()
+                });
+                if draw >= 20 {
+                    assert_eq!(time, (13, draw - 20));
+                    early = true;
+                } else {
+                    assert_eq!(time, (14, draw + 40));
+                    late = true;
+                }
+            }
+        }
+        assert!(early && late);
+    }
+
+    /// The saved-state tokens (kind 2) of neighbor `nid` in `world`.
+    fn saved_state_tokens(world: &World, nid: i16) -> Vec<(u32, u16)> {
+        world
+            .neighbors
+            .inventories
+            .iter()
+            .filter(|i| i.neighbor == nid)
+            .flat_map(|i| &i.items)
+            .filter(|t| t.kind == trip::SAVED_STATE_KIND)
+            .map(|t| (t.guid, t.count))
+            .collect()
+    }
+
+    /// Every destination with a native arrival writes the travelers'
+    /// tokens on departure, as its travel tree's routine 17 does: the
+    /// whole family to Vacation Island and Old Town (mode 1), a lone
+    /// traveler to Studio Town and a Magic Town community lot (mode 0).
+    /// The leader's arrival clock tokens (kind 2, GUIDs 7 and 8) hold the
+    /// arrival time the tree passed added to the clock (taken as the time
+    /// itself for house 40, 0x45a785), and the return takes every token
+    /// back out.
+    #[test]
+    fn every_destination_with_an_arrival_writes_the_departure_tokens() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard) = live_store(&root, "all-destinations");
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let members = nh.family_in(5).unwrap().1.members.clone();
+        let leader_guid = members[0];
+        let trips = [
+            (
+                TravelRequest::vacation(40, leader_guid, VacationAccommodation::None),
+                members.len(),
+            ),
+            (TravelRequest::old_town(58, leader_guid), members.len()),
+            (TravelRequest::studio_town(81, leader_guid), 1),
+            (
+                TravelRequest::magic_town(
+                    93,
+                    TravelParty::Single {
+                        sim_guid: leader_guid,
+                    },
+                    TravelTransport::MagicHole,
+                ),
+                1,
+            ),
+        ];
+        for (request, travelers) in trips {
+            let house = request.destination_house;
+            let mut home =
+                crate::lifecycle::enter_lot(&root, &store, "UserData", 5, &[3], Frames::default())
+                    .unwrap();
+            let leader_nid = home.world.neighbors.first_of(leader_guid).unwrap().id;
+            let destination = TravelDestination::classify(house, &nh.zoning).unwrap();
+            let (hour, minute) = arrival_time(destination, &mut home.world.lot_rng.clone());
+            let clock = trip::arrival_clock(
+                home.world.globals[GLOBAL_HOURS],
+                home.world.globals[GLOBAL_MINUTES],
+                hour,
+                minute,
+                house == 40,
+            );
+            let departed =
+                depart_to_destination(&root, &store, "UserData", &mut home, &request).unwrap();
+            let snapshot = store.load_lot_snapshot("UserData", 5).unwrap().unwrap();
+            let record = decode_travel_envelope(snapshot.saved_lot.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                record.departure_tokens.len(),
+                travelers,
+                "house {house}: one traveler's tokens each"
+            );
+            let stored = store.load_neighborhood("UserData").unwrap().unwrap();
+            let leader_tokens = stored_tokens(&stored, leader_nid, trip::SAVED_STATE_KIND);
+            for (guid, count) in [
+                (trip::ARRIVAL_HOUR_GUID, clock.0),
+                (trip::ARRIVAL_MINUTE_GUID, clock.1),
+            ] {
+                // A count of 0 adds no token (0x41f38d).
+                let held = leader_tokens
+                    .iter()
+                    .find(|&&(g, _)| g == guid)
+                    .map_or(0, |&(_, c)| c);
+                assert_eq!(
+                    held, count as u16,
+                    "house {house}: clock token {guid} in {leader_tokens:?}"
+                );
+            }
+            let world = &departed.destination_lot.world;
+            for &nid in &record.departure_tokens {
+                let tokens = saved_state_tokens(world, nid);
+                assert!(!tokens.is_empty(), "house {house}: neighbor {nid} has none");
+            }
+            let mut lot = departed.destination_lot;
+            let returned = return_from_destination(
+                &root,
+                &store,
+                &departed.session,
+                &mut lot,
+                &[3],
+                Frames::default(),
+            )
+            .unwrap();
+            for &nid in &record.departure_tokens {
+                assert_eq!(
+                    saved_state_tokens(&returned.home_lot.world, nid),
+                    [],
+                    "house {house}: the return left neighbor {nid}'s tokens"
+                );
+            }
+        }
+    }
+
+    /// A trip a script asked for with Generic Sims Call 17 goes with the
+    /// party its mode names, as the trees ask for them: a lone traveler
+    /// (mode 0) to Vacation Island and Old Town, whose phone plugins pass
+    /// their dialog's choice and which the API sends only whole families
+    /// to, and a whole family (mode 1) to a Magic Town community lot, as
+    /// the Magic Town phone plugin asks.
+    #[test]
+    fn a_requested_trip_takes_the_party_its_mode_names() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard) = live_store(&root, "requested-parties");
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let members = nh.family_in(5).unwrap().1.members.clone();
+        let leader_guid = members[0];
+        for (house, hour, minute, mode, travelers) in [
+            (40, 14, 41, 0, 1),
+            (58, 0, 15, 0, 1),
+            (93, 14, 0, 1, members.len()),
+        ] {
+            let mut home =
+                crate::lifecycle::enter_lot(&root, &store, "UserData", 5, &[3], Frames::default())
+                    .unwrap();
+            let leader = person_with_guid(&home.world, leader_guid).unwrap();
+            let asked = Interpreter::new(&home.program, &home.catalog, Stream::Lot)
+                .machine(&mut home.world, leader, 0, true)
+                .request_trip(house, hour, minute, mode)
+                .unwrap()
+                .expect("routine 17 asks for the trip");
+            home.world.trip_request = Some(asked.clone());
+            let departed = depart_from_request(&root, &store, "UserData", &mut home).unwrap();
+            assert_eq!(home.world.trip_request, None, "house {house}");
+            assert_eq!(departed.session.travelers.len(), travelers, "house {house}");
+            assert_eq!(asked.saved.len(), travelers, "house {house}");
+            assert_eq!(departed.session.fare_paid, 0, "house {house}");
+            let mut lot = departed.destination_lot;
+            return_from_destination(
+                &root,
+                &store,
+                &departed.session,
+                &mut lot,
+                &[3],
+                Frames::default(),
+            )
+            .unwrap();
+        }
+    }
+
+    /// A lone traveler holding a companion's kind-1 token would have
+    /// routine 17 rewrite that companion's saved state too (0x45a34b), so
+    /// the API refuses the trip and changes nothing.
+    #[test]
+    fn a_lone_traveler_holding_a_companion_token_is_refused() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard) = live_store(&root, "stray-companion");
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let members = nh.family_in(5).unwrap().1.members.clone();
+        let (leader_guid, other_guid) = (members[0], members[1]);
+        let mut home =
+            crate::lifecycle::enter_lot(&root, &store, "UserData", 5, &[3], Frames::default())
+                .unwrap();
+        let leader_nid = home.world.neighbors.first_of(leader_guid).unwrap().id;
+        let other_nid = home.world.neighbors.first_of(other_guid).unwrap().id;
+        set_neighbor_token_count(
+            &mut home.world,
+            leader_nid,
+            COMPANION_TOKEN_KIND,
+            other_guid,
+            1,
+        );
+        set_neighbor_token_count(&mut home.world, other_nid, trip::SAVED_STATE_KIND, 3, 7);
+        let rng_before = home.world.lot_rng;
+        let revision_before = store
+            .load_neighborhood("UserData")
+            .unwrap()
+            .unwrap()
+            .revision;
+        // Magic Town draws the arrival minute before routine 17 runs.
+        let Err(err) = depart_to_destination(
+            &root,
+            &store,
+            "UserData",
+            &mut home,
+            &TravelRequest::magic_town(
+                93,
+                TravelParty::Single {
+                    sim_guid: leader_guid,
+                },
+                TravelTransport::MagicHole,
+            ),
+        ) else {
+            panic!("the trip is refused");
+        };
+        assert!(
+            matches!(&err, TravelError::InvalidParty(text) if text.contains("kind-1 token")),
+            "{err:?}"
+        );
+        assert_eq!(saved_state_tokens(&home.world, other_nid), [(3, 7)]);
+        assert_eq!(home.world.lot_rng, rng_before, "the refused trip drew");
+        let stored = store.load_neighborhood("UserData").unwrap().unwrap();
+        assert_eq!(stored.revision, revision_before, "the refused trip saved");
+        assert_eq!(
+            stored_tokens(&stored, other_nid, trip::SAVED_STATE_KIND),
+            []
+        );
+        let after = store.load_lot_snapshot("UserData", 5).unwrap().unwrap();
+        assert!(
+            after
+                .saved_lot
+                .as_deref()
+                .is_none_or(|lot| decode_travel_envelope(lot).is_err()),
+            "the refused trip wrote a travel envelope"
         );
     }
 

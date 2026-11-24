@@ -95,9 +95,12 @@
 //!   0x1c), is saved to its neighbor record (0x425a69,
 //!   [`crate::people::save_to_record`]).
 //!
-//! Routine 24 (0x44ff6e), the outfit editor of dressers and clothing racks,
-//! is not ported: it needs the editor struct (0x408b3b), its 18 category
-//! accessors (0x40d4ff to 0x40e1f9) and its commit (0x409492).
+//! - 24 (0x44ff6e): the running person's outfit of category temp 0
+//!   becomes entry temp 1 of that category's wardrobe list, through the
+//!   outfit editor, and temp 1 becomes the index it wore. See
+//!   [`outfit_editor`].
+
+mod outfit_editor;
 
 use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
@@ -204,6 +207,10 @@ impl Machine<'_, '_> {
             )),
             23 => {
                 self.read_arrival_clock()?;
+                Ok(true)
+            }
+            24 => {
+                self.change_outfit()?;
                 Ok(true)
             }
             25 => {
