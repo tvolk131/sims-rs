@@ -1807,6 +1807,21 @@ impl App {
         if let Session::Shell(shell) = &mut self.session {
             redraw |= shell.pump_coop_restage();
             redraw |= shell.poll_background_saves();
+            // A trip a script asked for leaves the lot between ticks.
+            redraw |= shell.pump_trip_request();
+        } else if let Session::Standalone { game, .. } = &mut self.session
+            && game.trip_request().is_some()
+            && game.asking().is_none()
+            && game.asking_special_panel().is_none()
+        {
+            // A house opened alone has no neighborhood to travel in.
+            game.decline_trip();
+            game.show_notice(
+                "Travel",
+                "Travel needs the neighborhood: launch in Neighborhood mode to leave the lot."
+                    .to_owned(),
+            );
+            redraw = true;
         } else if let Session::Standalone { game, .. } = &mut self.session
             && let Some((host_house, host_family)) = game.pending_coop_restage()
         {
@@ -3173,7 +3188,7 @@ fn run() -> Result<(), String> {
         }
         if let Some(still) = config.still {
             let started = Instant::now();
-            let ran = game.run(still.ticks);
+            let ran = run_still(&mut game, still.ticks);
             eprintln!(
                 "sims-game: ran {ran} ticks in {:.2} s",
                 started.elapsed().as_secs_f32()
@@ -3302,7 +3317,7 @@ fn run() -> Result<(), String> {
         }
         if let Some(still) = config.still {
             let started = Instant::now();
-            let ran = game.run(still.ticks);
+            let ran = run_still(&mut game, still.ticks);
             eprintln!(
                 "sims-game: ran {ran} ticks in {:.1} s",
                 started.elapsed().as_secs_f32()
@@ -3688,6 +3703,31 @@ fn classify_lot_hotkey(
         },
         _ => None,
     }
+}
+
+/// Runs a headless still's ticks. A still has no neighborhood to travel
+/// in, so a trip a script asks for (Generic Sims Call 17) is reported and
+/// declined, and the lot plays on to the still's tick.
+fn run_still(game: &mut Game, ticks: u32) -> u32 {
+    let mut ran = 0;
+    loop {
+        ran += game.run(ticks - ran);
+        // A trip asked for on the still's last tick is reported too.
+        let Some(trip) = game.trip_request() else {
+            break;
+        };
+        eprintln!(
+            "sims-game: tick {ran}: a script asked to travel to house {} (caller {}); a headless still stays on the lot",
+            trip.house, trip.caller
+        );
+        // Once declined the trip is not reported again. Another needs a
+        // tick to ask for it, so the loop ends when no tick runs.
+        game.decline_trip();
+        if ran == ticks {
+            break;
+        }
+    }
+    ran
 }
 
 #[cfg(test)]

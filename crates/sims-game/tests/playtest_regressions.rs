@@ -421,10 +421,22 @@ fn magic_hole_and_downtown_pickers_use_real_graphical_destination_maps_end_to_en
         );
     }
 
-    // Clicking visitable Magic Town community lot 93 travels to lot 93 cleanly!
+    // Clicking visitable Magic Town community lot 93 travels to lot 93 cleanly:
+    // the pick itself does not travel, the Magic Hole's script asks for the
+    // trip (Generic Sims Call 17) a tick later, and the shell carries it out
+    // between ticks, as the window's loop does each frame.
     let _ = shell.press(lot_93_pt);
     let _ = shell.release(lot_93_pt);
     assert!(!shell.destination_picker_open());
+    for _ in 0..10 {
+        if shell.active_lot_house() != Some(5) {
+            break;
+        }
+        let game = shell.game_mut().expect("the Goth house");
+        assert!(game.stopped().is_none(), "lot halted: {:?}", game.stopped());
+        game.run(1);
+        shell.pump_trip_request();
+    }
     assert_eq!(
         shell.active_lot_house(),
         Some(93),
