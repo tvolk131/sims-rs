@@ -150,14 +150,16 @@ fn the_middle_ped_marker_places_an_arriving_family_once() {
     }
     assert_eq!(shell.active_lot_house(), Some(93));
     // The script asks for the jumper's trip (routine 17's mode 0): the
-    // jumper goes, with a companion if it holds one, not the household.
+    // jumper goes alone, not the household.
     let trip = shell.active_trip().expect("a trip to lot 93").clone();
-    assert_eq!(trip.leader_guid, jumper_guid);
     assert!(
-        trip.travelers.iter().all(|t| household.contains(&t.guid)),
-        "only the household travels: {:?}",
-        trip.travelers
+        household.len() > 1,
+        "the household has more than the jumper"
     );
+    assert!(household.contains(&jumper_guid));
+    assert_eq!(trip.leader_guid, jumper_guid);
+    let party: Vec<u32> = trip.travelers.iter().map(|t| t.guid).collect();
+    assert_eq!(party, vec![jumper_guid], "the jumper goes alone");
 
     let game = shell.game_mut().expect("lot 93");
     let travelers: Vec<u16> = {

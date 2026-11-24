@@ -43,8 +43,10 @@ travels by itself. The script's request is the trip.
    removed.
    - The pick is still recorded. The shell reads its picker only for how
      the trip goes, which picks the loading screen: the Magic Hole, the
-     blimp, or the star limo.
-   - The record is dropped when the trip departs, so the trip departs once.
+     blimp, or the star limo. It does so only when the picked lot is the
+     trip's house.
+   - The record is dropped when the trip is handled, departed or refused,
+     so the trip departs once and a stale pick never colours a later trip.
 4. **Refusals.** In these cases the shell shows a notice and declines the
    trip (`Game::decline_trip`), and the lot goes on:
    - co-op;
@@ -54,12 +56,17 @@ travels by itself. The script's request is the trip.
    - a failed departure.
 
    A house opened alone has no neighborhood, so the window declines its
-   trips with a notice.
-5. **A declined trip stays in the lot.** `sims_vm` clears a request only on
+   trips with a notice. A headless still (`--png`) reports the trip on
+   stderr, declines it, and runs on to the still's tick.
+5. **A declined trip stays declined.** `sims_vm` clears a request only on
    departure, and `Lot::world` is crate-private. `Game` therefore remembers
    the declined request and lets ticks run while the pending request is
-   that one. A later routine 17 merges into the request and changes it, so
-   the new request is carried out.
+   the same trip: the same house, leader, family and caller.
+   - A later routine 17 does not replace a pending request (`generic.rs`,
+     routine 17's merge). It only adds the neighbors it saved to
+     `saved`, which the comparison leaves out.
+   - So after a refusal no trip can be carried out until the lot is left
+     or reloaded. A retry needs the VM to drop the request (below).
 
 ## The dialog release latch (`0x5e45e1`–`0x5e45ed`)
 
@@ -98,7 +105,8 @@ two tests.
 - The shell lands on lot 21 with:
   - the caller as leader and only traveler;
   - `fare_paid` 0 and the script's fare taken once;
-  - no saved-state token written twice;
+  - the saved-state tokens (GUIDs and counts) routine 17 wrote on the
+    home lot, unchanged;
   - the request carried out, and no lot pick left behind.
 
 **A declined trip lets the lot play on.** On a house opened alone, the
@@ -114,7 +122,7 @@ for the caller alone.
 
 Two tests changed, because both assumed the shortcut:
 - `magic_town_arrival` expected the whole household to jump in. It now
-  checks that the marker places each of the trip's travelers once.
+  checks that the jumper goes alone and that the marker places them.
 - `playtest_regressions` expected travel on the click itself. Both now run
   frames until the script asks for the trip.
 
@@ -126,7 +134,13 @@ Two tests changed, because both assumed the shortcut:
   belongs with the VM's return path.
 - **Clearing a declined request in the lot.** `Lot` has no API to drop
   `World::trip_request`. A `Lot::cancel_trip_request` in sims-vm would let
-  `Game` drop its declined copy.
+  `Game` drop its declined copy, and let a Sim try again after a refusal.
+  Whether native keeps or drops a request its main loop refuses is not
+  read.
+- **The transport in the saved trip.** `depart_from_request` records the
+  default transport in `TravelSession` (the blimp or the studio shuttle).
+  The loading screen uses the picker's, but a reload of a saved trip does
+  not know it. Carrying it belongs in `sims_vm::travel`.
 - **The needs bars' trend arrows.** The 800 tour shot shows red arrows on
   three bars. The draw is now read and documented in
   `sims_ui::needs_history`:

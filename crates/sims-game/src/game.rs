@@ -2811,17 +2811,24 @@ impl Game {
     /// While one is pending no tick runs: [`Game::advance`] and
     /// [`Game::run`] stop after the tick that asked for it.
     pub fn trip_request(&self) -> Option<&sims_sim::TripRequest> {
-        self.lot
-            .world()
-            .trip_request
-            .as_ref()
-            .filter(|&trip| self.declined_trip.as_ref() != Some(trip))
+        self.lot.world().trip_request.as_ref().filter(|&trip| {
+            !self
+                .declined_trip
+                .as_ref()
+                .is_some_and(|d| same_trip(d, trip))
+        })
     }
 
     /// Lets the lot go on without carrying out the pending trip
     /// ([`Game::trip_request`]): a lot without a neighborhood, or a trip the
-    /// host refused. The lot keeps the request, so a later request merges
-    /// into it and is a new one to carry out.
+    /// host refused.
+    ///
+    /// The lot keeps the request: `sims_vm` clears it only on departure. A
+    /// later Generic Sims Call 17 does not replace a pending request; it only
+    /// adds the neighbors it saved (`saved`). So the trip stays declined,
+    /// whatever later calls add, until the lot is left or reloaded. A retry
+    /// needs the VM to drop the request (a `Lot::cancel_trip_request`, not
+    /// yet in sims-vm).
     pub fn decline_trip(&mut self) {
         self.declined_trip = self.lot.world().trip_request.clone();
     }
@@ -14363,9 +14370,53 @@ fn pet_breed_label(row: &str) -> String {
     known.to_owned()
 }
 
+/// Whether two trip requests are the same trip: the same house, party and
+/// caller. `saved` is left out, because a later Generic Sims Call 17 adds
+/// to a pending request's `saved` without changing the trip.
+fn same_trip(a: &sims_sim::TripRequest, b: &sims_sim::TripRequest) -> bool {
+    a.house == b.house
+        && a.leader_guid == b.leader_guid
+        && a.family == b.family
+        && a.caller == b.caller
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_trip_that_only_saved_more_is_the_same_trip() {
+        let trip = sims_sim::TripRequest {
+            house: 21,
+            leader_guid: 0x1234,
+            family: 0,
+            caller: 7,
+            saved: vec![1],
+        };
+        let mut merged = trip.clone();
+        merged.saved.push(2);
+        assert!(same_trip(&trip, &merged));
+        for other in [
+            sims_sim::TripRequest {
+                house: 22,
+                ..trip.clone()
+            },
+            sims_sim::TripRequest {
+                leader_guid: 0x4321,
+                ..trip.clone()
+            },
+            sims_sim::TripRequest {
+                family: 3,
+                ..trip.clone()
+            },
+            sims_sim::TripRequest {
+                caller: 8,
+                ..trip.clone()
+            },
+        ] {
+            assert!(!same_trip(&trip, &other), "{other:?}");
+        }
+    }
 
     fn ctss(entries: &[(u8, &str)]) -> sims_formats::strings::StringTable {
         sims_formats::strings::StringTable {

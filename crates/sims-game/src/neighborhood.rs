@@ -7261,13 +7261,16 @@ impl NeighborhoodShell {
         let Some(trip) = session.game.trip_request().cloned() else {
             return false;
         };
+        let house = u32::try_from(trip.house).unwrap_or(0);
         // The lot pick the script asked with only says how the trip goes, for
-        // the loading screen.
+        // the loading screen, and only when the trip goes to the lot picked.
+        // The pick is dropped either way, so a stale one never colours a
+        // later trip.
         let transport = session
             .game
             .take_pending_travel_lot()
+            .filter(|&(_, lot)| lot == house)
             .and_then(|(picker, _)| picker_transport(&picker));
-        let house = u32::try_from(trip.house).unwrap_or(0);
         let refusal = if session.game.coop_active() {
             Some("Leave the co-op session before traveling to a destination.".to_owned())
         } else if session.active_trip.is_some() {

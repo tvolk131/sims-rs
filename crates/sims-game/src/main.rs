@@ -3188,7 +3188,7 @@ fn run() -> Result<(), String> {
         }
         if let Some(still) = config.still {
             let started = Instant::now();
-            let ran = game.run(still.ticks);
+            let ran = run_still(&mut game, still.ticks);
             eprintln!(
                 "sims-game: ran {ran} ticks in {:.2} s",
                 started.elapsed().as_secs_f32()
@@ -3317,7 +3317,7 @@ fn run() -> Result<(), String> {
         }
         if let Some(still) = config.still {
             let started = Instant::now();
-            let ran = game.run(still.ticks);
+            let ran = run_still(&mut game, still.ticks);
             eprintln!(
                 "sims-game: ran {ran} ticks in {:.1} s",
                 started.elapsed().as_secs_f32()
@@ -3703,6 +3703,29 @@ fn classify_lot_hotkey(
         },
         _ => None,
     }
+}
+
+/// Runs a headless still's ticks. A still has no neighborhood to travel
+/// in, so a trip a script asks for (Generic Sims Call 17) is reported and
+/// declined, and the lot plays on to the still's tick.
+fn run_still(game: &mut Game, ticks: u32) -> u32 {
+    let mut ran = game.run(ticks);
+    while ran < ticks {
+        let Some(trip) = game.trip_request() else {
+            break;
+        };
+        eprintln!(
+            "sims-game: tick {ran}: a script asked to travel to house {} (caller {}); a headless still stays on the lot",
+            trip.house, trip.caller
+        );
+        game.decline_trip();
+        let more = game.run(ticks - ran);
+        if more == 0 {
+            break;
+        }
+        ran += more;
+    }
+    ran
 }
 
 #[cfg(test)]

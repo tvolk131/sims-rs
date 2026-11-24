@@ -61,6 +61,16 @@ fn saved_state(game: &Game, guid: u32) -> Vec<Item> {
         .collect()
 }
 
+/// The saved-state tokens of `guid`, as (GUID, count) in GUID order.
+fn tokens_of(game: &Game, guid: u32) -> Vec<(u32, u16)> {
+    let mut tokens: Vec<(u32, u16)> = saved_state(game, guid)
+        .iter()
+        .map(|t| (t.guid, t.count))
+        .collect();
+    tokens.sort_unstable();
+    tokens
+}
+
 /// The objects (in id order) whose pie menu offers `person` Go Downtown
 /// through the phone's Call Plugin, with that entry's action.
 fn go_downtown(game: &mut Game, person: u16) -> Vec<(u16, Interaction)> {
@@ -219,6 +229,9 @@ fn the_phones_go_downtown_leaves_the_lot_once_through_the_shell() {
     // carry out a trip the lot asked for.
     let mut frames = 0;
     let mut asked = false;
+    // The saved-state tokens routine 17 wrote, as the home lot held them
+    // when the trip was asked for.
+    let mut written: Option<Vec<(u32, u16)>> = None;
     while shell.active_lot_house() == Some(HOME) {
         frames += 1;
         assert!(frames < CALL_FRAMES, "the trip never departed");
@@ -235,6 +248,7 @@ fn the_phones_go_downtown_leaves_the_lot_once_through_the_shell() {
             assert_eq!(game.run(1), 0, "a tick ran with a trip pending");
             assert_eq!(game.advance(1_000_000), 0, "time ran with a trip pending");
             asked = true;
+            written.get_or_insert_with(|| tokens_of(game, leader_guid));
         }
         shell.pump_trip_request();
     }
@@ -261,15 +275,15 @@ fn the_phones_go_downtown_leaves_the_lot_once_through_the_shell() {
         game.take_pending_travel_lot().is_none(),
         "the lot pick departs once"
     );
-    // Routine 17 wrote one token for each value it saves; a second
-    // departure would write them again.
-    let tokens = saved_state(game, leader_guid);
-    assert!(!tokens.is_empty(), "the saved state traveled");
-    let mut guids: Vec<u32> = tokens.iter().map(|t| t.guid).collect();
-    guids.sort_unstable();
-    let before = guids.len();
-    guids.dedup();
-    assert_eq!(guids.len(), before, "a token was written twice: {tokens:?}");
+    // Routine 17 wrote one token for each value it saves, and the trip
+    // carries exactly those (GUIDs and counts) to the destination.
+    let written = written.expect("the trip was asked for");
+    assert!(!written.is_empty(), "routine 17 saved the caller's state");
+    assert_eq!(
+        tokens_of(game, leader_guid),
+        written,
+        "the saved state traveled as routine 17 wrote it"
+    );
     // The Downtown lot plays on.
     assert_eq!(game.run(10), 10);
 }
