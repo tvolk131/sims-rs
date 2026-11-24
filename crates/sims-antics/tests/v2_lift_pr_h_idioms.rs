@@ -409,3 +409,216 @@ fn a_tree_run_by_name_keeps_its_name_table() {
         report.trees
     );
 }
+
+/// `iff`'s chunks (without its resource map), edited by `edit`, plus `extra` at the end.
+fn rebuild(iff: &Iff, mut edit: impl FnMut(&mut ChunkData), extra: Vec<ChunkData>) -> Iff {
+    let mut chunks: Vec<ChunkData> = iff
+        .chunks
+        .iter()
+        .filter(|c| &c.tag != b"rsmp")
+        .map(|c| ChunkData {
+            tag: c.tag,
+            id: c.id,
+            flags: c.flags,
+            label: c.label.clone(),
+            data: iff.data(c).to_vec(),
+        })
+        .collect();
+    chunks.iter_mut().for_each(&mut edit);
+    chunks.extend(extra);
+    Iff::parse(sims_formats::iff::write(&chunks).expect("write IFF")).expect("parse IFF")
+}
+
+fn proven(check: &TreeCheck) -> bool {
+    matches!(check, TreeCheck::Identical | TreeCheck::Equivalent)
+}
+
+/// The rebuilt object's file.
+fn rebuilt(report: &sims_antics::v2::DecompileV2Report) -> Iff {
+    compile(&report.source)
+}
+
+#[test]
+fn a_tree_run_by_name_is_proven_only_with_the_tree_it_runs() {
+    // `Pump` reads a string table the lift cannot reproduce (its chunk is marked
+    // deleted), so it is not proven; neither is a caller that runs it by name, nor
+    // primitives that look up a fixed name (Go To Routing Slot, Reach) finding it.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_0130;
+    strings 300 "Lines" {
+        a = "A",
+    }
+    strings 303 "Tree names" {
+        pump = "Pump",
+    }
+    @id(4300) @frame(locals: 0) tree pump "Pump" {
+        raw { op 0x0015 (0x2c, 0x01, 0, 0, 0, 0, 0, 0); }
+    }
+    @id(4301) @frame(locals: 0) tree caller "Caller" {
+        raw { run_tree_by_name(table: 303, index: 1, mode: 0); }
+    }
+    @id(4302) @frame(locals: 0) tree ask "route ask to move animation" {
+        raw { op 0x0015 (0x2c, 0x01, 0, 0, 0, 0, 0, 0); }
+    }
+    @id(4303) @frame(locals: 0) tree route "Route" {
+        raw { op 0x002d (0, 0, 0, 0, 0, 0, 0, 0); }
+    }
+    @id(4304) @frame(locals: 0) tree grab "CT - Grab" {
+        raw { op 0x0015 (0x2c, 0x01, 0, 0, 0, 0, 0, 0); }
+    }
+    @id(4305) @frame(locals: 0) tree reach "Reach" {
+        raw { op 0x002f (0, 0, 0, 0, 0, 0, 0, 0); }
+    }
+}"#;
+    let original = rebuild(
+        &compile(source),
+        |c| {
+            if &c.tag == b"STR#" && c.id == 300 {
+                c.flags |= sims_formats::iff::DELETED;
+            }
+        },
+        Vec::new(),
+    );
+    let report = report(&original);
+    for id in [4300, 4302, 4304] {
+        assert!(!proven(check_of(&report, id)), "{:?}", report.trees);
+    }
+    for id in [4301, 4303, 4305] {
+        assert!(
+            matches!(check_of(&report, id), TreeCheck::Inconclusive(why) if why.contains("not proven")),
+            "{id}: {:?}",
+            report.trees
+        );
+    }
+}
+
+#[test]
+fn a_lookup_tries_exact_names_before_ignoring_case() {
+    // Labelled `mAiN`, the original's `main` is found for `Main` only after every file's
+    // exact pass (a global `Main` would win); rebuilt as `Main` it wins at once.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_0131;
+    strings 303 "Tree names" {
+        main = "Main",
+    }
+    @id(4200) main { temp[0] = 1; }
+    @id(4301) @frame(locals: 0) tree caller "Caller" {
+        raw { run_tree_by_name(table: 303, index: 1, mode: 0); }
+    }
+}"#;
+    let report = report(&relabel(&compile(source), 4200, "mAiN"));
+    assert!(
+        matches!(check_of(&report, 4301), TreeCheck::Inconclusive(why) if why.contains("by name")),
+        "{:?}",
+        report.trees
+    );
+}
+
+#[test]
+fn a_deleted_last_chunk_names_its_tree() {
+    // The VM keeps the last BHAV chunk of an ID, deleted or not, so this file's tree
+    // 4300 is labelled `Gone`: the caller is proven only if the rebuilt file agrees.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_0132;
+    strings 303 "Tree names" {
+        pump = "Pump",
+    }
+    @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 1; }
+    @id(4301) @frame(locals: 0) tree caller "Caller" {
+        raw { run_tree_by_name(table: 303, index: 1, mode: 0); }
+    }
+}"#;
+    let iff = compile(source);
+    let pump = iff.all(b"BHAV").find(|c| c.id == 4300).expect("pump");
+    let gone = ChunkData {
+        tag: *b"BHAV",
+        id: 4300,
+        flags: sims_formats::iff::DELETED,
+        label: "Gone".to_owned(),
+        data: iff.data(pump).to_vec(),
+    };
+    let original = rebuild(&iff, |_| {}, vec![gone]);
+    let report = report(&original);
+    let rebuilt = rebuilt(&report);
+    let label = rebuilt
+        .chunks
+        .iter()
+        .rev()
+        .find(|c| &c.tag == b"BHAV" && c.id == 4300)
+        .map(|c| c.label.clone());
+    if label.as_deref() != Some("Gone") {
+        assert!(!proven(check_of(&report, 4301)), "{:?}", report.trees);
+    }
+}
+
+/// The trees an object's `init` and `main` callbacks run, the VM's way: its OBJf
+/// table when it has one, else the OBJD's own words.
+fn init_and_main(iff: &Iff) -> (u16, u16) {
+    let objd = iff.chunks.iter().find(|c| &c.tag == b"OBJD").expect("OBJD");
+    if let Some(table) = iff.get(b"OBJf", objd.id) {
+        let entries = sims_formats::execution::ObjectFunctions::parse(iff.data(table))
+            .expect("OBJf")
+            .entries;
+        let action = |i: usize| entries.get(i).map_or(0, |f| f.action);
+        return (action(0), action(1));
+    }
+    let data = iff.data(objd);
+    let word = |at: usize| u16::from_le_bytes([data[at], data[at + 1]]);
+    (word(0x56), word(0x0a))
+}
+
+#[test]
+fn a_callback_tree_is_proven_only_where_the_rebuilt_object_runs_it() {
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_0133;
+    @id(4200) main { temp[0] = 1; }
+    @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 2; }
+}"#;
+    let iff = compile(source);
+    // One tree as both `init` and `main`.
+    let shared = rebuild(
+        &iff,
+        |c| {
+            if &c.tag == b"OBJD" {
+                c.data[0x56..0x58].copy_from_slice(&4200u16.to_le_bytes());
+            }
+        },
+        Vec::new(),
+    );
+    let lifted = report(&shared);
+    if proven(check_of(&lifted, 4200)) {
+        assert_eq!(init_and_main(&rebuilt(&lifted)), (4200, 4200));
+    }
+    // An OBJf table naming `Pump` as `main` overrides the OBJD's words.
+    let objd = iff.chunks.iter().find(|c| &c.tag == b"OBJD").expect("OBJD");
+    let mut table = Vec::new();
+    for word in [0u32, 0] {
+        table.extend(word.to_le_bytes());
+    }
+    table.extend(b"fJBO");
+    table.extend(2u32.to_le_bytes());
+    for (condition, action) in [(0u16, 0u16), (0, 4300)] {
+        table.extend(condition.to_le_bytes());
+        table.extend(action.to_le_bytes());
+    }
+    let objf = ChunkData {
+        tag: *b"OBJf",
+        id: objd.id,
+        flags: 0,
+        label: String::new(),
+        data: table,
+    };
+    let overridden = rebuild(&iff, |_| {}, vec![objf]);
+    assert_eq!(init_and_main(&overridden).1, 4300);
+    let report = report(&overridden);
+    for id in [4200, 4300] {
+        if proven(check_of(&report, id)) {
+            assert_eq!(
+                init_and_main(&rebuilt(&report)).1,
+                4300,
+                "{id}: {:?}",
+                report.trees
+            );
+        }
+    }
+}
