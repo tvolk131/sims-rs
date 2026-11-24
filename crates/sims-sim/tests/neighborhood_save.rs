@@ -10,7 +10,7 @@ use sims_formats::neighborhood::{Family, Inventory, InventoryItem, Neighbor, Rel
 use sims_formats::neighborhood_file::{NeighborhoodFile, parse_family_name};
 use sims_formats::tatt::{Entry, Tatt};
 use sims_sim::characters::Characters;
-use sims_sim::neighborhood_save::SaveInputs;
+use sims_sim::neighborhood_save::{SAVE_INPUTS_FORMAT, SaveInputs, TEMPORARY_FILE};
 use sims_sim::{NeighborhoodStore, StoredNeighborhood};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -363,9 +363,11 @@ fn an_imported_save_is_saved_again_byte_for_byte() {
     let db = TempDb::new("ud2");
     let store = NeighborhoodStore::open(&db.0).unwrap();
     store.import_directory("UD2", &folder, 0xff).unwrap();
-    let neighborhood = store.load_neighborhood("UD2").unwrap().unwrap();
-    let inputs = SaveInputs::from_saved(&recorded).unwrap();
-    let written = neighborhood.neighborhood_iff(&inputs).unwrap();
+    // Everything the save needs comes from the store: the record and the
+    // save inputs the import kept.
+    let out = TempDir::new("ud2-out");
+    let path = store.save_neighborhood_iff("UD2", &out.0).unwrap();
+    let written = std::fs::read(&path).unwrap();
     let first = written.iter().zip(&recorded).position(|(a, b)| a != b);
     assert!(
         written == recorded,
@@ -373,4 +375,213 @@ fn an_imported_save_is_saved_again_byte_for_byte() {
         written.len(),
         recorded.len()
     );
+    assert_eq!(
+        store.load_save_inputs("UD2").unwrap(),
+        SaveInputs::from_saved(&recorded).unwrap()
+    );
+    assert!(!out.0.join(TEMPORARY_FILE).exists());
+}
+
+/// The import keeps each FAMh (and the rest of the save inputs) in the
+/// store, and the store's save writes them back through `NTemp.iff`
+/// onto `Neighborhood.iff`, replacing the old file.
+#[test]
+fn the_store_keeps_family_histories_and_saves_through_the_temporary_file() {
+    let neighborhood = sample();
+    let mut inputs = SaveInputs::default();
+    inputs.histories.insert(1, vec![9, 8, 7, 6, 5]);
+    inputs.histories.insert(3, vec![1, 2, 3, 4]);
+    inputs.uninitialized.neighbor_names = vec![0x5a, 0xa5, 0x3c];
+    inputs.uninitialized.family_names.insert(1, 0x77);
+    let bytes = neighborhood.neighborhood_iff(&inputs).unwrap();
+
+    let folder = TempDir::new("histories");
+    std::fs::write(folder.0.join("Neighborhood.iff"), &bytes).unwrap();
+    let db = TempDb::new("histories");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store.import_directory("Hood", &folder.0, 0xff).unwrap();
+    let kept = store.load_save_inputs("Hood").unwrap();
+    assert_eq!(kept.histories, inputs.histories);
+    assert_eq!(kept, SaveInputs::from_saved(&bytes).unwrap());
+
+    let out = TempDir::new("histories-out");
+    std::fs::write(out.0.join("Neighborhood.iff"), b"old").unwrap();
+    let path = store.save_neighborhood_iff("Hood", &out.0).unwrap();
+    assert_eq!(path, out.0.join("Neighborhood.iff"));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert!(!out.0.join(TEMPORARY_FILE).exists());
+
+    // A family that moves in from a `.FAM` file brings its FAMh.
+    store
+        .update_save_inputs("Hood", |inputs| {
+            inputs.histories.insert(2, vec![0x42; 6]);
+        })
+        .unwrap();
+    store.save_neighborhood_iff("Hood", &out.0).unwrap();
+    let iff = Iff::parse(std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(iff.data(iff.get(b"FAMh", 2).unwrap()), [0x42; 6]);
+
+    // Deleting the neighborhood forgets them; there is none to save to.
+    assert!(store.delete_neighborhood("Hood").unwrap());
+    assert_eq!(
+        store.load_save_inputs("Hood").unwrap(),
+        SaveInputs::default()
+    );
+    assert!(store.update_save_inputs("Hood", |_| {}).is_err());
+    assert!(store.save_neighborhood_iff("Hood", &out.0).is_err());
+}
+
+/// Save inputs are stored with their version, and another version is
+/// refused rather than misread.
+#[test]
+fn save_inputs_round_trip_and_refuse_another_version() {
+    let mut inputs = SaveInputs::default();
+    inputs.histories.insert(4, vec![1, 2, 3]);
+    inputs.option_bytes = vec![0, 2, 1];
+    inputs.family_names.insert(4, " Name ".to_owned());
+    inputs.uninitialized.map_padding = vec![7, 7];
+    let encoded = inputs.encode();
+    assert_eq!(encoded[..4], SAVE_INPUTS_FORMAT.to_le_bytes());
+    assert_eq!(SaveInputs::decode(&encoded).unwrap(), inputs);
+
+    let mut other = encoded.clone();
+    other[..4].copy_from_slice(&(SAVE_INPUTS_FORMAT + 1).to_le_bytes());
+    assert!(SaveInputs::decode(&other).is_err());
+    let mut trailing = encoded;
+    trailing.push(0);
+    assert!(SaveInputs::decode(&trailing).is_err());
+    assert!(SaveInputs::decode(&[1, 0]).is_err());
+}
+
+/// A `Neighborhood.iff` the save did not write still gives its FAMh, its
+/// names and their last bytes.
+#[test]
+fn a_file_the_save_did_not_write_gives_what_reads() {
+    let mut name = vec![0xfd, 0xff, 1, 0, 1];
+    name.extend(b"Rho\0\0");
+    name.push(0x33);
+    let iff = |chunks: &[(&[u8; 4], u16, &[u8])]| {
+        let mut bytes =
+            b"IFF FILE 2.5:TYPE FOLLOWED BY SIZE\0 JAMIE DOORNBOS & MAXIS 1\0\0\0\0".to_vec();
+        for (tag, id, data) in chunks {
+            bytes.extend(*tag);
+            bytes.extend((76 + data.len() as u32).to_be_bytes());
+            bytes.extend(id.to_be_bytes());
+            bytes.extend(0x10u16.to_be_bytes());
+            bytes.extend([0; 64]);
+            bytes.extend(*data);
+        }
+        bytes
+    };
+    let bytes = iff(&[(b"FAMh", 6, &[5, 4, 3]), (b"FAMs", 6, &name)]);
+    let inputs = SaveInputs::from_file(&bytes).unwrap();
+    assert_eq!(inputs.histories[&6], [5, 4, 3]);
+    assert_eq!(inputs.family_names[&6], "Rho");
+    assert_eq!(inputs.uninitialized.family_names[&6], 0x33);
+    assert!(inputs.option_bytes.is_empty());
+}
+
+/// A family the store drops takes its FAMh and name with it, so a family
+/// that later takes its ID saves none of them.
+#[test]
+fn a_dropped_family_takes_its_history_and_name_with_it() {
+    let mut inputs = SaveInputs::default();
+    inputs.histories.insert(1, vec![1, 1]);
+    inputs.histories.insert(3, vec![3, 3, 3]);
+    inputs.family_names.insert(3, " Gamma ".to_owned());
+    inputs.uninitialized.family_names.insert(3, 0x44);
+    let bytes = sample().neighborhood_iff(&inputs).unwrap();
+
+    let folder = TempDir::new("dropped");
+    std::fs::write(folder.0.join("Neighborhood.iff"), &bytes).unwrap();
+    let db = TempDb::new("dropped");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store.import_directory("Hood", &folder.0, 0xff).unwrap();
+    assert!(
+        store
+            .load_save_inputs("Hood")
+            .unwrap()
+            .histories
+            .contains_key(&3)
+    );
+
+    // Dropped: family 3's entries go; family 1's stay.
+    let mut state = store.load_neighborhood("Hood").unwrap().unwrap();
+    let gamma = state.families.remove(&3).unwrap();
+    store.save_neighborhood("Hood", &state).unwrap();
+    let kept = store.load_save_inputs("Hood").unwrap();
+    assert!(!kept.histories.contains_key(&3));
+    assert!(!kept.family_names.contains_key(&3));
+    assert!(!kept.uninitialized.family_names.contains_key(&3));
+    assert_eq!(kept.histories[&1], [1, 1]);
+
+    // A new family 3 saves no FAMh.
+    let mut state = store.load_neighborhood("Hood").unwrap().unwrap();
+    state.families.insert(3, gamma);
+    store.save_neighborhood("Hood", &state).unwrap();
+    let out = TempDir::new("dropped-out");
+    let path = store.save_neighborhood_iff("Hood", &out.0).unwrap();
+    let iff = Iff::parse(std::fs::read(&path).unwrap()).unwrap();
+    assert!(iff.get(b"FAMh", 3).is_none());
+    assert!(iff.get(b"FAMh", 1).is_some());
+}
+
+/// A rename that fails (here onto a folder named `Neighborhood.iff`)
+/// leaves no `NTemp.iff` behind.
+#[test]
+fn a_failed_save_leaves_no_temporary_file() {
+    let out = TempDir::new("failed-save");
+    std::fs::create_dir(out.0.join("Neighborhood.iff")).unwrap();
+    let result = sample().save_neighborhood_iff(&out.0, &SaveInputs::default());
+    assert!(result.is_err());
+    assert!(!out.0.join(TEMPORARY_FILE).exists());
+    assert!(out.0.join("Neighborhood.iff").is_dir());
+}
+
+/// A moved-in family's FAMh may be stored before the family is committed:
+/// the commit that adds the family keeps it.
+#[test]
+fn a_history_stored_before_its_family_is_kept() {
+    let bytes = sample().neighborhood_iff(&SaveInputs::default()).unwrap();
+    let folder = TempDir::new("staged");
+    std::fs::write(folder.0.join("Neighborhood.iff"), &bytes).unwrap();
+    let db = TempDb::new("staged");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store.import_directory("Hood", &folder.0, 0xff).unwrap();
+
+    store
+        .update_save_inputs("Hood", |inputs| {
+            inputs.histories.insert(7, vec![7; 5]);
+        })
+        .unwrap();
+    let mut state = store.load_neighborhood("Hood").unwrap().unwrap();
+    state.families.insert(7, family(0, 2, vec![0x1000_0007]));
+    store.save_neighborhood("Hood", &state).unwrap();
+    assert_eq!(
+        store.load_save_inputs("Hood").unwrap().histories[&7],
+        [7; 5]
+    );
+}
+
+/// A `NTemp.iff` left as a link to `Neighborhood.iff` is replaced, not
+/// written through.
+#[cfg(unix)]
+#[test]
+fn a_linked_temporary_file_is_not_written_through() {
+    let out = TempDir::new("linked");
+    let target = out.0.join("Neighborhood.iff");
+    std::fs::write(&target, b"old").unwrap();
+    let elsewhere = out.0.join("Other.iff");
+    std::fs::write(&elsewhere, b"other").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, out.0.join(TEMPORARY_FILE)).unwrap();
+    let inputs = SaveInputs::default();
+    let path = sample().save_neighborhood_iff(&out.0, &inputs).unwrap();
+    assert_eq!(path, target);
+    assert_eq!(std::fs::read(&elsewhere).unwrap(), b"other");
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        sample().neighborhood_iff(&inputs).unwrap()
+    );
+    assert!(!std::fs::symlink_metadata(&target).unwrap().is_symlink());
+    assert!(std::fs::symlink_metadata(out.0.join(TEMPORARY_FILE)).is_err());
 }

@@ -7,14 +7,16 @@
 //! - `sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result] [--ignore-frame-residue]`
-//! - `sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--global <Global.iff>] [--semi-global <semi.iff>] [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--ignore-fault-last-result] [--behavioral] [--param-domain <tree>:<index>=<set>]... [--assume-equiv <id[,id...]>] [--v2-enum-domains <file.antics> [--pack <pack_dir>]] [--all]`
+//! - `sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--global <Global.iff>] [--semi-global <semi.iff>] [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--ignore-fault-last-result] [--ignore-fault-scratch-pointer] [--behavioral] [--param-domain <tree>:<index>=<set>]... [--assume-equiv <id[,id...]>] [--v2-enum-domains <file.antics> [--pack <pack_dir>]] [--all]`
 //!   (exit 0 equivalent, 1 different, 2 inconclusive or error). `--behavioral` compares
 //!   without node numbers and frame storage (`docs/decisions/20261123-verifier-behavioral-mode.md`).
 //!   The domain flags assume parameter values on entry and print every assumption
 //!   (`docs/decisions/20261124-verifier-domains-and-speed.md`). `--assume-equiv` assumes
-//!   private trees behave the same and `--ignore-fault-last-result` that nothing reads a
-//!   faulting path's last result; both print `ASSUME:` lines
-//!   (`docs/decisions/20261124-verifier-pilot-upgrades.md`).
+//!   private trees behave the same, `--ignore-fault-last-result` that nothing reads a
+//!   faulting path's last result and `--ignore-fault-scratch-pointer` that nothing reads
+//!   its scratch-pointer state; each prints an `ASSUME:` line
+//!   (`docs/decisions/20261124-verifier-pilot-upgrades.md`,
+//!   `docs/decisions/20261124-verifier-round2.md`).
 //!   Only files that differ in BHAV bodies alone are compared; DIFFERENT is reported only when both trees, run in
 //!   sims-vm from the same world, end differently; EQUIVALENT assumes neither run
 //!   exhausts the VM's instruction budget.
@@ -174,7 +176,7 @@ fn print_usage() {
          sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result] [--ignore-frame-residue]\n  \
-         sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--global <Global.iff>] [--semi-global <semi.iff>] [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--ignore-fault-last-result] [--behavioral] [--param-domain <tree>:<index>=<set>]... [--assume-equiv <id[,id...]>] [--v2-enum-domains <file.antics> [--pack <pack_dir>]] [--all]   (exit 0 equivalent, 1 different, 2 inconclusive)\n    \
+         sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--global <Global.iff>] [--semi-global <semi.iff>] [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--ignore-fault-last-result] [--ignore-fault-scratch-pointer] [--behavioral] [--param-domain <tree>:<index>=<set>]... [--assume-equiv <id[,id...]>] [--v2-enum-domains <file.antics> [--pack <pack_dir>]] [--all]   (exit 0 equivalent, 1 different, 2 inconclusive)\n    \
              (files must differ in BHAV bodies alone; DIFFERENT needs a sims-vm replay that ends differently;\n    \
               EQUIVALENT assumes neither run exhausts the VM instruction budget; the same holds for equiv;\n    \
               a tree is EQUIVALENT only if every tree it may run is the same bytes or proven equivalent too;\n    \
@@ -191,8 +193,9 @@ fn print_usage() {
               --v2-enum-domains assumes it for every enum-typed parameter of the file's trees: EQUIVALENT then\n    \
               holds only for such runs; every assumption is printed, with how the files' own calls stand against it;\n    \
               --assume-equiv assumes the listed private trees behave the same (unless shown to differ), and\n    \
-              --ignore-fault-last-result that nothing reads the last result a faulting path leaves: both are\n    \
-              printed as ASSUME lines; an INCONCLUSIVE run names the trees it is EQUIVALENT modulo)\n  \
+              --ignore-fault-last-result that nothing reads the last result a faulting path leaves, and\n    \
+              --ignore-fault-scratch-pointer that nothing reads the scratch-pointer state it leaves: each is\n    \
+              printed as an ASSUME line; an INCONCLUSIVE run names the trees it is EQUIVALENT modulo)\n  \
          sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv] [--globals <Global.iff|archive.far[!member.iff]>] [--semiglobal <file.iff|archive.far!member.iff>] [--no-catalog]   (lifts to .air Antics IR)\n  \
          sims-antics lift --v2 <file.iff|archive.far> [--entry <name.iff>] [--install <dir>] [--globals ...] [--semiglobal ...] [--no-catalog]   (decompiles an object to checked .antics v2)\n  \
          sims-antics build <pack_dir> --out <dir>\n  \
@@ -2619,6 +2622,11 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
                 }
                 "--ignore-fault-last-result" => {
                     opts.live.observe_fault_last_result = false;
+                    i += 1;
+                    continue;
+                }
+                "--ignore-fault-scratch-pointer" => {
+                    opts.live.observe_fault_scratch_pointer = false;
                     i += 1;
                     continue;
                 }
