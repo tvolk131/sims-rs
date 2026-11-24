@@ -3709,8 +3709,10 @@ fn classify_lot_hotkey(
 /// in, so a trip a script asks for (Generic Sims Call 17) is reported and
 /// declined, and the lot plays on to the still's tick.
 fn run_still(game: &mut Game, ticks: u32) -> u32 {
-    let mut ran = game.run(ticks);
-    while ran < ticks {
+    let mut ran = 0;
+    loop {
+        ran += game.run(ticks - ran);
+        // A trip asked for on the still's last tick is reported too.
         let Some(trip) = game.trip_request() else {
             break;
         };
@@ -3718,12 +3720,12 @@ fn run_still(game: &mut Game, ticks: u32) -> u32 {
             "sims-game: tick {ran}: a script asked to travel to house {} (caller {}); a headless still stays on the lot",
             trip.house, trip.caller
         );
+        // Once declined the trip is not reported again. Another needs a
+        // tick to ask for it, so the loop ends when no tick runs.
         game.decline_trip();
-        let more = game.run(ticks - ran);
-        if more == 0 {
+        if ran == ticks {
             break;
         }
-        ran += more;
     }
     ran
 }

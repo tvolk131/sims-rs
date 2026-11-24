@@ -57,7 +57,8 @@ travels by itself. The script's request is the trip.
 
    A house opened alone has no neighborhood, so the window declines its
    trips with a notice. A headless still (`--png`) reports the trip on
-   stderr, declines it, and runs on to the still's tick.
+   stderr, declines it, and runs on to the still's tick. A trip asked
+   for on the last tick is reported the same way.
 5. **A declined trip stays declined.** `sims_vm` clears a request only on
    departure, and `Lot::world` is crate-private. `Game` therefore remembers
    the declined request and lets ticks run while the pending request is
@@ -137,10 +138,22 @@ Two tests changed, because both assumed the shortcut:
   `Game` drop its declined copy, and let a Sim try again after a refusal.
   Whether native keeps or drops a request its main loop refuses is not
   read.
-- **The transport in the saved trip.** `depart_from_request` records the
-  default transport in `TravelSession` (the blimp or the studio shuttle).
-  The loading screen uses the picker's, but a reload of a saved trip does
-  not know it. Carrying it belongs in `sims_vm::travel`.
+- **The transport in the departure.** `depart_from_request` departs with
+  the destination's default transport (the blimp or the studio shuttle).
+  The loading screen uses the picker's, but the arrival does not: a Magic
+  Hole trip to a Magic Town lot with both anchors can place its travelers
+  at the cab stop, and the saved `TravelSession` records the default.
+  The transport should come with the request routine 17 makes. That would
+  also stop a stale pick of the same house, left by a script that exited
+  before routine 17, from choosing the loading screen. This belongs in
+  `sims_vm::travel`.
+- **The shell's dialog answers at the destination.** `depart_from_request`
+  boots the destination with the answer list `[3]`. The shell's old
+  departure passed its own list, which in the window is empty. So the
+  destination's first choice dialog can be answered for the player.
+  `Lot` has no public way to set a choice list after boot (`replay_dialogs`
+  also queues one-button notices). `depart_from_request` should take the
+  shell's answers and frame schedule.
 - **The needs bars' trend arrows.** The 800 tour shot shows red arrows on
   three bars. The draw is now read and documented in
   `sims_ui::needs_history`:
