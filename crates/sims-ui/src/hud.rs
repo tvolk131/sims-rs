@@ -33,10 +33,11 @@ pub const TALL_STRIP: i32 = 150;
 /// pixels and the needs panel after it. Measured on the original's screen
 /// (the old prototype used 388).
 pub const NEEDS_WIDTH: i32 = 387;
-/// The live subpanel's place in the strip and its width at 800 by 600
-/// (0x517e3d, 0x517d9e).
-const SUBPANEL_X: i32 = 300;
+/// The live subpanel's width at 800 by 600 (0x517d9e), and so how far
+/// past the gadget's left edge it starts: at 800 by 600 that is the
+/// strip's 300 (0x517e3d), one pixel under the gadget's right edge.
 const SUBPANEL_WIDTH: i32 = 280;
+const SUBPANEL_FROM_GADGET: i32 = NEEDS_WIDTH - SUBPANEL_WIDTH;
 
 /// Resources the panel draws (`UIGraphics/Res_CPanel.h`).
 pub mod id {
@@ -1196,8 +1197,8 @@ pub fn balloon_objects(items: &[Item]) -> impl Iterator<Item = u32> + '_ {
 }
 
 /// The live-mode strip: portraits at the left, the gadget and the subpanel
-/// to its right. At width 800 the gadget sits at `x = 413` with a 279 px
-/// subpanel; at width 1024 (`0x518f40..0x518f48`, `0x51f258..0x51f260`,
+/// to its right. At width 800 the gadget sits at `x = 413` with a 280 px
+/// subpanel from 520; at width 1024 (`0x518f40..0x518f48`, `0x51f258..0x51f260`,
 /// `0x51f527..0x51f52f`) the gadget stays at `x = 413` and the subpanel
 /// widens by 224 px (`0xe0`). Any wider viewport keeps the gadget anchored
 /// beside the 4-column portrait block at `x = 413` and gives the extra width
@@ -1208,20 +1209,21 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
         .saturating_add(strip.width)
         .saturating_sub(800)
         .max(0);
-    // The subpanel (0x517d9e, 0x517e3d): (0, 50, 280, 150) in a holder at
-    // (300, 0) of the 150-high live panel at the strip's left, so 280 by
-    // 100 from 300 into the strip, a pixel under the gadget's right edge,
-    // and 224 wider at 1024 (0x51f258..0x51f260).
-    let subpanel = Rect::new(
-        strip.x.saturating_add(SUBPANEL_X),
-        strip.y,
-        SUBPANEL_WIDTH + extra,
-        STRIP,
-    );
     let gadget = Rect::new(
         strip.x + strip.width - (NEEDS_WIDTH + extra),
         strip.y,
         108,
+        STRIP,
+    );
+    // The subpanel (0x517d9e, 0x517e3d): (0, 50, 280, 150) in a holder at
+    // (300, 0) of the 150-high live panel at the strip's left, so 280 by
+    // 100 from 300 into the strip, a pixel under the gadget's right edge,
+    // and 224 wider at 1024 (0x51f258..0x51f260). Held to the gadget, as
+    // the hit test is, so a window narrower than 800 keeps them together.
+    let subpanel = Rect::new(
+        gadget.x.saturating_add(SUBPANEL_FROM_GADGET),
+        strip.y,
+        SUBPANEL_WIDTH + extra,
         STRIP,
     );
     // The portraits, 45 by 45 from (9, 5) in a strip (the old prototype's
@@ -2056,8 +2058,9 @@ const FACT_SIZE: [i32; 2] = [80, 16];
 
 /// Draws the house panel (0x52e49e) in the subpanel `panel`.
 ///
-/// - **Ratings:** each rating's label, in the labels' font, sized to its
-///   text with its right end 3 left of its bar (0x52e0bb); the empty bar
+/// - **Ratings:** each rating's label, in the labels' font, in a text box
+///   the font's measure wide (`+0x68`) and its line high (`+0x58`), its
+///   right end 3 left of its bar (0x52e0bb..0x52e10c); the empty bar
 ///   ([`id::RATING_EMPTY`]); and the full bar ([`id::TRAIT_FULL`]) over
 ///   it, cut to 4 pixels a tenth: the rating kept to 0 to 100, over 10,
 ///   times 4, at most the bar's width. A rating not ported draws its
@@ -2068,11 +2071,11 @@ const FACT_SIZE: [i32; 2] = [80, 16];
 ///   converted to square meters, as the original does where the
 ///   language measures in meters.
 ///
-/// The facts are centred in their boxes by the rows an "A" inks, as the
-/// original's text boxes are (0x5e3f42..0x5e3f78).
+/// The labels and facts are centred in their boxes by the rows an "A"
+/// inks, as the original's text boxes are (0x5e3f42..0x5e3f78), and
+/// placed by the font's measure ([`Font::box_width`]).
 ///
-/// **Unverified:** the labels' color (the needs labels' is taken), and
-/// that the rating labels sit at their tops.
+/// **Unverified:** the labels' color (the needs labels' is taken).
 fn draw_house(frame: &mut Frame, art: &Art, panel: Rect, house: &House) {
     let (Some(font), Some(empty), Some(full)) = (
         art.font(HOUSE_FONT),
@@ -2090,7 +2093,9 @@ fn draw_house(frame: &mut Frame, art: &Art, panel: Rect, house: &House) {
         // as a text box's is.
         let top = panel.y.saturating_add(RATING_TOPS[n]);
         let label = [
-            bar[0].saturating_sub(3).saturating_sub(font.width(name)),
+            bar[0]
+                .saturating_sub(3)
+                .saturating_sub(font.box_width(name)),
             text_box_y(font, top, font.line_height),
         ];
         font.draw(frame, name, label, LABEL);
@@ -2112,7 +2117,7 @@ fn draw_house(frame: &mut Frame, art: &Art, panel: Rect, house: &House) {
         let [w, h] = FACT_SIZE;
         let [x, y] = at([0, top]);
         let place = [
-            x.saturating_add(w - font.width(text)),
+            x.saturating_add(w - font.box_width(text)),
             text_box_y(font, y, h),
         ];
         font.draw(frame, text, place, LABEL);
@@ -2316,8 +2321,8 @@ fn interests(
     let rows = 3usize;
     let left = arrow_w + 6;
     let right = panel.width - arrow_w - 4;
-    // 0x519251 / 0x519274: 2 columns (6/page) at 800 px (`panel.width == 279`),
-    // 3 columns (9/page) at 1024 px (`panel.width == 503`), never exceeding
+    // 0x519251 / 0x519274: 2 columns (6/page) at 800 px (`panel.width == 280`),
+    // 3 columns (9/page) at 1024 px (`panel.width == 504`), never exceeding
     // the columns that fit strictly inside `left..right` at intermediate widths
     // such as 880 px.
     let max_fit = ((right - left + 3) / col_stride).max(1) as usize;
@@ -2419,8 +2424,8 @@ fn gifts(items: &mut Vec<Item>, panel: Rect, snapshot: &Snapshot, controls: &Con
     let cell_w = 45;
     let cell_h = 45;
     // 0x519262 / 0x51927e / 0x51e355: native `[esi + 0x450] - 1` yields 5 items
-    // per page at 800 px (`panel.width == 279`) and 9 items per page at 1024 px
-    // (`panel.width == 503`).
+    // per page at 800 px (`panel.width == 280`) and 9 items per page at 1024 px
+    // (`panel.width == 504`).
     let pitch_x = if panel.width <= 300 { 46 } else { 48 };
     let left = button_w + arrow_w + 6;
     let right = panel.width - arrow_w - 2;
@@ -2700,8 +2705,8 @@ fn relationships(items: &mut Vec<Item>, panel: Rect, snapshot: &Snapshot, contro
             Relations::Everyone => true,
         })
         .collect();
-    // 0x519247..0x51926a: 5 people per page at 800px (`panel.width = 279`),
-    // 10 at 1024px (`panel.width = 503`), scaling cleanly with wider panels
+    // 0x519247..0x51926a: 5 people per page at 800px (`panel.width = 280`),
+    // 10 at 1024px (`panel.width = 504`), scaling cleanly with wider panels
     // while keeping a gutter for the right page arrow (`arrow_w + 2`).
     let [arrow_w, arrow_h] = [9, 49];
     let [w, h] = RELATION_SIZE;
@@ -3430,8 +3435,8 @@ pub fn covers(items: &[Item], point: [i32; 2]) -> bool {
     })
 }
 
-/// Whether `point` lies inside the live-mode subpanel (`[gadget.x + 108..,
-/// gadget.y..]`, `0x51f22b..0x51f3e5`). Moving the pointer outside this area
+/// Whether `point` lies inside the live-mode subpanel (`[gadget.x + 107..,
+/// gadget.y..]`, the subpanel's own rect, `0x51f22b..0x51f3e5`). Moving the pointer outside this area
 /// (including onto an open help balloon, which attaches outside `LivePanel` at
 /// `0x51a0a2..0x51a0b5`, onto the lot, cluster, portraits, gadget buttons, or
 /// out of the window) dismisses an open help balloon with `UI_whoosh`
@@ -3440,11 +3445,7 @@ pub fn in_subpanel(items: &[Item], [x, y]: [i32; 2]) -> bool {
     let Some(gadget) = items.iter().find(|i| i.kind == Kind::Image(id::GAUGE)) else {
         return false;
     };
-    x >= gadget
-        .rect
-        .x
-        .saturating_add(SUBPANEL_X - (800 - 220 - NEEDS_WIDTH))
-        && y >= gadget.rect.y
+    x >= gadget.rect.x.saturating_add(SUBPANEL_FROM_GADGET) && y >= gadget.rect.y
 }
 
 /// Whether `point` lies inside the expanded Options panel (`cWinOptions`,
@@ -4137,6 +4138,12 @@ mod tests {
         assert_eq!(text_box_y(&font, 10, 12), 15);
         // The odd pixel is cut toward zero, not floored: (1 - 2) / 2 is 0.
         assert_eq!(text_box_y(&font, 10, 1), 10);
+        // Without an `A` the whole line is centred.
+        let without_a = crate::font::tests::without_a();
+        assert_eq!(
+            text_box_y(&without_a, 10, 13),
+            10 + (13 - without_a.line_height) / 2
+        );
     }
 
     #[test]
@@ -4309,6 +4316,108 @@ mod tests {
         assert_eq!(relation_colors(0, false), ([33, 146, 74], [140, 40, 41]));
         assert_eq!(relation_colors(0, true), ([33, 170, 49], [165, 40, 41]));
         assert_eq!(relation_colors(100, false), ([0, 203, 57], [66, 89, 90]));
+    }
+
+    /// The pixels in `frame` left of `right` that are not black.
+    fn inked(frame: &Frame, right: i32) -> Vec<[i32; 2]> {
+        let height = i32::try_from(frame.height()).unwrap_or(0);
+        (0..right)
+            .flat_map(|x| (0..height).map(move |y| [x, y]))
+            .filter(|&[x, y]| frame.pixel(x, y).is_some_and(|p| p != [0; 3]))
+            .collect()
+    }
+
+    #[test]
+    fn a_personality_label_is_centred_on_its_bar_by_the_row_under_an_a() {
+        // The hanging font's line is 4 high but its `A` ends at row 2:
+        // on an 8-high bar the label goes (8 - 2) / 2 = 3 down, so the `g`
+        // of "Outgoing" (rows 2 and 3) first inks row 8 + 18 + 3 + 2.
+        let mut art = Art::default();
+        art.insert_font(TRAIT_FONT, crate::font::tests::hanging_font());
+        let bar = |rgb: [u8; 3]| Image {
+            width: 40,
+            height: 8,
+            rgba: [rgb[0], rgb[1], rgb[2], 255].repeat(40 * 8),
+        };
+        art.insert(id::TRAIT_EMPTY, bar([1, 1, 1]));
+        art.insert(id::TRAIT_FULL, bar([2, 2, 2]));
+        let mut frame = Frame::new(220, 110, [0; 3]);
+        draw_personality(&mut frame, &art, Rect::new(0, 0, 220, 100), &[0; 5], false);
+        let top = (0..110)
+            .find(|&y| (0..220).any(|x| frame.pixel(x, y) == Some(LABEL)))
+            .expect("the `g` is drawn");
+        assert_eq!(top, 8 + 18 + 3 + 2);
+    }
+
+    #[test]
+    fn right_aligned_and_centred_text_moves_by_the_fonts_measure() {
+        use crate::font::tests::{digit_font, hanging_font_plus};
+        let solid = |w: u32, h: u32| Image {
+            width: w,
+            height: h,
+            rgba: [1, 1, 1, 255].repeat((w * h) as usize),
+        };
+        // Two fonts with the same advances, one with a `width_extra` of
+        // 1: what is right aligned by the measure (`+0x68`) moves a pixel
+        // left; what is drawn from the left does not.
+        let shifted = |narrow: &[[i32; 2]], by: i32| -> Vec<[i32; 2]> {
+            narrow.iter().map(|&[x, y]| [x - by, y]).collect()
+        };
+        let house = |font| {
+            let mut art = Art::default();
+            art.insert_font(HOUSE_FONT, font);
+            art.insert(id::RATING_EMPTY, solid(40, 14));
+            art.insert(id::TRAIT_FULL, solid(40, 16));
+            let mut frame = Frame::new(220, 110, [0; 3]);
+            let mut s = snapshot();
+            s.house.bathrooms = 1;
+            draw_house(&mut frame, &art, Rect::new(0, 0, 220, 100), &s.house);
+            inked(&frame, 156)
+        };
+        // The facts ("Bathrooms", "Bedrooms": a `B`) and a rating label
+        // ("Furnishings": a `g`).
+        let narrow = house(hanging_font_plus(0));
+        assert!(narrow.iter().any(|&[x, _]| x < 80), "a fact is drawn");
+        assert!(narrow.iter().any(|&[x, _]| x > 80), "a label is drawn");
+        assert_eq!(house(hanging_font_plus(3)), shifted(&narrow, 1));
+        let skills = |font| {
+            let mut art = Art::default();
+            art.insert_font(SKILL_FONT, font);
+            art.insert(id::SKILL_EMPTY, solid(40, 11));
+            art.insert(id::SKILL_FULL, solid(40, 11));
+            let mut frame = Frame::new(220, 110, [0; 3]);
+            let panel = Rect::new(0, 0, 220, 100);
+            draw_skills(&mut frame, &art, panel, &[0; 6], &[0; 6]);
+            inked(&frame, 156)
+        };
+        let narrow = skills(hanging_font_plus(0));
+        assert!(!narrow.is_empty(), "\"Cooking\" and \"Logic\" draw a `g`");
+        assert_eq!(skills(hanging_font_plus(3)), shifted(&narrow, 1));
+        // A relationship's number, "7", centred in the 45-wide box: at
+        // 22 - 1 / 2 = 22 measured 1 wide, at 22 - 2 / 2 = 21 measured 2.
+        let number = |font| {
+            let mut art = Art::default();
+            art.insert_font(RELATION_FONT, font);
+            let relation = Relation {
+                guid: 7,
+                id: 1,
+                daily: 7,
+                lifetime: 0,
+                friends: false,
+                pink_heart: false,
+                red_heart: false,
+                star: false,
+                family: false,
+            };
+            let mut frame = Frame::new(60, 120, [0; 3]);
+            let r = Rect::new(0, 10, 45, 90);
+            draw_relation(&mut frame, &art, &Faces::default(), r, &relation, false);
+            (0..45)
+                .find(|&x| frame.pixel(x, 8) == Some(LABEL))
+                .expect("the number is drawn")
+        };
+        assert_eq!(number(digit_font(0)), 22);
+        assert_eq!(number(digit_font(6)), 21);
     }
 
     #[test]
@@ -5739,6 +5848,27 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i.kind, Kind::PetSkills { .. }))
         );
+    }
+
+    #[test]
+    fn the_subpanel_is_where_its_hit_test_starts_at_every_width() {
+        let s = snapshot();
+        let controls = Controls {
+            expanded: true,
+            panel: Some(Panel::Needs),
+            ..Controls::default()
+        };
+        for (size, x) in [([640, 480], 360), ([800, 600], 520), ([1024, 768], 520)] {
+            let items = layout(size, &s, &controls);
+            let panel = items
+                .iter()
+                .find(|i| matches!(i.kind, Kind::Needs { pet: false }))
+                .expect("the needs panel")
+                .rect;
+            assert_eq!(panel.x, x, "{size:?}");
+            assert!(in_subpanel(&items, [panel.x, panel.y]), "{size:?}");
+            assert!(!in_subpanel(&items, [panel.x - 1, panel.y]), "{size:?}");
+        }
     }
 
     #[test]

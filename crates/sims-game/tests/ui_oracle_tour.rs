@@ -247,9 +247,13 @@ fn run_until_relationships_settle(game: &mut Game) {
         game.toggle_pause();
     }
     let mut ticks = 0;
-    while ticks < 2 {
+    for _ in 0..1_000 {
+        if ticks >= 2 {
+            break;
+        }
         ticks += game.advance(10_000);
     }
+    assert!(ticks >= 2, "the lot stopped after {ticks} ticks");
     game.toggle_pause();
 }
 

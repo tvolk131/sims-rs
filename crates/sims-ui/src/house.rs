@@ -896,8 +896,10 @@ pub fn furnishings(values: Values, curve: &Curve) -> i32 {
 /// The Layout rating (0x4166ee..0x41674f): the five earlier days' and
 /// today's samples summed, and those spent following a route; the
 /// samples less twice the routing ones, over the samples (at least 1),
-/// kept to 0 to 1, times 100, cut toward zero. The sums wrap at 32 bits
-/// and the arithmetic is single precision, as the original's FPU is set.
+/// kept to 0 to 1, times 100, cut toward zero. The sums wrap at 32 bits,
+/// and so does the doubling (`lea eax, [ecx + ecx]` at 0x416719, before
+/// the `fild`); the arithmetic is single precision, as the original's FPU
+/// is set.
 pub fn layout(usage: &HouseUsage) -> i32 {
     let (total, routing) = usage
         .history
@@ -1561,6 +1563,38 @@ mod tests {
         assert_eq!(
             layout(&usage([(0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (3, 1)])),
             33
+        );
+        // 18 / 20 is 0.9 in single precision, 0.89999998; times 100 it
+        // rounds to 90 before the cut (in double it would cut to 89).
+        assert_eq!(
+            layout(&usage([(0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (20, 1)])),
+            90
+        );
+        // The sums wrap at 32 bits: past `i32::MAX` the total is negative,
+        // so at least 1, and one routing sample takes it below 0.
+        assert_eq!(
+            layout(&usage([
+                (i32::MAX, 0),
+                (0, 0),
+                (0, 0),
+                (0, 0),
+                (0, 0),
+                (2, 1)
+            ])),
+            0
+        );
+        // So does the doubling: twice 2^30 is `i32::MIN`, and 2^30 less
+        // that, over 2^30, is 3, kept to 1.
+        assert_eq!(
+            layout(&usage([
+                (0, 0),
+                (0, 0),
+                (0, 0),
+                (0, 0),
+                (0, 0),
+                (1 << 30, 1 << 30)
+            ])),
+            100
         );
     }
 

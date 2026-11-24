@@ -126,9 +126,11 @@ impl Font {
 
     /// The rows `ch` inks, down from the top of its line: its first and
     /// one past its last (the box the original's font gives a character,
-    /// read by 0x5e3f46 and 0x60b927). `None` when the font lacks it.
+    /// read by 0x5e3f46 and 0x60b927). `None` when the font has no ink
+    /// for it: a byte the code page lacks, or one the font has no glyph
+    /// for (its metric is left empty).
     pub fn rows(&self, ch: char) -> Option<[i32; 2]> {
-        self.metric(ch).map(|m| {
+        self.metric(ch).filter(|m| m.atlas[3] > 0).map(|m| {
             let top = m.bearing[1];
             [top, top.saturating_add(i32::from(m.atlas[3]))]
         })
@@ -381,6 +383,52 @@ pub(crate) mod tests {
         Font::new(decoded)
     }
 
+    /// [`hanging_font`] with `extra` added to the bearing of its glyph
+    /// past the single-byte codes (300), which is never drawn: every
+    /// advance the same, the mean bearing `extra / 4` higher. With 3 the
+    /// font's `width_extra` is 1 (0.25 + 0.75 + 0.5, cut), not 0.
+    pub(crate) fn hanging_font_plus(extra: i8) -> Font {
+        let mut decoded = hanging_font().decoded;
+        for glyph in &mut decoded.glyphs {
+            if glyph.code == 300 {
+                glyph.bearing_x += extra;
+            }
+        }
+        Font::new(decoded)
+    }
+
+    /// The digits, each 1 by 1 with an advance of 1, and an undrawn glyph
+    /// (300) whose bearing `extra` gives the font a `width_extra` of 1 at 6
+    /// (6 / 11 + 0.5, cut) and 0 at 0.
+    pub(crate) fn digit_font(extra: i8) -> Font {
+        let glyph = |code, bearing_x| ffn::Glyph {
+            code,
+            width: 1,
+            height: 1,
+            atlas_x: 0,
+            atlas_y: 0,
+            first_bearing: 0,
+            bearing_x,
+            bearing_y: 0,
+        };
+        let mut glyphs: Vec<ffn::Glyph> = (48..58).map(|code| glyph(code, 0)).collect();
+        glyphs.push(glyph(300, extra));
+        Font::new(ffn::Font {
+            flags: 9,
+            glyphs,
+            width: 1,
+            height: 1,
+            coverage: vec![15],
+        })
+    }
+
+    /// [`hanging_font`] without its `A`.
+    pub(crate) fn without_a() -> Font {
+        let mut decoded = hanging_font().decoded;
+        decoded.glyphs.retain(|g| g.code != 65);
+        Font::new(decoded)
+    }
+
     #[test]
     fn metrics_follow_the_original_rules() {
         let f = font();
@@ -398,11 +446,13 @@ pub(crate) mod tests {
         // Bearings 1, 0, 0: a mean of a third, plus a half, cut to 0.
         let f = font();
         assert_eq!(f.box_width("AB"), f.width("AB"));
-        // With the `g` (bearing 0) as well the mean falls; raise every
-        // bearing by one and the mean is 1.25, plus a half, cut to 1.
+        // With the `g` and a bearing of 1 for `B`, the mean is exactly a
+        // half: plus a half, 1 (cut without the half, it would be 0).
         let mut decoded = hanging_font().decoded;
         for glyph in &mut decoded.glyphs {
-            glyph.bearing_x += 1;
+            if glyph.code == 66 {
+                glyph.bearing_x = 1;
+            }
         }
         let shifted = Font::new(decoded);
         assert_eq!(shifted.box_width("AB"), shifted.width("AB") + 1);
@@ -413,6 +463,15 @@ pub(crate) mod tests {
         assert_eq!(hanging.rows('A'), Some([0, 2]));
         assert_eq!(hanging.rows('g'), Some([2, 4]));
         assert_eq!(hanging.rows('\u{1F600}'), None);
+        // A font with a `g` but no `A`: `A` is in the code page but has no
+        // glyph, so it has no rows either.
+        let without_a = without_a();
+        assert_eq!(without_a.rows('A'), None);
+        assert_eq!(hanging_font_plus(3).box_width(""), 1);
+        assert_eq!(hanging_font_plus(3).width("AgB"), hanging.width("AgB"));
+        assert_eq!(digit_font(6).box_width("7"), 2);
+        assert_eq!(digit_font(0).box_width("7"), 1);
+        assert!(without_a.rows('g').is_some());
     }
 
     #[test]
