@@ -291,6 +291,21 @@ pub enum ObjectMember {
     ExternBcon(ExternBconDecl),
     Bcon(BconTableDecl),
     Tree(TreeMemberDecl),
+    Variant(VariantDecl),
+}
+
+/// Extra catalog variant sharing the object's resource pool:
+/// `variant "Name" { guid: ..., price: ..., init: tree_name, main: tree_name, description: "..." }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariantDecl {
+    pub span: Span,
+    pub name: String,
+    pub guid: Option<(Span, u32)>,
+    pub price: Option<(Span, i64)>,
+    pub description: Option<String>,
+    /// Standalone `tree` names replacing the primary OBJD's init / main trees.
+    pub init: Option<(Span, String)>,
+    pub main: Option<(Span, String)>,
 }
 
 /// Procedural sprite declaration (`Sprite::procedural("cot", primary: #RRGGBB, ...)`).
@@ -682,6 +697,14 @@ pub struct MatchArm {
     pub body: Vec<V2Stmt>,
 }
 
+/// One arm of a `match` expression (`Pattern => value`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchExprArm {
+    pub span: Span,
+    pub pattern: MatchPattern,
+    pub value: V2Expr,
+}
+
 /// Pattern inside a `match` arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchPattern {
@@ -782,6 +805,12 @@ pub enum V2Expr {
         span: Span,
         inner: Box<V2Expr>,
     },
+    /// Expression `match`: every arm yields a value, and the arms are exhaustive.
+    Match {
+        span: Span,
+        scrutinee: Box<V2Expr>,
+        arms: Vec<MatchExprArm>,
+    },
 }
 
 impl V2Expr {
@@ -802,7 +831,8 @@ impl V2Expr {
             | Self::Binary { span: s, .. }
             | Self::Call { span: s, .. }
             | Self::MethodCall { span: s, .. }
-            | Self::Try { span: s, .. } => *s,
+            | Self::Try { span: s, .. }
+            | Self::Match { span: s, .. } => *s,
         }
     }
 }
