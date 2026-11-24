@@ -2038,7 +2038,9 @@ fn encode_nbrs(neighbors: &[Option<Neighbor>]) -> Result<Vec<u8>, CafError> {
         }
         out.extend_from_slice(&n.unknown_zero.to_le_bytes());
         out.extend_from_slice(&n.person_mode.to_le_bytes());
-        if n.person_mode > 0 {
+        // The shared serializer 0x423e08 writes the words for any nonzero
+        // mode (`cmp [esi+0x18], 0; je` at 0x423e8e), a negative one too.
+        if n.person_mode != 0 {
             let expected = if n.version == 4 { 80 } else { PERSON_WORDS };
             for i in 0..expected {
                 let word = n.person_data.get(i).copied().unwrap_or(0);
@@ -3118,6 +3120,40 @@ mod tests {
         assert_eq!(parsed.entries.len(), 2);
         assert!(parsed.entries[0].is_none());
         assert_eq!(parsed.entries[1].as_ref(), Some(&neighbor));
+    }
+
+    /// A negative person mode keeps its person words, as 0x423e8e tests
+    /// the mode against 0, and a zero mode writes none.
+    #[test]
+    fn encode_nbrs_writes_person_words_for_any_nonzero_mode() {
+        let neighbor = |id: i16, person_mode: i32| Neighbor {
+            version: 10,
+            version_extra: Some(SAVED_REVISION),
+            name: format!("user{id:05}"),
+            unknown_zero: 0,
+            person_mode,
+            person_data: if person_mode == 0 {
+                Vec::new()
+            } else {
+                (0..PERSON_WORDS as i16).map(|w| w * 3 - id).collect()
+            },
+            id,
+            guid: 0x5000_0000 + id as u32,
+            unknown_negative: -1,
+            relationships: Vec::new(),
+        };
+        let entries = [
+            Some(neighbor(1, -1)),
+            Some(neighbor(2, -7)),
+            Some(neighbor(3, 0)),
+            Some(neighbor(4, SAVED_REVISION)),
+        ];
+        let raw = encode_nbrs(&entries).unwrap();
+        let parsed = Neighbors::parse(&raw).unwrap();
+        assert_eq!(parsed.entries, entries);
+        let with_words = encode_nbrs(&entries[..1]).unwrap();
+        let without = encode_nbrs(&[Some(neighbor(1, 0))]).unwrap();
+        assert_eq!(with_words.len() - without.len(), PERSON_WORDS * 2);
     }
 
     #[test]
