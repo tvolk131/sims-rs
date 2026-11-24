@@ -112,6 +112,19 @@ impl Parser {
         }
     }
 
+    /// An identifier that introduces a binding. `stack_obj` is the running frame's stack object
+    /// and cannot be rebound: lowering and its `stack_obj` analysis read the name as that cell.
+    fn expect_binding_ident(&mut self, desc: &str) -> Result<(String, Span)> {
+        let (name, span) = self.expect_ident(desc)?;
+        if name == "stack_obj" {
+            return Err(Error::at(
+                span,
+                format!("'stack_obj' is the frame's stack object and cannot be used as a {desc}"),
+            ));
+        }
+        Ok((name, span))
+    }
+
     fn expect_string(&mut self, desc: &str) -> Result<(String, Span)> {
         let tok = self.bump();
         match tok.kind {
@@ -517,7 +530,7 @@ impl Parser {
         let mut seen_names = BTreeSet::new();
         let mut seen_default = false;
         while !self.eat(&TokenKind::RParen) {
-            let (name, span) = self.expect_ident("parameter name")?;
+            let (name, span) = self.expect_binding_ident("parameter name")?;
             if !seen_names.insert(name.clone()) {
                 return Err(Error::at(
                     span,
@@ -623,7 +636,7 @@ impl Parser {
         let mut seen_temps: BTreeSet<u8> = BTreeSet::new();
         let mut first = true;
         while !self.eat(&TokenKind::RParen) {
-            let (name, span) = self.expect_ident("parameter name")?;
+            let (name, span) = self.expect_binding_ident("parameter name")?;
             if !seen_names.insert(name.clone()) {
                 return Err(Error::at(
                     span,
@@ -1334,7 +1347,7 @@ impl Parser {
     }
 
     fn parse_param_member(&mut self, span: Span) -> Result<ObjectMember> {
-        let (name, _) = self.expect_ident("parameter name")?;
+        let (name, _) = self.expect_binding_ident("parameter name")?;
         if self.eat(&TokenKind::Assign) {
             // `param energy_step = 20;` binding form
             let value = self.parse_param_value()?;
@@ -2140,9 +2153,9 @@ impl Parser {
         let mut sim_binding = "sim".to_owned();
         let mut autonomous_binding: Option<String> = None;
         if self.eat(&TokenKind::LParen) && !self.eat(&TokenKind::RParen) {
-            sim_binding = self.expect_ident("guard sim parameter")?.0;
+            sim_binding = self.expect_binding_ident("guard sim parameter")?.0;
             if self.eat(&TokenKind::Comma) && self.peek().kind != TokenKind::RParen {
-                let (auto_name, aspan) = self.expect_ident("guard is_autonomous parameter")?;
+                let (auto_name, aspan) = self.expect_binding_ident("guard is_autonomous parameter")?;
                 if !allow_autonomous {
                     return Err(Error::at(
                         aspan,
@@ -2243,7 +2256,7 @@ impl Parser {
                         return Err(Error::at(fspan, "duplicate 'run' in functional block"));
                     }
                     if self.eat(&TokenKind::LParen) && !self.eat(&TokenKind::RParen) {
-                        sim_binding = self.expect_ident("sim parameter name")?.0;
+                        sim_binding = self.expect_binding_ident("sim parameter name")?.0;
                         self.expect(&TokenKind::RParen, "')'")?;
                     }
                     body = Some(self.parse_block()?);
@@ -2386,7 +2399,7 @@ impl Parser {
                         ));
                     }
                     if self.eat(&TokenKind::LParen) && !self.eat(&TokenKind::RParen) {
-                        sim_binding = self.expect_ident("sim parameter name")?.0;
+                        sim_binding = self.expect_binding_ident("sim parameter name")?.0;
                         self.expect(&TokenKind::RParen, "')'")?;
                     }
                     run_body = Some(self.parse_block()?);
@@ -2585,7 +2598,7 @@ impl Parser {
             return Err(Error::at(span, "'animate' does not take type arguments"));
         }
         if self.eat(&TokenKind::Pipe) {
-            let (event, _) = self.expect_ident("animation event binding name")?;
+            let (event, _) = self.expect_binding_ident("animation event binding name")?;
             self.expect(&TokenKind::Pipe, "'|'")?;
             let body = self.parse_block()?;
             return Ok(V2Stmt::Animate {
@@ -2631,7 +2644,7 @@ impl Parser {
         // `let Some(name [: Type]) = expr else { ... };`
         if self.eat_ident("Some") {
             self.expect(&TokenKind::LParen, "'('")?;
-            let (name, _) = self.expect_ident("binding name")?;
+            let (name, _) = self.expect_binding_ident("binding name")?;
             let ty = if self.eat(&TokenKind::Colon) {
                 Some(self.parse_type()?)
             } else {
@@ -2658,7 +2671,7 @@ impl Parser {
         }
 
         let _is_mut = self.eat_ident("mut");
-        let (name, _) = self.expect_ident("variable name")?;
+        let (name, _) = self.expect_binding_ident("variable name")?;
         let ty = if self.eat(&TokenKind::Colon) {
             Some(self.parse_type()?)
         } else {
@@ -2729,7 +2742,7 @@ impl Parser {
 
     fn parse_for_stmt(&mut self, span: Span) -> Result<V2Stmt> {
         self.bump(); // 'for'
-        let (binding, _) = self.expect_ident("loop variable name")?;
+        let (binding, _) = self.expect_binding_ident("loop variable name")?;
         if !self.eat_ident("in") {
             return Err(Error::at(self.span(), "expected 'in' in 'for' loop"));
         }
