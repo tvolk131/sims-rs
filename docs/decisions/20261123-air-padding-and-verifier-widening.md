@@ -168,7 +168,7 @@ would rewrite every snapshot of `return false;` for no gain.
 
 ## Follow-up
 
-`bin/sims-antics.rs` does not yet pass `library_argless_from_iff(Global.iff)` into
+`bin/sims-antics.rs` does not yet pass `library_argless_from_iff` of its `--global` file into
 `IffEquivOptions::extra_argless`. The bin was outside this change's scope. Until it
 does, CLI `verify-equiv` treats calls into global trees as reading their operands.
 That is sound, just narrower.
