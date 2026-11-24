@@ -765,6 +765,11 @@ fn slot_lets_share_words_with_raw_and_text() {
         }
         sim.data[9] = pref;
         raw { temp[0] := local[5]; }
+        raw {
+            local __w;
+            __w := 1;
+            temp[1] := __w;
+        }
     }
     tree v {
         @slot(2) let left = self.n + 4;
@@ -777,6 +782,8 @@ fn slot_lets_share_words_with_raw_and_text() {
         "local[5] := my.data[9];",
         "my.data[9] := local[5];",
         "temp[0] := local[5];",
+        "local[0] := 1;",
+        "temp[1] := local[0];",
     ] {
         assert!(u.contains(want), "missing `{want}` in:\n{u}");
     }

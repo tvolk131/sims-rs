@@ -323,8 +323,8 @@ pub(crate) fn assign_frame_slots(body: &str) -> String {
     out
 }
 
-/// `line` with each local of `slots` written as `local[K]`: `let x;` goes, `let x = v;` becomes
-/// `local[K] := v;`, and every other use of `x` outside strings and comments becomes `local[K]`.
+/// `line` with each local of `slots` written as `local[K]`: `let x;` (or `local x;`) goes,
+/// `let x = v;` becomes `local[K] := v;`, and every other use of `x` outside strings and comments becomes `local[K]`.
 fn place_locals_in_line(line: &str, slots: &BTreeMap<String, usize>) -> String {
     let bytes = line.as_bytes();
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
@@ -366,7 +366,8 @@ fn place_locals_in_line(line: &str, slots: &BTreeMap<String, usize>) -> String {
             continue;
         }
         let (word, end) = word_at(i);
-        if word == "let" {
+        // `.air` declares with `let` or `local`.
+        if matches!(word, "let" | "local") {
             let name_at = skip_spaces(end);
             let (name, name_end) = word_at(name_at);
             if let Some(k) = slots.get(name) {
