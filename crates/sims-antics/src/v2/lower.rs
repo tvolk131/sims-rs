@@ -3898,6 +3898,9 @@ enum HelperCell {
 /// it, the defer instance, and its (line, column) (see `TreeLowerer::seen_decls`).
 type DeclInstance = (Vec<(usize, usize)>, Option<usize>, (usize, usize));
 
+/// A raw block: its source line, column and code (see `TreeLowerer::own_raw_consts`).
+type RawBlockKey = (usize, usize, String);
+
 #[derive(Clone)]
 struct TreeLowerer<'a> {
     env: &'a ObjectEnv<'a>,
@@ -3944,9 +3947,11 @@ struct TreeLowerer<'a> {
     /// with their `.air` values (see `collect_raw_consts`).
     raw_declared: BTreeSet<String>,
     raw_consts: BTreeMap<String, String>,
-    /// The `.air` constants the tree's live raw blocks declare themselves, in order, with the
-    /// declaration's text when it ends in the same block (see `collect_raw_consts`).
-    raw_own_decls: Vec<(String, Option<String>)>,
+    /// The raw block that declares each raw `.air` constant, and the raw blocks that name each
+    /// word (see `own_raw_consts`). A block is its source position and code, so the copies of one
+    /// block (an inlined helper, a specialized region) are one block.
+    raw_const_owner: BTreeMap<String, RawBlockKey>,
+    raw_names: BTreeMap<String, BTreeSet<RawBlockKey>>,
     /// A raw block of the tree formats text (see `raw_facts`), however it is spelled.
     raw_formats_text: bool,
     /// The tree's first `@slot(N) let`: its pinned locals are named `__slot<N>_..` through the
@@ -4017,7 +4022,8 @@ impl<'a> TreeLowerer<'a> {
             raw_span: None,
             raw_declared: BTreeSet::new(),
             raw_consts: BTreeMap::new(),
-            raw_own_decls: Vec::new(),
+            raw_const_owner: BTreeMap::new(),
+            raw_names: BTreeMap::new(),
             raw_formats_text: false,
             slot_span: None,
             pinned_locals: BTreeMap::new(),
@@ -6407,6 +6413,82 @@ impl<'a> TreeLowerer<'a> {
         Ok(air_name)
     }
 
+    /// A raw `.air` constant belongs to the raw block that declares it, and its declaration ends
+    /// in that block: no other raw block of the tree may name it or declare it again (a value
+    /// several blocks share is a v2 `const`). Each block is then analysed on its own, with the
+    /// constants it declares and the v2 constants it names, exactly as the `.air` compiler reads
+    /// it. Argument keys and labels (a word before `:`) and fields (after `.`) are not names.
+    fn own_raw_consts(
+        &mut self,
+        tokens: &[crate::lexer::Token],
+        own_consts: &BTreeSet<String>,
+        code: &str,
+        span: Span,
+    ) -> Result<()> {
+        use crate::lexer::TokenKind;
+        let key: RawBlockKey = (span.line, span.column, code.to_owned());
+        for (i, t) in tokens.iter().enumerate() {
+            if matches!(&t.kind, TokenKind::Ident(kw) if kw == "const")
+                && !tokens[i..].iter().any(|t| t.kind == TokenKind::Semicolon)
+            {
+                return Err(Error::at(
+                    span,
+                    "a raw '.air' 'const' declaration must end with ';' in its own raw block",
+                ));
+            }
+        }
+        let mut names = BTreeSet::new();
+        for (i, t) in tokens.iter().enumerate() {
+            let TokenKind::Ident(word) = &t.kind else {
+                continue;
+            };
+            let kind = |k: usize| tokens.get(i + k).map(|t| &t.kind);
+            if (i > 0 && tokens[i - 1].kind == TokenKind::Dot) || kind(1) == Some(&TokenKind::Colon)
+            {
+                continue;
+            }
+            match (kind(1), kind(2)) {
+                (Some(TokenKind::Dot), Some(TokenKind::Ident(entry))) => {
+                    names.insert(format!("{word}.{entry}"));
+                }
+                _ => {
+                    names.insert(word.clone());
+                }
+            }
+        }
+        let shared = |name: &str| {
+            Err(Error::at(
+                span,
+                format!(
+                    "'{name}' is a raw '.air' constant another raw block of this tree declares or \
+                     names; a raw constant belongs to its own block (share a value with a v2 \
+                     'const')"
+                ),
+            ))
+        };
+        for name in own_consts {
+            let other_owner = self.raw_const_owner.get(name).is_some_and(|k| *k != key);
+            let other_user = self
+                .raw_names
+                .get(name)
+                .is_some_and(|blocks| blocks.iter().any(|k| *k != key));
+            if other_owner || other_user {
+                return shared(name);
+            }
+            self.raw_const_owner.insert(name.clone(), key.clone());
+        }
+        for name in &names {
+            if self.raw_const_owner.get(name).is_some_and(|k| *k != key) {
+                return shared(name);
+            }
+            self.raw_names
+                .entry(name.clone())
+                .or_default()
+                .insert(key.clone());
+        }
+        Ok(())
+    }
+
     /// Records the v2 names a `raw { }` block uses as `.air` named constants of the tree, and
     /// returns the block's `const NAME = value;` declarations (for checking it on its own).
     ///
@@ -6426,65 +6508,29 @@ impl<'a> TreeLowerer<'a> {
         };
         // Discarded code (a dead branch) emits nothing, so it declares nothing in the tree.
         let live = self.checking_discarded == 0;
-        // Raw `.air` constants (`const K = ..;`, `const T.e = ..;`) are the raw code's own, by full
-        // name, for the rest of the tree: v2 declares none of them. (A v2 constant of the same
-        // name that an earlier block used is declared tree-wide, and `.air` rejects the clash
-        // unless the values agree.)
-        let mut line_starts = vec![0];
-        line_starts.extend(code.match_indices('\n').map(|(i, _)| i + 1));
-        let offset = |t: &crate::lexer::Token| line_starts[t.span.line - 1] + t.span.column - 1;
-        let mut own_decls: Vec<(String, Option<String>)> = Vec::new();
-        for (i, t) in tokens.iter().enumerate() {
-            let kind = |k: usize| tokens.get(i + k).map(|t| &t.kind);
-            if !matches!(&t.kind, TokenKind::Ident(kw) if kw == "const") {
-                continue;
-            }
-            let Some(TokenKind::Ident(name)) = kind(1) else {
-                continue;
-            };
-            let name = match (kind(2), kind(3)) {
-                (Some(TokenKind::Dot), Some(TokenKind::Ident(entry))) => format!("{name}.{entry}"),
-                _ => name.clone(),
-            };
-            // A declaration may end in a later block; its name is owned all the same.
-            let text = tokens[i..]
-                .iter()
-                .find(|t| t.kind == TokenKind::Semicolon)
-                .map(|semi| code[offset(t)..=offset(semi)].to_owned());
-            own_decls.push((name, text));
-        }
-        let own_consts: BTreeSet<String> = own_decls
+        // The block's own `.air` constants (`const K = ..;`, `const T.e = ..;`), by full name:
+        // v2 declares none of them for this block. (A v2 constant of the same name that another
+        // block uses is declared tree-wide, and `.air` rejects the clash unless the values agree.)
+        let own_consts: BTreeSet<String> = tokens
             .iter()
-            .chain(&self.raw_own_decls)
-            .map(|(name, _)| name.clone())
-            .collect();
-        // The block is checked in the constant environment the `.air` compiler gives it: the
-        // tree's v2 constants (declared at the top of the tree), the earlier raw blocks' own
-        // declarations, then this block's v2 constants, one declaration per name. A name this
-        // block declares itself is left to the block.
-        let mut env: Vec<(String, String)> = Vec::new();
-        let set = |env: &mut Vec<(String, String)>, name: &str, text: String| match env
-            .iter_mut()
-            .find(|(n, _)| n == name)
-        {
-            Some(slot) => slot.1 = text,
-            None => env.push((name.to_owned(), text)),
-        };
-        for (name, value) in &self.raw_consts {
-            set(&mut env, name, format!("const {name} = {value};"));
-        }
-        for (name, text) in &self.raw_own_decls {
-            if let Some(text) = text {
-                set(&mut env, name, text.clone());
-            }
-        }
-        if live {
-            for d in &own_decls {
-                if !self.raw_own_decls.contains(d) {
-                    self.raw_own_decls.push(d.clone());
+            .enumerate()
+            .filter_map(|(i, t)| {
+                let kind = |k: usize| tokens.get(i + k).map(|t| &t.kind);
+                if !matches!(&t.kind, TokenKind::Ident(kw) if kw == "const") {
+                    return None;
                 }
-            }
-        }
+                let Some(TokenKind::Ident(name)) = kind(1) else {
+                    return None;
+                };
+                match (kind(2), kind(3)) {
+                    (Some(TokenKind::Dot), Some(TokenKind::Ident(entry))) => {
+                        Some(format!("{name}.{entry}"))
+                    }
+                    _ => Some(name.clone()),
+                }
+            })
+            .collect();
+        self.own_raw_consts(&tokens, &own_consts, code, span)?;
         let mut found: Vec<(String, String)> = Vec::new();
         for (i, tok) in tokens.iter().enumerate() {
             let TokenKind::Ident(word) = &tok.kind else {
@@ -6501,7 +6547,8 @@ impl<'a> TreeLowerer<'a> {
                 continue;
             }
             // An `.air` keyword (`temp`, `my`, ..) keeps its meaning: no constant can name it.
-            if crate::parser::is_reserved_ident(word) {
+            // Nor does a label or an argument key (a word before `:`).
+            if crate::parser::is_reserved_ident(word) || next(1) == Some(&TokenKind::Colon) {
                 continue;
             }
             if next(1) == Some(&TokenKind::Dot)
@@ -6538,6 +6585,7 @@ impl<'a> TreeLowerer<'a> {
                 found.push((word.clone(), value));
             }
         }
+        let mut prelude = String::new();
         let mut declared = BTreeSet::new();
         for (name, value) in found {
             if !declared.insert(name.clone()) {
@@ -6560,15 +6608,7 @@ impl<'a> TreeLowerer<'a> {
                 }
                 None => {}
             }
-            set(&mut env, &name, format!("const {name} = {value};"));
-        }
-        let block_own: BTreeSet<&str> = own_decls.iter().map(|(n, _)| n.as_str()).collect();
-        let mut prelude = String::new();
-        for (name, text) in env {
-            if !block_own.contains(name.as_str()) {
-                prelude.push_str(&text);
-                prelude.push('\n');
-            }
+            prelude.push_str(&format!("const {name} = {value};\n"));
         }
         Ok(prelude)
     }
