@@ -6339,7 +6339,9 @@ impl<'a> TreeLowerer<'a> {
             }
         }
         let air_name = self.fresh(&format!("slot{n}_{name}"));
-        self.pinned_locals.insert(air_name.clone(), usize::from(n));
+        if self.checking_discarded == 0 {
+            self.pinned_locals.insert(air_name.clone(), usize::from(n));
+        }
         Ok(air_name)
     }
 
@@ -6360,6 +6362,8 @@ impl<'a> TreeLowerer<'a> {
         let Ok(tokens) = crate::lexer::tokenize(code) else {
             return Ok(String::new());
         };
+        // Discarded code (a dead branch) emits nothing, so it declares nothing in the tree.
+        let live = self.checking_discarded == 0;
         let mut found: Vec<(String, String)> = Vec::new();
         for (i, tok) in tokens.iter().enumerate() {
             let TokenKind::Ident(word) = &tok.kind else {
@@ -6370,9 +6374,13 @@ impl<'a> TreeLowerer<'a> {
             }
             let next = |k: usize| tokens.get(i + k).map(|t| &t.kind);
             if matches!(word.as_str(), "let" | "local") {
-                if let Some(TokenKind::Ident(name)) = next(1) {
+                if live && let Some(TokenKind::Ident(name)) = next(1) {
                     self.raw_declared.insert(name.clone());
                 }
+                continue;
+            }
+            // An `.air` keyword (`temp`, `my`, ..) keeps its meaning: no constant can name it.
+            if crate::parser::is_reserved_ident(word) {
                 continue;
             }
             if next(1) == Some(&TokenKind::Dot)
@@ -6401,7 +6409,11 @@ impl<'a> TreeLowerer<'a> {
             }
         }
         let mut prelude = String::new();
+        let mut declared = BTreeSet::new();
         for (name, value) in found {
+            if !declared.insert(name.clone()) {
+                continue;
+            }
             match self.raw_consts.get(&name) {
                 Some(old) if *old != value => {
                     return Err(Error::at(
@@ -6413,9 +6425,10 @@ impl<'a> TreeLowerer<'a> {
                     ));
                 }
                 Some(_) => {}
-                None => {
+                None if live => {
                     self.raw_consts.insert(name.clone(), value.clone());
                 }
+                None => {}
             }
             prelude.push_str(&format!("const {name} = {value};\n"));
         }

@@ -8,8 +8,8 @@ use crate::ast::{Branches, Condition, Item, PrimitiveCall, Stmt, Target};
 /// (`$Local:N`): Dialog (36) and Add/Change Action String (50).
 const TEXT_OPCODES: [u16; 2] = [36, 50];
 
-/// Facts about one raw block. Code that does not parse gets every fact (the `.air` compiler
-/// reports it later).
+/// Facts about one raw block. Code that does not parse gets every fact but the loop exit, which
+/// its tokens decide (the `.air` compiler reports the error later).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RawFacts {
     /// It defines a label (`@x:` or bare `x:`).
@@ -54,7 +54,23 @@ pub(crate) fn raw_facts(code: &str, prelude: Option<&str>) -> RawFacts {
             scan(&t.body, 0, &mut facts);
             facts
         }
-        _ => RawFacts::all(),
+        _ => {
+            // The `.air` compiler reports the error. Until then only a loop exit is read from
+            // the tokens: without a `break`, a `continue` or a branch (`->`, which may name a
+            // node by number) the block cannot leave the loop it sits in. A shape-only parse
+            // fails on a constant in a named position (`refresh(target: K)`), so this keeps such
+            // a block usable in a `for ... else`.
+            let mut facts = RawFacts::all();
+            if let Ok(tokens) = crate::lexer::tokenize(code) {
+                use crate::lexer::TokenKind as T;
+                facts.exits_enclosing_loop = tokens.iter().any(|t| match &t.kind {
+                    T::Ident(w) => w == "break" || w == "continue",
+                    T::Arrow => true,
+                    _ => false,
+                });
+            }
+            facts
+        }
     }
 }
 

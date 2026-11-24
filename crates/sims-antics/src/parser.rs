@@ -423,7 +423,7 @@ impl Parser {
     }
 
     /// `const NAME = value;`: a named constant for the rest of the tree, where `value` is an
-    /// integer or a direct operand. It emits no node.
+    /// integer or a read-only operand. It emits no node.
     fn parse_const_decl(&mut self) -> Result<()> {
         self.expect_ident("'const'")?;
         let (name, nspan) = self.expect_ident("constant name")?;
@@ -445,12 +445,16 @@ impl Parser {
             self.bump();
             ConstValue::Int(v)
         } else {
+            // Read-only operands only (a literal or a `bcon[..]` entry): a constant naming a
+            // cell would let an out-operand or a dotted assignment write through it.
             match self.parse_operand()? {
-                OperandRef::Direct(op) => ConstValue::Operand(op),
+                OperandRef::Direct(op) if matches!(op.scope, 7 | 26) => ConstValue::Operand(op),
                 _ => {
                     return Err(Error::at(
                         nspan,
-                        format!("constant '{name}' must be an integer or a direct operand"),
+                        format!(
+                            "constant '{name}' must be an integer, a literal or a bcon[..] entry"
+                        ),
                     ));
                 }
             }
@@ -955,7 +959,15 @@ impl Parser {
                 Ok(LocalRef::Index(idx))
             }
             TokenKind::Ident(_) => {
-                let (name, _) = self.expect_ident(description)?;
+                let (name, span) = self.expect_ident(description)?;
+                // A named integer constant is the local's index; a tree local wins.
+                if !self.tree_locals.contains(&name)
+                    && let Some(&ConstValue::Int(v)) = self.consts.get(&name)
+                {
+                    return u8::try_from(v).map(LocalRef::Index).map_err(|_| {
+                        Error::at(span, format!("{description} {v} out of 0..=255 range"))
+                    });
+                }
                 Ok(LocalRef::Named(name))
             }
             other => Err(Error::at(
@@ -2556,7 +2568,10 @@ impl Parser {
         let span = self.span();
         if let TokenKind::Ident(name) = &self.peek().kind
             && !self.tree_locals.contains(name)
-            && self.consts.contains_key(name)
+            && (self.consts.contains_key(name)
+                || (self.peek_at(1).kind == TokenKind::Dot
+                    && matches!(&self.peek_at(2).kind, TokenKind::Ident(entry)
+                        if self.consts.contains_key(&format!("{name}.{entry}")))))
         {
             return Err(Error::at(
                 span,
@@ -2906,7 +2921,7 @@ fn const_operand(value: ConstValue, span: Span) -> Result<OperandRef> {
     }
 }
 
-fn is_reserved_ident(name: &str) -> bool {
+pub(crate) fn is_reserved_ident(name: &str) -> bool {
     matches!(
         name,
         "tree"

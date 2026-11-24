@@ -300,7 +300,10 @@ pub(crate) fn assign_frame_slots(
     let mut used = usage.explicit.clone();
     let mut slots: BTreeMap<String, usize> = BTreeMap::new();
     for name in &usage.lets {
-        if let Some(&n) = pinned.get(name) {
+        // A name a raw block declares itself is that block's local, whatever lowering named.
+        if let Some(&n) = pinned.get(name)
+            && !raw_declared.contains(name)
+        {
             used.insert(n);
             slots.insert(name.clone(), n);
         }
@@ -346,7 +349,11 @@ fn place_locals(body: &str, slots: &BTreeMap<String, usize>) -> Option<String> {
                 };
                 let prev = i.checked_sub(1).map(|p| &tokens[p].kind);
                 let next = tokens.get(i + 1).map(|t| &t.kind);
-                if matches!(prev, Some(T::Dot)) || matches!(next, Some(T::Colon)) {
+                // A field, a label or argument key, or a called name.
+                if matches!(prev, Some(T::Dot))
+                    || matches!(next, Some(T::Colon | T::LParen))
+                    || matches!(prev, Some(T::Ident(kw)) if kw == "call" || kw == "subroutine")
+                {
                     continue;
                 }
                 match prev {
@@ -1387,10 +1394,39 @@ fn may_write_stack_obj(text: &str) -> bool {
         return true;
     }
     let stripped = strip_strings(text);
-    stripped.contains("dest: stack_obj")
+    names_stack_obj_as_target(&stripped)
+        || stripped.contains("dest: stack_obj")
         || scope_store_lhs(&stripped).is_some_and(|n| n == 10)
         || callees(&stripped)
             .any(|c| !matches!(c, "call" | "scope") && !STACK_OBJ_KEEPING_PRIMS.contains(&c))
+}
+
+/// `stack_obj` is the target of an `.air` expression, by token: followed by anything but the end
+/// of an operand or a comparison (`stack_obj:=9`, `stack_obj += 1`, `stack_obj sqrt 9`, the
+/// writing condition `stack_obj inc_lt 9`). Text that does not lex may.
+fn names_stack_obj_as_target(text: &str) -> bool {
+    use crate::lexer::TokenKind as T;
+    let Ok(tokens) = crate::lexer::tokenize(text) else {
+        return true;
+    };
+    tokens.windows(2).any(|w| {
+        matches!(&w[0].kind, T::Ident(n) if n == "stack_obj")
+            && !matches!(
+                w[1].kind,
+                T::Semicolon
+                    | T::RParen
+                    | T::Comma
+                    | T::RBracket
+                    | T::LBrace
+                    | T::Eof
+                    | T::EqEq
+                    | T::BangEq
+                    | T::Lt
+                    | T::LtEq
+                    | T::Gt
+                    | T::GtEq
+            )
+    })
 }
 
 /// The scope number of a `scope(S, I) op ..` store's target.
@@ -1410,10 +1446,14 @@ fn scope_store_lhs(stripped: &str) -> Option<u32> {
 /// still moved away from its entry value: some line may write it and no later `restore` line
 /// (`stack_obj := __self_obj;`) puts it back on every path. A field read through another
 /// object moves the stack object and restores it right after, so it leaves nothing displaced.
-/// A subroutine call counts as a write. Code that does not parse may.
+/// A subroutine runs in its own frame with its own stack object, so a call writes none here.
+/// Code that does not parse may.
+///
+/// Precision matters both ways: a missing restore leaves the exhaustion block on the wrong
+/// object, and a needless one replaces the iterator's false result, which the block may read.
 pub(crate) fn body_may_leave_stack_obj_moved(body: &str, restore: &str) -> bool {
     fn line_writes(l: &str) -> bool {
-        may_write_stack_obj(l) || callees(&strip_strings(l)).any(|c| c == "call")
+        may_write_stack_obj(l)
     }
     /// `moved` after `nodes`, setting `exits` if a `continue` may see it moved.
     fn flow(nodes: &[Node], mut moved: bool, restore: &str, exits: &mut bool) -> bool {

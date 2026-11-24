@@ -700,3 +700,151 @@ fn raw_nested_loops_do_not_exit_a_for_else() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Review round 3
+// ---------------------------------------------------------------------------
+
+/// Raw constants resolve wherever a raw block lands: twice in one inlined helper, past a `local K`
+/// in discarded code, and in a `local:` operand. A constant named like an `.air` keyword (`temp`)
+/// never shadows it.
+#[test]
+fn raw_consts_survive_inlining_discarded_code_and_keywords() {
+    let literal = nodes(&obj(
+        "    @id(4300) tree a { raw { temp[0] := 7; temp[1] := 7; } }",
+    ));
+    assert_eq!(
+        nodes(&obj(r#"    const K = 7;
+    fn f() { raw { temp[0] := K; temp[1] := K; } }
+    @id(4300) tree a { f(); }"#)),
+        literal,
+    );
+    assert_eq!(
+        nodes(&obj(r#"    const K = 7;
+    @id(4300) tree a {
+        if false { raw { local K; } }
+        raw { temp[0] := K; temp[1] := K; }
+    }"#)),
+        literal,
+    );
+    assert_eq!(
+        nodes(&obj(r#"    const temp = 17;
+    @id(4300) tree a { raw { temp[0] := 7; temp[1] := 7; } }"#)),
+        literal,
+    );
+    assert_eq!(
+        nodes(&obj(r#"    const L = 1;
+    @id(4300) tree a { raw { animate(clip: 1, table: 0, events: 0, local: L); } }"#)),
+        nodes(&obj(
+            "    @id(4300) tree a { raw { animate(clip: 1, table: 0, events: 0, local: 1); } }"
+        )),
+    );
+}
+
+/// Only live `@slot` lets pin a word: a slot in discarded code pins nothing, and a raw block's own
+/// local spelled like a slot name keeps its `.air` placement. A call target spelled like a pinned
+/// local stays a call target.
+#[test]
+fn slot_pins_come_from_live_code_and_leave_call_targets_alone() {
+    let air = expand(
+        "slot_dead.antics",
+        &obj(r#"    tree a {
+        if false { @slot(7) let x: i16; }
+        @slot(3) let q = 1;
+        raw { local __slot7_x_0; __slot7_x_0 := 9; temp[0] := local[7]; }
+    }"#),
+    );
+    let body = tree(&air, "a");
+    assert!(body.contains("__slot7_x_0 := 9;"), "{body}");
+    assert!(!body.contains("local[7] := 9;"), "{body}");
+    let air = expand(
+        "slot_call.antics",
+        &obj(r#"    tree __slot3_x_0 { return true; }
+    tree a {
+        @slot(3) let x = 7;
+        raw { call __slot3_x_0() -> true: true, false: false; }
+    }"#),
+    );
+    let body = tree(&air, "a");
+    assert!(body.contains("local[3] := 7;"), "{body}");
+    assert!(body.contains("call __slot3_x_0()"), "{body}");
+}
+
+/// A raw `for ... else` body that names `stack_obj` as any primitive's target (an unspaced `:=`,
+/// `sqrt`, a test like `inc_lt`) gets the exhaustion restore. A subroutine call does not: the VM
+/// gives each frame its own stack object.
+#[test]
+fn raw_stack_obj_targets_restore_but_calls_do_not() {
+    for raw in [
+        "stack_obj:=9;",
+        "stack_obj sqrt 9;",
+        "if stack_obj inc_lt 9 { temp[0] := 1; }",
+    ] {
+        let air = expand(
+            "cursor_raw.antics",
+            &obj(&format!(
+                "    tree a (sim: Sim) {{
+        for item in lot.objects() {{ raw {{ {raw} }} }} else {{ raw {{ temp[1] := stack_obj; }} }}
+    }}"
+            )),
+        );
+        let body = tree(&air, "a");
+        let ls = lines(body);
+        let exhausted = index_of(&ls, |l| l == "temp[1] := stack_obj;", body);
+        assert_eq!(ls[exhausted - 1], "stack_obj := __self_obj;", "{body}");
+    }
+    let air = expand(
+        "cursor_call.antics",
+        &obj(r#"    @id(4300) tree b { raw { stack_obj := 9; } }
+    tree a (sim: Sim) {
+        for item in lot.objects() {
+            raw { if call 4300() { temp[1] := 1; } }
+        } else { gosub_found_action(); }
+    }"#),
+    );
+    assert!(
+        !tree(&air, "a").contains("stack_obj := __self_obj;"),
+        "{air}"
+    );
+}
+
+/// `.air` named constants are read-only operands: a constant naming a cell is rejected, dotted or
+/// not, so it can never be a destination.
+#[test]
+fn air_constants_cannot_name_cells() {
+    for decl in [
+        "const X = temp[0]; random(X, 7);",
+        "const T.X = temp[0]; T.X := 7;",
+    ] {
+        let src = format!("tree 4096 \"Probe\" {{ {decl} return true; }}");
+        let err = sims_antics::compile_air(&src).expect_err("cell constant must fail");
+        assert!(
+            err.to_string()
+                .contains("must be an integer, a literal or a bcon[..] entry"),
+            "{err}"
+        );
+    }
+}
+
+/// A raw `for ... else` block the `.air` parser rejects still lowers with a correct loop shape:
+/// the loop-exit fact falls back to the tokens while the other facts stay conservative.
+#[test]
+fn unparsed_raw_exhaustion_blocks_keep_the_loop_shape() {
+    let src = obj(r#"    const K = 7;
+    tree a {
+        for item in lot.objects() {}
+        else { raw { refresh(target: K); } }
+    }"#);
+    let air = sims_antics::v2::expand_v2_source_to_objects(
+        "else_lenient.antics",
+        &src,
+        &PackResolverConfig::default(),
+    )
+    .expect("expands")
+    .remove(0)
+    .air_source;
+    let body = tree(&air, "a");
+    let ls = lines(body);
+    let raw = index_of(&ls, |l| l == "refresh(target: K);", body);
+    assert_eq!(ls[raw + 1], "break;", "{body}");
+}
