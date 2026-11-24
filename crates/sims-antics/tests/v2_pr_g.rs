@@ -423,3 +423,48 @@ fn tier2_job_data_reads_scope_33_through_the_temps() {
         "unknown job_data() argument 'row'",
     );
 }
+
+#[test]
+fn tier2_distance_to_measures_to_the_stack_object() {
+    let air = expand(
+        "distance.antics",
+        &sim_tree(
+            "let Some(o) = find_best_object(prep) else { return; }; \
+             let d = distance_to(o); \
+             self.n = d; \
+             self.n = distance_to(stack_obj, from: o, temp: 3); \
+             self.n = distance_to(o, from: stack_obj);",
+        ),
+    );
+    for needle in [
+        "get_distance_to(temp[0]);",
+        "get_distance_to(temp[3], from: ",
+        "= temp[3];",
+    ] {
+        assert!(air.contains(needle), "missing '{needle}':\n{air}");
+    }
+    // Moving to the target restores the entry stack object afterwards, and a `from` of the
+    // stack object is read before the move.
+    let body = &air[air.find("\"t\" {").expect("tree")..];
+    let gets = body.matches("get_distance_to(").count();
+    assert_eq!(gets, 3, "{body}");
+    assert!(body.contains("__self_obj"), "{body}");
+    let last = body.rfind("get_distance_to(").expect("third");
+    let copy = body[..last].rfind("= stack_obj;").expect("from copied");
+    let mv = body[..last].rfind("stack_obj := ").expect("moved");
+    assert!(copy < mv, "{body}");
+    for (name, body, needle) in [
+        (
+            "dist_type.antics",
+            "self.n = distance_to(3);",
+            "distance_to target must be an object",
+        ),
+        (
+            "dist_temp.antics",
+            "self.n = distance_to(stack_obj, temp: 8);",
+            "distance_to temp",
+        ),
+    ] {
+        expect_err(name, &sim_tree(body), needle);
+    }
+}

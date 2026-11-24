@@ -10706,6 +10706,14 @@ impl<'a> TreeLowerer<'a> {
                     {
                         return self.lower_job_data(args, *span);
                     }
+                    if fname == "distance_to"
+                        && self
+                            .env
+                            .lookup_fn(&self.owner_module, fname, self.in_object_scope)
+                            .is_none()
+                    {
+                        return self.lower_distance_to(args, *span);
+                    }
                     if matches!(
                         fname.as_str(),
                         "can_afford"
@@ -10839,6 +10847,58 @@ impl<'a> TreeLowerer<'a> {
         self.line(format!("temp[1] := {level};"));
         let tmp = self.fresh("job");
         self.line(format!("let {tmp} = scope(33, {field});"));
+        Ok((tmp, ValueType::I16))
+    }
+
+    /// `distance_to(target, from: obj, temp: n)`: Get Distance To measures from `from` (the
+    /// running object by default) to the stack object, so `stack_obj` points at `target` around
+    /// it. The result lands in `temp[n]` (0 by default).
+    fn lower_distance_to(&mut self, args: &[CallArg], span: Span) -> Result<(String, ValueType)> {
+        let bound = self.bind_builtin_args("distance_to", args, &["target"], &["from", "temp"])?;
+        let target_arg = bound
+            .get("target")
+            .ok_or_else(|| Error::at(span, "distance_to() requires a target object"))?;
+        let mut handle = |key: &str, arg: &CallArg| -> Result<String> {
+            let (air, ty) = self.lower_value_expr(&arg.value)?;
+            if !ty.is_object_handle() {
+                return Err(Error::at(
+                    arg.span,
+                    format!(
+                        "distance_to {key} must be an object, found '{}'",
+                        self.env.display_value_type(&ty)
+                    ),
+                ));
+            }
+            Ok(air)
+        };
+        let target = handle("target", target_arg)?;
+        let mut from = match bound.get("from") {
+            Some(arg) => Some(handle("from", arg)?),
+            None => None,
+        };
+        let temp = match bound.get("temp") {
+            Some(arg) => self.eval_builtin_int(&arg.value, "distance_to temp", 0, 7)?,
+            None => 0,
+        };
+        let moves = target != "stack_obj";
+        // `from` is read after `stack_obj` moves to the target.
+        if moves && from.as_deref() == Some("stack_obj") {
+            let copy = self.fresh("dist_from");
+            self.line(format!("let {copy} = stack_obj;"));
+            from = Some(copy);
+        }
+        if moves {
+            self.line(format!("stack_obj := {target};"));
+        }
+        self.line(match &from {
+            Some(f) => format!("get_distance_to(temp[{temp}], from: {f});"),
+            None => format!("get_distance_to(temp[{temp}]);"),
+        });
+        if moves {
+            self.emit_restore_stack_obj();
+        }
+        let tmp = self.fresh("dist");
+        self.line(format!("let {tmp} = temp[{temp}];"));
         Ok((tmp, ValueType::I16))
     }
 
@@ -14137,6 +14197,16 @@ fn expr_may_clobber_stack_obj(
         V2Expr::Call { callee, args, .. } => {
             if let V2Expr::Ident(_, fname) = callee.as_ref() {
                 if matches!(fname.as_str(), "find_best_object" | "create_object") {
+                    return true;
+                }
+                // `distance_to` points `stack_obj` at its target unless that already is it.
+                if fname == "distance_to"
+                    && env.lookup_fn(owner_mod, fname, allow_local_fns).is_none()
+                    && !args.first().is_some_and(|a| {
+                        a.name.is_none()
+                            && matches!(&a.value, V2Expr::Ident(_, n) if n == "stack_obj")
+                    })
+                {
                     return true;
                 }
                 if matches!(
