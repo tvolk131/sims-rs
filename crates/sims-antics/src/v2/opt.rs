@@ -891,7 +891,9 @@ fn callees(stripped: &str) -> impl Iterator<Item = &str> {
 /// temps, params, advertisements, my person data and slots, locals, tuning constants, and the
 /// job and neighborhood tables. Every other scope may (scope 27, the sprite flags, reads the
 /// stack object's; scope 10 is the stack object itself).
-const STACK_FREE_SCOPES: &[u32] = &[0, 3, 6, 7, 8, 9, 11, 12, 14, 18, 20, 25, 26, 28, 29, 30, 33, 34, 36];
+const STACK_FREE_SCOPES: &[u32] = &[
+    0, 3, 6, 7, 8, 9, 11, 12, 14, 18, 20, 25, 26, 28, 29, 30, 33, 34, 36,
+];
 
 /// Whether every `scope(S, ..)` in a (string-stripped) text names a stack-free scope.
 fn scopes_stack_free(stripped: &str) -> bool {
@@ -902,7 +904,10 @@ fn scopes_stack_free(stripped: &str) -> bool {
             .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_');
         let rest = &stripped[at + "scope(".len()..];
         let num = rest.split(',').next().unwrap_or("").trim();
-        preceded || num.parse::<u32>().is_ok_and(|n| STACK_FREE_SCOPES.contains(&n))
+        preceded
+            || num
+                .parse::<u32>()
+                .is_ok_and(|n| STACK_FREE_SCOPES.contains(&n))
     })
 }
 
@@ -1895,7 +1900,8 @@ mod tests {
     #[test]
     fn review_regressions_keep_observers() {
         // A primitive may read the last result the save sets, so the save stays before it.
-        let body = "    let __self_obj = stack_obj;\n    idle_for_input(param[0], 1);\n    return true;\n";
+        let body =
+            "    let __self_obj = stack_obj;\n    idle_for_input(param[0], 1);\n    return true;\n";
         assert_eq!(optimize_tree_body(body), body);
         // Scope 27 (sprite flags) reads the stack object, so the switch before it stays.
         let body = "    stack_obj := my.id;\n    temp[0] := 0;\n    scope(27, 0) := 1;\n    return true;\n";

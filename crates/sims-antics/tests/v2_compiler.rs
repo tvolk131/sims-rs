@@ -9676,7 +9676,9 @@ fn pr_f_review_regressions_lower_soundly() {
     assert!(!t.contains("dest: stack_obj"), "{t}");
     let t = tree_of(
         "cursor_shadow.antics",
-        &obj("    @id(4300) tree t (sim: Sim) { for o in lot.objects() { let sim = o; sim.attr[0] = 1; } }"),
+        &obj(
+            "    @id(4300) tree t (sim: Sim) { for o in lot.objects() { let sim = o; sim.attr[0] = 1; } }",
+        ),
         4300,
     );
     assert!(!t.contains("dest: stack_obj"), "{t}");
