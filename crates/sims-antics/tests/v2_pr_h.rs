@@ -615,3 +615,86 @@ fn specialize_survives_fmt_and_lint() {
     sims_antics::v2::lint_v2_source(&formatted, "spec_fmt.antics").expect("lint");
     expand("spec_fmt.antics", &formatted);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Tier 2: `const` names inside `raw { }`
+// ---------------------------------------------------------------------------------------------
+
+/// A `const` in an operand position of raw code is its number (a GUID in hex), and a tuning
+/// table entry is its `bcon[N]` operand. Labels, branch targets, fields, cells, call names,
+/// argument keys, strings, comments and the raw code's own locals are left alone.
+#[test]
+fn raw_blocks_resolve_consts_and_tuning_entries() {
+    let air = expand(
+        "rawconst.antics",
+        &obj(r#"    const SLOT = 3;
+    const KIND = 0x7F40_1001;
+    const done = 7;
+    const mine = 9;
+    bcon 4097 "Tuning" {
+        cheap = 10,
+        dear = 25,
+    }
+    tree t (sim: Sim) {
+        raw {
+            my.attr[SLOT] := SLOT;
+            temp[1] := Tuning.dear;
+            expr(my.attr[0] == SLOT) -> true: @done, false: false;
+            temp[0] := done; // “done” stays here
+          @done:
+            local mine;
+            mine := 1;
+            set_to_next(guid, KIND, dest: temp[2]);
+        }
+    }
+"#),
+    );
+    let t = tree(&air, "t");
+    for want in [
+        "my.attr[3] := 3;",
+        "expr(my.attr[0] == 3) -> true: @done, false: false;",
+        "temp[0] := 7; // “done” stays here",
+        "@done:",
+        "local mine;",
+        "mine := 1;",
+        "set_to_next(guid, 0x7f401001, dest: temp[2]);",
+    ] {
+        assert!(t.contains(want), "missing `{want}` in:\n{t}");
+    }
+    assert!(
+        t.contains("temp[1] := bcon[") && !t.contains("Tuning.dear"),
+        "the tuning entry is a bcon operand:\n{t}"
+    );
+}
+
+/// A name one raw block declares as a local stays that local in every raw block of the tree,
+/// and declaring a name an earlier raw block read as a const is an error.
+#[test]
+fn raw_locals_shadow_consts_tree_wide() {
+    let air = expand(
+        "rawshadow.antics",
+        &obj(r#"    const k = 5;
+    tree t {
+        raw {
+            local k;
+            k := 1;
+        }
+        raw { temp[0] := k; }
+    }
+"#),
+    );
+    assert!(tree(&air, "t").contains("temp[0] := k;"), "{air}");
+    expect_err(
+        "rawclash.antics",
+        &obj(r#"    const k = 5;
+    tree t {
+        raw { temp[0] := k; }
+        raw {
+            local k;
+            k := 1;
+        }
+    }
+"#),
+        "which an earlier raw block of this tree read as a const",
+    );
+}

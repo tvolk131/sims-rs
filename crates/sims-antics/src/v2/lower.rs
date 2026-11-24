@@ -3749,6 +3749,10 @@ struct TreeLowerer<'a> {
     /// forms (`scope(25, N)`, raw `op` operands, primitive fields) the pin placement can't see.
     pin_span: Option<Span>,
     raw_span: Option<Span>,
+    /// Names the tree's `raw` blocks declare as `.air` locals, and the `const` names they had
+    /// resolved: one name cannot be both (see `resolve_raw_consts`).
+    raw_declared: BTreeSet<String>,
+    raw_resolved: BTreeSet<String>,
     /// Set when the tree's bytes after some node matter beyond `.air` semantics, so the backend
     /// pass must leave the tree alone: a `raw` block (its literal calls and ops may read the
     /// following instruction's bytes), or a literal-argument call whose callee frame may read
@@ -3800,6 +3804,8 @@ impl<'a> TreeLowerer<'a> {
             frame_args: 0,
             pin_span: None,
             raw_span: None,
+            raw_declared: BTreeSet::new(),
+            raw_resolved: BTreeSet::new(),
             keep_layout: false,
             param_words_used: 0,
             frame_locals: None,
@@ -5735,6 +5741,8 @@ impl<'a> TreeLowerer<'a> {
                         "'raw { ... }' is not allowed inside a 'defer' block",
                     ));
                 }
+                let resolved = self.resolve_raw_consts(code, *span)?;
+                let code = &resolved;
                 if self.has_any_active_cleanups()
                     || !self.inline_call_stack.is_empty()
                     || self.enclosing_cancel_flag().is_some()
@@ -5772,6 +5780,185 @@ impl<'a> TreeLowerer<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// `raw { }` code with the v2 names it uses replaced by their values: a `const` name by its
+    /// number (a GUID in hex) and `Table.entry` of a tuning table by its `bcon[N]` operand.
+    ///
+    /// Only an identifier in an operand position is a v2 name: not after `.` (a field) or `@` (a
+    /// label), not
+    /// before `.`, `[`, `(` or `:` (a cell, a call, an argument key or a label), not in a branch
+    /// target list (`-> ..;`), not an `.air` word (`my`, `temp`, ..), and not a local the raw
+    /// code declares itself (`let x`, `local x`).
+    ///
+    /// A `.air` local is in scope in every raw block of the tree, so a name that one raw block
+    /// declares stays a local in all of them, and declaring a name an earlier block resolved as
+    /// a `const` is an error rather than a silent change of meaning.
+    fn resolve_raw_consts(&mut self, code: &str, span: Span) -> Result<String> {
+        const AIR_WORDS: &[&str] = &[
+            "my",
+            "stack",
+            "temp",
+            "param",
+            "local",
+            "global",
+            "stack_obj",
+            "me",
+            "true",
+            "false",
+            "error",
+            "let",
+            "if",
+            "else",
+            "while",
+            "break",
+            "continue",
+            "return",
+            "bcon",
+            "const",
+            "str",
+            "tree",
+            "interaction",
+            "raw",
+            "op",
+            "pad",
+            "scope",
+            "neighbor",
+            "neighborhood",
+            "data",
+            "attr",
+            "person",
+            "motive",
+        ];
+        let bytes = code.as_bytes();
+        let is_ident_start = |b: u8| b.is_ascii_alphabetic() || b == b'_';
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        // Names the raw code declares as its own locals.
+        {
+            let words: Vec<&str> = code
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|w| !w.is_empty())
+                .collect();
+            for pair in words.windows(2) {
+                if matches!(pair[0], "let" | "local") {
+                    if self.raw_resolved.contains(pair[1]) {
+                        return Err(Error::at(
+                            span,
+                            format!(
+                                "raw block declares local '{}', which an earlier raw block of \
+                                 this tree read as a const; rename one of them",
+                                pair[1]
+                            ),
+                        ));
+                    }
+                    self.raw_declared.insert(pair[1].to_owned());
+                }
+            }
+        }
+        let next_non_space = |from: usize| {
+            bytes[from..]
+                .iter()
+                .copied()
+                .find(|b| !matches!(b, b' ' | b'\t'))
+        };
+        let prev_non_space = |to: usize| {
+            bytes[..to]
+                .iter()
+                .rev()
+                .copied()
+                .find(|b| !matches!(b, b' ' | b'\t'))
+        };
+        let mut out = String::with_capacity(code.len());
+        let (mut i, mut in_targets) = (0usize, false);
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'"' {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(bytes.len());
+                out.push_str(&code[start..i]);
+                continue;
+            }
+            if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+                let start = i;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                out.push_str(&code[start..i]);
+                continue;
+            }
+            if b == b'-' && bytes.get(i + 1) == Some(&b'>') {
+                in_targets = true;
+            }
+            if matches!(b, b';' | b'{' | b'}' | b'\n') {
+                in_targets = false;
+            }
+            if !is_ident_start(b) || (i > 0 && is_ident(bytes[i - 1])) {
+                // Copy one whole character: `code` may hold non-ASCII text.
+                let len = code[i..].chars().next().map_or(1, char::len_utf8);
+                out.push_str(&code[i..i + len]);
+                i += len;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && is_ident(bytes[i]) {
+                i += 1;
+            }
+            let word = &code[start..i];
+            let after = next_non_space(i);
+            let before = prev_non_space(start);
+            let operand_position = !in_targets
+                && !matches!(before, Some(b'.' | b'@'))
+                && !matches!(after, Some(b'[' | b'(' | b':'))
+                && !AIR_WORDS.contains(&word)
+                && !self.raw_declared.contains(word);
+            // `Table.entry` of a tuning table.
+            if operand_position && after == Some(b'.') {
+                let dot = start + bytes[start..].iter().position(|&c| c == b'.').unwrap_or(0);
+                let mut j = dot + 1;
+                while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
+                    j += 1;
+                }
+                let entry_start = j;
+                while j < bytes.len() && is_ident(bytes[j]) {
+                    j += 1;
+                }
+                let entry = &code[entry_start..j];
+                if !entry.is_empty()
+                    && let Some(found) = self.env.lookup_bcon_entry(
+                        &self.owner_module,
+                        word,
+                        entry,
+                        self.in_object_scope,
+                        span,
+                    )
+                {
+                    out.push_str(&found?.0);
+                    self.raw_resolved.insert(word.to_owned());
+                    i = j;
+                    continue;
+                }
+            }
+            if operand_position
+                && after != Some(b'.')
+                && let Some(v) =
+                    self.env
+                        .lookup_const(&self.owner_module, word, self.in_object_scope)
+            {
+                if i16::try_from(v).is_ok() {
+                    out.push_str(&v.to_string());
+                } else {
+                    out.push_str(&format!("{v:#010x}"));
+                }
+                self.raw_resolved.insert(word.to_owned());
+                continue;
+            }
+            out.push_str(word);
+        }
+        Ok(out)
     }
 
     /// Counted `for` loops. The VM's `inc_lt` / `dec_gt` step the cursor with i16 wrap-around and
