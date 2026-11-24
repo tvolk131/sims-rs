@@ -101,7 +101,7 @@ The work is a refactor that is strictly behaviour-preserving. It adds no syntax 
 - 1,341 `.antics` files:
   - every `.antics` in the repository;
   - every pilot and scratch object under `cache/scratch`, which includes the 13 Round 3 pilot objects;
-  - 642 synthetic probes from earlier review rounds.
+  - 642 files from earlier review work: synthetic probes, plus snapshots of repository sources (including copies of `open-pack` objects).
 - 163 packs, including `open-pack`.
 
 The outputs compared are:
@@ -117,7 +117,7 @@ Turning the remaining text emission sites (about 300 `self.line` calls in `lower
 
 That PR starts from the seams added here:
 
-- **`Emitter`.** `TreeLowerer` writes the lowered body (the text before the backend passes) through it, so it can start building `mir::Stmt` instead of text. Two kinds of text can be prepended outside it, both conditionally: the `__saved_stack_obj` entry save (in `finish`, when the body uses it), and `const` lines for constants a raw block uses but does not declare itself (in `finish_body`, zero or more).
+- **`Emitter`.** `TreeLowerer` writes the lowered body (the text before the backend passes) through it, so it can start building `mir::Stmt` instead of text. Two kinds of text can be prepended outside it, both conditionally: the `__saved_stack_obj` entry save (in `finish`, when the body uses it), and `const` lines (in `finish_body`, zero or more) for the constants found by scanning the raw blocks' tokens, minus those the raw blocks declare themselves. The scan is token-based, so a name used only as a label can still get a `const` line, in the base and the new binary alike.
 - **`InstKind`.** Today a view over the text; it can become a stored typed instruction.
 - **`StackObjOp`.** Generated `let X = stack_obj;` saves and plain `:=` writes of the stack object are already typed (raw `.air` and compound writes excepted).
 - **`FrameFacts`.** It carries the frame metadata.
