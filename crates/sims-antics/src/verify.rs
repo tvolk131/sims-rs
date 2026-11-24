@@ -22,6 +22,7 @@ mod iff;
 mod live;
 mod rename;
 mod replay;
+mod text;
 pub use domains::{
     ParamDomain, ParamDomains, V2EnumDomain, parse_param_domain_arg, v2_enum_param_domains,
 };
@@ -32,6 +33,7 @@ pub use iff::{
     single_file_problem, tree_reach,
 };
 pub use live::{GUARANTEED_ATTRIBUTES, LiveContext, LiveOptions, check_bhav_live_equivalent};
+pub use text::{TableLocals, TextLocals, string_locals};
 
 /// Category of safety violation reported by [`verify_object_safety`] / [`verify_pack_safety`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
