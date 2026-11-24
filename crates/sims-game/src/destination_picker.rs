@@ -764,6 +764,8 @@ impl DestinationMapPicker {
             magic_cost: 0,
             occupant: None,
             anchor,
+            tooltip: None,
+            alpha_shift: None,
         })
     }
 

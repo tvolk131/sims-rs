@@ -53,14 +53,24 @@ pub const PENDING_IMPORT: usize = 10;
 
 impl Neighborhood {
     pub fn open(directory: &Path) -> Result<Self> {
+        Self::open_with_file(directory).map(|(neighborhood, _)| neighborhood)
+    }
+
+    /// [`Neighborhood::open`], also giving the `Neighborhood.iff` bytes it
+    /// read, so that a caller reading more from the file reads the same
+    /// file even if a save replaces it meanwhile.
+    pub fn open_with_file(directory: &Path) -> Result<(Self, Vec<u8>)> {
         let path = resolve(directory, "Neighborhood.iff")?.ok_or_else(|| Error::Missing {
             root: directory.to_path_buf(),
             path: "Neighborhood.iff".into(),
         })?;
-        let iff = read_iff(&path)?;
+        let bytes = std::fs::read(&path).map_err(|e| Error::io(&path, e))?;
+        let iff =
+            Iff::parse(bytes.clone()).map_err(|e| Error::format(&path.display().to_string(), e))?;
         let mut families = BTreeMap::new();
         for chunk in iff.all(b"FAMI") {
-            let family = Family::parse(iff.data(chunk))
+            // Family 0 has no member list (0x4105e7).
+            let family = Family::parse_chunk(iff.data(chunk), chunk.id)
                 .map_err(|e| Error::format(&format!("{} FAMI #{}", path.display(), chunk.id), e))?;
             families.insert(chunk.id, family);
         }
@@ -91,7 +101,7 @@ impl Neighborhood {
             }
             None => (Vec::new(), [0; 16], None),
         };
-        Ok(Self {
+        let neighborhood = Self {
             directory: directory.to_path_buf(),
             families,
             type_attributes,
@@ -99,7 +109,8 @@ impl Neighborhood {
             inventories,
             data,
             options,
-        })
+        };
+        Ok((neighborhood, bytes))
     }
 
     /// The character directory, whose files define this neighborhood's Sims.

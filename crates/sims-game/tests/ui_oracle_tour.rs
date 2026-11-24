@@ -508,3 +508,319 @@ fn ui_oracle_tour_ratchet() {
     assert_eq!(results.len(), FLOORS.len(), "every floor must be scored");
     assert!(failures.is_empty(), "UI oracle regressions: {failures:#?}");
 }
+
+/// The need controls' rects in the panel's order: each control's help
+/// area (`0x513330`), as the HUD laid it out.
+fn need_controls(game: &Game) -> [Option<[i32; 2]>; 8] {
+    let mut controls = [None; 8];
+    for item in game.hud_items() {
+        if let Some(sims_ui::command::Command::Help(sims_ui::balloon::Help::Need {
+            pet: false,
+            index,
+        })) = item.command
+        {
+            controls[usize::from(index)] = Some([item.rect.x, item.rect.y]);
+        }
+    }
+    controls
+}
+
+/// The 800 Needs shot caught three falling needs (Hunger, Energy, Bladder)
+/// one arrow deep, the arrow at full red (565 keeps a red of 248 and up at
+/// 255), and the other four slots drawn in the panel's blue: on the
+/// bottom row they show as blue arrows over the panel's edge. Our bars'
+/// draw (`0x50c2fa`, `0x50c818`) at our layout's need controls must put
+/// every one of those pixels where the original did, in its colour, and
+/// the original must show no red pixel we do not draw.
+#[test]
+fn needs_trend_arrows_match_the_oracle() {
+    use sims_ui::needs_history::{Arrows, BLUE, RED, SLOTS};
+    let (Some(install), Some(oracle)) = (env_dir("SIMS_INSTALL"), env_dir("SIMS_UI_ORACLE")) else {
+        eprintln!("skipping: set SIMS_INSTALL and SIMS_UI_ORACLE to check the trend arrows");
+        return;
+    };
+    let shot = read_png(&oracle.join("shots/live-expanded-needs-800.png"));
+    let mut game = open_goth(&install, [800, 600]);
+    if !game.panel_expanded() {
+        game.hotkey_mode(Mode::Live);
+    }
+    game.render();
+    let controls = need_controls(&game);
+    let falling = Arrows {
+        falling: true,
+        colours: {
+            let mut c = [BLUE; SLOTS];
+            c[0] = RED;
+            c
+        },
+    };
+    let mut drawn = std::collections::BTreeMap::new();
+    for need in [0, 1, 6] {
+        let control = controls[need].expect("a need control");
+        for (point, rgb) in falling.pixels(control) {
+            drawn.insert(point, rgb);
+        }
+    }
+    assert_eq!(drawn.len(), 3 * SLOTS * 9);
+    // The quantized 565 colour, as the oracle holds it.
+    let q = |rgb: u32| {
+        let [_, r, g, b] = rgb.to_be_bytes();
+        let (r, g, b) = (r >> 3, g >> 2, b >> 3);
+        [
+            (r << 3) | (r >> 2),
+            (g << 2) | (g >> 4),
+            (b << 3) | (b >> 2),
+        ]
+    };
+    let at = |[x, y]: [i32; 2]| shot.pixels[y as usize * shot.width + x as usize];
+    let wrong: Vec<_> = drawn
+        .iter()
+        .filter(|&(&p, &rgb)| at(p) != q(rgb))
+        .map(|(&p, &rgb)| (p, q(rgb), at(p)))
+        .collect();
+    assert!(wrong.is_empty(), "pixels unlike the oracle: {wrong:?}");
+    let missing: Vec<[i32; 2]> = (500..600)
+        .flat_map(|y| (420..800).map(move |x| [x, y]))
+        .filter(|&p| at(p) == [255, 0, 0] && !drawn.contains_key(&p))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "oracle arrow pixels we do not draw: {missing:?}"
+    );
+}
+
+/// The trend arrows as the lot runs: the window loop's frames sample the
+/// needs on the presentation clock (at ultra speed, every 48 ms), the bars
+/// light falling needs, and the HUD's draw puts each bar's arrows on the
+/// canvas in the colours its draw (`0x50c2fa`) gave, fading on to the
+/// darker red. Static frames show none.
+#[test]
+fn needs_trend_arrows_show_as_the_lot_runs() {
+    use sims_ui::needs_history::DARK_RED;
+    let Some(install) = env_dir("SIMS_INSTALL") else {
+        eprintln!("skipping: set SIMS_INSTALL to run the trend arrows on the Goth house");
+        return;
+    };
+    let trends = |game: &Game| -> Vec<(sims_ui::frame::Rect, sims_ui::needs_history::Arrows)> {
+        game.hud_items()
+            .iter()
+            .filter_map(|i| match &i.kind {
+                sims_ui::hud::Kind::Trend(a) => Some((i.rect, *a)),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut game = open_goth(&install, [800, 600]);
+    if !game.panel_expanded() {
+        game.hotkey_mode(Mode::Live);
+    }
+    game.render();
+    assert!(trends(&game).is_empty(), "a static frame shows no arrows");
+    game.set_speed(sims_ui::command::Speed::Ultra);
+    let mut dark = false;
+    let mut shown = 0;
+    for _ in 0..120 {
+        game.advance_while(33_333, 33_333, |_| true);
+        game.render();
+        let lit = trends(&game);
+        if lit.is_empty() {
+            continue;
+        }
+        shown += 1;
+        let controls = need_controls(&game);
+        for (rect, arrows) in lit {
+            assert!(
+                controls.contains(&Some([rect.x, rect.y])),
+                "arrows at a need control: {rect:?}"
+            );
+            for ([x, y], rgb) in arrows.pixels([rect.x, rect.y]) {
+                let [_, r, g, b] = rgb.to_be_bytes();
+                assert_eq!(ours_at(game.canvas(), x as usize, y as usize), [r, g, b]);
+            }
+            dark |= arrows.colours.contains(&DARK_RED);
+        }
+        if dark {
+            break;
+        }
+    }
+    assert!(shown > 0, "no need bar lit as the lot ran");
+    assert!(dark, "no arrow settled to the darker red");
+}
+
+/// Lit arrows fade on the frames the HUD itself asks for: the loop wakes
+/// when `next_wake_us` says, and draws only when the HUD animates or a blink
+/// or need sample is due (ticks and the plumb bob's spin, which would also
+/// draw, are left out). While a bar is lit, the HUD asks for a frame well
+/// inside the 48 ms sampling period at ultra speed, so the 500 ms fades run
+/// smoothly up to full red. A due sample leaves its deadline to the redraw,
+/// so the loop never asks to wake at once.
+#[test]
+fn needs_trend_arrows_fade_on_frames_the_loop_asks_for() {
+    use sims_ui::needs_history::{DARK_RED, RED};
+    let Some(install) = env_dir("SIMS_INSTALL") else {
+        eprintln!("skipping: set SIMS_INSTALL to run the trend arrows on the Goth house");
+        return;
+    };
+    let lit = |game: &Game| -> Vec<sims_ui::needs_history::Arrows> {
+        game.hud_items()
+            .iter()
+            .filter_map(|i| match &i.kind {
+                sims_ui::hud::Kind::Trend(a) => Some(*a),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut game = open_goth(&install, [800, 600]);
+    if !game.panel_expanded() {
+        game.hotkey_mode(Mode::Live);
+    }
+    game.render();
+    game.set_speed(sims_ui::command::Speed::Ultra);
+    // The window's first timed frame, which starts the panel's clock.
+    game.advance_while(16_667, 16_667, |_| true);
+    game.render();
+    let mut clock = 0u64;
+    let mut last_drawn: Option<(u64, bool)> = None;
+    let mut widest_lit_gap = 0;
+    let (mut drawn, mut lit_frames, mut full) = (0, 0, false);
+    while clock < 3_000_000 {
+        let wake = game
+            .next_wake_us(false, 16_667)
+            .expect("the live panel asks for a wakeup");
+        assert!(wake > 0, "a wakeup of 0 us spins");
+        clock += wake;
+        game.advance_while(wake, wake, |_| true);
+        if !(game.ui_animating() || game.blink_due()) {
+            continue;
+        }
+        game.render();
+        drawn += 1;
+        if let Some((at, true)) = last_drawn {
+            widest_lit_gap = widest_lit_gap.max(clock - at);
+        }
+        let arrows = lit(&game);
+        lit_frames += usize::from(!arrows.is_empty());
+        full |= arrows
+            .iter()
+            .any(|a| a.colours.iter().any(|c| [RED, DARK_RED].contains(c)));
+        last_drawn = Some((clock, !arrows.is_empty()));
+    }
+    assert!(
+        drawn > 0 && lit_frames > 0,
+        "no arrows drawn: {drawn} frames"
+    );
+    assert!(
+        widest_lit_gap <= 40_000,
+        "a lit bar went {widest_lit_gap} us without a frame"
+    );
+    assert!(full, "no arrow faded up to full red");
+}
+
+/// The 1.91 neighborhood captures (`SIMS_NB_ORACLE` overrides).
+const DEFAULT_NB_ORACLE: &str =
+    "/Users/tommyvolk/Desktop/sims-rs/cache/nb-save-movein-evict-20261121/shots";
+
+/// The share of `region` where `ours` and `oracle` agree within one step
+/// of each 5-6-5 channel (the capture widens 5-bit values differently).
+fn near_565(ours: &Rgb, oracle: &Rgb, [x, y, w, h]: Region) -> f64 {
+    let q = |[r, g, b]: [u8; 3]| [i32::from(r >> 3), i32::from(g >> 2), i32::from(b >> 3)];
+    let mut same = 0usize;
+    for py in y..y + h {
+        for px in x..x + w {
+            let i = py as usize * oracle.width + px as usize;
+            let (a, b) = (q(ours.pixels[i]), q(oracle.pixels[i]));
+            same += usize::from(a.iter().zip(&b).all(|(a, b)| (a - b).abs() <= 1));
+        }
+    }
+    same as f64 / (w * h) as f64
+}
+
+/// The lot card hangs from its lot as the original's tooltip places it
+/// (`0x5ddbda`: under a lot too near the top, else above it; `0x5da2b0`:
+/// pulled back to end a pixel short of the right edge), blends over the map
+/// through its tiler's alpha less 70 (`0x54f939`, `0x4ba004`), and shows
+/// each member's framed thumbnail (`BMP_` 2004, `0x550b02`). Checked
+/// against `02-nb-hover-goth.png` (Lot 5, three members, card below the
+/// lot) and `05-nb-hover-newbie.png` (Lot 7, two members, card above it and
+/// over the top bar).
+#[test]
+fn neighborhood_lot_cards_match_the_oracle() {
+    let Some(install) = env_dir("SIMS_INSTALL") else {
+        eprintln!("skipping: set SIMS_INSTALL to check the lot cards");
+        return;
+    };
+    let shots = std::env::var_os("SIMS_NB_ORACLE")
+        .map_or_else(|| PathBuf::from(DEFAULT_NB_ORACLE), PathBuf::from);
+    if !shots.join("02-nb-hover-goth.png").is_file() {
+        eprintln!("skipping: no neighborhood captures at {}", shots.display());
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("sims-lot-cards-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let mut shell = sims_game::neighborhood::NeighborhoodShell::open(
+        install,
+        dir.join("saves.redb"),
+        1,
+        true,
+        vec![3],
+        Frames::default(),
+    )
+    .expect("open Neighborhood 1");
+    shell.resize([800, 600]);
+    // (lot, capture, card, portrait row)
+    let cases: [(u16, &str, Region, Region); 2] = [
+        (
+            5,
+            "02-nb-hover-goth.png",
+            [524, 252, 275, 180],
+            [549, 382, 75, 25],
+        ),
+        (
+            7,
+            "05-nb-hover-newbie.png",
+            [524, 27, 275, 180],
+            [549, 157, 50, 25],
+        ),
+    ];
+    for (lot, shot, card, portraits) in cases {
+        let oracle = read_png(&shots.join(shot));
+        let map_lot = shell.map().lot(lot).expect("lot");
+        let [left, top, right, bottom] = shell.map().lot_screen_rect(map_lot, [800, 600]);
+        let point = (top..bottom)
+            .flat_map(|y| (left..right).map(move |x| [x, y]))
+            .find(|&p| shell.map().hit_test([800, 600], p) == Some(lot))
+            .expect("a point on the lot");
+        shell.hover(point);
+        // Past the card's delay and the 300 ms fade.
+        for _ in 0..40 {
+            shell.tick_shell(16_000);
+        }
+        shell.render();
+        let canvas = shell.canvas();
+        let ours = Rgb {
+            width: canvas.width,
+            height: canvas.height,
+            pixels: canvas
+                .color
+                .iter()
+                .map(|&p| [(p >> 16) as u8, (p >> 8) as u8, p as u8])
+                .collect(),
+        };
+        let whole = near_565(&ours, &oracle, card);
+        let faces = near_565(&ours, &oracle, portraits);
+        eprintln!("lot {lot}: card {whole:.4}, portraits {faces:.4}");
+        // The misses are the map's water frames at the card's edges.
+        assert!(
+            whole >= 0.97,
+            "lot {lot} card {whole:.4} < 0.97 against {shot}"
+        );
+        assert!(
+            faces >= 0.94,
+            "lot {lot} portraits {faces:.4} < 0.94 against {shot}"
+        );
+        shell.hover([400, 590]);
+        for _ in 0..40 {
+            shell.tick_shell(16_000);
+        }
+    }
+}

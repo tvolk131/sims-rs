@@ -35,6 +35,7 @@ use crate::neighborhood::{Family, Neighborhood, Neighbors};
 use crate::reader::{Reader, encode_western, western};
 use crate::tatt::Tatt;
 use crate::{Error, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// The flags of every resource the save adds.
@@ -71,7 +72,7 @@ pub struct NeighborhoodFile {
 
 /// Bytes the save leaves uninitialized. Any values are faithful; these
 /// reproduce a recorded file. The default leaves them all zero.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Uninitialized {
     /// The last byte of each family's FAMs, by family ID. The string
     /// table's writer (0x470696) allocates four bytes per entry beyond its
