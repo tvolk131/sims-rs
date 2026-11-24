@@ -755,11 +755,13 @@ struct Symbols {
     ident_counts: BTreeMap<String, usize>,
     /// Literal `attr[N]` indices.
     attr_indices: BTreeSet<i64>,
-    /// Identifier-like words inside `raw { }` bodies (which never resolve a `const`).
+    /// Identifier-like words in `raw { }` code (not its comments or strings), less the
+    /// names a block declares as its own `.air` constants: lowering resolves every other
+    /// v2 `const` a raw block names.
     raw_words: BTreeSet<String>,
     /// Literal indices `raw { }` bodies address (`attr[5]`, `data[0x10]`), outside the
-    /// frame's own `local` / `temp` / `param` words: `raw` does not resolve `const` names,
-    /// so a constant written there as its value is used all the same.
+    /// frame's own `local` / `temp` / `param` words: a constant written there as its value
+    /// is used all the same.
     raw_index_literals: BTreeSet<i64>,
     /// Whether code outside the file set's names may read BCON entries by number: a `raw`
     /// `bcon[N]`, or an `extern` tree (globals and semi-globals can read an object's
@@ -790,8 +792,20 @@ impl Symbols {
                     // Names and indices in `.air` code, not in its comments or strings
                     // (a quoted tree label may read `attr[7]`).
                     let outside = air_code_only(code);
-                    self.raw_words
-                        .extend(air_words(&outside).map(str::to_owned));
+                    // A block's own `const K = ..;` (or `const T.e`) is its constant, not
+                    // the v2 one: v2 declares no second `K` for that block.
+                    let words: Vec<&str> = air_words(&outside).collect();
+                    let own: BTreeSet<&str> = words
+                        .windows(2)
+                        .filter(|w| w[0] == "const")
+                        .map(|w| w[1])
+                        .collect();
+                    self.raw_words.extend(
+                        words
+                            .iter()
+                            .filter(|w| !own.contains(*w))
+                            .map(|w| (*w).to_owned()),
+                    );
                     for (word, n) in raw_index_words(&outside) {
                         if !matches!(word, "local" | "temp" | "param") {
                             self.raw_index_literals.insert(n);
@@ -1830,21 +1844,11 @@ impl FileLinter<'_> {
         if count > 1 || c.name.starts_with('_') {
             return;
         }
-        // `raw` does not resolve `const` names (the build rejects one there), so a name
-        // in a `raw` body is not a use; only the value written in its place is.
-        if self.symbols.raw_words.contains(&c.name) {
-            self.emit(
-                UNUSED_DECL,
-                c.span,
-                format!("constant `{}` is only named inside `raw {{ }}`", c.name),
-                Some(format!("write its value, {}, in the `raw` body", c.value)),
-                None,
-                Some(
-                    "`raw` does not resolve `const` names: the build rejects the name there"
-                        .to_owned(),
-                ),
-            );
-        } else if !self.symbols.raw_index_literals.contains(&c.value) {
+        // A `raw` block that names the constant uses it: lowering declares it for the
+        // block as an `.air` constant.
+        if !self.symbols.raw_words.contains(&c.name)
+            && !self.symbols.raw_index_literals.contains(&c.value)
+        {
             self.emit(
                 UNUSED_DECL,
                 c.span,
@@ -2908,7 +2912,15 @@ impl FileLinter<'_> {
             V2Stmt::LetUninit { span, name, .. } => (*span, name, true),
             _ => return,
         };
-        if name.starts_with('_') {
+        // `@slot(N) let`: the frame word is pinned so that code addressing it by number
+        // (raw `op` bytes, a primitive, another tree sharing the frame) can read or fill
+        // it; the source does not say which, and the build keeps every store to it.
+        if name.starts_with('_')
+            || matches!(
+                &list[i],
+                V2Stmt::Let { slot: Some(_), .. } | V2Stmt::LetUninit { slot: Some(_), .. }
+            )
+        {
             return;
         }
         let rest = &list[i + 1..];

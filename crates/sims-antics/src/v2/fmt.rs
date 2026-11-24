@@ -529,6 +529,8 @@ enum Frame {
     Group,
     /// `( ... )` / `[ ... ]` laid out vertically.
     BrokenGroup,
+    /// `{ value }`: an arm of a one-line `const NAME = if .. { a } else { b };`.
+    InlineBlock,
 }
 
 impl Frame {
@@ -552,6 +554,7 @@ fn is_space_keyword(s: &str) -> bool {
             | "flag_set"
             | "flag_clear"
             | "flag_test"
+            | "const"
     )
 }
 
@@ -679,6 +682,69 @@ fn analyze(toks: &[Tok]) -> Analysis {
         frame[o] = Some(kind);
         frame[c] = Some(kind);
     }
+    // One-line `const NAME = if c { a } else { b };` bindings stay on one line: written
+    // on one line, no comment inside, and each arm one value (no `;`, no inner `{`).
+    for i in 0..n {
+        if !(toks[i].class == Class::Ident && text(i) == "const") {
+            continue;
+        }
+        let Some(eq) = (i + 1..n).find(|&k| {
+            is_punct(k, "=") || is_punct(k, ";") || is_punct(k, "{") || is_punct(k, "}")
+        }) else {
+            continue;
+        };
+        if !is_punct(eq, "=") || !(toks.get(eq + 1).is_some_and(|t| t.text == "if")) {
+            continue;
+        }
+        // The statement's `;`, outside every bracket.
+        let mut depth = 0usize;
+        let mut end = None;
+        for k in eq + 1..n {
+            if toks[k].class == Class::Punct {
+                match text(k) {
+                    "{" | "(" | "[" => depth += 1,
+                    "}" | ")" | "]" => {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    ";" if depth == 0 => {
+                        end = Some(k);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let Some(end) = end else {
+            continue;
+        };
+        let one_line = (i + 1..=end)
+            .all(|k| toks[k].newlines_before == 0 && toks[k].leading.is_empty())
+            && toks[end].class == Class::Punct;
+        let braces: Vec<usize> = (eq + 1..end)
+            .filter(|&k| is_punct(k, "{") && toks[k].class == Class::Punct)
+            .collect();
+        let simple = !braces.is_empty()
+            && (eq + 1..end).all(|k| toks[k].class != Class::Raw)
+            && braces.iter().all(|&o| {
+                partner[o].is_some_and(|c| {
+                    c > o + 1
+                        && (o + 1..c).all(|k| {
+                            !(toks[k].class == Class::Punct && matches!(text(k), "{" | "}" | ";"))
+                        })
+                })
+            });
+        if one_line && simple {
+            for &o in &braces {
+                frame[o] = Some(Frame::InlineBlock);
+                if let Some(c) = partner[o] {
+                    frame[c] = Some(Frame::InlineBlock);
+                }
+            }
+        }
+    }
 
     // Turbofish / `Result<...>` generics.
     let mut generic_open = vec![false; n];
@@ -729,7 +795,7 @@ fn analyze(toks: &[Tok]) -> Analysis {
     for i in 0..n.saturating_sub(2) {
         if is_punct(i, "@")
             && toks[i + 1].class == Class::Ident
-            && matches!(text(i + 1), "id" | "frame" | "guard_id")
+            && matches!(text(i + 1), "id" | "frame" | "guard_id" | "slot" | "context")
             && is_punct(i + 2, "(")
             && let Some(c) = partner[i + 2]
         {
@@ -1004,6 +1070,20 @@ impl<'a> Printer<'a> {
             return Sep::Newline;
         }
 
+        // One-line `const` arms: `{ a }`.
+        if p_punct && pt == "{" && self.frame(p) == Some(Frame::InlineBlock) {
+            return Sep::Space;
+        }
+        if n_punct && nt == "}" && self.frame(i) == Some(Frame::InlineBlock) {
+            return Sep::Space;
+        }
+        if p_punct && pt == "}" && self.frame(p) == Some(Frame::InlineBlock) {
+            return if n_punct && nt == ";" {
+                Sep::None
+            } else {
+                Sep::Space
+            };
+        }
         // Block braces.
         if p_punct && pt == "{" && self.frame(p) == Some(Frame::Block) {
             return if self.a.partner[p] == Some(i) {
