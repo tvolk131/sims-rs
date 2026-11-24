@@ -32,6 +32,7 @@ pub mod head;
 pub mod load;
 pub mod migration;
 pub mod motives;
+pub mod neighborhood_save;
 pub mod neighborhood_store;
 pub mod neighbors;
 pub mod patch_import;

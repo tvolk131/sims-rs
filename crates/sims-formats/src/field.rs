@@ -111,7 +111,7 @@ impl FieldWriter {
     }
     fn bits(&mut self, count: usize, value: u32) {
         for index in (0..count).rev() {
-            if self.bit % 8 == 0 {
+            if self.bit.is_multiple_of(8) {
                 self.bytes.push(0);
             }
             if (value >> index) & 1 != 0 {
