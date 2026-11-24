@@ -21,6 +21,8 @@
 //! - `v4 -> v5`: keeps the layout; `made_characters` is in the order made
 //!   from v5 on, so a v4 build refuses it rather than saving it back by
 //!   GUID. A v4 record's made types read back in GUID order.
+//! - `v5 -> v6`: keeps the layout; family 0 is read again without a member
+//!   list, as the original reads it (0x4105e7).
 
 use crate::characters::Characters;
 use crate::neighborhood_store::{NEIGHBORHOOD_FORMAT, StoredNeighborhood};
@@ -572,6 +574,28 @@ fn migrate_v4_to_v5(record: &str, body: &[u8]) -> std::result::Result<Vec<u8>, M
     })
 }
 
+/// Format 6 holds family 0 as the original reads it (0x4105e7): without
+/// a member list. Formats 1–5 read it with one, so its secondary house was
+/// taken for a member count. Reading it again is exact even after a world
+/// writeback, which only appends zeros to a version 9 record's tail
+/// (`Family::upgrade_to_v9`). The layout is format 5's, so a format-5
+/// build refuses it rather than saving family 0 read the old way.
+fn migrate_v5_to_v6(record: &str, body: &[u8]) -> std::result::Result<Vec<u8>, MigrationError> {
+    let failed = |detail: String| MigrationError::StepFailed {
+        record: record.to_owned(),
+        from: 5,
+        to: 6,
+        detail,
+    };
+    let mut v6: StoredNeighborhood = decode_postcard_exact(record, 5, body)?;
+    if let Some(zero) = v6.families.get_mut(&0) {
+        *zero = zero
+            .for_chunk(0)
+            .map_err(|error| failed(format!("family 0: {error}")))?;
+    }
+    postcard::to_allocvec(&v6).map_err(|error| failed(error.to_string()))
+}
+
 fn validate_neighborhood_current(
     record: &str,
     body: &[u8],
@@ -605,9 +629,15 @@ static NEIGHBORHOOD_STEPS: &[MigrationStep] = &[
         description: "keep made person types in the order made (format 4 had them by GUID)",
         apply: migrate_v4_to_v5,
     },
+    MigrationStep {
+        from: 5,
+        to: 6,
+        description: "read family 0 without a member list, as the original does",
+        apply: migrate_v5_to_v6,
+    },
 ];
 
-/// Registered forward migration chain for [`StoredNeighborhood`] (`v1 -> v2 -> v3 -> v4 -> v5`).
+/// Registered forward migration chain for [`StoredNeighborhood`] (`v1 -> v2 -> v3 -> v4 -> v5 -> v6`).
 pub const NEIGHBORHOOD_MIGRATIONS: MigrationRegistry = MigrationRegistry {
     min_version: NEIGHBORHOOD_MIN_FORMAT,
     current_version: NEIGHBORHOOD_FORMAT,
@@ -616,7 +646,7 @@ pub const NEIGHBORHOOD_MIGRATIONS: MigrationRegistry = MigrationRegistry {
 };
 
 /// Decodes a [`StoredNeighborhood`] record from any supported version
-/// (`v1..=v5`), applying forward migrations in memory and returning both the
+/// (`v1..=v6`), applying forward migrations in memory and returning both the
 /// decoded neighborhood and its [`MigrationReport`].
 pub fn decode_neighborhood_with_report(
     name: &str,

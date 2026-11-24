@@ -140,8 +140,8 @@ fn lot_total_value_and_net_worth_match_sims_exe_191_formula() {
 #[test]
 fn stored_neighborhood_decode_rejects_short_corrupt_and_unsupported_versions() {
     assert_eq!(NEIGHBORHOOD_MIN_FORMAT, 1);
-    assert_eq!(NEIGHBORHOOD_FORMAT, 5);
-    assert_eq!(NEIGHBORHOOD_MIGRATIONS.steps().len(), 4);
+    assert_eq!(NEIGHBORHOOD_FORMAT, 6);
+    assert_eq!(NEIGHBORHOOD_MIGRATIONS.steps().len(), 5);
 
     // Truncated header (< 4 bytes).
     assert!(matches!(
@@ -158,7 +158,7 @@ fn stored_neighborhood_decode_rejects_short_corrupt_and_unsupported_versions() {
             Err(MigrationError::UnsupportedVersion {
                 found,
                 min_supported: 1,
-                max_supported: 5,
+                max_supported: 6,
                 ..
             }) if found == unsupported
         ));
@@ -188,7 +188,7 @@ fn stored_neighborhood_decode_rejects_short_corrupt_and_unsupported_versions() {
     with_trailing.push(0xAA);
     assert!(matches!(
         StoredNeighborhood::decode_with_report("UserData", &with_trailing),
-        Err(MigrationError::CorruptPayload { version: 5, .. })
+        Err(MigrationError::CorruptPayload { version: 6, .. })
     ));
 }
 
@@ -219,8 +219,8 @@ fn historical_0c25ad21_and_1719402e_layouts_migrate_losslessly() {
     let (decoded_0c, rep_0c) =
         StoredNeighborhood::decode_with_report("HistV1", &hist_0c25ad21).unwrap();
     assert_eq!(rep_0c.original_version, 1);
-    assert_eq!(rep_0c.final_version, 5);
-    assert_eq!(rep_0c.steps_applied, 4);
+    assert_eq!(rep_0c.final_version, 6);
+    assert_eq!(rep_0c.steps_applied, 5);
     assert_eq!(decoded_0c.instance_id, 0xCAFE_BABE_1234_5678);
     assert_eq!(decoded_0c.revision, 5);
     assert_eq!(
@@ -268,8 +268,8 @@ fn historical_0c25ad21_and_1719402e_layouts_migrate_losslessly() {
     let (decoded_17, rep_17) =
         StoredNeighborhood::decode_with_report("HistV2", &hist_1719402e).unwrap();
     assert_eq!(rep_17.original_version, 2);
-    assert_eq!(rep_17.final_version, 5);
-    assert_eq!(rep_17.steps_applied, 3);
+    assert_eq!(rep_17.final_version, 6);
+    assert_eq!(rep_17.steps_applied, 4);
     assert_eq!(decoded_17, expected_v2_epochs);
 
     // 3. Both historical layouts migrate cleanly inside `migrate_all`.
@@ -324,16 +324,16 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
         StoredNeighborhood::decode_strict("UserData", &v1_bytes),
         Err(MigrationError::UnsupportedVersion {
             found: 1,
-            min_supported: 5,
-            max_supported: 5,
+            min_supported: 6,
+            max_supported: 6,
             ..
         })
     ));
     let (migrated_v1, report_v1) =
         StoredNeighborhood::decode_with_report("UserData", &v1_bytes).unwrap();
     assert_eq!(report_v1.original_version, 1);
-    assert_eq!(report_v1.final_version, 5);
-    assert_eq!(report_v1.steps_applied, 4);
+    assert_eq!(report_v1.final_version, 6);
+    assert_eq!(report_v1.steps_applied, 5);
     assert!(report_v1.was_migrated());
     assert_eq!(migrated_v1.name, v1.name);
     assert_eq!(migrated_v1.families, v1.families);
@@ -373,8 +373,8 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
     let (migrated_v2, report_v2) =
         StoredNeighborhood::decode_with_report("UserData2", &v2_bytes).unwrap();
     assert_eq!(report_v2.original_version, 2);
-    assert_eq!(report_v2.final_version, 5);
-    assert_eq!(report_v2.steps_applied, 3);
+    assert_eq!(report_v2.final_version, 6);
+    assert_eq!(report_v2.steps_applied, 4);
     assert_eq!(migrated_v2.instance_id, 0x1234_5678_9ABC_DEF0);
     assert_eq!(migrated_v2.revision, 11);
     assert_eq!(
@@ -410,8 +410,8 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
     let (migrated_v3, report_v3) =
         StoredNeighborhood::decode_with_report("UserDataV3", &v3_fixture_bytes).unwrap();
     assert_eq!(report_v3.original_version, 3);
-    assert_eq!(report_v3.final_version, 5);
-    assert_eq!(report_v3.steps_applied, 2);
+    assert_eq!(report_v3.final_version, 6);
+    assert_eq!(report_v3.steps_applied, 3);
     assert_eq!(migrated_v3.instance_id, 0x0BAD_F00D_1234_5678);
     assert_eq!(migrated_v3.deletion_epoch, 3);
     assert_eq!(migrated_v3.revision, 14);
@@ -461,16 +461,16 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
             NeighborhoodSchemaStatus::NeedsMigration {
                 id: "UserData".to_owned(),
                 from_version: 1,
-                target_version: 5,
+                target_version: 6,
             },
             NeighborhoodSchemaStatus::NeedsMigration {
                 id: "UserData2".to_owned(),
                 from_version: 2,
-                target_version: 5,
+                target_version: 6,
             },
             NeighborhoodSchemaStatus::Current {
                 id: "UserData3".to_owned(),
-                version: 5,
+                version: 6,
             },
             NeighborhoodSchemaStatus::Invalid {
                 id: "UserData4".to_owned(),
@@ -478,7 +478,7 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
                     record: "UserData4".to_owned(),
                     found: 99,
                     min_supported: 1,
-                    max_supported: 5,
+                    max_supported: 6,
                 },
             },
         ]
@@ -534,8 +534,8 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
     );
     let single = store.migrate_neighborhood("UserData").unwrap().unwrap();
     assert_eq!(single.from_version, 1);
-    assert_eq!(single.to_version, 5);
-    assert_eq!(single.steps_applied, 4);
+    assert_eq!(single.to_version, 6);
+    assert_eq!(single.steps_applied, 5);
 
     // Checked save on unmigrated v2 row succeeds because read-time and write-time
     // migration derive the exact same (instance_id, revision).
@@ -571,14 +571,14 @@ fn forward_schema_migrations_v1_and_v2_to_v3_and_atomic_store_upgrade() {
 
     let store = NeighborhoodStore::open(&db.0).unwrap();
     let report = store.migrate_all().unwrap();
-    assert_eq!(report.target_version, 5);
+    assert_eq!(report.target_version, 6);
     assert_eq!(report.inspected, 3);
     assert_eq!(report.already_current, 2);
     assert_eq!(report.migrated.len(), 1);
     assert_eq!(report.migrated[0].id, "UserData2");
     assert_eq!(report.migrated[0].from_version, 2);
-    assert_eq!(report.migrated[0].to_version, 5);
-    assert_eq!(store.recorded_schema_version().unwrap(), Some(5));
+    assert_eq!(report.migrated[0].to_version, 6);
+    assert_eq!(store.recorded_schema_version().unwrap(), Some(6));
 
     // Second `migrate_all` is a clean idempotent no-op.
     let second = store.migrate_all().unwrap();
@@ -1868,7 +1868,7 @@ fn made_types_keep_the_order_made_and_format_4_reads_them_by_guid() {
     let keys = |n: &StoredNeighborhood| n.made_characters.made.keys().copied().collect::<Vec<_>>();
 
     let bytes = neighborhood.encode();
-    assert_eq!(bytes[..4], 5u32.to_le_bytes());
+    assert_eq!(bytes[..4], 6u32.to_le_bytes());
     let back = StoredNeighborhood::decode("UserData", &bytes).unwrap();
     assert_eq!(keys(&back), [0x0005_7000, 0x0005_1000]);
 
@@ -1876,6 +1876,6 @@ fn made_types_keep_the_order_made_and_format_4_reads_them_by_guid() {
     v4[..4].copy_from_slice(&4u32.to_le_bytes());
     let (old, report) = StoredNeighborhood::decode_with_report("UserData", &v4).unwrap();
     assert_eq!(report.original_version, 4);
-    assert_eq!(report.steps_applied, 1);
+    assert_eq!(report.steps_applied, 2);
     assert_eq!(keys(&old), [0x0005_1000, 0x0005_7000]);
 }
