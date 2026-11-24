@@ -92,6 +92,71 @@ impl<'a> Fields<'a> {
     }
 }
 
+/// Writes the same packed field stream (the stream's packed mode, set by
+/// 0x4644f5). A zero is one clear bit (0x46460a). Any other value is a set
+/// bit, a two-bit selector, and the value's low bits at the selected width
+/// (0x46463d, 0x46464f). The selector is the first width whose sign-extended
+/// range holds the value (0x46465b compares the value against each width's
+/// mask, `-1 << (width - 1)`, from 0x464512), and the widest otherwise. Bits
+/// go most significant first; the last byte's unused bits stay clear.
+#[derive(Debug, Default, Clone)]
+pub struct FieldWriter {
+    bytes: Vec<u8>,
+    bit: usize,
+}
+
+impl FieldWriter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    fn bits(&mut self, count: usize, value: u32) {
+        for index in (0..count).rev() {
+            if self.bit.is_multiple_of(8) {
+                self.bytes.push(0);
+            }
+            if (value >> index) & 1 != 0 {
+                let last = self.bytes.len() - 1;
+                self.bytes[last] |= 0x80 >> (self.bit % 8);
+            }
+            self.bit += 1;
+        }
+    }
+    fn signed(&mut self, value: i32, widths: [usize; 4]) {
+        if value == 0 {
+            self.bits(1, 0);
+            return;
+        }
+        let selector = widths
+            .iter()
+            .position(|&width| {
+                let mask = -1i32 << (width - 1);
+                value & mask == mask || value & mask == 0
+            })
+            .unwrap_or(3);
+        self.bits(1, 1);
+        self.bits(2, selector as u32);
+        let width = widths[selector];
+        let low = if width == 32 {
+            value as u32
+        } else {
+            (value as u32) & ((1 << width) - 1)
+        };
+        self.bits(width, low);
+    }
+    pub fn i16(&mut self, value: i16) {
+        self.signed(i32::from(value), [5, 8, 13, 16]);
+    }
+    pub fn i32(&mut self, value: i32) {
+        self.signed(value, [6, 11, 21, 32]);
+    }
+    pub fn u32(&mut self, value: u32) {
+        self.i32(value as i32);
+    }
+    pub fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +176,52 @@ mod tests {
         assert_eq!(odd.byte_position(), 3);
         assert!(odd.i16().is_err());
         assert!(Fields::new(&[0xff], 0).i32().is_err());
+    }
+
+    #[test]
+    fn the_writer_picks_the_narrowest_width_and_reads_back() {
+        let shorts = [
+            0, -1, 15, -16, 16, 127, -128, 128, 4095, -4096, 4096, 32767, -32768,
+        ];
+        let ints = [
+            0,
+            31,
+            -32,
+            32,
+            1023,
+            -1024,
+            1024,
+            1 << 20,
+            -(1 << 20),
+            i32::MAX,
+            i32::MIN,
+        ];
+        let mut writer = FieldWriter::new();
+        for &value in &shorts {
+            writer.i16(value);
+        }
+        for &value in &ints {
+            writer.i32(value);
+        }
+        let bytes = writer.finish();
+        let mut reader = Fields::new(&bytes, 0);
+        for &value in &shorts {
+            assert_eq!(reader.i16().unwrap(), value);
+        }
+        for &value in &ints {
+            assert_eq!(reader.i32().unwrap(), value);
+        }
+        assert!(reader.remaining_bits() < 8);
+
+        // The same bits as the reader's fixture: zero, short -1, short 15.
+        let mut writer = FieldWriter::new();
+        writer.i16(0);
+        writer.i16(-1);
+        writer.i16(15);
+        assert_eq!(writer.finish(), [0x4f, 0xc7, 0x80]);
+        // 16 needs the second width (8 bits): 1 01 00010000.
+        let mut writer = FieldWriter::new();
+        writer.i16(16);
+        assert_eq!(writer.finish(), [0xa2, 0x00]);
     }
 }
