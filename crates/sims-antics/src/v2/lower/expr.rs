@@ -251,7 +251,7 @@ impl<'a> TreeLowerer<'a> {
             if declare_let {
                 self.line(format!("let {dst_air} = {mask};"));
             } else {
-                self.line(format!("{dst_air} := {mask};"));
+                self.emit_store(dst_air, ":=", &mask.to_string());
             }
             return Ok(ValueType::Bitflags(key));
         }
@@ -275,7 +275,7 @@ impl<'a> TreeLowerer<'a> {
                     if declare_let {
                         self.line(format!("let {dst_air} = {n};"));
                     } else {
-                        self.line(format!("{dst_air} := {n};"));
+                        self.emit_store(dst_air, ":=", &n.to_string());
                     }
                     ValueType::I16
                 } else {

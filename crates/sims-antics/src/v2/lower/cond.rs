@@ -596,7 +596,7 @@ impl<'a> TreeLowerer<'a> {
     /// helper calls, and `run_functional`) into `dst_local` (`0` or `1`).
     pub(super) fn emit_bool_into_local(&mut self, expr: &V2Expr, dst_local: &str) -> Result<()> {
         if let Some(b) = self.try_eval_const_bool(expr) {
-            self.line(format!("{dst_local} := {};", if b { 1 } else { 0 }));
+            self.emit_store(dst_local, ":=", if b { "1" } else { "0" });
             return Ok(());
         }
         match expr {
