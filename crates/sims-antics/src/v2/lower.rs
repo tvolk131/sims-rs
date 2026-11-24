@@ -6683,12 +6683,39 @@ impl<'a> TreeLowerer<'a> {
                 }
                 Ok((v, v))
             }
-            MatchPattern::Ident(pspan, name) => Err(Error::at(
-                *pspan,
-                format!(
-                    "unexpected identifier pattern '{name}' in match (use 'Enum::Variant', integer literal, or '_')"
-                ),
-            )),
+            // A `const` item matches its value.
+            MatchPattern::Ident(pspan, name) => {
+                let Some(raw) = self.const_item(name) else {
+                    return Err(Error::at(
+                        *pspan,
+                        format!(
+                            "unexpected identifier pattern '{name}' in match (use 'Enum::Variant', an integer literal or const, or '_')"
+                        ),
+                    ));
+                };
+                let v = i16::try_from(raw).map_err(|_| {
+                    Error::at(
+                        *pspan,
+                        format!("const pattern '{name}' = {raw} is outside the i16 range"),
+                    )
+                })?;
+                if *val_ty != ValueType::I16 {
+                    return Err(Error::at(
+                        *pspan,
+                        format!(
+                            "const pattern '{name}' cannot match '{}'",
+                            self.env.display_value_type(val_ty)
+                        ),
+                    ));
+                }
+                if !seen_vals.insert(v) || overlaps(v, v) {
+                    return Err(Error::at(
+                        *pspan,
+                        format!("duplicate match arm for value {v} ('{name}')"),
+                    ));
+                }
+                Ok((v, v))
+            }
             // The parser flattens OR-patterns and keeps `_` out of them.
             MatchPattern::Wildcard(pspan) | MatchPattern::Or(pspan, _) => Err(Error::at(
                 *pspan,

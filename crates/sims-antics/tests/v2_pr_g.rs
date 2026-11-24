@@ -527,3 +527,58 @@ fn tier3_local_slot_reads_pin_the_layout() {
         expect_err(name, &sim_tree(body), needle);
     }
 }
+
+#[test]
+fn tier3_const_patterns_match_their_value() {
+    let air = expand(
+        "const_match.antics",
+        &obj(
+            "    const LOW = 2;\n    const HIGH = 0x40;\n    tree t (sim: Sim) { \
+                 match self.n { LOW => { self.n = 1; } HIGH | 7 => { self.n = 3; } _ => {} } \
+             }",
+        ),
+    );
+    assert!(air.contains("== 2"), "{air}");
+    assert!(air.contains("== 64"), "{air}");
+    for (name, members, needle) in [
+        (
+            "const_dup.antics",
+            "    const LOW = 2;\n    tree t { match self.n { 2 => {} LOW => {} _ => {} } }",
+            "duplicate match arm for value 2 ('LOW')",
+        ),
+        (
+            "const_wide.antics",
+            "    const BIG = 70000;\n    tree t { match self.n { BIG => {} _ => {} } }",
+            "outside the i16 range",
+        ),
+        (
+            "not_const.antics",
+            "    tree t { match self.n { nothing => {} _ => {} } }",
+            "unexpected identifier pattern 'nothing'",
+        ),
+    ] {
+        expect_err(name, &obj(members), needle);
+    }
+}
+
+#[test]
+fn tier3_match_arms_without_braces() {
+    let air = expand(
+        "short_arms.antics",
+        &obj(
+            "    extern mod g { @id(300) fn probe() -> bool; }\n    tree t (sim: Sim) { \
+                 match self.n { 0 => g::probe(), 1 => self.n = 5, 2 => self.n += 1 } \
+                 match self.n { 3 => return; _ => self.n = 0 } \
+             }",
+        ),
+    );
+    assert!(air.contains("call 300(temps)"), "{air}");
+    assert!(air.contains("stack.attr[0] := 5;"), "{air}");
+    assert!(air.contains("stack.attr[0] += 1;"), "{air}");
+    assert!(air.contains("stack.attr[0] := 0;"), "{air}");
+    expect_err(
+        "short_arm_missing_comma.antics",
+        &obj("    tree t { match self.n { 0 => self.n = 1 1 => self.n = 2, _ => {} } }"),
+        "expected ';'",
+    );
+}
