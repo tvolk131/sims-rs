@@ -290,7 +290,7 @@ fn zero_local_loops_sounds_and_frame_kinds_round_trip() {
         "temp[0] += o.attr[1];",
         "for p in lot.sims() {",
         "if p.kind == 0 {",
-        "temp[1] += p.person[5];",
+        "temp[1] += p.personality.playful;",
         "@id(4304) @frame(args: 0, locals: 0, format: 0x8002, revision: 0, kind: 3) tree",
         "sound sound_0 = preset(\"ui_click\", wav: \"synth_chime\", id: 0);",
         "sound sound_7 = preset(\"ui_click\", wav: \"synth_chime\", id: 7);",
