@@ -2891,3 +2891,110 @@ fn argless_listing_needs_a_zero_argument_count() {
         &LiveOptions::default(),
     ));
 }
+
+/// `verify-equiv --global` / `--semi-global` mark a library tree argument-free only
+/// when the file supplying its range gives it 0 arguments and it is not indexed, and
+/// only when every file that supplies it agrees. Then `[0; 8]` and `[0xff; 8]` are
+/// the same call.
+#[test]
+fn verify_equiv_cli_takes_argless_library_trees() {
+    let dir = scratch_dir("cli-argless");
+    let write = |name: &str, bytes: &[u8]| {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+    const LIVE: u16 = 0x10;
+    const DELETED: u16 = 0x10 | 0x04;
+    // (id, args, kind, chunk flags), in physical order.
+    let library_with_flags = |trees: &[(u16, u8, u8, u16)]| {
+        let chunks: Vec<ChunkData> = trees
+            .iter()
+            .map(|&(id, args, kind, flags)| {
+                let lib = BhavChunk {
+                    kind,
+                    ..tree(id, args, 0, vec![expr((LIT, 0), EQ, (LIT, 0), T, T)])
+                };
+                ChunkData {
+                    flags,
+                    ..bhav_chunk(&lib, "Lib")
+                }
+            })
+            .collect();
+        write_iff(&chunks).unwrap()
+    };
+    let library = |trees: &[(u16, u8, u8)]| {
+        let live: Vec<_> = trees
+            .iter()
+            .map(|&(id, args, kind)| (id, args, kind, LIVE))
+            .collect();
+        library_with_flags(&live)
+    };
+    let run = |callee: u16, libraries: &[(&str, &std::path::Path)]| {
+        let object = |ops| {
+            write_iff(&[bhav_chunk(
+                &tree(4096, 0, 0, vec![prim(callee, ops, T, F)]),
+                "Main",
+            )])
+        };
+        let pa = write("a.iff", &object([0; 8]).unwrap());
+        let pb = write("b.iff", &object([0xFF; 8]).unwrap());
+        let mut cmd = cli();
+        cmd.arg("verify-equiv").arg(&pa).arg(&pb);
+        for (flag, path) in libraries {
+            cmd.arg(flag).arg(path);
+        }
+        let out = cmd.output().unwrap();
+        (
+            out.status.code(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    // Not argument-free: the call compares its operands, which differ.
+    let assert_reads_operands = |(code, text): (Option<i32>, String)| {
+        assert_eq!(code, Some(2), "{text}");
+        assert!(text.contains("INCONCLUSIVE"), "{text}");
+    };
+    let plain = write("plain.iff", &library(&[(300, 0, 0), (8192, 0, 0)]));
+    // Each library's own range, argument-free and not indexed: equivalent.
+    let (code, text) = run(300, &[("--global", &plain)]);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("EQUIVALENT"), "{text}");
+    let (code, text) = run(8192, &[("--semi-global", &plain)]);
+    assert_eq!(code, Some(0), "{text}");
+    // No library, or a library whose range does not hold the callee: unknown.
+    for libraries in [&[][..], &[("--semi-global", plain.as_path())][..]] {
+        assert_reads_operands(run(300, libraries));
+    }
+    assert_reads_operands(run(8192, &[("--global", &plain)]));
+    // One argument, or an indexed tree: the operands are read.
+    for (args, kind) in [(1, 0), (0, 4)] {
+        let lib = write("reads.iff", &library(&[(300, args, kind)]));
+        assert_reads_operands(run(300, &[("--global", &lib)]));
+    }
+    // Two files that both supply the tree but disagree on its kind: not argument-free,
+    // whichever comes first.
+    let indexed = write("indexed.iff", &library(&[(300, 0, 4)]));
+    for order in [[&plain, &indexed], [&indexed, &plain]] {
+        assert_reads_operands(run(300, &[("--global", order[0]), ("--global", order[1])]));
+    }
+    // Inside one file the VM keeps the last copy of an ID, deleted or not, and so do
+    // both readers: only an argument-free last copy counts.
+    for last in [LIVE, DELETED] {
+        let lib = write(
+            "copies.iff",
+            &library_with_flags(&[(300, 0, 0, LIVE), (300, 0, 4, last)]),
+        );
+        assert_reads_operands(run(300, &[("--global", &lib)]));
+        let lib = write(
+            "copies.iff",
+            &library_with_flags(&[(300, 0, 4, LIVE), (300, 0, 0, last)]),
+        );
+        let (code, text) = run(300, &[("--global", &lib)]);
+        assert_eq!(code, Some(0), "{text}");
+    }
+}
