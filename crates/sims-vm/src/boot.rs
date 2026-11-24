@@ -320,6 +320,10 @@ pub struct Lot {
     /// The floor and wall catalogs the load renumbered the lot's patterns
     /// by (load step 6b).
     pub(crate) surfaces: Surfaces,
+    /// The architecture's prices (0x47b006) from the install and
+    /// `surfaces`, which the day's statistics read
+    /// ([`crate::daily`]).
+    pub(crate) architecture_prices: crate::lifecycle::LotPrices,
     pub(crate) world: World,
     /// The motive constants, worked out at the first step: a load that
     /// runs no tick does not need them.
@@ -1202,7 +1206,7 @@ impl Lot {
         preloaded: PreloadedBoot<'_>,
     ) -> Result<Self, BootError> {
         let PreloadedBoot {
-            install: _,
+            install,
             neighborhood,
             characters,
             index,
@@ -1566,11 +1570,13 @@ impl Lot {
         };
         let (lot_name, lot_description) = read_lot_info(house, load.house, zoning);
         let fast = crate::program::ProgramFast::build(&program, &catalog);
+        let architecture_prices = crate::lifecycle::LotPrices::load(install, &surfaces);
         Ok(Self {
             program,
             fast,
             catalog,
             surfaces,
+            architecture_prices,
             world,
             tuning: None,
             player: Answers::choices(answers),
@@ -1793,6 +1799,7 @@ impl Lot {
             dialog_text: Some(&dialog_text),
             character_names: Some(&character_names),
             default_character_name: Some(&self.default_character_name),
+            architecture_prices: Some(&self.architecture_prices),
             active_family: (self.load.house != 0 && self.load.family == 0)
                 .then_some(family_zero_members.as_slice()),
             coop,
@@ -4072,6 +4079,7 @@ mod tests {
             fast,
             catalog,
             surfaces: sims_content::Surfaces::default(),
+            architecture_prices: crate::lifecycle::LotPrices::default(),
             world,
             tuning: None,
             player: Answers::default(),

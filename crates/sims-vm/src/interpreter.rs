@@ -217,6 +217,10 @@ pub struct Interpreter<'a> {
     /// consulted by Buy Mode pickup/placement/delete operations (`crate::buy`);
     /// normal simulation ticks never set this.
     pub move_objects: bool,
+    /// The prices the day's statistics work the architecture's value out
+    /// with (0x47b006), from the lot's install
+    /// ([`crate::lifecycle::LotPrices`]). None leaves the value as it was.
+    pub(crate) architecture_prices: Option<&'a crate::lifecycle::LotPrices>,
 }
 
 /// One call of the original's "run this object's function" (0x422d46):
@@ -262,6 +266,7 @@ impl<'a> Interpreter<'a> {
             global_lib: program.libraries.get(&program.global),
             fast: None,
             move_objects: false,
+            architecture_prices: None,
         }
     }
 
@@ -641,6 +646,7 @@ impl<'a> Machine<'a, '_> {
             inline_special_panel: self.inline_special_panel,
             in_both_ways: self.in_both_ways,
             move_objects: false,
+            architecture_prices: None,
             global_lib: self.global_lib,
             fast: self.fast,
         }

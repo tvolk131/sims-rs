@@ -2079,6 +2079,7 @@ impl Lot {
             view_centre: None,
             character_names: Some(character_names),
             default_character_name: Some(&self.default_character_name),
+            architecture_prices: Some(&self.architecture_prices),
             active_family: self.coop_active_family(),
             coop: Some(coop),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
@@ -2148,6 +2149,7 @@ impl Lot {
                 view_centre: None,
                 character_names: Some(&probe_names),
                 default_character_name: Some(&self.default_character_name),
+                architecture_prices: Some(&self.architecture_prices),
                 active_family: self.coop_active_family(),
                 coop: Some(&probe_coop),
                 ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
@@ -2877,6 +2879,7 @@ impl Lot {
             view_centre: None,
             character_names: Some(&character_names),
             default_character_name: Some(&self.default_character_name),
+            architecture_prices: Some(&self.architecture_prices),
             active_family: self.coop_active_family(),
             coop: Some(&coop_cell),
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
@@ -3859,6 +3862,7 @@ mod tests {
             fast,
             catalog,
             surfaces: sims_content::Surfaces::default(),
+            architecture_prices: crate::lifecycle::LotPrices::default(),
             world,
             tuning: Some(tuning),
             player: Answers::default(),

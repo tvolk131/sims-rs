@@ -1713,8 +1713,12 @@ fn strict_mode_runs_the_goth_houses_whole_day() {
     // lost value for the day (unverified: the run has left the recording
     // by then). The run before Set To Next mode 3 followed a group's
     // links had 12653; before Find Location For mode 5 fixed its swapped
-    // axes it had 12524. The architecture's value is not ported and keeps
-    // the saved one.
+    // axes it had 12524. The architecture's value is worked out again
+    // too (0x47b006 plus the objects that add to it, 0x416121): this
+    // house's walls, floors and architecture objects come to the saved
+    // 15277. The recording agrees on the mechanism: there a 1500-valued
+    // architecture object is gone by update 25000, +0xa4 keeps 15277
+    // until this update and then drops by exactly 1500, to 13777.
     assert_eq!(values(&lot), (12539, 15277));
     assert_eq!(lot.world().hash_hex(), TICK_31478);
     assert_eq!(digest(&format_31_bytes(lot.world())), TICK_31478_31);

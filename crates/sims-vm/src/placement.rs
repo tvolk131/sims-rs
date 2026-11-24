@@ -78,9 +78,7 @@ mod dynamic;
 pub(crate) use dynamic::unlink_tile_force;
 mod find;
 pub(crate) use find::Rules;
-pub(crate) use find::{
-    Refusal, closed_directions, floor, pool_byte, pool_tile, segments, tile_flags,
-};
+pub(crate) use find::{Refusal, closed_directions, pool_tile, tile_flags};
 
 /// A person's own tick while its thread runs: the person, and the
 /// animator refresh its taking itself off the lot left pending
@@ -261,6 +259,10 @@ const CONTAINER_SLOT: u16 = 0;
 const GRIDS: [u16; 2] = [3, 103];
 /// The tile flags of the two levels.
 const FLAGS: [u16; 2] = [8, 108];
+/// An object's type: a door, whose tiles the factory makes as portals
+/// (0x440a91).
+const DOOR: i16 = 8;
+
 /// The tile flag a door or window sets on the tile it stands on (0x4330d7).
 pub(crate) const PORTAL_TILE: u8 = 8;
 
@@ -2252,6 +2254,36 @@ impl Interpreter<'_> {
                 self.take_off_one(world, part, notify)?;
             }
         }
+        self.door_moved(world, id)
+    }
+
+    /// A door's group taken off or put (the portal's own versions of the
+    /// group's virtual functions 0x50 and 0x58, 0x4634f2 and 0x4630d9,
+    /// for an object made as a portal: a tile of a group whose master has
+    /// type 8, 0x440a91, whatever the tile's own type) ends with every portal's costs forgotten
+    /// ([`Interpreter::forget_portal_costs`], 0x46387c), so routes work
+    /// their way through the doors out again.
+    ///
+    /// Not ported here: the wall work the put does first (0x463159, from
+    /// the door's place, 0x4795c5) and the room update at the door's tile
+    /// (0x476a18), which both versions run.
+    fn door_moved(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        if world
+            .objects
+            .get(&id)
+            .is_some_and(|object| object.multipart.is_some())
+            && self
+                .master_words(world, id, "the portal class test (0x440a91)")
+                .map_err(fail)?[word::TYPE]
+                == DOOR
+        {
+            self.forget_portal_costs(world).map_err(fail)?;
+        }
         Ok(())
     }
 
@@ -2575,7 +2607,7 @@ impl Interpreter<'_> {
         if was_outside && notify {
             self.placed_from_outside(world, id)?;
         }
-        Ok(())
+        self.door_moved(world, id)
     }
 
     /// Turns a group by `steps` times its turn step (a group's virtual

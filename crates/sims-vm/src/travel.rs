@@ -68,18 +68,19 @@ use crate::boot::{Finished, Frames, LoadReport, Lot, NeighborhoodOrigin, opening
 use crate::daily::value as object_value;
 use crate::factory::word;
 use crate::interpreter::{Interpreter, Stream};
+use crate::lifecycle::{LotPrices, architecture_value_and_built};
 use crate::people;
 use crate::placement::{Place, Rules};
 use crate::play::Play;
 use crate::selection::selected;
 use crate::{Answers, Program};
 use serde::{Deserialize, Serialize};
-use sims_content::{Animations, Catalog, House, Index, Install, People, SurfaceCatalog, Surfaces};
+use sims_content::{Animations, Catalog, House, Index, Install, People, Surfaces};
 use sims_core::CrtRng;
 use sims_formats::iff::Iff;
 use sims_formats::saved_objects::Accessory;
 use sims_formats::strings::StringTable;
-use sims_sim::load::{Context, ExpandedWall, FLOORS, WALLS, visitor_again};
+use sims_sim::load::{Context, visitor_again};
 use sims_sim::neighborhood_store::{
     CheckedCommitError, DEFAULT_ARCH_VALUE_MULTIPLIER, NeighborhoodStore, StoredNeighborhood,
     lot_total_value,
@@ -213,22 +214,8 @@ const NEIGHBORHOOD_TUNING: u16 = 4;
 const AUTONOMY_TUNING: u16 = 2;
 const DEFAULT_FRIENDSHIP_THRESHOLD: i32 = 50;
 
-/// Lot array / pricing constants (`0x47b006`).
-const TILE_FLAGS: [u16; 2] = [8, 108];
-const POOL_ARRAY: u16 = 9;
+/// The tile flag 0x47b006 and the object pass skip (0x4452cc).
 const TILE_LOCKED: u8 = 0x20;
-const SPLIT_FLOOR: u16 = 0xff;
-const POOL_TILE_LIMIT: u8 = 0x10;
-const PATTERNED_WALL_STYLES: [u16; 4] = [1, 7, 8, 9];
-const WALL_CELL: usize = 14;
-const STYLE_TABLE: u16 = 129;
-const FLOOR_TABLE: u16 = 130;
-const WALL_TABLE: u16 = 131;
-const POOL_TABLE: u16 = 133;
-const FLOOR_DEFAULT_TABLE: u16 = 134;
-const WALL_DEFAULT_TABLE: u16 = 135;
-const PRICED_STYLES: [u16; 5] = [1, 2, 13, 12, 14];
-const SECOND_STYLE: u16 = 255;
 const US_ENGLISH: u8 = 1;
 
 /// Complete Collection 1.91 away-from-home travel destinations.
@@ -2287,7 +2274,7 @@ fn depart(
     }
 
     // Recompute home lot values & write back neighborhood state onto a staged copy.
-    let prices = LotPrices::load(&install, &home_lot.surfaces);
+    let prices = home_lot.architecture_prices.clone();
     let tuning = NeighborhoodTuning::from_program(&home_lot.program);
     let home_interp = Interpreter {
         view_rotation: home_lot.view_rotation,
@@ -3383,8 +3370,9 @@ pub fn return_from_destination(
         destination_lot,
         answers,
         frames,
-        None,
-    )
+        Leg::Home(None),
+    )?
+    .home()
 }
 
 /// Carries out the trip home a script on the destination lot asked for
@@ -3403,7 +3391,9 @@ pub fn return_from_destination(
 /// travelers from their live state instead ([`return_from_destination`]),
 /// so every kind-2 token the request saved is erased, and one is taken
 /// from the caller's first kind-3 token. A companion that token names who
-/// did not travel is not made on the home lot.
+/// did not travel keeps its own tokens, and the home lot runs the tail's
+/// routines 20 and 21 for it: found on the home lot or made there, then
+/// restored from them.
 ///
 /// A request for another house (a destination's Go Somewhere Else, tree
 /// 0x1016) or by a person who is not one of the trip's travelers is
@@ -3427,10 +3417,101 @@ pub fn return_from_request(
         destination_lot,
         answers,
         frames,
-        Some(&trip),
-    )?;
+        Leg::Home(Some(&trip)),
+    )?
+    .home()?;
     destination_lot.world.trip_request = None;
     Ok(result)
+}
+
+/// Carries out a trip from one destination to another that a script on
+/// the destination lot asked for with Generic Sims Call 17
+/// ([`World::trip_request`]): a destination's Go Somewhere Else (tree
+/// 0x1016, routine 17 with the picked lot, 0, 30 and mode 0).
+///
+/// The original's main loop does not tell this from a departure from
+/// home: the handler (0x4fc59c) clears the request (byte +0x130), sets
+/// the arrival flags from the house and the GUID or family 0x4fc713
+/// recorded, saves the neighborhood (0x428843) and loads the new house
+/// with 0x4f1ae9, whose arrival marker restores the travelers from the
+/// saved-state tokens routine 17 wrote on the lot they left. The family's
+/// own house stays as it was saved when it left.
+///
+/// So the destination lot is left as a trip home leaves it (its people
+/// flushed into the neighborhood, temporary hotel keys revoked, the lot
+/// itself not saved), and the new destination boots like a departure a
+/// script asked for ([`depart_from_request_with`]), with the shell's
+/// transport, answers, frames and camera. The trip keeps its frozen home
+/// lot and home clock. Its funds and MagiCoins on arrival become those it
+/// left the first destination with, which that lot's merge committed:
+/// a resume or abort starts from them, and the trip home reports the
+/// change since. It gets a new trip ID, and
+/// the old destination handle and `session` stop working. The returned
+/// session is the one [`return_from_request`] and
+/// [`return_from_destination`] take.
+///
+/// Every traveler must be on the lot and go along: a party that leaves
+/// one behind (a whole family's member Go Somewhere Else, which asks in
+/// mode 0, does not take) or takes someone else (a mode 1 request that
+/// saved a household member visiting the lot) is refused
+/// ([`TravelError::InvalidParty`]), as is a date anywhere but Downtown
+/// (whose middle ped marker alone brings the companion in with routine
+/// 19) or with the leader as its own companion, and a house that is the trip's home, its current destination
+/// or no destination. A refused request stays; it is cleared once the trip
+/// succeeds.
+pub fn travel_on_from_request(
+    install_root: &Path,
+    store: &NeighborhoodStore,
+    session: &TravelSession,
+    destination_lot: &mut Lot,
+    departure: &TripDeparture,
+) -> Result<DepartureResult, TravelError> {
+    let trip = destination_lot.world.trip_request.clone().ok_or_else(|| {
+        TravelError::Lot("no trip was asked for (Generic Sims Call 17 has not run)".into())
+    })?;
+    let result = return_home(
+        install_root,
+        store,
+        session,
+        destination_lot,
+        &departure.answers,
+        departure.frames.clone(),
+        Leg::OnTo(&trip, departure),
+    )?;
+    let Left::OnTo(result) = result else {
+        return Err(TravelError::Lot("the trip went home instead".into()));
+    };
+    destination_lot.world.trip_request = None;
+    Ok(result)
+}
+
+/// Where a trip goes when it leaves its destination lot.
+#[derive(Clone, Copy)]
+enum Leg<'a> {
+    /// Home, as the shell asks ([`return_from_destination`]) or a script
+    /// does ([`return_from_request`]).
+    Home(Option<&'a sims_sim::TripRequest>),
+    /// To another destination, as a script asks
+    /// ([`travel_on_from_request`]).
+    OnTo(&'a sims_sim::TripRequest, &'a TripDeparture),
+}
+
+/// What leaving a destination lot gives: the home lot, or the next
+/// destination.
+enum Left {
+    Home(ReturnResult),
+    OnTo(DepartureResult),
+}
+
+impl Left {
+    fn home(self) -> Result<ReturnResult, TravelError> {
+        match self {
+            Self::Home(result) => Ok(result),
+            Self::OnTo(_) => Err(TravelError::Lot(
+                "the trip went to another destination instead".into(),
+            )),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3441,8 +3522,8 @@ fn return_home(
     destination_lot: &mut Lot,
     answers: &[u8],
     frames: Frames,
-    homebound: Option<&sims_sim::TripRequest>,
-) -> Result<ReturnResult, TravelError> {
+    leg: Leg<'_>,
+) -> Result<Left, TravelError> {
     if destination_lot.load.finished.is_none() {
         return Err(TravelError::Lot(
             "destination lot load did not complete".into(),
@@ -3568,13 +3649,13 @@ fn return_home(
     // A trip home a script asked for: its house and its caller are checked
     // against the persisted trip, and the caller's neighbor record is the
     // one whose kind-3 token the tail's routine 20 takes.
-    let homebound = match homebound {
-        None => None,
-        Some(trip) => {
+    let homebound = match leg {
+        Leg::Home(None) | Leg::OnTo(..) => None,
+        Leg::Home(Some(trip)) => {
             if i64::from(trip.house) != i64::from(auth_session.home_house) {
                 return Err(TravelError::SessionMismatch(format!(
-                    "routine 17 asked for house {}, not the trip's home house {}; a trip from \
-                     one destination to another is not carried out",
+                    "routine 17 asked for house {}, not the trip's home house {}; a trip to \
+                     another destination is travel_on_from_request's",
                     trip.house, auth_session.home_house
                 )));
             }
@@ -3600,8 +3681,17 @@ fn return_home(
                          trip's travelers"
                     ))
                 })?;
-            Some((trip, caller.neighbor_id))
+            Some((trip, caller.neighbor_id, caller_guid))
         }
+    };
+    let onward = match leg {
+        Leg::OnTo(trip, departure) => Some(onward_request(
+            &destination_lot.world,
+            auth_session,
+            trip,
+            departure,
+        )?),
+        Leg::Home(_) => None,
     };
 
     // Clone the destination lot's saved snapshot so we can flush persons,
@@ -3698,19 +3788,50 @@ fn return_home(
     //     needs the frozen stack, which the curb placement below drops, so
     //     the tokens go as the tail would leave them: none. A traveler the
     //     departure did not save keeps its own.
+    //     A trip on to another destination keeps the ones routine 17 wrote
+    //     again for the next arrival marker.
+    let rewritten: &[i16] = match leg {
+        Leg::OnTo(trip, _) => &trip.saved,
+        Leg::Home(_) => &[],
+    };
     for &neighbor in &persisted.departure_tokens {
-        clear_saved_state_tokens(&mut dest_saved.world, neighbor);
+        if !rewritten.contains(&neighbor) {
+            clear_saved_state_tokens(&mut dest_saved.world, neighbor);
+        }
     }
     // A trip home routine 17 asked for wrote them again (and the arrival
     // clock), for the neighbors it saved; the tail would leave none, and
     // would have taken one kind-3 token from the caller (routine 20 on
     // `my.data[11]`, in either mode).
-    if let Some((trip, caller_neighbor)) = homebound {
+    //
+    // A companion that token names who did not travel is not placed with
+    // the travelers: the home lot's routine 20 finds it, or makes it, and
+    // routine 21 restores it from its own saved-state tokens, which stay
+    // for that ([`bring_companion_home`]).
+    let mut companion_at_home = None;
+    if let Some((trip, caller_neighbor, caller_guid)) = homebound {
+        let token = dest_saved
+            .world
+            .neighbors
+            .inventories
+            .iter()
+            .find(|i| i.neighbor == caller_neighbor)
+            .and_then(|inventory| {
+                let place = trip::token_place(&inventory.items, trip::HOMEBOUND_COMPANION_KIND, 0);
+                (place >= 0).then(|| trip::read_token(&inventory.items, place).guid)
+            });
+        let stays = token.filter(|&guid| !auth_session.travelers.iter().any(|t| t.guid == guid));
+        let stays_neighbor =
+            stays.and_then(|guid| dest_saved.world.neighbors.first_of(guid).map(|n| n.id));
         for &neighbor in &trip.saved {
-            clear_saved_state_tokens(&mut dest_saved.world, neighbor);
+            if Some(neighbor) != stays_neighbor {
+                clear_saved_state_tokens(&mut dest_saved.world, neighbor);
+            }
         }
         clear_arrival_clock_tokens(&mut dest_saved.world, caller_neighbor);
-        if let Some(inventory) = dest_saved
+        if stays.is_some() {
+            companion_at_home = Some(caller_guid);
+        } else if let Some(inventory) = dest_saved
             .world
             .neighbors
             .inventories
@@ -3828,7 +3949,7 @@ fn return_home(
         }
     }
 
-    let updated_stored = merge_destination_into_latest_neighborhood(
+    let mut updated_stored = merge_destination_into_latest_neighborhood(
         &persisted.baseline,
         &home_snapshot.neighborhood,
         &dest_saved.world,
@@ -3836,6 +3957,34 @@ fn return_home(
         funds_at_return,
         tuning.friendship_threshold,
     )?;
+
+    if let (Some(request), Leg::OnTo(trip, _)) = (&onward, leg) {
+        if let Some(missing) = (0..auth_session.travelers.len())
+            .find(|idx| !resolved_by_index.contains_key(idx))
+            .map(|idx| auth_session.travelers[idx].guid)
+        {
+            return Err(TravelError::InvalidParty(format!(
+                "traveler 0x{missing:08X} is not on destination lot {}, so it cannot go on",
+                auth_session.destination_house
+            )));
+        }
+        return travel_on(
+            install_root,
+            store,
+            &persisted,
+            (
+                home_snapshot.neighborhood.instance_id,
+                home_snapshot.neighborhood.revision,
+            ),
+            destination_lot,
+            request,
+            &trip.saved,
+            returning_states,
+            updated_stored,
+            funds_at_return,
+        )
+        .map(Left::OnTo);
+    }
 
     // 5. Reconcile & resume the frozen home lot in memory BEFORE committing to
     //    REDB, leaving any Build/Buy community-lot snapshot in REDB untouched
@@ -3856,6 +4005,23 @@ fn return_home(
         answers,
         frames,
     )?;
+
+    if let Some(caller_guid) = companion_at_home {
+        let caller = returning_travelers
+            .iter()
+            .find(|&&(guid, _)| guid == caller_guid)
+            .map(|&(_, id)| id)
+            .ok_or_else(|| {
+                TravelError::Lot(format!(
+                    "the caller 0x{caller_guid:08X} of the trip home is not on the home lot"
+                ))
+            })?;
+        // Routine 20 saves the neighborhood itself (0x4252cc); the
+        // inventories its tail wrote go into the record the commit writes.
+        for neighbor in bring_companion_home(&mut resumed_home, caller)? {
+            store_inventory(&mut updated_stored, &resumed_home.world, neighbor);
+        }
+    }
 
     // Snapshot reconciled home lot so REDB holds the post-return home state too.
     let mut home_saved_after = resumed_home
@@ -3945,10 +4111,405 @@ fn return_home(
         home_revision: final_revision,
     };
 
-    Ok(ReturnResult {
+    Ok(Left::Home(ReturnResult {
         home_lot: resumed_home,
         report,
+    }))
+}
+
+/// The [`TravelRequest`] for a trip on from `session`'s destination lot
+/// (`world`) that routine 17 asked for: its party, read as a departure's
+/// is ([`travel_request_for_trip`]), must be the trip's travelers, all of
+/// them, and its house another destination than the trip's home and the
+/// lot it is on. The shell's `departure` gives the transport, answers,
+/// frames and camera.
+fn onward_request(
+    world: &World,
+    session: &TravelSession,
+    trip: &sims_sim::TripRequest,
+    departure: &TripDeparture,
+) -> Result<TravelRequest, TravelError> {
+    let house = i64::from(trip.house);
+    if house == i64::from(session.home_house) {
+        return Err(TravelError::SessionMismatch(format!(
+            "routine 17 asked for the trip's home house {}; a trip home is \
+             return_from_request's",
+            session.home_house
+        )));
+    }
+    if house == i64::from(session.destination_house) {
+        return Err(TravelError::SameHouse {
+            house: session.destination_house,
+        });
+    }
+    let request = TravelRequest {
+        transport: departure.transport,
+        answers: departure.answers.clone(),
+        frames: departure.frames.clone(),
+        view_centre: departure.view_centre,
+        ..travel_request_for_trip(world, trip)?
+    };
+    // Routine 17 saved whoever it took (mode 1: every member of the
+    // family on the lot, 0x45a3ef), so a Sim it saved who is not a
+    // traveler, a member visiting the lot, would go without the session.
+    if let Some(stray) = trip
+        .saved
+        .iter()
+        .find(|&&nid| !session.travelers.iter().any(|t| t.neighbor_id == nid))
+    {
+        return Err(TravelError::InvalidParty(format!(
+            "routine 17 wrote the saved state of neighbor {stray}, who is not one of the \
+             trip's travelers"
+        )));
+    }
+    let travelers: BTreeSet<u32> = session.travelers.iter().map(|t| t.guid).collect();
+    let party: BTreeSet<u32> = match &request.party {
+        TravelParty::Single { sim_guid } => BTreeSet::from([*sim_guid]),
+        TravelParty::Date {
+            leader_guid,
+            companion_guid,
+        } => {
+            if leader_guid == companion_guid {
+                return Err(TravelError::InvalidParty(
+                    "a date's companion must be distinct from the leader".into(),
+                ));
+            }
+            BTreeSet::from([*leader_guid, *companion_guid])
+        }
+        // A whole family is every member on the lot (0x45a3ef): the
+        // travelers, when they are all the household's.
+        TravelParty::WholeFamily { leader_guid } => {
+            if let Some(other) = session.travelers.iter().find(|t| !t.is_household_member) {
+                return Err(TravelError::InvalidParty(format!(
+                    "Sim 0x{:08X} travels with the family but is not in it, so a whole \
+                     family's trip on leaves it behind",
+                    other.guid
+                )));
+            }
+            let mut all = travelers.clone();
+            all.insert(*leader_guid);
+            all
+        }
+        TravelParty::HouseholdGroup { .. } => {
+            return Err(TravelError::InvalidParty(
+                "Generic Sims Call 17 asks for no household group".into(),
+            ));
+        }
+    };
+    if party != travelers {
+        return Err(TravelError::InvalidParty(format!(
+            "the trip on takes {party:08X?}, but the trip's travelers are {travelers:08X?}; a \
+             traveler left behind is not carried out"
+        )));
+    }
+    Ok(request)
+}
+
+/// The rest of [`travel_on_from_request`], once the destination lot is
+/// left: `stored` is the neighborhood with that lot's visit merged in,
+/// `states` the travelers as they left it, and `saved` the neighbor ids
+/// routine 17 wrote saved-state tokens for. The next destination boots
+/// as a departure a script asked for does ([`depart`]), and the trip's
+/// envelope is written again with it, fenced on the neighborhood
+/// revision `fence` names.
+#[allow(clippy::too_many_arguments)]
+fn travel_on(
+    install_root: &Path,
+    store: &NeighborhoodStore,
+    persisted: &PersistedTravelRecord,
+    fence: (u128, u64),
+    destination_lot: &mut Lot,
+    request: &TravelRequest,
+    saved: &[i16],
+    mut states: Vec<LiveTravelerSnapshot>,
+    mut stored: StoredNeighborhood,
+    funds: i32,
+) -> Result<DepartureResult, TravelError> {
+    let session = &persisted.session;
+    let neighborhood_id = session.neighborhood_id.as_str();
+    let house = request.destination_house;
+    let zoning = i16::try_from(house)
+        .ok()
+        .and_then(|lot| stored.zoning.get(&lot).copied());
+    let Some(destination) = TravelDestination::classify(house, &stored.zoning) else {
+        return Err(TravelError::NotTravelDestination { house, zoning });
+    };
+    let install = Install::detect(install_root).map_err(|e| TravelError::Lot(e.to_string()))?;
+    let installed = u16::from(install.expansions.0) & destination_lot.program.expansions;
+    let required_bit = destination.expansion_bit();
+    if installed & required_bit == 0 {
+        return Err(TravelError::ExpansionNotInstalled {
+            destination,
+            required_bit,
+            installed,
+        });
+    }
+    if let Some((occupant, _)) = stored.family_in(house) {
+        return Err(TravelError::DestinationOccupied {
+            house,
+            family: occupant,
+        });
+    }
+    let transport = request
+        .transport
+        .unwrap_or_else(|| destination.default_transport());
+    if transport.destination() != destination {
+        return Err(TravelError::IncompatibleTransport {
+            destination,
+            transport,
+        });
+    }
+    if fence.1 == u64::MAX {
+        return Err(TravelError::Lot(
+            "neighborhood revision counter exhausted before the trip on".into(),
+        ));
+    }
+    let dest_snapshot = store
+        .load_lot_snapshot(neighborhood_id, house)?
+        .ok_or_else(|| TravelError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
+    if dest_snapshot.neighborhood.instance_id != fence.0 {
+        return Err(TravelError::NeighborhoodMismatch {
+            expected: format!("{neighborhood_id}#{:032x}", fence.0),
+            actual: format!(
+                "{neighborhood_id}#{:032x}",
+                dest_snapshot.neighborhood.instance_id
+            ),
+        });
+    }
+    if dest_snapshot.neighborhood.revision != fence.1 {
+        return Err(TravelError::StaleNeighborhood {
+            neighborhood: neighborhood_id.to_owned(),
+            expected_revision: fence.1,
+            current_revision: dest_snapshot.neighborhood.revision,
+        });
+    }
+    if dest_snapshot.saved_lot.is_none() && dest_snapshot.base_house.is_none() {
+        return Err(TravelError::HouseNotFound {
+            neighborhood: neighborhood_id.to_owned(),
+            house,
+        });
+    }
+
+    // The family is away at the new destination (`0x425d95`, FAMI `+0x13c`).
+    if let Some(family) = stored.families.get_mut(&session.home_family) {
+        family.upgrade_to_v9();
+        let house_i32 = i32::try_from(house).map_err(|e| TravelError::Lot(e.to_string()))?;
+        family.set_secondary_house(house_i32);
+    }
+
+    let is_date = matches!(request.party, TravelParty::Date { .. });
+    let arrival = ArrivalFamily::of(&request.party, destination, house, &stored.zoning);
+    // A date's companion comes in through the arrival marker's routine 19
+    // (from the leader's kind-1 token): Downtown's middle ped marker (EP3
+    // PedMarkers tree 0x100e, node 11). The other destinations' arrival
+    // trees do not run it, so the companion would never arrive.
+    if is_date && (destination != TravelDestination::Downtown || arrival == ArrivalFamily::Group) {
+        return Err(TravelError::InvalidParty(format!(
+            "house {house} has no arrival marker that brings a date's companion in \
+             (routine 19 runs on Downtown's)"
+        )));
+    }
+    let leader_guid = request.party.leader_guid();
+    // The roster is leader first, as a departure's is: the date's
+    // companion token, abort and return read the leader and companion
+    // from their places.
+    states.sort_by_key(|state| state.guid != leader_guid);
+    let trip_id = alloc_trip_id(
+        store.store_id(),
+        fence.0,
+        fence.1,
+        session.home_house,
+        house,
+        session.home_family,
+    );
+    let runtime =
+        StoreRuntime::from_snapshot(install_root, stored.clone(), &dest_snapshot.character_files)?;
+    let (mut dest_lot, travelers) = boot_destination_lot(
+        runtime,
+        store.store_id(),
+        trip_id,
+        neighborhood_id,
+        house,
+        transport,
+        VacationAccommodation::None,
+        leader_guid,
+        is_date,
+        arrival,
+        request.view_centre,
+        &request.answers,
+        request.frames.clone(),
+        session.home_family,
+        funds,
+        &states,
+        saved,
+        true,
+        dest_snapshot.saved_lot.as_deref(),
+        dest_snapshot.base_house,
+    )?;
+
+    // The MagiCoins the next lot holds, from the merged neighborhood the
+    // commit writes (a concurrent edit the merge kept counts).
+    let members = stored
+        .families
+        .get(&session.home_family)
+        .map(|family| family.members.clone())
+        .unwrap_or_default();
+    let magic_coins = family_magic_coins(&dest_lot.world, &members);
+    let mut onward = TravelSession {
+        trip_id,
+        funds_at_arrival: funds,
+        magic_coins_at_arrival: magic_coins,
+        destination_house: house,
+        destination,
+        transport,
+        accommodation: VacationAccommodation::None,
+        leader_guid,
+        travelers,
+        ..session.clone()
+    };
+    let envelope_bytes = encode_travel_envelope(&PersistedTravelRecord {
+        trip_id,
+        is_date,
+        view_centre: request.view_centre,
+        session: onward.clone(),
+        baseline: DepartureBaseline::from_stored(&stored, fence.1 + 1, session.home_family),
+        departure_snapshots: states,
+        frozen_home_bytes: persisted.frozen_home_bytes.clone(),
+        version: TRAVEL_ENVELOPE_VERSION,
+        arrival: Some(arrival),
+        departure_tokens: saved.to_vec(),
+    })?;
+    let (committed_instance, committed_revision) = match store.save_lot_and_neighborhood_checked(
+        neighborhood_id,
+        session.home_house,
+        Some(fence),
+        &envelope_bytes,
+        &stored,
+        &[],
+    )? {
+        Ok(version) => version,
+        Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
+            return Err(TravelError::NeighborhoodMismatch {
+                expected: format!("{neighborhood_id}#{expected:032x}"),
+                actual: format!("{neighborhood_id}#{current:032x}"),
+            });
+        }
+        Err(CheckedCommitError::RevisionMismatch { expected, current }) => {
+            return Err(TravelError::StaleNeighborhood {
+                neighborhood: neighborhood_id.to_owned(),
+                expected_revision: expected,
+                current_revision: current,
+            });
+        }
+    };
+
+    destination_lot.neighborhood_origin = None;
+    destination_lot.loaded = [0u8; 32];
+    onward.instance_id = committed_instance;
+    dest_lot.neighborhood_origin = None;
+    dest_lot.loaded = trip_binding_tag(store.store_id(), trip_id);
+    Ok(DepartureResult {
+        destination_lot: dest_lot,
+        session: onward,
+        home_revision: committed_revision,
     })
+}
+
+/// The home lot's tail of a trip home a script asked for, for a
+/// companion the caller's first kind-3 token names who did not travel:
+/// the caller runs routine 20 on itself (0x45087d; the Go Downtown
+/// plugin's n14, the Vacation plugin's n79/n81), which finds the
+/// companion on the home lot or makes it (0x4e9719) and takes one from the
+/// token. When that names a person (temp 0 above 0), routine 21
+/// (0x45098a) restores the companion from its saved-state tokens (the Go
+/// Downtown plugin's n90, the Vacation plugin's n89). Both run in the lot
+/// update the tail runs in, so they draw from the lot's stream. The
+/// caller's temps are put back afterwards: the port places it from its
+/// live state, without the frozen stack the tail ran on.
+///
+/// Returns the neighbor ids whose inventories the routines wrote: the
+/// caller's, and the companion's when routine 21 ran.
+fn bring_companion_home(lot: &mut Lot, caller: u16) -> Result<Vec<i16>, TravelError> {
+    let interpreter = Interpreter {
+        view_rotation: lot.view_rotation,
+        view_centre: lot.view_centre,
+        architecture_prices: Some(&lot.architecture_prices),
+        ..Interpreter::new(&lot.program, &lot.catalog, Stream::Lot)
+    };
+    let world = &mut lot.world;
+    let temps = world
+        .objects
+        .get(&caller)
+        .map(|object| object.temps.clone())
+        .ok_or_else(|| TravelError::Lot(format!("the caller {caller} is gone")))?;
+    let set_temp_0 = |world: &mut World, value: i16| {
+        if let Some(slot) = world
+            .objects
+            .get_mut(&caller)
+            .and_then(|object| object.temps.first_mut())
+        {
+            *slot = value;
+        }
+    };
+    let call = |world: &mut World, routine: u16| {
+        let mut operands = [0u8; 8];
+        operands[..2].copy_from_slice(&routine.to_le_bytes());
+        interpreter
+            .machine(world, caller, 0, true)
+            .generic_call(&operands)
+            .map_err(|trap| TravelError::Lot(format!("routine {routine} on the home lot: {trap}")))
+    };
+    set_temp_0(world, caller as i16);
+    call(world, 20)?;
+    let companion = world
+        .objects
+        .get(&caller)
+        .and_then(|object| object.temps.first().copied())
+        .unwrap_or(-1);
+    let mut written: Vec<i16> = trip::person_neighbor(world, caller).into_iter().collect();
+    if companion > 0 {
+        set_temp_0(world, companion);
+        call(world, 21)?;
+        written.extend(trip::person_neighbor(world, companion as u16));
+    }
+    if let Some(object) = world.objects.get_mut(&caller) {
+        object.temps = temps;
+    }
+    Ok(written)
+}
+
+/// Puts `neighbor_id`'s inventory as `world` holds it into `stored`, in
+/// place of the one there (or after the others when there is none).
+fn store_inventory(stored: &mut StoredNeighborhood, world: &World, neighbor_id: i16) {
+    let Some(live) = world
+        .neighbors
+        .inventories
+        .iter()
+        .find(|inv| inv.neighbor == neighbor_id)
+    else {
+        return;
+    };
+    let saved = sims_formats::neighborhood::Inventory {
+        neighbor: neighbor_id,
+        items: live
+            .items
+            .iter()
+            .map(|item| sims_formats::neighborhood::InventoryItem {
+                kind: item.kind,
+                guid: item.guid,
+                count: item.count,
+            })
+            .collect(),
+    };
+    match stored
+        .inventories
+        .iter_mut()
+        .flatten()
+        .find(|inv| inv.neighbor == neighbor_id)
+    {
+        Some(slot) => *slot = saved,
+        None => stored.inventories.push(Some(saved)),
+    }
 }
 
 /// Opens an unoccupied travel destination lot from REDB in Build/Buy edit mode
@@ -4099,6 +4660,7 @@ fn boot_destination_for_edit(
         program,
         fast,
         catalog: Arc::new(catalog),
+        architecture_prices: LotPrices::load(&install, &surfaces),
         surfaces,
         world,
         tuning: None,
@@ -4932,6 +5494,7 @@ fn boot_destination_lot(
         program,
         fast,
         catalog: Arc::new(catalog),
+        architecture_prices: LotPrices::load(&install, &surfaces),
         surfaces,
         world,
         tuning: None,
@@ -5318,6 +5881,7 @@ fn reconcile_frozen_home_lot(
         program,
         fast,
         catalog: Arc::new(catalog),
+        architecture_prices: LotPrices::load(&install, &surfaces),
         surfaces,
         world,
         tuning: None,
@@ -6158,207 +6722,6 @@ impl NeighborhoodTuning {
         }
         tuning
     }
-}
-
-/// Architecture surface prices (`Build.iff` + pattern catalogs) needed by
-/// `0x47b006` (`architecture_value`).
-#[derive(Debug, Clone, Default)]
-struct LotPrices {
-    styles: BTreeMap<u16, i32>,
-    pool: i32,
-    floors: BTreeMap<u16, i32>,
-    walls: BTreeMap<u16, i32>,
-}
-
-impl LotPrices {
-    fn load(install: &Install, surfaces: &Surfaces) -> Self {
-        let tables: BTreeMap<u16, StringTable> = install
-            .file("GameData/Build.iff")
-            .ok()
-            .and_then(|path| Iff::parse(std::fs::read(path).ok()?).ok())
-            .map(|iff| {
-                [
-                    STYLE_TABLE,
-                    FLOOR_TABLE,
-                    WALL_TABLE,
-                    POOL_TABLE,
-                    FLOOR_DEFAULT_TABLE,
-                    WALL_DEFAULT_TABLE,
-                ]
-                .into_iter()
-                .filter_map(|id| {
-                    let chunk = iff.get(b"STR#", id)?;
-                    Some((
-                        id,
-                        StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk))
-                            .ok()?,
-                    ))
-                })
-                .collect()
-            })
-            .unwrap_or_default();
-        let price = |table: u16, entry: u16| -> Option<i32> {
-            let at = usize::from(entry).checked_sub(1)? * 3;
-            Some(atoi(&tables.get(&table)?.entry(at, US_ENGLISH)?.raw_text))
-        };
-        let mut styles: BTreeMap<u16, i32> = PRICED_STYLES
-            .iter()
-            .zip(1u16..)
-            .map(|(&style, entry)| (style, price(STYLE_TABLE, entry).unwrap_or(0)))
-            .collect();
-        styles.insert(SECOND_STYLE, styles[&PRICED_STYLES[0]]);
-        let pool = price(POOL_TABLE, 1).unwrap_or(0);
-        let mut floors = BTreeMap::new();
-        for key in 1u16..=29 {
-            floors.insert(key, price(FLOOR_TABLE, key).unwrap_or(0));
-        }
-        let mut walls = BTreeMap::new();
-        for key in (0u16..=30).chain(248..=255) {
-            walls.insert(key, price(WALL_TABLE, key).unwrap_or(0));
-        }
-        let plug_ins = |catalog: &SurfaceCatalog, default: i32, out: &mut BTreeMap<u16, i32>| {
-            for file in catalog.files.iter().skip(1) {
-                for &key in file.keys.values() {
-                    out.insert(key, file.price.unwrap_or(default));
-                }
-            }
-        };
-        plug_ins(
-            &surfaces.floors,
-            price(FLOOR_DEFAULT_TABLE, 1).unwrap_or(0),
-            &mut floors,
-        );
-        plug_ins(
-            &surfaces.walls,
-            price(WALL_DEFAULT_TABLE, 1).unwrap_or(0),
-            &mut walls,
-        );
-        Self {
-            styles,
-            pool,
-            floors,
-            walls,
-        }
-    }
-}
-
-fn atoi(bytes: &[u8]) -> i32 {
-    let mut i = 0;
-    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) {
-        i += 1;
-    }
-    let negative = match bytes.get(i) {
-        Some(b'-') => {
-            i += 1;
-            true
-        }
-        Some(b'+') => {
-            i += 1;
-            false
-        }
-        _ => false,
-    };
-    let mut value = 0i64;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        value = value
-            .wrapping_mul(10)
-            .wrapping_add(i64::from(bytes[i] - b'0'));
-        i += 1;
-    }
-    if negative {
-        value.wrapping_neg() as i32
-    } else {
-        value as i32
-    }
-}
-
-fn architecture_value_and_built(world: &World, prices: &LotPrices) -> (i32, bool) {
-    let full = FULL_SIZE as usize;
-    let size = usize::try_from(world.size).unwrap_or(0).min(full);
-    let array = |id: u16, stride: usize| {
-        world
-            .arrays
-            .get(&id)
-            .filter(|a| a.stride == stride && a.data.len() == full * full * stride)
-            .map(|a| a.data.as_slice())
-    };
-    let mut walls_sum = 0i32;
-    let mut rest = 0i32;
-    let mut built = false;
-    let floor_price = |key: u16| prices.floors.get(&key).copied().unwrap_or(0);
-    for level in 0..2 {
-        let (Some(flags), Some(floors), Some(walls)) = (
-            array(TILE_FLAGS[level], 1),
-            array(FLOORS[level], 2),
-            array(WALLS[level], WALL_CELL),
-        ) else {
-            continue;
-        };
-        for b in 0..size {
-            for a in 0..size {
-                let cell = a * full + b;
-                if flags[cell] & TILE_LOCKED != 0 {
-                    continue;
-                }
-                let wall = ExpandedWall::get(walls, size, a, b);
-                let segments = u32::from(wall.segments);
-                if segments != 0 {
-                    built = true;
-                }
-                let style = |index: usize| match index {
-                    0..6 => wall.styles[index].unwrap_or(0),
-                    _ => wall.patterns.get(index - 6).copied().unwrap_or(0),
-                };
-                let mut bit = segments & segments.wrapping_neg();
-                while bit != 0 {
-                    let index = bit.trailing_zeros() as usize;
-                    let kind = style(index);
-                    walls_sum =
-                        walls_sum.wrapping_add(prices.styles.get(&kind).copied().unwrap_or(0));
-                    if PATTERNED_WALL_STYLES.contains(&kind) {
-                        let side = index + usize::from(bit == 0x10 || bit == 0x20);
-                        let pattern = wall.patterns.get(side).copied().unwrap_or(0);
-                        rest = rest.wrapping_add(prices.walls.get(&pattern).copied().unwrap_or(0));
-                    }
-                    loop {
-                        bit <<= 1;
-                        if segments & bit == bit || bit >= 0x20 {
-                            break;
-                        }
-                    }
-                    if bit >= 0x20 {
-                        break;
-                    }
-                }
-                let floor = u16::from_le_bytes([floors[cell * 2], floors[cell * 2 + 1]]);
-                if floor != 0 {
-                    built = true;
-                }
-                if floor == SPLIT_FLOOR {
-                    if segments & 0x30 != 0 {
-                        for half in [style(0), wall.patterns[0]] {
-                            if half != 0 {
-                                rest = rest.wrapping_add(floor_price(half) / 2);
-                            }
-                        }
-                    }
-                } else if floor != 0 {
-                    rest = rest.wrapping_add(floor_price(floor));
-                }
-                if level == 0
-                    && let Some(pool) = array(POOL_ARRAY, 1)
-                {
-                    if pool[cell] < POOL_TILE_LIMIT {
-                        built = true;
-                        rest = rest.wrapping_add(prices.pool);
-                    } else if pool[cell] == POOL_TILE_LIMIT {
-                        built = true;
-                    }
-                }
-            }
-        }
-    }
-    ((walls_sum / 2).wrapping_add(rest), built)
 }
 
 fn update_lot_values(
@@ -8590,6 +8953,189 @@ mod tests {
         assert_eq!(
             stored_tokens(&stored, leader_nid, trip::HOMEBOUND_COMPANION_KIND),
             [(members[1], 1)]
+        );
+    }
+
+    /// A destination's Go Somewhere Else (routine 17 for another
+    /// destination) carries the trip on: the next lot boots with the
+    /// traveler restored from the tokens routine 17 wrote, the family is
+    /// away there, and the trip keeps its frozen home lot, so the trip home
+    /// from the second destination resumes it. The first destination's
+    /// handle and session stop working.
+    #[test]
+    fn a_trip_goes_on_from_one_destination_to_another() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard) = live_store(&root, "travel-on");
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let leader_guid = nh.family_in(5).unwrap().1.members[0];
+        let mut home =
+            crate::lifecycle::enter_lot(&root, &store, "UserData", 5, &[3], Frames::default())
+                .unwrap();
+        let home_ticks = home.ticks;
+        let leader = person_with_guid(&home.world, leader_guid).unwrap();
+        let leader_nid = home.world.neighbors.first_of(leader_guid).unwrap().id;
+        ask_for_trip(&mut home, leader, 21, 0, 30, 0);
+        let departed = depart_from_request(&root, &store, "UserData", &mut home).unwrap();
+        let first = departed.session;
+        let mut downtown = departed.destination_lot;
+        let traveler = person_with_guid(&downtown.world, leader_guid).unwrap();
+
+        // A request for the lot it is on, or one the shell cannot carry
+        // out, stays.
+        ask_for_trip(&mut downtown, traveler, 21, 0, 30, 0);
+        let err = travel_on_from_request(
+            &root,
+            &store,
+            &first,
+            &mut downtown,
+            &TripDeparture::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TravelError::SameHouse { house: 21 }),
+            "{err:?}"
+        );
+        downtown.cancel_trip_request().unwrap();
+
+        // What is spent on the first destination stays spent.
+        let downtown_funds = downtown.world.budget.funds - 120;
+        downtown.world.set_funds(downtown_funds).unwrap();
+        ask_for_trip(&mut downtown, traveler, 58, 0, 15, 0);
+        let saved = downtown.world.trip_request.clone().unwrap().saved;
+        assert_eq!(saved, [leader_nid]);
+        let on = travel_on_from_request(
+            &root,
+            &store,
+            &first,
+            &mut downtown,
+            &TripDeparture {
+                answers: vec![3],
+                ..TripDeparture::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(downtown.world.trip_request, None);
+        assert_eq!(downtown.loaded, [0u8; 32]);
+        let second = on.session.clone();
+        assert_ne!(second.trip_id, first.trip_id);
+        assert_eq!(second.destination_house, 58);
+        assert_eq!(second.destination, TravelDestination::OldTown);
+        assert_eq!(second.home_house, first.home_house);
+        assert_eq!(second.departure_ticks, first.departure_ticks);
+        assert_eq!(second.funds_at_arrival, downtown_funds);
+        assert_eq!(second.travelers.len(), 1);
+        assert_eq!(second.travelers[0].guid, leader_guid);
+        assert_eq!(
+            second.travelers[0].home_object_id,
+            first.travelers[0].home_object_id
+        );
+        let mut old_town = on.destination_lot;
+        assert_eq!(old_town.load.house, 58);
+        assert!(person_with_guid(&old_town.world, leader_guid).is_some());
+        let stored = store.load_neighborhood("UserData").unwrap().unwrap();
+        assert_eq!(stored.families[&first.home_family].secondary_house(), 58);
+        assert_eq!(
+            inspect_active_trip(&store, "UserData", first.home_house).unwrap(),
+            Some(second.clone())
+        );
+
+        // The first leg's session and handle are spent.
+        assert!(
+            return_from_destination(
+                &root,
+                &store,
+                &first,
+                &mut downtown,
+                &[3],
+                Frames::default()
+            )
+            .is_err()
+        );
+
+        let traveler = person_with_guid(&old_town.world, leader_guid).unwrap();
+        ask_for_trip(&mut old_town, traveler, -1, 0, 30, 0);
+        let returned = return_from_request(
+            &root,
+            &store,
+            &second,
+            &mut old_town,
+            &[3],
+            Frames::default(),
+        )
+        .unwrap();
+        assert_eq!(returned.home_lot.load.house, first.home_house);
+        assert_eq!(returned.home_lot.ticks, home_ticks);
+        assert!(person_with_guid(&returned.home_lot.world, leader_guid).is_some());
+        assert_eq!(returned.report.destination_house, 58);
+        assert_eq!(saved_state_tokens(&returned.home_lot.world, leader_nid), []);
+        let stored = store.load_neighborhood("UserData").unwrap().unwrap();
+        assert_eq!(stored.families[&first.home_family].secondary_house(), 0);
+        assert_eq!(
+            inspect_active_trip(&store, "UserData", first.home_house).unwrap(),
+            None
+        );
+    }
+
+    /// A companion the caller's kind-3 token names who did not travel is
+    /// the home lot's routine 20 (0x45087d) to find or make, and routine
+    /// 21's to restore from its own saved-state tokens, which the trip
+    /// home leaves for it. Both write into the neighborhood the return
+    /// commits.
+    #[test]
+    fn a_trip_home_makes_a_companion_that_stayed_behind_at_home() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard) = live_store(&root, "request-home-companion");
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let leader_guid = nh.family_in(5).unwrap().1.members[0];
+        let companion_guid = nh.family_in(7).unwrap().1.members[0];
+        let mut home =
+            crate::lifecycle::enter_lot(&root, &store, "UserData", 5, &[3], Frames::default())
+                .unwrap();
+        assert_eq!(person_with_guid(&home.world, companion_guid), None);
+        let leader = person_with_guid(&home.world, leader_guid).unwrap();
+        let leader_nid = home.world.neighbors.first_of(leader_guid).unwrap().id;
+        let companion_nid = home.world.neighbors.first_of(companion_guid).unwrap().id;
+        ask_for_trip(&mut home, leader, 21, 0, 30, 0);
+        let departed = depart_from_request(&root, &store, "UserData", &mut home).unwrap();
+        let session = departed.session;
+        let mut lot = departed.destination_lot;
+        let traveler = person_with_guid(&lot.world, leader_guid).unwrap();
+
+        ask_for_trip(&mut lot, traveler, -1, 0, 30, 0);
+        set_neighbor_token_count(
+            &mut lot.world,
+            leader_nid,
+            trip::HOMEBOUND_COMPANION_KIND,
+            companion_guid,
+            2,
+        );
+        // Motive 6 (+0x7a4) at 42.
+        set_neighbor_token_count(&mut lot.world, companion_nid, trip::SAVED_STATE_KIND, 1, 42);
+        let returned =
+            return_from_request(&root, &store, &session, &mut lot, &[3], Frames::default())
+                .unwrap();
+        let world = &returned.home_lot.world;
+        let companion = person_with_guid(world, companion_guid).expect("made at home");
+        let person = world.objects[&companion].person.as_ref().unwrap();
+        assert_eq!(person.motives[6], 42.0);
+        assert_eq!(saved_state_tokens(world, leader_nid), []);
+        assert_eq!(saved_state_tokens(world, companion_nid), []);
+        assert_eq!(
+            tokens_of(world, leader_nid, trip::HOMEBOUND_COMPANION_KIND),
+            [(companion_guid, 1)]
+        );
+        let stored = store.load_neighborhood("UserData").unwrap().unwrap();
+        assert_eq!(
+            stored_tokens(&stored, leader_nid, trip::HOMEBOUND_COMPANION_KIND),
+            [(companion_guid, 1)]
+        );
+        assert_eq!(
+            stored_tokens(&stored, companion_nid, trip::SAVED_STATE_KIND),
+            []
         );
     }
 
