@@ -985,7 +985,11 @@ fn pr_e_idioms_round_trip() {
     let iff = parse_iff(&compile("synth-switchboard.antics", PR_E_IDIOMS).iff_bytes);
     let report =
         decompile_iff_to_v2_report(&iff, &DecompileV2Options::default()).expect("decompile");
-    for t in report.trees.iter().filter(|t| (4400..=4404).contains(&t.id)) {
+    for t in report
+        .trees
+        .iter()
+        .filter(|t| (4400..=4404).contains(&t.id))
+    {
         assert_eq!(t.style, TreeStyle::Idiomatic, "tree {}\n{source}", t.id);
         assert_eq!(t.raw_statements, 0, "tree {}\n{source}", t.id);
     }
@@ -1015,5 +1019,9 @@ fn a_relowering_idiom_that_is_not_proven_falls_back_inside_the_tree() {
     let relay = report.trees.iter().find(|t| t.id == 4410).unwrap();
     assert!(proven(&relay.check), "{:?}\n{}", relay.check, report.source);
     assert_eq!(relay.style, TreeStyle::Idiomatic, "{}", report.source);
-    assert!(report.source.contains("self.attr_2 = 3;"), "{}", report.source);
+    assert!(
+        report.source.contains("self.attr_2 = 3;"),
+        "{}",
+        report.source
+    );
 }

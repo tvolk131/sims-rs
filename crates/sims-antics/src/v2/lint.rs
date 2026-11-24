@@ -433,6 +433,10 @@ struct Symbols {
     attr_indices: BTreeSet<i64>,
     /// Identifier-like words inside `raw { }` bodies.
     raw_words: BTreeSet<String>,
+    /// Whether code outside the file set's names may read BCON entries by number: a `raw`
+    /// `bcon[N]`, or an `extern` tree (globals and semi-globals can read an object's
+    /// private tables).
+    bcon_by_number: bool,
 }
 
 impl Symbols {
@@ -453,6 +457,7 @@ impl Symbols {
                     }
                 }
                 TokenKind::RawBlock(code) => {
+                    self.bcon_by_number |= code.contains("bcon[");
                     for w in code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
                         if !w.is_empty() {
                             self.raw_words.insert(w.to_owned());
@@ -478,6 +483,7 @@ impl Symbols {
                     ObjectMember::Fn(f) => this.add_fn(f),
                     ObjectMember::Tree(t) => this.add_return(&t.ident, ret_kind(&t.ret)),
                     ObjectMember::ExternMod(m) => {
+                        this.bcon_by_number = true;
                         for f in &m.fns {
                             this.add_return(&format!("{}::{}", m.name, f.name), ret_kind(&f.ret));
                         }
@@ -491,6 +497,7 @@ impl Symbols {
                 V2Item::Enum(e) => self.add_enum(&e.name, &e.variants),
                 V2Item::Fn(f) => self.add_fn(f),
                 V2Item::ExternMod(m) => {
+                    self.bcon_by_number = true;
                     for f in &m.fns {
                         self.add_return(&format!("{}::{}", m.name, f.name), ret_kind(&f.ret));
                     }
@@ -555,9 +562,11 @@ impl Symbols {
     }
 }
 
+/// A `tree` or `extern` fn's return kind. A `-> bool` tree is often run for what it does
+/// (a test that also acts), so only a dropped `Result` counts for these.
 fn ret_kind(r: &ReturnAbi) -> RetKind {
     match r {
-        ReturnAbi::Bool => RetKind::Bool,
+        ReturnAbi::Bool => RetKind::Other,
         ReturnAbi::Result | ReturnAbi::ResultValue { .. } => RetKind::Result,
         ReturnAbi::Void | ReturnAbi::Value { .. } => RetKind::Other,
     }
@@ -836,27 +845,24 @@ const NON_YIELDING_CALLS: &[&str] = &[
 /// Methods that never yield.
 const NON_YIELDING_METHODS: &[&str] = &["is_type", "set", "clear", "contains", "is_empty"];
 
-/// `.air` primitives a v2 builtin spells, with that spelling.
+/// `.air` primitives a v2 builtin spells with the same operands, with that spelling.
+///
+/// Primitives whose v2 spelling takes different operands are left out, since a raw block
+/// holding them is often the only way to say it: `play_sound` (v2 names a declared
+/// `sound`), `stop_all_sounds` and `push_interaction` (v2 picks the target from the
+/// tree's context), `test_object_type` as a statement, `set_to_next` outside a loop, and
+/// `stack_obj :=` (not every source has a v2 spelling).
 const RAW_BUILTINS: &[(&str, &str)] = &[
     ("action_string", "action_label(...)"),
     ("refresh", "refresh(target: .., mode: ..)"),
-    ("play_sound", "play_sound(sound)"),
-    ("stop_all_sounds", "stop_all_sounds()"),
     ("go_to_relative", "go_to_relative(...)"),
-    ("push_interaction", "push_interaction(...)"),
     ("run_tree_by_name", "run_tree_by_name(...)"),
     ("manage_inventory", "manage_inventory(...)"),
     ("show_string", "show_string(...)"),
     ("set_headline", "set_headline(...)"),
     ("special_effect", "special_effect(...)"),
     ("breakpoint", "breakpoint(...)"),
-    ("test_object_type", "x.is_type(GUID)"),
-    (
-        "set_to_next",
-        "for o in lot.objects() / for p in lot.sims()",
-    ),
     ("notify_idle", "notify_out_of_idle()"),
-    ("stack_obj", "stack_obj = x;"),
 ];
 
 // ---------------------------------------------------------------------------------------
@@ -970,7 +976,7 @@ impl FileLinter<'_> {
                         );
                     }
                 }
-                ObjectMember::Bcon(b) if !template => {
+                ObjectMember::Bcon(b) if !template && !self.symbols.bcon_by_number => {
                     let used: Vec<bool> = b
                         .entries
                         .iter()
@@ -1059,8 +1065,11 @@ impl FileLinter<'_> {
         }
         match s {
             V2Stmt::While {
-                span, cond, body, ..
-            } if matches!(cond, V2Expr::Bool(_, true)) => {
+                span,
+                cond: V2Expr::Bool(_, true),
+                body,
+                ..
+            } => {
                 if self.text_at(*span).starts_with("while") {
                     self.emit(
                         WHILE_TRUE,
@@ -1419,13 +1428,10 @@ impl FileLinter<'_> {
         let mut values: Vec<String> = Vec::new();
         let mut has_else = false;
         let mut cur = s;
-        loop {
-            let V2Stmt::If {
-                cond, else_body, ..
-            } = cur
-            else {
-                break;
-            };
+        while let V2Stmt::If {
+            cond, else_body, ..
+        } = cur
+        {
             let V2Expr::Binary {
                 lhs,
                 op: V2BinOp::Eq,
@@ -1486,7 +1492,8 @@ impl FileLinter<'_> {
         }
         let mut spellings = Vec::new();
         for l in &lines {
-            if l.split_whitespace().any(|w| w == "pad")
+            if l.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|w| w == "pad")
                 || l.contains("->")
                 || l.contains('{')
                 || l.contains('}')
@@ -1500,14 +1507,6 @@ impl FileLinter<'_> {
             let Some((_, v2)) = RAW_BUILTINS.iter().find(|(air, _)| *air == word) else {
                 return;
             };
-            if word == "stack_obj"
-                && !l
-                    .trim_start_matches("stack_obj")
-                    .trim_start()
-                    .starts_with(":=")
-            {
-                return;
-            }
             if !spellings.contains(v2) {
                 spellings.push(*v2);
             }

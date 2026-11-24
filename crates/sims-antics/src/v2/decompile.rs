@@ -2000,6 +2000,19 @@ impl Model {
         }
         out.indent = 0;
         out.line("}");
+        // A GUID constant only `raw` text needed (its trees went `raw`) is left out; the
+        // blank line keeps the line numbers the statement ranges use.
+        for name in self.guid_consts.values() {
+            let decl = format!("const {name} = ");
+            let is_decl = |l: &str| l.trim_start().starts_with(&decl);
+            let used = out
+                .lines
+                .iter()
+                .any(|l| !is_decl(l) && l.contains(name.as_str()));
+            if !used && let Some(l) = out.lines.iter_mut().find(|l| is_decl(l)) {
+                l.clear();
+            }
+        }
         let mut text = out.lines.join("\n");
         text.push('\n');
         Generated {
@@ -2427,10 +2440,22 @@ impl Translator<'_> {
             && flags & 0x03 == 0x02
         {
             let object = match object {
-                OperandRef::Direct(Operand { scope: 3, index: 11 }) if self.sim => "sim",
-                OperandRef::Direct(Operand { scope: 3, index: 11 }) => "self",
-                OperandRef::Direct(Operand { scope: 10, index: 0 }) if self.sim => "self",
-                OperandRef::Direct(Operand { scope: 10, index: 0 }) => "stack_obj",
+                OperandRef::Direct(Operand {
+                    scope: 3,
+                    index: 11,
+                }) if self.sim => "sim",
+                OperandRef::Direct(Operand {
+                    scope: 3,
+                    index: 11,
+                }) => "self",
+                OperandRef::Direct(Operand {
+                    scope: 10,
+                    index: 0,
+                }) if self.sim => "self",
+                OperandRef::Direct(Operand {
+                    scope: 10,
+                    index: 0,
+                }) => "stack_obj",
                 _ => return None,
             };
             format!(
@@ -2761,7 +2786,11 @@ impl Translator<'_> {
                 function,
                 change_icon,
             } if *function <= 255 && self.extra() => {
-                let icon = if *change_icon { ", change_icon: true" } else { "" };
+                let icon = if *change_icon {
+                    ", change_icon: true"
+                } else {
+                    ""
+                };
                 format!("stack_obj.run_functional({function}{icon})")
             }
             PrimitiveCall::Breakpoint { cond } => format!("breakpoint({})", self.rvalue(cond)?),

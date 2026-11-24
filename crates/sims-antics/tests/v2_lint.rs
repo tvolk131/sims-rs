@@ -219,15 +219,14 @@ fn dropped_bool_and_result_calls_are_flagged() {
         lines,
         [
             line_of(&source, "is_bright();"),
-            line_of(&source, "check();"),
             line_of(&source, "try_light(3);"),
             line_of(&source, "can_afford(5);"),
             line_of(&source, "is_type(0x7E00_0200);"),
         ],
         "{found:#?}"
     );
-    assert!(found[2].message.contains("`Result`"), "{:?}", found[2]);
-    assert!(found[2].help.as_deref().unwrap().contains('?'));
+    assert!(found[1].message.contains("`Result`"), "{:?}", found[1]);
+    assert!(found[1].help.as_deref().unwrap().contains('?'));
 }
 
 #[test]
@@ -356,6 +355,25 @@ fn unused_locals_states_consts_and_bcon_entries_are_flagged() {
         ],
         "{found:#?}"
     );
+}
+
+#[test]
+fn bcon_entries_are_not_judged_when_something_reads_them_by_number() {
+    let members = "    bcon 4097 \"Tuning\" { low = 1, high = 9 }\n    \
+         tree probe \"Probe\" {\n        self.level = Tuning.low;\n        self.mode = Mode::Off;\n";
+    let flagged = obj(&format!("{members}    }}"));
+    assert_eq!(of(&flagged, "unused_decl").len(), 1, "{flagged}");
+    let raw = obj(&format!(
+        "{members}        raw {{ temp[0] := bcon[129]; }}\n    }}"
+    ));
+    none(&raw, "unused_decl");
+    let external = format!(
+        "extern mod synth_globals {{\n    @id(256) fn tune() -> bool;\n}}\n{}",
+        obj(&format!("{members}        synth_globals::tune();\n    }}"))
+    );
+    none(&external, "unused_decl");
+    // A `-> bool` extern called for what it does is not a dropped result either.
+    none(&external, "dropped_bool_call");
 }
 
 #[test]
@@ -507,13 +525,12 @@ fn short_or_mixed_chains_are_fine() {
 
 #[test]
 fn raw_blocks_of_native_primitives_are_flagged() {
-    let source = tree(
-        "        raw {\n            notify_idle();\n            stop_all_sounds();\n        }",
-    );
+    let source =
+        tree("        raw {\n            notify_idle();\n            breakpoint();\n        }");
     let d = one(&source, "manual_raw_has_builtin");
     let help = d.help.unwrap();
     assert!(help.contains("notify_out_of_idle()"), "{help}");
-    assert!(help.contains("stop_all_sounds()"), "{help}");
+    assert!(help.contains("breakpoint(...)"), "{help}");
 }
 
 #[test]
@@ -523,6 +540,13 @@ fn raw_blocks_v2_cannot_spell_are_fine() {
         "        raw { notify_idle() pad 0xff; }",
         "        raw { random(temp[0], 1) -> true: true, false: true; }",
         "        raw { notify_idle(); my.attr[0] := 1; }",
+        "        raw { play_sound(1) pad(3: 0x01, 4: 0x01); }",
+        // v2 spells these with different operands (a declared sound, a context target).
+        "        raw { play_sound(1, stack_obj); }",
+        "        raw { stop_all_sounds(true); }",
+        "        raw { push_interaction(menu: 0, object: 0, priority: 0, flags: 7); }",
+        "        raw { test_object_type(0x7e000100, stack_obj); }",
+        "        raw { stack_obj := stack.slot[0]; }",
     ] {
         none(&tree(raw), "manual_raw_has_builtin");
     }
