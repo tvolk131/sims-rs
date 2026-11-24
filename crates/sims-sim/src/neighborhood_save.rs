@@ -34,6 +34,10 @@ pub struct SaveInputs {
     /// NGBH option bytes as read. Each is written as read while its truth
     /// is the stored option's; otherwise the option is written as 0 or 1.
     pub option_bytes: Vec<u8>,
+    /// Family names as read. The store keeps each trimmed, so a name read
+    /// with spaces round it is written as read while it trims to the
+    /// stored one.
+    pub family_names: BTreeMap<u16, String>,
 }
 
 impl SaveInputs {
@@ -43,6 +47,11 @@ impl SaveInputs {
         let (file, uninitialized) = NeighborhoodFile::parse(bytes)
             .map_err(|error| Error::Store(format!("Neighborhood.iff: {error}")))?;
         let option_bytes = file.neighborhood.option_bytes;
+        let family_names = file
+            .families
+            .iter()
+            .map(|record| (record.id, record.name.clone()))
+            .collect();
         let histories = file
             .families
             .into_iter()
@@ -52,6 +61,7 @@ impl SaveInputs {
             histories,
             uninitialized,
             option_bytes,
+            family_names,
         })
     }
 }
@@ -89,7 +99,7 @@ impl StoredNeighborhood {
                 Ok(FamilyRecord {
                     id,
                     family: self.families[&id].clone(),
-                    name: self.family_surname(id).unwrap_or_default().to_owned(),
+                    name: self.family_name(id, inputs),
                     history: inputs.histories.get(&id).cloned(),
                 })
             })
@@ -125,5 +135,16 @@ impl StoredNeighborhood {
         self.neighborhood_file(inputs)?
             .to_bytes(&inputs.uninitialized)
             .map_err(|error| Error::Store(format!("Neighborhood.iff: {error}")))
+    }
+
+    /// Family `id`'s name: as read while it trims to the stored surname
+    /// (an empty one when none is stored), else the stored surname.
+    fn family_name(&self, id: u16, inputs: &SaveInputs) -> String {
+        let stored = self.family_surname(id).unwrap_or_default();
+        inputs
+            .family_names
+            .get(&id)
+            .filter(|read| read.trim() == stored)
+            .map_or_else(|| stored.to_owned(), Clone::clone)
     }
 }

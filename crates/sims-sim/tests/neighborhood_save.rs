@@ -256,10 +256,46 @@ fn family_zero_is_imported_and_saved_without_a_member_list() {
     );
 }
 
-/// NGBH option bytes other than 0 and 1 survive the store, which keeps
-/// only their truth, when the save is given the bytes it read.
+/// A store from before format 6 holds family 0 read with a member list.
+/// The migration reads it again, also after a world writeback padded its
+/// tail, so the save writes what the original read.
 #[test]
-fn option_bytes_read_from_a_save_are_written_again() {
+fn a_format_five_store_has_family_zero_read_again() {
+    let mut tail = vec![0; 16];
+    tail[0..4].copy_from_slice(&2i32.to_le_bytes());
+    tail[4..8].copy_from_slice(&0x0001_0001u32.to_le_bytes());
+    tail[8..12].copy_from_slice(&0x0003_0003u32.to_le_bytes());
+    tail[12..16].copy_from_slice(&0x0002_0002u32.to_le_bytes());
+    let zero = Family {
+        tail,
+        ..family(0, 2, Vec::new())
+    };
+    let chunk = zero.to_chunk(0).unwrap();
+    let misread = Family::parse(&chunk).unwrap();
+    assert_eq!(misread.members.len(), 2);
+    let mut padded = misread.clone();
+    padded.upgrade_to_v9();
+    assert_ne!(padded.tail, misread.tail);
+
+    for old in [misread, padded] {
+        let mut neighborhood = sample();
+        neighborhood.families.insert(0, old);
+        let mut bytes = neighborhood.encode();
+        bytes[..4].copy_from_slice(&5u32.to_le_bytes());
+        let (back, report) = StoredNeighborhood::decode_with_report("Old", &bytes).unwrap();
+        assert_eq!(report.steps_applied, 1);
+        assert_eq!(back.families[&0].to_chunk(0).unwrap(), chunk);
+        let saved = back.neighborhood_iff(&SaveInputs::default()).unwrap();
+        let iff = Iff::parse(saved).unwrap();
+        assert_eq!(iff.data(iff.get(b"FAMI", 0).unwrap()), chunk);
+    }
+}
+
+/// NGBH option bytes other than 0 and 1, and family names with spaces
+/// round them, survive the store, which keeps only the options' truth and
+/// trimmed names, when the save is given what it read.
+#[test]
+fn option_bytes_and_names_read_from_a_save_are_written_again() {
     let neighborhood = sample();
     let mut inputs = SaveInputs::default();
     let plain = neighborhood.neighborhood_iff(&inputs).unwrap();
@@ -270,6 +306,23 @@ fn option_bytes_read_from_a_save_are_written_again() {
 
     inputs = SaveInputs::from_saved(&odd).unwrap();
     assert_eq!(neighborhood.neighborhood_iff(&inputs).unwrap(), odd);
+
+    // A name read with spaces round it is written as read.
+    let (mut file, uninitialized) = NeighborhoodFile::parse(&odd).unwrap();
+    let alpha = file
+        .families
+        .iter_mut()
+        .find(|record| record.id == 1)
+        .unwrap();
+    alpha.name = " Alpha ".to_owned();
+    let spaced = file.to_bytes(&uninitialized).unwrap();
+    let inputs = SaveInputs::from_saved(&spaced).unwrap();
+    assert_eq!(neighborhood.neighborhood_iff(&inputs).unwrap(), spaced);
+    let mut renamed = neighborhood.clone();
+    renamed.set_family_surname(1, "Delta");
+    let (file, _) = NeighborhoodFile::parse(&renamed.neighborhood_iff(&inputs).unwrap()).unwrap();
+    let delta = file.families.iter().find(|record| record.id == 1).unwrap();
+    assert_eq!(delta.name, "Delta");
 
     // An option changed since the read is written as 0 or 1.
     let mut changed = neighborhood.clone();

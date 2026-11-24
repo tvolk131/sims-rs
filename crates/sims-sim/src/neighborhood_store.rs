@@ -990,8 +990,9 @@ const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// `instance_id` and `deleted_characters`; format 3 added `deletion_epoch` and
 /// `deleted_at_epoch`; format 4 added `family_surnames`; format 5 keeps
 /// `made_characters` in the order made, in format 4's layout, so a format-4
-/// build refuses it).
-pub const NEIGHBORHOOD_FORMAT: u32 = 5;
+/// build refuses it; format 6 holds family 0 as the original reads it,
+/// without a member list, in format 5's layout).
+pub const NEIGHBORHOOD_FORMAT: u32 = 6;
 
 /// Default `"architecture value multiplier"` from `Global.far` `FCNS #4`
 /// (`0x6e4a88`, `0x3f333333`).
@@ -1322,7 +1323,8 @@ impl StoredNeighborhood {
                 .get(index)
                 .and_then(|entry| entry.as_ref())
                 .filter(|prev| prev.id == live.id && prev.guid == live.guid);
-            let person_data = if live.revision > 0 {
+            // Any nonzero mode carries person words (0x423e8e).
+            let person_data = if live.revision != 0 {
                 live.data.clone()
             } else {
                 Vec::new()

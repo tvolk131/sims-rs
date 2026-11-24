@@ -69,7 +69,9 @@ The payload follows.
   - if the mode is nonzero (0x423e8e, `je`: negative modes too),
     0x100 shorts from +0x74. 0x423e08 is the read and write in one, so
     the reader now reads them for any nonzero mode, not only positive
-    ones;
+    ones, and so does the store's world writeback. sims-vm's CAF export
+    (`caf.rs`) still writes them only for a positive mode; that file is
+    outside this change and is a follow-up;
   - short id, int GUID (+4);
   - the relationship map (0x4650ee): −1, the count, then per entry 1,
     the target, the count, and the values.
@@ -132,7 +134,10 @@ adds no fields to it. A save needs things the store doesn't keep:
 - the uninitialized bytes and the map's unused bytes;
 - the NGBH option bytes as read. The original saves each option byte as
   it holds it, and a read keeps any nonzero byte; the store keeps only
-  each option's truth.
+  each option's truth. A read byte is written while its truth matches the
+  stored option;
+- the family names as read. The store keeps them trimmed; a read name is
+  written while it trims to the stored one.
 
 They go in a separate `SaveInputs`, which `SaveInputs::from_saved` reads
 from an earlier save. Keeping FAMh in REDB needs a store migration, which
@@ -144,8 +149,12 @@ The original reads and writes family 0 without a member list (0x4105e7).
 `sims_content::Neighborhood::open` reads every FAMI with one, so family
 0's secondary house is taken for a member count. The store's import now
 reads family 0 again as the original does (`Family::for_chunk(0)`), and
-the save writes the stored record as it is. A store imported before this
-change keeps the misread record, so it should be imported again.
+the save writes the stored record as it is. `NEIGHBORHOOD_FORMAT` is now
+6: the v5 → v6 migration reads family 0 again the same way. That is exact
+even after a world writeback, because `Family::upgrade_to_v9` only
+appends zeros to a version 9 tail, and the first 16 bytes after the
+fixed fields are what the original read. The layout is format 5's, so a
+format-5 build refuses a format-6 store rather than misreading it.
 
 `Neighborhood::open` itself still fails on a family 0 whose secondary
 house, taken as a count, runs past the chunk. The fix belongs in
