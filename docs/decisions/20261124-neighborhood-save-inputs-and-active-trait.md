@@ -48,8 +48,11 @@ of it, including those in sims-vm. A separate table changes neither, so
 - **Re-import** replaces the entry, and **delete** removes it.
 - A neighborhood imported before this change has no entry. Its save then
   writes no FAMh and zeros for the uninitialized bytes.
-- `NeighborhoodStore::save_save_inputs` replaces the entry. Callers use
-  it, for example, when a family moves in from a `.FAM` file: when the
+- `NeighborhoodStore::update_save_inputs` changes the entry in one write
+  transaction: the caller's change gets the entry as it stands, so it
+  can't write back a stale copy, such as one that still holds a dropped
+  family's FAMh. Callers use it, for example, when a family moves in
+  from a `.FAM` file: when the
   family has one (+0x140), 0x4107a8 copies that file's FAMh. Only
   otherwise does 0x4107cf test the stored history (+0x144).
 - When a commit drops a family, its entries go too: its FAMh, its name

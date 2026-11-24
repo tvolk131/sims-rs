@@ -985,7 +985,7 @@ fn purge_removed_family_albums_in_txn(
 /// `previous` that is not in `next`, so a family that later takes its ID
 /// gets none of them. Those of a family new in `next` stay: a caller may
 /// store a moved-in family's FAMh before committing the family
-/// ([`NeighborhoodStore::save_save_inputs`]), and the import keeps only
+/// ([`NeighborhoodStore::update_save_inputs`]), and the import keeps only
 /// the families it imports.
 fn forget_family_save_inputs_in_txn(
     txn: &redb::WriteTransaction,
@@ -2866,10 +2866,13 @@ impl NeighborhoodStore {
         save_inputs_in(&txn, id)
     }
 
-    /// Replaces `id`'s save inputs, for instance with a family's FAMh when
-    /// a `.FAM` file moves in (the save copies such a family's FAMh from
-    /// its file, 0x4107a8). `id` must be an imported neighborhood.
-    pub fn save_save_inputs(&self, id: &str, inputs: &SaveInputs) -> Result<()> {
+    /// Changes `id`'s save inputs with `change`, for instance to add a
+    /// family's FAMh when a `.FAM` file moves in (the save copies such a
+    /// family's FAMh from its file, 0x4107a8). `change` gets the inputs as
+    /// they stand in the same write transaction, so it never writes back a
+    /// stale copy (such as a dropped family's entries). `id` must be an
+    /// imported neighborhood.
+    pub fn update_save_inputs(&self, id: &str, change: impl FnOnce(&mut SaveInputs)) -> Result<()> {
         let txn = self.db.begin_write().map_err(store)?;
         {
             let exists = txn
@@ -2881,8 +2884,15 @@ impl NeighborhoodStore {
             if !exists {
                 return Err(Error::Store(format!("no neighborhood {id:?}")));
             }
-            txn.open_table(NEIGHBORHOOD_SAVE_INPUTS)
+            let mut table = txn.open_table(NEIGHBORHOOD_SAVE_INPUTS).map_err(store)?;
+            let mut inputs = table
+                .get(id)
                 .map_err(store)?
+                .map(|value| SaveInputs::decode(value.value()))
+                .transpose()?
+                .unwrap_or_default();
+            change(&mut inputs);
+            table
                 .insert(id, inputs.encode().as_slice())
                 .map_err(store)?;
         }

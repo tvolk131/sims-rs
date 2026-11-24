@@ -412,9 +412,11 @@ fn the_store_keeps_family_histories_and_saves_through_the_temporary_file() {
     assert!(!out.0.join(TEMPORARY_FILE).exists());
 
     // A family that moves in from a `.FAM` file brings its FAMh.
-    let mut changed = kept.clone();
-    changed.histories.insert(2, vec![0x42; 6]);
-    store.save_save_inputs("Hood", &changed).unwrap();
+    store
+        .update_save_inputs("Hood", |inputs| {
+            inputs.histories.insert(2, vec![0x42; 6]);
+        })
+        .unwrap();
     store.save_neighborhood_iff("Hood", &out.0).unwrap();
     let iff = Iff::parse(std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(iff.data(iff.get(b"FAMh", 2).unwrap()), [0x42; 6]);
@@ -425,7 +427,7 @@ fn the_store_keeps_family_histories_and_saves_through_the_temporary_file() {
         store.load_save_inputs("Hood").unwrap(),
         SaveInputs::default()
     );
-    assert!(store.save_save_inputs("Hood", &changed).is_err());
+    assert!(store.update_save_inputs("Hood", |_| {}).is_err());
     assert!(store.save_neighborhood_iff("Hood", &out.0).is_err());
 }
 
@@ -547,9 +549,11 @@ fn a_history_stored_before_its_family_is_kept() {
     let store = NeighborhoodStore::open(&db.0).unwrap();
     store.import_directory("Hood", &folder.0, 0xff).unwrap();
 
-    let mut inputs = store.load_save_inputs("Hood").unwrap();
-    inputs.histories.insert(7, vec![7; 5]);
-    store.save_save_inputs("Hood", &inputs).unwrap();
+    store
+        .update_save_inputs("Hood", |inputs| {
+            inputs.histories.insert(7, vec![7; 5]);
+        })
+        .unwrap();
     let mut state = store.load_neighborhood("Hood").unwrap().unwrap();
     state.families.insert(7, family(0, 2, vec![0x1000_0007]));
     store.save_neighborhood("Hood", &state).unwrap();
