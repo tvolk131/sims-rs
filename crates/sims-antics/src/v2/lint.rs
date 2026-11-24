@@ -1581,9 +1581,9 @@ impl FileLinter<'_> {
             }
             // Strings reach a primitive as call arguments: a literal, a `strings`
             // entry's name, or (for a dialog) its 1-based number in `STR#` 301.
-            let mut args: Vec<(&str, &CallArg)> = Vec::new();
+            let mut args: Vec<(&str, &V2Expr)> = Vec::new();
             if let V2Stmt::Animate { args: a, .. } = s {
-                args.extend(a.iter().map(|a| ("animate", a)));
+                args.extend(a.iter().map(|a| ("animate", &a.value)));
             }
             for e in stmt_exprs(s) {
                 walk_expr(e, &mut |x| match x {
@@ -1594,14 +1594,36 @@ impl FileLinter<'_> {
                             V2Expr::Ident(_, n) => n.as_str(),
                             _ => "",
                         };
-                        args.extend(a.iter().map(|a| (name, a)));
+                        if name != "dialog" {
+                            args.extend(a.iter().map(|a| (name, &a.value)));
+                            return;
+                        }
+                        // A dialog's strings: the text arguments and the `buttons` tuple
+                        // (`kind:`, `flags:` and the like are numbers, not strings).
+                        for a in a {
+                            match (a.name.as_deref(), &a.value) {
+                                (Some("buttons"), V2Expr::Tuple(_, items)) => {
+                                    args.extend(items.iter().map(|v| ("dialog", v)));
+                                }
+                                (
+                                    Some(
+                                        "title" | "message" | "text" | "mode4_str" | "button1"
+                                        | "button2" | "button3",
+                                    ),
+                                    v,
+                                ) => args.push(("dialog", v)),
+                                _ => {}
+                            }
+                        }
                     }
-                    V2Expr::MethodCall { args: a, .. } => args.extend(a.iter().map(|a| ("", a))),
+                    V2Expr::MethodCall { args: a, .. } => {
+                        args.extend(a.iter().map(|a| ("", &a.value)));
+                    }
                     _ => {}
                 });
             }
-            for (callee, a) in args {
-                match &a.value {
+            for (callee, value) in args {
+                match value {
                     V2Expr::Str(span, text) => note(*span, text, "this string".to_owned()),
                     V2Expr::Ident(span, name) if strings.contains_key(name) => {
                         note(*span, &strings[name], format!("string `{name}`"));
@@ -1742,8 +1764,10 @@ impl FileLinter<'_> {
         walk_stmts(&t.body, &mut |s| {
             if let V2Stmt::RawAir { span, code } = s {
                 for (word, n) in raw_index_words(&strip_air_comments(code)) {
+                    // A frame has at most 255 argument words; a larger index is the
+                    // compiler's to reject.
                     if word == "param"
-                        && usize::try_from(n).is_ok_and(|n| n >= args)
+                        && usize::try_from(n).is_ok_and(|n| n >= args && n < 256)
                         && hit.is_none_or(|(_, m)| n > m)
                     {
                         hit = Some((hit.map_or(*span, |(at, _)| at), n));
@@ -1765,7 +1789,7 @@ impl FileLinter<'_> {
                 n + 1
             )),
             None,
-            Some("the compiled header takes its argument count from the raw read alone, and v2 callers pass no argument words; a lifted tree keeps the original's `@frame(args:)` so the count matches".to_owned()),
+            Some("the compiled header takes its argument count from the raw read alone, and only a caller that passes `temps` fills those words; a lifted tree keeps the original's `@frame(args:)` so the count matches".to_owned()),
         );
     }
 
@@ -2037,10 +2061,30 @@ impl FileLinter<'_> {
     /// Returns whether `list` ends the clobbered state (a `stack_obj = self` restore, or a
     /// report) anywhere.
     fn clobber_walk(&mut self, list: &[V2Stmt], clobbered: Option<Span>) -> bool {
-        // Handles saved in this list are its own: a nested block's do not leak out.
-        let outer = self.self_handles.clone();
+        // A `let` in this list ends with it: a shadowing binding's handle state does not
+        // leak out (stores to outer bindings do).
+        let declared: BTreeSet<String> = list
+            .iter()
+            .filter_map(|s| match s {
+                V2Stmt::Let { name, .. }
+                | V2Stmt::LetSome { name, .. }
+                | V2Stmt::LetUninit { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        let outer: BTreeSet<String> = declared
+            .iter()
+            .filter(|n| self.self_handles.contains(*n))
+            .cloned()
+            .collect();
         let ended = self.clobber_walk_list(list, clobbered);
-        self.self_handles = outer;
+        for name in declared {
+            if outer.contains(&name) {
+                self.self_handles.insert(name);
+            } else {
+                self.self_handles.remove(&name);
+            }
+        }
         ended
     }
 
@@ -2375,7 +2419,14 @@ impl FileLinter<'_> {
             return;
         }
         {
-            let t = last.trim();
+            // A label (`@done:`) may start the statement.
+            let mut t = last.trim();
+            while let Some(rest) = t.strip_prefix('@')
+                && let Some((label, after)) = rest.split_once(':')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                t = after.trim_start();
+            }
             let Some(rest) = t.strip_prefix("call") else {
                 return;
             };
@@ -2802,7 +2853,21 @@ fn runs_a_node(s: &V2Stmt) -> bool {
             !matches!(target, V2Expr::Ident(..))
                 && print_expr(target).is_none_or(|t| print_expr(value).is_none_or(|v| t != v))
         }
-        V2Stmt::If { cond, .. } | V2Stmt::While { cond, .. } => live(cond),
+        // A test with a literal or a short-circuit (`true || x`) may fold.
+        V2Stmt::If { cond, .. } | V2Stmt::While { cond, .. } => {
+            let mut foldable = false;
+            walk_expr(cond, &mut |x| {
+                foldable |= matches!(
+                    x,
+                    V2Expr::Bool(..)
+                        | V2Expr::Binary {
+                            op: V2BinOp::Or | V2BinOp::And,
+                            ..
+                        }
+                );
+            });
+            live(cond) && !foldable
+        }
         V2Stmt::Match { scrutinee, .. } => live(scrutinee),
         V2Stmt::Expr { expr, .. } => matches!(
             expr,

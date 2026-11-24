@@ -51,12 +51,12 @@ Rules that depend on the frame use the real layout, not a guess from source orde
 |---|---|
 | "read before anything assigns it" moved to its own code | **`uninitialized_local_read`** (new) |
 | Builtins the VM writes a local through assign it: `random_into`'s first positional argument and `animate`'s event `local:`. `set_headline(local:)` and `push_interaction(icon:)` read theirs | `uninitialized_local_read` |
-| A `let` whose slot a `$Local:N` / `$TimeLocal:N` token reads is used. Tokens come from call arguments: string literals, `strings` entry names, and a dialog's numeric string (1-based into `STR#` 301). When the `let` isn't read, the note names the slots the tokens read and the slot the `let` is on | `unused_decl` |
+| A `let` whose slot a `$Local:N` / `$TimeLocal:N` token reads is used. Tokens come from call arguments: string literals and `strings` entry names; for a dialog, only its text arguments and `buttons`, where a number is a string (1-based into `STR#` 301). When the `let` isn't read, the note names the slots the tokens read and the slot the `let` is on | `unused_decl` |
 | A `const` whose value a `raw` block uses as a literal index (`attr[7]`; not `local` / `temp` / `param`) is used, because `raw` does not resolve `const` names | `unused_decl` |
 | A token's slot holds no local, a compiler temporary, or an inlined helper's local. The note lists the tree's slot layout, and states that the verifier does not compare string tokens | **`dialog_local_slot_mismatch`** (new) |
-| A `raw` block that ends in a bare `call N(...);` (no `->` edges) where code runs next: later statements, the code after an enclosing `if`, or a loop's test. Its false edge exits the tree. Help: `if call N(...) {}` | **`raw_bare_call_false_exit`** (new) |
-| A `(sim: Sim)` tree with no parameters and no `@frame(args:)` whose `raw` reads `param[n]`. The compiled header takes its argument count from that read alone, and v2 callers pass no argument words (`sim` is not one) | **`missing_sim_frame_args`** (new) |
-| `stack_obj = saved;` restores `self` when `saved` took the handle before any swap, in its own block or an enclosing one. Help now offers `stack_obj.<field>` for writes meant for the other object | `stack_obj_clobber_after_self` |
+| A `raw` block that ends in a bare `call N(...);` (labelled or not, no `->` edges) where code runs next: later statements, the code after an enclosing `if`, or a loop's test. Its false edge exits the tree. Help: `if call N(...) {}` | **`raw_bare_call_false_exit`** (new) |
+| A `(sim: Sim)` tree with no parameters and no `@frame(args:)` whose `raw` reads `param[n]`. The compiled header takes its argument count from that read alone, and only a caller passing `temps` fills those words (`sim` is not one) | **`missing_sim_frame_args`** (new) |
+| `stack_obj = saved;` restores `self` when `saved` took the handle before any swap, in its own block or an enclosing one (a `let` that shadows it ends with its block; a store to it does not). Help now offers `stack_obj.<field>` for writes meant for the other object | `stack_obj_clobber_after_self` |
 | Not reported when the condition contains a comparison: `return a op b;` lowers to the flipped compare and ends on the opposite last result. `!c` returning false suggests `return c;`, not `!!` | `redundant_bool_return` |
 | Reported only for an `if` / `while` testing `!(a op b)` whose both successors run another node before the tree can end. Otherwise the compare's own result can be the tree's last result | `negated_comparison` |
 | The message names the culprit: the raw slots below the named locals, and repeated `let`s or compiler temporaries | `frame_headroom` |
@@ -64,7 +64,8 @@ Rules that depend on the frame use the real layout, not a guess from source orde
 ### Why heuristics, and which ones
 
 - **`raw_bare_call_false_exit`** fires only when v2 code follows the block. Inside a block of `.air`, the false exit is the author's own `.air`. A lifted tree mirrors the original's.
-- **`negated_comparison`** counts a successor as running a node only when nothing can fold it away: a call, a store to a place, or a test or `return` that reads a place or calls. A `let`, a store to a plain local, and a test of constants do not count.
+- **`negated_comparison`** counts a successor as running a node only when nothing can fold it away: a call, a store to a place, or a test or `return` that reads a place or calls. A `let`, a store to a plain local, and a test with a literal or a short-circuit (`true || x`) do not count.
+- **Directive coverage** follows `else` / `else if` by tokens: an `else if` whose condition holds an `if` expression with braces ends the coverage early (write the directive on the line itself).
 - **`dialog_local_slot_mismatch`** checks only what the frame shows. It cannot know which `let` the author meant when the slot holds a different `let` of the same tree.
 
 ## Decision 3: `lift --v2` names and spellings (Sol, reviewed here)
@@ -88,7 +89,7 @@ Every new spelling is an extra idiom: a tree that does not prove falls back to t
 - **Checker:**
   - The lift's own comparison drops Animate operand byte 2 when flag `0x20` is clear, because the VM reads it only then (`sims-vm` `animate.rs` `store_event`).
   - Every OBJD's bytes are compared, not only the variant words.
-  - A tree that shows text from a `STR#` table is inconclusive when the rebuilt object's table differs in the texts the VM reads (language and text of each entry, in order). This covers Show String (21) and Set Action String (50), by their table operand, and a private Dialog (36, `STR#` 301). Before, such a tree could prove although the rebuilt object had no table. The lift writes no `strings` members yet, so every such tree is now inconclusive; v2 `strings` holds one language, so writing them is its own change.
+  - A tree that shows text from a string table is inconclusive when the rebuilt object's table differs in the texts the VM reads (language and text of each entry, in order). This covers Show String (21) and Set Action String (50), by their table operand, and a private Dialog (36, `STR#` 301) that names a string. The table's `STR#`, `CTSS` and legacy `CST` chunks of the id are compared, since the loader falls back on the latter two. Before, such a tree could prove although the rebuilt object had no table. The lift writes no `strings` members yet, so every such tree is now inconclusive; v2 `strings` holds one language, so writing them is its own change.
 - **Variants:**
   - Catalog variants are kept when the primary OBJD is not a multi-tile master.
   - All 68 base-game multi-OBJD files are tile groups. v2's `variant` cannot spell those, so they stay reported as not reproduced.

@@ -474,6 +474,13 @@ fn restored_or_object_context_self_is_fine() {
         ),
         "stack_obj_clobber_after_self",
     );
+    // A store to the outer binding in a nested block is kept.
+    one(
+        &sim_tree(
+            "        let saved = stack_obj;\n        if temp[0] != 0 {\n            saved = sim;\n        } else {\n            saved = sim;\n        }\n        stack_obj = sim;\n        stack_obj = saved;\n        self.level = 1;",
+        ),
+        "stack_obj_clobber_after_self",
+    );
     // A restore inside a nested block ends the clobber.
     none(
         &sim_tree(
@@ -678,6 +685,20 @@ fn string_tokens_follow_hex_raw_locals_and_numeric_dialog_strings() {
     );
     let d = one(&numeric, "dialog_local_slot_mismatch");
     assert!(d.message.contains("dialog string 1"), "{d:?}");
+    // `kind: 2` is a number, not dialog string 2; a `buttons` tuple names strings.
+    let two = |call: &str| {
+        obj(&format!(
+            "    strings 301 \"Dialog prim string set\" {{ msg = \"Go on?\", a = \"$Local:4\", b = \"No\" }}\n    tree probe \"Probe\" (sim: Sim) {{\n        self.level = 0;\n        self.mode = Mode::Off;\n        {call}\n    }}"
+        ))
+    };
+    none(
+        &two("dialog(kind: 2, message: msg, title: msg)?;"),
+        "dialog_local_slot_mismatch",
+    );
+    one(
+        &two("dialog(kind: yes_no, message: msg, buttons: (a, b))?;"),
+        "dialog_local_slot_mismatch",
+    );
     // A state with a string's name is not the string.
     none(
         &obj(
@@ -744,6 +765,11 @@ fn raw_calls_with_their_own_edges_or_nested_in_an_arm() {
         "        if self.level > 0 {\n            raw { call 4301(temps); }\n        }\n        self.level = 1;",
     );
     one(&source, "raw_bare_call_false_exit");
+    // A label does not hide the call.
+    one(
+        &wrap("        raw { @last: call 4301(temps); }\n        self.level = 1;"),
+        "raw_bare_call_false_exit",
+    );
     // Last in a loop body: the loop's test follows it.
     one(
         &wrap("        while self.level > 0 {\n            raw { call 4301(temps); }\n        }"),
@@ -816,6 +842,11 @@ fn odd_raw_text_does_not_crash_the_linter() {
     ] {
         let _ = lint_v2_source(&tree(raw), "probe.antics");
     }
+    // An argument index no frame can hold is the compiler's to reject.
+    let _ = lint_v2_source(
+        &sim_tree("        raw { temp[0] := param[9223372036854775807]; }"),
+        "probe.antics",
+    );
 }
 
 #[test]
@@ -1103,6 +1134,7 @@ fn negated_comparisons_a_branch_may_end_on_are_fine() {
         "        while !(self.level > 3) { self.level += 1; }",
         // A test of constants folds away: the `return` right after is the next node.
         "        if !(self.level == 3) {\n            if true { return true; }\n        }\n        sleep(1);",
+        "        if !(self.level == 3) {\n            if true || self.level == 0 { return true; }\n        }\n        sleep(1);",
     ] {
         none(&tree(body), "negated_comparison");
     }

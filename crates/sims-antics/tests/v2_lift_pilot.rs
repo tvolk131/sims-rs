@@ -356,3 +356,65 @@ fn trees_showing_text_the_lift_does_not_write_are_inconclusive() {
         TreeCheck::Identical | TreeCheck::Equivalent
     ));
 }
+
+/// `iff` with chunk `from` retagged `to` (same id and bytes).
+fn retagged(iff: &Iff, from: ([u8; 4], u16), to: [u8; 4]) -> Iff {
+    let chunks: Vec<_> = iff
+        .chunks
+        .iter()
+        .filter(|c| &c.tag != b"rsmp")
+        .map(|c| ChunkData {
+            tag: if (c.tag, c.id) == from { to } else { c.tag },
+            id: c.id,
+            flags: c.flags,
+            label: c.label.clone(),
+            data: iff.data(c).to_vec(),
+        })
+        .collect();
+    Iff::parse(sims_formats::iff::write(&chunks).expect("write IFF")).expect("parse IFF")
+}
+
+#[test]
+fn fallback_text_tables_and_tableless_dialogs() {
+    let iff = compile(
+        r#"object "Fable Board" {
+    guid: 0x7E00_00A5;
+    strings 301 "Dialog prim string set" { ask = "Go on?" }
+    strings 431 "Notes" { a = "Read" }
+    @id(4300) tree confirm {
+        dialog(kind: yes_no, message: ask)?;
+    }
+    @id(4301) tree note {
+        raw { show_string(table: 431, index: 1); }
+    }
+    @id(4302) tree pick {
+        dialog(kind: 5)?;
+    }
+}"#,
+    );
+    // The original's loader falls back on a legacy `CST` 301 and a `CTSS` 431.
+    let iff = retagged(&iff, (*b"STR#", 301), *b"\0CST");
+    let iff = retagged(&iff, (*b"STR#", 431), *b"CTSS");
+    let report = decompile_iff_to_v2_report(&iff, &DecompileV2Options::default()).expect("lift");
+    let check = |id: u16| {
+        &report
+            .trees
+            .iter()
+            .find(|t| t.id == id)
+            .unwrap_or_else(|| panic!("tree {id} in {:?}", report.trees))
+            .check
+    };
+    for id in [4300, 4301] {
+        assert!(
+            matches!(check(id), TreeCheck::Inconclusive(_)),
+            "tree {id}: {:?}",
+            check(id)
+        );
+    }
+    // A dialog naming no string reads no table.
+    assert!(
+        !matches!(check(4302), TreeCheck::Inconclusive(why) if why.contains("STR#")),
+        "{:?}",
+        check(4302)
+    );
+}

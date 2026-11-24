@@ -369,7 +369,7 @@ struct Model {
     /// Behaviour-relevant non-code chunks of the original, as the VM reads them.
     original_resources: BTreeMap<([u8; 4], u16), Vec<u8>>,
     /// The original's string tables, as the VM reads their text.
-    original_strings: BTreeMap<u16, Option<StringTexts>>,
+    original_strings: BTreeMap<([u8; 4], u16), StringTexts>,
     library_arities: BTreeMap<u16, usize>,
 }
 
@@ -912,10 +912,17 @@ impl Model {
             .iter()
             .filter_map(|i| match i.opcode {
                 21 | 50 => Some(u16::from_le_bytes([i.operands[0], i.operands[1]])),
-                36 => Some(301),
+                // A dialog reads STR# 301 for its nonzero string operands (0 to 4, 6);
+                // a dialog that names none (a lot picker) reads no table.
+                36 if [0, 1, 2, 3, 4, 6].iter().any(|&k| i.operands[k] != 0) => Some(301),
                 _ => None,
             })
-            .find(|id| self.original_strings.get(id) != recompiled.strings.get(id))
+            .find(|&id| {
+                STRING_TAGS.iter().any(|tag| {
+                    let key = (**tag, id);
+                    self.original_strings.get(&key) != recompiled.strings.get(&key)
+                })
+            })
             .map(|id| format!("reads STR# {id}, which the decompiled object does not reproduce"))
     }
 
@@ -1149,29 +1156,33 @@ struct RecompiledFile {
     ctx: LiveContext,
     sounds: BTreeMap<u16, String>,
     resources: BTreeMap<([u8; 4], u16), Vec<u8>>,
-    strings: BTreeMap<u16, Option<StringTexts>>,
+    strings: BTreeMap<([u8; 4], u16), StringTexts>,
     attributes: Option<u16>,
 }
 
 /// A string table's entries as the VM reads them: language and text bytes (comments
-/// and the table's encoding are not observable).
-type StringTexts = Vec<(u8, Vec<u8>)>;
+/// and the table's encoding are not observable), or its bytes when it does not parse.
+type StringTexts = std::result::Result<Vec<(u8, Vec<u8>)>, Vec<u8>>;
 
-/// Each `STR#` chunk's texts (`None`: it does not parse), the last chunk of an id winning.
-fn string_texts(iff: &Iff) -> BTreeMap<u16, Option<StringTexts>> {
+/// The chunks a text read can resolve: `STR#`, the catalog's `CTSS`, and the legacy
+/// `CST` the loader falls back on when a file has no `STR#` of the id.
+const STRING_TAGS: [&[u8; 4]; 3] = [b"STR#", b"CTSS", b"\0CST"];
+
+/// Each text table's texts, by tag and id, the last chunk of an id winning.
+fn string_texts(iff: &Iff) -> BTreeMap<([u8; 4], u16), StringTexts> {
     iff.chunks
         .iter()
-        .filter(|c| &c.tag == b"STR#")
+        .filter(|c| STRING_TAGS.contains(&&c.tag))
         .map(|c| {
             let texts = StringTable::parse_chunk(iff.data(c), c.flags)
-                .ok()
                 .map(|t| {
                     t.entries
                         .into_iter()
                         .map(|e| (e.language, e.raw_text))
                         .collect()
-                });
-            (c.id, texts)
+                })
+                .map_err(|_| iff.data(c).to_vec());
+            ((c.tag, c.id), texts)
         })
         .collect()
 }

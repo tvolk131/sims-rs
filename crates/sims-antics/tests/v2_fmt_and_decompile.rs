@@ -925,6 +925,17 @@ fn end_of_line_directives_cover_else_arms_and_follow_raw_blocks() {
             "{found:#?}\n{text}"
         );
     }
+    // The block opens on the line a multi-line raw block ends on.
+    let source = "object \"Synth Eol\" {\n    guid: 0x7E00_0007;\n    price: 1;\n    state level @ 2: i16;\n    tree t \"T\" {\n        raw {\n            temp[0] := 1;\n        } if self.level > 1 { while true { sleep(1); } } // antics-lint: allow(while_true)\n    }\n}\n";
+    let once = format_v2_source(source).expect("format");
+    assert_eq!(format_v2_source(&once).expect("format twice"), once);
+    for text in [source, once.as_str()] {
+        let found = sims_antics::v2::lint::lint_v2_source(text, "eol.antics").expect("lint");
+        assert!(
+            found.iter().all(|d| d.rule != "while_true"),
+            "{found:#?}\n{text}"
+        );
+    }
 }
 
 #[test]

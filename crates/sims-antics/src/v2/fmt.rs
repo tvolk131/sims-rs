@@ -275,8 +275,12 @@ fn reattach_end_of_line_comments(s: &mut Scanned) {
         while first > 0 && line[first - 1] == Some(l) {
             first -= 1;
         }
-        if toks[first..=p].iter().any(|t| t.class == Class::Raw) {
-            continue;
+        // A raw block ending on this line: only what follows it counts.
+        if let Some(r) = (first..=p).rev().find(|&k| toks[k].class == Class::Raw) {
+            first = r + 1;
+            if first > p {
+                continue;
+            }
         }
         let opener = (first..p).find(|&o| {
             toks[o].class == Class::Punct
