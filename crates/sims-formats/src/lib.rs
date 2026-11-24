@@ -11,6 +11,7 @@ pub mod iff_write;
 mod legacy_sprite;
 pub mod lot;
 pub mod neighborhood;
+pub mod neighborhood_file;
 mod reader;
 pub mod saved_objects;
 pub mod sprite;

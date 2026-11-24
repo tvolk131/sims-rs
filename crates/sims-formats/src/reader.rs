@@ -104,8 +104,78 @@ pub(crate) fn western(bytes: &[u8]) -> String {
         .into_owned()
 }
 
+/// Encodes text as Windows-1252, the inverse of [`western`]. `None` when a
+/// character has no Windows-1252 byte or is NUL, which would end the C
+/// string early.
+pub(crate) fn encode_western(text: &str) -> Option<Vec<u8>> {
+    let (bytes, _, unmappable) = encoding_rs::WINDOWS_1252.encode(text);
+    (!unmappable && !bytes.contains(&0)).then(|| bytes.into_owned())
+}
+
+/// The little-endian stream the original's raw (unpacked) mode writes.
+#[derive(Debug, Default)]
+pub(crate) struct Out(pub(crate) Vec<u8>);
+
+impl Out {
+    /// The saved-resource header the stream writer puts first (0x464d40):
+    /// four zero bytes, the version, and the tag as a little-endian word.
+    pub(crate) fn header(version: u32, magic: &[u8; 4]) -> Self {
+        let mut out = Self(vec![0; 4]);
+        out.u32(version);
+        out.0.extend(magic);
+        out
+    }
+    pub(crate) fn u8(&mut self, value: u8) {
+        self.0.push(value);
+    }
+    pub(crate) fn i16(&mut self, value: i16) {
+        self.0.extend(value.to_le_bytes());
+    }
+    pub(crate) fn u16(&mut self, value: u16) {
+        self.0.extend(value.to_le_bytes());
+    }
+    pub(crate) fn i32(&mut self, value: i32) {
+        self.0.extend(value.to_le_bytes());
+    }
+    pub(crate) fn u32(&mut self, value: u32) {
+        self.0.extend(value.to_le_bytes());
+    }
+    pub(crate) fn len32(&mut self, len: usize) -> crate::Result<()> {
+        let len = u32::try_from(len)
+            .map_err(|_| crate::Error::new(self.0.len(), "count exceeds 32 bits"))?;
+        self.u32(len);
+        Ok(())
+    }
+    /// A C string padded to an even stream offset, as [`crate::lot`]'s
+    /// `padded_string` reads it. The original's string writer only moves
+    /// past the padding byte (0x464cd7), so the caller supplies it.
+    pub(crate) fn padded_string(
+        &mut self,
+        text: &str,
+        pad: impl FnOnce() -> u8,
+    ) -> crate::Result<()> {
+        let bytes = encode_western(text)
+            .ok_or_else(|| crate::Error::new(self.0.len(), "string is not Windows-1252 text"))?;
+        self.0.extend(bytes);
+        self.0.push(0);
+        if self.0.len() & 1 != 0 {
+            self.0.push(pad());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn western_text_encodes_back_to_its_bytes() {
+        let bytes: Vec<u8> = (1..=255).collect();
+        let text = super::western(&bytes);
+        assert_eq!(super::encode_western(&text).unwrap(), bytes);
+        assert_eq!(super::encode_western("a\0b"), None);
+        assert_eq!(super::encode_western("\u{4e00}"), None);
+    }
+
     #[test]
     fn a_byte_order_mark_is_read_as_three_characters() {
         assert_eq!(
