@@ -1120,3 +1120,40 @@ fn air_constants_follow_each_operands_direction() {
         air("dialog(message: 1);").expect("index"),
     );
 }
+
+/// Raw `.air` constants belong to the raw code for the rest of the tree: a later block's label of
+/// the same name is no constant use, a later block reads an earlier block's dotted constant, and
+/// a later block's opcode spelled by one still counts as formatting text.
+#[test]
+fn raw_constants_reach_later_raw_blocks() {
+    assert_eq!(
+        nodes(&obj(r#"    const K = 1;
+    @id(4300) tree a {
+        raw { const K = 2; temp[0] := K; }
+        raw { K: temp[1] := 3; }
+    }"#)),
+        nodes(&obj(
+            "    @id(4300) tree a { raw { temp[0] := 2; } raw { K: temp[1] := 3; } }"
+        )),
+    );
+    assert_eq!(
+        nodes(&obj(r#"    bcon 4097 "Tuning" { valid = 25 }
+    @id(4300) tree a {
+        raw { const Tuning.extra = 2; }
+        raw { const Tuning.other = 3; temp[0] := Tuning.extra; }
+    }"#)),
+        nodes(&obj(r#"    bcon 4097 "Tuning" { valid = 25 }
+    @id(4300) tree a { raw { temp[0] := 2; } }"#)),
+    );
+    expect_err(
+        "text_op_const.antics",
+        &obj(r#"    tree a {
+        const C = if temp[0] == 0 { 7 } else { 9 };
+        let x = C;
+        temp[1] = x;
+        raw { const TextOp = 50; }
+        raw { op TextOp (45, 1, 0, 0, 1, 0, 0, 0); }
+    }"#),
+        "formats text",
+    );
+}

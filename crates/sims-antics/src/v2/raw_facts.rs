@@ -52,18 +52,25 @@ pub(crate) fn raw_facts(code: &str, prelude: Option<&str>) -> RawFacts {
         "tree 4096 \"__raw_facts\" {{\n{}{code}\n}}\n",
         prelude.unwrap_or("")
     );
-    // A strict parse needs every name declared; when that fails (a constant an earlier raw block
-    // declared, which this block cannot see), the shape-only parse still reads the structure.
-    let parsed = match prelude {
-        Some(_) => crate::parser::parse_module(&wrapped)
-            .or_else(|_| crate::parser::parse_module_lenient(&wrapped)),
-        None => crate::parser::parse_module_lenient(&wrapped),
-    };
-    match parsed.ok().and_then(|m| m.items.into_iter().next()) {
+    // With a prelude every name the block uses is declared, so a strict parse must succeed. When
+    // it does not (the `.air` compiler reports the error later), a shape-only parse reads values
+    // as 0 and could miss a fact (`op K` with a text opcode), so only its loop exits are trusted.
+    let strict = prelude.and_then(|_| crate::parser::parse_module(&wrapped).ok());
+    let exact = strict.is_some() || prelude.is_none();
+    let parsed = strict.or_else(|| crate::parser::parse_module_lenient(&wrapped).ok());
+    match parsed.and_then(|m| m.items.into_iter().next()) {
         Some(Item::Tree(t)) => {
             let mut facts = RawFacts::default();
             scan(&t.body, 0, &mut facts);
-            facts
+            if exact {
+                facts
+            } else {
+                RawFacts {
+                    breaks_enclosing_loop: facts.breaks_enclosing_loop,
+                    continues_enclosing_loop: facts.continues_enclosing_loop,
+                    ..RawFacts::all()
+                }
+            }
         }
         _ => {
             // The `.air` compiler reports the error. Until then only a loop exit is read from
@@ -185,6 +192,11 @@ mod tests {
         assert!(
             raw_facts("temp[0] :=", None).defines_label,
             "unparsed code has every fact"
+        );
+        let f = raw_facts("op TextOp (45, 1, 0, 0, 1, 0, 0, 0);", Some(""));
+        assert!(
+            f.formats_text && f.defines_label && !f.exits_enclosing_loop(),
+            "a failed strict parse trusts only the shape's loop exits"
         );
     }
 }
