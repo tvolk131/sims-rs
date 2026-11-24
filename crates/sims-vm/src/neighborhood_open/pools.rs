@@ -443,7 +443,10 @@ impl<'a, 'b> Fills<'a, 'b> {
                 source,
                 ordinal,
                 matches_generic,
-                self.context.registry.iter().any(|entry| entry.guid == source && entry.resolves),
+                self.context
+                    .registry
+                    .iter()
+                    .any(|entry| entry.guid == source && entry.resolves),
             )?,
             None if matches_generic => {}
             None => {
@@ -631,7 +634,9 @@ impl LazySkeletons {
         match earlier {
             Some(Some(_)) => return Ok(Vec::new()),
             Some(None) => {
-                return Err(format!("0x5a389b: an earlier load of the skeleton {name:?} failed"));
+                return Err(format!(
+                    "0x5a389b: an earlier load of the skeleton {name:?} failed"
+                ));
             }
             None => {}
         }
@@ -731,7 +736,11 @@ impl Specialties {
         Err(format!(
             "{address}: Townie {ordinal}'s template {source:#010x} is not a specialty the draw \
              could still pick{}",
-            if first { " (a new family takes specialties first)" } else { " nor the generic one" }
+            if first {
+                " (a new family takes specialties first)"
+            } else {
+                " nor the generic one"
+            }
         )
         .into())
     }
@@ -799,7 +808,11 @@ mod tests {
     fn the_first_seven_celebrities_are_women() {
         for ordinal in 0..=6 {
             assert!(check_celebrity_sex(ordinal, 1).is_ok());
-            assert!(check_celebrity_sex(ordinal, 0).unwrap_err().starts_with("0x42c6d7"));
+            assert!(
+                check_celebrity_sex(ordinal, 0)
+                    .unwrap_err()
+                    .starts_with("0x42c6d7")
+            );
         }
         for ordinal in [7, 8, 20] {
             assert!(check_celebrity_sex(ordinal, 0).is_ok());
@@ -821,7 +834,10 @@ mod tests {
     #[test]
     fn a_new_townie_family_takes_specialties_first() {
         let mut townies = specialties(true);
-        let error = townies.take(GENERIC, 0, true, true).unwrap_err().to_string();
+        let error = townies
+            .take(GENERIC, 0, true, true)
+            .unwrap_err()
+            .to_string();
         assert!(error.starts_with("0x42ac96"), "{error}");
         // Duplicates are separate candidates, each used up once.
         townies.take(A, 0, false, true).unwrap();
@@ -889,8 +905,16 @@ mod tests {
         assert_eq!(lazy.loaded["kat"].as_deref(), Some("pets"));
         // A blocked one fails, and is marked so it fails the same way after.
         assert_eq!(lazy.load(&skeletons, "bad").unwrap_err(), "blocked");
-        assert!(lazy.load(&skeletons, "bad").unwrap_err().starts_with("0x5a389b"));
-        assert!(lazy.load(&skeletons, "nobody").unwrap_err().starts_with("0x5a03c0"));
+        assert!(
+            lazy.load(&skeletons, "bad")
+                .unwrap_err()
+                .starts_with("0x5a389b")
+        );
+        assert!(
+            lazy.load(&skeletons, "nobody")
+                .unwrap_err()
+                .starts_with("0x5a03c0")
+        );
     }
 
     #[test]
