@@ -3029,9 +3029,11 @@ fn lower_standalone_tree(
         ctx.emit_all_cleanups()?;
         ctx.line("return true;".to_owned());
     }
+    let mut air = String::new();
     write_framed_tree(
-        trees_air, ctx, sig.id, &d.label, &frame, positional, &d.ident,
-    )
+        &mut air, ctx, sig.id, &d.label, &frame, positional, &d.ident,
+    )?;
+    Ok(air)
 }
 
 /// Finishes `ctx` and writes it as tree `id` with the `.air` header of its `@frame(...)`
@@ -3119,7 +3121,6 @@ fn write_framed_tree(
             ));
         }
     }
-    let mut trees_air = String::new();
     if header.is_empty() {
         let _ = writeln!(trees_air, "tree {id} \"{label}\" {{");
     } else {
@@ -3131,7 +3132,7 @@ fn write_framed_tree(
     }
     trees_air.push_str(&body);
     trees_air.push_str("}\n\n");
-    Ok(trees_air)
+    Ok(())
 }
 
 /// The frame locals `.air` allocates for a lowered tree body: one per `let` / `local` name,
