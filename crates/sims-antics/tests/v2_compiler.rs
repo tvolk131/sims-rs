@@ -7000,7 +7000,7 @@ fn maxis_interop_extern_calls_bcon_tables_sparse_states_and_trees_lower_exactly(
     // binding, `?` on Result / Result<T @ temp[1]>, and direct return capture.
     for needle in [
         "if call 256(2, 10) {\n    }\n    my.attr[1] := temp[0];",
-        "temp[0] := __v_q_0;\n    temp[1] := bcon[129];\n    if call 256(temps) {\n    }\n    my.attr[2] := temp[0];",
+        "temp[0] := my.attr[0];\n    temp[1] := bcon[129];\n    if call 256(temps) {\n    }\n    my.attr[2] := temp[0];",
         "temp[4] := 4;\n    if call 257(temps) {\n        my.attr[3] := 1;\n    }",
         "temp[0] := my.attr[0];\n    if !call 8192(temps) {\n        return error;\n    }\n    my.attr[5] := temp[1];",
         "if !call 258(1) {\n        return error;\n    }",
@@ -7017,7 +7017,7 @@ fn maxis_interop_extern_calls_bcon_tables_sparse_states_and_trees_lower_exactly(
     );
     assert!(
         air.contains(
-            "tree 4098 \"Quality Score\" {\n    if my.attr[0] > 0 {\n        temp[0] := my.attr[0];\n        temp[0] *= 24;\n        temp[0] /= 5;\n        temp[0] += 1;\n        return true;\n    } else {\n        temp[0] := 0;\n        return true;\n    }\n}"
+            "tree 4098 \"Quality Score\" {\n    if my.attr[0] > 0 {\n        temp[0] := my.attr[0];\n        temp[0] *= 24;\n        temp[0] /= 5;\n        temp[0] += 1;\n    } else {\n        temp[0] := 0;\n    }\n    return true;\n}"
         ),
         "{air}"
     );
@@ -7618,16 +7618,19 @@ fn readability_loops_ranges_consts_fields_and_builtins_run_live() {
             .expect("expand counting frame");
     let air = &expanded[0].air_source;
     for needle in [
+        // The four `for i` loops share one local (backend coalescing of one source name).
         "let __v_i_0 = -1;\n    while __v_i_0 inc_lt 5 {",
-        "let __v_i_1 = 5;\n    while __v_i_1 dec_gt -1 {",
-        "let __v_i_2 = 0;\n    while __v_i_2 inc_lt 3 {",
-        "let __range_4 = __v_n_3;\n    let __v_i_5 = 2;\n    while __v_i_5 inc_lt __range_4 {",
-        "while true {\n        __v_k_40 += 1;",
-        "let __v_u_41;\n",
-        "__v_d_43 -= 3;\n    if __v_d_43 > 0 {\n        my.attr[7] := 1;",
+        "__v_i_0 := 5;\n    while __v_i_0 dec_gt -1 {",
+        "__v_i_0 := 0;\n    while __v_i_0 inc_lt 3 {",
+        "let __range_4 = my.attr[16];\n    __v_i_0 := 2;\n    while __v_i_0 inc_lt __range_4 {",
+        // Single-pass helper wrappers unwrap; dead flags go and copies forward.
+        "let __v_a_6 = 1;\n    let __v_b_10 = 2;\n    let __v_c_14 = 3;\n    let __v_d_18 = 4;",
+        "while true {\n        __v_k_24 += 1;",
+        "my.attr[6] := 9;",
+        "__v_d_18 -= 3;\n    if __v_d_18 > 0 {\n        my.attr[7] := 1;",
         "if !test_object_type(0x7f400999, object: my.id) {",
-        "while set_to_next(person, dest: __v_p_44) {",
-        "while set_to_next(all, dest: __v_o_45) {",
+        "while set_to_next(person, dest: __v_p_28) {",
+        "while set_to_next(all, dest: __v_o_29) {",
         "my.data[8] flag_set 14;",
         "random(my.attr[14], 1);",
         "stack.attr[10] := my.person[58];",
@@ -7638,6 +7641,10 @@ fn readability_loops_ranges_consts_fields_and_builtins_run_live() {
     assert!(
         !air.contains("__ret_above"),
         "tail helper must not use a wrapper:\n{air}"
+    );
+    assert!(
+        !air.contains("let __v_i_1") && !air.contains("__fn_ret"),
+        "{air}"
     );
 }
 
@@ -7772,7 +7779,7 @@ fn readability_builtins_animate_frame_and_raw_lower_exactly() {
         "refresh(target: stack_obj, mode: 2);",
         "refresh(target: me, mode: 0);",
         // A global range would receive the draw, so it is copied first.
-        "let __rnd_range_",
+        "= global[3];\n    random(stack.attr[0], __",
         "action_string(table: 301, index: 4);",
         "show_string(table: 301, index: 5);",
         "set_headline(kind: 1, index: 2, duration: -1, options: 0, stack_obj: true, local: __v_icon_0);",
@@ -7783,12 +7790,13 @@ fn readability_builtins_animate_frame_and_raw_lower_exactly() {
         "while !animate(clip: 8, table: 0, flags: 0x00, events: 2) {\n        stack.attr[1] := param[0];",
         "while !animate(clip: 9, table: 0, flags: 0x20, events: 1, local: __v_ev_1) {\n        if __v_ev_1 == 3 {\n            break;",
         "if animate(clip: 10, table: 0, flags: 0x00, events: 0) {",
-        "op 0x0004 (0, 0, 0, 0, 0, 0, 0, 0);\n    op 0x0005 (0, 0, 0, 0, 0, 0, 0, 0);\n    op 0x0031 (0, 0, 0, 0, 0, 0, 0, 0);",
+        // `notify_out_of_idle()` pads its operand with 0xFF like the original.
+        "op 0x0004 (0, 0, 0, 0, 0, 0, 0, 0);\n    op 0x0005 (0, 0, 0, 0, 0, 0, 0, 0);\n    notify_idle() pad 0xff;",
         // `find_best_interaction()` leaves its pick in stack_obj for `gosub_found_action()`.
         "if op 0x0003 (0, 0, 0, 0, 0, 0, 0, 0) {\n        op 0x001e (0, 0, 0, 0, 0, 0, 0, 0);\n    }",
         // `create_object` puts back the stack object it found, on both edges.
         "= stack_obj;\n    if create_object(0x7f400011, mode: 0, flags: 0x00) {",
-        "= stack_obj;\n    create_object(0x7f400011, mode: 0, flags: 0x00);\n    stack_obj := __pre_stack_obj_",
+        ":= stack_obj;\n    create_object(0x7f400011, mode: 0, flags: 0x00);\n    stack_obj := __cond_2;",
         // `pick(Mode::Loud)`: the literal enum compare folds away.
         ";\n    stack.attr[0] := 1;\n    scope(12, 2) := 10;",
         "scope(28, 3) := -5;\n    scope(29, 5) := 1;",
@@ -7796,7 +7804,8 @@ fn readability_builtins_animate_frame_and_raw_lower_exactly() {
         // A raw block that only writes attributes and calls a BHAV keeps no dead self save.
         "tree 4201 \"Raw Safe\" {\n    my.attr[0] := 1; call 256(temps);\n    stack.attr[0] := 1;",
         "tree 4202 \"Raw Clobber\" {\n    let __self_obj = stack_obj;",
-        "tree 4203 \"Manual Stack\" {\n    let __self_obj = stack_obj;\n    let __v_keep_0 = stack_obj;\n    stack_obj := my.id;",
+        // Switching away and straight back is dropped by the backend pass, with the saves.
+        "tree 4203 \"Manual Stack\" {\n    stack.attr[0] := 2;\n    return true;",
     ] {
         assert!(air.contains(needle), "missing:\n{needle}\n---\n{air}");
     }
@@ -8244,7 +8253,8 @@ object "Stack Cases" {
     let air = &expanded[0].air_source;
     for tree in [
         "\"Raw Step\" {\n    let __self_obj = stack_obj;",
-        "\"Borrow\" {\n    let __self_obj = stack_obj;",
+        // The user's own `stack_obj` write stands; the self save is unread and dropped.
+        "\"Borrow\" {\n    stack_obj := 0;\n    stack.attr[0] := 2;",
     ] {
         assert!(air.contains(tree), "missing {tree}:\n{air}");
     }
@@ -8309,7 +8319,11 @@ fn shadowed_builtins_folded_checks_and_local_slots() {
             "    fn animate() { stack_obj = 0; }\n    tree t (sim: Sim) { animate(); self.n = 1; }",
         ),
     );
-    assert!(air.contains("let __self_obj = stack_obj;"), "{air}");
+    // The write stands (the self save it forced is unread, so the backend pass drops it).
+    assert!(
+        air.contains("stack_obj := 0;\n    stack.attr[0] := 1;"),
+        "{air}"
+    );
 
     // User functions win in value position and are not treated as local-writing builtins.
     let air = expand(
@@ -8337,7 +8351,9 @@ fn shadowed_builtins_folded_checks_and_local_slots() {
     // Discarded code does not shift later generated names.
     let air = expand(
         "dead_names.antics",
-        &obj("    init { while false { let dead = 1; } let live = 1; self.n = live; }"),
+        &obj(
+            "    init { while false { let dead = 1; } let live = 1; self.n = live; self.n += live; }",
+        ),
     );
     assert!(air.contains("let __v_live_0 = 1;"), "{air}");
 
@@ -8393,5 +8409,737 @@ fn shadowed_builtins_folded_checks_and_local_slots() {
         "rev_missing_end.antics",
         &obj("    init { for i in (1..).rev() { } }"),
         "expected expression",
+    );
+}
+
+// ===========================================================================
+// PR E: zero-raw gaps, expression `match`, multi-variant IFF, backend pass
+// ===========================================================================
+
+/// The BHAV `tree`'s local count in a compiled object.
+fn bhav_locals(obj: &CompiledObject, tree: u16) -> u16 {
+    let iff = Iff::parse(obj.iff_bytes.clone()).expect("IFF parse");
+    let chunk = iff.get(b"BHAV", tree).expect("BHAV present");
+    Behavior::parse(iff.data(chunk)).expect("BHAV parse").locals
+}
+
+const PR_E_MATCH_V2: &str = r#"
+enum Mode { Off, Low, High }
+
+object "Match Probe" {
+    guid: 0x7F40_0110;
+    const DEFAULT = 2;
+    state mode: Mode;
+    state r0: i16;
+    state r1: i16;
+    state r2: i16;
+    state r3: i16;
+    state r4: i16;
+    state r5: i16;
+    state r6: i16;
+
+    fn pick(mode: Mode) -> i16 {
+        return match mode { Mode::Off => 0, Mode::Low => 10, Mode::High => 20 };
+    }
+
+    fn band(x: i16) -> i16 {
+        return match x { -32768..=-1 => -1, 0 => 0, 1..=9 => 1, _ => 2 };
+    }
+
+    init {
+        self.mode = Mode::Low;
+        self.r0 = pick(Mode::High);
+        match DEFAULT {
+            1 => { self.r1 = 100; }
+            2 => { self.r1 = 200; }
+            _ => { self.r1 = 300; }
+        }
+    }
+
+    @id(4300) tree probe "Probe" (sim: Sim, n: i16) {
+        self.r2 = band(n);
+        self.r3 = match self.mode { Mode::Off => n, Mode::Low => n * 2, Mode::High => n + 100 };
+        let big = match n { 0 => self.r3 > 3, _ => n > 5 };
+        self.r4 = 0;
+        if big {
+            self.r4 = 1;
+        }
+        self.r5 = pick(self.mode);
+        self.r6 = 0;
+        for i in 0..3 {
+            self.r6 += i;
+        }
+        for i in 0..n {
+            self.r6 += 1;
+        }
+    }
+}
+"#;
+
+#[test]
+fn pr_e_expression_match_and_coalescing_run_live() {
+    let cfg = PackResolverConfig::default();
+    let obj = compile_v2_source("match.antics", PR_E_MATCH_V2, &cfg).expect("compile match probe");
+    let mut vm = V2VmFixture::from_objects(&[&obj], 5000);
+    let o = vm.spawn(0x7F40_0110, 4, 4);
+    assert_eq!(
+        vm.obj_attr(o, 1),
+        20,
+        "pick(Mode::High) folds to the High arm"
+    );
+    assert_eq!(
+        vm.obj_attr(o, 2),
+        200,
+        "a const scrutinee selects one statement arm"
+    );
+    for (n, band, r3, big, r6) in [
+        (0, 0, 0, 0, 3),
+        (7, 1, 14, 1, 10),
+        (-4, -1, -8, 0, 3),
+        (12, 2, 24, 1, 15),
+    ] {
+        assert!(vm.try_run_tree(o, 4300, n).expect("probe runs"), "n = {n}");
+        assert_eq!(vm.obj_attr(o, 3), band, "band({n}) by range arms");
+        assert_eq!(
+            vm.obj_attr(o, 4),
+            r3,
+            "enum scrutinee, arithmetic arms (n = {n})"
+        );
+        assert_eq!(vm.obj_attr(o, 5), big, "bool-valued match (n = {n})");
+        assert_eq!(vm.obj_attr(o, 6), 10, "pick(self.mode) at runtime");
+        assert_eq!(vm.obj_attr(o, 7), r6, "two `for i` loops (n = {n})");
+    }
+
+    let air = &sims_antics::v2::expand_v2_source_to_objects("match.antics", PR_E_MATCH_V2, &cfg)
+        .expect("expand match probe")[0]
+        .air_source;
+    // Operand scrutinees are tested in place; constant ones fold.
+    assert!(!air.contains("__match"), "{air}");
+    assert!(!air.contains("== 2 {"), "the DEFAULT match folds:\n{air}");
+    assert!(air.contains("my.attr[1] := 20;"), "{air}");
+    assert!(air.contains("my.attr[2] := 200;"), "{air}");
+    // The two `i` bindings share a local, and compiler temps share slots with each other.
+    assert!(
+        !air.contains("let __v_i_") || air.matches("let __v_i_").count() == 1,
+        "{air}"
+    );
+    assert!(bhav_locals(&obj, 4300) <= 4, "{air}");
+}
+
+const PR_E_GAPS_V2: &str = r#"
+object "Gap Probe" {
+    guid: 0x7F40_0120;
+    state ages: i16;
+    state visitors: i16;
+    state kinds: i16;
+    state slot0: i16;
+    state flag2: i16;
+    state counter: i16;
+    state twice: i16;
+    state seen: i16;
+
+    interaction "Poke" {
+        run(sim) {
+            return true;
+        }
+    }
+
+    @id(4300) tree people "People" (sim: Sim) {
+        self.ages = 0;
+        self.visitors = 0;
+        self.kinds = 0;
+        for p in lot.sims() {
+            self.ages += p.age;
+            if p.is_visitor {
+                self.visitors += 1;
+            }
+            self.kinds += p.kind + p.person[12];
+            p.person[40] = 7;
+        }
+    }
+
+    @id(4301) tree sprites "Sprites" (sim: Sim) {
+        set_dynamic_sprite(index: 2, value: 1);
+        self.sprite_flags[3] = 1;
+        self.flag2 = self.sprite_flags[2] + self.sprite_flags[3] * 10;
+        self.sprite_flags[3] = 0;
+    }
+
+    @id(4304) tree slots "Slots" (sim: Sim) {
+        if self.slot[0] == 0 {
+            self.slot0 = 1;
+        }
+    }
+
+    @id(4302) tree pusher "Pusher" (sim: Sim) {
+        let target = stack_obj;
+        stack_obj = sim;
+        target.push_interaction(menu: 0, priority: 2);
+    }
+
+    @id(4303) tree counters "Counters" (sim: Sim, n: i16) {
+        self.counter = 0;
+        while inc_lt(&mut self.counter, 4) {
+        }
+        param[0] += 5;
+        self.twice = n;
+        if dec_gt(&mut self.counter, 3) {
+            self.seen = 1;
+        }
+    }
+}
+"#;
+
+#[test]
+fn pr_e_zero_raw_gaps_run_live() {
+    let cfg = PackResolverConfig::default();
+    let mut obj = compile_v2_source("gaps.antics", PR_E_GAPS_V2, &cfg).expect("compile gaps");
+    assert!(
+        !PR_E_GAPS_V2.contains("raw"),
+        "the probe needs no raw blocks"
+    );
+    // v2 declares no dynamic sprites; give the definition four so scope 27 has flags to set.
+    {
+        let iff = Iff::parse(obj.iff_bytes.clone()).expect("IFF parse");
+        let objd = iff.get(b"OBJD", 128).expect("OBJD");
+        let at = objd.payload.start + 65 * 2;
+        obj.iff_bytes[at..at + 2].copy_from_slice(&4i16.to_le_bytes());
+    }
+    let mut vm = V2VmFixture::from_objects(&[&obj], 5000);
+    let o = vm.spawn(0x7F40_0120, 4, 4);
+    let sim = vm.sim_id;
+    {
+        let person = vm
+            .world
+            .objects
+            .get_mut(&sim)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap();
+        person.data[32] = 1;
+        person.data[65] = 3;
+        person.data[12] = 4;
+    }
+
+    // Other Sims' person data from a `lot.sims()` loop, read and written.
+    assert!(vm.try_run_tree(o, 4300, 0).expect("people runs"));
+    assert_eq!(vm.obj_attr(o, 0), 25, "p.age");
+    assert_eq!(vm.obj_attr(o, 1), 1, "p.is_visitor");
+    assert_eq!(vm.obj_attr(o, 2), 7, "p.kind + p.person[12]");
+    assert_eq!(vm.sim_skill(40), 7, "p.person[40] = 7");
+
+    // Dynamic sprite flags (scope 27) and the object's own slot.
+    assert!(vm.try_run_tree(o, 4301, 0).expect("sprites runs"));
+    assert_eq!(vm.obj_attr(o, 4), 11, "sprite flags 2 and 3 read back");
+    assert_eq!(vm.world.objects[&o].dynamic_sprites, vec![0, 0, 1, 0]);
+
+    // `push_interaction` from a local: the object is pinned into an explicit local.
+    assert!(vm.try_run_tree(o, 4302, 0).expect("pusher runs"));
+    let queue = &vm.world.objects[&sim].person.as_ref().unwrap().queue;
+    assert_eq!(queue.len(), 1, "one action queued");
+    assert_eq!(
+        queue[0].target, o as i16,
+        "the local's object is the target"
+    );
+
+    // inc_lt / dec_gt and an assignable param.
+    assert!(vm.try_run_tree(o, 4303, 2).expect("counters runs"));
+    assert_eq!(
+        vm.obj_attr(o, 5),
+        3,
+        "inc_lt to 4, then dec_gt 3 decrements once"
+    );
+    assert_eq!(
+        vm.obj_attr(o, 6),
+        7,
+        "param[0] += 5 is seen through the named param"
+    );
+    assert_eq!(vm.obj_attr(o, 7), 0, "dec_gt(4 -> 3, 3) is false");
+
+    let air = &sims_antics::v2::expand_v2_source_to_objects("gaps.antics", PR_E_GAPS_V2, &cfg)
+        .expect("expand gaps")[0]
+        .air_source;
+    for needle in [
+        "stack_obj := __v_p_0;\n        let __fdata_1 = stack.person[58];\n        stack_obj := __self_obj;",
+        ":= stack.person[32];",
+        ":= stack.person[65];",
+        "stack_obj := __v_p_0;\n        stack.person[40] := 7;",
+        "temp[0] := 2;\n    let __fdata_1 = scope(27, 0);\n    temp[0] := 3;\n    let __arith_2 = scope(27, 0);",
+        "temp[0] := 2;\n    scope(27, 0) := 1;",
+        "local[0] := __v_target_",
+        "push_interaction(menu: 0, object: 0, priority: 2, flags: 2);",
+        "while stack.attr[5] inc_lt 4 {",
+        "param[0] += 5;",
+        "if stack.attr[5] dec_gt 3 {",
+        "if stack.slot[0] == 0 {",
+    ] {
+        assert!(air.contains(needle), "missing:\n{needle}\n---\n{air}");
+    }
+}
+
+const PR_E_VARIANTS_V2: &str = r#"
+object "Lamp Line" {
+    guid: 0x7F40_0130;
+    price: 300;
+    state level: i16;
+    state kind: i16;
+
+    init {
+        self.level = 5;
+        self.kind = 1;
+    }
+
+    tree init_budget "Init Budget" {
+        self.level = 2;
+        self.kind = 2;
+    }
+
+    variant "Budget Lamp" {
+        guid: 0x7F40_0131,
+        price: 120,
+        description: "A cheaper lamp.",
+        init: init_budget,
+    }
+    variant "Same Lamp" { guid: 0x7F40_0132 }
+}
+"#;
+
+#[test]
+fn pr_e_multi_variant_iff_runs_live() {
+    let cfg = PackResolverConfig::default();
+    let obj = compile_v2_source("variants.antics", PR_E_VARIANTS_V2, &cfg).expect("compile");
+    let iff = Iff::parse(obj.iff_bytes.clone()).expect("IFF parse");
+    assert!(iff.map_error().is_none(), "rsmp is rebuilt");
+    let word = |id: u16, w: usize| {
+        let data = iff.data(iff.get(b"OBJD", id).expect("OBJD"));
+        u16::from_le_bytes([data[w * 2], data[w * 2 + 1]])
+    };
+    let guid = |id: u16| u32::from(word(id, 14)) | (u32::from(word(id, 15)) << 16);
+    assert_eq!(guid(128), 0x7F40_0130);
+    assert_eq!(guid(129), 0x7F40_0131);
+    assert_eq!(guid(130), 0x7F40_0132);
+    assert_eq!(
+        (word(128, 18), word(129, 18), word(130, 18)),
+        (300, 120, 300)
+    );
+    assert_eq!(
+        word(129, 43),
+        4098,
+        "variant init names the standalone tree"
+    );
+    assert_eq!(word(130, 43), word(128, 43), "no override shares the init");
+    assert_eq!(word(129, 41), word(128, 41) + 1, "own catalog strings");
+    let ctss = StringTable::parse(iff.data(iff.get(b"CTSS", word(129, 41)).expect("CTSS")))
+        .expect("CTSS parse");
+    assert_eq!(ctss.entries[0].text, "Budget Lamp");
+    assert_eq!(ctss.entries[1].text, "A cheaper lamp.");
+    // One BHAV pool.
+    assert_eq!(iff.chunks.iter().filter(|c| &c.tag == b"BHAV").count(), 3);
+
+    let mut vm = V2VmFixture::from_objects(&[&obj], 5000);
+    let base = vm.spawn(0x7F40_0130, 4, 4);
+    let budget = vm.spawn(0x7F40_0131, 6, 4);
+    let same = vm.spawn(0x7F40_0132, 8, 4);
+    assert_eq!((vm.obj_attr(base, 0), vm.obj_attr(base, 1)), (5, 1));
+    assert_eq!((vm.obj_attr(budget, 0), vm.obj_attr(budget, 1)), (2, 2));
+    assert_eq!((vm.obj_attr(same, 0), vm.obj_attr(same, 1)), (5, 1));
+
+    // A source without variants is unchanged.
+    let plain = PR_E_VARIANTS_V2
+        .split("    variant \"Budget Lamp\"")
+        .next()
+        .unwrap()
+        .to_owned()
+        + "}\n";
+    let plain = compile_v2_source("plain.antics", &plain, &cfg).expect("compile plain");
+    let plain_iff = Iff::parse(plain.iff_bytes.clone()).expect("IFF parse");
+    assert_eq!(
+        plain_iff
+            .chunks
+            .iter()
+            .filter(|c| &c.tag == b"OBJD")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn pr_e_helper_arguments_skip_copies_for_plain_locals() {
+    let cfg = PackResolverConfig::default();
+    let src = r#"
+object "Arg Probe" {
+    guid: 0x7F40_0140;
+    state a: i16;
+    state b: i16;
+
+    fn add(x: i16, y: i16) -> i16 {
+        return x + y;
+    }
+    fn bump(x: i16, r: &mut i16) {
+        *r += x;
+    }
+
+    init {
+        let v = 3;
+        let w = 4;
+        self.a = add(v, w);
+        let k = 5;
+        bump(k, &mut k);
+        self.b = k;
+    }
+}
+"#;
+    let obj = compile_v2_source("args.antics", src, &cfg).expect("compile args");
+    let mut vm = V2VmFixture::from_objects(&[&obj], 5000);
+    let o = vm.spawn(0x7F40_0140, 4, 4);
+    assert_eq!(vm.obj_attr(o, 0), 7);
+    assert_eq!(
+        vm.obj_attr(o, 1),
+        10,
+        "the borrowed local is copied before the call"
+    );
+    let air = &sims_antics::v2::expand_v2_source_to_objects("args.antics", src, &cfg)
+        .expect("expand args")[0]
+        .air_source;
+    assert!(
+        !air.contains("__arg_x") || air.matches("__arg_x").count() <= 2,
+        "{air}"
+    );
+    assert!(
+        !air.contains("__arg_y"),
+        "plain locals are passed in place:\n{air}"
+    );
+}
+
+#[test]
+fn pr_e_negative_diagnostics() {
+    let cfg = PackResolverConfig::default();
+    let obj = |members: &str| {
+        format!(
+            "enum Mode {{ Off, Low, High }}\nobject \"Pr E\" {{\n    guid: 0x7F40_0150;\n    state n: i16;\n    state m: Mode;\n{members}\n}}\n"
+        )
+    };
+    let expect_err = |name: &str, src: &str, needle: &str| {
+        let err = compile_v2_source(name, src, &cfg).expect_err(&format!("{name} must fail"));
+        assert!(
+            err.message.contains(needle),
+            "{name}: expected '{needle}' in: {err}"
+        );
+    };
+    let init = |body: &str| obj(&format!("    init {{ {body} }}"));
+    let sim_tree = |body: &str| obj(&format!("    tree t (sim: Sim) {{ {body} }}"));
+
+    // Expression match.
+    expect_err(
+        "match_i16_open.antics",
+        &init("self.n = match self.n { 0 => 1, 1 => 2 };"),
+        "exhaustive",
+    );
+    expect_err(
+        "match_enum_open.antics",
+        &init("self.n = match self.m { Mode::Off => 1, Mode::Low => 2 };"),
+        "exhaustive",
+    );
+    expect_err(
+        "match_types.antics",
+        &init("self.n = match self.n { 0 => 1, _ => true };"),
+        "different types",
+    );
+    expect_err(
+        "match_block.antics",
+        &init("self.n = match self.n { 0 => { 1 }, _ => 2 };"),
+        "not a block",
+    );
+    expect_err(
+        "match_empty.antics",
+        &init("self.n = match self.n { };"),
+        "at least one arm",
+    );
+
+    // Read-only slots and rooms; typed handles have no person data.
+    expect_err(
+        "slot_write.antics",
+        &sim_tree("self.slot[0] = 1;"),
+        "read-only",
+    );
+    expect_err(
+        "room_write.antics",
+        &sim_tree("for p in lot.sims() { p.room = 1; }"),
+        "read-only",
+    );
+    expect_err(
+        "bad_handle_field.antics",
+        &sim_tree("for p in lot.sims() { self.n = p.nonsense; }"),
+        "unknown field 'p.nonsense'",
+    );
+
+    // push_interaction from a handle sets the local flag itself.
+    expect_err(
+        "push_flag.antics",
+        &sim_tree("let o = stack_obj; o.push_interaction(menu: 0, flags: 2);"),
+        "implied by an object handle",
+    );
+    // param[n] needs a frame that has it.
+    expect_err("param_init.antics", &init("param[0] = 1;"), "param");
+    expect_err(
+        "param_range.antics",
+        &obj("    tree t (sim: Sim, a: i16) { param[1] = 1; }"),
+        "param",
+    );
+    // inc_lt takes a mutable i16 place.
+    expect_err(
+        "inc_lt_value.antics",
+        &init("if inc_lt(3, 4) { }"),
+        "'&mut x'",
+    );
+
+    // Variants.
+    expect_err(
+        "variant_no_guid.antics",
+        &obj("    variant \"V\" { price: 10 }"),
+        "guid",
+    );
+    expect_err(
+        "variant_dup_guid.antics",
+        &obj("    variant \"V\" { guid: 0x7F40_0150 }"),
+        "reuses GUID",
+    );
+    expect_err(
+        "variant_dup_name.antics",
+        &obj("    variant \"V\" { guid: 0x7F40_0151 }\n    variant \"V\" { guid: 0x7F40_0152 }"),
+        "duplicate variant 'V'",
+    );
+    expect_err(
+        "variant_unknown_tree.antics",
+        &obj("    variant \"V\" { guid: 0x7F40_0151, init: nowhere }"),
+        "nowhere",
+    );
+    let multi_tile = r#"
+object "Two Tiles" {
+    guid: 0x7F40_0160;
+    master_id: 1;
+    tiles: [
+        tile { name: "A", guid: 0x7F40_0161, objd_id: 129, offset: [0, 0], lead: true, interaction_group: -1, shape: "cot" },
+        tile { name: "B", guid: 0x7F40_0162, objd_id: 130, offset: [1, 0], lead: false, interaction_group: 1, shape: "cot" },
+    ];
+    variant "V" { guid: 0x7F40_0163 }
+}
+"#;
+    expect_err("variant_tiles.antics", multi_tile, "multi-tile");
+    expect_err(
+        "variant_dup_field.antics",
+        &obj("    variant \"V\" { guid: 0x7F40_0151, guid: 0x7F40_0152 }"),
+        "duplicate variant field 'guid'",
+    );
+}
+
+/// Review fixes: one-arm matches still read the scrutinee, `&mut` sprite cells fix their index
+/// at the call, and functionals see the four-word frame.
+#[test]
+fn pr_e_review_fixes_lower_soundly() {
+    let src = r#"
+fn bump(flag: &mut i16, i: &mut i16) {
+    *i = 0;
+    *flag = 1;
+}
+
+object "Pr E Review" {
+    guid: 0x7F40_0170;
+    state n: i16;
+    state k: i16;
+
+    @id(4400) tree one_arm "One Arm" (sim: Sim) {
+        self.n = match sim.person[12] { _ => 4 };
+    }
+
+    @id(4401) tree sprite_ref "Sprite Ref" (sim: Sim) {
+        let i = self.k;
+        bump(&mut self.sprite_flags[i], &mut i);
+        self.n = i;
+    }
+
+    @id(4402) tree pinned "Pinned" (sim: Sim) {
+        let o = stack_obj;
+        stack_obj = sim;
+        o.push_interaction(menu: 0, priority: 2);
+    }
+
+    functional prep(a: i16) {
+        score: 10,
+        run(sim) {
+            self.n = param[3];
+        }
+    }
+}
+"#;
+    let expanded = sims_antics::v2::expand_v2_source_to_objects(
+        "review.antics",
+        src,
+        &PackResolverConfig::default(),
+    )
+    .expect("expand review probe");
+    let air = &expanded[0].air_source;
+    let tree = |label: &str| {
+        let start = air
+            .find(&format!("\"{label}\""))
+            .unwrap_or_else(|| panic!("tree {label}:\n{air}"));
+        let end = air[start..].find("\n}\n").map_or(air.len(), |e| start + e);
+        &air[start..end]
+    };
+    // The wildcard-only match still reads its scrutinee once (a person cell read can fault).
+    assert!(tree("One Arm").contains("= my.person[12];"), "{air}");
+    // The reference keeps the index the call saw; the helper's `*i = 0` does not move it.
+    let sprite = tree("Sprite Ref");
+    assert!(sprite.contains("__ref_idx_flag"), "{sprite}");
+    assert!(sprite.contains("temp[0] := __ref_idx_flag"), "{sprite}");
+    assert!(tree("Pinned").contains("local[0] := __v_o_0;"), "{air}");
+    // `param[3]` is inside a functional's frame, and its header declares the four words.
+    assert!(air.contains("param[3]"), "{air}");
+    assert!(air.contains("(args: 4)"), "{air}");
+    compile_v2_source("review.antics", src, &PackResolverConfig::default())
+        .expect("the functional's header covers param[3]");
+
+    // A helper argument bound to a tunable template param is a BCON read, not a constant: the
+    // match inside the helper stays a run-time test.
+    let tuned = r#"
+fn pick(value: i16) -> i16 {
+    return match value { 3 => 31, _ => 17 };
+}
+
+template Tuned {
+    param cycles: i16 = 3;
+    state n: i16;
+    init {
+        self.n = pick(cycles);
+    }
+}
+
+object "Pr E Tuned" from Tuned {
+    guid: 0x7F40_0171;
+}
+"#;
+    let expanded = sims_antics::v2::expand_v2_source_to_objects(
+        "tuned.antics",
+        tuned,
+        &PackResolverConfig::default(),
+    )
+    .expect("expand tuned probe");
+    let air = &expanded[0].air_source;
+    assert!(air.contains(":= 31;") && air.contains(":= 17;"), "{air}");
+
+    // Trees whose bytes matter beyond `.air` semantics skip the backend pass: a raw block
+    // (its literal calls may read the next instruction), or a literal call to a wide frame.
+    let layout = r#"
+object "Pr E Layout" {
+    guid: 0x7F40_0172;
+    state n: i16;
+
+    @id(4410) @frame(args: 6, format: 0x8002) tree wide "Wide" (a: i16) {
+        self.n = param[5] + a;
+    }
+
+    @id(4411) tree with_raw "With Raw" () {
+        let unused = 5;
+        raw { my.attr[0] := 1; }
+    }
+
+    @id(4412) tree caller "Caller" () {
+        wide(1);
+        let unused = 5;
+    }
+}
+"#;
+    let expanded = sims_antics::v2::expand_v2_source_to_objects(
+        "layout.antics",
+        layout,
+        &PackResolverConfig::default(),
+    )
+    .expect("expand layout probe");
+    let air = &expanded[0].air_source;
+    let tree = |label: &str| {
+        let start = air
+            .find(&format!("\"{label}\""))
+            .unwrap_or_else(|| panic!("tree {label}:\n{air}"));
+        let end = air[start..].find("\n}\n").map_or(air.len(), |e| start + e);
+        air[start..end].to_owned()
+    };
+    assert!(tree("With Raw").contains(" = 5;"), "{air}");
+    assert!(tree("Caller").contains("call 4410(1)"), "{air}");
+    assert!(tree("Caller").contains(" = 5;"), "{air}");
+}
+
+#[test]
+fn pr_e_review_negative_diagnostics() {
+    let cfg = PackResolverConfig::default();
+    let obj = |members: &str| {
+        format!(
+            "object \"Pr E Review\" {{\n    guid: 0x7F40_0180;\n    state n: i16;\n{members}\n}}\n"
+        )
+    };
+    let expect_err = |name: &str, src: &str, needle: &str| {
+        let err = compile_v2_source(name, src, &cfg).expect_err(&format!("{name} must fail"));
+        assert!(
+            err.message.contains(needle),
+            "{name}: expected '{needle}' in: {err}"
+        );
+    };
+    // Arms must have the same type, not merely assignable ones.
+    expect_err(
+        "match_handle_i16.antics",
+        &obj("    tree t (sim: Sim) { let x = match self.n { 0 => 1, _ => stack_obj }; }"),
+        "different types",
+    );
+    // The pinned push slot and raw .air cannot share a tree, in either order.
+    expect_err(
+        "pin_then_raw.antics",
+        &obj(
+            "    tree t (sim: Sim) { let o = stack_obj; o.push_interaction(menu: 0); raw { my.attr[0] := 1; } }",
+        ),
+        "cannot share a tree",
+    );
+    expect_err(
+        "raw_then_pin.antics",
+        &obj(
+            "    tree t (sim: Sim) { raw { my.attr[0] := 1; } let o = stack_obj; o.push_interaction(menu: 0); }",
+        ),
+        "cannot share a tree",
+    );
+    // Variant trees run as the object's own init/main.
+    expect_err(
+        "variant_sim_tree.antics",
+        &obj("    tree t (sim: Sim) { }\n    variant \"V\" { guid: 0x7F40_0181, init: t }"),
+        "object-self tree with no parameters",
+    );
+    expect_err(
+        "variant_primary_name.antics",
+        &obj("    variant \"Pr E Review\" { guid: 0x7F40_0181 }"),
+        "primary object's name",
+    );
+    // A variant tree may not read more argument words than the VM's four.
+    expect_err(
+        "variant_wide_frame.antics",
+        &obj(
+            "    @frame(args: 5, format: 0x8002)\n    tree v () { }\n    variant \"V\" { guid: 0x7F40_0181, main: v }",
+        ),
+        "object-self tree with no parameters",
+    );
+    // A raw block in folded-away code emits nothing, so it does not conflict with the pin.
+    compile_v2_source(
+        "pin_discarded_raw.antics",
+        &obj("    tree t (sim: Sim) { match 0 { 1 => { raw { my.attr[0] := 1; } } _ => { } } let o = stack_obj; o.push_interaction(menu: 0); }"),
+        &cfg,
+    )
+    .expect("discarded raw and a pinned push may share a tree");
+    // Nested match scrutinees are bounded like every other nesting.
+    let deep = format!(
+        "{}self.n{}",
+        "match ".repeat(200),
+        " { _ => 1 }".repeat(200)
+    );
+    expect_err(
+        "match_deep.antics",
+        &obj(&format!("    init {{ self.n = {deep}; }}")),
+        "nesting depth",
     );
 }
