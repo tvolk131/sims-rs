@@ -770,9 +770,18 @@ fn caller_frame_size_matters_when_calling_other_trees() {
         observe_frame_residue: false,
         ..LiveOptions::default()
     };
-    assert_equivalent(&live_with(
+    // A frame with no word at all still shows: Create New Object Instance writes into
+    // the first word of the new object's bottom frame and fails when there is none.
+    assert_inconclusive(&live_with(
         &no_call_more,
         &no_call_fewer,
+        &LiveContext::default(),
+        &ignoring,
+    ));
+    let no_call_one = tree(4096, 0, 1, vec![expr((TEMP, 0), SET, (LIT, 1), T, ERR)]);
+    assert_equivalent(&live_with(
+        &no_call_more,
+        &no_call_one,
         &LiveContext::default(),
         &ignoring,
     ));

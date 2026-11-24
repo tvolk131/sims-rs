@@ -7,9 +7,10 @@
 //! - `sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]`
 //! - `sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result] [--ignore-frame-residue]`
-//! - `sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--global <Global.iff>] [--semi-global <semi.iff>] [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--all]`
-//!   (exit 0 equivalent, 1 different, 2 inconclusive or error). Only files that differ in
-//!   BHAV bodies alone are compared; DIFFERENT is reported only when both trees, run in
+//! - `sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--global <Global.iff>] [--semi-global <semi.iff>] [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--behavioral] [--all]`
+//!   (exit 0 equivalent, 1 different, 2 inconclusive or error). `--behavioral` compares
+//!   without node numbers and frame storage (`docs/decisions/20261123-verifier-behavioral-mode.md`).
+//!   Only files that differ in BHAV bodies alone are compared; DIFFERENT is reported only when both trees, run in
 //!   sims-vm from the same world, end differently; EQUIVALENT assumes neither run
 //!   exhausts the VM's instruction budget.
 //! - `sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv] [--globals <Global.iff|archive.far[!member.iff]>] [--semiglobal <file.iff|archive.far!member.iff>] [--no-catalog]`
@@ -164,7 +165,7 @@ fn print_usage() {
          sims-antics check <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics verify <pack_dir|file.antics> [--pack <pack_dir>]\n  \
          sims-antics equiv <a.antics|a.air> <b.iff> --tree <id> [--pack <pack_dir>] [--ignore-last-result] [--ignore-frame-residue]\n  \
-         sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--global <Global.iff>] [--semi-global <semi.iff>] [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--all]   (exit 0 equivalent, 1 different, 2 inconclusive)\n    \
+         sims-antics verify-equiv <a.iff> <b.iff> [--tree <id>] [--global <Global.iff>] [--semi-global <semi.iff>] [--my-attributes <n>] [--ignore-scratch-pointer] [--ignore-last-result] [--ignore-frame-residue] [--behavioral] [--all]   (exit 0 equivalent, 1 different, 2 inconclusive)\n    \
              (files must differ in BHAV bodies alone; DIFFERENT needs a sims-vm replay that ends differently;\n    \
               EQUIVALENT assumes neither run exhausts the VM instruction budget; the same holds for equiv;\n    \
               a tree is EQUIVALENT only if every tree it may run is the same bytes or proven equivalent too;\n    \
@@ -174,7 +175,9 @@ fn print_usage() {
               name the libraries calls to 256-4095 and 8192 and up run; they are trusted to be the game's,\n    \
               and two that disagree on a tree are refused;\n    \
               --my-attributes is the attribute count of whatever runs as me, which call_as may make another\n    \
-              object than the one whose file holds the tree: give the smallest count of anything that runs it)\n  \
+              object than the one whose file holds the tree: give the smallest count of anything that runs it;\n    \
+              --behavioral ignores node numbers and frame storage (implies --ignore-frame-residue) and holds\n    \
+              only for runs that start and end under one build, see docs/decisions/20261123-verifier-behavioral-mode.md)\n  \
          sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv] [--globals <Global.iff|archive.far[!member.iff]>] [--semiglobal <file.iff|archive.far!member.iff>] [--no-catalog]   (lifts to .air Antics IR)\n  \
          sims-antics build <pack_dir> --out <dir>\n\
          lift arities: inside an install, global and semi-global callee arities come from its catalog;\n  \
@@ -2205,6 +2208,11 @@ fn cmd_verify_equiv(args: &[OsString]) -> Result<(), CliError> {
                 }
                 "--ignore-last-result" => {
                     opts.live.observe_last_result = false;
+                    i += 1;
+                    continue;
+                }
+                "--behavioral" => {
+                    opts.live.behavioral = true;
                     i += 1;
                     continue;
                 }
