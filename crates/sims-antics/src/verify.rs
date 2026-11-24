@@ -17,9 +17,13 @@ use sims_formats::sprite::{DrawGroup, Palette, SpriteSet};
 use sims_formats::strings::StringTable;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+mod domains;
 mod iff;
 mod live;
 mod replay;
+pub use domains::{
+    ParamDomain, ParamDomains, V2EnumDomain, parse_param_domain_arg, v2_enum_param_domains,
+};
 pub use iff::{
     IffEquivOptions, IffEquivReport, IffVerdict, Reach, ResourceReport, ResourceVerdict,
     check_iff_equivalent, check_tree_with_callees, library_argless_from_iff,
@@ -5629,6 +5633,9 @@ pub fn context_mismatch(
             .iter()
             .any(|ins| ins.opcode != 2 || ins.operands[6] == 26 || ins.operands[7] == 26)
     };
+    if ctx_a.param_domains.get(&a.id) != ctx_b.param_domains.get(&b.id) {
+        return Some("the sides assume different parameter domains for the tree".to_owned());
+    }
     (ctx_a.local_bcons != ctx_b.local_bcons && (may_read_constants(a) || may_read_constants(b)))
         .then(|| "the files' constant tables (BCON) differ and the trees may read them".to_owned())
 }
