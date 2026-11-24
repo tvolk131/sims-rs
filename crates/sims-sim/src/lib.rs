@@ -76,8 +76,8 @@ pub use world::{
     ADVERTISEMENTS, Advertisement, BoundSlot, Budget, Dialog, Dialogs, FULL_SIZE, FrameStorage,
     Headline, HouseUsage, IndicatorQueues, MagicHistory, Object, PersonOutfit, PersonTick,
     PortraitFile, SCRATCH_PTR_ARG_SLOT, SCRATCH_PTR_EXPRESSION, SCRATCH_PTR_SET,
-    SCRATCH_PTR_SET_TO_NEXT, ScratchPtrBitSerialize, ScratchPtrs, TypeAttributes, Usage,
-    Whereabouts, WorkwearCache, World,
+    SCRATCH_PTR_SET_TO_NEXT, ScratchPtrBitSerialize, ScratchPtrs, TripRequest, TypeAttributes,
+    Usage, Whereabouts, WorkwearCache, World,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
