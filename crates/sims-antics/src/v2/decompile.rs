@@ -13,8 +13,8 @@
 
 use crate::arity_catalog::{bhav_arities_in_range, vm_kept_bhavs};
 use crate::ast::{
-    AssignOp, CallTarget, CompareOp, Condition, LocalRef, Operand, OperandRef, PrimitiveCall, Stmt,
-    StringRef, Target,
+    AssignOp, CallTarget, CompareOp, Condition, LocalRef, Operand, OperandRef, PrimitiveCall,
+    SlotSpec, Stmt, StringRef, Target,
 };
 use crate::error::{Error, Result};
 use crate::ir::BhavChunk;
@@ -27,8 +27,8 @@ use crate::v2::fmt::format_v2_source;
 use crate::v2::parser::snake_case_ident;
 use crate::v2::{PackResolverConfig, compile_expanded_v2_object, expand_v2_source_to_objects};
 use crate::verify::{
-    EquivOptions, EquivResult, LiveContext, LiveOptions, canonicalize_primitive_operands,
-    check_bhav_equivalent_combined, same_tree_bytes,
+    EquivOptions, EquivResult, LiveContext, LiveOptions, apply_operand_pad,
+    canonicalize_primitive_operands, check_bhav_equivalent_combined, same_tree_bytes,
 };
 use sims_formats::behavior::{InteractionTable, ObjectDefinition};
 use sims_formats::iff::{Chunk, Iff};
@@ -188,11 +188,13 @@ pub fn decompile_iff_to_v2_report(
         let generated = model.generate(&plan);
         match model.compile(&generated.text) {
             Err(Failure::V2 { line, message })
-                if plan.drop_variants(&model, &generated, line, &message) => {}
+                if plan.drop_strings(&model, &generated, line, &message)
+                    || plan.drop_variants(&model, &generated, line, &message) => {}
             Err(Failure::Air {
                 tree: None,
                 message,
-            }) if plan.drop_variants(&model, &generated, None, &message) => {}
+            }) if plan.drop_strings(&model, &generated, None, &message)
+                || plan.drop_variants(&model, &generated, None, &message) => {}
             Err(Failure::V2 { line, message }) => {
                 let tree = line.and_then(|l| generated.tree_at_line(l.saturating_sub(1)));
                 // An extra idiom is turned off before anything is lowered: it may be what
@@ -324,6 +326,14 @@ struct BconModel {
     entries: Vec<(String, i16)>,
 }
 
+/// A `STR#` table some tree shows text from, written as a `strings` member.
+struct StringsModel {
+    id: u16,
+    label: String,
+    /// Entry name -> text (the table's US English entries, in order).
+    entries: Vec<(String, String)>,
+}
+
 struct SoundModel {
     ident: String,
     wav: String,
@@ -342,6 +352,10 @@ struct Model {
     primary_init: u16,
     primary_main: u16,
     bcons: Vec<BconModel>,
+    /// String tables the trees read, by ID.
+    strings: Vec<StringsModel>,
+    /// The tables trees show text from that are not written, and why.
+    strings_skipped: Vec<(u16, String)>,
     /// Library constant operand address -> entry name in `extern bcon library_consts`.
     extern_bcons: BTreeMap<u16, String>,
     /// Attribute slots referenced as `my.attr` / `stack.attr`.
@@ -753,6 +767,7 @@ impl Model {
             .collect();
 
         let ctx_original = live_context(iff, &options.library_arities);
+        let strings = strings_models(iff, &trees);
         Ok(Self {
             name: objd_chunk.label.trim().to_owned(),
             guid: objd.guid,
@@ -761,6 +776,8 @@ impl Model {
             variants,
             primary_init,
             primary_main,
+            strings: strings.0,
+            strings_skipped: strings.1,
             bcons,
             extern_bcons,
             states,
@@ -910,13 +927,7 @@ impl Model {
     fn string_gap(&self, tree: &BhavChunk, recompiled: &RecompiledFile) -> Option<String> {
         tree.instructions
             .iter()
-            .filter_map(|i| match i.opcode {
-                21 | 50 => Some(u16::from_le_bytes([i.operands[0], i.operands[1]])),
-                // A dialog reads STR# 301 for its nonzero string operands (0 to 4, 6);
-                // a dialog that names none (a lot picker) reads no table.
-                36 if [0, 1, 2, 3, 4, 6].iter().any(|&k| i.operands[k] != 0) => Some(301),
-                _ => None,
-            })
+            .filter_map(string_table_read)
             .find(|&id| {
                 STRING_TAGS.iter().any(|tag| {
                     let key = (**tag, id);
@@ -1160,29 +1171,240 @@ struct RecompiledFile {
     attributes: Option<u16>,
 }
 
-/// A string table's entries as the VM reads them: language and text bytes (comments
-/// and the table's encoding are not observable), or its bytes when it does not parse.
-type StringTexts = std::result::Result<Vec<(u8, Vec<u8>)>, Vec<u8>>;
+/// A string table as the VM reads it: its US English texts in order when the VM's
+/// reading is plain ([`plain_string_table`]), else every chunk of its tag and ID as
+/// stored (flags and bytes), so that only an identical table compares equal. Comments
+/// and the table's encoding are not observable.
+type StringTexts = std::result::Result<Vec<Vec<u8>>, Vec<(u16, Vec<u8>)>>;
+
+/// The string table instruction `i` shows text from: Show String (21) and Set Action
+/// String (50) name one; a private Dialog (36) of an ordinary kind (0 to 4, operand 5's
+/// low 7 bits) reads `STR#` 301 for its nonzero string operands (0 to 4, 6). One that
+/// names none reads no table, and the other kinds (pickers and panels, `sims-vm`
+/// `primitives/dialog.rs`) return before any text is formatted.
+fn string_table_read(i: &sims_formats::behavior::Instruction) -> Option<u16> {
+    match i.opcode {
+        21 | 50 => Some(u16::from_le_bytes([i.operands[0], i.operands[1]])),
+        36 if i.operands[5] & 0x7f <= 4
+            && [0, 1, 2, 3, 4, 6].iter().any(|&k| i.operands[k] != 0) =>
+        {
+            Some(301)
+        }
+        _ => None,
+    }
+}
+
+/// The `STR#` tables the trees show text from that a v2 `strings` member can write (the
+/// table's US English entries, each text one a v2 string literal spells), and those it
+/// cannot, with why.
+fn strings_models(iff: &Iff, trees: &[TreeModel]) -> (Vec<StringsModel>, Vec<(u16, String)>) {
+    let ids: BTreeSet<u16> = trees
+        .iter()
+        .flat_map(|t| t.original.instructions.iter().filter_map(string_table_read))
+        .collect();
+    let mut used = BTreeSet::new();
+    let mut out = Vec::new();
+    let mut skipped = Vec::new();
+    for id in ids {
+        if !iff.chunks.iter().any(|c| &c.tag == b"STR#" && c.id == id) {
+            continue;
+        }
+        let texts = match plain_string_table(iff, b"STR#", id) {
+            Ok((_, texts)) => texts,
+            Err(why) => {
+                skipped.push((id, why.to_owned()));
+                continue;
+            }
+        };
+        let texts: Vec<String> = texts
+            .iter()
+            .map(|t| sims_formats::strings::decode_verbatim(t, 1))
+            .collect();
+        // A v2 literal spells no other control character, and the table encoder takes no NUL.
+        let spellable = |t: &String| {
+            !t.chars()
+                .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        };
+        // A table with no entries at all is written empty (one with entries and none
+        // in US English is not plain).
+        if !texts.iter().all(spellable) {
+            skipped.push((
+                id,
+                "a text holds a control character a v2 string does not spell".to_owned(),
+            ));
+            continue;
+        }
+        let Some(chunk) = iff.get(b"STR#", id) else {
+            continue;
+        };
+        let entries = texts
+            .into_iter()
+            .enumerate()
+            .map(|(n, text)| (string_entry_name(&text, n + 1, &mut used), text))
+            .collect();
+        out.push(StringsModel {
+            id,
+            label: chunk.label.trim().to_owned(),
+            entries,
+        });
+    }
+    (out, skipped)
+}
+
+/// The one chunk the VM reads table `tag` `id` from and its US English texts in the
+/// order it reads them, when that reading is plain; else why not. Plain means what
+/// `sims-vm` (`program.rs`: `unported_strings`, `english_fallback`, `loaded_order`) and
+/// the original's loader agree on, read the simple way:
+/// - one chunk of the tag and ID, not deleted, the one the resource map gives;
+/// - flag 0x10 (the loader byte-swaps the header of a resource without it);
+/// - format -1, -2 or -3 with a count from 0 to 0x7fff;
+/// - US English entries in one run, unless there are none at all (the loader puts a
+///   later run of a language in front of the earlier ones, and reads a table with
+///   entries and none in English again for English).
+fn plain_string_table<'a>(
+    iff: &'a Iff,
+    tag: &[u8; 4],
+    id: u16,
+) -> std::result::Result<(&'a sims_formats::iff::Chunk, Vec<Vec<u8>>), &'static str> {
+    let mut chunks = iff.chunks.iter().filter(|c| &c.tag == tag && c.id == id);
+    let (Some(chunk), None) = (chunks.next(), chunks.next()) else {
+        return Err("the file has more than one chunk of its ID");
+    };
+    if chunk.flags & sims_formats::iff::DELETED != 0 {
+        return Err("its chunk is marked deleted");
+    }
+    if iff.map_error().is_some() || !iff.get(tag, id).is_some_and(|c| c.offset == chunk.offset) {
+        return Err("the resource map does not name its chunk");
+    }
+    if iff.resource_flags(chunk) & 0x10 == 0 {
+        return Err("its resource lacks flag 0x10, so the loader byte-swaps its header");
+    }
+    let data = iff.data(chunk);
+    let word = |at: usize| {
+        data.get(at..at + 2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+    };
+    if !matches!(word(0), Some(-3..=-1)) || !word(2).is_some_and(|n| n >= 0) {
+        return Err("its format or count is one the loader reads another way");
+    }
+    let table = StringTable::parse(data).map_err(|_| "it does not parse")?;
+    let english: Vec<usize> = table
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.language == 1)
+        .map(|(n, _)| n)
+        .collect();
+    if english.is_empty() && !table.entries.is_empty() {
+        return Err("it has entries and none in US English, which the loader reads again");
+    }
+    if english.windows(2).any(|w| w[1] != w[0] + 1) {
+        return Err("its US English entries are not in one run");
+    }
+    let texts = english
+        .into_iter()
+        .map(|n| table.entries[n].raw_text.clone())
+        .collect();
+    Ok((chunk, texts))
+}
+
+/// A `strings` entry name from its text: its first words in snake case, else `s<N>`
+/// (`n` is the entry's number from 1), unique within the object.
+fn string_entry_name(text: &str, n: usize, used: &mut BTreeSet<String>) -> String {
+    const RESERVED: &[&str] = &[
+        "if",
+        "else",
+        "let",
+        "return",
+        "true",
+        "false",
+        "self",
+        "sim",
+        "while",
+        "loop",
+        "match",
+        "fn",
+        "tree",
+        "const",
+        "state",
+        "strings",
+        "for",
+        "in",
+        "break",
+        "continue",
+        "raw",
+        "defer",
+        "repeat",
+        "sound",
+        "object",
+        "mod",
+        "use",
+        "pub",
+        "enum",
+        "struct",
+        "stack_obj",
+        "temp",
+        "param",
+        "local",
+        "none",
+        "some",
+    ];
+    let words: Vec<String> = text
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '$' && c != ':')
+        .filter(|w| {
+            !w.is_empty() && !w.contains('$') && w.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+        .take(4)
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let mut name = words.join("_");
+    name.truncate(32);
+    let name = name.trim_end_matches('_').to_owned();
+    let base = if name.is_empty()
+        || name.starts_with(|c: char| c.is_ascii_digit())
+        || RESERVED.contains(&name.as_str())
+    {
+        format!("s{n}")
+    } else {
+        name
+    };
+    let mut candidate = base.clone();
+    if used.contains(&candidate) {
+        candidate = format!("{base}_{n}");
+    }
+    let mut k = 2;
+    while used.contains(&candidate) {
+        candidate = format!("{base}_{n}_{k}");
+        k += 1;
+    }
+    used.insert(candidate.clone());
+    candidate
+}
 
 /// The chunks a text read can resolve: `STR#`, the catalog's `CTSS`, and the legacy
 /// `CST` the loader falls back on when a file has no `STR#` of the id.
 const STRING_TAGS: [&[u8; 4]; 3] = [b"STR#", b"CTSS", b"\0CST"];
 
-/// Each text table's texts, by tag and id, the last chunk of an id winning.
+/// Each text table, by tag and ID ([`StringTexts`]).
 fn string_texts(iff: &Iff) -> BTreeMap<([u8; 4], u16), StringTexts> {
-    iff.chunks
+    let keys: BTreeSet<([u8; 4], u16)> = iff
+        .chunks
         .iter()
         .filter(|c| STRING_TAGS.contains(&&c.tag))
-        .map(|c| {
-            let texts = StringTable::parse_chunk(iff.data(c), c.flags)
-                .map(|t| {
-                    t.entries
-                        .into_iter()
-                        .map(|e| (e.language, e.raw_text))
+        .map(|c| (c.tag, c.id))
+        .collect();
+    keys.into_iter()
+        .map(|(tag, id)| {
+            let texts = plain_string_table(iff, &tag, id)
+                .map(|(_, texts)| texts)
+                .map_err(|_| {
+                    iff.chunks
+                        .iter()
+                        .filter(|c| c.tag == tag && c.id == id)
+                        .map(|c| (c.flags, iff.data(c).to_vec()))
                         .collect()
-                })
-                .map_err(|_| iff.data(c).to_vec());
-            ((c.tag, c.id), texts)
+                });
+            ((tag, id), texts)
         })
         .collect()
 }
@@ -1824,25 +2046,63 @@ fn call_params(arity: usize) -> impl Iterator<Item = String> {
     (0..arity).map(|i| format!("arg_{i}: i16"))
 }
 
-fn animation_local(s: &Stmt) -> Option<u8> {
-    let (Stmt::If { cond, .. } | Stmt::While { cond, .. }) = s else {
-        return None;
-    };
-    let mut cond = cond;
-    while let Condition::Not(inner) = cond {
-        cond = inner;
-    }
-    match cond {
-        Condition::Primitive {
-            prim:
-                PrimitiveCall::Animate {
-                    flags,
-                    local_index: LocalRef::Index(i),
-                    ..
-                },
+/// The highest slot that needs a named declaration for a primitive's local arguments.
+fn builtin_local(s: &Stmt) -> Option<u16> {
+    let prim = match s {
+        Stmt::Primitive {
+            prim,
+            branches: None,
             ..
-        } if flags & 0x20 != 0 => Some(*i),
+        } => prim,
+        Stmt::If { cond, .. } | Stmt::While { cond, .. } => {
+            let mut cond = cond;
+            while let Condition::Not(inner) = cond {
+                cond = inner;
+            }
+            let Condition::Primitive { prim, .. } = cond else {
+                return None;
+            };
+            prim
+        }
+        _ => return None,
+    };
+    if let PrimitiveCall::Animate {
+        flags,
+        local_index: LocalRef::Index(i),
+        ..
+    } = prim
+        && flags & 0x20 != 0
+        && matches!(s, Stmt::If { .. } | Stmt::While { .. })
+    {
+        return Some(u16::from(*i));
+    }
+    match unpadded(prim) {
+        PrimitiveCall::FindLocation {
+            local: LocalRef::Index(i),
+            flags,
+            ..
+        } if flags & 1 != 0 || *i != 0 => Some(u16::from(*i)),
+        PrimitiveCall::Relationship {
+            direction,
+            local: LocalRef::Index(i),
+            value,
+            ..
+        } => {
+            let value = u16::try_from(direct_local(value)?).ok()?;
+            Some(if matches!(direction, 2 | 3) || *i != 0 {
+                value.max(u16::from(*i))
+            } else {
+                value
+            })
+        }
         _ => None,
+    }
+}
+
+fn unpadded(prim: &PrimitiveCall) -> &PrimitiveCall {
+    match prim {
+        PrimitiveCall::Padded { call, .. } => call,
+        _ => prim,
     }
 }
 
@@ -1877,6 +2137,8 @@ struct Plan {
     standalone: BTreeSet<u16>,
     /// Why the catalog variants are left out (the compiler rejected them).
     variants_off: Option<String>,
+    /// Why the `strings` members are left out (the compiler rejected them).
+    strings_off: Option<String>,
     /// Trees written without the extra idioms (see [`Translator::extra`]), after a round
     /// that used them was not proven.
     plain: BTreeSet<u16>,
@@ -1910,6 +2172,7 @@ impl Plan {
             raw_stmts: BTreeMap::new(),
             standalone,
             variants_off: None,
+            strings_off: None,
             plain: BTreeSet::new(),
         }
     }
@@ -2008,6 +2271,25 @@ impl Plan {
         true
     }
 
+    /// Leaves the `strings` members out when the compiler rejects one of them. `false` when
+    /// that cannot help.
+    fn drop_strings(
+        &mut self,
+        model: &Model,
+        generated: &Generated,
+        line: Option<usize>,
+        message: &str,
+    ) -> bool {
+        let at_strings = line
+            .is_some_and(|l| generated.strings_lines.contains(&l.saturating_sub(1)))
+            || (line.is_none() && message.contains("STR#"));
+        if self.strings_off.is_some() || model.strings.is_empty() || !at_strings {
+            return false;
+        }
+        self.strings_off = Some(message.lines().next().unwrap_or_default().to_owned());
+        true
+    }
+
     fn lower_at_line(&mut self, model: &Model, generated: &Generated, line: Option<usize>) -> bool {
         let Some(line) = line else {
             return self.lower_all(model);
@@ -2068,6 +2350,8 @@ struct Generated {
     extras: BTreeSet<u16>,
     /// 0-based lines holding the `variant` members.
     variant_lines: std::ops::Range<usize>,
+    /// 0-based lines holding the `strings` members.
+    strings_lines: std::ops::Range<usize>,
 }
 
 struct Out {
@@ -2184,6 +2468,35 @@ impl Model {
             out.line("}");
             out.line("");
         }
+        let strings_start = out.lines.len();
+        if let Some(why) = &plan.strings_off {
+            if !self.strings.is_empty() {
+                out.line(format!("// strings are not written: {why}."));
+                out.line("");
+            }
+        } else {
+            for (id, why) in &self.strings_skipped {
+                out.line(format!("// strings {id} is not written: {why}."));
+            }
+            if !self.strings_skipped.is_empty() {
+                out.line("");
+            }
+            for st in &self.strings {
+                out.line(format!(
+                    "strings {} \"{}\" {{",
+                    st.id,
+                    v2_string_literal(&st.label)
+                ));
+                out.indent += 1;
+                for (name, text) in &st.entries {
+                    out.line(format!("{name} = \"{}\",", v2_string_literal(text)));
+                }
+                out.indent -= 1;
+                out.line("}");
+                out.line("");
+            }
+        }
+        let strings_lines = strings_start..out.lines.len();
         for s in &self.states {
             out.line(format!("state attr_{s} @ {s}: i16;"));
         }
@@ -2218,6 +2531,12 @@ impl Model {
                     out.line(format!("@id({}) {} {{", t.id, kind.keyword()));
                 }
                 None => {
+                    if let Some(kind) = t.lifecycle {
+                        out.line(format!(
+                            "// The object's {0} tree, written as a plain tree: the build gives the object its own `{0}` tree at a new ID.",
+                            kind.keyword()
+                        ));
+                    }
                     let b = &t.original;
                     let mut params = Vec::new();
                     if sim {
@@ -2231,11 +2550,15 @@ impl Model {
                     } else {
                         format!(" ({})", params.join(", "))
                     };
-                    let kind = if b.kind == 0 {
+                    let mut kind = if b.kind == 0 {
                         String::new()
                     } else {
                         format!(", kind: {}", b.kind)
                     };
+                    // A 0-node tree (entering it faults) is `@frame(empty)` with a `{}` body.
+                    if b.instructions.is_empty() {
+                        kind.push_str(", empty");
+                    }
                     out.line(format!(
                         "@id({}) @frame(args: {}, locals: {}, format: {:#06x}, revision: {}{kind}) tree {} \"{}\"{ctx} {{",
                         t.id, b.args, b.locals, b.format, b.revision, t.ident, t.label
@@ -2246,13 +2569,13 @@ impl Model {
             let mut raw_count = 0;
             match &t.body {
                 Some(body) if level.idiomatic() => {
-                    let mut animate_locals = 0;
+                    let mut named_locals = 0;
                     if as_lifecycle.is_none() && !plan.plain.contains(&t.id) {
                         walk_stmts(body, &mut |s| {
-                            if let Some(index) = animation_local(s)
-                                && u16::from(index) < t.original.locals
+                            if let Some(index) = builtin_local(s)
+                                && index < t.original.locals
                             {
-                                animate_locals = animate_locals.max(u16::from(index) + 1);
+                                named_locals = named_locals.max(index + 1);
                             }
                         });
                     }
@@ -2270,16 +2593,16 @@ impl Model {
                         hoisted_save: hoisted_self_save(body, &t.lifted),
                         sims_loop: None,
                         cursor: None,
-                        animate_locals,
+                        named_locals,
                         extras: std::cell::Cell::new(false),
                     };
-                    if animate_locals > 0 && tr.extra() {
-                        if animate_locals > 1 {
+                    if named_locals > 0 && tr.extra() {
+                        if named_locals > 1 {
                             // A raw block disables v2's removal of unused declarations.
                             // The earlier slots must stay allocated even when unread.
-                            out.line("raw { /* Preserve animation local slot numbers. */ }");
+                            out.line("raw { /* Preserve builtin local slot numbers. */ }");
                         }
-                        for i in 0..animate_locals {
+                        for i in 0..named_locals {
                             out.line(format!("let slot_{i}: i16;"));
                         }
                     }
@@ -2364,8 +2687,25 @@ impl Model {
             raw_counts,
             extras,
             variant_lines,
+            strings_lines,
         }
     }
+}
+
+/// `text` as the inside of a v2 string literal.
+fn v2_string_literal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn hex_u32(v: u32) -> String {
@@ -2430,8 +2770,8 @@ struct Translator<'a> {
     /// The binding of the innermost `for` loop whose cursor is `stack_obj` itself: inside it,
     /// the stack object's cells are the binding's (`o.data[i]`, `p.person[i]`).
     cursor: Option<String>,
-    /// Number of leading frame locals declared for animations that write events to a local.
-    animate_locals: u16,
+    /// Number of leading frame slots declared for builtins with named local operands.
+    named_locals: u16,
     /// Whether an extra idiom was written (see [`Translator::extra`]).
     extras: std::cell::Cell<bool>,
 }
@@ -2500,6 +2840,10 @@ impl Translator<'_> {
                 i += used;
                 continue;
             }
+            if let Some(used) = self.value_builtin(&body[i..], out) {
+                i += used;
+                continue;
+            }
             if let Some(used) = self.pair(&body[i..], out) {
                 i += used;
                 continue;
@@ -2539,6 +2883,9 @@ impl Translator<'_> {
                     return;
                 }
                 if self.match_chain(id, s, out) {
+                    return;
+                }
+                if self.return_compare(id, cond, then_body, else_body, out) {
                     return;
                 }
                 let Some(c) = self.cond(cond) else {
@@ -2610,6 +2957,70 @@ impl Translator<'_> {
                 None => self.emit_raw(s),
             },
         }
+    }
+
+    /// `if a op b { return true; } else { return false; }` as `return a op b;`, and the
+    /// other polarity as `return !(a op b);`: each lowers to the same compare node with
+    /// the same exits (so the same last result). Also a primitive test returned whole
+    /// (`return can_afford(..);`), in that polarity only. No tree calls.
+    fn return_compare(
+        &mut self,
+        id: usize,
+        cond: &Condition,
+        then_body: &[Stmt],
+        else_body: &[Stmt],
+        out: &mut Out,
+    ) -> bool {
+        let (cond, negated) = match cond {
+            Condition::Not(inner) => (inner.as_ref(), true),
+            c => (c, false),
+        };
+        let compare = matches!(
+            cond,
+            Condition::Compare {
+                op: CompareOp::Gt
+                    | CompareOp::Lt
+                    | CompareOp::Eq
+                    | CompareOp::Ge
+                    | CompareOp::Le
+                    | CompareOp::Ne,
+                ..
+            }
+        );
+        if !compare && !matches!(cond, Condition::Primitive { .. }) {
+            return false;
+        }
+        let returns = |body: &[Stmt]| match body {
+            [Stmt::Return { target, .. }] => match target {
+                Target::ReturnTrue => Some(true),
+                Target::ReturnFalse => Some(false),
+                _ => None,
+            },
+            _ => None,
+        };
+        let (Some(on_true), Some(on_false)) = (returns(then_body), returns(else_body)) else {
+            return false;
+        };
+        if on_true == on_false
+            || (!compare && on_true == negated)
+            || self.forced_raw(id + 1)
+            || self.forced_raw(id + 2)
+        {
+            return false;
+        }
+        let Some(c) = self.cond(cond) else {
+            return false;
+        };
+        self.flush_raw(out);
+        let start = out.lines.len();
+        if on_true != negated {
+            out.line(format!("return {c};"));
+        } else {
+            out.line(format!("return !({c});"));
+        }
+        self.record(id, start, out);
+        self.next_id = id + 3;
+        true
     }
 
     fn try_dialog(
@@ -2843,6 +3254,155 @@ impl Translator<'_> {
         } if l == lhs)
     }
 
+    /// Folds the setup and result store of a value builtin within one structured block.
+    fn value_builtin(&mut self, rest: &[Stmt], out: &mut Out) -> Option<usize> {
+        let id = self.next_id;
+        if self.plan.plain.contains(&self.tree.id) || self.forced_raw(id) {
+            return None;
+        }
+        let (used, text) = self.job_data(rest).or_else(|| self.distance_to(rest))?;
+        if (id + 1..id + used).any(|i| self.forced_raw(i)) || !self.extra() {
+            return None;
+        }
+        self.next_id += used;
+        self.flush_raw(out);
+        let start = out.lines.len();
+        out.line(text);
+        self.record(id, start, out);
+        Some(used)
+    }
+
+    /// `temp[0] := career; temp[1] := level; dest := scope(33, field)`.
+    fn job_data(&self, rest: &[Stmt]) -> Option<(usize, String)> {
+        let (career, rest) = if let Some(career) = assigned_to(rest.first()?, 8, 0) {
+            (Some(career), &rest[1..])
+        } else {
+            // The optimizer drops an identity career store before a plain level store.
+            (None, rest)
+        };
+        let [level, read, ..] = rest else {
+            return None;
+        };
+        let level = assigned_to(level, 8, 1)?;
+        let Stmt::Assign {
+            lhs,
+            op: AssignOp::Set,
+            rhs: OperandRef::Direct(Operand { scope: 33, index }),
+            ..
+        } = read
+        else {
+            return None;
+        };
+        if *index < 0 || is_operand(level, 8, 0) {
+            return None;
+        }
+        let (lhs, level) = (self.lvalue(lhs)?, self.rvalue(level)?);
+        let career_arg = match career {
+            Some(operand) => self.rvalue(operand)?,
+            None => "temp[0]".to_owned(),
+        };
+        Some((
+            usize::from(career.is_some()) + 2,
+            format!("{lhs} = job_data({career_arg}, {level}, {index});"),
+        ))
+    }
+
+    /// Get Distance To writes a temp. An adjacent assignment can use the builtin's return
+    /// value directly. A move can be folded when the distance is the only use of the entry save.
+    fn distance_to(&self, rest: &[Stmt]) -> Option<(usize, String)> {
+        if self.cursor.is_some() {
+            return None;
+        }
+        let (target, get, tail, used) = match rest {
+            [get @ Stmt::Primitive { prim, .. }, tail @ ..]
+                if matches!(unpadded(prim), PrimitiveCall::GetDistanceTo { .. }) =>
+            {
+                ("stack_obj".to_owned(), get, tail, 1)
+            }
+            [save, move_to, get, restore, tail @ ..] if self.next_id == 0 => {
+                let saved = self_save_local(save)?;
+                let target = self.distance_handle(assigned_to(move_to, 10, 0)?)?;
+                if target == "stack_obj" || !is_operand(assigned_to(restore, 10, 0)?, 25, saved) {
+                    return None;
+                }
+                let needle = format!("local[{saved}]");
+                if self
+                    .tree
+                    .lifted
+                    .iter()
+                    .map(|l| l.matches(&needle).count())
+                    .sum::<usize>()
+                    != 2
+                {
+                    return None;
+                }
+                (target, get, tail, 4)
+            }
+            _ => return None,
+        };
+        let Stmt::Primitive {
+            prim,
+            branches: None,
+            ..
+        } = get
+        else {
+            return None;
+        };
+        let PrimitiveCall::GetDistanceTo { temp, flags, from } = unpadded(prim) else {
+            return None;
+        };
+        let from = match (flags, from) {
+            (0, None) => String::new(),
+            (1, Some(from)) => {
+                if used > 1
+                    && matches!(from, OperandRef::Direct(o) if matches!(o.scope, 4 | 10 | 16))
+                {
+                    // With a move, v2 reads a stack-relative 'from' before changing stack_obj.
+                    return None;
+                }
+                format!(", from: {}", self.distance_handle(from)?)
+            }
+            _ => return None,
+        };
+        let temp_arg = if *temp == 0 {
+            String::new()
+        } else {
+            format!(", temp: {temp}")
+        };
+        let call = format!("distance_to({target}{from}{temp_arg})");
+        if let [
+            Stmt::Assign {
+                lhs,
+                op: AssignOp::Set,
+                rhs,
+                ..
+            },
+            ..,
+        ] = tail
+            && is_operand(rhs, 8, i16::from(*temp))
+            && let Some(lhs) = self.lvalue(lhs)
+        {
+            return Some((used + 1, format!("{lhs} = {call};")));
+        }
+        // Lowering can eliminate the resulting temp-to-itself store before an Expression.
+        Some((used, format!("temp[{temp}] = {call};")))
+    }
+
+    fn distance_handle(&self, operand: &OperandRef) -> Option<String> {
+        let OperandRef::Direct(o) = operand else {
+            return None;
+        };
+        match (o.scope, o.index, self.sim) {
+            (10, 0, _) => Some("stack_obj".to_owned()),
+            (3, 11, true) => Some("sim".to_owned()),
+            (3, 11, false) => Some("self.id".to_owned()),
+            (4, 11, true) => Some("self.id".to_owned()),
+            (3, 2, true) => Some("sim.container".to_owned()),
+            (16, 0..=255, true) | (20, 0..=255, false) => self.rvalue(operand),
+            _ => None,
+        }
+    }
+
     /// Two-statement idioms, each the exact lowering of its v2 spelling. Returns how many
     /// statements it consumed.
     ///
@@ -3060,10 +3620,7 @@ impl Translator<'_> {
             "animate(clip: {clip_id}, table: {table}, flags: {flags_without_local}, events: {events}"
         );
         if flags & 0x20 != 0 {
-            if u16::from(*local) >= self.animate_locals || !self.extra() {
-                return None;
-            }
-            text.push_str(&format!(", local: slot_{local}"));
+            text.push_str(&format!(", local: {}", self.local_name(u16::from(*local))?));
         } else if *local != 0 && !self.extra() {
             return None;
         }
@@ -3074,7 +3631,28 @@ impl Translator<'_> {
     fn simple(&self, s: &Stmt) -> Option<String> {
         match s {
             Stmt::Assign { lhs, op, rhs, .. } => {
-                let op = assign_operator(op)?;
+                if let Some(lhs) = self.flags_place(lhs)
+                    && let Some(rhs) = self.flags_place(rhs)
+                    && matches!(
+                        op,
+                        AssignOp::Set | AssignOp::BitAnd | AssignOp::BitOr | AssignOp::BitXor
+                    )
+                    && self.extra()
+                {
+                    return Some(format!("{lhs} {} {rhs};", assign_operator(op)?));
+                }
+                let op = match op {
+                    AssignOp::FlagSet | AssignOp::FlagClear
+                        if self.flags_place(lhs).is_some() && self.extra() =>
+                    {
+                        if *op == AssignOp::FlagSet {
+                            "flag_set"
+                        } else {
+                            "flag_clear"
+                        }
+                    }
+                    _ => assign_operator(op)?,
+                };
                 Some(format!("{} {op} {};", self.lvalue(lhs)?, self.rvalue(rhs)?))
             }
             Stmt::Return {
@@ -3151,6 +3729,14 @@ impl Translator<'_> {
     fn cond(&self, c: &Condition) -> Option<String> {
         match c {
             Condition::Compare { lhs, op, rhs, .. } => {
+                if matches!(op, CompareOp::Eq | CompareOp::Ne)
+                    && is_operand(rhs, 7, 0)
+                    && let Some(flags) = self.flags_place(lhs)
+                    && self.extra()
+                {
+                    let not = if *op == CompareOp::Ne { "!" } else { "" };
+                    return Some(format!("{not}{flags}.is_empty()"));
+                }
                 let op = match op {
                     CompareOp::Gt => ">",
                     CompareOp::Lt => "<",
@@ -3168,6 +3754,9 @@ impl Translator<'_> {
                         return self
                             .extra()
                             .then(|| format!("{name}(&mut {place}, {bound})"));
+                    }
+                    CompareOp::FlagTest if self.flags_place(lhs).is_some() && self.extra() => {
+                        "flag_test"
                     }
                     CompareOp::FlagTest => return None,
                 };
@@ -3251,24 +3840,23 @@ impl Translator<'_> {
                     self.rvalue(amount)?
                 ))
             }
-            // `play_sound(sound)` targets the Sim in an object's own tree and the stack object
-            // (`self`) in an interaction; `sim` names the other target there.
-            PrimitiveCall::PlaySound { sound_id, flags } => {
-                let sound = self.model.sounds.get(sound_id)?;
-                let target = match (self.sim, flags) {
-                    (false, 0) | (true, 2) => "",
-                    (true, 0) => ", sim",
-                    _ => return None,
-                };
-                self.extra()
-                    .then(|| format!("play_sound({}{target})", sound.ident))
-            }
-            PrimitiveCall::StopAllSounds { use_stack_object } => {
-                match (self.sim, use_stack_object) {
-                    (false, false) | (true, true) => Some("stop_all_sounds()".to_owned()),
-                    (true, false) => Some("stop_all_sounds(sim)".to_owned()),
-                    (false, true) => None,
+            PrimitiveCall::PlaySound { sound_id, flags } => self.play_sound(*sound_id, *flags),
+            PrimitiveCall::Padded { call, pad } => match call.as_ref() {
+                PrimitiveCall::PlaySound { sound_id, flags } => {
+                    let [lo, hi] = sound_id.to_le_bytes();
+                    let operands =
+                        apply_operand_pad(23, [lo, hi, 0, 0, *flags, 0, 0, 0], pad).ok()?;
+                    self.play_sound(*sound_id, operands[4])
                 }
+                PrimitiveCall::StopAllSounds { .. } if self.extra() => self.prim_stmt(call),
+                _ => self.builtin(p),
+            },
+            PrimitiveCall::StopAllSounds { use_stack_object } => {
+                let target = self.sound_target(*use_stack_object);
+                if !self.sim && *use_stack_object && !self.extra() {
+                    return None;
+                }
+                Some(format!("stop_all_sounds({target})"))
             }
             PrimitiveCall::RemoveObject { target, flags } => {
                 let mine = if self.sim { 1 } else { 0 };
@@ -3283,6 +3871,38 @@ impl Translator<'_> {
             }
             other => self.builtin(other),
         }
+    }
+
+    /// The empty spelling selects the running object in an object-context tree and the
+    /// stack object in a Sim-context tree.
+    fn sound_target(&self, stack: bool) -> &'static str {
+        match (self.sim, stack) {
+            (false, false) | (true, true) => "",
+            (true, false) => "sim",
+            (false, true) => "stack_obj",
+        }
+    }
+
+    fn play_sound(&self, sound_id: u16, flags: u8) -> Option<String> {
+        // v2 cannot emit 0xff, whose target bit the VM ignores.
+        if flags == 0xff || !self.extra() {
+            return None;
+        }
+        let sound = self
+            .model
+            .sounds
+            .get(&sound_id)
+            .map_or_else(|| sound_id.to_string(), |sound| sound.ident.clone());
+        let target = self.sound_target(flags & 2 != 0);
+        let mut args = vec![sound];
+        if !target.is_empty() {
+            args.push(target.to_owned());
+        }
+        let flags = flags & !2;
+        if flags != 0 {
+            args.push(format!("flags: {flags}"));
+        }
+        Some(format!("play_sound({})", args.join(", ")))
     }
 
     /// Builtins that are the same primitive as a statement or a condition.
@@ -3387,8 +4007,103 @@ impl Translator<'_> {
             } if flags & 0x20 == 0 => format!(
                 "special_effect(duration: {duration}, kind: {kind}, size: {size}, flags: {flags}, str_index: {str_index})"
             ),
-            _ => return None,
+            _ => self.pilot_builtin(p)?,
         })
+    }
+
+    fn pilot_builtin(&self, p: &PrimitiveCall) -> Option<String> {
+        let text = match unpadded(p) {
+            PrimitiveCall::ChangeSuit {
+                index,
+                scope,
+                remove,
+            } => {
+                let remove = if *remove { ", remove: true" } else { "" };
+                format!("change_suit(index: {index}, scope: {scope}{remove})")
+            }
+            PrimitiveCall::Burn { mode, flags } => format!("burn(mode: {mode}, flags: {flags})"),
+            PrimitiveCall::LookTowards { mode } => format!("look_towards(mode: {mode})"),
+            PrimitiveCall::DropOnto {
+                src: SlotSpec::Literal(src),
+                dst: SlotSpec::Literal(dst),
+            } => format!("drop_onto(src: {src}, dst: {dst})"),
+            PrimitiveCall::FindLocation {
+                mode,
+                flags,
+                local: LocalRef::Index(local),
+            } => {
+                let local = if flags & 1 != 0 || *local != 0 {
+                    format!(", local: {}", self.local_name(u16::from(*local))?)
+                } else {
+                    String::new()
+                };
+                format!("find_location(mode: {mode}, flags: {flags}{local})")
+            }
+            PrimitiveCall::Relationship {
+                column,
+                direction,
+                flags,
+                local: LocalRef::Index(local),
+                value,
+            } => {
+                let value = self.local_name(u16::try_from(direct_local(value)?).ok()?)?;
+                let local = if matches!(direction, 2 | 3) || *local != 0 {
+                    format!(", local: {}", self.local_name(u16::from(*local))?)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "relationship(column: {column}, dir: {direction}, flags: {flags}{local}, value: {value})"
+                )
+            }
+            PrimitiveCall::OldRelationship {
+                write,
+                column,
+                param,
+                direction,
+                flags,
+            } => format!(
+                "old_relationship(write: {write}, column: {column}, param: {param}, dir: {direction}, flags: {flags})"
+            ),
+            PrimitiveCall::GenericCall { routine } => format!("generic_call({routine})"),
+            PrimitiveCall::RouteTo {
+                slot,
+                source,
+                flags,
+            } if *source <= 2 => {
+                Self::slot_builtin("route_to", *slot, *flags, "source", *source, 1)
+            }
+            PrimitiveCall::Snap { slot, mode, flags } if *mode <= 4 => {
+                Self::slot_builtin("snap", *slot, *flags, "mode", *mode, 3)
+            }
+            _ => return None,
+        };
+        self.extra().then_some(text)
+    }
+
+    fn slot_builtin(
+        prim: &str,
+        slot: u16,
+        flags: u8,
+        key: &str,
+        value: u16,
+        default: u16,
+    ) -> String {
+        let flags = if flags == 0 {
+            String::new()
+        } else {
+            format!(", flags: {flags}")
+        };
+        let extra = if value == default {
+            String::new()
+        } else {
+            format!(", {key}: {value}")
+        };
+        format!("{prim}({slot}{flags}{extra})")
+    }
+
+    fn local_name(&self, slot: u16) -> Option<String> {
+        (slot < self.named_locals && self.extra()).then(|| format!("slot_{slot}"))
     }
 
     fn rvalue(&self, r: &OperandRef) -> Option<String> {
@@ -3417,6 +4132,7 @@ impl Translator<'_> {
             16 if self.sim && o.index >= 0 && self.extra() => {
                 Some(format!("self.slot[{}]", o.index))
             }
+            3 if self.sim && o.index == 2 && self.extra() => Some("sim.container".to_owned()),
             19 if o.index == 65 => {
                 let p = self.person_binding()?;
                 Some(format!("{p}.kind"))
@@ -3430,6 +4146,31 @@ impl Translator<'_> {
     fn person_binding(&self) -> Option<&str> {
         let p = self.sims_loop.as_deref()?;
         self.extra().then_some(p)
+    }
+
+    fn personality(&self, handle: &str, index: i16) -> Option<String> {
+        let trait_name = match index {
+            2 => "nice",
+            3 => "active",
+            5 => "playful",
+            6 => "outgoing",
+            7 => "neat",
+            _ => return None,
+        };
+        self.extra()
+            .then(|| format!("{handle}.personality.{trait_name}"))
+    }
+
+    /// Numeric uses of the same word keep the `.data[8]` spelling: `.flags` is typed.
+    fn flags_place(&self, r: &OperandRef) -> Option<String> {
+        let handle = if is_operand(r, 4, 8) {
+            self.cursor.as_deref().unwrap_or("stack_obj")
+        } else if !self.sim && is_operand(r, 3, 8) {
+            "self"
+        } else {
+            return None;
+        };
+        Some(format!("{handle}.flags"))
     }
 
     fn lvalue(&self, r: &OperandRef) -> Option<String> {
@@ -3448,7 +4189,11 @@ impl Translator<'_> {
                 4 => return Some(format!("{c}.data[{i}]")),
                 16 => return Some(format!("{c}.slot[{i}]")),
                 19 if i == 65 => return Some(format!("{c}.kind")),
-                19 => return Some(format!("{c}.person[{i}]")),
+                19 => {
+                    return self
+                        .personality(c, i)
+                        .or_else(|| Some(format!("{c}.person[{i}]")));
+                }
                 10 | 13 | 15 | 27 => return None,
                 _ => {}
             }
@@ -3459,11 +4204,20 @@ impl Translator<'_> {
             (10, _) if i == 0 => "stack_obj".to_owned(),
             (0, false) | (1, true) if i <= self.model.state_limit => format!("self.attr_{i}"),
             (3, false) => format!("self.data[{i}]"),
+            (0, true) if i <= 255 && self.extra() => format!("sim.attr[{i}]"),
+            (3, true) if i <= 255 && self.extra() => format!("sim.data[{i}]"),
+            (4, _) if i == 8 && self.extra() => "stack_obj.data[8]".to_owned(),
             (14, true) => format!("sim.motive[{i}]"),
-            (18, true) => format!("sim.person[{i}]"),
+            (18, true) => self
+                .personality("sim", i)
+                .unwrap_or_else(|| format!("sim.person[{i}]")),
             (9, _) if !(self.in_handler && i == 0) && self.extra() => format!("param[{i}]"),
-            (19, _) => format!("{}.person[{i}]", self.person_binding()?),
-            (25, _) if (i as u16) < self.animate_locals && self.extra() => format!("slot_{i}"),
+            (19, _) => {
+                let binding = self.person_binding();
+                self.personality(binding.unwrap_or("stack_obj"), i)
+                    .or_else(|| binding.map(|p| format!("{p}.person[{i}]")))?
+            }
+            (25, _) => self.local_name(i as u16)?,
             _ => return None,
         })
     }

@@ -613,6 +613,48 @@ fn builtins_that_write_a_local_assign_it() {
     one(&source, "uninitialized_local_read");
 }
 
+#[test]
+fn relationship_reads_into_its_value_local() {
+    // Without flag 4 `relationship(value:)` reads the number into the local.
+    for flags in ["0", "1", "SOME_FLAGS"] {
+        let source = sim_tree(&format!(
+            "        let n: i16;\n        relationship(column: 0, dir: 0, flags: {flags}, local: 0, value: n);\n        self.level = n;"
+        ));
+        let source = if flags == "SOME_FLAGS" {
+            source.replace("object \"", "const SOME_FLAGS = 0;\nobject \"")
+        } else {
+            source
+        };
+        // A call statement goes on when the row is missing (false, `n` unwritten).
+        one(&source, "uninitialized_local_read");
+        none(&source, "unused_decl");
+        // As `?` or a test, the read follows a true result, which wrote `n`.
+        for form in [
+            format!(
+                "relationship(column: 0, dir: 0, flags: {flags}, local: 0, value: n)?;\n        self.level = n;"
+            ),
+            format!(
+                "if relationship(column: 0, dir: 0, flags: {flags}, local: 0, value: n) {{\n            self.level = n;\n        }}"
+            ),
+        ] {
+            let source = sim_tree(&format!("        let n: i16;\n        {form}"));
+            let source = if flags == "SOME_FLAGS" {
+                source.replace("object \"", "const SOME_FLAGS = 0;\nobject \"")
+            } else {
+                source
+            };
+            none(&source, "uninitialized_local_read");
+        }
+    }
+    // With flag 4 it writes the relationship from the local: a read.
+    one(
+        &sim_tree(
+            "        let n: i16;\n        relationship(column: 0, dir: 0, flags: 4, local: 0, value: n);\n        self.level = n;",
+        ),
+        "uninitialized_local_read",
+    );
+}
+
 // --- $Local:N string tokens -------------------------------------------------------------
 
 /// A Sim tree whose dialog shows the string `hi`.
@@ -620,6 +662,44 @@ fn dialog_tree(text: &str, body: &str) -> String {
     obj(&format!(
         "    strings 301 \"Dialog prim string set\" {{ hi = \"{text}\" }}\n    tree probe \"Probe\" (sim: Sim) {{\n        self.level = 0;\n        self.mode = Mode::Off;\n{body}\n        dialog(kind: 0, message: hi, title: hi)?;\n    }}"
     ))
+}
+
+#[test]
+fn locals_of_trees_showing_strings_the_file_does_not_hold_may_be_read() {
+    // A dialog's `STR#` 301 number past the file's own entries (the object's spliced
+    // table), or `show_string` by number: the text, and its `$Local:N` tokens, are
+    // unknown, so no local is reported unread.
+    let unread = "        let shown = random(7);";
+    for (members, call) in [
+        ("", "dialog(kind: 0, message: 3, title: 3)?;"),
+        (
+            "    strings 301 \"Dialog prim string set\" { hi = \"Hi\" }\n",
+            "dialog(kind: 0, message: 2, title: hi)?;",
+        ),
+        ("", "action_label(table: 431, index: 2);"),
+    ] {
+        let source = obj(&format!(
+            "{members}    tree probe \"Probe\" (sim: Sim) {{\n        self.level = 0;\n        self.mode = Mode::Off;\n{unread}\n        {call}\n    }}"
+        ));
+        none(&source, "unused_decl");
+    }
+    // The file's own entry without a token leaves it unread.
+    let source = dialog_tree("Hi", unread);
+    one(&source, "unused_decl");
+}
+
+#[test]
+fn a_local_read_by_an_action_label_token_is_used() {
+    let source = obj(
+        "    strings 431 \"Labels\" { a = \"$Local:1\" }\n    tree probe \"Probe\" (sim: Sim) {\n        self.level = 0;\n        self.mode = Mode::Off;\n        let shown = random(7);\n        action_label(table: 431, index: 1);\n    }",
+    );
+    none(&source, "unused_decl");
+    none(&source, "dialog_local_slot_mismatch");
+    // Show String formats no token: its text reads nothing.
+    let source = obj(
+        "    strings 431 \"Labels\" { a = \"$Local:1\" }\n    tree probe \"Probe\" (sim: Sim) {\n        self.level = 0;\n        self.mode = Mode::Off;\n        let shown = random(7);\n        show_string(table: 431, index: 1);\n    }",
+    );
+    one(&source, "unused_decl");
 }
 
 #[test]
@@ -727,6 +807,41 @@ fn a_raw_block_ending_in_a_bare_call_before_more_code_is_flagged() {
 }
 
 #[test]
+fn allow_directives_work_inside_raw() {
+    let wrap = |raw: &str| {
+        obj(&format!(
+            "    @id(4300) tree probe \"Probe\" {{\n        self.mode = Mode::Off;\n        raw {{\n            temp[0] := 1;\n{raw}\n        }}\n        self.level = 1;\n    }}\n    @id(4301) tree other \"Other\" {{ return true; }}"
+        ))
+    };
+    // Trailing the call's line, in `.air`'s `//` or `#` comment form.
+    for raw in [
+        "            call 4301(temps); // antics-lint: allow(raw_bare_call_false_exit)",
+        "            call 4301(temps); # antics-lint: allow(raw_bare_call_false_exit)",
+        // On its own line: covers the next line of code.
+        "            # antics-lint: allow(raw_bare_call_false_exit)\n\n            call 4301(temps);",
+    ] {
+        let source = wrap(raw);
+        none(&source, "raw_bare_call_false_exit");
+        none(&source, "unknown_lint_rule");
+    }
+    // On another line, for another rule, or as `//!`: the call is still reported.
+    for raw in [
+        "            call 4301(temps);\n            # antics-lint: allow(raw_bare_call_false_exit)",
+        "            call 4301(temps); # antics-lint: allow(while_true)",
+        "            //! antics-lint: allow(raw_bare_call_false_exit)\n            temp[1] := 2;\n            call 4301(temps);",
+    ] {
+        one(&wrap(raw), "raw_bare_call_false_exit");
+    }
+    // A `#` inside an `.air` string is not a comment.
+    one(
+        &wrap(
+            "            temp[1] := \"# antics-lint: allow(raw_bare_call_false_exit)\";\n            call 4301(temps);",
+        ),
+        "raw_bare_call_false_exit",
+    );
+}
+
+#[test]
 fn guarded_or_final_raw_calls_are_fine() {
     let other = "\n    @id(4301) tree other \"Other\" { return true; }";
     for body in [
@@ -829,6 +944,152 @@ fn a_const_written_as_its_value_in_raw_is_used() {
             "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { temp[7] := 1; }\n    }",
         ),
         "unused_decl",
+    );
+}
+
+#[test]
+fn a_const_named_only_in_raw_is_not_used() {
+    // The build rejects the name in `raw`: say so instead of counting it as a use.
+    let d = one(
+        &obj(
+            "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { temp[0] := LEVEL_SLOT; }\n    }",
+        ),
+        "unused_decl",
+    );
+    assert!(d.message.contains("only named inside `raw"), "{d:?}");
+    assert!(
+        d.note
+            .as_deref()
+            .unwrap()
+            .contains("does not resolve `const`"),
+        "{d:?}"
+    );
+    assert_eq!(
+        d.help.as_deref(),
+        Some("write its value, 7, in the `raw` body")
+    );
+}
+
+#[test]
+fn a_const_named_in_a_raw_comment_or_string_is_just_unused() {
+    for raw in [
+        "raw { /* ROOM */ temp[0] := 1; }",
+        "raw { temp[0] := 1; # ROOM\n }",
+        "raw { temp[0] := \"ROOM \\\" ROOM\"; }",
+    ] {
+        let d = one(
+            &obj(&format!(
+                "    const ROOM = 2;\n    tree probe \"Probe\" {{\n        self.mode = Mode::Off;\n        self.level = 0;\n        {raw}\n    }}"
+            )),
+            "unused_decl",
+        );
+        assert!(d.message.contains("never used"), "{raw}: {d:?}");
+    }
+}
+
+#[test]
+fn negated_comparisons_storing_a_local_are_fine() {
+    // An unwritten local may fault before the store replaces the last result.
+    none(
+        &tree(
+            "        let x: i16;\n        if !(temp[0] > 0) { temp[1] = x; } else { temp[1] = 0; }\n        temp[2] = 3;",
+        ),
+        "negated_comparison",
+    );
+    // A `const` cannot.
+    one(
+        &obj(
+            "    const K = 2;\n    tree probe \"Probe\" {\n        self.level = 0;\n        if !(temp[0] > 0) { temp[1] = K; } else { temp[1] = 0; }\n        temp[2] = 3;\n    }",
+        ),
+        "negated_comparison",
+    );
+}
+
+#[test]
+fn a_raw_action_string_may_read_any_local() {
+    let source = obj(
+        "    strings 431 \"Labels\" { a = \"$Local:0\" }\n    tree probe \"Probe\" {\n        self.level = 0;\n        self.mode = Mode::Off;\n        let shown = 7;\n        raw { action_string(table: 431, index: 1); }\n    }",
+    );
+    none(&source, "unused_decl");
+}
+
+#[test]
+fn a_const_matching_an_index_in_a_raw_label_is_unused() {
+    let d = one(
+        &obj(
+            "    const ROOM = 7;\n    @id(4300) tree probe \"Probe\" {\n        self.level = 0;\n        self.mode = Mode::Off;\n        raw { call \"ROOM attr[7]\"(temps); }\n    }\n    @id(4301) tree other \"ROOM attr[7]\" { return true; }",
+        ),
+        "unused_decl",
+    );
+    assert!(d.message.contains("never used"), "{d:?}");
+}
+
+#[test]
+fn raw_bare_calls_are_reported_on_their_own_line() {
+    let wrap = |pre: &str, raw: &str| {
+        obj(&format!(
+            "    @id(4300) tree probe \"Probe\" {{\n        self.mode = Mode::Off;\n{pre}{raw}\n        self.level = 1;\n    }}\n    @id(4301) tree other \"Other\" {{ return true; }}"
+        ))
+    };
+    let line_of = |source: &str, needle: &str| {
+        source
+            .lines()
+            .position(|l| l.contains(needle))
+            .map(|n| n + 1)
+            .unwrap()
+    };
+    // `raw`, `{`, a directive for another rule and the call on successive lines.
+    let source = wrap(
+        "",
+        "        raw\n        {\n            # antics-lint: allow(while_true)\n            call 4301(temps);\n        }",
+    );
+    let d = one(&source, "raw_bare_call_false_exit");
+    assert_eq!(d.line, line_of(&source, "call 4301"), "{d:?}");
+    // ... and with that directive for this rule, the call is not reported.
+    none(
+        &wrap(
+            "",
+            "        raw\n        {\n            # antics-lint: allow(raw_bare_call_false_exit)\n            call 4301(temps);\n        }",
+        ),
+        "raw_bare_call_false_exit",
+    );
+    // A commented-out copy of the call earlier in the block does not take its place.
+    let source = wrap(
+        "",
+        "        raw {\n            /* call 4301(temps); */\n            temp[0] := 1;\n            call 4301(temps);\n        }",
+    );
+    let d = one(&source, "raw_bare_call_false_exit");
+    assert_eq!(d.line, line_of(&source, "            call 4301"), "{d:?}");
+    // Multi-byte text before a `raw` with a commented `raw` ahead of it.
+    let source = wrap(
+        "",
+        "        dialog(\"\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\"); /*raw*/ raw {\n            temp[0] := 1;\n            call 4301(temps);\n        }",
+    );
+    let d = one(&source, "raw_bare_call_false_exit");
+    assert_eq!(d.line, line_of(&source, "call 4301"), "{d:?}");
+    assert_eq!(d.column, 13, "{d:?}");
+}
+
+#[test]
+fn raw_directives_after_labels_and_before_the_brace() {
+    let wrap = |raw: &str| {
+        obj(&format!(
+            "    @id(4300) tree probe \"Probe\" {{\n        self.mode = Mode::Off;\n{raw}\n        self.level = 1;\n    }}\n    @id(4301) tree other \"Other\" {{ return true; }}"
+        ))
+    };
+    // A label on its own line: the call's trailing directive covers it.
+    none(
+        &wrap(
+            "        raw {\n            temp[0] := 1;\n            @where:\n            call 4301(temps); # antics-lint: allow(raw_bare_call_false_exit)\n        }",
+        ),
+        "raw_bare_call_false_exit",
+    );
+    // `//!` between `raw` and `{` is a v2 comment: file level.
+    none(
+        &wrap(
+            "        raw //! antics-lint: allow(raw_bare_call_false_exit)\n        {\n            temp[0] := 1;\n            call 4301(temps);\n        }",
+        ),
+        "raw_bare_call_false_exit",
     );
 }
 
@@ -952,39 +1213,123 @@ fn if_returning_bool_literals_is_flagged() {
     );
     let d = one(&source, "redundant_bool_return");
     assert_eq!(d.suggestion.as_deref(), Some("return self.on;"));
-    let inverted = obj(
-        "    state on: bool;\n    fn low() -> bool {\n        if self.on { return false; } else { return true; }\n    }",
+    let with_else = obj(
+        "    state on: bool;\n    fn high() -> bool {\n        if self.on { return true; } else { return false; }\n    }",
     );
     assert_eq!(
-        one(&inverted, "redundant_bool_return")
+        one(&with_else, "redundant_bool_return")
             .suggestion
             .as_deref(),
-        Some("return !self.on;")
-    );
-    // A negated condition returning false is the operand, not `!!`.
-    let negated = obj(
-        "    state on: bool;\n    fn on() -> bool {\n        if !self.on { return false; }\n        return true;\n    }",
-    );
-    assert_eq!(
-        one(&negated, "redundant_bool_return").suggestion.as_deref(),
         Some("return self.on;")
     );
 }
 
 #[test]
-fn if_returning_a_comparison_keeps_its_last_result() {
-    // `return a op b;` lowers with the opposite last result: not reported.
-    for cond in [
-        "self.level > 3",
-        "!(self.level > 3)",
-        "self.on && self.level == 2",
+fn if_returning_a_comparison_is_flagged_in_the_same_polarity() {
+    // `return c;` ends on the node testing `c` with the same exits: the same last result.
+    for (cond, returned) in [
+        ("self.level > 3", "self.level > 3"),
+        ("!(self.level > 3)", "!(self.level > 3)"),
+        ("self.on && self.level == 2", "self.on && (self.level == 2)"),
     ] {
-        none(
+        let d = one(
             &obj(&format!(
                 "    state on: bool;\n    fn high() -> bool {{\n        if {cond} {{ return true; }}\n        return false;\n    }}"
             )),
             "redundant_bool_return",
         );
+        assert_eq!(d.suggestion, Some(format!("return {returned};")));
+    }
+}
+
+#[test]
+fn if_returning_a_test_that_may_fold_or_a_deferred_block_is_fine() {
+    for body in [
+        // `1 < 2` folds away: the `if` leaves the earlier compare's result, where
+        // `return 1 < 2;` would run a compare.
+        "        if self.level > 0 { return false; }\n        if 1 < 2 { return true; }\n        return false;",
+        "        if self.level > 0 && true { return true; }\n        return false;",
+        // A `defer` runs before each `return`: the two forms lower differently.
+        "        defer { self.level = 0; }\n        if self.level > 3 { return true; }\n        return false;",
+    ] {
+        none(
+            &obj(&format!("    fn high() -> bool {{\n{body}\n    }}")),
+            "redundant_bool_return",
+        );
+    }
+}
+
+#[test]
+fn if_returning_a_call_with_a_literal_argument_is_flagged() {
+    // A `bool` literal among a call's arguments does not make its test fold.
+    let d = one(
+        &obj(
+            "    fn ran() -> bool {\n        if stack_obj.run_functional(4, change_icon: true) { return true; }\n        return false;\n    }",
+        ),
+        "redundant_bool_return",
+    );
+    assert_eq!(
+        d.suggestion.as_deref(),
+        Some("return stack_obj.run_functional(4, change_icon: true);")
+    );
+}
+
+#[test]
+fn if_returning_a_long_chain_or_inside_a_lock_is_fine() {
+    for body in [
+        // Three tests: `return` lowers the chain through a local.
+        "        if temp[0] > 3 && temp[1] == 2 && temp[2] < 1 { return true; }\n        return false;",
+        "        if temp[0] > 3 || temp[1] == 2 { return true; }\n        return false;",
+        // `return` inside `with lock` leaves through the unlock, after the test.
+        "        with lock(self.on) {\n            if temp[0] > 0 { return true; }\n            return false;\n        }\n        return false;",
+    ] {
+        none(
+            &obj(&format!(
+                "    state on: bool;\n    fn high() -> bool {{\n{body}\n    }}"
+            )),
+            "redundant_bool_return",
+        );
+    }
+}
+
+#[test]
+fn suggestions_spell_valid_v2() {
+    // An operand that is itself a comparison keeps its parentheses.
+    let d = one(
+        &obj(
+            "    state on: bool;\n    tree probe \"Probe\" {\n        self.level = 0;\n        if !((temp[0] > 0) == self.on) { temp[1] = 1; } else { temp[1] = 2; }\n        temp[2] = 3;\n    }",
+        ),
+        "negated_comparison",
+    );
+    assert_eq!(d.suggestion.as_deref(), Some("(temp[0] > 0) != self.on"));
+    // A non-ASCII space stays itself; v2 has no `\u{..}` escape.
+    let d = one(
+        &obj(
+            "    fn ask() -> bool {\n        if dialog(kind: 0, message: \"Hi\u{a0}there\") { return true; }\n        return false;\n    }",
+        ),
+        "redundant_bool_return",
+    );
+    assert_eq!(
+        d.suggestion.as_deref(),
+        Some("return dialog(kind: 0, message: \"Hi\u{a0}there\");")
+    );
+}
+
+#[test]
+fn if_returning_false_then_true_keeps_its_last_result() {
+    // `return !c;` would end on the opposite last result: never reported.
+    for cond in ["self.on", "!self.on", "self.level > 3", "!(self.level > 3)"] {
+        for shape in [
+            format!("if {cond} {{ return false; }}\n        return true;"),
+            format!("if {cond} {{ return false; }} else {{ return true; }}"),
+        ] {
+            none(
+                &obj(&format!(
+                    "    state on: bool;\n    fn low() -> bool {{\n        {shape}\n    }}"
+                )),
+                "redundant_bool_return",
+            );
+        }
     }
 }
 
@@ -1112,7 +1457,7 @@ fn inline_guid_literals_in_bodies_are_flagged() {
 #[test]
 fn negated_comparisons_are_flagged_with_a_polarity_note() {
     let source = tree(
-        "        if !(self.level == 3) { sleep(1); }\n        if !(self.level < temp[0]) { sleep(1); }\n        sleep(2);",
+        "        if !(self.level == 3) { temp[0] = 1; }\n        temp[2] = 0;\n        if !(self.level < temp[0]) { self.level = temp[1] + 1; }\n        self.mode = Mode::Low;\n        sleep(2);",
     );
     let found = of(&source, "negated_comparison");
     let suggestions: Vec<&str> = found
@@ -1121,6 +1466,11 @@ fn negated_comparisons_are_flagged_with_a_polarity_note() {
         .collect();
     assert_eq!(suggestions, ["self.level != 3", "self.level >= temp[0]"]);
     assert!(found[0].note.as_deref().unwrap().contains("polarity"));
+    // Both branches go on to a store that cannot fault.
+    one(
+        &tree("        while !(self.level > 3) { self.level += 1; }\n        temp[0] = 2;"),
+        "negated_comparison",
+    );
 }
 
 #[test]
@@ -1128,19 +1478,51 @@ fn negated_comparisons_a_branch_may_end_on_are_fine() {
     // A branch that can end the tree right after the compare leaves its result as the
     // tree's last result: flipping it would change that.
     for body in [
-        "        if !(self.level == 3) { sleep(1); }",
-        "        if !(self.level == 3) { return true; }\n        sleep(1);",
-        "        if !(self.level == 3) { sleep(1); }\n        return false;",
+        "        if !(self.level == 3) { temp[0] = 1; }",
+        "        if !(self.level == 3) { return true; }\n        temp[0] = 1;",
+        "        if !(self.level == 3) { temp[0] = 1; }\n        return false;",
         "        while !(self.level > 3) { self.level += 1; }",
         // A test of constants folds away: the `return` right after is the next node.
-        "        if !(self.level == 3) {\n            if true { return true; }\n        }\n        sleep(1);",
-        "        if !(self.level == 3) {\n            if true || self.level == 0 { return true; }\n        }\n        sleep(1);",
+        "        if !(self.level == 3) {\n            if true { return true; }\n        }\n        temp[0] = 1;",
+        "        if !(self.level == 3) {\n            if true || self.level == 0 { return true; }\n        }\n        temp[0] = 1;",
     ] {
         none(&tree(body), "negated_comparison");
     }
-    // Both branches run a node first.
+}
+
+#[test]
+fn negated_comparisons_before_a_call_or_a_fault_are_fine() {
+    // The last result is observable at a call (the callee and the verifier see it) and
+    // at a fault, so the compare's own result may be the one that shows.
+    for body in [
+        "        if !(self.level == 3) { sleep(1); }\n        temp[0] = 1;",
+        "        if !(self.level == 3) { temp[0] = 1; }\n        sleep(1);",
+        "        while !(self.level > 3) { self.level += 1; }\n        sleep(1);",
+        "        if !(self.level == 3) { temp[0] = 1; }\n        temp[1] = temp[0] / 2;",
+        "        if !(self.level == 3) { temp[0] = 1; }\n        temp[1] = temp[temp[0]];",
+        // A store to a `let` may be folded away.
+        "        let n = 0;\n        if !(self.level == 3) { n = 1; }\n        temp[0] = n;",
+        // `temp[8]` is past the temps: the store faults.
+        "        if !(temp[0] > 0) { temp[8] = 1; } else { temp[1] = 2; }\n        temp[3] = 1;",
+        // A flag operation faults on a bit out of range.
+        "        if !(temp[0] > 0) { temp[1] = 1; } else { temp[1] flag_set temp[2]; }\n        temp[3] = 1;",
+        // A test may fold away (`-1 < 0`), and then the tree ends on the compare.
+        "        if !(temp[0] > 0) {\n            if -1 < 0 {}\n        } else {\n            temp[1] = 2;\n        }\n        return true;",
+        // A test of places is not counted either.
+        "        if !(temp[0] > 0) { temp[1] = 1; }\n        if temp[2] == 2 { sleep(1); }",
+        // A field of `self` that is not a `state` may lower to a primitive.
+        "        if !(temp[0] > 0) { self.price = 1; }\n        temp[3] = 1;",
+    ] {
+        none(&tree(body), "negated_comparison");
+    }
+    // In a Sim's body `self` follows `stack_obj`, which may be missing: a store to it
+    // can fault.
+    none(
+        &sim_tree("        if !(self.level == 3) { self.level = 1; }\n        temp[0] = 1;"),
+        "negated_comparison",
+    );
     one(
-        &tree("        while !(self.level > 3) { self.level += 1; }\n        sleep(1);"),
+        &sim_tree("        if !(temp[0] == 3) { temp[1] = 1; }\n        temp[2] = 1;"),
         "negated_comparison",
     );
 }
