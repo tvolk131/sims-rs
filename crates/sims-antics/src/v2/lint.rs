@@ -185,7 +185,7 @@ pub fn lint_v2_paths(paths: &[PathBuf]) -> Result<(Vec<LintDiagnostic>, BTreeMap
         let source = std::fs::read_to_string(&path)
             .map_err(|e| Error::new(format!("failed to read {}: {e}", path.display())))?;
         // `.air` shares the extension; it is not v2.
-        if !crate::v2::is_v2_source(&source) {
+        if !is_lintable_v2(&source) {
             continue;
         }
         inputs.push(LintInput {
@@ -198,6 +198,20 @@ pub fn lint_v2_paths(paths: &[PathBuf]) -> Result<(Vec<LintDiagnostic>, BTreeMap
     let diagnostics = lint_v2_sources(&inputs)?;
     let sources = inputs.into_iter().map(|i| (i.name, i.source)).collect();
     Ok((diagnostics, sources))
+}
+
+/// Whether `source` is linted as v2 rather than skipped as `.air` (Antics IR), which shares
+/// the extension.
+///
+/// [`crate::v2::is_v2_source`] decides by the first keyword, which misses a v2 file that
+/// starts with `const` (both languages have it). So a file is also v2 when it parses as
+/// v2, or when it parses as neither, so that its syntax error is reported rather than the
+/// file skipped.
+#[must_use]
+pub fn is_lintable_v2(source: &str) -> bool {
+    crate::v2::is_v2_source(source)
+        || parse_v2_file(source).is_ok()
+        || crate::parser::parse_module(source).is_err()
 }
 
 /// The nearest ancestor directory of `path` holding a `pack.toml`.
@@ -230,12 +244,13 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
     }
 
     let mut out = Vec::new();
-    for (input, ast, _) in &parsed {
-        let directives = Directives::scan(&input.source);
+    for (input, ast, tokens) in &parsed {
+        let directives = Directives::scan(&input.source, tokens);
         let mut cx = FileLinter {
             file: &input.name,
             lines: input.source.lines().collect(),
             symbols: &symbols,
+            enums: symbols.file_enums(ast),
             diags: Vec::new(),
         };
         cx.lint_file(ast);
@@ -301,8 +316,25 @@ impl Directives {
         self.file.contains(rule) || self.lines.get(&line).is_some_and(|s| s.contains(rule))
     }
 
-    fn scan(source: &str) -> Self {
+    fn scan(source: &str, tokens: &[crate::v2::lexer::Token]) -> Self {
         let lines: Vec<&str> = source.lines().collect();
+        let line_starts: Vec<usize> = std::iter::once(0)
+            .chain(source.match_indices('\n').map(|(i, _)| i + 1))
+            .collect();
+        // `raw { }` bodies follow `.air` comment and string rules, so they are skipped
+        // whole: byte offset of each `raw` keyword -> one past its closing `}`.
+        let raw_ends: BTreeMap<usize, usize> = tokens
+            .iter()
+            .filter_map(|t| {
+                let TokenKind::RawBlock(body) = &t.kind else {
+                    return None;
+                };
+                let start = line_starts.get(t.span.line.checked_sub(1)?)? + t.span.column - 1;
+                let open = start + source.get(start..)?.find('{')?;
+                Some((start, open + 1 + body.len() + 1))
+            })
+            .collect();
+        let mut skip_until = 0usize;
         // Per line: whether it holds code, and its line comment (column, text after `//`).
         let mut code = vec![false; lines.len()];
         let mut comments: Vec<Option<(usize, String)>> = vec![None; lines.len()];
@@ -312,6 +344,12 @@ impl Directives {
             let b = line.as_bytes();
             let mut i = 0;
             while i < b.len() {
+                let offset = line_starts[n] + i;
+                if offset < skip_until {
+                    code[n] |= !b[i].is_ascii_whitespace();
+                    i += 1;
+                    continue;
+                }
                 if block_depth > 0 {
                     if b[i..].starts_with(b"*/") {
                         block_depth -= 1;
@@ -342,6 +380,10 @@ impl Directives {
                 if b[i..].starts_with(b"/*") {
                     block_depth += 1;
                     i += 2;
+                    continue;
+                }
+                if let Some(&end) = raw_ends.get(&offset) {
+                    skip_until = end;
                     continue;
                 }
                 if b[i] == b'"' {
@@ -457,7 +499,7 @@ impl Symbols {
                     }
                 }
                 TokenKind::RawBlock(code) => {
-                    self.bcon_by_number |= code.contains("bcon[");
+                    self.bcon_by_number |= raw_indexes(code, "bcon");
                     for w in code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
                         if !w.is_empty() {
                             self.raw_words.insert(w.to_owned());
@@ -511,14 +553,46 @@ impl Symbols {
 
     fn add_enum(&mut self, name: &str, variants: &[crate::v2::ast::EnumVariant]) {
         let names: Vec<String> = variants.iter().map(|v| v.name.clone()).collect();
-        self.enums
-            .entry(name.to_owned())
-            .and_modify(|e| {
-                if e.as_ref() != Some(&names) {
-                    *e = None;
+        merge_enum(&mut self.enums, name, Some(names));
+    }
+
+    /// The enums a file can name: its own declarations, then its `use` imports (under
+    /// their alias) resolved against the file set. A name this cannot pin to one variant
+    /// list maps to `None`; a name neither declared nor imported is absent.
+    fn file_enums(&self, file: &V2File) -> BTreeMap<String, Option<Vec<String>>> {
+        let mut local = BTreeMap::new();
+        let mut add = |e: &crate::v2::ast::EnumDecl| {
+            let names = e.variants.iter().map(|v| v.name.clone()).collect();
+            merge_enum(&mut local, &e.name, Some(names));
+        };
+        for item in &file.items {
+            let members = match item {
+                V2Item::Enum(e) => {
+                    add(e);
+                    continue;
                 }
-            })
-            .or_insert(Some(names));
+                V2Item::Object(o) => &o.members,
+                V2Item::Template(t) => &t.members,
+                _ => continue,
+            };
+            for m in members {
+                if let ObjectMember::Enum(e) = m {
+                    add(e);
+                }
+            }
+        }
+        let mut imported = BTreeMap::new();
+        for u in &file.uses {
+            for item in &u.items {
+                let name = item.alias.as_deref().unwrap_or(&item.name);
+                if !local.contains_key(name) {
+                    let target = self.enums.get(&item.name).cloned().flatten();
+                    merge_enum(&mut imported, name, target);
+                }
+            }
+        }
+        local.extend(imported);
+        local
     }
 
     fn add_fn(&mut self, f: &FnDecl) {
@@ -812,8 +886,8 @@ fn pattern_text(e: &V2Expr) -> Option<String> {
             V2Expr::Int(_, v) => Some(format!("-{v}")),
             _ => None,
         },
-        V2Expr::Ident(_, n) if n != "self" && n != "true" && n != "false" => Some(n.clone()),
-        V2Expr::Path(_, segs) => Some(segs.join("::")),
+        V2Expr::Path(_, segs) if segs.len() == 2 => Some(segs.join("::")),
+        // A `match` arm takes no other identifier, not even a `const`.
         _ => None,
     }
 }
@@ -873,7 +947,69 @@ struct FileLinter<'a> {
     file: &'a str,
     lines: Vec<&'a str>,
     symbols: &'a Symbols,
+    /// Enums this file can name (see `Symbols::file_enums`).
+    enums: BTreeMap<String, Option<Vec<String>>>,
     diags: Vec<LintDiagnostic>,
+}
+
+/// Whether the operands of raw `.air` primitive `word` (`args` is the text after its name)
+/// have a v2 spelling: `name()` for argless ones, otherwise only `key: <literal>` pairs, and
+/// none of the flag bits that make the VM read an operand from a local slot.
+fn native_operands(word: &str, args: &str) -> bool {
+    let Some(inner) = args.strip_prefix('(').and_then(|a| a.strip_suffix(')')) else {
+        return false;
+    };
+    let inner = inner.trim();
+    if matches!(word, "notify_idle" | "breakpoint") {
+        return inner.is_empty();
+    }
+    let literal = |v: &str| -> Option<i64> {
+        let (neg, digits) = v.strip_prefix('-').map_or((false, v), |d| (true, d));
+        let n = match digits
+            .strip_prefix("0x")
+            .or_else(|| digits.strip_prefix("0X"))
+        {
+            Some(hex) => i64::from_str_radix(&hex.replace('_', ""), 16).ok()?,
+            None => digits.replace('_', "").parse().ok()?,
+        };
+        Some(if neg { -n } else { n })
+    };
+    !inner.is_empty()
+        && inner.split(',').all(|arg| {
+            let Some((key, value)) = arg.split_once(':') else {
+                return false;
+            };
+            let value = value.trim();
+            match literal(value) {
+                // `special_effect` flag 0x20 reads the duration from a local.
+                Some(n) => !(word == "special_effect" && key.trim() == "flags" && n & 0x20 != 0),
+                None => matches!(value, "true" | "false"),
+            }
+        })
+}
+
+/// Whether `.air` text indexes `word` by number (`word[`, spaces allowed before the `[`).
+fn raw_indexes(code: &str, word: &str) -> bool {
+    code.match_indices(word).any(|(at, _)| {
+        let before = code[..at].chars().next_back();
+        !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            && code[at + word.len()..].trim_start().starts_with('[')
+    })
+}
+
+/// Records `name`'s variants, or `None` once two declarations of it disagree.
+fn merge_enum(
+    map: &mut BTreeMap<String, Option<Vec<String>>>,
+    name: &str,
+    variants: Option<Vec<String>>,
+) {
+    map.entry(name.to_owned())
+        .and_modify(|e| {
+            if *e != variants {
+                *e = None;
+            }
+        })
+        .or_insert(variants);
 }
 
 /// What kind of body a statement list is.
@@ -1181,7 +1317,7 @@ impl FileLinter<'_> {
         let Some(name) = enum_name else {
             return;
         };
-        let Some(Some(variants)) = self.symbols.enums.get(name) else {
+        let Some(Some(variants)) = self.enums.get(name) else {
             return;
         };
         if named.iter().any(|n| !variants.iter().any(|v| v == n)) {
@@ -1320,7 +1456,8 @@ impl FileLinter<'_> {
                         ended = true;
                         continue;
                     }
-                    true
+                    // `stack_obj = stack_obj;` changes nothing.
+                    !is_ident(value, "stack_obj")
                 }
                 // `find_best_interaction()` leaves its pick in `stack_obj`.
                 other => {
@@ -1444,6 +1581,11 @@ impl FileLinter<'_> {
             let (Some(k), Some(v)) = (place_key(lhs), pattern_text(rhs)) else {
                 return;
             };
+            if let V2Expr::Path(_, segs) = rhs.as_ref()
+                && !self.enums.contains_key(&segs[0])
+            {
+                return;
+            }
             if key.as_ref().is_some_and(|x| *x != k) || values.contains(&v) {
                 return;
             }
@@ -1483,7 +1625,10 @@ impl FileLinter<'_> {
         // One `.air` statement per entry.
         let lines: Vec<&str> = code
             .lines()
-            .flat_map(|l| l.split("//").next().unwrap_or("").split(';'))
+            .flat_map(|l| {
+                let l = l.split("//").next().unwrap_or("");
+                l.split('#').next().unwrap_or("").split(';')
+            })
             .map(str::trim)
             .filter(|l| !l.is_empty())
             .collect();
@@ -1507,6 +1652,9 @@ impl FileLinter<'_> {
             let Some((_, v2)) = RAW_BUILTINS.iter().find(|(air, _)| *air == word) else {
                 return;
             };
+            if !native_operands(&word, l[word.len()..].trim()) {
+                return;
+            }
             if !spellings.contains(v2) {
                 spellings.push(*v2);
             }
@@ -1535,13 +1683,15 @@ impl FileLinter<'_> {
         }
         let rest = &list[i + 1..];
         let mut read = false;
+        // A raw block that addresses `local[N]` may be reading or writing this binding's
+        // slot, which the source does not say.
+        let mut by_slot = false;
         walk_stmts(rest, &mut |s| {
-            if let V2Stmt::RawAir { code, .. } = s
-                && code
+            if let V2Stmt::RawAir { code, .. } = s {
+                read |= code
                     .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                    .any(|w| w == name)
-            {
-                read = true;
+                    .any(|w| w == name);
+                by_slot |= raw_indexes(code, "local");
             }
             for (k, e) in stmt_exprs(s).into_iter().enumerate() {
                 // The target of a plain `x = ...` is a write, not a read.
@@ -1560,6 +1710,9 @@ impl FileLinter<'_> {
                 read |= mentions_ident(e, name).is_some();
             }
         });
+        if by_slot {
+            return;
+        }
         // `else` bodies of `let Some` cannot see the binding; its own uses are in `rest`.
         if !read {
             self.emit(
@@ -1593,36 +1746,59 @@ impl FileLinter<'_> {
             Some(o) => o,
             None => return,
         };
-        // Source spans by label, for every named member that becomes a tree.
-        let mut by_label: BTreeMap<String, Span> = BTreeMap::new();
-        let mut object_spans = Vec::new();
-        for item in &ast.items {
-            if let V2Item::Object(o) = item {
-                object_spans.push(o.span);
-                for m in &o.members {
-                    match m {
-                        ObjectMember::Tree(t) => {
-                            by_label.insert(t.label.clone(), t.span);
-                        }
-                        ObjectMember::Interaction(i) => {
-                            by_label.insert(i.label.clone(), i.span);
-                        }
-                        ObjectMember::Init(b) => {
-                            by_label.insert("init".to_owned(), b.span);
-                        }
-                        ObjectMember::Main(b) => {
-                            by_label.insert("main".to_owned(), b.span);
-                        }
-                        _ => {}
-                    }
-                }
-            }
+        // Per source object: its span, and the spans of its members that become trees, by
+        // pinned id and by label (labels repeat across objects).
+        struct Spans {
+            name: String,
+            span: Span,
+            by_id: BTreeMap<u16, Span>,
+            by_label: BTreeMap<String, Span>,
         }
-        let fallback = object_spans.first().copied().unwrap_or(Span::new(1, 1));
-        for obj in objects {
+        let mut sources = Vec::new();
+        for item in &ast.items {
+            let V2Item::Object(o) = item else {
+                continue;
+            };
+            let mut spans = Spans {
+                name: o.name.clone(),
+                span: o.span,
+                by_id: BTreeMap::new(),
+                by_label: BTreeMap::new(),
+            };
+            for m in &o.members {
+                let (id, label, span) = match m {
+                    ObjectMember::Tree(t) => (t.pinned_id, t.label.as_str(), t.span),
+                    ObjectMember::Interaction(i) => (i.pinned_id, i.label.as_str(), i.span),
+                    ObjectMember::Init(b) => (None, "init", b.span),
+                    ObjectMember::Main(b) => (None, "main", b.span),
+                    _ => continue,
+                };
+                if let Some(id) = id {
+                    spans.by_id.insert(id, span);
+                }
+                spans.by_label.entry(label.to_owned()).or_insert(span);
+            }
+            sources.push(spans);
+        }
+        let single = sources.len() == 1 && objects.len() == 1;
+        for obj in &objects {
+            // An object the file does not declare (from elsewhere in its pack) is not
+            // this file's to report.
+            let Some(source) = sources
+                .iter()
+                .find(|s| s.name == obj.name)
+                .or_else(|| sources.first().filter(|_| single))
+            else {
+                continue;
+            };
             for b in obj.behaviors.values() {
                 let nodes = b.instructions.len();
-                let at = by_label.get(&b.label).copied().unwrap_or(fallback);
+                let at = source
+                    .by_id
+                    .get(&b.id)
+                    .or_else(|| source.by_label.get(&b.label))
+                    .copied()
+                    .unwrap_or(source.span);
                 if nodes > NODE_WARN {
                     self.emit(
                         FRAME_HEADROOM,

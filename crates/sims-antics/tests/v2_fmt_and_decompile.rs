@@ -1025,3 +1025,32 @@ fn a_relowering_idiom_that_is_not_proven_falls_back_inside_the_tree() {
         report.source
     );
 }
+
+#[test]
+fn an_extra_idiom_that_does_not_compile_is_dropped_before_the_tree_is_lowered() {
+    // The `local[0]` write and the `push_interaction` pair up as
+    // `push_interaction(.., object: self)`, which clashes with the raw block left after
+    // it; the tree must keep its other statements idiomatic, as it did without the idiom.
+    const SOURCE: &str = r#"object "Synth Patch" {
+    guid: 0x7E00_0009;
+    price: 5;
+    sprite: Sprite::procedural("floor_lamp", primary: #101010, accent: #202020, trim: #303030);
+
+    @id(4420) tree patch "Patch" {
+        raw {
+            local[0] := my.id;
+            push_interaction(menu: 0, object: 0, priority: 0, flags: 2);
+            temp[1] := stack.data[0];
+        }
+        temp[0] = 3;
+    }
+}
+"#;
+    let iff = parse_iff(&compile("synth-patch.antics", SOURCE).iff_bytes);
+    let report =
+        decompile_iff_to_v2_report(&iff, &DecompileV2Options::default()).expect("decompile");
+    let patch = report.trees.iter().find(|t| t.id == 4420).unwrap();
+    assert!(proven(&patch.check), "{:?}\n{}", patch.check, report.source);
+    assert_ne!(patch.style, TreeStyle::Raw, "{}", report.source);
+    assert!(report.source.contains("temp[0] = 3;"), "{}", report.source);
+}

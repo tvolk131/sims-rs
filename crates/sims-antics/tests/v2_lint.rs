@@ -173,6 +173,55 @@ fn wildcard_rules_cover_match_expressions() {
 }
 
 #[test]
+fn wildcard_rules_resolve_the_enum_through_imports() {
+    // `Mode` here is `Wider` imported under another name; an unrelated two-variant `Mode`
+    // elsewhere in the set must not make the `_` arm look redundant.
+    let user = obj("    tree probe \"Probe\" {\n        match self.mode {\n            Mode::Off => { self.level = 1; }\n            Mode::Low => { self.level = 2; }\n            _ => { self.level = 3; }\n        }\n    }")
+        .replace(
+            "enum Mode { Off, Low, High }\n",
+            "use crate::shared::wide::Wider as Mode;\n",
+        );
+    let files = |user: &str| {
+        lint_v2_sources(&[
+            LintInput {
+                name: "wide.antics".to_owned(),
+                source: "pub enum Wider { Off, Low, High }\n".to_owned(),
+                ..LintInput::default()
+            },
+            LintInput {
+                name: "narrow.antics".to_owned(),
+                source: "pub enum Mode { Off, Low }\n".to_owned(),
+                ..LintInput::default()
+            },
+            LintInput {
+                name: "user.antics".to_owned(),
+                source: user.to_owned(),
+                ..LintInput::default()
+            },
+        ])
+        .unwrap()
+    };
+    let found = files(&user);
+    assert!(
+        !found.iter().any(|d| d.rule == "enum_wildcard_all_covered"),
+        "{found:#?}"
+    );
+    let single: Vec<_> = found
+        .iter()
+        .filter(|d| d.rule == "enum_wildcard_single_variant")
+        .collect();
+    assert_eq!(single.len(), 1, "{found:#?}");
+    assert_eq!(single[0].suggestion.as_deref(), Some("Mode::High"));
+    // A name neither declared nor imported is not judged.
+    let unimported = user.replace("use crate::shared::wide::Wider as Mode;\n", "");
+    let found = files(&unimported);
+    assert!(
+        !found.iter().any(|d| d.rule.starts_with("enum_wildcard")),
+        "{found:#?}"
+    );
+}
+
+#[test]
 fn enum_wildcard_all_covered_cannot_be_allowed() {
     let match_stmt = "        match self.mode {\n            Mode::Off => { self.level = 1; }\n            Mode::Low => { self.level = 2; }\n            Mode::High => { self.level = 3; }\n";
     for allowed in [
@@ -318,6 +367,10 @@ fn restored_or_object_context_self_is_fine() {
         &sim_tree("        stack_obj = sim;\n        stack_obj = self;\n        self.level = 1;"),
         "stack_obj_clobber_after_self",
     );
+    none(
+        &sim_tree("        stack_obj = stack_obj;\n        self.level = 1;"),
+        "stack_obj_clobber_after_self",
+    );
     // An object-context tree: `self` is always this object.
     none(
         &tree("        stack_obj = 0;\n        self.level = 1;"),
@@ -358,15 +411,33 @@ fn unused_locals_states_consts_and_bcon_entries_are_flagged() {
 }
 
 #[test]
+fn locals_are_not_judged_when_raw_code_addresses_locals_by_number() {
+    one(
+        &tree("        let x = 7;\n        raw { temp[1] := temp[0]; }"),
+        "unused_decl",
+    );
+    none(
+        &tree("        let x = 7;\n        raw { temp[1] := local[1]; }"),
+        "unused_decl",
+    );
+    none(
+        &tree("        let x: i16;\n        raw { local [0] := 2; }\n        self.level = x;"),
+        "unused_decl",
+    );
+}
+
+#[test]
 fn bcon_entries_are_not_judged_when_something_reads_them_by_number() {
     let members = "    bcon 4097 \"Tuning\" { low = 1, high = 9 }\n    \
          tree probe \"Probe\" {\n        self.level = Tuning.low;\n        self.mode = Mode::Off;\n";
     let flagged = obj(&format!("{members}    }}"));
     assert_eq!(of(&flagged, "unused_decl").len(), 1, "{flagged}");
-    let raw = obj(&format!(
-        "{members}        raw {{ temp[0] := bcon[129]; }}\n    }}"
-    ));
-    none(&raw, "unused_decl");
+    for read in ["bcon[129]", "bcon [129]"] {
+        let raw = obj(&format!(
+            "{members}        raw {{ temp[0] := {read}; }}\n    }}"
+        ));
+        none(&raw, "unused_decl");
+    }
     let external = format!(
         "extern mod synth_globals {{\n    @id(256) fn tune() -> bool;\n}}\n{}",
         obj(&format!("{members}        synth_globals::tune();\n    }}"))
@@ -454,6 +525,23 @@ fn big_trees_and_many_locals_are_flagged() {
 }
 
 #[test]
+fn frame_headroom_points_at_the_tree_in_its_own_object() {
+    // Two objects in one file, each with a tree labeled "Shared"; only the first is big.
+    let many_nodes: String = (0..205).map(|_| "        self.level += 1;\n").collect();
+    let big = obj(&format!(
+        "    @id(4200) tree shared \"Shared\" {{\n        self.mode = Mode::Off;\n{many_nodes}    }}"
+    ));
+    let small = obj("    @id(4201) tree shared \"Shared\" {\n        self.mode = Mode::Off;\n        self.level += 1;\n    }")
+        .replace("enum Mode { Off, Low, High }\n", "")
+        .replace("Synth Probe", "Synth Probe Two")
+        .replace("0x7E00_0100", "0x7E00_0101");
+    let source = format!("{big}{small}");
+    let d = one(&source, "frame_headroom");
+    assert!(d.message.contains("tree 4200"), "{d:?}");
+    assert_eq!(d.line, line_of(&source, "@id(4200)"), "{d:?}");
+}
+
+#[test]
 fn small_trees_have_headroom() {
     none(&tree("        self.level += 1;"), "frame_headroom");
 }
@@ -516,6 +604,8 @@ fn short_or_mixed_chains_are_fine() {
         "        if self.level == 1 {\n            sleep(1);\n        } else if temp[0] == 2 {\n            sleep(2);\n        } else if self.level == 3 {\n            sleep(3);\n        }",
         "        if self.level == 1 {\n            sleep(1);\n        } else if self.level > 2 {\n            sleep(2);\n        } else if self.level == 3 {\n            sleep(3);\n        }",
         "        if self.level == 1 {\n            sleep(1);\n        } else if self.level == 1 {\n            sleep(2);\n        } else if self.level == 3 {\n            sleep(3);\n        }",
+        // `match` arms take only literals and enum variants.
+        "        let a = random(10);\n        let b = random(10);\n        let c = random(10);\n        if self.level == a {\n            sleep(1);\n        } else if self.level == b {\n            sleep(2);\n        } else if self.level == c {\n            sleep(3);\n        }",
     ] {
         none(&tree(body), "collapsible_if_chain");
     }
@@ -531,6 +621,12 @@ fn raw_blocks_of_native_primitives_are_flagged() {
     let help = d.help.unwrap();
     assert!(help.contains("notify_out_of_idle()"), "{help}");
     assert!(help.contains("breakpoint(...)"), "{help}");
+    one(
+        &tree(
+            "        raw { special_effect(duration: 10, kind: 1, size: 2, flags: 0x01, str_index: 0); # sparkle\n }",
+        ),
+        "manual_raw_has_builtin",
+    );
 }
 
 #[test]
@@ -547,6 +643,10 @@ fn raw_blocks_v2_cannot_spell_are_fine() {
         "        raw { push_interaction(menu: 0, object: 0, priority: 0, flags: 7); }",
         "        raw { test_object_type(0x7e000100, stack_obj); }",
         "        raw { stack_obj := stack.slot[0]; }",
+        // Operand forms v2's builtin rejects: a local-slot flag, a non-literal operand.
+        "        raw { special_effect(duration: 0, flags: 32); }",
+        "        raw { show_string(table: 300, index: local[0]); }",
+        "        raw { breakpoint(temp[0]); }",
     ] {
         none(&tree(raw), "manual_raw_has_builtin");
     }
@@ -639,6 +739,20 @@ fn allow_directives_suppress_by_line_and_file() {
     one(
         &tree(&format!(
             "        dialog(\"// antics-lint: allow(while_true)\");\n{flagged}"
+        )),
+        "while_true",
+    );
+    // Nor inside a `raw { }` body, which follows `.air` comment rules.
+    one(
+        &tree(&format!(
+            "        raw {{\n            //! antics-lint: allow(while_true)\n            notify_idle() pad 0xff;\n        }}\n{flagged}"
+        )),
+        "while_true",
+    );
+    // An `.air` `#` comment holding a quote does not hide a directive after the block.
+    none(
+        &tree(&format!(
+            "        raw {{\n            notify_idle() pad 0xff; # \"\n        }}\n        // antics-lint: allow(while_true)\n{flagged}"
         )),
         "while_true",
     );
@@ -779,4 +893,30 @@ fn cli_exit_codes_and_json() {
     assert_ne!(out.status.code(), Some(0));
     let out = cli(&[]);
     assert_ne!(out.status.code(), Some(0));
+}
+
+#[test]
+fn cli_lints_files_that_start_with_const() {
+    let dir = scratch("cli-const");
+    let good = dir.join("good.antics");
+    let bad = dir.join("bad.antics");
+    std::fs::write(
+        &good,
+        format!(
+            "const SPARE = 3;\n{}",
+            tree("        while true {\n            sleep(1);\n        }")
+        ),
+    )
+    .unwrap();
+    std::fs::write(&bad, "const BAD = ;\n").unwrap();
+
+    let out = cli(&["--json".as_ref(), good.as_os_str()]);
+    let json = String::from_utf8(out.stdout).unwrap();
+    assert!(json.contains("\"while_true\""), "{json}");
+    assert!(json.contains("SPARE"), "{json}");
+
+    let out = cli(&["--json".as_ref(), bad.as_os_str()]);
+    assert_ne!(out.status.code(), Some(0));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("bad.antics"), "{err}");
 }

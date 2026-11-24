@@ -190,12 +190,17 @@ pub fn decompile_iff_to_v2_report(
                 message,
             }) if plan.drop_variants(&model, &generated, None, &message) => {}
             Err(Failure::V2 { line, message }) => {
-                if !plan.lower_at_line(&model, &generated, line) {
+                let tree = line.and_then(|l| generated.tree_at_line(l.saturating_sub(1)));
+                // An extra idiom is turned off before anything is lowered: it may be what
+                // clashes with the rest of the tree.
+                let unblamed = tree.is_none() && plan.drop_all_extras(&generated);
+                if !unblamed
+                    && !tree.is_some_and(|id| plan.drop_extras(id, &generated))
+                    && !plan.lower_at_line(&model, &generated, line)
                     // A tree that fails at its lowest level is left out.
-                    let tree = line.and_then(|l| generated.tree_at_line(l.saturating_sub(1)));
-                    if !tree.is_some_and(|id| model.omit(id, &message)) {
-                        return Err(no_compile(&message));
-                    }
+                    && !tree.is_some_and(|id| model.omit(id, &message))
+                {
+                    return Err(no_compile(&message));
                 }
             }
             Err(Failure::Air { tree, message }) => {
@@ -205,7 +210,7 @@ pub fn decompile_iff_to_v2_report(
                             || plan.lower_tree(&model, id)
                             || model.omit(id, &message)
                     }
-                    None => plan.lower_all(&model),
+                    None => plan.drop_all_extras(&generated) || plan.lower_all(&model),
                 };
                 if !handled {
                     return Err(no_compile(&message));
@@ -1628,6 +1633,13 @@ impl Plan {
     /// did not, so the tree has to move down a style instead.
     fn drop_extras(&mut self, id: u16, generated: &Generated) -> bool {
         generated.extras.contains(&id) && self.plain.insert(id)
+    }
+
+    /// [`Self::drop_extras`] for every tree, for a failure no one tree is blamed for.
+    fn drop_all_extras(&mut self, generated: &Generated) -> bool {
+        let before = self.plain.len();
+        self.plain.extend(generated.extras.iter().copied());
+        self.plain.len() != before
     }
 
     fn level(&self, t: &TreeModel) -> Level {
