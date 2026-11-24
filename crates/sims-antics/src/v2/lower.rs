@@ -26,6 +26,7 @@ use crate::v2::specialize;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::rc::Rc;
 
 const MAX_INLINE_DEPTH: usize = 16;
 const MAX_INLINE_EXPANSIONS: usize = 256;
@@ -3557,6 +3558,8 @@ enum TreeContext {
 enum Binding {
     /// Regular local variable in `.air` (`local_name` is unique within the tree).
     Local { air_name: String, ty: ValueType },
+    /// A read-only caller cell whose value is stable for this inline call.
+    Operand { air: String, ty: ValueType },
     /// Immutable constant `i16` operand (literal or `bcon.<name>`) forwarded into an inline helper.
     ConstI16 { air: String, value: i16 },
     /// Immutable constant `bool` value forwarded into an inline helper.
@@ -3583,6 +3586,8 @@ enum Binding {
     Sound(u16),
     /// Compile-time `Slot` index passed to a helper function.
     Slot(u16),
+    /// Compile-time 32-bit GUID passed to a helper function.
+    Guid(u32),
     /// `Sim` handle passed to a helper function.
     SimHandle,
     /// `self` Object handle passed to a helper function.
@@ -3724,9 +3729,10 @@ enum FnReturnKind {
     Value(ValueType),
 }
 
+#[derive(Clone)]
 struct ActiveInlineFn {
-    ret_flag: String,
-    ret_val: String,
+    ret_flag: Option<String>,
+    target: InlineReturnTarget,
     ret_kind: FnReturnKind,
     /// Active `defer` token when this helper was entered (returns matching `current_defer_id`
     /// exit only this helper frame, whereas mismatched returns would escape an enclosing `defer`).
@@ -3740,6 +3746,40 @@ struct PreparedFunctional {
     saved_stack_obj: Option<String>,
 }
 
+#[derive(Clone)]
+enum InlineReturnTarget {
+    Void,
+    Store(String),
+    Branch {
+        arms: Rc<InlineBranchArms>,
+        break_after: bool,
+    },
+}
+
+struct InlineBranchArms {
+    on_true: String,
+    on_false: String,
+    /// Both arms exit the tree, so the helper needs no single-pass loop.
+    terminal: bool,
+}
+
+type InlineHelperCall<'a> = (String, FnDecl, bool, &'a [CallArg], Span);
+
+enum InlineCallMode<'a> {
+    Materialize,
+    TailCondition,
+    Into(&'a str),
+    Branch(Rc<InlineBranchArms>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HelperCell {
+    Temp(i16),
+    Param(i16),
+    OwnAttr(i16),
+}
+
+#[derive(Clone)]
 struct TreeLowerer<'a> {
     env: &'a ObjectEnv<'a>,
     tree_ctx: TreeContext,
@@ -3969,7 +4009,12 @@ impl<'a> TreeLowerer<'a> {
     fn fresh(&mut self, prefix: &str) -> String {
         let id = self.next_id;
         self.next_id += 1;
-        format!("__{prefix}_{id}")
+        let scope = if prefix.starts_with("v_") && !self.inline_call_stack.is_empty() {
+            "inline_"
+        } else {
+            ""
+        };
+        format!("__{scope}{prefix}_{id}")
     }
 
     fn line(&mut self, text: String) {
@@ -5007,6 +5052,8 @@ impl<'a> TreeLowerer<'a> {
                     self.line(format!("let {air_name};"));
                     self.lower_if_expr(*ispan, cond, then_value, else_value, Some(&air_name))?
                         .1
+                } else if let Some(ty) = self.try_lower_inline_into(init, &air_name)? {
+                    ty
                 } else if is_compound_arith_or_neg(init) {
                     self.lower_arith_into_dest(init, &air_name, true)?
                 } else if let Some((val_air, inferred)) = self.try_lower_callable_value_raw(init)? {
@@ -5725,6 +5772,10 @@ impl<'a> TreeLowerer<'a> {
                     return r1.and(p1).and(r2).and(p2);
                 }
 
+                if self.try_lower_inline_branch(cond, then_body, else_body, false)? {
+                    return Ok(());
+                }
+
                 if self.try_lower_short_circuit_if(
                     cond,
                     ArmBody::Stmts(then_body),
@@ -5779,17 +5830,41 @@ impl<'a> TreeLowerer<'a> {
                 Ok(())
             }
             V2Stmt::Return { span, value } => {
-                if let Some(active_fn) = self.active_inline_fn.as_ref() {
+                if let Some(active_fn) = self.active_inline_fn.clone() {
                     if active_fn.owner_defer_id != self.current_defer_id {
                         return Err(Error::at(
                             *span,
                             "'return' cannot exit out of a 'defer' block",
                         ));
                     }
-                    let ret_flag = active_fn.ret_flag.clone();
-                    let ret_val = active_fn.ret_val.clone();
-                    let ret_kind = active_fn.ret_kind.clone();
-                    match (ret_kind, value) {
+                    let ret_val = match active_fn.target {
+                        InlineReturnTarget::Void => String::new(),
+                        InlineReturnTarget::Store(dest) => dest,
+                        InlineReturnTarget::Branch { arms, break_after } => {
+                            let expr = value.as_ref().ok_or_else(|| {
+                                Error::at(
+                                    *span,
+                                    "helper function with return type must return a value",
+                                )
+                            })?;
+                            return self.emit_inline_bool_edges(
+                                expr,
+                                arms.terminal,
+                                &mut |c, edge| {
+                                    c.emit_all_cleanups()?;
+                                    let arm = if edge { &arms.on_true } else { &arms.on_false };
+                                    for line in arm.lines() {
+                                        c.line(line.to_owned());
+                                    }
+                                    if break_after {
+                                        c.line("break;".to_owned());
+                                    }
+                                    Ok(())
+                                },
+                            );
+                        }
+                    };
+                    match (active_fn.ret_kind, value) {
                         (FnReturnKind::Void, Some(_)) => {
                             return Err(Error::at(
                                 *span,
@@ -5838,7 +5913,9 @@ impl<'a> TreeLowerer<'a> {
                         }
                     }
                     self.emit_all_cleanups()?;
-                    self.line(format!("{ret_flag} := 1;"));
+                    if let Some(ret_flag) = active_fn.ret_flag {
+                        self.line(format!("{ret_flag} := 1;"));
+                    }
                     self.line("break;".to_owned());
                     return Ok(());
                 }
@@ -5862,6 +5939,20 @@ impl<'a> TreeLowerer<'a> {
                         Ok(())
                     }
                     Some(expr) => {
+                        if self.try_lower_inline_branch(
+                            expr,
+                            &[V2Stmt::Return {
+                                span: *span,
+                                value: Some(V2Expr::Bool(*span, true)),
+                            }],
+                            &[V2Stmt::Return {
+                                span: *span,
+                                value: Some(V2Expr::Bool(*span, false)),
+                            }],
+                            true,
+                        )? {
+                            return Ok(());
+                        }
                         if !self.has_active_cleanups() {
                             self.emit_return_bool_expr(expr)
                         } else {
@@ -6356,8 +6447,11 @@ impl<'a> TreeLowerer<'a> {
     }
 
     fn emit_inline_fn_return_propagation(&mut self, restore_stack: bool) -> Result<()> {
-        if let Some(active) = self.active_inline_fn.as_ref() {
-            let ret_flag = active.ret_flag.clone();
+        if let Some(ret_flag) = self
+            .active_inline_fn
+            .as_ref()
+            .and_then(|active| active.ret_flag.clone())
+        {
             // If we're still inside an outer loop inside the inline fn (Wait: the inline fn's
             // own wrapper loop is at `fn_scope_depth`!), breaking out of an inner loop needs to
             // propagate upward until we exit the wrapper loop.
@@ -9164,6 +9258,40 @@ impl<'a> TreeLowerer<'a> {
         Ok((final_ty, saved_stack_obj))
     }
 
+    /// A by-value read may move from argument evaluation to its uses only for a valid,
+    /// stable cell. Unknown effects (including primitives, calls, raw code, and indirect
+    /// writes) force a snapshot. A Sim tree's `stack.attr` can address a different object
+    /// even before the helper is entered, so only declared attributes on `my` qualify.
+    fn can_forward_helper_cell(&self, air: &str, decl: &FnDecl, args: &[&V2Expr]) -> bool {
+        let index = |prefix| {
+            air.strip_prefix(prefix)?
+                .strip_suffix(']')?
+                .parse::<i16>()
+                .ok()
+        };
+        let cell = if let Some(i) = index("temp[").filter(|i| (0..8).contains(i)) {
+            HelperCell::Temp(i)
+        } else if let Some(i) = index("param[").filter(|&i| (i as usize) < self.frame_args) {
+            HelperCell::Param(i)
+        } else if let Some(i) = index("my.attr[")
+            && self.env.states.values().any(|s| s.attr_index == i as usize)
+        {
+            HelperCell::OwnAttr(i)
+        } else {
+            return false;
+        };
+        let self_states = (!decl.params.iter().any(|p| p.name == "self")
+            && !stmts_mutate_or_borrow_ident(&decl.body, "self"))
+        .then_some(&self.env.states);
+        args.iter().all(|e| helper_expr_has_no_writes(e))
+            && decl
+                .params
+                .iter()
+                .filter_map(|p| p.default.as_ref())
+                .all(helper_expr_has_no_writes)
+            && stmts_preserve_helper_cell(&decl.body, cell, self_states)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn bind_helper_arg(
         &mut self,
@@ -9175,19 +9303,24 @@ impl<'a> TreeLowerer<'a> {
         arg_span: Span,
         call_args: &[&V2Expr],
     ) -> Result<Binding> {
+        let read_only = !stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name);
         // A caller local passed by value needs no `__arg_*` copy when nothing can change it
         // while the helper runs: the helper never mutates or borrows the parameter, and no
         // argument of this call borrows the local (`&mut x`, or a local-writing builtin).
         let elide_local = match arg_expr {
             V2Expr::Ident(_, n)
                 if !matches!(param.ty, V2Type::MutRef(_))
-                    && !stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name)
+                    && read_only
                     && !call_args
                         .iter()
                         .any(|a| expr_borrows_ident_in(a, n, LOCAL_WRITING_BUILTINS)) =>
             {
                 match self.lookup_var(n) {
-                    Some(Binding::Local { air_name, .. }) => Some(air_name.clone()),
+                    Some(Binding::Local { air_name, .. })
+                        if !call_args.iter().any(|e| {
+                            matches!(e, V2Expr::Ident(_, name)
+                                if matches!(self.lookup_var(name), Some(Binding::MutRef { target: LValue::Direct { air, .. } }) if air == air_name))
+                        }) => Some(air_name.clone()),
                     _ => None,
                 }
             }
@@ -9201,9 +9334,19 @@ impl<'a> TreeLowerer<'a> {
             c.line(format!("let {loc} = {air};"));
             loc
         };
+        let bind_operand = |c: &mut Self, air: String, ty: ValueType| {
+            if read_only && c.can_forward_helper_cell(&air, fn_decl, call_args) {
+                Binding::Operand { air, ty }
+            } else {
+                Binding::Local {
+                    air_name: arg_local(c, air),
+                    ty,
+                }
+            }
+        };
         let binding = match &param.ty {
             V2Type::I16 => {
-                if !stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name)
+                if read_only
                     && let Some((const_air, const_val)) =
                         self.try_const_i16_air_operand(arg_expr)?
                 {
@@ -9223,17 +9366,11 @@ impl<'a> TreeLowerer<'a> {
                             ),
                         ));
                     }
-                    let loc = arg_local(self, air);
-                    Binding::Local {
-                        air_name: loc,
-                        ty: ValueType::I16,
-                    }
+                    bind_operand(self, air, ValueType::I16)
                 }
             }
             V2Type::Bool => {
-                if !stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name)
-                    && let Some(const_b) = self.try_const_bool_arg(arg_expr)
-                {
+                if read_only && let Some(const_b) = self.try_const_bool_arg(arg_expr) {
                     Binding::ConstBool(const_b)
                 } else {
                     let (air, ty) = self.lower_value_expr(arg_expr)?;
@@ -9243,11 +9380,7 @@ impl<'a> TreeLowerer<'a> {
                             format!("parameter '{}' expects bool", param.name),
                         ));
                     }
-                    let loc = arg_local(self, air);
-                    Binding::Local {
-                        air_name: loc,
-                        ty: ValueType::Bool,
-                    }
+                    bind_operand(self, air, ValueType::Bool)
                 }
             }
             V2Type::ObjectId => {
@@ -9273,7 +9406,7 @@ impl<'a> TreeLowerer<'a> {
                 let expected =
                     self.env
                         .resolve_value_type(&param.ty, fn_mod, is_local_fn, param.span)?;
-                if !stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name) {
+                if read_only {
                     if let ValueType::Bitflags(ref bf_key) = expected
                         && let Some((mask, single_bit)) =
                             self.try_eval_const_bitflag(arg_expr, bf_key)?
@@ -9436,8 +9569,179 @@ impl<'a> TreeLowerer<'a> {
                 let slot_idx = self.resolve_slot_expr(arg_expr)?;
                 Binding::Slot(slot_idx)
             }
+            V2Type::Guid => Binding::Guid(self.resolve_guid_expr(arg_expr)?),
         };
         Ok(binding)
+    }
+
+    /// Resolves the same direct helper calls as value lowering. A tree and the
+    /// pre-existing builtins with priority over helpers keep their usual paths.
+    fn direct_helper<'e>(&self, expr: &'e V2Expr) -> Result<Option<InlineHelperCall<'e>>> {
+        let V2Expr::Call {
+            span,
+            callee,
+            type_args,
+            args,
+        } = expr
+        else {
+            return Ok(None);
+        };
+        let V2Expr::Ident(_, name) = callee.as_ref() else {
+            return Ok(None);
+        };
+        if !type_args.is_empty()
+            || self.resolve_callable(callee, *span)?.is_some()
+            || matches!(
+                name.as_str(),
+                "random"
+                    | "can_afford"
+                    | "debit_funds"
+                    | "credit_funds"
+                    | "dialog"
+                    | "route_to"
+                    | "snap"
+                    | "find_best_object"
+            )
+        {
+            return Ok(None);
+        }
+        Ok(self
+            .env
+            .lookup_fn(&self.owner_module, name, self.in_object_scope)
+            .map(|(module, decl, local)| (module, decl, local, args.as_slice(), *span)))
+    }
+
+    fn try_lower_inline_into(&mut self, expr: &V2Expr, dest: &str) -> Result<Option<ValueType>> {
+        if self.enclosing_cancel_flag().is_some() {
+            return Ok(None);
+        }
+        let Some((module, decl, local, args, span)) = self.direct_helper(expr)? else {
+            return Ok(None);
+        };
+        if decl.return_type.is_none() {
+            return Ok(None);
+        }
+        Ok(self
+            .inline_helper_call_mode(
+                &module,
+                &decl,
+                local,
+                args,
+                span,
+                InlineCallMode::Into(dest),
+            )?
+            .map(|(_, ty)| ty))
+    }
+
+    /// A caller arm is lowered in the caller's lexical and cleanup scopes. Hoist its
+    /// declarations once so that copies on multiple exits share the same frame slots.
+    fn capture_inline_arm(
+        &mut self,
+        body: &[V2Stmt],
+        declarations: &mut Vec<String>,
+    ) -> Result<String> {
+        let old_indent = std::mem::replace(&mut self.indent, 0);
+        let start = self.out.len();
+        let result = self.lower_block(body);
+        let arm = self.out.split_off(start);
+        self.indent = old_indent;
+        result?;
+        let mut code = String::new();
+        for line in arm.lines() {
+            let trimmed = line.trim_start();
+            if let Some(decl) = trimmed.strip_prefix("let ") {
+                let (name, init) = decl
+                    .strip_suffix(';')
+                    .unwrap_or(decl)
+                    .split_once(" = ")
+                    .map_or((decl.trim_end_matches(';'), None), |(n, v)| (n, Some(v)));
+                declarations.push(format!("let {name};"));
+                if let Some(init) = init {
+                    let indent = &line[..line.len() - trimmed.len()];
+                    writeln!(code, "{indent}{name} := {init};").unwrap();
+                }
+            } else {
+                writeln!(code, "{line}").unwrap();
+            }
+        }
+        Ok(code)
+    }
+
+    fn try_lower_inline_branch(
+        &mut self,
+        cond: &V2Expr,
+        then_body: &[V2Stmt],
+        else_body: &[V2Stmt],
+        terminal: bool,
+    ) -> Result<bool> {
+        // A synthetic loop cannot host caller arms that jump to an enclosing loop.
+        // An enclosing inline return also uses a relative break target.
+        if self.active_inline_fn.is_some()
+            || self.enclosing_cancel_flag().is_some()
+            || self.keep_layout
+            || self.pin_span.is_some()
+            || stmts_exit_loop(then_body)
+            || stmts_exit_loop(else_body)
+        {
+            return Ok(false);
+        }
+        let (call, negated) = match cond {
+            V2Expr::Unary {
+                op: V2UnaryOp::Not,
+                inner,
+                ..
+            } => (inner.as_ref(), true),
+            _ => (cond, false),
+        };
+        let Some((module, decl, local, args, span)) = self.direct_helper(call)? else {
+            return Ok(false);
+        };
+        if !self.helper_returns_condition(&module, &decl, local)
+            || stmts_return_through_loop(&decl.body)
+        {
+            return Ok(false);
+        }
+
+        // Check a trial emission for raw code, pinned slots and calls that depend on the
+        // layout of adjacent nodes. These need the ordinary single-copy branch lowering.
+        let prefix = std::mem::take(&mut self.out);
+        let mut trial = self.clone();
+        self.out = prefix;
+        let strings = self.env.dialog_strings.borrow().clone();
+        let mut declarations = Vec::new();
+        let then_air = trial.capture_inline_arm(then_body, &mut declarations)?;
+        let else_air = trial.capture_inline_arm(else_body, &mut declarations)?;
+        let (on_true, on_false) = if negated {
+            (else_air, then_air)
+        } else {
+            (then_air, else_air)
+        };
+        let arms = Rc::new(InlineBranchArms {
+            on_true,
+            on_false,
+            terminal,
+        });
+        if !trial.keep_layout && trial.pin_span.is_none() {
+            trial.inline_helper_call_mode(
+                &module,
+                &decl,
+                local,
+                args,
+                span,
+                InlineCallMode::Branch(arms),
+            )?;
+        }
+        if trial.keep_layout || trial.pin_span.is_some() {
+            *self.env.dialog_strings.borrow_mut() = strings;
+            return Ok(false);
+        }
+        for decl in declarations {
+            trial.line(decl);
+        }
+        self.out.push_str(&trial.out);
+        trial.out = std::mem::take(&mut self.out);
+        *self = trial;
+        Ok(true)
     }
 
     fn inline_helper_call(
@@ -9448,23 +9752,42 @@ impl<'a> TreeLowerer<'a> {
         args: &[CallArg],
         call_span: Span,
     ) -> Result<Option<(String, ValueType)>> {
-        self.inline_helper_call_mode(fn_mod, fn_decl, is_local_fn, args, call_span, false)
+        self.inline_helper_call_mode(
+            fn_mod,
+            fn_decl,
+            is_local_fn,
+            args,
+            call_span,
+            InlineCallMode::Materialize,
+        )
     }
 
-    /// Whether a `-> bool` helper is straight-line code ending in one `return <cond>;`, which
+    /// An inline Result uses the same true/false edges as bool. An explicit
+    /// `return error;` still exits the enclosing BHAV, as it does in other helpers.
+    /// Preserve the meaning of existing user-defined types named Result.
+    fn helper_returns_condition(&self, module: &str, decl: &FnDecl, is_local: bool) -> bool {
+        match decl.return_type.as_ref() {
+            Some(V2Type::Bool) => true,
+            Some(V2Type::Named(name)) if name == "Result" => {
+                self.env.lookup_named_type(module, name, is_local).is_none()
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a bool or Result helper ends in one `return <cond>;`, which
     /// inlines as a branch condition without the return-flag loop wrapper.
-    fn is_tail_return_bool_helper(&self, fn_decl: &FnDecl) -> bool {
+    fn has_single_inline_tail_return(&self, fn_decl: &FnDecl) -> bool {
         let Some((V2Stmt::Return { value: Some(_), .. }, prefix)) = fn_decl.body.split_last()
         else {
             return false;
         };
-        fn_decl.return_type == Some(V2Type::Bool)
-            && !stmts_have_return(prefix)
+        !stmts_have_return(prefix)
             && !prefix.iter().any(|s| matches!(s, V2Stmt::Defer { .. }))
             && (self.in_defer() || self.enclosing_cancel_flag().is_none())
     }
 
-    /// Inlines a helper; with `tail_cond` (only for [`Self::is_tail_return_bool_helper`]
+    /// Inlines a helper; with `TailCondition` (only for [`Self::has_single_inline_tail_return`]
     /// helpers) the prefix is emitted and the returned operand is the tail condition's `.air`
     /// text, to be used directly as the caller's branch condition.
     fn inline_helper_call_mode(
@@ -9474,7 +9797,7 @@ impl<'a> TreeLowerer<'a> {
         is_local_fn: bool,
         args: &[CallArg],
         call_span: Span,
-        tail_cond: bool,
+        mode: InlineCallMode<'_>,
     ) -> Result<Option<(String, ValueType)>> {
         let fqn = format!(
             "{}::{fn_mod}::{}",
@@ -9635,7 +9958,9 @@ impl<'a> TreeLowerer<'a> {
 
         let ret_kind = match &fn_decl.return_type {
             None => FnReturnKind::Void,
-            Some(V2Type::Bool) => FnReturnKind::Bool,
+            Some(_) if self.helper_returns_condition(fn_mod, fn_decl, is_local_fn) => {
+                FnReturnKind::Bool
+            }
             Some(other) => {
                 match self
                     .env
@@ -9674,7 +9999,7 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
 
-        if tail_cond {
+        if matches!(mode, InlineCallMode::TailCondition) {
             let prev_vars = std::mem::replace(&mut self.var_scopes, vec![bound_params]);
             let prev_active_fn = self.active_inline_fn.take();
             let prev_in_obj = self.in_object_scope;
@@ -9687,7 +10012,7 @@ impl<'a> TreeLowerer<'a> {
                     prefix,
                 )) = fn_decl.body.split_last()
                 else {
-                    unreachable!("checked by is_tail_return_bool_helper");
+                    unreachable!("checked by has_single_inline_tail_return");
                 };
                 c.push_scope(ScopeFrame {
                     cleanups: Vec::new(),
@@ -9722,68 +10047,79 @@ impl<'a> TreeLowerer<'a> {
 
         let has_returns = stmts_have_return(&fn_decl.body);
         let has_enclosing_cancel = !self.in_defer() && self.enclosing_cancel_flag().is_some();
-        let needs_wrapper = has_returns || has_enclosing_cancel;
-        let ret_val_local = if ret_kind != FnReturnKind::Void {
-            let rv = self.fresh(&format!("ret_{}", fn_decl.name));
-            self.line(format!("let {rv} = 0;"));
-            Some(rv)
+        let branch = matches!(&mode, InlineCallMode::Branch(_));
+        let needs_wrapper = if let InlineCallMode::Branch(arms) = &mode {
+            !arms.terminal && !self.has_single_inline_tail_return(fn_decl)
+        } else {
+            has_returns || has_enclosing_cancel
+        };
+        let ret_val_local = match &mode {
+            InlineCallMode::Into(dest) => {
+                // Keep later source-local names stable when the result slot is elided.
+                self.next_id += 1;
+                self.line(format!("let {dest};"));
+                Some((*dest).to_owned())
+            }
+            InlineCallMode::Materialize if ret_kind != FnReturnKind::Void => {
+                let rv = self.fresh(&format!("ret_{}", fn_decl.name));
+                self.line(format!("let {rv} = 0;"));
+                Some(rv)
+            }
+            _ => None,
+        };
+        let ret_flag = if !branch && has_returns {
+            let flag = self.fresh("fn_ret");
+            if stmts_return_through_loop(&fn_decl.body) {
+                self.line(format!("let {flag} = 0;"));
+                Some(flag)
+            } else {
+                None
+            }
         } else {
             None
+        };
+        let target = match mode {
+            InlineCallMode::Branch(arms) => InlineReturnTarget::Branch {
+                arms,
+                break_after: needs_wrapper,
+            },
+            _ => ret_val_local
+                .clone()
+                .map_or(InlineReturnTarget::Void, InlineReturnTarget::Store),
         };
 
         let prev_vars = std::mem::replace(&mut self.var_scopes, vec![bound_params]);
         let prev_active_fn = self.active_inline_fn.take();
         let prev_in_obj = self.in_object_scope;
         self.in_object_scope = is_local_fn;
+        if has_returns {
+            self.active_inline_fn = Some(ActiveInlineFn {
+                ret_flag,
+                target,
+                ret_kind: ret_kind.clone(),
+                owner_defer_id: self.current_defer_id,
+            });
+        }
 
         let res = self.with_owner_module(fn_mod, |c| {
             if needs_wrapper {
-                if has_returns {
-                    let ret_flag = c.fresh("fn_ret");
-                    let rv_name = ret_val_local
-                        .clone()
-                        .unwrap_or_else(|| c.fresh("fn_void_ret"));
-                    c.line(format!("let {ret_flag} = 0;"));
-                    c.active_inline_fn = Some(ActiveInlineFn {
-                        ret_flag,
-                        ret_val: rv_name,
-                        ret_kind: ret_kind.clone(),
-                        owner_defer_id: c.current_defer_id,
-                    });
-                }
                 c.line("while true {".to_owned());
                 c.indent += 1;
-                c.push_scope(ScopeFrame {
-                    cleanups: Vec::new(),
-                    is_loop_body: false,
-                    is_fn_root: true,
-                    is_air_while: true,
-                    owner_defer_id: c.current_defer_id,
-                    cancel_flag: None,
-                    restore_stack_on_break: false,
-                    continue_step: None,
-                });
-                let r = c.lower_stmts(&fn_decl.body);
-                let p = c.pop_scope_and_run_cleanups();
+            }
+            c.push_scope(ScopeFrame {
+                is_fn_root: true,
+                is_air_while: needs_wrapper,
+                owner_defer_id: c.current_defer_id,
+                ..ScopeFrame::block()
+            });
+            let r = c.lower_stmts(&fn_decl.body);
+            let p = c.pop_scope_and_run_cleanups();
+            if needs_wrapper {
                 c.line("break;".to_owned());
                 c.indent -= 1;
                 c.line("}".to_owned());
-                r.and(p)
-            } else {
-                c.push_scope(ScopeFrame {
-                    cleanups: Vec::new(),
-                    is_loop_body: false,
-                    is_fn_root: true,
-                    is_air_while: false,
-                    owner_defer_id: c.current_defer_id,
-                    cancel_flag: None,
-                    restore_stack_on_break: false,
-                    continue_step: None,
-                });
-                let r = c.lower_stmts(&fn_decl.body);
-                let p = c.pop_scope_and_run_cleanups();
-                r.and(p)
             }
+            r.and(p)
         });
 
         self.in_object_scope = prev_in_obj;
@@ -10778,7 +11114,9 @@ impl<'a> TreeLowerer<'a> {
                     target: LValue::Direct { air, .. },
                 }) => canonical_air_cell(air) == canon_target,
                 Some(Binding::MutRef { .. }) => true,
-                Some(Binding::ConstI16 { air, .. }) => canonical_air_cell(air) == canon_target,
+                Some(Binding::ConstI16 { air, .. } | Binding::Operand { air, .. }) => {
+                    canonical_air_cell(air) == canon_target
+                }
                 _ => false,
             },
             V2Expr::Deref { inner, .. } => {
@@ -11079,6 +11417,7 @@ impl<'a> TreeLowerer<'a> {
                 if let Some(binding) = self.lookup_var(name).cloned() {
                     return match binding {
                         Binding::Local { air_name, ty } => Ok((air_name, ty)),
+                        Binding::Operand { air, ty } => Ok((air, ty)),
                         Binding::ConstI16 { air, .. } => Ok((air, ValueType::I16)),
                         Binding::ConstBool(b) => {
                             Ok((if b { "1" } else { "0" }.to_owned(), ValueType::Bool))
@@ -11120,6 +11459,7 @@ impl<'a> TreeLowerer<'a> {
                         },
                         Binding::SimHandle => Ok(("my.id".to_owned(), ValueType::ObjectId)),
                         Binding::Motive(_)
+                        | Binding::Guid(_)
                         | Binding::Skill(_)
                         | Binding::Sound(_)
                         | Binding::Slot(_) => Err(Error::at(
@@ -11652,19 +11992,22 @@ impl<'a> TreeLowerer<'a> {
             .lookup_const(&self.owner_module, name, self.in_object_scope)
     }
 
-    /// A 32-bit GUID operand: an integer literal or a `const` item.
+    /// A 32-bit GUID operand: an integer literal, a `const` item, or a helper binding.
     fn resolve_guid_expr(&self, expr: &V2Expr) -> Result<u32> {
         let (span, value) = match expr {
             V2Expr::Int(span, v) => (*span, *v),
-            V2Expr::Ident(span, name) => match self.const_item(name) {
-                Some(v) => (*span, v),
-                None => {
-                    return Err(Error::at(
+            V2Expr::Ident(span, name) => {
+                if let Some(Binding::Guid(guid)) = self.lookup_var(name) {
+                    return Ok(*guid);
+                }
+                let value = self.const_item(name).ok_or_else(|| {
+                    Error::at(
                         *span,
                         format!("expected a GUID literal or const, found '{name}'"),
-                    ));
-                }
-            },
+                    )
+                })?;
+                (*span, value)
+            }
             other => {
                 return Err(Error::at(
                     other.span(),
@@ -12450,11 +12793,17 @@ impl<'a> TreeLowerer<'a> {
                     if let Some((fn_mod, fn_decl, is_local)) =
                         self.env
                             .lookup_fn(&self.owner_module, fname, self.in_object_scope)
-                        && self.is_tail_return_bool_helper(&fn_decl)
+                        && self.helper_returns_condition(&fn_mod, &fn_decl, is_local)
+                        && self.has_single_inline_tail_return(&fn_decl)
                     {
                         let (text, _) = self
                             .inline_helper_call_mode(
-                                &fn_mod, &fn_decl, is_local, args, *span, true,
+                                &fn_mod,
+                                &fn_decl,
+                                is_local,
+                                args,
+                                *span,
+                                InlineCallMode::TailCondition,
                             )?
                             .expect("tail bool helpers return a condition");
                         return Ok(Some(text));
@@ -12944,6 +13293,98 @@ impl<'a> TreeLowerer<'a> {
             self.line("}".to_owned());
         }
         Ok(true)
+    }
+
+    /// Evaluates a helper return before emitting the matching cleanup and caller edge.
+    /// A comparison keeps its own polarity, and logical operators short-circuit.
+    fn emit_inline_bool_edges(
+        &mut self,
+        expr: &V2Expr,
+        terminal: bool,
+        edge: &mut dyn FnMut(&mut Self, bool) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(value) = self.try_eval_const_bool(expr) {
+            return edge(self, value);
+        }
+        if let Some(value) = self.try_fold_literal_cond(expr) {
+            self.check_folded_cond(expr)?;
+            return edge(self, value);
+        }
+        match expr {
+            V2Expr::Unary {
+                op: V2UnaryOp::Not,
+                inner,
+                ..
+            } => {
+                return self.emit_inline_bool_edges(inner, terminal, &mut |c, b| edge(c, !b));
+            }
+            V2Expr::Binary {
+                lhs,
+                op: op @ (V2BinOp::And | V2BinOp::Or),
+                rhs,
+                ..
+            } => {
+                if self.try_fold_literal_cond(lhs) == Some(*op == V2BinOp::Or) {
+                    self.check_folded_cond(rhs)?;
+                }
+                return self.emit_inline_bool_edges(lhs, terminal, &mut |c, b| {
+                    if b == (*op == V2BinOp::And) {
+                        c.emit_inline_bool_edges(rhs, terminal, edge)
+                    } else {
+                        edge(c, b)
+                    }
+                });
+            }
+            _ => {}
+        }
+
+        // `Some(saved)` after a `run_functional` test: each edge first restores the stack object
+        // (to `saved`, or to the entry object when `saved` is `None`).
+        let (test, restore) = if let Some((_, receiver, args, span)) = run_functional_test(expr) {
+            let PreparedFunctional {
+                prim,
+                saved_stack_obj,
+                ..
+            } = self.prepare_run_functional(receiver, args, span)?;
+            (prim, Some(saved_stack_obj))
+        } else if let Some(test) = self.try_lower_simple_air_cond(expr)? {
+            (test, None)
+        } else {
+            let local = self.fresh("cond");
+            self.line(format!("let {local};"));
+            self.emit_bool_into_local(expr, &local)?;
+            (format!("{local} != 0"), None)
+        };
+        self.line(format!("if {test} {{"));
+        self.indent += 1;
+        if let Some(saved) = &restore {
+            self.emit_restore_stack_obj(saved.as_deref());
+        }
+        edge(self, true)?;
+        self.indent -= 1;
+        if terminal {
+            self.line("}".to_owned());
+        } else {
+            let else_at = self.out.len();
+            self.line("} else {".to_owned());
+            self.indent += 1;
+            let arm_at = self.out.len();
+            if let Some(saved) = &restore {
+                self.emit_restore_stack_obj(saved.as_deref());
+            }
+            edge(self, false)?;
+            self.indent -= 1;
+            if self.out.len() == arm_at {
+                self.out.truncate(else_at);
+            }
+            self.line("}".to_owned());
+            return Ok(());
+        }
+        if let Some(saved) = &restore {
+            self.emit_restore_stack_obj(saved.as_deref());
+        }
+        edge(self, false)?;
+        Ok(())
     }
 
     fn emit_return_bool_expr(&mut self, expr: &V2Expr) -> Result<()> {
@@ -14424,6 +14865,8 @@ const LOCAL_WRITING_BUILTINS: &[&str] = &[
     "set_headline",
     "push_interaction",
     "relationship",
+    "create_object",
+    "find_location",
 ];
 
 fn stmts_mutate_or_borrow_ident(stmts: &[V2Stmt], target_name: &str) -> bool {
@@ -14544,13 +14987,13 @@ fn builtin_args_write_ident(
         "random_into" => args
             .first()
             .is_some_and(|a| a.name.is_none() && is_target(&a.value)),
-        "animate" | "set_headline" | "push_interaction" => args
+        "animate" | "set_headline" | "push_interaction" | "create_object" | "find_location" => args
             .iter()
             .any(|a| matches!(a.name.as_deref(), Some("local" | "icon")) && is_target(&a.value)),
         // Without flag 4 the VM stores the number into `value:`.
         "relationship" => args
             .iter()
-            .any(|a| a.name.as_deref() == Some("value") && is_target(&a.value)),
+            .any(|a| matches!(a.name.as_deref(), Some("value" | "local")) && is_target(&a.value)),
         _ => false,
     }
 }
@@ -14794,6 +15237,122 @@ fn stmts_have_return(stmts: &[V2Stmt]) -> bool {
             ..
         } => stmts_have_return(then_body) || stmts_have_return(else_body),
         V2Stmt::Match { arms, .. } => arms.iter().any(|a| stmts_have_return(&a.body)),
+        _ => false,
+    })
+}
+
+/// A helper's relative `break` reaches its wrapper directly unless a return is nested
+/// inside one of the helper's own loops, including the loop for animation events.
+fn stmts_return_through_loop(stmts: &[V2Stmt]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        V2Stmt::Repeat { body, .. }
+        | V2Stmt::While { body, .. }
+        | V2Stmt::ForEach { body, .. }
+        | V2Stmt::Animate { body, .. } => stmts_have_return(body),
+        V2Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => stmts_return_through_loop(then_body) || stmts_return_through_loop(else_body),
+        V2Stmt::Match { arms, .. } => arms.iter().any(|a| stmts_return_through_loop(&a.body)),
+        V2Stmt::WithLock { body, .. } | V2Stmt::Defer { body, .. } => {
+            stmts_return_through_loop(body)
+        }
+        V2Stmt::LetSome { else_body, .. } => stmts_return_through_loop(else_body),
+        _ => false,
+    })
+}
+
+/// Expressions whose evaluation cannot modify a forwarded temp, parameter, or own attribute.
+fn helper_expr_has_no_writes(expr: &V2Expr) -> bool {
+    match expr {
+        V2Expr::Int(..)
+        | V2Expr::Bool(..)
+        | V2Expr::Str(..)
+        | V2Expr::Path(..)
+        | V2Expr::Ident(..) => true,
+        V2Expr::Unary { inner, .. } => helper_expr_has_no_writes(inner),
+        V2Expr::Binary { lhs, rhs, .. } => {
+            helper_expr_has_no_writes(lhs) && helper_expr_has_no_writes(rhs)
+        }
+        V2Expr::Field { base, .. } => matches!(base.as_ref(), V2Expr::Ident(..)),
+        V2Expr::Index { base, index, .. } => {
+            let simple_base = match base.as_ref() {
+                V2Expr::Ident(..) => true,
+                V2Expr::Field { base, field, .. } => {
+                    matches!(base.as_ref(), V2Expr::Ident(..)) && field != "sprite_flags"
+                }
+                _ => false,
+            };
+            simple_base && helper_expr_has_no_writes(index)
+        }
+        _ => false,
+    }
+}
+
+fn stmts_preserve_helper_cell(
+    stmts: &[V2Stmt],
+    cell: HelperCell,
+    self_states: Option<&BTreeMap<String, ResolvedState>>,
+) -> bool {
+    let preserves = |body: &[V2Stmt]| stmts_preserve_helper_cell(body, cell, self_states);
+    let expr_ok = helper_expr_has_no_writes;
+    stmts.iter().all(|stmt| match stmt {
+        V2Stmt::Let { init, .. } => expr_ok(init),
+        V2Stmt::Assign { target, value, .. } => {
+            let disjoint = match target {
+                // Bare identifiers in helper scope name local bindings or `stack_obj`.
+                V2Expr::Ident(..) => true,
+                V2Expr::Field { base, field, .. } => match cell {
+                    HelperCell::OwnAttr(i) => {
+                        matches!(base.as_ref(), V2Expr::Ident(_, name) if name == "self")
+                            && self_states
+                                .and_then(|s| s.get(field))
+                                .is_some_and(|s| s.attr_index != i as usize)
+                    }
+                    _ => expr_ok(target),
+                },
+                V2Expr::Index { base, index, .. } => match base.as_ref() {
+                    V2Expr::Ident(_, name) if name == "temp" || name == "param" => {
+                        match (name.as_str(), cell) {
+                            ("temp", HelperCell::Temp(i)) | ("param", HelperCell::Param(i)) => {
+                                matches!(index.as_ref(), V2Expr::Int(_, n) if *n != i64::from(i))
+                            }
+                            _ => expr_ok(index),
+                        }
+                    }
+                    V2Expr::Field { base, field, .. } => match cell {
+                        HelperCell::OwnAttr(i) => {
+                            self_states.is_some()
+                                && field == "attr"
+                                && matches!(base.as_ref(), V2Expr::Ident(_, name) if name == "self")
+                                && matches!(index.as_ref(), V2Expr::Int(_, n) if *n != i64::from(i))
+                        }
+                        _ => expr_ok(target),
+                    },
+                    _ => false,
+                },
+                _ => false,
+            };
+            disjoint && expr_ok(value)
+        }
+        V2Stmt::If {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => expr_ok(cond) && preserves(then_body) && preserves(else_body),
+        V2Stmt::While { cond, body, .. } => expr_ok(cond) && preserves(body),
+        V2Stmt::Repeat { count, body, .. } => expr_ok(count) && preserves(body),
+        V2Stmt::Match {
+            scrutinee, arms, ..
+        } => expr_ok(scrutinee) && arms.iter().all(|a| preserves(&a.body)),
+        V2Stmt::Defer { body, .. } => preserves(body),
+        V2Stmt::Return { value, .. } => value.as_ref().is_none_or(expr_ok),
+        V2Stmt::Break { .. }
+        | V2Stmt::Continue { .. }
+        | V2Stmt::ReturnError { .. }
+        | V2Stmt::LetUninit { .. } => true,
         _ => false,
     })
 }
