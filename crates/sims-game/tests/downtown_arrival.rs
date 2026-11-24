@@ -13,7 +13,13 @@
 //! On a date the leader's inventory holds a token of kind 1 naming the
 //! companion (Manage Inventory operation 5 at departure). Routine 19 takes
 //! it and names the companion, and the marker places the companion and
-//! links the two by their DateFlag words (nodes 16 and 23).
+//! links the two by their DateFlag words (nodes 16 and 23). The departure
+//! makes only the leader; routine 19 makes the companion.
+//!
+//! The departure also leaves each traveler's saved state in its inventory
+//! as kind-2 tokens, as the Go Downtown plugin's Generic Sims Call 17 does
+//! (0x45a22d), with the arrival clock in tokens 7 and 8. The marker's
+//! routine 21 restores the motives from them and leaves the clock tokens.
 //!
 //! Needs an install (`SIMS_INSTALL`); skipped otherwise.
 
@@ -39,6 +45,8 @@ const FAMILY: usize = 61;
 const KIND: usize = 65;
 /// The token kind that names a traveler's companion.
 const COMPANION_TOKEN: i32 = 1;
+/// The token kind of a traveler's saved state.
+const SAVED_STATE_TOKEN: i32 = 2;
 
 fn install_root() -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
@@ -186,6 +194,30 @@ fn the_middle_ped_marker_finishes_a_downtown_arrival() {
         1,
         "the marker's arrival pass stopped before node 24"
     );
+    // Routine 21 restored the saved state and erased its tokens; the clock
+    // tokens name nothing for it and stay.
+    let world = game.lot().world();
+    let traveler = &world.objects[&arrived.traveler];
+    let guids: Vec<u32> = saved_state_tokens(game, traveler.guid)
+        .iter()
+        .map(|&(guid, _)| guid)
+        .collect();
+    assert_eq!(guids, [7, 8], "only the clock tokens are left");
+}
+
+/// The kind-2 tokens in `guid`'s neighbor inventory, as (GUID, count).
+fn saved_state_tokens(game: &sims_game::Game, guid: u32) -> Vec<(u32, u16)> {
+    let world = game.lot().world();
+    let record = world.neighbors.first_of(guid).expect("a neighbor record");
+    world
+        .neighbors
+        .inventories
+        .iter()
+        .filter(|i| i.neighbor == record.id)
+        .flat_map(|i| &i.items)
+        .filter(|t| t.kind == SAVED_STATE_TOKEN)
+        .map(|t| (t.guid, t.count))
+        .collect()
 }
 
 #[test]
@@ -224,6 +256,12 @@ fn the_middle_ped_marker_brings_back_a_date() {
         traveler as i16,
         "the companion's DateFlag does not name the leader"
     );
+    // Node 23 links the leader to the companion and negates it.
+    assert_eq!(
+        person_word(game, traveler, DATE_FLAG),
+        -(companion as i16),
+        "the leader's DateFlag is not the companion's, negated"
+    );
 }
 
 /// A solo trip by a household member other than the first. The traveler
@@ -261,6 +299,7 @@ fn a_solo_traveler_who_is_not_the_first_member_leads_the_visit() {
     let traveler = arrived.traveler;
     let home_family = arrived.home_family;
     let game = arrived.shell.game_mut().expect("the Downtown lot");
+    let leader_guid = Some(game.lot().world().objects[&traveler].guid);
     assert_eq!(person_word(game, traveler, PETS_OUTSIDE), 1);
     assert!(!game.edit_mode(), "a solo visit opened in edit mode");
     let world = game.lot().world();
@@ -310,6 +349,21 @@ fn a_solo_traveler_who_is_not_the_first_member_leads_the_visit() {
     assert_eq!(arrived.shell.active_lot_house(), Some(5));
     let home = arrived.shell.game().expect("the Goth house again");
     assert_eq!(home.lot().world().globals[9] as u16, home_family);
+    // The Go Downtown plugin's tail would read the clock back (routine 23);
+    // the trip home leaves the saved state as that tail does: none.
+    let traveler_guid = home
+        .lot()
+        .world()
+        .objects
+        .values()
+        .find(|o| o.person.is_some() && Some(o.guid) == leader_guid)
+        .map(|o| o.guid)
+        .expect("the traveler is home");
+    assert_eq!(
+        saved_state_tokens(home, traveler_guid),
+        [],
+        "the trip home kept the departure's saved state"
+    );
     assert_eq!(
         home.lot().world().budget.funds,
         spent,
@@ -399,10 +453,12 @@ fn an_aborted_date_takes_back_the_companion_token() {
             companion,
         ))
         .expect("travel Downtown");
-    // The token is there on arrival, before the marker takes it.
-    assert_eq!(
-        companion_tokens(shell.game_mut().expect("the Downtown lot"), leader),
-        1
+    // The tokens are there on arrival, before the marker takes them.
+    let game = shell.game_mut().expect("the Downtown lot");
+    assert_eq!(companion_tokens(game, leader), 1);
+    assert!(
+        saved_state_tokens(game, leader).len() > 2,
+        "the departure wrote the leader's saved state and clock"
     );
     drop(shell);
 
@@ -414,5 +470,10 @@ fn an_aborted_date_takes_back_the_companion_token() {
         companion_tokens(game, leader),
         0,
         "the aborted date kept its token"
+    );
+    assert_eq!(
+        saved_state_tokens(game, leader),
+        [],
+        "the aborted trip kept the departure's saved state"
     );
 }
