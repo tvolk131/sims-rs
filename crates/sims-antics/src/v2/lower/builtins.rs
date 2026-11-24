@@ -80,7 +80,7 @@ impl<'a> TreeLowerer<'a> {
                     TreeContext::ObjectSelf => "my.id",
                 };
                 let tmp = self.fresh("icon");
-                self.line(format!("let {tmp} = {self_air};"));
+                self.emit_let(&tmp, self_air);
                 return Ok(tmp);
             }
         }
@@ -562,7 +562,7 @@ impl<'a> TreeLowerer<'a> {
                 // original's pointer aliasing on global 34), so a global range is copied first.
                 if range_air.starts_with("global[") {
                     let tmp = self.fresh("rnd_range");
-                    self.line(format!("let {tmp} = {range_air};"));
+                    self.emit_let(&tmp, &range_air);
                     range_air = tmp;
                 }
                 self.reject_read_only_sim_slot(&dst.value)?;

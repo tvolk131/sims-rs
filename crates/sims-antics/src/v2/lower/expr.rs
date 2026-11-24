@@ -310,9 +310,9 @@ impl<'a> TreeLowerer<'a> {
                     ));
                 }
                 if declare_let {
-                    self.line(format!("let {dst_air} = {b_air};"));
+                    self.emit_let(dst_air, &b_air);
                 } else if b_air != dst_air {
-                    self.line(format!("{dst_air} := {b_air};"));
+                    self.emit_store(dst_air, ":=", &b_air);
                 }
                 b_ty
             }
@@ -668,7 +668,7 @@ impl<'a> TreeLowerer<'a> {
                         // See `random_into`: a global range would receive the draw.
                         if range_air.starts_with("global[") {
                             let copy = self.fresh("rnd_range");
-                            self.line(format!("let {copy} = {range_air};"));
+                            self.emit_let(&copy, &range_air);
                             range_air = copy;
                         }
                         let tmp = self.fresh("rnd");
@@ -858,7 +858,7 @@ impl<'a> TreeLowerer<'a> {
             return air;
         }
         let copy = self.fresh(prefix);
-        self.line(format!("let {copy} = {air};"));
+        self.emit_let(&copy, &air);
         copy
     }
 

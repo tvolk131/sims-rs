@@ -84,7 +84,7 @@ impl<'a> TreeLowerer<'a> {
             target_air
         } else {
             let staged = self.fresh("rf_obj");
-            self.line(format!("let {staged} = {target_air};"));
+            self.emit_let(&staged, &target_air);
             staged
         };
         let mut change_icon = false;
@@ -110,7 +110,7 @@ impl<'a> TreeLowerer<'a> {
                     val
                 } else {
                     let staged = self.fresh("rf_arg");
-                    self.line(format!("let {staged} = {val};"));
+                    self.emit_let(&staged, &val);
                     staged
                 };
                 staged_args.push((staged, val_ty, arg.span));
@@ -921,7 +921,7 @@ impl<'a> TreeLowerer<'a> {
             delta
         } else {
             let snap = self.fresh("mc_d");
-            self.line(format!("let {snap} = {delta};"));
+            self.emit_let(&snap, &delta);
             snap
         };
         let (stop, _) = self.lower_value_expr(&stop_at.value)?;

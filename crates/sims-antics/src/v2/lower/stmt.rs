@@ -51,11 +51,11 @@ impl<'a> TreeLowerer<'a> {
                 } else if is_compound_arith_or_neg(init) {
                     self.lower_arith_into_dest(init, &air_name, true)?
                 } else if let Some((val_air, inferred)) = self.try_lower_callable_value_raw(init)? {
-                    self.line(format!("let {air_name} = {val_air};"));
+                    self.emit_let(&air_name, &val_air);
                     inferred
                 } else {
                     let (val_air, inferred) = self.lower_value_expr(init)?;
-                    self.line(format!("let {air_name} = {val_air};"));
+                    self.emit_let(&air_name, &val_air);
                     inferred
                 };
                 let final_ty = if let Some(ann) = ty {
@@ -628,7 +628,7 @@ impl<'a> TreeLowerer<'a> {
                                 }
                             }
                         };
-                        self.line(format!("let {iter_var} = {root_expr};"));
+                        self.emit_let(&iter_var, &root_expr);
                         parts_root_opt = Some(root_expr);
                         (
                             "part".to_owned(),
@@ -924,7 +924,7 @@ impl<'a> TreeLowerer<'a> {
                                         ),
                                     ));
                                 }
-                                self.line(format!("{ret_val} := {val_air};"));
+                                self.emit_store(&ret_val, ":=", &val_air);
                             }
                         }
                     }
@@ -1145,7 +1145,7 @@ impl<'a> TreeLowerer<'a> {
                 ));
             }
             let local = c.fresh("range");
-            c.line(format!("let {local} = {air};"));
+            c.emit_let(&local, &air);
             Ok(Bound::Local(local))
         };
         let lo = snapshot(self, start)?;
@@ -1187,10 +1187,10 @@ impl<'a> TreeLowerer<'a> {
             let lo_adj = adjust(self, &lo, -1);
             let hi_adj = adjust(self, &hi, i16::from(inclusive));
             if rev {
-                self.line(format!("let {iter_var} = {hi_adj};"));
+                self.emit_let(&iter_var, &hi_adj);
                 self.line(format!("while {iter_var} dec_gt {lo_adj} {{"));
             } else {
-                self.line(format!("let {iter_var} = {lo_adj};"));
+                self.emit_let(&iter_var, &lo_adj);
                 self.line(format!("while {iter_var} inc_lt {hi_adj} {{"));
             }
         } else {
@@ -1215,7 +1215,7 @@ impl<'a> TreeLowerer<'a> {
             } else {
                 (lo_air, last_hi, "+=")
             };
-            self.line(format!("let {iter_var} = {first};"));
+            self.emit_let(&iter_var, &first);
             self.line("while true {".to_owned());
             edge_step = Some(ContinueStep::Range {
                 var: iter_var.clone(),
@@ -1410,7 +1410,7 @@ impl<'a> TreeLowerer<'a> {
             self.em.indent();
             self.line(format!("if {cand_var} == {raw_var} {{"));
             self.em.indent();
-            self.line(format!("{found_var} := {cand_var};"));
+            self.emit_store(&found_var, ":=", &cand_var);
             self.line("break;".to_owned());
             self.em.dedent();
             self.line("}".to_owned());
@@ -1445,13 +1445,13 @@ impl<'a> TreeLowerer<'a> {
                     self.em.indent();
                     self.line(format!("if {found_var} == 0 {{"));
                     self.em.indent();
-                    self.line(format!("{found_var} := {cand_var};"));
-                    self.line(format!("{bvar} := {sf};"));
+                    self.emit_store(&found_var, ":=", &cand_var);
+                    self.emit_store(bvar, ":=", sf);
                     self.em.dedent();
                     self.line(format!("}} else if {sf} > {bvar} {{"));
                     self.em.indent();
-                    self.line(format!("{found_var} := {cand_var};"));
-                    self.line(format!("{bvar} := {sf};"));
+                    self.emit_store(&found_var, ":=", &cand_var);
+                    self.emit_store(bvar, ":=", sf);
                     self.em.dedent();
                     self.line("}".to_owned());
                     self.em.dedent();
@@ -1459,7 +1459,7 @@ impl<'a> TreeLowerer<'a> {
                 } else {
                     self.line(format!("if {found_var} == 0 {{"));
                     self.em.indent();
-                    self.line(format!("{found_var} := {cand_var};"));
+                    self.emit_store(&found_var, ":=", &cand_var);
                     self.em.dedent();
                     self.line("}".to_owned());
                 }
@@ -1490,7 +1490,7 @@ impl<'a> TreeLowerer<'a> {
                 self.em.indent();
                 self.line(format!("if {tchk} == {raw_var} {{"));
                 self.em.indent();
-                self.line(format!("{found_var} := {raw_var};"));
+                self.emit_store(&found_var, ":=", &raw_var);
                 self.line("break;".to_owned());
                 self.em.dedent();
                 self.line("}".to_owned());

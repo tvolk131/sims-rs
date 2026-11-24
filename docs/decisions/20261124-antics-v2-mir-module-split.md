@@ -35,7 +35,9 @@ The work is a refactor that is strictly behaviour-preserving. It adds no syntax 
 - **A new `v2/mir/` layer** takes what was mixed into `opt.rs`. See the module map below.
 - **`opt.rs`** keeps only the optimizer passes over the MIR. It went from 2,723 lines to 810.
 - **`mir::Emitter`** replaces `TreeLowerer`'s `out` / `indent` fields. It writes lines at a depth and gives the marks that trial lowering uses: `mark`, `truncate`, `split_off`, `since`, `take_text` / `set_text` / `append`.
-- **`mir::StackObjOp`** types the `stack_obj` cursor operations. Every `let X = stack_obj;` and `stack_obj := X;` the lowering writes now goes through `TreeLowerer::stack_op`.
+- **`mir::StackObjOp`** types the `stack_obj` cursor operations (`Save`: `let X = stack_obj;`, `Set`: `stack_obj := X;`), written through `TreeLowerer::stack_op`.
+  - The dedicated save and restore sites call it directly.
+  - The generic writers `emit_let` / `emit_store` route a stack-object operand to it. Every plain `let A = B;` and `A op B;` with named operands goes through these, so a source `stack_obj = self.id;`, a `let saved = stack_obj;` or a `distance_to` snapshot is typed too.
 - **`mir::finish_body` with `FrameFacts`** is the per-tree backend pipeline. It takes over what `TreeLowerer::finish` ran inline:
   - the entry-save drop or the optimizer;
   - the pinned slot;

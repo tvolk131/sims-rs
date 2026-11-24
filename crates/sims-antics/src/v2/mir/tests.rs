@@ -38,7 +38,7 @@ fn emitter_writes_indented_lines_and_rewinds_to_marks() {
 
 #[test]
 fn bodies_round_trip_through_mir() {
-    let body = "    let __x_1 = my.attr[0];\n    if __x_1 == 1 {\n        my.attr[1] := 2;\n    } else if __x_1 == 2 {\n        while __x_1 < 5 {\n            __x_1 += 1;\n        }\n    } else {\n        dialog(\"a { b } -> c;\");\n    }\n    while true {\n        break;\n    }\n    return true;\n";
+    let body = "    let __x_1 = my.attr[0];\n    if __x_1 == 1 {\n        my.attr[1] := 2;\n    } else if __x_1 == 2 {\n        while __x_1 < 5 {\n            __x_1 += 1;\n        }\n    } else {\n        call \"a { b } -> c;\"(temps);\n    }\n    while true {\n        break;\n    }\n    return true;\n";
     let nodes = parse_body(body).expect("in the modelled subset");
     assert_eq!(nodes.len(), 4);
     assert!(matches!(&nodes[1], Stmt::If { arms, else_body: Some(_) } if arms.len() == 2));

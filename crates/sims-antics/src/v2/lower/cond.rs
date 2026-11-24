@@ -173,7 +173,7 @@ impl<'a> TreeLowerer<'a> {
             (l, r, r_ty)
         } else {
             let snap_l = self.fresh("cmp_l");
-            self.line(format!("let {snap_l} = {l};"));
+            self.emit_let(&snap_l, &l);
             let (r, r_ty) = self.lower_value_expr(rhs)?;
             (snap_l, r, r_ty)
         };
@@ -270,7 +270,7 @@ impl<'a> TreeLowerer<'a> {
                 return Ok(if effective { "1 == 1" } else { "1 == 0" }.to_owned());
             }
             let tmp = self.fresh("bf_tst");
-            self.line(format!("let {tmp} = {lhs_air};"));
+            self.emit_let(&tmp, &lhs_air);
             self.line(format!("{tmp} &= {mask};"));
             return Ok(if method == "contains" {
                 if negated {
@@ -288,7 +288,7 @@ impl<'a> TreeLowerer<'a> {
             lhs_air
         } else {
             let s = self.fresh("bf_lhs");
-            self.line(format!("let {s} = {lhs_air};"));
+            self.emit_let(&s, &lhs_air);
             s
         };
         let (rhs_air, rhs_ty) = self.lower_value_expr(&args[0].value)?;
@@ -305,7 +305,7 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
         let tmp = self.fresh("bf_tst");
-        self.line(format!("let {tmp} = {lhs_snap};"));
+        self.emit_let(&tmp, &lhs_snap);
         self.line(format!("{tmp} &= {rhs_air};"));
         Ok(if method == "contains" {
             if negated {
@@ -749,7 +749,7 @@ impl<'a> TreeLowerer<'a> {
                             ),
                         ));
                     }
-                    self.line(format!("{dst_local} := {rv};"));
+                    self.emit_store(dst_local, ":=", &rv);
                     return Ok(());
                 }
                 Err(Error::at(*span, "unsupported boolean call expression"))

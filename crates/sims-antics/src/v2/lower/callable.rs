@@ -208,7 +208,7 @@ impl<'a> TreeLowerer<'a> {
             operands[i] =
                 if const_val.is_none() && (air.contains("temp[") || later_impure || may_fault) {
                     let snap = self.fresh("arg");
-                    self.line(format!("let {snap} = {air};"));
+                    self.emit_let(&snap, &air);
                     (snap, None)
                 } else {
                     (air, const_val)
@@ -521,11 +521,11 @@ impl<'a> TreeLowerer<'a> {
         }
         if self.has_active_cleanups() {
             let ret_snap = self.fresh("fret");
-            self.line(format!("let {ret_snap} = {val_air};"));
+            self.emit_let(&ret_snap, &val_air);
             self.emit_all_cleanups()?;
-            self.line(format!("{dest} := {ret_snap};"));
+            self.emit_store(&dest, ":=", &ret_snap);
         } else {
-            self.line(format!("{dest} := {val_air};"));
+            self.emit_store(&dest, ":=", &val_air);
         }
         self.line("return true;".to_owned());
         Ok(())

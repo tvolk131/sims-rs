@@ -624,7 +624,7 @@ impl<'a> TreeLowerer<'a> {
         };
         match lval {
             LValue::Direct { air, .. } => {
-                self.line(format!("{air} {op_str} {rhs_air};"));
+                self.emit_store(air, op_str, rhs_air);
             }
             LValue::ForeignAttr {
                 obj_air,
@@ -633,7 +633,7 @@ impl<'a> TreeLowerer<'a> {
             } => {
                 let effective_rhs = if rhs_air.starts_with("stack.") || rhs_air == "stack_obj" {
                     let snap = self.fresh("frhs");
-                    self.line(format!("let {snap} = {rhs_air};"));
+                    self.emit_let(&snap, rhs_air);
                     snap
                 } else {
                     rhs_air.to_owned()
@@ -658,7 +658,7 @@ impl<'a> TreeLowerer<'a> {
                     || clobbers_temp0
                 {
                     let snap = self.fresh("frhs");
-                    self.line(format!("let {snap} = {rhs_air};"));
+                    self.emit_let(&snap, rhs_air);
                     snap
                 } else {
                     rhs_air.to_owned()
@@ -673,7 +673,7 @@ impl<'a> TreeLowerer<'a> {
                 } else {
                     None
                 };
-                self.line(format!("{cell} {op_str} {effective_rhs};"));
+                self.emit_store(cell, op_str, &effective_rhs);
                 if switches {
                     self.emit_restore_stack_obj(saved.as_deref());
                 }
@@ -728,11 +728,11 @@ impl<'a> TreeLowerer<'a> {
                     self.line(setup.clone());
                 }
                 if obj_air == "stack_obj" {
-                    self.line(format!("let {tmp} = {cell};"));
+                    self.emit_let(&tmp, cell);
                 } else {
                     let saved = self.save_stack_obj_for_move();
                     self.stack_op(mir::StackObjOp::Set(obj_air));
-                    self.line(format!("let {tmp} = {cell};"));
+                    self.emit_let(&tmp, cell);
                     self.emit_restore_stack_obj(saved.as_deref());
                 }
                 Ok((tmp, ty.clone()))

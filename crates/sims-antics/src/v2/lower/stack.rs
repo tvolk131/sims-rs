@@ -9,6 +9,25 @@ impl<'a> TreeLowerer<'a> {
         self.line(op.text());
     }
 
+    /// `let NAME = VALUE;`, typed as a [`mir::StackObjOp::Save`] when `VALUE` is the stack
+    /// object.
+    pub(super) fn emit_let(&mut self, name: &str, value: &str) {
+        if value == "stack_obj" {
+            self.stack_op(mir::StackObjOp::Save(name));
+        } else {
+            self.line(format!("let {name} = {value};"));
+        }
+    }
+
+    /// `LHS OP RHS;`, typed as a [`mir::StackObjOp::Set`] when it sets the stack object.
+    pub(super) fn emit_store(&mut self, lhs: &str, op: &str, rhs: &str) {
+        if lhs == "stack_obj" && op == ":=" {
+            self.stack_op(mir::StackObjOp::Set(rhs));
+        } else {
+            self.line(format!("{lhs} {op} {rhs};"));
+        }
+    }
+
     pub(super) fn track_stack_obj(&mut self, explicit_stack_obj: bool) {
         self.explicit_stack_obj = explicit_stack_obj;
         self.has_self_obj_local |=

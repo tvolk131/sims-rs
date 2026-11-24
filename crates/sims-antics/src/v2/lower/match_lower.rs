@@ -171,7 +171,7 @@ impl<'a> TreeLowerer<'a> {
                         .1
                 } else {
                     let (air, ty) = self.lower_value_expr(expr)?;
-                    self.line(format!("{dest} := {air};"));
+                    self.emit_store(&dest, ":=", &air);
                     ty
                 };
                 match &result.ty {
@@ -334,7 +334,7 @@ impl<'a> TreeLowerer<'a> {
                         .all(|b| b.is_ascii_alphanumeric() || b == b'_'));
             if !plain {
                 let l = self.fresh("match");
-                self.line(format!("let {l} = {val_air};"));
+                self.emit_let(&l, &val_air);
             }
             return self.lower_match_arm(arm, result);
         }
@@ -345,7 +345,7 @@ impl<'a> TreeLowerer<'a> {
             val_air
         } else {
             let l = self.fresh("match");
-            self.line(format!("let {l} = {val_air};"));
+            self.emit_let(&l, &val_air);
             l
         };
         self.emit_match_chain(

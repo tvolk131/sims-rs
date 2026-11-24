@@ -201,7 +201,7 @@ impl<'a> TreeLowerer<'a> {
                 return air;
             }
             let loc = c.fresh(&format!("arg_{}", param.name));
-            c.line(format!("let {loc} = {air};"));
+            c.emit_let(&loc, &air);
             loc
         };
         let bind_operand = |c: &mut Self, air: String, ty: ValueType| {
@@ -362,7 +362,7 @@ impl<'a> TreeLowerer<'a> {
                 match &mut lval {
                     LValue::ForeignAttr { obj_air, .. } | LValue::ForeignCell { obj_air, .. } => {
                         let snap = self.fresh(&format!("ref_obj_{}", param.name));
-                        self.line(format!("let {snap} = {obj_air};"));
+                        self.emit_let(&snap, obj_air);
                         *obj_air = snap;
                     }
                     LValue::Direct { .. } => {}
@@ -378,7 +378,7 @@ impl<'a> TreeLowerer<'a> {
                     && idx.parse::<i16>().is_err()
                 {
                     let snap = self.fresh(&format!("ref_idx_{}", param.name));
-                    self.line(format!("let {snap} = {idx};"));
+                    self.emit_let(&snap, idx);
                     *setup = format!("temp[0] := {snap};");
                 }
                 Binding::MutRef { target: lval }
@@ -419,7 +419,7 @@ impl<'a> TreeLowerer<'a> {
                         ));
                     }
                     let loc = self.fresh(&format!("obj_{}", param.name));
-                    self.line(format!("let {loc} = {air};"));
+                    self.emit_let(&loc, &air);
                     Binding::ForeignObject { air_name: loc }
                 }
             }
