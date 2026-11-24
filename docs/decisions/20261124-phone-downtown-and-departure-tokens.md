@@ -136,8 +136,11 @@ Generic Sims Call's table is at 0x45143a and its true branch at 0x44f7f0.
   the leader's link is negative, as natively). The companion's traveler
   record keeps destination object ID 0, and the trip home finds it by
   GUID.
-- **The envelope keeps version 4.** No persisted shape changed: the
-  companion record's destination ID 0 already decodes in v1–v4.
+- **The envelope moves to version 5** (`TRIP_TOKEN_ENVELOPE_VERSION`).
+  The layout is unchanged, so v1–v4 still decode, but a v5 trip carries
+  kind-2 tokens in the travelers' inventories. The trip home and the abort
+  clear those tokens for v5+ trips only (the stand-in for the plugin tail,
+  below); older trips never had them.
 - **Routine 24 is a follow-up.** It needs the outfit editor's accessors
   and commit.
 
