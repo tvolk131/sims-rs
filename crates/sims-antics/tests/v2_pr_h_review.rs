@@ -1157,3 +1157,55 @@ fn raw_constants_reach_later_raw_blocks() {
         "formats text",
     );
 }
+
+/// A raw block is analysed in the constant environment the `.air` compiler gives it: the tree's
+/// v2 constants, the earlier raw blocks' declarations (which may use them), then its own v2
+/// constants, without the names it declares itself.
+#[test]
+fn raw_blocks_see_the_trees_constant_environment() {
+    let seeded = |body: &str| {
+        nodes(&format!(
+            "object \"Review\" {{\n    guid: 0x7F40_0800;\n    const SEED = 7;\n{body}\n}}\n"
+        ))
+    };
+    // An earlier declaration built from a v2 constant changes no later fact (entry save, text).
+    assert_eq!(
+        seeded(
+            r#"    @id(4300) tree a (sim: Sim) {
+        raw { const K = literal(SEED); }
+        raw { if gosub_found_action() { temp[1] := 3; } else { temp[1] := 4; } }
+        stack_obj = sim.container;
+    }"#
+        ),
+        seeded(
+            r#"    @id(4300) tree a (sim: Sim) {
+        raw { if gosub_found_action() { temp[1] := 3; } else { temp[1] := 4; } }
+        stack_obj = sim.container;
+    }"#
+        ),
+    );
+    seeded(
+        r#"    @id(4300) tree a {
+        raw { const K = literal(SEED); }
+        const C = if temp[0] == 0 { 7 } else { 9 };
+        let x = C;
+        temp[1] = x;
+        raw { temp[2] := 3; }
+    }"#,
+    );
+    seeded(
+        r#"    fn f() { raw { const K = literal(SEED); temp[0] := K; } }
+    @id(4300) tree a { f(); f(); }"#,
+    );
+    // Discarded code declares its own constant; a declaration may end in the next block.
+    nodes(&obj(r#"    @id(4300) tree a {
+        raw { const K = 1; }
+        if false { raw { const K = 2; temp[0] := K; } }
+        raw { temp[1] := K; }
+    }"#));
+    nodes(&obj(r#"    const K = 7;
+    @id(4300) tree a {
+        raw { const K = 9 }
+        raw { ; temp[0] := 1; }
+    }"#));
+}
