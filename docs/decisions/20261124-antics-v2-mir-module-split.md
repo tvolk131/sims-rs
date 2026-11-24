@@ -29,7 +29,7 @@ The work is a refactor that is strictly behaviour-preserving. It adds no syntax 
 ### Changes
 
 - **`v2/lower.rs` becomes `v2/lower/`**, with 24 child modules plus `mod.rs`.
-  - The split commit moves every item verbatim. Its only edits are a `pub(super)` on moved items that had no visibility, and the module headers.
+  - The split commit is mechanical: it moves every item unchanged apart from a `pub(super)` on moved items that had no visibility, the module headers, and the `rustfmt` reflow those cause (for example `lower_object`'s signature now spans several lines).
   - Later commits in this change edit the moved code only to route emission through `mir::Emitter`, `StackObjOp` and the typed writers (below), and to hand the end of `finish` to `mir::finish_body`. Each of those edits keeps the output byte-identical.
   - Types, structs and enums stay in `lower/mod.rs`, so their private fields stay visible to every child.
 - **A new `v2/mir/` layer** takes what was mixed into `opt.rs`. See the module map below.
@@ -96,7 +96,7 @@ The work is a refactor that is strictly behaviour-preserving. It adds no syntax 
 
 ### Verification
 
-**Differential harness.** It runs the base binary (b3758a7c) and the new one over the same corpus, and compares every observable output byte for byte. The corpus is:
+**Differential harness.** It runs the base binary (b3758a7c) and the new one over the same corpus. The corpus is:
 
 - 1,341 `.antics` files:
   - every `.antics` in the repository;
@@ -106,11 +106,8 @@ The work is a refactor that is strictly behaviour-preserving. It adds no syntax 
 
 The outputs compared are:
 
-- `expand`;
-- `check`;
-- `lint --json`;
-- the sha256 of the `.iff` built from each file;
-- the sha256 of every file each pack builds.
+- directly, as captured text (exit status, and stdout and stderr decoded as UTF-8 with the run's output directory replaced by a placeholder): `expand`, `check` and `lint --json` for each file, and each `build` run;
+- by sha256: the `.iff` built from each file outside a pack (through a one-object pack), and every file each pack builds.
 
 Two base runs agree with each other (0 differences). Every stage of this change also gives 0 differences.
 
@@ -120,7 +117,7 @@ Turning the remaining text emission sites (about 300 `self.line` calls in `lower
 
 That PR starts from the seams added here:
 
-- **`Emitter`.** `TreeLowerer` writes its body text through it (only the `__saved_stack_obj` entry save is prepended later, in `finish`), so it can start building `mir::Stmt` instead of text.
+- **`Emitter`.** `TreeLowerer` writes the lowered body (the text before the backend passes) through it, so it can start building `mir::Stmt` instead of text. Two lines are prepended outside it: the `__saved_stack_obj` entry save (in `finish`) and the `const` lines for raw-block constants declared elsewhere (in `finish_body`).
 - **`InstKind`.** Today a view over the text; it can become a stored typed instruction.
 - **`StackObjOp`.** Generated `let X = stack_obj;` saves and plain `:=` writes of the stack object are already typed (raw `.air` and compound writes excepted).
 - **`FrameFacts`.** It carries the frame metadata.
@@ -131,7 +128,7 @@ The Round 3 fixes each become a local change:
 - **Hidden `local: 0` slot accounting.** `FrameFacts::pinned` / `pinned_locals` in `mir/pipeline.rs`.
 - **Inline-helper slot sharing.** `lower/inline.rs`, which no longer shares a file with the statement dispatcher.
 
-The canonical `@context(inherit)` equivalence check is in the verifier. That is outside this change's files.
+- **Canonical `@context(inherit)` check.** Lowering checks an `@context(inherit)` tree by emitting it once per caller context and comparing the two `.air` strings (`emit_standalone_tree` in `lower/trees.rs`). Making that comparison canonical is a local change there; any verifier-side change would be separate follow-up work.
 
 ## What would reopen this
 

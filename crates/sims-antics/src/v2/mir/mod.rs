@@ -4,9 +4,10 @@
 //! [`InstKind`]: declaration, store, `return` / `break` / `continue` exit, or other), `if` chains and
 //! `while` loops. Every branch of the tree is a structured edge.
 //!
-//! The modelled subset is exactly what `parse_body` accepts. Lines are trimmed and blank lines
-//! skipped; every check below looks at the line with its string literals' contents removed. Each
-//! line must be one of:
+//! The modelled subset is exactly what `parse_body` accepts. Its checks are structural line
+//! checks, not `.air` validation: it accepts a form such as a bare `;` or an empty `if  {`
+//! condition without checking its syntax. Lines are trimmed and blank lines skipped; every check
+//! below looks at the line with its string literals' contents removed. Each line must be one of:
 //! - an `if COND {` or `while COND {` header (`COND` holding no `;`, `{` or `}`), which opens a
 //!   block;
 //! - a `}`, `} else if COND {` or `} else {` line, which closes the open block. Every block must be
