@@ -6,11 +6,14 @@
 //! objects, in the order it finds them. [`Catalog::build`] registers every object
 //! definition by GUID and resolves semi-global links. [`Neighborhood::open`]
 //! reads a neighborhood's families and finds its houses, and [`House::load`]
-//! reads a saved lot against the catalog. [`Animations`] holds the clips a
+//! reads a saved lot against the catalog. [`Catalog::buy_entries`] lists
+//! what the Buy catalog shows, with [`CatalogText`] and [`BuyLabels`] for its
+//! text. [`Animations`] holds the clips a
 //! person's animator plays.
 
 mod animations;
 pub mod assets;
+mod buy_catalog;
 mod catalog;
 mod error;
 pub mod family_import;
@@ -27,6 +30,10 @@ mod wardrobe;
 
 pub use animations::{Animations, Channel, Clip, Event, Track};
 pub use assets::Assets;
+pub use buy_catalog::{
+    BuyCatalog, BuyDefinition, BuyEligibility, BuyEntry, BuyLabels, CatalogText, has_interactions,
+    master_of,
+};
 pub use catalog::{Catalog, Object};
 pub use error::Error;
 pub use file_table::SuitTable;

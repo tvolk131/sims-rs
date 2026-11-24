@@ -29,6 +29,7 @@
 //! after a load (0x41003c), so the lot load counts them again too.
 
 use crate::load::LoadError;
+use crate::neighborhood_save::SaveInputs;
 use crate::neighbors::{FAMILY, RECORDED_KINDS, Registered};
 use sims_content::family_import::{self, Import, ImportInput, ImportOptions};
 use sims_content::{Catalog, Neighborhood, PENDING_IMPORT};
@@ -80,6 +81,23 @@ pub struct Opened {
     pub imports: Vec<(String, Import)>,
     /// The file counter after the last import (neighborhood +0x160).
     pub next_file: i32,
+}
+
+impl Opened {
+    /// Brings `inputs` up to date with this open, as the save after the
+    /// import (0x4252cc) sees the families: the renumbered family keeps
+    /// its entries under its new ID ([`SaveInputs::renumber_family`]),
+    /// and each imported family takes its file's FAMh
+    /// ([`SaveInputs::move_in_family`]), in scan order. A displaced
+    /// family keeps its own.
+    pub fn update_save_inputs(&self, inputs: &mut SaveInputs) {
+        if let Some((from, to)) = self.renumbered {
+            inputs.renumber_family(from, to);
+        }
+        for (_, import) in &self.imports {
+            inputs.move_in_family(import.family_id, import.family_history.clone());
+        }
+    }
 }
 
 /// Opens `neighborhood`: house 0's reload as far as the import reads it,

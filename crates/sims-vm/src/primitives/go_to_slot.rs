@@ -91,9 +91,13 @@
 //!   so if it is still lost the saved step 20 becomes 19 and the route
 //!   fails without waiting for the animator any longer. Step 19 fails the
 //!   route: the next step is 7 (0x45afc4).
-//! - With byte +0x78 of the context clear, a run at any step but 2 or 3
-//!   only sets it again (0x45aebb); steps 2 and 3 fail loudly
-//!   (0x45aea5).
+//! - With byte +0x78 of the context clear (the lot forgot its routes,
+//!   [`crate::Interpreter::forget_routes`]), a run sets it again
+//!   (0x45aebb). At step 2 it first forgets the door (+0x68, 0x45aeb8);
+//!   at step 3 the next step becomes 15 (0x45aeaf).
+//! - **15**, planning again (0x45b3aa): the animator is asked to stop
+//!   (0x589e2d), with no sound; while it does not, the run yields in
+//!   step 15. Once it stops, the next step is 1 (0x45b05a).
 //!
 //! The steps run one after another in a run until one yields or pushes a
 //! tree. Every run works on the person's last context. Its retry count
@@ -200,6 +204,9 @@ const START: i32 = 12;
 const BEGIN_ROUTE: &str = "begin_route";
 const END_ROUTE: &str = "end_route";
 const ASK: i32 = 14;
+/// Step 15: a route under way the lot forgot stops its walk and plans
+/// again (0x45b3aa).
+const REPLAN: i32 = 15;
 const GIVE_UP: i32 = 16;
 const FEEDBACK: i32 = 17;
 const PLAN: i32 = 18;
@@ -498,15 +505,17 @@ impl Machine<'_, '_> {
             };
         }
         if !ctx.byte_78 {
-            // 0x45aea5: steps 2 and 3 do more first (context +0x68, or
-            // step 15), which is not ported; every other step, the lost
-            // steps 19 and 20 among them, only sets the byte again
-            // (0x45aebb), written back with the context.
-            if matches!(state, PORTAL | UNDER_WAY) {
-                return Err(unsupported(
-                    "0x45aea5",
-                    &format!("at step {state} with byte +0x78 of its context clear"),
-                ));
+            // 0x45aea5: the lot forgot what its routes worked out
+            // ([`Interpreter::forget_routes`]). On the way through a door
+            // the door is forgotten (0x45aeb8), so step 2 chooses again;
+            // a route under way goes to step 15 (0x45aeaf), which stops
+            // the walk and plans again. Every step, these and the lost
+            // steps 19 and 20 among them, sets the byte again (0x45aebb),
+            // written back with the context.
+            match state {
+                PORTAL => ctx.word_68 = 0,
+                UNDER_WAY => state = REPLAN,
+                _ => {}
             }
             ctx.byte_78 = true;
         }
@@ -941,6 +950,16 @@ impl Machine<'_, '_> {
                     // returned.
                     self.set_person_word(ROUTE_RESULT, ctx.result as i16)?;
                     state = FAILED;
+                }
+                REPLAN => {
+                    // 0x45b3aa: the animator is asked to stop (0x589e2d),
+                    // with no sound; while it does not, the run yields at
+                    // this step (0x45b9a0). Once it stops, the route
+                    // starts again from finding its places (0x45b05a).
+                    if !ask_stop(self.world, me)? {
+                        break;
+                    }
+                    state = CANDIDATES;
                 }
                 LOST_UNDER_WAY => {
                     // 0x45b352: the animator is asked to stop (0x589e2d),

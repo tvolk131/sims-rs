@@ -44,10 +44,10 @@ knowledge.
 | sims-kernel | 5.5k | **removed** | 0 | [sims-kernel](#sims-kernel--removed) |
 | sims-tools | 0.9k | **removed** | 0 | [sims-tools](#sims-tools--removed) |
 | sims-fixtures | 6.8k | **removed** | 0 | [sims-fixtures](#sims-fixtures--removed) |
-| sims-formats (leftovers) | 2.1k | stays | 2 | [sims-formats](#sims-formats-leftovers--stays) |
-| sims-runtime | 129k | stays | 2 | [sims-runtime](#sims-runtime--stays) |
+| sims-formats (leftovers) | 2.1k | **removed** | 0 | [sims-formats](#sims-formats-leftovers--removed) |
+| sims-runtime | 129k | stays | 2 (1 partly ported) | [sims-runtime](#sims-runtime--stays) |
 | sims-app | 88k | stays | 5 | [sims-app](#sims-app--stays) |
-| sims-content | 98k | stays | 13 | [sims-content](#sims-content--stays) |
+| sims-content | 98k | stays | 10 (3 ported) | [sims-content](#sims-content--stays) |
 | sims-render | 55k | stays | 5 | [sims-render](#sims-render--stays) |
 | sims-vm | 100k | stays | 3 (5 ported) | [sims-vm](#sims-vm--stays) |
 | sims-sim | 187k | stays | ~20 | [sims-sim](#sims-sim--stays) |
@@ -64,12 +64,12 @@ the details, the legacy line ranges and the evidence. Several items overlap acro
 (noted in brackets). A crate can be removed once its items are ported, or dropped with a
 cited reason.
 
-**sims-formats**
-1. Parity for an empty SKN texture line. Legacy evidence says the original reader skips empty lines, which would make three EP7 meshes fail to load, but `crates/sims-formats/src/avatar/text.rs:214` accepts them. Settle it with the oracle.
-2. Re-express the catalog short-read tests and the synthetic text-avatar rejection tests.
+**sims-formats** (removed; both items done)
+1. ~~Parity for an empty SKN texture line.~~ Settled from the disassembly: the reader (0x59a629) skips empty lines, so an empty texture line fails. `crates/sims-formats/src/avatar/text.rs` now does the same ([ADR](decisions/20261124-buy-catalog-famh-move-in-fuzzer-and-skn.md)).
+2. ~~Re-express the catalog short-read tests and the synthetic text-avatar rejection tests.~~ They are in `crates/sims-formats/tests/avatar_codecs/{catalog,avatar}.rs`.
 
 **sims-runtime**
-1. Port the exploration fuzzer (`src/exploration.rs`) as the CI determinism and snapshot fuzzer. This was the salvage audit's PORT item, and nothing equivalent exists.
+1. Port the exploration fuzzer (`src/exploration.rs`) as the CI determinism and snapshot fuzzer. This was the salvage audit's PORT item. **Partly ported:** `crates/sims-sim/tests/state_fuzzer.rs` fuzzes the state layer (World snapshots with warm-fork and cold-restore branches, stored neighborhoods, save inputs, the REDB store against a model) with the legacy fuzzer's sampling, trace, panic capture and shrinking ([ADR](decisions/20261124-buy-catalog-famh-move-in-fuzzer-and-skn.md)). Still to do: the tick-level driver over `sims-vm`, which `sims-sim` cannot depend on.
 2. Absorb the comparator skeleton from `src/fixture_replay.rs` into an in-repo oracle comparator, or record its invariants in an ADR. It covers time invariants, bounds and `first_difference`.
 
 **sims-app**
@@ -80,9 +80,9 @@ cited reason.
 5. Downgrade or port the two remaining PORT verdicts: `owned_worker.rs` and `bin/inspector.rs`.
 
 **sims-content**
-1. Buy eligibility from the real TTAB (`0x457cb0`).
-2. Catalog-name fallback (`0x457d3b`, `*` + OBJD label).
-3. Buy category labels (STR# 150, 200–207 and 210; catalog-6 remap; column order).
+1. ~~Buy eligibility from the real TTAB (`0x457cb0`).~~ Ported to `crates/sims-content/src/buy_catalog.rs` ([ADR](decisions/20261124-buy-catalog-famh-move-in-fuzzer-and-skn.md)).
+2. ~~Catalog-name fallback (`0x457d3b`, `*` + OBJD label).~~ Ported there too; the legacy CATS order and language fallback were wrong.
+3. ~~Buy category labels (STR# 150, 200–207 and 210; catalog-6 remap; column order).~~ Ported there too.
 4. Built-in avatar materials (`0x5d41db`).
 5. Footstep floor material (`0x5890a8`) [also sims-sim #2].
 6. Censor appearance (`<profile>-needs` in `adult.cmx.bcf`, person word 30) [also sims-render #1].
@@ -182,26 +182,27 @@ bit patterns in a round-trip storage test. No file outside `legacy/` cites the c
 
 The salvage audit marked its design as worth reading ("design only"). The README stays readable at the tag. The legacy `sims-runtime` (`fixture_replay`, `conformance`) and `sims-render` (dev-dependency) still name this crate; they are not built. The suite manifests in `legacy/fixtures/suites/` belong to the legacy `sims-runtime` conformance runner, so they stay with that crate.
 
-## sims-formats (leftovers) — stays
+## sims-formats (leftovers) — removed
 
-**Verdict: STAYS.** Only 2.1k lines remain here. The rest moved into `crates/sims-formats` during the
-re-founding. What remains is the PE32 reader, the native FAR mount reader and nine test files
-whose code they test now lives in `crates/sims-formats`. One real parity question is unresolved,
-so the crate stays.
+**Verdict: DELETE-SAFE (removed 2026-11-24).** The 2.1k lines left here were the PE32 reader,
+the native FAR mount reader and nine test files whose code now lives in `crates/sims-formats`.
+The last two items are done: the empty SKN texture line is settled and the reader aligned
+([ADR](decisions/20261124-buy-catalog-famh-move-in-fuzzer-and-skn.md)), and the two
+synthetic test suites are re-expressed. The files are byte-identical at `legacy-final`, so
+`legacy/crates/sims-formats/<path>` is read with
+`git show legacy-final:crates/sims-formats/<path>`.
 
 | Legacy module/area | Knowledge | Status | Evidence |
 | --- | --- | --- | --- |
 | `src/pe32.rs` (+`pe32/tests.rs`) | Bounded PE32/I386 reader for the executable's initial image (sections, imports) | deliberately dropped | salvage-audit (formats): "drop `far/mount.rs` and `pe32` (oracle tooling only)". No current crate reads Sims.exe bytes |
 | `src/far/mount.rs`, `tests/far_mount.rs` | Native incremental FAR mount (0x5b9dbc): magic and version are not validated; the signed count is read at the manifest offset; a name of 2048 bytes or more fails ("native mount buffer"); a name is cut at its first NUL. The native catalog manager registers the archive and publishes each member as it is read, so a short read leaves earlier members visible and the archive registered, and a retry takes the already-mounted branch (see legacy `sims-sim/src/pose/clothing/catalog_mount.rs:121`) | deliberately dropped | salvage-audit (formats), as above. `crates/sims-formats/src/far.rs:83` validates more strictly (32 KiB cap, embedded NUL rejected). `crates/sims-content/src/index.rs` parses a whole directory before registering any member, so partial mounting is not reproduced. `crates/sims-formats/src/far.rs:83` parses names up to 32 KiB, and the content index then skips members whose names exceed 1,024 bytes (`crates/sims-content/src/index.rs:1108`), so the native 2,047-byte limit is never what decides. All of these differences only show on malformed archives. They are recorded here as a deliberate drop |
 | `tests/resource_map.rs` `map_ordinal_order_overrides_file_and_numeric_id_order` | `rsmp` order decides resource order over file and ID order | ported | `crates/sims-formats/tests/boundaries.rs` `a_resource_map_decides_lookup_as_well_as_order`, `a_resource_map_can_choose_the_earlier_chunk`, `only_version_2_5_headers_name_a_resource_map` |
-| `tests/catalog.rs` (2 public tests) | Binary avatar catalog: a native short read on a count returns "none" and keeps earlier successes; the next count read then errors; three groups decode and leave a tail unread | ported in code, **tests to re-express** | Behavior is in `crates/sims-formats/src/avatar/catalog.rs:60-62` (doc: "None represents the native count reader's short-read failure"). No current test pins it |
-| `tests/skn_texture_names.rs` | **The original's SKN name reader skips empty lines.** With an empty texture line, the bone count (`1`) is taken as the texture and parsing then fails ("invalid avatar integer"). The native token sequence comes from a private-fixture capture. The legacy Rust reader, which follows it, fails on three EP7 meshes (`xskin-funhousecart-ROOT-CART.skn` at offset 0x27, and `xskin-magic-wizeyelashes-R_HAND-WAX_JAR01/08.skn` at 0x36). What the original game does with these meshes is still an open oracle question | **still to mine** | `crates/sims-formats/src/avatar/text.rs:214-216` deliberately *accepts* an empty texture line ("EP7's untextured fun-house cart skins"), and `tests/avatar_codecs/avatar.rs` `skn_texture_line_may_be_empty` pins that. This disagrees with the legacy reader. Settle the original's behavior with the oracle, then align the reader or its note |
-| `tests/text_avatar.rs` `text_avatar_rejects_invalid_or_unrepresented_data` | CMX `version 301`, nonzero trailing counts, NUL in names and trailing bytes are rejected; SKN out-of-range indices, NaN, oversize blends (32769), huge counts and incomplete lines are rejected | ported in code, **tests to re-express** | `crates/sims-formats/src/avatar/text.rs` enforces these bounds. The legacy test was gated on a private fixture, but its rejection cases are synthetic |
+| `tests/catalog.rs` (2 public tests) | Binary avatar catalog: a native short read on a count returns "none" and keeps earlier successes; the next count read then errors; three groups decode and leave a tail unread | ported | Behavior is in `crates/sims-formats/src/avatar/catalog.rs:60-62`. Tests: `crates/sims-formats/tests/avatar_codecs/catalog.rs` `catalog_keeps_what_it_read_before_a_later_short_read`, `a_mixed_catalog_decodes_all_three_groups_and_leaves_the_tail_unread`. Its private-fixture motion test is not minable |
+| `tests/skn_texture_names.rs` | **The original's SKN name reader skips empty lines.** With an empty texture line, the bone count (`1`) is taken as the texture and parsing then fails ("invalid avatar integer"). The legacy Rust reader, which follows it, fails on three EP7 accessory meshes | ported | Settled from the disassembly: 0x59a629 reads the name, texture and bone names with one getline loop (0x59a644, 0x59a6a9, 0x59a733) that skips empty lines (0x59a676, 0x59a6db, 0x59a769), and a failed read returns the failed stream (0x59a921). `crates/sims-formats/src/avatar/text.rs` `read_skn` now does the same. Tests: `skn_skips_empty_name_lines_so_an_empty_texture_line_fails` and, with `SIMS_INSTALL`, `installed_skns_fail_only_for_an_empty_texture_line` (3,165 SKNs, exactly 3 fail, all with an empty texture line) |
+| `tests/text_avatar.rs` `text_avatar_rejects_invalid_or_unrepresented_data` | CMX `version 301`, nonzero trailing counts, NUL in names and trailing bytes are rejected; SKN out-of-range indices, NaN, oversize blends (32769), huge counts and incomplete lines are rejected | ported | `crates/sims-formats/src/avatar/text.rs` enforces these bounds. Test: `crates/sims-formats/tests/avatar_codecs/avatar.rs` `text_avatars_reject_invalid_or_unrepresented_data`, on a synthetic SKN in place of the private fixture's. Its native-record comparisons are not minable |
 | `tests/{career,neighborhood,surface_map,legacy_rle,resource_map(native),catalog(native motion),text_avatar(native)}.rs` | Native-reader parity on private captures | not minable (fixture JSON absent) | The `tests/fixtures/*.json` files were never public. The parsers are in `crates/sims-formats/src/{career,neighborhood,lot,legacy_sprite,iff,avatar}.rs` |
 
-**Still to mine (sims-formats):**
-1. SKN empty-texture-line parity (`legacy/crates/sims-formats/tests/skn_texture_names.rs`) → `crates/sims-formats/src/avatar/text.rs`. Settle it with the oracle (load an EP7 fun-house cart accessory), then align either the reader or the legacy note.
-2. Re-express the two catalog short-read tests and the synthetic text-avatar rejection cases as `crates/sims-formats` tests.
+Nothing is left to mine. Legacy crates that name `sims-formats` in their `Cargo.toml` mean the workspace crate, not this one, and they are not built.
 
 ## sims-runtime — stays
 
@@ -229,7 +230,7 @@ Both are pure Rust with no native dependencies (anyhow, serde, sha2, serde_json)
 
 | Legacy module/area | Knowledge | Status | Evidence |
 |---|---|---|---|
-| `src/exploration.rs` (852, 9 synthetic tests) | The `Driver` trait: observe, candidates, execute, fork, checkpoint, restore. A seeded weighted SplitMix64 command choice with rejection sampling and no modulo bias. Two branches run side by side: a warm fork, plus cold `checkpoint→restore` at several command boundaries, deduplicated, with every one required. A per-tick trace is compared, reporting the first differing offset, so a transient divergence is caught even when command endpoints are equal. The input journal is written *before* execution. Panics are caught and reported. `verify_replay` excludes wall-clock data. `minimize` does delta-debugging. Outcomes: Passed, Incomplete or Failed. | **still to mine** | salvage-audit:216-218 says PORT. Nothing equivalent exists. `grep fuzz/cold.?restore/warm.?fork` over `crates/` finds only perf "warm cache" benchmarks. Partial overlaps: `crates/sims-vm/tests/save.rs:19` (one restore at tick 500, then 500 ticks compared by `World::hash`, with no commands); `crates/sims-vm/tests/coop.rs:454` and `crates/sims-net/tests/lockstep_memory.rs:734,852` (scripted commands, snapshot join, drift); `crates/sims-vm/tests/interaction_sweep.rs` (exhaustive menu sweep with no restore comparison). None of them does randomised command choice, cold restore at arbitrary command boundaries, a per-tick first-offset trace or minimisation. |
+| `src/exploration.rs` (852, 9 synthetic tests) | The `Driver` trait: observe, candidates, execute, fork, checkpoint, restore. A seeded weighted SplitMix64 command choice with rejection sampling and no modulo bias. Two branches run side by side: a warm fork, plus cold `checkpoint→restore` at several command boundaries, deduplicated, with every one required. A per-tick trace is compared, reporting the first differing offset, so a transient divergence is caught even when command endpoints are equal. The input journal is written *before* execution. Panics are caught and reported. `verify_replay` excludes wall-clock data. `minimize` does delta-debugging. Outcomes: Passed, Incomplete or Failed. | **partly ported** (state layer: `crates/sims-sim/tests/state_fuzzer.rs`, [ADR](decisions/20261124-buy-catalog-famh-move-in-fuzzer-and-skn.md); tick-level driver still to mine) | salvage-audit:216-218 says PORT. Since 2026-11-24, `crates/sims-sim/tests/state_fuzzer.rs` covers the state layer at command boundaries: seeded World commands with warm-fork, cold-restore and REDB-restore branches and per-command traces, record round-trips, and the REDB store against a model, with shrinking. What it cannot do from `sims-sim` is tick; the tick-level driver below is still open. Before it, `grep fuzz/cold.?restore/warm.?fork` over `crates/` found only perf "warm cache" benchmarks. Partial overlaps: `crates/sims-vm/tests/save.rs:19` (one restore at tick 500, then 500 ticks compared by `World::hash`, with no commands); `crates/sims-vm/tests/coop.rs:454` and `crates/sims-net/tests/lockstep_memory.rs:734,852` (scripted commands, snapshot join, drift); `crates/sims-vm/tests/interaction_sweep.rs` (exhaustive menu sweep with no restore comparison). None of them does randomised command choice, cold restore at arbitrary command boundaries, a per-tick first-offset trace or minimisation. |
 | `src/fixture_replay.rs` + `fixture_replay/tests.rs` (977, 13 synthetic tests) | Comparator skeleton. `Driver{tick, observe, input, poll}` with `Poll::{CompletedTick, PartialPass, Boundary}`. Its invariants are listed below this table. | **still to mine** (REFERENCE) | salvage-audit:220-222. Today the oracle comparison is done by private scripts (private comparison scripts outside the repository; see ADR `20261114-comparison-harness-runs-again-capture-holds-1000.md`). `tools/harness/` only captures. No in-repo `first_difference` or boundary-invariant checker exists. Partial-pass semantics are ported (`crates/sims-vm/tests/interpreter/tick.rs:280`). Its `sims_fixtures` Store/CaseManifest/BlobRef plumbing is dropped (vision: evidence tooling). |
 | `src/original_session.rs` `step` loop service order (1563-1820) | Host continuation order around one tick. Before the tick: UiEffect wait, removal graphic, selection assets (then HouseNotification), dialog construction, headline-catalog preparation (only with no modal), `update_contexts`. After it: the tick, a UiEffect re-check, republishing the selected person, dialog, the carried-object dependent graphic refresh, `host.service`, then the stop kind (Dialog, Budget or Faulted). | ported / superseded; rest deliberately dropped | The sim-observable order is documented in more detail in `crates/sims-vm/src/tick.rs:1-65`: lot RNG swap, scheduler pass, clock, then end-of-update dialogs, then removals, then the selection check, the signals and the hour/day turns. Frame-time effects are in `crates/sims-vm/src/frame.rs:1-50+`. UI effects, dialogs and answers go through `tick.rs` `Update.ui_effects` and `Player`. The remaining services (removal and selection graphics, headline catalog, dependent graphic) are presentation-asset continuations, which the vision drops. `tick.rs:41-62` lists them as "Not modeled". |
 | `original_session/draw_parent/` (28.5k; 893 of the 1,160 unique addresses) | Resumable cursors over the native draw call graph: `4a92a2` post-window/model regions, `4aceb8` region loop, `4aee4c` rows, `4b0388/5dee3e` DirectDraw surface copy, `4b027d` EndFrame, `5ce76a` model gate, `4d28df` action window, `4a8bad` person visibility. Each child binds a SHA-pinned capture (`tick==89073`, `executes_target_code==false`) and calls a legacy `sims_sim::lot_presenter::*` algorithm (terrain_raster, walls, row_tail, floor_prep, sprite_gradient, object_shadow, room_masks…). | deliberately dropped | vision non-goals (call order, memory layout); salvage-audit:224 says DROP. A heuristic pass over the 1,160 address contexts: 785 are `pc`/return/cut lists, 84 are code pins or memory reads, 86 are bare pc lists, and the rest are vtables, string or global addresses, or `FUN_` labels. The algorithms are in legacy `sims-sim` (that crate's audit). Draw rules with sim effects are ported in `crates/sims-vm/src/frame.rs`. Render rules are ported in `crates/sims-render` (`scene.rs`, `shadows.rs`, `grass.rs`, `cutaway.rs`), which cite `0x434e23`, `0x4ae844`, `0x4ad8ac`, `0x4a9458`, `0x4aacb9`, `0x4a8895` and `0x4ab992`. The uncited entries (`4a92a2`, `4aceb8`, `4b0388`, `4b027d`, `5ce76a`) are dirty-region, DirectDraw or 3D-device plumbing. |
@@ -259,7 +260,7 @@ Both are pure Rust with no native dependencies (anyhow, serde, sha2, serde_json)
 
 ### 3. Still-to-mine backlog
 
-1. **Port the exploration fuzzer.**
+1. **Port the exploration fuzzer.** The state layer is done: `crates/sims-sim/tests/state_fuzzer.rs` ([ADR](decisions/20261124-buy-catalog-famh-move-in-fuzzer-and-skn.md)) runs seeded World command lists with warm-fork, cold-restore and REDB-restore branches compared by a per-command trace with the first differing command, round-trips stored neighborhoods and save inputs, and checks the REDB `NeighborhoodStore` against a model across reopening, with panic capture and delta-debugging. What remains is the tick-level driver below; its SplitMix64 sampler and `check_or_shrink` can be copied from that test.
    - Source: `legacy/crates/sims-runtime/src/exploration.rs` (all 852 lines, including the 9 unit tests at roughly 560-852).
    - Destination: a dev or test module such as `crates/sims-game/tests/` or a `sims-vm` `dev` module.
    - Driver mapping: `Command` = `sims_net::protocol::Command` (`crates/sims-net/src/protocol.rs:516`), observe = `World::hash()` plus the RNG streams, checkpoint/restore = `sims_vm::boot::save` (`Lot::save` → `Saved::encode/decode` → `Lot::restore`), fork = `Clone`.
@@ -430,7 +431,7 @@ Until these are ported, or written into `docs/`, the crate stays. The `legacy-fi
 | `compatibility.rs` | Corpus opcode census | ported (core) | `crates/sims-cli/src/census.rs`. The legacy extras (operand-variant, expression-byte and semi-global call-resolution histograms) are tooling, not game rules |
 | `avatar_installation.rs` (+`objects.rs`), `avatar_mount.rs`, `avatar_mount_tests.rs`, `avatar_catalog.rs` (+`startup/`) | Mount order (0x43ae81); avatar search paths (0x5835ed); texture paths (0x414633); download providers (0x43bdc5); file-table hash order; loose file over archive member; cmx before bcf before ndx | ported | Compared line by line with legacy `sims-sim catalog_paths::initial_mounts`: `crates/sims-content/src/import_wardrobe.rs:23-60,740-797`, `people.rs:1076-1082`, `install.rs:121-148`, `file_table.rs`, `tests/install.rs`. Lines 56-77 of `avatar_installation.rs` are only this project's cabinet-extraction bindings (the salvage audit calls for that to be REWRITTEN; done by `Install::detect`). **Gap:** numbered-catalog open order (§3 item 9) |
 | `object_catalog.rs`, `object_catalog/{household,portraits,saved_types,retained/*}` | Registration order; `filter_flagged`; type attributes (word 90, reset-per-lot bit word 91&2); global controllers (type 7/12, word 42 ≠ 0); latest-registration GUID lookup | ported | `crates/sims-vm/src/program.rs:1194-1225`; `crates/sims-vm/src/load.rs:350-380`; `crates/sims-content/src/catalog.rs`. `retained/*` and `saved_types` are retention/checkpoint infra (dropped, vision) |
-| `object_catalog/products.rs`, `products/labels.rs` | Buy membership; CATS before CTSS; name fallback; TTAB eligibility (0x457cb0); category labels UIText STR#150/200-207/210 | **partly — still to mine** | CATS before CTSS, sort and sort-word eligibility are ported in `crates/sims-ui/src/buy.rs:690-790,1584-1630`. Missing: §3 items 1-3 |
+| `object_catalog/products.rs`, `products/labels.rs` | Buy membership; CATS before CTSS; name fallback; TTAB eligibility (0x457cb0); category labels UIText STR#150/200-207/210 | ported | Sort and sort-word eligibility in `crates/sims-ui/src/buy.rs:690-790,1584-1630`; §3 items 1-3 in `crates/sims-content/src/buy_catalog.rs` (`Catalog::buy_entries`, `CatalogText`, `BuyLabels`). `sims-ui` does not use them yet |
 | `object_catalog/thumbnail.rs` | 0x4ccaa0 composition (halve width over 45, centre with truncation) | ported | `crates/sims-ui/src/thumbnail.rs:193-200` |
 | `save_storage.rs` | Save-to-world order: SIMI/context before controllers; action serial raised by 0x41f1c5; NBRS defaults (0x430ad6); family word rebuilt from FAMI (0x425244); 0x43fe0a bit7; secondary append order (0x4228a9); room pass before function 7 (0x442659); calendar statistics order; TATT overlay (0x43a516) | ported | Sampled about 20 addresses, all present: `crates/sims-vm/src/load.rs`, `objects.rs:473-486`, `crates/sims-sim/src/neighbors.rs:71-73,281,376`, `crates/sims-sim/src/world.rs:1114-1128`, `crates/sims-vm/src/daily.rs:209-216` |
 | `house_loading.rs` | Post-load visit order (0x415eff F0, then 0x442659, 0x428041/0x428679, 0x43fc94 visits); person tail (0x5893a9, 0x459d23) | ported | `crates/sims-vm/src/visits.rs`, `load.rs`, `removal.rs`; `crates/sims-sim/src/load.rs`. Every address checked is cited |
@@ -464,20 +465,20 @@ Until these are ported, or written into `docs/`, the crate stays. The `legacy-fi
 
 Items 1-8 and 13 exist only in this crate (some also have a kernel in legacy `sims-sim`). Item 9's source is in legacy `sims-sim`; it is listed because a test here pins it.
 
-1. **Buy eligibility needs the actual TTAB (0x457cb0).**
+1. ~~**Buy eligibility needs the actual TTAB (0x457cb0).**~~ **Ported:** `BuyDefinition::eligibility`, `interaction_table`, `master_of` and `has_interactions` in `crates/sims-content/src/buy_catalog.rs`, checked against 0x4cd83b–0x4cd86b, 0x45726a, 0x43ae0a and 0x457cb0. Switching `sims-ui` over is left to its track.
    - Rule: an object with no master and no graphic is listed only if its TTAB loads and has at least one entry.
    - The TTAB is looked up in the object's own file, then in its semi-global. A loaded empty table hides the fallback, and Global.iff is never read.
    - A TTAB id of -1 means the master's.
    - Current code checks only `ttab <= 0`.
    - Source: `legacy/crates/sims-content/src/object_catalog/products.rs:85-116`, kernel in `legacy/crates/sims-sim/src/object_catalog/products.rs:48-55`. Test: `tests/object_resources.rs::buy_product_table_fallback_and_legacy_names_use_actual_resource_precedence`.
    - Destination: `crates/sims-ui/src/buy.rs:1586` `is_buy_catalog_eligible`.
-2. **Catalog name fallback (0x4061e3, then 0x457d3b).**
+2. ~~**Catalog name fallback (0x4061e3, then 0x457d3b).**~~ **Ported:** `CatalogText::read`. The disassembly corrects two of the rules below: a `CATS` holds the description *then* the name (0x40631f), and a `CTSS` is read in the game's language only, with no per-entry fallback to language 1 (0x470ca7 with 0, 0). The `*` is at 0x6c12fc.
    - Rule: an empty CATS/CTSS name becomes `'*'` plus the OBJD label.
    - CTSS entries use the requested language, falling back to language 1, and are C-string-truncated by 0x5d4cf9.
    - Current code: `buy.rs:712-716` uses the label without `*`, and `crates/sims-vm/src/primitives/dialog.rs:1549-1552` says this fallback is not ported.
    - Source: `products.rs:34-76`.
    - Destination: `sims-ui` buy and `sims-vm` `catalog_name`. Verify the `*` against the exe.
-3. **Buy category labels.**
+3. ~~**Buy category labels.**~~ **Ported:** `BuyLabels` (0x5057a2–0x5058cb, 0x506765). Each table falls back to US English only when it has no string in the game's language (0x46feac with 0, 1). Catalogs 2–6 hide root buttons 4–6 (`BuyLabels::shown`).
    - Source tables: UIText STR#150 (7×8 roots), STR#200-207 (functions) and STR#210 (special columns 4-7 read entries 4, 5, 2, 3).
    - Catalog 6 rows 2 and 3 remap to `roots[5][4]` and `roots[4][2]`.
    - Source: `legacy/crates/sims-content/src/object_catalog/products/labels.rs`.
