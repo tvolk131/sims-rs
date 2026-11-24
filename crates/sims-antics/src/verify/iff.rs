@@ -51,6 +51,11 @@ pub struct IffEquivOptions {
     /// files' own calls to a constrained tree are checked against it
     /// ([`IffEquivReport::assumptions`]).
     pub param_domains: ParamDomains,
+    /// Private trees assumed to behave the same in both files (`verify-equiv
+    /// --assume-equiv`), whatever their own check says, unless it showed them to differ.
+    /// Empty by default. Each one applied is an [`IffEquivReport::assumptions`] line, and
+    /// every verdict that depends on it holds only if it does.
+    pub assume_equiv: BTreeSet<u16>,
 }
 
 impl Default for IffEquivOptions {
@@ -63,6 +68,7 @@ impl Default for IffEquivOptions {
             extra_arities: BTreeMap::new(),
             extra_argless: BTreeSet::new(),
             param_domains: ParamDomains::new(),
+            assume_equiv: BTreeSet::new(),
         }
     }
 }
@@ -153,8 +159,15 @@ pub struct IffEquivReport {
     /// Why the files fall outside the structural precondition (see the module docs).
     pub file_problems: Vec<String>,
     /// Every parameter domain assumed ([`IffEquivOptions::param_domains`]): applied or
-    /// not and why, and how the files' own calls to the tree stand against it.
+    /// not and why, and how the files' own calls to the tree stand against it. Also every
+    /// tree assumed equivalent ([`IffEquivOptions::assume_equiv`]) and every other
+    /// assumption the options make.
     pub assumptions: Vec<String>,
+    /// When the verdict is `Inconclusive` only because of some private trees whose
+    /// checks could not decide them: those trees. Assuming them equivalent
+    /// (`--assume-equiv`) would make every other resource proven, so the files are
+    /// equivalent modulo this set. `None` otherwise.
+    pub equivalent_modulo: Option<BTreeSet<u16>>,
 }
 
 impl IffEquivReport {
@@ -272,6 +285,12 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
     let (assumptions, violations) =
         domain_calls(&opts.param_domains, &iff_a, &iff_b, &ctx_a, &ctx_b);
     report.assumptions = assumptions;
+    if !opts.live.observe_fault_last_result {
+        report.assumptions.push(
+            "a path that faults is compared without the last branch result it leaves              (--ignore-fault-last-result): nothing reads it after the fault, although              play-mode recovery keeps it in the object's rebuilt frame and copies it into              a reset person's last-action flags"
+                .to_owned(),
+        );
+    }
     if strict.live != opts.live {
         let recheck: Vec<(&Chunk, &Chunk)> = iff_a
             .chunks
@@ -312,35 +331,142 @@ pub fn check_iff_equivalent(a: &[u8], b: &[u8], opts: &IffEquivOptions) -> Resul
             }
         }
     }
-    for ca in &iff_a.chunks {
-        let is_bhav = &ca.tag == b"BHAV";
-        if is_bhav && opts.tree.is_some_and(|tree| ca.id != tree) {
-            continue;
+    type Verdicts = BTreeMap<u16, (ResourceVerdict, Vec<String>)>;
+    // Assumes tree `id` behaves the same: its own verdict and its verdict as a tree
+    // another may run become EQUIVALENT where they were INCONCLUSIVE. Returns why each
+    // was not proven, or why the assumption does not apply. A tree shown to differ in
+    // either check is never assumed, and nothing DIFFERENT is ever replaced. The
+    // "EQUIVALENT modulo" dry run below goes through the same function, so what it
+    // advertises is exactly what `--assume-equiv` would give.
+    let assume_tree = |id: u16,
+                       verdicts: &mut Verdicts,
+                       dependency_verdicts: &mut Verdicts|
+     -> std::result::Result<(Option<String>, Option<String>), String> {
+        let defined = |trees: &BTreeMap<u16, BhavChunk>| trees.contains_key(&id);
+        if !runs_from_own_file(id) {
+            return Err(not_run_from_file(id).unwrap_or_default());
         }
-        let (verdict, notes) = if is_bhav && runs_from_own_file(ca.id) {
-            let (verdict, notes) = verdicts[&ca.id].clone();
-            (
-                needs_callees(
-                    ca.id,
-                    verdict,
-                    &ids,
-                    &trees_a,
-                    &trees_b,
-                    &dependency_verdicts,
-                ),
-                notes,
+        if !defined(&trees_a) || !defined(&trees_b) {
+            return Err("not both files define it".to_owned());
+        }
+        if !verdicts.contains_key(&id) {
+            return Err("no tree checked can run it".to_owned());
+        }
+        let differs = |map: &Verdicts| {
+            matches!(
+                map.get(&id).map(|(v, _)| v),
+                Some(ResourceVerdict::Different { .. })
             )
-        } else if is_bhav {
-            verdicts[&ca.id].clone()
-        } else {
-            (ResourceVerdict::Identical, Vec::new())
         };
-        report.resources.push(ResourceReport {
-            tag: ca.tag,
-            id: ca.id,
-            verdict,
-            notes,
+        if differs(verdicts) || differs(dependency_verdicts) {
+            return Err("it was shown to differ".to_owned());
+        }
+        let assume = |verdict: &mut ResourceVerdict| match verdict {
+            ResourceVerdict::Inconclusive { why } => {
+                let unproven = why.clone();
+                *verdict = ResourceVerdict::Equivalent {
+                    how: format!("ASSUMED by --assume-equiv, not proven: {unproven}"),
+                };
+                Some(unproven)
+            }
+            _ => None,
+        };
+        let own = verdicts.get_mut(&id).and_then(|(v, _)| assume(v));
+        let dependency = dependency_verdicts
+            .get_mut(&id)
+            .and_then(|(v, _)| assume(v));
+        Ok((own, dependency))
+    };
+    let mut applied = BTreeSet::new();
+    for &id in &opts.assume_equiv {
+        let result = assume_tree(id, &mut verdicts, &mut dependency_verdicts);
+        if result.is_ok() {
+            applied.insert(id);
+        }
+        let line = match result {
+            Err(why) => format!(
+                "BHAV #{id} behaves the same in both files (--assume-equiv): NOT APPLIED ({why})"
+            ),
+            Ok((None, None)) => {
+                format!(
+                    "BHAV #{id} behaves the same in both files (--assume-equiv): already proven"
+                )
+            }
+            Ok((Some(why), _)) => format!(
+                "BHAV #{id} behaves the same in both files (--assume-equiv): NOT PROVEN ({why}); \
+                 every verdict that depends on it holds only if it does"
+            ),
+            Ok((None, Some(why))) => format!(
+                "BHAV #{id} behaves the same in both files when a primitive runs it as an \
+                 object use (--assume-equiv): NOT PROVEN with its last result and frame \
+                 observed ({why}); every verdict that depends on it holds only if it does"
+            ),
+        };
+        report.assumptions.push(line);
+    }
+    let resources = |verdicts: &Verdicts, dependency_verdicts: &Verdicts| {
+        let mut out = Vec::new();
+        for ca in &iff_a.chunks {
+            let is_bhav = &ca.tag == b"BHAV";
+            if is_bhav && opts.tree.is_some_and(|tree| ca.id != tree) {
+                continue;
+            }
+            let (verdict, notes) = if is_bhav && runs_from_own_file(ca.id) {
+                let (verdict, notes) = verdicts[&ca.id].clone();
+                (
+                    needs_callees(
+                        ca.id,
+                        verdict,
+                        &ids,
+                        &trees_a,
+                        &trees_b,
+                        dependency_verdicts,
+                    ),
+                    notes,
+                )
+            } else if is_bhav {
+                verdicts[&ca.id].clone()
+            } else {
+                (ResourceVerdict::Identical, Vec::new())
+            };
+            out.push(ResourceReport {
+                tag: ca.tag,
+                id: ca.id,
+                verdict,
+                notes,
+            });
+        }
+        out
+    };
+    report.resources = resources(&verdicts, &dependency_verdicts);
+    // Which trees' own checks the inconclusive verdicts come down to: assume every
+    // private tree that is not proven (as itself, or as a tree another may run), the
+    // way `--assume-equiv` would, and see whether every resource then is. The set also
+    // names the trees this run already assumed, so it is a complete `--assume-equiv`
+    // list on its own.
+    if report.verdict() == IffVerdict::Inconclusive {
+        let (mut assumed, mut assumed_deps) = (verdicts.clone(), dependency_verdicts.clone());
+        let mut unproven = applied;
+        for &id in &ids {
+            let inconclusive = [&verdicts, &dependency_verdicts].iter().any(|map| {
+                matches!(
+                    map.get(&id).map(|(v, _)| v),
+                    Some(ResourceVerdict::Inconclusive { .. })
+                )
+            });
+            if inconclusive && assume_tree(id, &mut assumed, &mut assumed_deps).is_ok() {
+                unproven.insert(id);
+            }
+        }
+        let all_proven = resources(&assumed, &assumed_deps).iter().all(|r| {
+            matches!(
+                r.verdict,
+                ResourceVerdict::Identical | ResourceVerdict::Equivalent { .. }
+            )
         });
+        if all_proven && !unproven.is_empty() {
+            report.equivalent_modulo = Some(unproven);
+        }
     }
     Ok(report)
 }
@@ -638,34 +764,53 @@ fn needs_callees(
     }
     let reach = tree_reach(id, ids, trees_a, trees_b);
     // With a primitive in reach, the tree itself may be run as an object use too.
-    for dep in reach.trees.iter().filter(|&&t| t != id || reach.opaque) {
-        match verdicts.get(dep).map(|(v, _)| v) {
-            Some(ResourceVerdict::Identical | ResourceVerdict::Equivalent { .. }) => {}
-            Some(ResourceVerdict::Different { .. } | ResourceVerdict::Inconclusive { .. })
-            | None => {
-                if *dep == id {
-                    return ResourceVerdict::Inconclusive {
-                        why: format!(
-                            "a primitive in the reach of tree #{id} may run it as an object \
-                             use, whose return records its last result and frame, and it was \
-                             not shown to behave the same with those observed"
-                        ),
-                    };
-                }
-                return ResourceVerdict::Inconclusive {
-                    why: format!(
-                        "tree #{id} may run tree #{dep}{}, which was not shown to behave \
-                         the same",
-                        if reach.opaque {
-                            " (a primitive or a call outside the file may run any tree of \
-                             the object)"
-                        } else {
-                            ""
-                        }
-                    ),
-                };
-            }
-        }
+    let unproven: Vec<u16> = reach
+        .trees
+        .iter()
+        .copied()
+        .filter(|&t| t != id || reach.opaque)
+        .filter(|dep| {
+            !matches!(
+                verdicts.get(dep).map(|(v, _)| v),
+                Some(ResourceVerdict::Identical | ResourceVerdict::Equivalent { .. })
+            )
+        })
+        .collect();
+    let others: Vec<u16> = unproven.iter().copied().filter(|&t| t != id).collect();
+    if let Some((&dep, rest)) = others.split_first() {
+        // Every tree it waits on, so one run shows what to prove (or `--assume-equiv`).
+        let rest = if rest.is_empty() {
+            String::new()
+        } else {
+            let list: Vec<String> = rest.iter().map(|t| format!("#{t}")).collect();
+            format!(" (and {})", list.join(", "))
+        };
+        let itself = if unproven.contains(&id) {
+            ", and may itself be run as an object use"
+        } else {
+            ""
+        };
+        return ResourceVerdict::Inconclusive {
+            why: format!(
+                "tree #{id} may run tree #{dep}{rest}{}{itself}, which {} not shown to behave \
+                 the same",
+                if reach.opaque {
+                    " (a primitive or a call outside the file may run any tree of the object)"
+                } else {
+                    ""
+                },
+                if rest.is_empty() { "was" } else { "were" },
+            ),
+        };
+    }
+    if unproven.contains(&id) {
+        return ResourceVerdict::Inconclusive {
+            why: format!(
+                "a primitive in the reach of tree #{id} may run it as an object use, whose \
+                 return records its last result and frame, and it was not shown to behave the \
+                 same with those observed"
+            ),
+        };
     }
     verdict
 }

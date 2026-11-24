@@ -1013,6 +1013,7 @@ fn file_problems_take_precedence() {
         }],
         file_problems: vec!["map".to_owned()],
         assumptions: Vec::new(),
+        equivalent_modulo: None,
     };
     assert_eq!(report.verdict(), IffVerdict::Inconclusive);
 }

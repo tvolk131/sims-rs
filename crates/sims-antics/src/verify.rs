@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 mod domains;
 mod iff;
 mod live;
+mod rename;
 mod replay;
 pub use domains::{
     ParamDomain, ParamDomains, V2EnumDomain, parse_param_domain_arg, v2_enum_param_domains,
@@ -3866,7 +3867,9 @@ fn canonicalize_lt(
     (CanonPred::Lt(lhs, rhs), on_true, on_false)
 }
 
-/// Canonicalizes primitive operands by zeroing verified-ignored padding bytes.
+/// Canonicalizes primitive operands by zeroing verified-ignored padding bytes, and by
+/// rewriting an encoding the VM reads exactly as another one to that one (Set To Next's
+/// explicit stack-object destination).
 pub(crate) fn canonicalize_primitive_operands(opcode: u16, ops: [u8; 8]) -> [u8; 8] {
     match opcode {
         // Sleep: word 0 (param_index) only (`sleep.rs:29`).
@@ -4001,12 +4004,15 @@ pub(crate) fn canonicalize_primitive_operands(opcode: u16, ops: [u8; 8]) -> [u8;
                 [ops[0], ops[1], ops[2], 0, ops[4], ops[5], ops[6], ops[7]]
             }
         }
-        // SetToNext: when bit 7 of mode is clear, dest scope/index bytes 5 and 7 are ignored (`set_to_next.rs:7-9`).
+        // SetToNext: when bit 7 of mode is clear, dest scope/index bytes 5 and 7 are ignored
+        // and the destination is the stack object, scope 10 index 0 (`set_to_next.rs:119`).
+        // A destination that names exactly that (bit 7, scope 10, index byte 0) resolves the
+        // same cell through the same `resolve(10, 0, true)` call, so it reads as the default.
         31 => {
-            if ops[4] & 0x80 != 0 {
+            if ops[4] & 0x80 != 0 && !(ops[5] == 10 && ops[7] == 0) {
                 ops
             } else {
-                [ops[0], ops[1], ops[2], ops[3], ops[4], 0, ops[6], 0]
+                [ops[0], ops[1], ops[2], ops[3], ops[4] & 0x7F, 0, ops[6], 0]
             }
         }
         // TestObjectType: GUID (0..4), index (4..6), scope (6); byte 7 ignored (`object_type.rs:6-7`).
