@@ -38,9 +38,8 @@ use sims_formats::iff::{Iff, write};
 use sims_formats::iff_write::{ChunkWrite, write_chunk_with_residue};
 use sims_sim::neighbors::registry;
 use sims_sim::patch_import::{self, Context, Patch, open, pending};
-use std::collections::BTreeSet;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The context the import runs in: the complete collection's
 /// expansions and the game's language (1, English).
@@ -120,7 +119,7 @@ pub fn open_neighborhood(
     };
     // The scan reads the files only when an import is pending (0x42c1d5).
     let mut patches = Vec::new();
-    let mut patch_paths = Vec::new();
+    let mut patch_files = Vec::new();
     let scanned = if pending(&neighborhood, install.expansions.0)? {
         neighborhood.patches()?
     } else {
@@ -143,7 +142,11 @@ pub fn open_neighborhood(
         let relative = path
             .strip_prefix(directory)
             .map_err(|_| format!("{}: a Patch file outside the neighborhood", path.display()))?;
-        patch_paths.push(output.join(relative));
+        patch_files.push(PatchFile {
+            copy: output.join(relative),
+            source: path.clone(),
+            bytes,
+        });
     }
     let patch = open(&mut neighborhood, &patches, &context, new_guid)?;
     let mut pool_crt = *crt;
@@ -160,6 +163,9 @@ pub fn open_neighborhood(
         &skeletons,
         &mut pool_crt,
     )?;
+    // Before anything is written, so that removing them can fail only on
+    // an I/O error.
+    let used_up = imported_copies(&patch, &patches, &patch_files, output)?;
     write_imports(
         &install, &index, &catalog, &patches, &patch, output, captured,
     )?;
@@ -184,7 +190,7 @@ pub fn open_neighborhood(
     }
     // Last, once every file is written, so a failure above leaves the
     // copy's `Patch` folder as it was.
-    use_up_imported(&patch, &patches, &patch_paths)?;
+    use_up_imported(&used_up)?;
     neighborhood.directory = output.to_path_buf();
     *crt = pool_crt;
     Ok((
@@ -257,41 +263,99 @@ fn write_imports(
     Ok(())
 }
 
-/// Uses up each imported `*.FAM` file in the output copy (0x429947 to
-/// 0x429a82). A housed family's file was moved onto its house file, which
-/// [`write_imports`] has written in its place; a houseless family's was
-/// deleted (0x429a75 → 0x5b98d5). Either way the file is gone from
-/// `Patch`. A file the copy lacks is left alone: the deletion's result is
-/// not checked (0x429a87).
-fn use_up_imported(
+/// A scanned `Patch` file: where the output copy has it, where it was
+/// read, and what was read.
+struct PatchFile {
+    copy: PathBuf,
+    source: PathBuf,
+    bytes: Vec<u8>,
+}
+
+/// The output copies of the imported `*.FAM` files, to be used up once
+/// the open has written everything else. Each must be a plain file inside
+/// `output`, not the source file itself (through a link), and hold the
+/// bytes that were imported; anything else is refused before the open
+/// writes a file. A copy that is missing is left out: the original does
+/// not check the deletion (0x429a87).
+fn imported_copies(
     opened: &patch_import::Opened,
     patches: &[Patch],
-    paths: &[std::path::PathBuf],
-) -> Result<(), BootError> {
+    files: &[PatchFile],
+    output: &Path,
+) -> Result<Vec<PathBuf>, BootError> {
+    let output =
+        std::fs::canonicalize(output).map_err(|error| format!("{}: {error}", output.display()))?;
+    let mut copies = Vec::new();
     for (name, _) in &opened.imports {
         let at = patches
             .iter()
             .position(|patch| &patch.name == name)
             .ok_or("an import names no Patch file")?;
-        let path = &paths[at];
+        if let Some(copy) = check_copy(&files[at], &output)? {
+            copies.push(copy);
+        }
+    }
+    Ok(copies)
+}
+
+/// One file for [`imported_copies`]: its canonical path, or `None` when
+/// the copy lacks it. `output` is canonical.
+fn check_copy(file: &PatchFile, output: &Path) -> Result<Option<PathBuf>, String> {
+    let path = &file.copy;
+    let refuse = |why: &str| format!("0x429a82: {}: {why}", path.display());
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(refuse(&error.to_string())),
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(refuse("not a plain file"));
+        }
+        Ok(_) => {}
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|error| refuse(&error.to_string()))?;
+    let source = std::fs::canonicalize(&file.source).map_err(|error| refuse(&error.to_string()))?;
+    if !canonical.starts_with(output) || canonical == source {
+        return Err(refuse("not a separate copy inside the output"));
+    }
+    if std::fs::read(path).map_err(|error| refuse(&error.to_string()))? != file.bytes {
+        return Err(refuse("differs from the imported file"));
+    }
+    Ok(Some(canonical))
+}
+
+/// Uses up each imported `*.FAM` file in the output copy (0x429947 to
+/// 0x429a82), as [`imported_copies`] listed them. A housed family's file
+/// was moved onto its house file, which [`write_imports`] has written in
+/// its place; a houseless family's was deleted (0x429a75 → 0x5b98d5).
+/// Either way the file is gone from `Patch`. As in the original, a
+/// failure partway leaves the earlier ones used up; the error names them.
+fn use_up_imported(copies: &[PathBuf]) -> Result<(), BootError> {
+    for (done, path) in copies.iter().enumerate() {
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("0x429a82: {}: {error}", path.display()).into()),
+            Err(error) => {
+                return Err(format!(
+                    "0x429a82: {}: {error}; already used up: {:?}",
+                    path.display(),
+                    &copies[..done]
+                )
+                .into());
+            }
         }
     }
     Ok(())
 }
 
-/// The bone scales a pool person's temporary actors copy (0x598da3).
+/// The skeletons a pool person's temporary actors copy (0x598da3).
 /// The first actor is made from the pool's template, so it takes the
 /// template's skeleton (0x426e8e). A second actor, made after the age is
 /// set (0x426e97, 0x40cc2a), takes the one its profile names, `adult` or
 /// `child`. The templates are the resolved definitions the pools can
 /// pick (kinds 0x800, 0x200, 0x1000 and 0x400). Each skeleton is looked
-/// up by name (0x5a0384) in the installed avatar files. A lookup that
-/// fails is kept and reported only if a pool person needs it, so an
-/// unrelated definition cannot stop the open.
+/// up by name (0x5a0384) in the avatar registry as the startup scan left
+/// it; the pools load an `.ndx` one on first use. A template whose
+/// skeleton name cannot be read is kept and reported only if a pool
+/// person needs it, so an unrelated definition cannot stop the open.
 fn pool_skeletons(
     install: &Install,
     index: &Index,
@@ -299,7 +363,6 @@ fn pool_skeletons(
     registered: &[sims_sim::neighbors::Registered],
 ) -> Result<pools::Skeletons, BootError> {
     let mut skeletons = pools::Skeletons::default();
-    let mut names = BTreeSet::from(["adult".to_owned(), "child".to_owned()]);
     for entry in registered {
         if !(matches!(entry.kind, 0x800 | 0x200 | 0x1000 | 0x400) && entry.resolves) {
             continue;
@@ -321,15 +384,12 @@ fn pool_skeletons(
                 entry.guid
             ))
         };
-        if let Ok(name) = &name {
-            names.insert(name.clone());
-        }
         skeletons.templates.insert(entry.guid, name);
     }
-    let mut avatars = AvatarRegistry::load(install)?;
-    // The registry as the startup scan left it (0x59f844, 0x584562), before
-    // the lookups below load anything: which skeletons are loaded, and
-    // which an `.ndx` names for loading on first use (0x5a03cd).
+    let avatars = AvatarRegistry::load(install)?;
+    // The registry as the startup scan left it (0x59f844, 0x584562): which
+    // skeletons are loaded, and which an `.ndx` names for loading on first
+    // use (0x5a03cd).
     let startup = People::load_each_with_registry(
         index,
         catalog,
@@ -338,14 +398,53 @@ fn pool_skeletons(
         &ArchivePool::new(),
     )?
     .0;
-    skeletons.eager = startup.skeletons_by_name.into_keys().collect();
+    skeletons.eager = startup
+        .skeletons_by_name
+        .into_iter()
+        .filter_map(|(name, skeleton)| Some((name, skeleton.scales.get(skeleton.place)?.clone())))
+        .collect();
     skeletons.indexed = startup.indexed_skeletons;
     skeletons.catalogs = startup.indexed_catalogs;
-    for name in names {
-        let scales = avatars
-            .skeleton_scales(&name)
-            .map_err(|error| error.to_string());
-        skeletons.scales.insert(name, scales);
-    }
     Ok(skeletons)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_separate_matching_copy_is_used_up() {
+        let root = std::env::temp_dir().join(format!("sims-patch-copies-{}", std::process::id()));
+        let (source, output) = (root.join("source"), root.join("output"));
+        for directory in [&source, &output] {
+            std::fs::create_dir_all(directory.join("Patch")).unwrap();
+        }
+        std::fs::write(source.join("Patch/A.FAM"), b"family").unwrap();
+        let file = |copy: PathBuf| PatchFile {
+            copy,
+            source: source.join("Patch/A.FAM"),
+            bytes: b"family".to_vec(),
+        };
+        let canonical = std::fs::canonicalize(&output).unwrap();
+        // Missing: left alone, as 0x429a87 does not check.
+        assert_eq!(
+            check_copy(&file(output.join("Patch/A.FAM")), &canonical),
+            Ok(None)
+        );
+        // A different file under the same name is refused.
+        std::fs::write(output.join("Patch/A.FAM"), b"other").unwrap();
+        let error = check_copy(&file(output.join("Patch/A.FAM")), &canonical).unwrap_err();
+        assert!(error.ends_with("differs from the imported file"), "{error}");
+        // The copy itself is.
+        std::fs::write(output.join("Patch/A.FAM"), b"family").unwrap();
+        let copy = check_copy(&file(output.join("Patch/A.FAM")), &canonical).unwrap();
+        assert_eq!(copy, Some(canonical.join("Patch/A.FAM")));
+        // The source, named as if it were in the output, is refused.
+        let error = check_copy(&file(source.join("Patch/A.FAM")), &canonical).unwrap_err();
+        assert!(
+            error.ends_with("not a separate copy inside the output"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

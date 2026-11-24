@@ -29,11 +29,12 @@ pub struct PoolInput {
     /// Magic Town (0x5580e9, 0x55fb4c).
     pub transition: Option<LotTransition>,
     /// The `.ndx` skeletons, by name, that earlier work loaded before the
-    /// pools run. A temporary actor's skeleton that neither the startup
+    /// pools run, in the order it loaded them (the first catalog to
+    /// register a name keeps it, 0x59f18c). A temporary actor's skeleton that neither the startup
     /// scan nor that work loaded is loaded on first use (0x5a03cd), with
     /// its draws. `adult` and `child` come from `Animation.ndx`; both UD2
     /// captures fit them loaded already. That is fitted, not traced.
-    pub loaded_skeletons: BTreeSet<String>,
+    pub loaded_skeletons: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -159,11 +160,9 @@ const TOURISTS: Pool = Pool {
 pub(super) struct Skeletons {
     /// The first actor's: each template's skeleton name, by template GUID.
     pub templates: BTreeMap<u32, Result<String, String>>,
-    /// Each skeleton's own bone scales, by name: the templates' and a
-    /// second actor's (`adult` or `child`).
-    pub scales: BTreeMap<String, Result<Vec<i32>, String>>,
-    /// The skeletons the startup scan loaded (0x59f844 → 0x59f132).
-    pub eager: BTreeSet<String>,
+    /// The skeletons the startup scan loaded (0x59f844 → 0x59f132), each
+    /// with its own bone scales.
+    pub eager: BTreeMap<String, Vec<i32>>,
     /// The skeletons an `.ndx` names, each with its catalog or why it
     /// cannot load (0x584562 → 0x59fc48), and each catalog's skeletons.
     pub indexed: BTreeMap<String, Result<String, String>>,
@@ -207,7 +206,10 @@ pub(super) fn fill<'a>(
     };
     // What earlier work loaded registers the same way, without draws
     // here: they were made before the pool boundary `crt` starts at.
-    fills.lazy = LazySkeletons::loaded_before(skeletons, &input.loaded_skeletons)?;
+    // A fill with no people looks nothing up.
+    if !input.people.is_empty() {
+        fills.lazy = LazySkeletons::loaded_before(skeletons, &input.loaded_skeletons)?;
+    }
     // The setup update (0x5580a2–0x5580e9, also 0x55fb05–0x55fb4c).
     for pool in [CELEBRITIES, FANS, MAGIC_TOWN] {
         fills.run(pool)?;
@@ -515,19 +517,7 @@ impl<'a, 'b> Fills<'a, 'b> {
         for name in [template, skeleton].into_iter().take(pool.actors) {
             // A name the registry lacks takes the miss branch (0x5a03c0);
             // one it holds but has not loaded is loaded now (0x5a03cd).
-            let scales = match skeletons.scales.get(name) {
-                Some(Ok(scales)) => scales.as_slice(),
-                Some(Err(reason)) => {
-                    return Err(format!("the skeleton {name:?} for User{file:05}: {reason}").into());
-                }
-                None => {
-                    return Err(format!(
-                        "0x5a03c0: no skeleton {name:?} looked up for User{file:05}"
-                    )
-                    .into());
-                }
-            };
-            let load = self
+            let (load, scales) = self
                 .lazy
                 .load(self.skeletons, name)
                 .map_err(|error| format!("{error} (User{file:05})"))?;
@@ -562,7 +552,7 @@ impl<'a, 'b> Fills<'a, 'b> {
             for scales in load {
                 self.draws.skeleton(&scales);
             }
-            self.draws.skeleton(scales);
+            self.draws.skeleton(&scales);
             self.draws.default_traits();
             for (word, value) in self.draws.default_traits() {
                 data[word] = value;
@@ -604,7 +594,7 @@ struct LazySkeletons {
 impl LazySkeletons {
     /// Registers `names`, loaded by earlier work, as their loads would,
     /// leaving their draws out: they were made before the pool boundary.
-    fn loaded_before(skeletons: &Skeletons, names: &BTreeSet<String>) -> Result<Self, BootError> {
+    fn loaded_before(skeletons: &Skeletons, names: &[String]) -> Result<Self, BootError> {
         let mut lazy = Self::default();
         for name in names {
             lazy.load(skeletons, name)
@@ -619,27 +609,50 @@ impl LazySkeletons {
     /// Looks up the skeleton `name` (0x5a0384) and, if the startup scan
     /// did not load it and no earlier lookup has, loads it now (0x5a03cd
     /// → 0x5a3810). Returns the bone scales whose builds the load draws,
-    /// in order, to come before the actor's copy.
+    /// in order, to come before the actor's copy, and the scales of the
+    /// skeleton the registry now holds under `name`, which the copy uses.
     ///
     /// The load reads the skeleton's `.ndx` catalog (0x59e60e → 0x59f087),
     /// which builds every skeleton in it, each drawing (0x59f107 →
     /// 0x598af7), and registers those not already registered (0x59f18c);
     /// this is `people::load_indexed_bcf_catalog_into`, the World's lazy
     /// load. A lookup that fails marks the skeleton (0x5a389b).
-    fn load(&mut self, skeletons: &Skeletons, name: &str) -> Result<Vec<Vec<i32>>, String> {
-        if skeletons.eager.contains(name) {
-            return Ok(Vec::new());
+    fn load(
+        &mut self,
+        skeletons: &Skeletons,
+        name: &str,
+    ) -> Result<(Vec<Vec<i32>>, Vec<i32>), String> {
+        if let Some(scales) = skeletons.eager.get(name) {
+            return Ok((Vec::new(), scales.clone()));
         }
-        let earlier = self.before.get(name).or(self.loaded.get(name));
-        match earlier {
-            Some(Some(_)) => return Ok(Vec::new()),
+        let builds = match self.before.get(name).or(self.loaded.get(name)) {
+            Some(Some(_)) => Vec::new(),
             Some(None) => {
                 return Err(format!(
                     "0x5a389b: an earlier load of the skeleton {name:?} failed"
                 ));
             }
-            None => {}
-        }
+            None => self.read_catalog(skeletons, name)?,
+        };
+        let Some(Some(location)) = self.before.get(name).or(self.loaded.get(name)) else {
+            return Err(format!("0x5a03cd: the load of {name:?} registered nothing"));
+        };
+        // The registry's entry points into the catalog that registered it
+        // (as `people::resolve_skeleton_by_name_into` finds it).
+        skeletons
+            .catalogs
+            .get(location)
+            .and_then(|(items, _)| items.iter().find(|item| item.name == name))
+            .and_then(|item| item.scales.get(item.place).cloned())
+            .map(|scales| (builds, scales))
+            .ok_or_else(|| {
+                format!("0x5a03c0: loaded catalog {location} does not define skeleton {name:?}")
+            })
+    }
+
+    /// The load itself: draws nothing here, but returns the builds and
+    /// registers the catalog's skeletons, or marks `name` failed.
+    fn read_catalog(&mut self, skeletons: &Skeletons, name: &str) -> Result<Vec<Vec<i32>>, String> {
         let failed = |loaded: &mut BTreeMap<String, Option<String>>, reason: String| {
             loaded.insert(name.to_owned(), None);
             Err(reason)
@@ -663,7 +676,7 @@ impl LazySkeletons {
             .filter_map(|item| item.scales.get(item.place).cloned())
             .collect();
         for item in items {
-            if !skeletons.eager.contains(&item.name) && !self.before.contains_key(&item.name) {
+            if !skeletons.eager.contains_key(&item.name) && !self.before.contains_key(&item.name) {
                 self.loaded
                     .entry(item.name.clone())
                     .or_insert_with(|| Some(location.clone()));
@@ -714,7 +727,9 @@ impl Specialties {
     /// five gives 3 (0x42ae75, 0x42ae8f, 0x42aebe) and the generic
     /// template otherwise (0x42aecf). The draws are on the game stream,
     /// which is not ported, so only whether the template could be the
-    /// pick is checked.
+    /// pick is checked. A GUID registered twice is two candidates, each
+    /// used up once; replaying a pick of one fails earlier, since which
+    /// definition its skeleton name is read from is unported.
     fn take(
         &mut self,
         source: u32,
@@ -879,7 +894,7 @@ mod tests {
             skeleton("dog", "pets.bcf", 1, &scales),
         ];
         Skeletons {
-            eager: ["adult".to_owned()].into(),
+            eager: [("adult".to_owned(), vec![1, 1])].into(),
             indexed: [
                 ("kat".to_owned(), Ok("pets".to_owned())),
                 ("dog".to_owned(), Ok("pets".to_owned())),
@@ -895,12 +910,19 @@ mod tests {
     fn a_skeleton_is_loaded_on_first_use_with_its_catalogs_draws() {
         let skeletons = registry();
         let mut lazy = LazySkeletons::default();
-        assert!(lazy.load(&skeletons, "adult").unwrap().is_empty());
-        // The first use builds every skeleton in the catalog, in order.
-        assert_eq!(lazy.load(&skeletons, "dog").unwrap(), [vec![1, 2], vec![1]]);
+        assert_eq!(
+            lazy.load(&skeletons, "adult").unwrap(),
+            (vec![], vec![1, 1])
+        );
+        // The first use builds every skeleton in the catalog, in order,
+        // and the copy takes the looked-up skeleton's own scales.
+        assert_eq!(
+            lazy.load(&skeletons, "dog").unwrap(),
+            (vec![vec![1, 2], vec![1]], vec![1])
+        );
         // Its sibling came with it, and neither loads again.
-        assert!(lazy.load(&skeletons, "kat").unwrap().is_empty());
-        assert!(lazy.load(&skeletons, "dog").unwrap().is_empty());
+        assert_eq!(lazy.load(&skeletons, "kat").unwrap(), (vec![], vec![1, 2]));
+        assert_eq!(lazy.load(&skeletons, "dog").unwrap(), (vec![], vec![1]));
         assert_eq!(lazy.files, BTreeSet::from(["pets.bcf".to_owned()]));
         assert_eq!(lazy.loaded["kat"].as_deref(), Some("pets"));
         // A blocked one fails, and is marked so it fails the same way after.
@@ -918,11 +940,33 @@ mod tests {
     }
 
     #[test]
+    fn the_first_catalog_to_register_a_skeleton_keeps_it() {
+        // `bigkat` is indexed to its own catalog, which also defines `kat`
+        // with other scales; `kat` itself is indexed to the pets catalog.
+        let mut skeletons = registry();
+        let big = vec![
+            skeleton("bigkat", "big.bcf", 0, &[vec![2], vec![3, 3]]),
+            skeleton("kat", "big.bcf", 1, &[vec![2], vec![3, 3]]),
+        ];
+        skeletons
+            .indexed
+            .insert("bigkat".to_owned(), Ok("big".to_owned()));
+        skeletons.catalogs.insert("big".to_owned(), (big, None));
+        let mut lazy = LazySkeletons::default();
+        lazy.load(&skeletons, "bigkat").unwrap();
+        // The copy takes the big catalog's `kat`, which registered first.
+        assert_eq!(lazy.load(&skeletons, "kat").unwrap(), (vec![], vec![3, 3]));
+        // Loaded before the pools in the other order, the pets' one wins.
+        let names = ["kat".to_owned(), "bigkat".to_owned()];
+        let mut lazy = LazySkeletons::loaded_before(&skeletons, &names).unwrap();
+        assert_eq!(lazy.load(&skeletons, "kat").unwrap(), (vec![], vec![1, 2]));
+    }
+
+    #[test]
     fn a_skeleton_loaded_before_the_pools_draws_nothing_there() {
         let skeletons = registry();
-        let mut lazy =
-            LazySkeletons::loaded_before(&skeletons, &["kat".to_owned()].into()).unwrap();
-        assert!(lazy.load(&skeletons, "dog").unwrap().is_empty());
+        let mut lazy = LazySkeletons::loaded_before(&skeletons, &["kat".to_owned()]).unwrap();
+        assert_eq!(lazy.load(&skeletons, "dog").unwrap(), (vec![], vec![1]));
         assert!(lazy.loaded.is_empty() && lazy.files.is_empty());
     }
 

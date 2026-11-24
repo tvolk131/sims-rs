@@ -25,11 +25,15 @@ two things:
 
 The port has already written each housed import's house file into the
 output. So for every import it deletes the output copy's family file,
-which leaves the same end state. Deletion uses `std::fs::remove_file`, and
-a file that is already gone is accepted, as 0x429a87 accepts it. It runs
-last, after every character file is written, so a failed open leaves the
-copy's `Patch` folder as it was. The UD2 open test checks that the
-folder ends empty.
+which leaves the same end state. Before the open writes any file, each
+copy must be a plain file inside the output (after resolving links), not
+the source file, and must hold the bytes that were imported; otherwise
+the open is refused. A copy that is missing is accepted, as 0x429a87
+accepts a failed deletion. The deletions (`std::fs::remove_file`) run
+last, after every character file is written. So a refused open leaves
+the copy's `Patch` folder as it was, and only an I/O error during the
+deletions can leave some used up; the error names them. The UD2 open
+test checks that the folder ends empty.
 
 ## The import preview gives members an inventory
 
@@ -76,17 +80,20 @@ That load opens the `.ndx` catalog (0x5b94ae) and reads it (0x59e60e →
 registered (0x59f18c) and marks the entry loaded (`+0x2c`). The pools
 now do the same, using the World's model of a lazy load
 (`people::load_indexed_bcf_catalog_into`). The load's draws come just
-before the actor's copy. A failed lookup is marked (0x5a389b).
+before the actor's copy, and the copy uses the scales of the entry the
+registry then holds: the first catalog to register a name keeps it. A
+failed lookup is marked (0x5a389b).
 `OpenedPools` reports the loads in the World's shape, for a caller to
 carry on.
 
 The startup state comes from the avatar registry: the eager catalogs
 are loaded, and `.ndx` entries are not. In the Complete Collection,
 `adult` and `child` come from `GameData/Animation/Animation.ndx`. Both
-UD2 captures need them loaded before the pools, and with them loaded
-lazily the first pool GUID differs (the test checks this).
+UD2 captures need them loaded before the pools. With them loaded
+lazily, the first celebrity's load draws before its copy, and the next
+pool GUID (`User00031`) differs (the test checks this).
 `PoolInput::loaded_skeletons` therefore stays as a fitted input, now
-meaning "loaded by earlier work". Which earlier step loads them is
+meaning "loaded by earlier work", as a list in load order. Which earlier step loads them is
 untraced. No capture loads a skeleton during the pools, so the lazy
 load's draws there are **unverified** beyond sharing the World's model.
 
