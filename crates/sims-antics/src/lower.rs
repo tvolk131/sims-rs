@@ -1215,7 +1215,9 @@ impl<'a> TreeBuilder<'a> {
                         message,
                         button1,
                         button2,
-                        *kind & 0x7F,
+                        // The VM shows kind `& 0x7F` but keeps the whole byte in the
+                        // dialog record (`dialog.rs`), so it is written as given.
+                        *kind,
                         title,
                         *flags,
                     ],

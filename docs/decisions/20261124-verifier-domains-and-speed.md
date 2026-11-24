@@ -73,11 +73,66 @@ calls respect the domain.
 
 ## Decision 2: wider cut-point bisimulation
 
-*(Filled in after the sweep diagnosis.)*
+The reversed-layout sweep (every install tree against itself laid out in reverse, under
+`--behavioral`) left 5,298 of 23,974 trees inconclusive. Grouping the reasons showed
+the largest share was the sweep's own setup, not the checker:
+
+| Inconclusive reason | Trees |
+| --- | ---: |
+| a call into the global library whose argument count the sweep never supplied | ~4,950 |
+| more than 250,000 path pairs to check | 145 |
+| a loop that records no event, so neither cut placement applies | 48 |
+| a call into a semi-global library the object does not load | ~110 |
+| other (Global 34, product-state and path caps) | ~45 |
+
+Changes:
+
+- **The sweep supplies library arities**, as `verify-equiv --global` and
+  `--semi-global` do. A call with spilled arguments is otherwise undecidable on purpose.
+- **Pairs that take one branch both ways are not counted.** Path and segment-end pairs
+  are indexed by the literals of their conditions. A pair whose conditions hold some
+  branch atom with opposite outcomes is infeasible: it is the first test
+  `feasibility` already makes. Those pairs are skipped without spending the
+  pair budget. Nothing else changes, so no new pair is ever accepted.
+- **A third cut placement: loop heads.** When cutting at primitives and at every event
+  both fail, the bisimulation also cuts each side on reaching a loop head of its own
+  tree. A loop head is the target of a back edge in a depth-first walk from the entry.
+  The walk follows the graph, so a renumbered tree has the same heads. Cut states pair
+  only with cut states of the same event history. The product abstraction is the same
+  one event cuts use: literals and equalities, path condition dropped. The induction
+  over cuts does not depend on where the cuts are, so the proof stays sound. A
+  misaligned cut (one side at a head, the other at an event or exit) fails the proof;
+  it is never a counterexample.
+
+Result: with library arities and pair indexing, 23,785 of 23,974 trees prove; loop-head cuts bring it to 23,838 (136 inconclusive, 0 counterexamples). Nearly all of the rest call a tree whose argument count the object does not know. New tests
+cover event-free loops: a positive that needs the loop-head cut, and negatives
+(another increment, `<=` for `<`, an extra or different temp write, a renumbered wrong
+loop) that must never prove.
+
+Multi-exit loops, shared tails and diamonds needed no new rule. The sweep found no
+inconclusive tree that failed because of them; diamonds already merge at cuts.
 
 ## Decision 3: the last raw operand forms in `.air`
 
-*(Filled in after the corpus classification.)*
+55 of 28,690 install trees still lift with an `op 0x…` line under strict padding.
+Grouped by form and by the tree's frame:
+
+- **Out-of-frame operands (49 trees).** The operand names a parameter the tree does not
+  take, or a local past its locals:
+  - `param[0] == 0` in trees with no arguments;
+  - Animate's event local past the locals;
+  - Animate's event count read from a parameter of a tree with none;
+  - Push Interaction's icon local, Relationship's local, or an expression local past
+    the frame.
+
+  These read or write another frame's storage in the VM. `.air` names frame slots by
+  the tree's own frame, so it has no honest spelling for them. They stay raw.
+- **Remove Object Instance with mode `0xFFFF` (6 lines).** Modes above 2 fault
+  (`remove.rs`), so the bytes are a guaranteed fault, not a form to name. They stay raw.
+- **Dialog with byte 5 bit 7 set (1 tree): now decoded.** The VM shows `kind & 0x7F`,
+  but the dialog record copies the whole byte. `kind` now takes 0 to 255 and lowers
+  unmasked, so `dialog(kind: 133, …)` rebuilds the exact bytes. The lowering used to
+  mask the bit away, which no source relied on.
 
 ## Decision 4: speed
 
