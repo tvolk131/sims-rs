@@ -15,6 +15,7 @@ pub mod ast;
 pub mod decompile;
 pub mod fmt;
 pub mod lexer;
+pub mod lint;
 pub mod loader;
 pub mod lower;
 mod opt;
@@ -25,6 +26,10 @@ pub use decompile::{
     decompile_iff_to_v2, decompile_iff_to_v2_report,
 };
 pub use fmt::{format_v2_source, is_v2_formatted};
+pub use lint::{
+    LINT_RULES, LintDiagnostic, LintInput, LintRule, Severity, diagnostics_to_json, lint_v2_paths,
+    lint_v2_source, lint_v2_sources, pack_dir_of, render_diagnostic,
+};
 pub use loader::{PackResolverConfig, ResolvedModule, resolve_v2_file, resolve_v2_source};
 pub use lower::{ExpandedV2Object, VariantSpec, lower_resolved_module};
 pub use parser::parse_v2_file;
