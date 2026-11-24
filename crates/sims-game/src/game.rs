@@ -2845,15 +2845,27 @@ impl Game {
     }
 
     /// Drops a trip [`Game::decline_trip`] only marked declined during
-    /// co-op, once the lot ticks on its own again. Left in the lot, the
-    /// stale request would hide every later trip: Generic Sims Call 17 only
-    /// adds to a pending request, and the mark hides it (`same_trip`).
+    /// co-op, just before the lot's next tick of its own. Left in the lot,
+    /// the stale request would hide every later trip: Generic Sims Call 17
+    /// only adds to a pending request, and the mark hides it (`same_trip`).
+    /// A different request pending by then is not the one declined, so it
+    /// stays and only the mark goes.
     fn drop_trip_declined_in_coop(&mut self) {
-        if self.declined_trip.is_none() || self.coop.is_active_or_starting() {
+        if self.coop.is_active_or_starting() {
             return;
         }
-        self.declined_trip = None;
-        self.lot.cancel_trip_request();
+        let Some(declined) = self.declined_trip.take() else {
+            return;
+        };
+        if self
+            .lot
+            .world()
+            .trip_request
+            .as_ref()
+            .is_some_and(|trip| same_trip(&declined, trip))
+        {
+            self.lot.cancel_trip_request();
+        }
     }
 
     /// Enables or disables `--debug` mode (which shows the maroon top
@@ -3916,7 +3928,6 @@ impl Game {
         idle: bool,
         mut keep_going: impl FnMut(u32) -> bool,
     ) -> (u32, bool) {
-        self.drop_trip_declined_in_coop();
         let mut ran = 0;
         let mut capped = false;
         while ran < ticks && self.stopped.is_none() {
@@ -3932,6 +3943,7 @@ impl Game {
                 capped = true;
                 break;
             }
+            self.drop_trip_declined_in_coop();
             let speed_before = (self.lot.world().speed(), self.lot.world().return_speed());
             let step = if self.play {
                 self.lot.step_play()

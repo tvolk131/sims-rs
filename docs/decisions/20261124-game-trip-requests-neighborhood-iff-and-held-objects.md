@@ -61,9 +61,10 @@ alone and a headless still decline the same way.
 still only latches the request (`declined_trip` with `same_trip`), as
 before. The shell refuses travel in co-op anyway.
 
-Once the session ends and the lot ticks on its own again, the next run
-drops a latched request (`Game::drop_trip_declined_in_coop`, then
-`Lot::cancel_trip_request`). Before this, the stale request stayed in the
+Once the session ends, a latched request is dropped just before the lot's
+next tick of its own (`Game::drop_trip_declined_in_coop`, then
+`Lot::cancel_trip_request`). This happens only while the lot still holds
+that same trip (`same_trip`). A run that ticks nothing changes nothing. Before this, the stale request stayed in the
 lot. A later routine 17 only adds to a pending request, and the latch hid
 it, so the host could not travel from that lot again until it was
 reloaded. This bug predates the change.
@@ -80,16 +81,18 @@ from 23 call sites. These include:
 The shell now writes the open neighborhood's committed record through
 `NeighborhoodStore::save_neighborhood_iff` (`NTemp.iff`, then renamed over
 `Neighborhood.iff`) whenever a commit has moved the record's
-`(instance_id, revision)`. The commits that do this are:
+`(instance_id, revision)`. The shell checks after:
 - a lot save;
-- a departure or return;
-- every commit followed by `refresh_from_store` (family moves, evictions,
-  CAF).
+- a departure, a return, or resuming an interrupted trip;
+- loading a saved slot into a lot;
+- opening a destination to edit;
+- every `refresh_from_store` (family moves, evictions, CAF).
 
-Entering a lot and staging co-op also check, but they normally commit
-nothing. An ordinary entry boots from the snapshot and checks that the
-store's version did not change, and a co-op restage only replaces the game
-in memory. So they write only when a commit has not been written yet.
+Every commit the shell makes is followed by one of these, so no committed
+revision goes unwritten. An ordinary lot entry and a co-op restage do not
+check. They commit nothing: the entry boots from the snapshot and checks
+that the store's version did not change, and the restage only replaces the
+game in memory.
 
 Details:
 - **Where.** `<saves file name>.userdata/<neighborhood id>/Neighborhood.iff`
