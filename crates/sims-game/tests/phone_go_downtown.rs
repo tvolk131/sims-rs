@@ -7,7 +7,7 @@
 //! (`World::trip_request`). The original's main loop finds the request
 //! between ticks and leaves the house; here [`Game`] stops ticking and
 //! [`NeighborhoodShell::pump_trip_request`] departs with
-//! `travel::depart_from_request`. The trip must depart once: no second fare
+//! `travel::depart_from_request_with`. The trip must depart once: no second fare
 //! and no second set of saved-state tokens, which the shell's own departure
 //! for the lot pick (`depart_to_destination`) would add.
 //!
@@ -289,7 +289,9 @@ fn the_phones_go_downtown_leaves_the_lot_once_through_the_shell() {
 }
 
 /// A house opened without its neighborhood cannot travel: the host declines
-/// the trip ([`Game::decline_trip`]) and the lot plays on.
+/// the trip ([`Game::decline_trip`]) and the lot plays on. The lot drops the
+/// request (`Lot::cancel_trip_request`) with the saved state routine 17
+/// wrote for it, so the script's tail restores nothing from it.
 #[test]
 fn a_declined_trip_lets_the_lot_play_on() {
     let Some(root) = install_root() else {
@@ -334,11 +336,115 @@ fn a_declined_trip_lets_the_lot_play_on() {
     assert_eq!(trip.leader_guid, leader_guid);
     assert_eq!(game.run(1), 0, "a tick ran with a trip pending");
 
-    game.decline_trip();
+    assert!(
+        !tokens_of(&game, leader_guid).is_empty(),
+        "routine 17 saved the caller's state"
+    );
+    let dropped = game.decline_trip().expect("the request is dropped");
+    assert_eq!(dropped, trip);
     assert!(game.trip_request().is_none());
+    assert!(
+        game.lot().world().trip_request.is_none(),
+        "the lot dropped the request"
+    );
+    assert_eq!(
+        tokens_of(&game, leader_guid),
+        [],
+        "the saved state routine 17 wrote was taken back"
+    );
     assert_eq!(game.run(30), 30, "the lot plays on");
     assert!(
         game.trip_request().is_none(),
-        "the declined trip stays declined"
+        "the dropped trip is not asked for again"
     );
+}
+
+/// In co-op the world changes only through the lockstep, so declining a
+/// trip only marks it declined and the request stays in the lot. Once the
+/// session ends and the lot ticks on its own, the request is dropped with
+/// the saved state routine 17 wrote. Otherwise it would hide every later
+/// trip: a later Generic Sims Call 17 only adds to a pending request.
+#[test]
+fn a_trip_declined_in_coop_is_dropped_once_the_lot_plays_alone() {
+    let Some(root) = install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to run the phone Go Downtown test");
+        return;
+    };
+    let mut game = Game::open(&Options {
+        house: goth_house(&root),
+        install: root,
+        answers: vec![3],
+        play: true,
+        frames: Frames::default(),
+    })
+    .expect("open the house");
+    game.resize(SIZE);
+    assert_eq!(game.run(5), 5);
+    let leader_guid = {
+        let world = game.lot().world();
+        let family = i32::from(world.globals[9]);
+        world
+            .families
+            .iter()
+            .find(|f| f.id == family)
+            .map(|f| f.members[0])
+            .expect("the household")
+    };
+    let caller = head(&game, leader_guid);
+    let ask_for_downtown = |game: &mut Game| {
+        call_downtown(game, caller);
+        game.render();
+        assert!(game.answer_special_panel(SpecialPanelResponse::Lot(Some(DOWNTOWN_LOT as i16))));
+        for _ in 0..10 {
+            if game.trip_request().is_some() {
+                return game.trip_request().expect("asked").clone();
+            }
+            assert_eq!(game.run(1), 1);
+        }
+        panic!("the script never asked for the trip");
+    };
+    let trip = ask_for_downtown(&mut game);
+
+    let mesh = sims_net::MemoryMesh::new(7);
+    game.coop_start_host_with_transport(
+        sims_game::coop::CoopTransport::memory(mesh.add_node("mem://host")),
+        sims_net::ManifestDigest([0x5A; 32]),
+        sims_game::coop::CoopStartOptions {
+            player_name: "Host".into(),
+            ..sims_game::coop::CoopStartOptions::default()
+        },
+    )
+    .expect("host co-op");
+    assert_eq!(game.decline_trip(), Some(trip.clone()));
+    assert!(game.trip_request().is_none());
+    assert!(
+        game.lot().world().trip_request.is_some(),
+        "in co-op the request stays in the lot"
+    );
+
+    game.leave_coop();
+    assert_eq!(game.run(1), 1, "the lot plays on alone");
+    assert!(
+        game.lot().world().trip_request.is_none(),
+        "the request declined in co-op was dropped"
+    );
+    assert_eq!(
+        tokens_of(&game, leader_guid),
+        [],
+        "the saved state routine 17 wrote was taken back"
+    );
+
+    // The first call's tail finishes before the phone offers the trip again.
+    let mut ticks = 0;
+    while go_downtown(&mut game, caller).is_empty() {
+        assert!(
+            ticks < CALL_FRAMES,
+            "the phone never offers Go Downtown again"
+        );
+        assert_eq!(game.run(1), 1);
+        ticks += 1;
+    }
+    let again = ask_for_downtown(&mut game);
+    assert_eq!(again.leader_guid, leader_guid);
+    assert_eq!(i32::from(again.house), i32::from(DOWNTOWN_LOT));
 }
