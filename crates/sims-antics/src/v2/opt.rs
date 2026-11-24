@@ -86,7 +86,10 @@ fn strip_strings(line: &str) -> String {
                 out.push('"');
                 continue;
             }
-            out.push(' ');
+            // Same byte width, so offsets into the stripped text index the original.
+            for _ in 0..c.len_utf8() {
+                out.push(' ');
+            }
         } else {
             if c == '"' {
                 in_str = true;
@@ -125,7 +128,13 @@ fn parse_block(lines: &[&str], pos: &mut usize) -> Option<(Vec<Node>, Option<Blo
         let line = lines[*pos];
         let s = strip_strings(line);
         *pos += 1;
-        if s.contains("//") || s.contains("->") || s.contains('#') {
+        if s.contains("//")
+            || s.contains("/*")
+            || s.contains("*/")
+            || s.contains("->")
+            || s.contains('#')
+            || names_local_slot(&s)
+        {
             return None;
         }
         if s == "}" {
@@ -330,8 +339,11 @@ fn idents(text: &str) -> Vec<&str> {
             while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
-            // Same byte offsets in the original: stripping only blanks string contents.
-            out.push(&text[start..i]);
+            // A field after `.` is not a variable. Same byte offsets in the original: stripping
+            // only blanks string contents.
+            if !follows_dot(bytes, start) {
+                out.push(&text[start..i]);
+            }
         } else if c.is_ascii_digit() {
             while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
@@ -341,6 +353,69 @@ fn idents(text: &str) -> Vec<&str> {
         }
     }
     out
+}
+
+/// Whether the token at `start` is a field (`.name`, spaces allowed before the name).
+fn follows_dot(bytes: &[u8], start: usize) -> bool {
+    bytes[..start]
+        .iter()
+        .rev()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|&b| b == b'.')
+}
+
+/// Opcodes whose VM handlers read no operand (find best interaction, grab, drop, gosub found
+/// action), as v2 emits them.
+const OPERAND_FREE_OPS: &[&str] = &["0x0003", "0x0004", "0x0005", "0x001e"];
+
+/// Whether a (string-stripped) line can name a local slot by number, which renaming and
+/// coalescing named locals would silently retarget: a raw `op` (its operands may encode a
+/// local), or `scope(N, …)` whose scope is the locals scope (25) or not a plain literal.
+fn names_local_slot(stripped: &str) -> bool {
+    // The operand-free primitives v2 builtins spell as raw ops name no local.
+    let mut cleaned = stripped.to_owned();
+    for opcode in OPERAND_FREE_OPS {
+        cleaned = cleaned.replace(&format!("op {opcode} (0, 0, 0, 0, 0, 0, 0, 0)"), "");
+    }
+    let stripped = cleaned.as_str();
+    let bytes = stripped.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let word = &stripped[start..i];
+            // A raw op is `op <opcode> (...)`; `op:` is a primitive's named argument.
+            if word == "op"
+                && !follows_dot(bytes, start)
+                && !stripped[i..].trim_start().starts_with(':')
+            {
+                return true;
+            }
+            if word == "scope" && stripped[i..].trim_start().starts_with('(') {
+                let args = stripped[i..].trim_start()[1..].trim_start();
+                let first = args.split([',', ')']).next().unwrap_or("").trim();
+                let scope = first.parse::<i64>().ok().or_else(|| {
+                    first
+                        .strip_prefix("0x")
+                        .and_then(|h| i64::from_str_radix(h, 16).ok())
+                });
+                if scope.is_none_or(|n| n == 25) {
+                    return true;
+                }
+            }
+        } else if c.is_ascii_digit() {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 /// Replaces identifier tokens (outside string literals) per `map`.
@@ -357,7 +432,9 @@ fn rename_idents(text: &str, map: &BTreeMap<String, String>) -> String {
             while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
-            if let Some(to) = map.get(&text[start..i]) {
+            if !follows_dot(bytes, start)
+                && let Some(to) = map.get(&text[start..i])
+            {
                 out.push_str(&text[last..start]);
                 out.push_str(to);
                 last = i;
@@ -374,20 +451,16 @@ fn rename_idents(text: &str, map: &BTreeMap<String, String>) -> String {
     out
 }
 
-/// An operand whose read cannot fault and has no side effects: a local, literal, `stack_obj`,
-/// or a cell of the running object, a temp, a param, or a global. (`stack.` cells fault when
-/// the stack object is invalid.)
+/// An operand whose read cannot fault and has no side effects: a named local, an integer
+/// literal, `stack_obj`, `my.id`, or an explicit `local[N]`. Cells of objects, temps, params,
+/// and globals stay: their reads can fault (an index past the data, or past the frame).
 fn is_safe_operand(s: &str) -> bool {
-    if s.contains('(') || s.contains(' ') || s.starts_with("stack.") {
-        return false;
-    }
     is_ident(s)
         || s.parse::<i32>().is_ok()
-        || s.starts_with("my.")
-        || s.starts_with("temp[")
-        || s.starts_with("param[")
-        || s.starts_with("global[")
-        || s.starts_with("local[")
+        || s == "my.id"
+        || s.strip_prefix("local[")
+            .and_then(|r| r.strip_suffix(']'))
+            .is_some_and(|n| n.parse::<u16>().is_ok())
 }
 
 /// Whether running `next` first cannot observe the previous node's result: assignments and
@@ -503,8 +576,9 @@ fn drop_dead_stack_obj_stores(nodes: &mut Vec<Node>) {
                 let safe = is_safe_operand(rhs) || rhs == "stack_obj";
                 let next_is_return =
                     matches!(next, Some(Node::Line(l)) if classify(l) == Kind::Return);
-                let next_is_store =
-                    matches!(next, Some(Node::Line(l)) if stack_obj_store(l).is_some());
+                // The next store must not read the value this one writes.
+                let next_is_store = matches!(next, Some(Node::Line(l))
+                    if stack_obj_store(l).is_some_and(|r| r != "stack_obj" && is_safe_operand(r)));
                 let redundant = known.as_deref() == Some(rhs) || rhs == "stack_obj";
                 if safe
                     && (next_is_return
@@ -1120,5 +1194,70 @@ mod tests {
         // `__a_1` is live around the loop back edge while `__b_2` is written in the body.
         let body = "    let __a_1 = 0;\n    while my.attr[0] < 5 {\n        let __b_2 = my.attr[1];\n        my.attr[2] := __b_2;\n        my.attr[4] := __b_2;\n        __a_1 += 1;\n    }\n    my.attr[3] := __a_1;\n    return true;\n";
         assert_eq!(optimize_tree_body(body), body);
+    }
+
+    #[test]
+    fn stack_obj_store_read_by_the_next_store_stays() {
+        // The second store reads the first one's value through `stack.`.
+        let body = "    stack_obj := __o_1;\n    stack_obj := stack.attr[0];\n    my.attr[0] := 1;\n    return true;\n";
+        let out = optimize_tree_body(body);
+        assert!(out.contains("stack_obj := __o_1;"), "{out}");
+        // An independent second store does kill the first.
+        let body = "    let __o_1 = my.id;\n    stack_obj := __o_1;\n    stack_obj := 7;\n    my.attr[0] := 1;\n    return true;\n";
+        assert!(!optimize_tree_body(body).contains("__o_1"));
+    }
+
+    #[test]
+    fn faulting_reads_stay() {
+        // An object cell, temp, param, or global read can fault, so its unread store stays.
+        for operand in [
+            "my.attr[99]",
+            "temp[0]",
+            "param[3]",
+            "global[2]",
+            "stack.attr[0]",
+        ] {
+            let body = format!("    let __a_1 = {operand};\n    return true;\n");
+            assert_eq!(optimize_tree_body(&body), body, "{operand}");
+        }
+        let body = "    let __a_1 = my.id;\n    let __b_2 = 5;\n    return true;\n";
+        assert_eq!(optimize_tree_body(body), "    return true;\n");
+    }
+
+    #[test]
+    fn local_slot_numbers_leave_the_tree_alone() {
+        let dead = "    let __a_1 = 0;\n    let __b_2 = 1;\n    my.attr[0] := __b_2;\n";
+        for line in [
+            "op 0x0002 (0x05, 0x00, 0x00, 0x00, 0x19, 0x07, 0x00, 0x00);",
+            "my.attr[1] := scope(25, 1);",
+            "my.attr[1] := scope(0x19, 0);",
+            "my.attr[1] := scope(__k_3, 0);",
+            "/* note */ my.attr[1] := 0;",
+        ] {
+            let body = format!("{dead}    {line}\n    return true;\n");
+            assert_eq!(optimize_tree_body(&body), body, "{line}");
+        }
+        // A named `op:` argument and the operand-free builtin ops are not raw local references.
+        for line in [
+            "manage_inventory(op: 1, kind: 2, flags: 3, guid: 0x7f400011);",
+            "op 0x0004 (0, 0, 0, 0, 0, 0, 0, 0);",
+            "my.attr[1] := scope(12, 2);",
+        ] {
+            let body = format!("{dead}    {line}\n    return true;\n");
+            assert_ne!(optimize_tree_body(&body), body, "{line}");
+        }
+    }
+
+    #[test]
+    fn strings_fields_and_wide_characters() {
+        // Multi-byte string contents keep byte offsets aligned, and a `.field` named like a
+        // local is not renamed.
+        let body = "    let __a_1 = 1;\n    my.attr[0] := __a_1;\n    let __b_2 = 2;\n    dialog(\"caf\u{e9} \u{2603}\", bcon.__b_2);\n    my.attr[1] := __b_2;\n    return true;\n";
+        let out = optimize_tree_body(body);
+        assert!(
+            out.contains("dialog(\"caf\u{e9} \u{2603}\", bcon.__b_2);"),
+            "{out}"
+        );
+        assert!(out.contains("my.attr[1] := __a_1;"), "{out}");
     }
 }

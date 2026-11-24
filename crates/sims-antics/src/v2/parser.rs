@@ -2982,11 +2982,13 @@ impl Parser {
 
     /// Expression `match s { P => value, ... }` (the `match` keyword is already consumed).
     fn parse_match_expr(&mut self, span: Span) -> Result<V2Expr> {
-        let scrutinee = self.parse_expr()?;
-        let open_span = self.expect(&TokenKind::LBrace, "'{'")?;
-        self.enter_nesting(open_span)?;
+        // Entered before the scrutinee, so `match match match ... x {..} {..}` is bounded too.
+        self.enter_nesting(span)?;
         let mut arms = Vec::new();
+        let mut scrutinee = None;
         let res = (|| {
+            scrutinee = Some(self.parse_expr()?);
+            let open_span = self.expect(&TokenKind::LBrace, "'{'")?;
             loop {
                 if self.eat(&TokenKind::RBrace) {
                     return Ok(());
@@ -3020,6 +3022,7 @@ impl Parser {
         })();
         self.leave_nesting();
         res?;
+        let scrutinee = scrutinee.expect("set before the arms parse");
         if arms.is_empty() {
             return Err(Error::at(span, "'match' must have at least one arm"));
         }

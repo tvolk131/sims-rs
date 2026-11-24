@@ -7779,7 +7779,7 @@ fn readability_builtins_animate_frame_and_raw_lower_exactly() {
         "refresh(target: stack_obj, mode: 2);",
         "refresh(target: me, mode: 0);",
         // A global range would receive the draw, so it is copied first.
-        ":= global[3];\n    random(stack.attr[0], __",
+        "= global[3];\n    random(stack.attr[0], __",
         "action_string(table: 301, index: 4);",
         "show_string(table: 301, index: 5);",
         "set_headline(kind: 1, index: 2, duration: -1, options: 0, stack_obj: true, local: __v_icon_0);",
@@ -8931,5 +8931,129 @@ object "Two Tiles" {
         "variant_dup_field.antics",
         &obj("    variant \"V\" { guid: 0x7F40_0151, guid: 0x7F40_0152 }"),
         "duplicate variant field 'guid'",
+    );
+}
+
+/// Review fixes: one-arm matches still read the scrutinee, `&mut` sprite cells fix their index
+/// at the call, and functionals see the four-word frame.
+#[test]
+fn pr_e_review_fixes_lower_soundly() {
+    let src = r#"
+fn bump(flag: &mut i16, i: &mut i16) {
+    *i = 0;
+    *flag = 1;
+}
+
+object "Pr E Review" {
+    guid: 0x7F40_0170;
+    state n: i16;
+    state k: i16;
+
+    @id(4400) tree one_arm "One Arm" (sim: Sim) {
+        self.n = match sim.person[12] { _ => 4 };
+    }
+
+    @id(4401) tree sprite_ref "Sprite Ref" (sim: Sim) {
+        let i = self.k;
+        bump(&mut self.sprite_flags[i], &mut i);
+        self.n = i;
+    }
+
+    @id(4402) tree pinned "Pinned" (sim: Sim) {
+        let o = stack_obj;
+        stack_obj = sim;
+        o.push_interaction(menu: 0, priority: 2);
+    }
+
+    functional prep(a: i16) {
+        score: 10,
+        run(sim) {
+            self.n = param[3];
+        }
+    }
+}
+"#;
+    let expanded = sims_antics::v2::expand_v2_source_to_objects(
+        "review.antics",
+        src,
+        &PackResolverConfig::default(),
+    )
+    .expect("expand review probe");
+    let air = &expanded[0].air_source;
+    let tree = |label: &str| {
+        let start = air
+            .find(&format!("\"{label}\""))
+            .unwrap_or_else(|| panic!("tree {label}:\n{air}"));
+        let end = air[start..].find("\n}\n").map_or(air.len(), |e| start + e);
+        &air[start..end]
+    };
+    // The wildcard-only match still reads its scrutinee once (a person cell read can fault).
+    assert!(tree("One Arm").contains("= my.person[12];"), "{air}");
+    // The reference keeps the index the call saw; the helper's `*i = 0` does not move it.
+    let sprite = tree("Sprite Ref");
+    assert!(sprite.contains("__ref_idx_flag"), "{sprite}");
+    assert!(sprite.contains("temp[0] := __ref_idx_flag"), "{sprite}");
+    assert!(tree("Pinned").contains("local[0] := __v_o_0;"), "{air}");
+    // `param[3]` is inside a functional's frame.
+    assert!(air.contains("param[3]"), "{air}");
+}
+
+#[test]
+fn pr_e_review_negative_diagnostics() {
+    let cfg = PackResolverConfig::default();
+    let obj = |members: &str| {
+        format!(
+            "object \"Pr E Review\" {{\n    guid: 0x7F40_0180;\n    state n: i16;\n{members}\n}}\n"
+        )
+    };
+    let expect_err = |name: &str, src: &str, needle: &str| {
+        let err = compile_v2_source(name, src, &cfg).expect_err(&format!("{name} must fail"));
+        assert!(
+            err.message.contains(needle),
+            "{name}: expected '{needle}' in: {err}"
+        );
+    };
+    // Arms must have the same type, not merely assignable ones.
+    expect_err(
+        "match_handle_i16.antics",
+        &obj("    tree t (sim: Sim) { let x = match self.n { 0 => 1, _ => stack_obj }; }"),
+        "different types",
+    );
+    // The pinned push slot and raw .air cannot share a tree, in either order.
+    expect_err(
+        "pin_then_raw.antics",
+        &obj(
+            "    tree t (sim: Sim) { let o = stack_obj; o.push_interaction(menu: 0); raw { my.attr[0] := 1; } }",
+        ),
+        "cannot share a tree",
+    );
+    expect_err(
+        "raw_then_pin.antics",
+        &obj(
+            "    tree t (sim: Sim) { raw { my.attr[0] := 1; } let o = stack_obj; o.push_interaction(menu: 0); }",
+        ),
+        "cannot share a tree",
+    );
+    // Variant trees run as the object's own init/main.
+    expect_err(
+        "variant_sim_tree.antics",
+        &obj("    tree t (sim: Sim) { }\n    variant \"V\" { guid: 0x7F40_0181, init: t }"),
+        "object-self tree with no parameters",
+    );
+    expect_err(
+        "variant_primary_name.antics",
+        &obj("    variant \"Pr E Review\" { guid: 0x7F40_0181 }"),
+        "primary object's name",
+    );
+    // Nested match scrutinees are bounded like every other nesting.
+    let deep = format!(
+        "{}self.n{}",
+        "match ".repeat(200),
+        " { _ => 1 }".repeat(200)
+    );
+    expect_err(
+        "match_deep.antics",
+        &obj(&format!("    init {{ self.n = {deep}; }}")),
+        "nesting depth",
     );
 }

@@ -41,7 +41,8 @@ Constraints:
 - **`push_interaction` from a local.**
   - `push_interaction(object: x, ...)` takes any object-handle expression, and so does the method form `x.push_interaction(menu: ..., ...)`. An integer literal still means a parameter index, as before.
   - The VM reads such an object from a *local slot index* (flag `0x02`). `.air` cannot name a local there, so v2 copies the handle into an explicit `local[k]` right before the push: `local[k] := x; push_interaction(..., object: k, flags: 2)`.
-  - **One pinned slot per tree.** `k` is one past the highest explicit `local[N]` the tree spells (in `raw { }` blocks), or 0. `.air` allocates every named local after the explicit ones, so the slot never collides with a binding or with raw code.
+  - **One pinned slot per tree.** `k` is one past the highest explicit `local[N]` in the tree text, or 0. `.air` allocates every named local after the explicit ones, so the slot never collides with a binding.
+  - **No `raw` in the same tree.** Raw `.air` can name local slots in forms a text scan cannot see (`scope(25, N)`, raw `op` operand bytes, primitive fields). A tree that pushes from a handle therefore may not also contain a `raw { }` block, in either order. A constant parameter index still works there.
   - Flag `0x02` is implied; spelling it as well is an error.
   - Pinning the binding itself (no copy node) would need `.air` to place a named local at a fixed slot. That is out of scope here, so the copy costs one node per push.
 - **Fields of other Sims and objects.**
@@ -57,6 +58,7 @@ Constraints:
   - **Dynamic sprites.** `obj.sprite_flags[i] = v` (and its read), with `set_dynamic_sprite(index: i, value: v)` as the statement spelling for `self`.
     - These lower to the VM's scope 27, which takes the flag index *from a temp*: `temp[0] := i; scope(27, 0) := v`.
     - They clobber `temp[0]`, as the original's own spelling does. A value that reads `temp[0]` is snapshotted before the index is written.
+    - `&mut obj.sprite_flags[i]` passed to a helper snapshots a run-time `i` at the call, like the object handle. The reference keeps naming the cell the call chose, even if the helper reassigns `i`.
     - The target becomes `stack_obj` for the access, like any foreign access.
 - **`run_functional` by number.** `obj.run_functional(4, change_icon: true)` accepts an integer function index (0..=255) as well as a kind name. A numeric index is always untyped: no signature is checked, and `let Some` yields `i16`.
 - **`notify_out_of_idle()`** lowers to `notify_idle() pad 0xff`, the original's operand spelling, which a verifier can observe.
@@ -64,7 +66,7 @@ Constraints:
 - **`param[n]`.**
   - `param[n]` is readable and assignable, including with `+=`, inside trees whose frame covers `n`:
     - standalone trees: positional params or `@frame(args:)`;
-    - functionals: 4.
+    - functionals: all 4 words of the frame the engine passes, whatever the functional declares.
   - Interactions and lifecycle trees have no arguments, so `param[n]` there is an error.
   - Named positional params stay immutable by name. `param[n] = ...` is the explicit escape hatch, and later reads of the named param see the new value.
 - **`inc_lt(&mut x, n)` / `dec_gt(&mut x, n)`.**
@@ -76,13 +78,14 @@ Constraints:
 ### 2. Ergonomics
 
 - **Expression `match`.** `let x = match s { A => e1, B => e2, _ => e3 };`, `return match ...;`, and any other value position accept a match.
-  - **Arms are expressions.** All arm values must have one type.
+  - **Arms are expressions.** All arm values must have exactly the same type. Assignment compatibility is not enough: `0` and an `ObjectId` do not mix, and neither do a generic and a typed handle.
   - **Strictly exhaustive.** Enums must cover every variant or have `_`. `i16` needs `_`, or literal and range arms that together cover `-32768..=32767`.
   - **Arms are values, not blocks.** `A => { ... }` is an error in expression form. A bool-valued arm lowers into the result local like any other bool expression.
   - **Lowering.** The match lowers to an if/else-if chain into one result local. The last arm is the `else`, with no test.
   - **Statement form unchanged.** The statement form keeps its rules: non-exhaustive `i16` matches remain allowed there.
 - **Constant `match`** (L3). A scrutinee that is a compile-time constant (literal, enum variant, `const`, constant helper argument) selects one arm. The other arms are still lowered into the discarded buffer, so they stay checked. Statement and expression forms both fold.
   - **No scrutinee copy.** A runtime scrutinee that is a single operand with no side effects (local, param, field, BCON) is no longer copied into a `__match` local. An arm body could change that operand, but the chain tests it only before any arm body runs.
+  - **One arm still reads.** A match with a single arm and no test (only `_`, or one arm that covers everything) still reads its scrutinee once, into a `__match` local, unless it is a local or a literal. A cell read can fault, and dropping it would hide that.
 - **Multi-variant IFF.** An object may declare catalog variants:
 
   ```
@@ -97,7 +100,11 @@ Constraints:
     - the IFF is re-encoded with a fresh `rsmp`.
 
     Variant OBJD/CTSS ids continue after the primary's and must be free.
-  - **Restrictions.** Variants are rejected on multi-tile objects (tiles already own the OBJD group). A variant needs a `guid`, and its name and GUID must be new. Pack-level duplicate-GUID checks read every OBJD GUID in each compiled IFF, so they include variant GUIDs.
+  - **Restrictions.**
+    - Variants are rejected on multi-tile objects (tiles already own the OBJD group).
+    - A variant needs a `guid`. Its name must differ from the primary's and from other variants', and its GUID must be new.
+    - A variant's `init:` / `main:` must name an object-self `tree` with no parameters, because the VM runs it as the object's init or main.
+  - **Pack GUID checks.** `compile_v2_pack_dir` reads every OBJD GUID in each compiled IFF, so it includes variant GUIDs. The CLI's `compile_pack_dir` (in `compile.rs`, outside this PR) checks only `guid` and `tile_guids`, so it does not yet see a variant GUID that collides with another object's. Fixing that is a one-line follow-up in `compile.rs`. Putting variant GUIDs into `tile_guids` is not an option: `sim_pack` treats a non-empty list as multi-tile.
   - **`init:` replaces the whole init.** A variant's init tree runs instead of the primary's, state defaults included. Leave `init:` out to share the primary's.
   - **Compatibility.** Single-variant source is unchanged byte-for-byte.
 
@@ -107,8 +114,9 @@ The lowering stays simple. A new pass rewrites each emitted `.air` tree body bef
 
 - **What it works on.** It parses the structured text v2 emits: one simple statement per line, plus `if` / `else if` / `else` and `while` blocks (`while true` is `.air`'s condition-free loop).
 - **When it skips a tree.** It leaves a tree untouched when any of these holds:
-  - the tree has labels, explicit branch targets (`->`), or comments;
-  - a line holds more than one statement or is not a recognised block line (some `raw { }` blocks).
+  - the tree has labels, explicit branch targets (`->`), or comments (`//`, `/* */`);
+  - a line holds more than one statement or is not a recognised block line (some `raw { }` blocks);
+  - a line can name a local *slot* by number: a raw `op` (other than the operand-free ops v2's builtins emit for find best interaction, grab, drop, and gosub found action), or `scope(s, …)` whose scope is 25 (locals) or not a literal. Coalescing and dropping named locals renumber slots, which would silently retarget such a reference.
 
 **Facts the rewrites rely on.**
 
@@ -123,9 +131,9 @@ The lowering stays simple. A new pass rewrites each emitted `.air` tree body bef
 - **Single-pass loops.** `while true { B; break; }` with no other `break` / `continue` of that loop in `B` becomes `B`. The loop has no node, and the `break` went where `B` now falls through.
 - **Dead `stack_obj` stores** (L1, L5).
   - A store directly before `return` is dead.
-  - A store directly before another store is dead.
+  - A store directly before another store is dead when the second store does not read `stack_obj` (its value is a local, a literal, or `my.id`, not a `stack.` cell).
   - A store is redundant when straight-line code proves `stack_obj` already holds that value: an earlier `stack_obj := x`, `let x = stack_obj`, or `x := stack_obj` with no write to either in between. It is dropped under the next-node rule.
-- **Dead local stores.** Liveness runs over the structured tree (if/else chains, loops to a fixpoint, `break` / `continue` / `return`). A plain store (`let x = e;` / `x := e;`) to a v2 local is dropped when nothing reads the local afterwards, under the next-node rule. Its operand must be one that cannot fault: a local, literal, `my.` / `temp` / `param` / `global` cell, or `stack_obj`, not a `stack.` cell. This removes the unread `__self_obj` save once its restores are dead, and helper return flags.
+- **Dead local stores.** Liveness runs over the structured tree (if/else chains, loops to a fixpoint, `break` / `continue` / `return`). A plain store (`let x = e;` / `x := e;`) to a v2 local is dropped when nothing reads the local afterwards, under the next-node rule. Its operand must be one that cannot fault: a named local, an integer literal, `stack_obj`, `my.id`, or an explicit `local[N]`. Cells of objects, temps, params, and globals stay, since an index past the data or the frame faults. This removes the unread `__self_obj` save once its restores are dead, and helper return flags.
 - **Copy forwarding.** `t := e; d := t;`, with `t` a v2 local dead afterwards, becomes `d := e;`. It is one expression node where there were two, with nothing between the read of `e` and the write of `d`.
 - **Duplicate tails.** `if c { A; T } else { B; T }` becomes `if c { A } else { B } T`, where `T` is a maximal run of identical trailing simple statements. Paths that leave early skipped `T` before and still do. Paths that fall off either branch run `T` once, after the same node as before.
 - **Local coalescing (L4/L5).**
@@ -137,6 +145,7 @@ The lowering stays simple. A new pass rewrites each emitted `.air` tree body bef
     - Locals live at tree entry never merge, and neither do `__self_obj` and `__saved_stack_obj`.
   - **How.** The merge is greedy in declaration order, so the result is deterministic. A merged `let y = e;` becomes `x := e;`, which is the same node.
 - **Tidying.** `let x;` declarations nothing names are dropped, and `let x;` directly before `x := e;` is spelled `let x = e;`.
+- **Text handling.** Token scans blank string contents byte for byte (so multi-byte text keeps offsets), and a name after `.` (`bcon.__t_2`) is a field, never a local.
 - **Not done here.**
   - *Jump threading:* the `.air` compiler already resolves a branch to a following `return` into the return code.
   - *Explicit slot naming:* `.air` text cannot name a local by slot. v2 has no way to put a local into dialog text, so a `$Local` token in a string table cannot rely on v2's local numbering, before or after this pass.

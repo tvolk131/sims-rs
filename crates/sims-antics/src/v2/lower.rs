@@ -1883,7 +1883,8 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
         if needs_self_save {
             ctx.line("let __self_obj = stack_obj;".to_owned());
         }
-        ctx.frame_args = func.decl.params.len();
+        // The engine runs a functional with a full four-word argument frame, whatever it declares.
+        ctx.frame_args = func.decl.params.len().max(4);
         for (pidx, fp) in func.decl.params.iter().enumerate() {
             ctx.bind_func_param(&fp.name, pidx, &fp.ty, fp.span)?;
         }
@@ -2253,7 +2254,7 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
     let variants = resolve_variants(
         &variant_decls,
         &manifest,
-        &tree_ids,
+        &env.trees,
         !manifest.tiles.is_empty(),
     )?;
 
@@ -2271,11 +2272,20 @@ fn lower_object(resolved: &ResolvedModule, obj: &ObjectDecl) -> Result<ExpandedV
 fn resolve_variants(
     decls: &[VariantDecl],
     manifest: &ObjectManifest,
-    tree_ids: &BTreeMap<String, u16>,
+    trees: &BTreeMap<String, CallableSig>,
     multi_tile: bool,
 ) -> Result<Vec<VariantSpec>> {
     let mut out: Vec<VariantSpec> = Vec::with_capacity(decls.len());
     for d in decls {
+        if d.name == manifest.name {
+            return Err(Error::at(
+                d.span,
+                format!(
+                    "variant '{}' has the primary object's name; each catalog entry needs its own",
+                    d.name
+                ),
+            ));
+        }
         if multi_tile {
             return Err(Error::at(
                 d.span,
@@ -2299,12 +2309,27 @@ fn resolve_variants(
         };
         let tree = |r: &Option<(Span, String)>, default: Option<&TreeRef>| -> Result<u16> {
             match r {
-                Some((tspan, ident)) => tree_ids.get(ident).copied().ok_or_else(|| {
-                    Error::at(
-                        *tspan,
-                        format!("variant tree '{ident}' is not a standalone 'tree' of this object"),
-                    )
-                }),
+                Some((tspan, ident)) => {
+                    let sig = trees.get(ident).ok_or_else(|| {
+                        Error::at(
+                            *tspan,
+                            format!(
+                                "variant tree '{ident}' is not a standalone 'tree' of this object"
+                            ),
+                        )
+                    })?;
+                    // The VM runs a catalog entry's init/main as the object itself, with no
+                    // arguments, like the primary's.
+                    if sig.sim_context != Some(false) || !sig.params.is_empty() {
+                        return Err(Error::at(
+                            *tspan,
+                            format!(
+                                "variant tree '{ident}' must be an object-self tree with no parameters (it runs as the object's init/main)"
+                            ),
+                        ));
+                    }
+                    Ok(sig.id)
+                }
                 None => match default {
                     Some(TreeRef::Id(id)) => Ok(*id),
                     _ => Err(Error::at(
@@ -3492,6 +3517,11 @@ struct TreeLowerer<'a> {
     checking_discarded: usize,
     /// Arguments in this tree's call frame (`param[0..frame_args]` are addressable).
     frame_args: usize,
+    /// Where this tree first uses `push_interaction(object: <handle>)` (the pinned slot) and a
+    /// `raw` block: the two cannot share a tree, since raw `.air` can name local slots in
+    /// forms (`scope(25, N)`, raw `op` operands, primitive fields) the pin placement can't see.
+    pin_span: Option<Span>,
+    raw_span: Option<Span>,
 }
 
 impl<'a> TreeLowerer<'a> {
@@ -3526,6 +3556,8 @@ impl<'a> TreeLowerer<'a> {
             active_inline_fn: None,
             checking_discarded: 0,
             frame_args: 0,
+            pin_span: None,
+            raw_span: None,
         }
     }
 
@@ -3552,7 +3584,7 @@ impl<'a> TreeLowerer<'a> {
             // The pinned `push_interaction` slot sits one past every explicit `local[N]` the
             // tree spells (raw blocks); `.air` allocates named locals after it.
             let next = explicit_local_slots(&out).max().map_or(0, |m| m + 1);
-            out = out.replace(PIN_SLOT, &next.to_string());
+            out = replace_outside_strings(&out, PIN_SLOT, &next.to_string());
         }
         super::opt::optimize_tree_body(&out)
     }
@@ -5204,6 +5236,10 @@ impl<'a> TreeLowerer<'a> {
             }
             V2Stmt::Expr { span: _, expr } => self.lower_expr_stmt(expr),
             V2Stmt::RawAir { span, code } => {
+                self.raw_span.get_or_insert(*span);
+                if self.pin_span.is_some() {
+                    return Err(Error::at(*span, RAW_WITH_PIN));
+                }
                 if self.in_defer() {
                     return Err(Error::at(
                         *span,
@@ -5863,7 +5899,10 @@ impl<'a> TreeLowerer<'a> {
                 match &result.ty {
                     None => result.ty = Some(ty),
                     Some(first) => {
-                        if !types_compatible_for_assign(first, &ty) {
+                        // The first arm's type is the match's type, so the others must equal it
+                        // (assignment-compatible is not enough: a generic handle is not a typed
+                        // one).
+                        if *first != ty {
                             return Err(Error::at(
                                 expr.span(),
                                 format!(
@@ -6080,14 +6119,24 @@ impl<'a> TreeLowerer<'a> {
             return Ok(());
         }
 
-        if let Some(wc) = wildcard
-            && cases.is_empty()
-        {
-            return self.lower_match_arm(wc, result);
-        }
-
-        if exhaustive_without_wildcard && cases.len() == 1 {
-            return self.lower_match_arm(cases[0].2, result);
+        // One arm and no test: the scrutinee is still read once (a read can fault), unless it
+        // is a local or a literal.
+        let single_arm = match wildcard {
+            Some(wc) if cases.is_empty() => Some(wc),
+            None if exhaustive_without_wildcard && cases.len() == 1 => Some(cases[0].2),
+            _ => None,
+        };
+        if let Some(arm) = single_arm {
+            let plain = val_air.parse::<i16>().is_ok()
+                || (val_air.starts_with("__")
+                    && val_air
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+            if !plain {
+                let l = self.fresh("match");
+                self.line(format!("let {l} = {val_air};"));
+            }
+            return self.lower_match_arm(arm, result);
         }
 
         // Every test runs before any arm body, and an operand read has no side effects, so a
@@ -7233,6 +7282,10 @@ impl<'a> TreeLowerer<'a> {
                         .eval_builtin_int(&a.value, "push_interaction object", 0, 255)
                         .is_err() =>
             {
+                self.pin_span.get_or_insert(a.span);
+                if self.raw_span.is_some() {
+                    return Err(Error::at(a.span, RAW_WITH_PIN));
+                }
                 let (obj, ty) = self.lower_value_expr(&a.value)?;
                 if !ty.is_object_handle() {
                     return Err(Error::at(
@@ -7889,6 +7942,20 @@ impl<'a> TreeLowerer<'a> {
                         *obj_air = snap;
                     }
                     LValue::Direct { .. } => {}
+                }
+                // Likewise a run-time dynamic-sprite index: the reference names the cell chosen
+                // at the call, even if the helper reassigns the caller's index variable.
+                if let LValue::ForeignCell {
+                    setup: Some(setup), ..
+                } = &mut lval
+                    && let Some(idx) = setup
+                        .strip_prefix("temp[0] := ")
+                        .and_then(|r| r.strip_suffix(';'))
+                    && idx.parse::<i16>().is_err()
+                {
+                    let snap = self.fresh(&format!("ref_idx_{}", param.name));
+                    self.line(format!("let {snap} = {idx};"));
+                    *setup = format!("temp[0] := {snap};");
                 }
                 Binding::MutRef { target: lval }
             }
@@ -12212,9 +12279,43 @@ struct MatchResult {
     ty: Option<ValueType>,
 }
 
+const RAW_WITH_PIN: &str = "push_interaction(object: <handle>) and 'raw { ... }' cannot share a tree: raw .air may name local slots the pinned object slot could collide with; pass a constant parameter index or move the raw block to its own tree";
+
 /// Placeholder for the per-tree pinned local slot of `push_interaction(object: <handle>)`,
 /// replaced in `TreeLowerer::finish` (not an identifier character, so no name contains it).
 const PIN_SLOT: &str = "@pin@";
+
+/// `text` with `pat` replaced by `with` outside `"..."` string literals (a dialog string may
+/// spell anything).
+fn replace_outside_strings(text: &str, pat: &str, with: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        if !in_str && rest.starts_with(pat) {
+            out.push_str(with);
+            i += pat.len();
+            continue;
+        }
+        let c = rest.chars().next().expect("non-empty rest");
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+        } else if c == '"' {
+            in_str = true;
+        }
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
 
 /// The `N` of every `local[N]` spelled in `.air` text.
 fn explicit_local_slots(air: &str) -> impl Iterator<Item = u32> + '_ {
