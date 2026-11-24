@@ -354,6 +354,8 @@ struct Model {
     bcons: Vec<BconModel>,
     /// String tables the trees read, by ID.
     strings: Vec<StringsModel>,
+    /// The tables trees show text from that are not written, and why.
+    strings_skipped: Vec<(u16, String)>,
     /// Library constant operand address -> entry name in `extern bcon library_consts`.
     extern_bcons: BTreeMap<u16, String>,
     /// Attribute slots referenced as `my.attr` / `stack.attr`.
@@ -765,6 +767,7 @@ impl Model {
             .collect();
 
         let ctx_original = live_context(iff, &options.library_arities);
+        let strings = strings_models(iff, &trees);
         Ok(Self {
             name: objd_chunk.label.trim().to_owned(),
             guid: objd.guid,
@@ -773,7 +776,8 @@ impl Model {
             variants,
             primary_init,
             primary_main,
-            strings: strings_models(iff, &trees),
+            strings: strings.0,
+            strings_skipped: strings.1,
             bcons,
             extern_bcons,
             states,
@@ -1167,11 +1171,11 @@ struct RecompiledFile {
     attributes: Option<u16>,
 }
 
-/// A string table's entries as the VM reads them, or its bytes when it does not parse.
-/// The port reads US English (language 1, `sims-vm` `dialog.rs` `dialog_strings`), so a
-/// table with language 1 entries is their texts in order; a table without is every
-/// entry's language and text. Comments and the table's encoding are not observable.
-type StringTexts = std::result::Result<Vec<(u8, Vec<u8>)>, Vec<u8>>;
+/// A string table as the VM reads it: its US English texts in order when the VM's
+/// reading is plain ([`plain_string_table`]), else every chunk of its tag and ID as
+/// stored (flags and bytes), so that only an identical table compares equal. Comments
+/// and the table's encoding are not observable.
+type StringTexts = std::result::Result<Vec<Vec<u8>>, Vec<(u16, Vec<u8>)>>;
 
 /// The string table instruction `i` shows text from: Show String (21) and Set Action
 /// String (50) name one; a private Dialog (36) reads `STR#` 301 for its nonzero string
@@ -1184,36 +1188,51 @@ fn string_table_read(i: &sims_formats::behavior::Instruction) -> Option<u16> {
     }
 }
 
-/// The `STR#` tables the trees show text from that a v2 `strings` member can write: the
-/// table's US English entries, each text one a v2 string literal spells.
-fn strings_models(iff: &Iff, trees: &[TreeModel]) -> Vec<StringsModel> {
+/// The `STR#` tables the trees show text from that a v2 `strings` member can write (the
+/// table's US English entries, each text one a v2 string literal spells), and those it
+/// cannot, with why.
+fn strings_models(iff: &Iff, trees: &[TreeModel]) -> (Vec<StringsModel>, Vec<(u16, String)>) {
     let ids: BTreeSet<u16> = trees
         .iter()
         .flat_map(|t| t.original.instructions.iter().filter_map(string_table_read))
         .collect();
     let mut used = BTreeSet::new();
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     for id in ids {
-        let Some(chunk) = iff.chunks.iter().rfind(|c| &c.tag == b"STR#" && c.id == id) else {
+        if !iff.chunks.iter().any(|c| &c.tag == b"STR#" && c.id == id) {
             continue;
+        }
+        let texts = match plain_string_table(iff, b"STR#", id) {
+            Ok((_, texts)) => texts,
+            Err(why) => {
+                skipped.push((id, why.to_owned()));
+                continue;
+            }
         };
-        let Ok(table) = StringTable::parse_chunk(iff.data(chunk), chunk.flags) else {
-            continue;
-        };
-        let texts: Vec<String> = table
-            .entries
+        let texts: Vec<String> = texts
             .iter()
-            .filter(|e| e.language == 1)
-            .map(|e| e.text.clone())
+            .map(|t| sims_formats::strings::decode_verbatim(t, 1))
             .collect();
         // A v2 literal spells no other control character, and the table encoder takes no NUL.
         let spellable = |t: &String| {
             !t.chars()
                 .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
         };
-        if texts.is_empty() || !texts.iter().all(spellable) {
+        if texts.is_empty() {
+            skipped.push((id, "it has no US English entries".to_owned()));
             continue;
         }
+        if !texts.iter().all(spellable) {
+            skipped.push((
+                id,
+                "a text holds a control character a v2 string does not spell".to_owned(),
+            ));
+            continue;
+        }
+        let Some(chunk) = iff.get(b"STR#", id) else {
+            continue;
+        };
         let entries = texts
             .into_iter()
             .enumerate()
@@ -1225,7 +1244,64 @@ fn strings_models(iff: &Iff, trees: &[TreeModel]) -> Vec<StringsModel> {
             entries,
         });
     }
-    out
+    (out, skipped)
+}
+
+/// The one chunk the VM reads table `tag` `id` from and its US English texts in the
+/// order it reads them, when that reading is plain; else why not. Plain means what
+/// `sims-vm` (`program.rs`: `unported_strings`, `english_fallback`, `loaded_order`) and
+/// the original's loader agree on, read the simple way:
+/// - one chunk of the tag and ID, not deleted, the one the resource map gives;
+/// - flag 0x10 (the loader byte-swaps the header of a resource without it);
+/// - format -1, -2 or -3 with a count from 0 to 0x7fff;
+/// - US English entries in one run, unless there are none at all (the loader puts a
+///   later run of a language in front of the earlier ones, and reads a table with
+///   entries and none in English again for English).
+fn plain_string_table<'a>(
+    iff: &'a Iff,
+    tag: &[u8; 4],
+    id: u16,
+) -> std::result::Result<(&'a sims_formats::iff::Chunk, Vec<Vec<u8>>), &'static str> {
+    let mut chunks = iff.chunks.iter().filter(|c| &c.tag == tag && c.id == id);
+    let (Some(chunk), None) = (chunks.next(), chunks.next()) else {
+        return Err("the file has more than one chunk of its ID");
+    };
+    if chunk.flags & sims_formats::iff::DELETED != 0 {
+        return Err("its chunk is marked deleted");
+    }
+    if iff.map_error().is_some() || !iff.get(tag, id).is_some_and(|c| c.offset == chunk.offset) {
+        return Err("the resource map does not name its chunk");
+    }
+    if iff.resource_flags(chunk) & 0x10 == 0 {
+        return Err("its resource lacks flag 0x10, so the loader byte-swaps its header");
+    }
+    let data = iff.data(chunk);
+    let word = |at: usize| {
+        data.get(at..at + 2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+    };
+    if !matches!(word(0), Some(-3..=-1)) || !word(2).is_some_and(|n| n >= 0) {
+        return Err("its format or count is one the loader reads another way");
+    }
+    let table = StringTable::parse(data).map_err(|_| "it does not parse")?;
+    let english: Vec<usize> = table
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.language == 1)
+        .map(|(n, _)| n)
+        .collect();
+    if english.is_empty() && !table.entries.is_empty() {
+        return Err("it has entries and none in US English, which the loader reads again");
+    }
+    if english.windows(2).any(|w| w[1] != w[0] + 1) {
+        return Err("its US English entries are not in one run");
+    }
+    let texts = english
+        .into_iter()
+        .map(|n| table.entries[n].raw_text.clone())
+        .collect();
+    Ok((chunk, texts))
 }
 
 /// A `strings` entry name from its text: its first words in snake case, else `s<N>`
@@ -1305,23 +1381,26 @@ fn string_entry_name(text: &str, n: usize, used: &mut BTreeSet<String>) -> Strin
 /// `CST` the loader falls back on when a file has no `STR#` of the id.
 const STRING_TAGS: [&[u8; 4]; 3] = [b"STR#", b"CTSS", b"\0CST"];
 
-/// Each text table's texts, by tag and id, the last chunk of an id winning.
+/// Each text table, by tag and ID ([`StringTexts`]).
 fn string_texts(iff: &Iff) -> BTreeMap<([u8; 4], u16), StringTexts> {
-    iff.chunks
+    let keys: BTreeSet<([u8; 4], u16)> = iff
+        .chunks
         .iter()
         .filter(|c| STRING_TAGS.contains(&&c.tag))
-        .map(|c| {
-            let texts = StringTable::parse_chunk(iff.data(c), c.flags)
-                .map(|t| {
-                    let english = t.entries.iter().any(|e| e.language == 1);
-                    t.entries
-                        .into_iter()
-                        .filter(|e| !english || e.language == 1)
-                        .map(|e| (e.language, e.raw_text))
+        .map(|c| (c.tag, c.id))
+        .collect();
+    keys.into_iter()
+        .map(|(tag, id)| {
+            let texts = plain_string_table(iff, &tag, id)
+                .map(|(_, texts)| texts)
+                .map_err(|_| {
+                    iff.chunks
+                        .iter()
+                        .filter(|c| c.tag == tag && c.id == id)
+                        .map(|c| (c.flags, iff.data(c).to_vec()))
                         .collect()
-                })
-                .map_err(|_| iff.data(c).to_vec());
-            ((c.tag, c.id), texts)
+                });
+            ((tag, id), texts)
         })
         .collect()
 }
@@ -2392,6 +2471,12 @@ impl Model {
                 out.line("");
             }
         } else {
+            for (id, why) in &self.strings_skipped {
+                out.line(format!("// strings {id} is not written: {why}."));
+            }
+            if !self.strings_skipped.is_empty() {
+                out.line("");
+            }
             for st in &self.strings {
                 out.line(format!(
                     "strings {} \"{}\" {{",

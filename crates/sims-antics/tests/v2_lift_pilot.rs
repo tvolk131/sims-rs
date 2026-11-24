@@ -1,9 +1,10 @@
 //! Synthetic round trips for additional v2 lift spellings and resource labels.
 
-use sims_antics::compile_v2_source;
+use sims_antics::v2::lint_v2_source;
 use sims_antics::v2::{
     DecompileV2Options, PackResolverConfig, TreeCheck, decompile_iff_to_v2_report,
 };
+use sims_antics::{IffEquivOptions, IffVerdict, check_iff_equivalent, compile_v2_source};
 use sims_formats::iff::{ChunkData, Iff};
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -370,6 +371,84 @@ fn trees_showing_text_prove_through_lifted_strings() {
             matches!(check(id), TreeCheck::Identical | TreeCheck::Equivalent),
             "tree {id}: {:?}",
             check(id)
+        );
+    }
+    assert!(
+        report.source.contains(
+            "// strings 431 is not written: a text holds a control character a v2 string does not spell."
+        ),
+        "{}",
+        report.source
+    );
+}
+
+/// The lift's check of tree `id` in `iff`, and the lifted source.
+fn check_of(iff: &Iff, id: u16) -> (TreeCheck, String) {
+    let report = decompile_iff_to_v2_report(iff, &DecompileV2Options::default()).expect("lift");
+    let check = report
+        .trees
+        .iter()
+        .find(|t| t.id == id)
+        .unwrap_or_else(|| panic!("tree {id} in {:?}", report.trees))
+        .check
+        .clone();
+    (check, report.source)
+}
+
+#[test]
+fn tables_the_vm_reads_another_way_are_not_written() {
+    let source = r#"object "Fable Notice" {
+    guid: 0x7E00_00A6;
+    strings 301 "Dialog prim string set" { ask = "Alpha" }
+    @id(4300) tree confirm {
+        dialog(kind: 0, message: 1, title: 1)?;
+    }
+}"#;
+    // A version -3 entry: language, text, comment.
+    let entry = |language: u8, text: &str| {
+        let mut out = vec![language];
+        out.extend_from_slice(text.as_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out
+    };
+    let table = |entries: &[(u8, &str)]| {
+        let mut out = vec![0xFD, 0xFF];
+        out.extend_from_slice(&u16::try_from(entries.len()).unwrap().to_le_bytes());
+        for (language, text) in entries {
+            out.extend(entry(*language, text));
+        }
+        out
+    };
+    // US English entries in two runs: the loader puts the later run first, so the
+    // dialog's first string is not the first US English entry.
+    let interleaved = with_data(
+        &compile(source),
+        (*b"STR#", 301),
+        table(&[(1, "Alpha"), (2, "Alphe"), (1, "Beta")]),
+    );
+    // A second, deleted chunk of the ID.
+    let deleted = with_chunks(
+        &compile(source),
+        vec![ChunkData {
+            tag: *b"STR#",
+            id: 301,
+            flags: 0x10 | sims_formats::iff::DELETED,
+            label: "Dialog prim string set".to_owned(),
+            data: table(&[(1, "Gamma")]),
+        }],
+    );
+    for (iff, why) in [
+        (interleaved, "its US English entries are not in one run"),
+        (deleted, "the file has more than one chunk of its ID"),
+    ] {
+        let (check, source) = check_of(&iff, 4300);
+        match check {
+            TreeCheck::Inconclusive(w) => assert!(w.contains("STR# 301"), "{w}"),
+            other => panic!("tree 4300: {other:?}\n{source}"),
+        }
+        assert!(
+            source.contains(&format!("// strings 301 is not written: {why}.")),
+            "{source}"
         );
     }
 }
@@ -761,4 +840,33 @@ fn comparisons_returned_whole_lift_as_return() {
     }
     // A primitive's test in the other polarity keeps its `if`.
     assert!(!lifted.contains("return !(can_afford"), "{lifted}");
+}
+
+#[test]
+fn redundant_bool_return_suggestions_prove_equivalent() {
+    // The lint's suggestion, `return <condition>;`, against the `if` it replaces: a
+    // primitive call with a `bool` literal argument (which must not count as foldable).
+    let object = |body: &str| {
+        format!(
+            "object \"Fable Pantry\" {{\n    guid: 0x7E00_00B2;\n    state level @ 2: i16;\n    @id(4300) tree ran \"Ran\" {{\n        self.level = 1;\n{body}\n    }}\n}}"
+        )
+    };
+    let flagged = object(
+        "        if stack_obj.run_functional(4, change_icon: true) { return true; }\n        return false;",
+    );
+    let diags = lint_v2_source(&flagged, "pantry.antics").expect("lint");
+    let d = diags
+        .iter()
+        .find(|d| d.rule == "redundant_bool_return")
+        .unwrap_or_else(|| panic!("{diags:#?}"));
+    let suggestion = d.suggestion.clone().expect("suggestion");
+    let rewritten = object(&format!("        {suggestion}"));
+    let a = compile_v2_source("a.antics", &flagged, &PackResolverConfig::default())
+        .expect("compile")
+        .iff_bytes;
+    let b = compile_v2_source("b.antics", &rewritten, &PackResolverConfig::default())
+        .expect("compile")
+        .iff_bytes;
+    let report = check_iff_equivalent(&a, &b, &IffEquivOptions::default()).expect("check");
+    assert_eq!(report.verdict(), IffVerdict::Equivalent, "{report:#?}");
 }

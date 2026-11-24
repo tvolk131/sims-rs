@@ -29,18 +29,20 @@ The **last result** is the true/false outcome of the last node to run. It is obs
 
 | Rule | Change |
 |---|---|
-| `negated_comparison` | Reported only when both successors of the `!(a op b)` test are **quiet**: a store to `temp[n]`, or to a field of `self` outside a Sim's body, with a value made of literals, locals, enum paths and such places (no division, no indexed read); or a test of such operands that cannot fold. A call, `sleep`, a primitive, `return`, a store to a `let` (which may fold away) and anything touching `self` in a Sim's body (where `self` follows `stack_obj`) are not quiet. |
-| `redundant_bool_return` | Reported for `if c { return true; } return false;` (or with `else`), comparisons and `&&` included, with the suggestion `return c;`. The other polarity is never reported: `return !c;` ends on the opposite last result. |
+| `negated_comparison` | Reported only when both successors of the `!(a op b)` test are **quiet**: a plain store (`=`, `+=`, `-=`, `*=`, `&=`, `|=`, `^=`) to `temp[0..=7]`, or to a `state` field of `self` outside a Sim's body, of a value made of literals, locals, enum paths and such places, combined with `+ - * & | ^` only, and not the target itself. Anything else is not quiet: a call, `sleep`, a primitive, `return`, a test (which may itself end the tree), a store to a `let` (which may fold away), division, an indexed read, and anything touching `self` in a Sim's body (where `self` follows `stack_obj`). |
+| `redundant_bool_return` | Reported for `if c { return true; } return false;` (or with `else`), comparisons and `&&` included, with the suggestion `return c;`. Not reported when the condition may fold to a constant (in its `!` / `&&` / `||` structure, a `bool` literal or a comparison of two operands neither of which reads a place; a literal argument of a call does not count), or in a body with `defer`. The other polarity is never reported: `return !c;` ends on the opposite last result. |
 | `uninitialized_local_read` | `relationship(value: x)` writes `x`, unless its `flags:` are a literal with flag 4 (which writes the relationship from the local). Flags that are not a literal count as a write. |
 | `unused_decl` (const) | A `const` named only inside `raw {}` is reported, with a note: `raw` does not resolve `const` names, and the build rejects the name there. A value written in its place still counts as a use. |
-| `unused_decl` (let) | A tree that shows strings this file does not hold is treated as possibly reading every local through `$Local:N`. This covers a dialog's `STR#` 301 number past the file's own entries (the object's spliced table), `show_string` and `action_string`. |
-| directives | `// antics-lint: allow(..)` and `# antics-lint: allow(..)` work inside `raw {}`, per line: trailing a line covers that line, and on its own line covers the next line of code. Inside `raw`, `//!` is never file-level, and a `#` inside an `.air` string is not a comment. |
+| `unused_decl` (let) | A tree that shows strings this file does not hold is treated as possibly reading every local through `$Local:N`. This covers a dialog's `STR#` 301 number past the file's own entries (the object's spliced table), and an `action_label` / `action_string` whose `table:` and `index:` (1-based) name no string in this file. `show_string` formats no tokens and reads no local. |
+| directives | `// antics-lint: allow(..)` and `# antics-lint: allow(..)` work inside `raw {}`, per line: trailing a line covers that line, and on its own line covers the next line of code. Inside `raw`, `//!` is never file-level, and a `#` inside an `.air` string is not a comment. A `raw` diagnostic lands on its statement's own line: the linter finds each `raw` keyword as the lexer counts columns (bytes, but characters inside a v2 string) and blanks `.air` comments in place, so a commented-out copy of a call cannot take its position. |
+| `unused_decl` (const in raw) | The "only named inside `raw`" advice needs the name in `.air` code: a name in an `.air` comment or string is an ordinary unused const. |
 
 The verifier checked the `redundant_bool_return` change on synthetic trees:
 
 - **Equivalent:**
   - `if c { return true; } return false;` and `return c;` (for `c` = `temp[0] > 3`, `!(temp[0] > 3)`, `a > 3 && b == 2`, `self.attr[0] == 2`, `can_afford(..)`);
-  - `if c { return false; } return true;` and `return !(c);`.
+  - `if c { return false; } return true;` and `return !(c);`;
+  - `if stack_obj.run_functional(4, change_icon: true) { return true; } return false;` and the lint's suggestion (a committed test).
 - **Inconclusive:** `if c { return false; } return true;` and the flipped comparison (`return temp[0] <= 3;`), because the last result at exit differs.
 
 ## Decision 2: `lift --v2` writes the strings trees show
@@ -49,7 +51,7 @@ The verifier checked the `redundant_bool_return` change on synthetic trees:
   - Show String (21) and Set Action String (50) tables, by operand;
   - `STR#` 301 for a private Dialog (36) that names a string.
 
-  It takes the last `STR#` chunk of each id and keeps its language-1 entries, which are what the VM reads.
+  It writes a table only when the VM reads it as plain US English entries: one `STR#` chunk of that id, not deleted, named by the resource map, with resource flag `0x10`, a format from -3 to -1, a parse, and its language-1 entries in one run (or no entries at all). Any other table is left out with a `// strings <id> is not written: <why>.` comment, and its trees stay inconclusive.
 - **Entry names.** Each name is the snake case of the text's first four words. It falls back to `s<n>` and gets a `_<n>` suffix when two names would collide.
 - **Tables left out.** A table is not written when a text holds a control character other than `\n`, `\r` or `\t`, which v2 string escapes cannot spell. Its trees stay inconclusive, and a comment in the output says why.
 - **0-node trees.** A `BHAV` with no nodes lifts as `@frame(.., empty) tree x "x" {}`. `fmt` keeps both `@frame(empty)` and `@frame(args: 4, empty)` idempotent and compile-identical.
@@ -88,14 +90,15 @@ All three lower to the same node with the same exits. A primitive test in the ot
   | Metric | `a9eacd99` | This change |
   |---|---|---|
   | Different | 0 | 0 |
-  | Proven | 2376 | 2719 |
-  | Inconclusive | 345 | 2 |
+  | Proven | 2376 | 2699 |
+  | Inconclusive | 345 | 22 |
   | Omitted | 1 | 1 |
-  | Idiomatic trees | 843 | 871 |
-  | Raw statements | 1193 | 1120 |
+  | Idiomatic trees | 843 | 870 |
+  | Raw statements | 1193 | 1119 |
 
-  The two trees still inconclusive are not about text. One is an animation event tree the verifier cannot decide (its paths may differ, but no replay confirmed it); the other is the tree that calls it.
-- **Open pack, 116 trees:** 0 different. Proven goes from 114 to 116: the two dialog trees prove again. 112 are idiomatic.
+  - Twenty of the trees still inconclusive show text from three tables whose resource lacks flag `0x10`. The VM's loader byte-swaps such a table's header, a path the port does not have, so the lift leaves them out (Decision 2) rather than write a table the compiler would mark `0x10`.
+  - The other two are not about text. One is an animation event tree the verifier cannot decide (its paths may differ, but no replay confirmed it); the other is the tree that calls it.
+- **Open pack, 116 trees:** 0 different. Proven goes from 114 to 116 (112 identical, 4 equivalent): the two dialog trees prove again. 112 are idiomatic.
 - **Warnings per corpus, before → after:**
 
   | Corpus | Before | After |
