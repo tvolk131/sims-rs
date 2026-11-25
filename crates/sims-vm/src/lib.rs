@@ -101,8 +101,9 @@ pub use buy::{
     available_funds, default_buy_direction, panel_mode, snap_to_tile_centre,
 };
 pub use coop::{
-    CoopBatchReport, CoopCommandStatus, CoopError, CoopVmContext, build_prices_from_install,
-    cancel_uid_to_wire, menu_entry_to_pick_command, player_mode_to_panel_mode,
+    CoopBatchReport, CoopCommandStatus, CoopError, CoopFork, CoopVmContext,
+    build_prices_from_install, cancel_uid_to_wire, menu_entry_to_pick_command,
+    player_mode_to_panel_mode,
 };
 pub use error::Error;
 pub use factory::TURN_BUDGET;

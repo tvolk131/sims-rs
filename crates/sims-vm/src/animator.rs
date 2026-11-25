@@ -2162,7 +2162,7 @@ impl Interpreter<'_> {
     /// next frame is always blended in, and the clip as looping. Neither
     /// is read from the original; the strides this gives equal the ones
     /// it stored for every person in the capture (see
-    /// `crates/sims-vm/tests/resize.rs`).
+    /// `crates/sims-vm/tests/integration/resize.rs`).
     pub fn strides(&self, world: &World, id: u16) -> Result<[F32; 2], Trap> {
         let name = self
             .posture_clip(world, id, WALK)?
