@@ -3555,36 +3555,157 @@ through their public interfaces only; the simulation never depends on it.
     - The lost captures `goth-ticks-20261114-long` and `-to1000` are not
       re-recorded: `goth-day-20261115` and `goth-rng-4155-20261118` cover
       them.
+- **Done (Batch 16 — travel through routine 17, saves and the Buy catalog,
+  the `.antics` v2 toolchain, one test binary per crate, #402–#452):**
+  - **Travel (`sims-vm`, `sims-game`):**
+    - Arrivals:
+      - Downtown arrivals bring back the companion (Generic Sims Call
+        19, #411).
+      - The traveler leads the destination's family and arrives off the
+        lot, so the marker no longer snaps it back (#414).
+      - A date's companion comes back home via routine 20 (#443).
+    - Departures:
+      - The phone's Go Downtown, and Generic Sims Calls 17, 20, 22, 23
+        and 25 (Downtown townies), with departure tokens (#426).
+      - Departure tokens for every destination, and Generic Sims Call 24
+        (the outfit editor, #430).
+    - The game shell:
+      - It carries out the trips scripts ask for between ticks (#431).
+      - Trip requests can be cancelled, the shell passes the picked
+        transport and the answers, and a trip home goes through routine
+        17 (#436).
+      - Trip requests and `Neighborhood.iff` saves happen in the shell
+        (#442).
+      - Every shell trip uses the warm VM install cache, and Go
+        Somewhere Else (`0x1016`) on a destination travels on (#452).
+    - The VM's other fixes in #443:
+      - destination-to-destination travel;
+      - route-cache invalidation at go-live and on door moves;
+      - the day turn's architecture value (+0xa4).
+  - **The VM's legacy backlog (#407):**
+    - community reseed, indicator star pools, named icons, sort, career
+      titles and `cAverageHistory`;
+    - co-op `PROTOCOL_VERSION` 2, so a protocol-1 `Hello` is turned away.
+  - **Neighborhood saves (`sims-sim`, `sims-content`, `sims-vm`):**
+    - Neighborhood open uses up the imported files, with preview
+      inventories, pool rules and lazy skeletons (#423).
+    - The `Neighborhood.iff` writer (0x4252cc) is byte for byte the same
+      as recorded saves (#429).
+    - Save inputs persist in REDB, the store saves through `NTemp.iff`,
+      and FAMI #0 is read by chunk ID (#435).
+    - A `.FAM` file's FAMh moves in with its family: the API came in
+      #441, and #451 commits it in the same transaction as the `.FAM`
+      Import and the Patch open.
+    - The factory has a creation-depth guard, `MAX_CREATION_DEPTH = 16`
+      (#451).
+  - **Buy catalog (`sims-content`, `sims-ui`):**
+    - Eligibility, CATS/CTSS text and category labels match the 1.91
+      builder (#441).
+    - `sims-ui` takes its listing and text from `Catalog::buy_entries`
+      (#452).
+    - `BuyCatalog::load` reads each object file once again
+      (`Catalog::buy_entries_visiting`), taking back the load time #452
+      added.
+  - **The interface (Track 1):**
+    - Wave 3 of the UI honesty audit (#405): native catalog order,
+      rendered thumbnails, choice dialogs, the album, roof arrows and the
+      phone book.
+    - Wave 4: the live subpanels at native parity with the Layout rating
+      (#428), the needs-bar trend arrows and the native lot card (#437).
+    - What a Sim holds is drawn at its hand, not its feet (#413), and
+      checked at the hand in play (#442).
+  - **The `.antics` v2 toolchain:**
+    - The language (Track 8):
+      - Maxis interop (#415);
+      - PRs D–H (#418, #422, #427, #433, #440);
+      - `lower/` split into modules over a typed MIR layer, byte for byte
+        the same (#445);
+      - the R3 lowering and MIR fixes (#450).
+    - Tools (Track 9):
+      - the canonical `fmt` and the validated `lift --v2` (#421);
+      - `sims-antics lint` with 13 rules (#424);
+      - three rounds of fixes keeping `fmt`, `lint` and `lift --v2` in
+        step with the language (#432, #439, #444).
+    - The equivalence verifier (Track 7):
+      - live-output BHAV equivalence and whole-file `verify-equiv`
+        (#402);
+      - pad clauses (#417), library argless trees (#419), `--behavioral`
+        (#420), and domains with a 2–7× speed-up (#425);
+      - pilot upgrades (#434), then verifier rounds 2 and 3 (#438, #446);
+      - #446 adds the `sims-antics test` runner, which runs unit tests
+        on the live `sims-vm`.
+    - Lift and the decoder:
+      - `lift` resolves callee arities from the install catalog (#406);
+      - private callees are named only for private callers (#412);
+      - primitive argument parsing is deduplicated (#416). The
+        one-table layout was rejected as not cleaner.
+  - **Tests and determinism:**
+    - A state-layer fuzzer in `sims-sim` (#441) and a tick-level fuzzer
+      in `sims-vm` (#449). Both check warm forks and cold restores.
+    - One integration test binary per crate:
+      - `sims-sim`, `sims-audio`, `sims-content`, `sims-formats`,
+        `sims-net` (#447);
+      - `sims-game`, `sims-ui`, `sims-render`, `sims-people` (#448),
+        where `sims-game` keeps `ratchet` and `ui_oracle_tour` as their
+        own binaries; #448 also splits `game.rs` and `neighborhood.rs`
+        into module folders;
+      - `sims-vm` (#449).
+      - Test filters are now `--test integration <module>::<test>`.
+  - **Legacy:**
+    - `legacy/crates/sims-formats` was removed (#441), and so were
+      `legacy/crates/sims-runtime` (#449) and `legacy/fixtures/suites`
+      (#451).
+    - What they held is under the `legacy-final` tag.
 - **Next (in flight, in order of player impact):**
-  - **Travel:**
-    - Downtown arrival (Generic Sims Call 19, companion token, abort
-      revokes it).
-    - The traveler snapping back after a marker places it (Find Location
-      mode 0 skips the person's `0x74` refresh, `0x45e519`).
-    - A traveler-led destination family: Generic Sims Call 18 takes member
-      0, so a solo trip by a non-first member is never placed.
-    - The phone's Go Downtown dropping out of the queue (routines 17, 20,
-      22 and 23).
-    - Downtown townies (routine 25).
-    - Routine 24 (dresser).
-  - **Carried objects drawn at the Sim's hand:** the person draw
-    (`0x459dc0`) draws held objects at body-string attach points
-    (`R_HAND`/`Palm`, `HEAD`/`Top`, `PELVIS`). Today they draw on the
-    floor.
-  - **Open PRs:**
-    - UI Honesty Wave 3 (#405).
-    - The `sims-vm` legacy backlog with co-op `PROTOCOL_VERSION` 2 (#407).
-    - `lift` install-catalog arities (#406).
-    - The live-output equivalence verifier (#402).
-  - **Co-op:** a build identity in `Hello`, so that mixed builds are
-    rejected even when the save format is unchanged.
+  - **Travel follow-ups:**
+    - After a trip on to lot 22, the cab sign's Go Home makes no trip
+      request (#452).
+    - A hop that leaves travelers behind (Go Somewhere Else for one
+      member of a family, mode 0) needs session support for the members
+      who stay (#443).
+    - Arrivals not made from the token alone:
+      - routine 17's kind-2, 7 and 8 tokens (saved motives, the arrival
+        clock) are neither written nor read;
+      - a date's companion is still made by the departure;
+      - a family arrival makes only the members who traveled (#414).
+    - `HouseholdGroup` and Magic Town 90–92 trips can still snap back
+      (#414).
+    - The outfit-editor routines 29, 30 and 31, and saving edited outfit
+      rows to the neighborhood (#430).
+    - The lot shift (0x444991) should forget routes, and 0x467436 at
+      go-live is not modeled (#443).
+  - **Drawing what a Sim holds:**
+    - the held draw order (objects before their Sim, `0x459e45` →
+      `0x45a131`);
+    - slot-1 animated objects;
+    - pets (#442).
+  - **Saves:** `export_family_fam` still writes no FAMh (#451).
+  - **Buy catalog:**
+    - `BuyLabels` (the category button text) is not used by `sims-ui`
+      yet.
+    - Untraced: whether the CATS/CTSS lookup also searches the
+      semi-global (#441).
+  - **Co-op:**
+    - a build identity in `Hello`, so that mixed builds are rejected even
+      when the protocol is unchanged;
+    - the strict script errors the tick fuzzer finds (seeds 0x64, 0x6c
+      and 0x6b, #449).
+  - **The `.antics` v2 redesign:** the Rust-like v2 redesign (Track 8)
+    is next, and the PR-level follow-ups are in the ADRs.
+  - **Tests:** `sims-antics` still builds one binary per test file (29).
   - **Legacy mining backlog:** see
     `docs/legacy-mining-audit.md#porting-backlog`.
-    - Parity-relevant items: walk animator states 5/7/8/12, footstep and
-      clip sounds, route-cache invalidation, the original wall draw order,
-      the camera glide, the censor mosaic, catalog eligibility and naming,
-      and non-modal/anchored dialogs.
-    - Tooling items: the determinism fuzzer and the oracle comparator.
+    - Parity-relevant items still open:
+      - walk animator states 5/7/8/12;
+      - footstep and clip sounds;
+      - the original wall draw order;
+      - the camera glide;
+      - the censor mosaic;
+      - non-modal and anchored dialogs.
+    - Ported since Batch 15: route-cache invalidation (#443), catalog
+      eligibility and naming (#441, #452), and the determinism fuzzer
+      (#441, #449).
+    - Tooling item still open: the oracle comparator.
 - **Needs from other crates:**
   - `sims-vm`: Done — all three failing Goth pie listings (#296) are
     now closed, and every person's pie menu on every object of the Goth
