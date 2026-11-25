@@ -3562,8 +3562,9 @@ fn call_params(arity: usize) -> impl Iterator<Item = String> {
 }
 
 /// The highest slot that needs a named declaration for a primitive's local arguments;
-/// `wave2` adds the operands only the wave 2 spellings name (see [`Translator::wave2`]).
-fn builtin_local(s: &Stmt, wave2: bool) -> Option<u16> {
+/// `wave2` adds the operands only the wave 2 spellings name (see [`Translator::wave2`]),
+/// and `wave3` (which implies `wave2`) those only the wave 3 ones name.
+fn builtin_local(s: &Stmt, wave2: bool, wave3: bool) -> Option<u16> {
     let prim = match s {
         Stmt::Primitive {
             prim,
@@ -3640,6 +3641,13 @@ fn builtin_local(s: &Stmt, wave2: bool) -> Option<u16> {
             icon_local: LocalRef::Index(i),
             ..
         } if flags & 0x03 == 0x01 && wave2 => Some(u16::from(*i)),
+        // Skin, age and sex are read from locals.
+        PrimitiveCall::MakeNewCharacter {
+            skin: LocalRef::Index(skin),
+            age: LocalRef::Index(age),
+            sex: LocalRef::Index(sex),
+            species,
+        } if *species <= 2 && wave3 => [skin, age, sex].into_iter().copied().max().map(u16::from),
         _ => None,
     }
 }
@@ -4486,11 +4494,18 @@ impl Model {
                     if as_lifecycle.is_none() && !plan.plain.contains(&t.id) {
                         let mut builtin_locals = 0;
                         let wave2 = !plan.pre_wave2.contains(&t.id);
+                        let wave3 = wave2 && !plan.pre_wave3.contains(&t.id);
                         walk_stmts(body, &mut |s| {
-                            let local = builtin_local(s, wave2);
-                            // A local only a wave 2 spelling names is that spelling's, even
-                            // when the spelling is not written: `drop_wave2` drops the pin.
-                            if wave2 && local != builtin_local(s, false) {
+                            let local = builtin_local(s, wave2, wave3);
+                            // A local only a wave 2 (wave 3) spelling names is that
+                            // spelling's, even when the spelling is not written:
+                            // `drop_wave2` (`drop_wave3`) drops the pin.
+                            if wave3 && local != builtin_local(s, wave2, false) {
+                                wave3_trees.insert(t.id);
+                            }
+                            if wave2
+                                && builtin_local(s, wave2, false) != builtin_local(s, false, false)
+                            {
                                 wave2_trees.insert(t.id);
                             }
                             if let Some(index) = local
@@ -7055,9 +7070,10 @@ impl Translator<'_> {
         }
     }
 
-    /// `param[p]`, which a slot argument reads by index (not the handler's `event`).
+    /// `param[p]`, which a slot argument reads by index. Inside an animation handler too:
+    /// the argument names the parameter by index, not the handler's `event` binding.
     fn param_slot(&self, p: i16) -> Option<String> {
-        (p >= 0 && !(self.in_handler && p == 0)).then(|| format!("param[{p}]"))
+        (p >= 0).then(|| format!("param[{p}]"))
     }
 
     fn local_name(&self, slot: u16) -> Option<String> {
@@ -7115,10 +7131,10 @@ impl Translator<'_> {
             // person's words (32).
             24 | 32
                 if (0..=if o.scope == 24 { 9 } else { 255 }).contains(&o.index)
-                    && self.stack_handle().is_some()
+                    && self.neighbor_handle().is_some()
                     && self.wave3() =>
             {
-                let handle = self.stack_handle()?;
+                let handle = self.neighbor_handle()?;
                 // The `i16` cells PR I-4 names (the `ObjectId`, `bool` and enum ones would
                 // type their uses differently).
                 let name = match (o.scope, o.index) {
@@ -7158,6 +7174,15 @@ impl Translator<'_> {
         } else {
             "stack_obj"
         })
+    }
+
+    /// The handle the stack object's neighborhood record is read through: the cursor
+    /// binding inside a `for` loop whose cursor is `stack_obj`, else [`Self::stack_handle`].
+    fn neighbor_handle(&self) -> Option<&str> {
+        match &self.cursor {
+            Some(c) => Some(c),
+            None => self.stack_handle(),
+        }
     }
 
     /// The handle the stack object's cells are read through in place, outside cursor and
@@ -7221,6 +7246,8 @@ impl Translator<'_> {
                 4 => return Some(format!("{c}.data[{i}]")),
                 16 => return Some(format!("{c}.slot[{i}]")),
                 19 if i == 65 => return Some(format!("{c}.kind")),
+                19 if i == FAME && self.wave3() => return Some(format!("{c}.fame")),
+                31 if i < 8 && self.wave3() => return Some(format!("{c}.person[temp[{i}]]")),
                 19 => {
                     return self
                         .personality(c, i)
@@ -7231,6 +7258,15 @@ impl Translator<'_> {
             }
         }
         if self.inherit {
+            // `me` is whatever runs the tree; its person words and the stack object's.
+            match o.scope {
+                18 if i == FAME && self.wave3() => return Some("me.fame".to_owned()),
+                19 if i == FAME && self.person_binding().is_none() && self.wave3() => {
+                    return Some("stack_obj.fame".to_owned());
+                }
+                30 if i < 8 && self.wave3() => return Some(format!("me.person[temp[{i}]]")),
+                _ => {}
+            }
             let cell = match o.scope {
                 0 => Some(("me", "attr")),
                 3 => Some(("me", "data")),
@@ -7892,6 +7928,28 @@ object "Fable Lamp" {
             ],
         );
         assert!(!lifted.contains("raw {"), "{lifted}");
+    }
+
+    /// The lint pass on its own: both `?` shapes are rewritten, and the file builds to the
+    /// same bytes with the rewrite.
+    #[test]
+    fn lint_spellings_rewrite_both_question_mark_shapes_to_the_same_bytes() {
+        let text = "use std::globals::*;\n\nobject \"Fable Wave3 Query\" {\n    guid: 0x7E00_016B;\n    #[bhav(id = 4300)]\n    fn t() {\n        if !globals::init_object() {\n            return error;\n        }\n        if globals::init_object() {\n        } else {\n            return error;\n        }\n        return true;\n    }\n}\n";
+        let fixes = lint_spellings(text);
+        assert_eq!(fixes.len(), 2, "{text}");
+        let rewritten = apply_lint_spellings(text, &fixes);
+        assert_eq!(
+            rewritten.matches("globals::init_object()?;").count(),
+            2,
+            "{rewritten}"
+        );
+        assert!(!rewritten.contains("if "), "{rewritten}");
+        let bytes = |t: &str| {
+            crate::compile_v2_source("q.antics", t, &PackResolverConfig::default())
+                .unwrap_or_else(|e| panic!("{e}\n{t}"))
+                .iff_bytes
+        };
+        assert_eq!(bytes(text), bytes(&rewritten));
     }
 
     #[test]

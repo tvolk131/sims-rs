@@ -267,3 +267,113 @@ object "Fable Wave3 Bench" {
         lacks(&lifted, &["if !globals::init_object()", "raw {"]);
     }
 }
+
+#[test]
+fn make_new_character_names_locals_only_it_reads() {
+    let source = r#"object "Fable Wave3 Cradle" {
+    guid: 0x7E00_0167;
+    #[bhav(id = 4300, args = 1, locals = 3)]
+    fn t(sim: Sim) {
+        raw {
+            make_new_character(skin: local[0], age: local[1], sex: local[2], species: 0);
+        }
+    }
+}"#;
+    for lifted in lift_both(source) {
+        has(
+            &lifted,
+            &["make_new_character(skin: slot_0, age: slot_1, sex: slot_2, species: 0);"],
+        );
+        lacks(&lifted, &["raw {"]);
+    }
+}
+
+#[test]
+fn slot_parameter_0_lifts_inside_an_animation_handler() {
+    let source = r#"object "Fable Wave3 Shelf" {
+    guid: 0x7E00_0168;
+    #[bhav(id = 4300, args = 1)]
+    fn t(sim: Sim, a: i16) {
+        animate(clip: 3, table: 1, events: 2) |event| {
+            reach(mode: 1, moves: true, slot: param[0]);
+            drop_onto(src: param[0], dst: 3);
+        }
+    }
+}"#;
+    for lifted in lift_both(source) {
+        has(
+            &lifted,
+            &[
+                "reach(mode: 1, moves: true, slot: param[0]);",
+                "drop_onto(src: param[0], dst: 3);",
+            ],
+        );
+        lacks(&lifted, &["raw {"]);
+    }
+}
+
+#[test]
+fn an_inherit_tree_names_its_runners_temp_indexed_and_fame_words() {
+    let source = r#"object "Fable Wave3 Gong" {
+    guid: 0x7E00_0169;
+    #[bhav(id = 4300, label = "Strike", locals = 0)]
+    fn strike(sim: Sim) {
+        raw {
+            my.motive[1] := 2;
+            if call 4301(temps) {
+                temp[0] := 1;
+            }
+        }
+    }
+    #[bhav(id = 4301, label = "Hum", locals = 0)]
+    fn hum() {
+        raw {
+            my.data[5] := 1;
+            my.data[6] := 1;
+            my.data[7] := 1;
+            temp[1] := scope(30, 3);
+            temp[2] := my.person[81];
+            temp[4] := stack.person[81];
+        }
+    }
+}"#;
+    for lifted in lift_both(source) {
+        has(
+            &lifted,
+            &[
+                "context = inherit",
+                "temp[1] = me.person[temp[3]];",
+                "temp[2] = me.fame;",
+                "temp[4] = stack_obj.fame;",
+            ],
+        );
+        lacks(&lifted, &["raw {", "person[81]"]);
+    }
+}
+
+#[test]
+fn a_stack_object_cursor_loop_names_its_binding_s_cells() {
+    let source = r#"object "Fable Wave3 Census" {
+    guid: 0x7E00_016A;
+    #[bhav(id = 4300)]
+    fn t(sim: Sim) {
+        for p in lot.sims() {
+            temp[0] += p.person[temp[3]];
+            temp[1] += p.neighbor.age;
+            temp[2] += p.fame;
+        }
+    }
+}"#;
+    for lifted in lift_both(source) {
+        has(
+            &lifted,
+            &[
+                "for p in lot.sims() {",
+                "p.person[temp[3]]",
+                "p.neighbor.age",
+                "p.fame",
+            ],
+        );
+        lacks(&lifted, &["raw {", "set_to_next"]);
+    }
+}
