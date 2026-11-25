@@ -1919,8 +1919,8 @@ fn native_operands(word: &str, args: &str) -> bool {
 }
 
 /// `.air` text with its whitespace removed, or `None` when whitespace separates two word
-/// characters (`1 2`, `scope(1 2, 0)`): those are two tokens, which removing the space would
-/// read as one.
+/// characters (`1 2`, `scope(1 2, 0)`: two tokens, which removing the space would read as
+/// one) or follows a `-` (`- 2`, which the `.air` lexer does not read as `-2`).
 fn compact_air(text: &str) -> Option<String> {
     let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let mut out = String::new();
@@ -1930,7 +1930,13 @@ fn compact_air(text: &str) -> Option<String> {
             gap = true;
             continue;
         }
-        if gap && word(c) && out.chars().last().is_some_and(word) {
+        // `- 2` is not `-2`: the `.air` lexer reads a sign only next to its digits.
+        if gap
+            && out
+                .chars()
+                .last()
+                .is_some_and(|p| p == '-' || (word(c) && word(p)))
+        {
             return None;
         }
         gap = false;
@@ -4098,19 +4104,13 @@ impl FileLinter<'_> {
                 l.split('#').next().unwrap_or("")
             })
             .collect();
-        // The block must end its last statement: `.air` reads adjacent raw blocks as one
-        // stream, so `raw { f() } raw { pad(3: 0x05); }` is one padded primitive.
-        if !code.join("\n").trim_end().ends_with(';') {
-            return;
-        }
-        // One `.air` statement per entry.
-        let lines: Vec<&str> = code
-            .iter()
-            .flat_map(|l| l.split(';'))
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .collect();
-        if lines.is_empty() {
+        // One `.air` statement per entry: only `;` ends one, never a line break.
+        let code = code.join("\n");
+        let mut lines: Vec<&str> = code.split(';').map(str::trim).collect();
+        // The block must end its last statement and hold no empty one: `.air` reads adjacent
+        // raw blocks as one stream, so `raw { f() } raw { pad(3: 0x05); }` is one padded
+        // primitive, and the leading `;` of `raw { f() } raw { ; g(); }` ends `f()`.
+        if lines.pop() != Some("") || lines.is_empty() || lines.iter().any(|l| l.is_empty()) {
             return;
         }
         let mut spellings = Vec::new();
@@ -4405,7 +4405,11 @@ impl FileLinter<'_> {
                         return None;
                     }
                 }
-                let mode = air_literal(mode?).filter(|m| (-32768..=32767).contains(m))?;
+                // `.air` defaults the mode to 0.
+                let mode = match mode {
+                    None => 0,
+                    Some(m) => air_literal(m).filter(|m| (-32768..=32767).contains(m))?,
+                };
                 if !moves.is_none_or(|b| matches!(b, "true" | "false")) {
                     return None;
                 }

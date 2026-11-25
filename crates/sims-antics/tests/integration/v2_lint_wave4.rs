@@ -487,3 +487,41 @@ fn pads_the_encoder_refuses_stay_raw() {
         "clear_motive_changes(pad5: 0x01);",
     );
 }
+
+// --- review round 2 -------------------------------------------------------------------------
+
+#[test]
+fn only_a_semicolon_ends_a_statement() {
+    // The leading `;` ends the first block's call, so the second block is not a statement of
+    // its own.
+    none(
+        &sim_tree("        raw { clear_motive_changes() } raw { ; clear_motive_changes(); }"),
+        RAW_RULE,
+    );
+    // A line break ends nothing: these two lines are one statement.
+    stays_raw(sim_tree, "clear_motive_changes()\n clear_motive_changes();");
+    stays_raw(sim_tree, "clear_motive_changes();; clear_motive_changes();");
+    // A sign apart from its digits is not a literal.
+    stays_raw(sim_tree, "scope(31, 0) := - 2;");
+    // Several statements on several lines still get the hint.
+    let d = one(
+        &sim_tree(
+            "        raw {\n            scope(27, 0) := 1;\n            scope(27, 1) := 0;\n        }",
+        ),
+        RAW_RULE,
+    );
+    assert_eq!(
+        d.help.as_deref(),
+        Some("use stack_obj.sprite_flags[temp[..]]")
+    );
+}
+
+#[test]
+fn reach_defaults_its_mode_to_0() {
+    same_as_raw(
+        sim_tree,
+        "reach(moves: true);",
+        "reach(mode: .., moves: ..)",
+        "reach(mode: 0, moves: true);",
+    );
+}

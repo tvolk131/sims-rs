@@ -85,10 +85,13 @@ The usual guards apply, tightened after review:
   of those may declare a member of the builtin's name, which would then take the call. Cells
   (`scope(..)`) name no call and are still spelled. This also applies to wave 1's
   `RAW_BUILTINS` forms, which now defer to a user function of the builtin's name as well.
-- The block must end its last statement with `;`. `.air` reads adjacent raw blocks as one
-  stream, so `raw { clear_motive_changes() } raw { pad(3: 0x05); }` is one padded primitive.
+- Only `;` ends a statement, never a line break. The block must end its last statement with
+  `;` and hold no empty statement. `.air` reads adjacent raw blocks as one stream, so
+  `raw { clear_motive_changes() } raw { pad(3: 0x05); }` is one padded primitive, and the leading
+  `;` of `raw { f() } raw { ; g(); }` ends `f()`.
 - Whitespace between two word tokens (`play_sound(1 2)`, `scope(1 2, 0)`) is never read as one
-  token.
+  token, and a sign apart from its digits (`- 2`) is not a literal.
+- `reach` without `mode:` is mode 0, as `.air` defaults it.
 - Pads are checked by the encoder's own rule (`verify::apply_operand_pad`) against the call's
   plain encoding: ascending, each once, a new value, and only bytes the VM ignores. Clear Motive
   Changes encodes byte 3 as 1, so `pad(3: 1)` stays raw.
@@ -103,8 +106,19 @@ The usual guards apply, tightened after review:
 - **An unpadded `play_sound`.** Wave 1 left it raw on purpose, since v2 would rather name a
   declared `sound`, and `v2_lint.rs` pins that. Only the padded form, which has no other spelling
   than raw before #469, is new here.
-- **Mode 1 `reach` in a functional's body.** The lint knows a tree's compiled argument count
-  but not a functional's, so `reach(mode: 1)` there gets no hint (a false negative).
+- **A parameter in a functional's body.** The lint knows a tree's compiled argument count but
+  not a functional's, so `reach(mode: 1)` and a `param[N]` source there get no hint (a false
+  negative).
+- **Positional `reach` operands and a trailing comma** get no hint (a false negative).
+
+### What the hint promises
+
+The hint promises that the spelling lowers to the statement's own node, not that the whole tree
+builds the same bytes. A raw block holding `scope(..)` or `pad` keeps its tree's layout
+(#469's scoped `keep_layout`). Once it is replaced, the optimizer may treat the tree as it treats
+any structured code: drop a repeated cursor store, or merge identical branch tails into one node
+after the branch. Those trees behave the same and may be smaller. This is how the hint has
+always worked: wave 2's forms and the lift's (#471) do the same.
 - **Scopes 28 and 29** (`advert.personality`, `advert.minimum`) were spelled before #469 and are
   not in this PR's brief. They are the same shape as scope 12 and can follow.
 
@@ -151,6 +165,11 @@ GPT-6.2 Sol (high effort), correctness and soundness only.
   `v2_lint_wave4.rs`: template members, block constants, a block that does not end its
   statement (and merged tokens), and pads the encoder refuses. The NOTE (functional frames) is a
   false negative, documented above.
+- **R2:** 5 findings. The 3 SHOULD-FIX scanner gaps are fixed with regression tests: a leading
+  `;` that ends the previous block's statement, a line break read as a statement end, and a
+  separated sign. The tail merge after a replaced block is the accepted behaviour above. Of the
+  NOTEs, `reach` without `mode:` is now spelled. Positional operands and functional parameters
+  stay false negatives.
 
 ## Consequences
 
