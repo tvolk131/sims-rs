@@ -88,13 +88,22 @@ impl<'a> TreeLowerer<'a> {
         let bottom_frame = (matches!(self.tree_ctx, TreeContext::ObjectSelf)
             || self.inherited_entry_save)
             && self.frame_args == 0;
-        let body_reads_global_34 =
-            mir::may_read_global_34(&replace_outside_strings(self.em.text(), PIN_SLOT, "0"));
+        let body = replace_outside_strings(self.em.text(), PIN_SLOT, "0");
+        let body_reads_global_34 = mir::may_read_global_34(&body);
         if body_reads_global_34 {
             self.env.saw_global_34.set(true);
         }
-        let main_rules =
-            self.env.reads_global_34 || body_reads_global_34 || self.pin_span.is_some();
+        // A bottom frame with a local that may be read before it is written takes main's rules
+        // as well: dropping a store, or the local it initializes, shifts which local lives in
+        // word 0, and that read sees what Create Object wrote there.
+        let bottom_reads_unwritten = bottom_frame
+            && !mir::parse_body(&body).is_some_and(|nodes| {
+                mir::locals_defined_before_reads(&nodes, mir::DrawRanges::Literal)
+            });
+        let main_rules = self.env.reads_global_34
+            || body_reads_global_34
+            || bottom_reads_unwritten
+            || self.pin_span.is_some();
         let text_reads = if formats_text && (bottom_frame || main_rules) {
             mir::TableLocals::Unknown
         } else if formats_text {

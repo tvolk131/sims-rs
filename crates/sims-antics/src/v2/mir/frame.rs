@@ -618,7 +618,7 @@ pub(crate) fn count_frame_locals(body: &str) -> usize {
 /// Whether `body` may read global 34, whose value depends on the scratch pointer every
 /// Expression sets (`sims-vm` `primitives/expression.rs`): a `global[34]` operand or one whose
 /// index is not a literal, a `scope(6, ..)` or `scope(<non-literal>, ..)` cell, or a raw `op`
-/// that may be an Expression naming it ([`raw_op_may_read_global_34`]).
+/// that may be an Expression or a UI Effect naming it ([`raw_op_may_read_global_34`]).
 /// A body that does not lex counts as reading it.
 pub(crate) fn may_read_global_34(body: &str) -> bool {
     use crate::lexer::TokenKind as T;
@@ -642,34 +642,36 @@ pub(crate) fn may_read_global_34(body: &str) -> bool {
 }
 
 /// Whether a raw `op` (`tokens` follow the keyword) may read global 34 in the way that depends
-/// on the scratch pointer. Only Expression (opcode 2) does: its right operand is global 34 when
-/// operand byte 7 (the right scope) is 6 and the word at bytes 2..4 (the right index) is 34
-/// (`sims-vm` `primitives/expression.rs`). Any other literal opcode reads none: below 256 it is
-/// another primitive, and from 256 up it calls a tree, which `ObjectEnv::reads_global_34`
-/// covers for the object's own trees. An opcode or operand byte that is not a literal may be
-/// anything, so it counts as a read. A `op` not followed by an opcode is not a raw op.
+/// on the scratch pointer. Two primitives do (`sims-vm`): Expression (opcode 2), whose right
+/// operand is global 34 when operand byte 7 (its scope) is 6 and the word at bytes 2..4 (its
+/// index) is 34 (`primitives/expression.rs`), and UI Effect (opcode 34), whose variable is
+/// global 34 when byte 1 is 6 and the word at bytes 2..4 is 34 (`primitives/ui_effect.rs`).
+/// Any other literal opcode reads none: below 256 it is another primitive, and from 256 up it
+/// calls a tree, which `ObjectEnv::reads_global_34` covers for the object's own trees. An
+/// opcode or operand byte that is not a literal may be anything, so it counts as a read. A
+/// `op` not followed by an opcode is not a raw op.
 fn raw_op_may_read_global_34(tokens: &[crate::lexer::Token]) -> bool {
     use crate::lexer::TokenKind as T;
-    match tokens.first().map(|t| &t.kind) {
-        Some(T::Ident(_)) => true,
-        Some(T::Int(2)) => {
-            // The operand list: `(b0, .., b7)`, its bytes separated by commas or by spaces.
-            if !matches!(tokens.get(1).map(|t| &t.kind), Some(T::LParen)) {
-                return true;
-            }
-            let mut bytes = Vec::new();
-            for t in &tokens[2..] {
-                match &t.kind {
-                    T::Int(b) => bytes.push(*b),
-                    T::Comma => {}
-                    T::RParen => break,
-                    _ => return true,
-                }
-            }
-            bytes.len() != 8 || (bytes[7] == 6 && bytes[2] | bytes[3] << 8 == 34)
-        }
-        _ => false,
+    let scope_byte = match tokens.first().map(|t| &t.kind) {
+        Some(T::Ident(_)) => return true,
+        Some(T::Int(2)) => 7,
+        Some(T::Int(34)) => 1,
+        _ => return false,
+    };
+    // The operand list: `(b0, .., b7)`, its bytes separated by commas or by spaces.
+    if !matches!(tokens.get(1).map(|t| &t.kind), Some(T::LParen)) {
+        return true;
     }
+    let mut bytes = Vec::new();
+    for t in &tokens[2..] {
+        match &t.kind {
+            T::Int(b) => bytes.push(*b),
+            T::Comma => {}
+            T::RParen => break,
+            _ => return true,
+        }
+    }
+    bytes.len() != 8 || (bytes[scope_byte] == 6 && bytes[2] | bytes[3] << 8 == 34)
 }
 
 /// Whether a Random Number range operand (`.air` text) may resolve to a word pointer, which

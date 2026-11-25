@@ -87,11 +87,12 @@ tree turns out to read it). Trees outside the object are not examined: the game'
 (251 trees) reads global 34 nowhere. So such a tree takes main's rules (`FrameFacts::main_rules`):
 
 - such a read is a `global[34]` operand, a `global[..]` whose index is not a literal, a
-  `scope(6, ..)` cell, or a raw `op` that may be an Expression naming it: opcode 2 with right
-  scope byte 7 = 6 and right index bytes 2..4 = 34, or an opcode or operand byte that is not a
-  literal (its bytes separated by commas or spaces). Only Expression reads global 34 that way,
-  so another literal opcode reads none (one from 256 up calls a tree, which the object rule
-  covers for the object's own trees);
+  `scope(6, ..)` cell, or a raw `op` that may be an Expression or a UI Effect naming it:
+  opcode 2 (Expression) with right scope byte 7 = 6 and right index bytes 2..4 = 34, opcode 34
+  (UI Effect, `primitives/ui_effect.rs`) with scope byte 1 = 6 and index bytes 2..4 = 34, or an
+  opcode or operand byte that is not a literal (its bytes separated by commas or spaces). Only
+  those two primitives read global 34 that way, so another literal opcode reads none (one from
+  256 up calls a tree, which the object rule covers for the object's own trees);
 - a text tree takes `Unknown`, which is main's rule;
 - out-operands are not definitions there (section 5), so they make no store dead;
 - a `random` defines its destination only with a literal range (`DrawRanges::Literal`, main's
@@ -244,8 +245,9 @@ declaration order, so generated names no longer matter.
   do. This branch applies that rule to text trees whose text reads no moved word (section 1),
   which is the R3-1 fix itself: each of the six saves the Chess R2, Piano R2 and Fridges R5
   sources lose comes before a call. A tree of an
-  object that may read global 34, a pinning tree, and a text tree that may be a bottom frame
-  keep main's rules and so keep the save where main does.
+  object that may read global 34, a pinning tree, a text tree that may be a bottom frame, and a
+  bottom frame that reads a local before writing it keep main's rules and so keep the save where
+  main does.
 - **Bottom frames.** Create Object with flag 0x10 (or 0x02) writes word 0 of the new object's
   bottom frame, and faults when the frame has none. So in a tree that may run as one, which
   local lives in which word is observable: a local read before it is written reads the
@@ -253,8 +255,11 @@ declaration order, so generated names no longer matter.
   frame takes main's text rule (`Unknown`): it keeps its declarations and entry save as main
   does. This covers an object-self tree with no arguments (an object's or a variant's `main`),
   and the inherit check's Sim pass over one, so both passes agree. The section 1 text rules apply
-  to the others. Main's own passes still drop declarations in a tree that formats no text, as
-  before. (Main's dead-store elimination can still drop a text tree's unread entry save, as
+  to the others. A tree that may run as a bottom frame and has a local that may be read before
+  it is written (`locals_defined_before_reads` with literal ranges, or a body that does not
+  parse) takes all of main's rules (`main_rules`): otherwise out-operand liveness can drop an
+  initializer and the local it reads, shifting the read-first local into word 0. Main's own
+  passes still drop declarations in a tree that formats no text, as before. (Main's dead-store elimination can still drop a text tree's unread entry save, as
   section 1 says.)
 
 ## Verification
@@ -273,8 +278,9 @@ declaration order, so generated names no longer matter.
     out-operand's unwritten exit, the kept `self` switch and `job_data` copy, raw blocks' own
     entry-object names (including discarded code and inherited trees), main's
     choices in trees that may read global 34, whose callee may, or that bound their frame by a
-    format or come near the largest frame, raw `op` Expressions that name global 34, and the
-    pinned slot pinning only where main pins.
+    format or come near the largest frame, raw `op` Expressions and UI Effects that name global
+    34, a bottom frame that reads a local first, and the pinned slot pinning only where main
+    pins.
   - The `opt.rs` unit tests cover the pipeline's text veto.
 
 ## What would reopen this

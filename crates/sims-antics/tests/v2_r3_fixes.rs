@@ -705,7 +705,7 @@ fn a_raw_op_with_a_named_opcode_may_read_global_34() {
 /// the object's other trees keep this branch's rules (here, an initializer an out-operand kills
 /// goes).
 #[test]
-fn only_a_raw_expression_naming_global_34_reads_it() {
+fn only_a_raw_expression_or_ui_effect_naming_global_34_reads_it() {
     let src = |raw: &str| {
         obj(
             "Plain",
@@ -735,14 +735,54 @@ fn only_a_raw_expression_naming_global_34_reads_it() {
         &src("op 2 (0 0 34 0 0 3 14 6);"),
     );
     assert!(tree(&air, "a").contains("= 7;"), "{air}");
+    // A UI Effect (opcode 34) whose variable (scope byte 1, index bytes 2..4) is global 34.
+    let air = expand(
+        "raw_global34_ui_effect.antics",
+        &src("op 34 (2, 6, 34, 0, 0, 0, 0, 0);"),
+    );
+    assert!(tree(&air, "a").contains("= 7;"), "{air}");
     for raw in [
         "op 2 (0, 0, 5, 0, 0, 3, 14, 6);",
         "op 2 (0 0 5 0 0 3 14 6);",
         "op 4 (0, 0, 0, 0, 0, 0, 0, 0);",
+        "op 34 (2, 6, 5, 0, 0, 0, 0, 0);",
+        "op 34 (2, 7, 34, 0, 0, 0, 0, 0);",
     ] {
         let air = expand("raw_other_op.antics", &src(raw));
         assert!(!tree(&air, "a").contains("= 7;"), "{raw}:\n{air}");
     }
+}
+
+/// Create Object with flag 0x10 or 0x02 writes word 0 of the new object's bottom frame, its
+/// `main`. A bottom frame with a local read before it is written keeps main's rules, so the
+/// same local lives in word 0; one whose locals are all written first may still drop an
+/// initializer an out-operand write kills.
+#[test]
+fn a_bottom_frame_that_reads_a_local_first_keeps_main_rules() {
+    let src = |use_line: &str| {
+        obj(
+            "Plain",
+            &format!(
+                r#"    main {{
+        let a: i16 = 7;
+        let incoming: i16;
+        temp[2] = 1;
+        let n = a;
+        temp[3] = 1;
+        random_into(n, 1)?;
+        {use_line}
+        temp[1] = n;
+    }}"#
+            ),
+        )
+    };
+    let air = expand("bottom_reads_first.antics", &src("me.attr[0] = incoming;"));
+    let main = tree(&air, "Main");
+    assert!(main.contains("= 7;"), "{air}");
+    let first = main.find("let ").expect("a local");
+    assert!(main[first..].starts_with("let __v_a_0 = 7;"), "{air}");
+    let air = expand("bottom_writes_first.antics", &src("me.attr[0] = 1;"));
+    assert!(!tree(&air, "Main").contains("= 7;"), "{air}");
 }
 
 /// A call carries the scratch pointer into the callee, so a tree whose callee may read global 34
