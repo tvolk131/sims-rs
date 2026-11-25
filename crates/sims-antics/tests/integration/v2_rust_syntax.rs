@@ -1895,3 +1895,108 @@ fn pr_i3_review_round_2_regressions() {
         "there are 8 temps",
     );
 }
+
+#[test]
+fn pr_i3_review_round_3_regressions() {
+    let cases: &[(&str, &[&str])] = &[
+        // A helper body resolves `set_to_next` in its own module: the builtin writes `dest`, so the caller's local is copied.
+        (
+            "fn advance(dest: i16) { set_to_next(person, dest: dest); }
+object \"Probe\" {
+    guid: 0x7F500001;
+    state n: i16;
+    fn set_to_next(dest: i16) {}
+    #[bhav] fn a() {
+        let x = 0;
+        advance(x);
+        self.n = x;
+    }
+}",
+            &["let __arg_dest_1 = __v_x_0;\n    set_to_next(1, dest: __arg_dest_1);"],
+        ),
+        // A helper argument (through another helper) that assigns `stack_obj` is restored after the call, in any tree.
+        (
+            "object \"Probe\" {
+    guid: 0x7F500001;
+    state n: i16;
+    fn select(o: ObjectId) -> i16 { stack_obj = o; 0 }
+    fn wrap(o: ObjectId) -> i16 { select(o) }
+    #[bhav] fn a(o: ObjectId) {
+        stack_obj.run_functional(4, wrap(o));
+        self.n = stack_obj.attr[0];
+    }
+}",
+            &[
+                "run_functional_tree(4);\n    stack_obj := __pre_stack_obj_6;\n    my.attr[0] := stack.attr[0];",
+            ],
+        ),
+        // A loop binding named `self` is that binding, not the running object.
+        (
+            "object \"Probe\" {
+    guid: 0x7F500001;
+    #[bhav] fn a() {
+        let self: ObjectId = 0;
+        for self in lot.objects() {
+            temp[0] = self;
+            self.remove();
+        }
+    }
+}",
+            &["temp[0] := stack_obj;\n        remove_object(stack_obj);"],
+        ),
+        // `&mut stack_obj` handed to a helper moves the cursor.
+        (
+            "object \"Probe\" {
+    guid: 0x7F500001;
+    state n: i16;
+    fn select(dest: &mut ObjectId, o: ObjectId) -> i16 { *dest = o; 0 }
+    #[bhav] fn a(o: ObjectId) {
+        set_to_next(person);
+        stack_obj.run_functional(4, select(&mut stack_obj, o));
+        self.n = stack_obj.attr[0];
+    }
+}",
+            &[
+                "run_functional_tree(4);\n    stack_obj := __pre_stack_obj_4;\n    my.attr[0] := stack.attr[0];",
+            ],
+        ),
+        // An assignment a literal `if false` discards moves nothing.
+        (
+            "object \"Probe\" {
+    guid: 0x7F500001;
+    fn arg(o: ObjectId) -> i16 {
+        if false { stack_obj = o; }
+        0
+    }
+    #[frame(locals = 2)]
+    #[bhav] fn a(o: ObjectId) {
+        set_to_next(person);
+        stack_obj.run_functional(4, arg(o));
+    }
+}",
+            &[
+                "(args: 1, locals: 2)",
+                "run_functional_tree(4);\n    return true;",
+            ],
+        ),
+        // A BCON entry named like a definition field is a constant.
+        (
+            "object \"Probe\" {
+    guid: 0x7F500001;
+    bcon 4097 \"Config\" { object_type = 2 }
+    #[frame(locals = 0)]
+    #[bhav] fn a() {
+        while temp[0] < Config.object_type { temp[0] += 1; }
+    }
+}",
+            &["(locals: 0) {\n    while temp[0] < bcon[128] {"],
+        ),
+    ];
+    for (src, wants) in cases {
+        let built = build(src);
+        let body = tree_body(&built.0, "a");
+        for want in *wants {
+            assert!(body.contains(want), "{want}:\n{body}");
+        }
+    }
+}

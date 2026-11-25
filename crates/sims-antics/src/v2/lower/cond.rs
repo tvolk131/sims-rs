@@ -38,6 +38,7 @@ impl<'a> TreeLowerer<'a> {
                 // A definition cell is read in place only on the stack object.
                 V2Expr::Ident(_, bname)
                     if definition_field(field).is_some()
+                        && !self.is_bcon_table_ref(bname)
                         && !self.handle_has_state(bname, field) =>
                 {
                     self.definition_cell_in_place(bname)

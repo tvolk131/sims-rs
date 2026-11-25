@@ -169,8 +169,10 @@ impl<'a> TreeLowerer<'a> {
             self.em.append(&args_text);
             staged_target = staged;
             cursor_saved = true;
-            if self.explicit_stack_obj && args.iter().any(|a| self.arg_moves_cursor(&a.value)) {
-                args_cursor = self.save_stack_obj_for_move();
+            if args.iter().any(|a| self.arg_moves_cursor(&a.value)) {
+                let after = self.fresh("pre_stack_obj");
+                self.stack_op(mir::StackObjOp::Save(&after));
+                args_cursor = Some(after);
                 // The cursor at exit is observable (item 5): this restore is the source's.
                 self.sets_stack_obj = true;
             }
@@ -756,7 +758,7 @@ impl<'a> TreeLowerer<'a> {
         };
         let air = if name == "stack_obj" {
             "stack_obj"
-        } else if self.is_self_ident(name) {
+        } else if self.is_self_keyword(name) {
             if self.inherit_tree {
                 return Err(Error::at(
                     target.span(),

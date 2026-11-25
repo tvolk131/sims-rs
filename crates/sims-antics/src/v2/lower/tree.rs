@@ -264,12 +264,6 @@ impl<'a> TreeLowerer<'a> {
     /// Whether `name` is read-only in `stmts`: assigned, borrowed `&mut`, or handed to an
     /// unshadowed builtin that writes a named local.
     pub(super) fn stmts_write_ident(&self, stmts: &[V2Stmt], name: &str) -> Result<bool> {
-        let active = self.active_local_writing_builtins()?;
-        Ok(stmts_mutate_or_borrow_ident_in(stmts, name, &active))
-    }
-
-    /// [`LOCAL_WRITING_BUILTINS`] less the names a user tree or helper shadows here.
-    pub(super) fn active_local_writing_builtins(&self) -> Result<Vec<&'static str>> {
         let mut active = Vec::new();
         for b in LOCAL_WRITING_BUILTINS {
             let callee = V2Expr::Ident(Span::default(), (*b).to_owned());
@@ -277,7 +271,24 @@ impl<'a> TreeLowerer<'a> {
                 active.push(*b);
             }
         }
-        Ok(active)
+        Ok(stmts_mutate_or_borrow_ident_in(stmts, name, &active))
+    }
+
+    /// [`LOCAL_WRITING_BUILTINS`] less the names a tree or helper shadows in `module` (object
+    /// trees and local helpers only where `allow_local`), as a helper body there resolves them.
+    pub(super) fn local_writing_builtins_in(
+        &self,
+        module: &str,
+        allow_local: bool,
+    ) -> Vec<&'static str> {
+        LOCAL_WRITING_BUILTINS
+            .iter()
+            .copied()
+            .filter(|b| {
+                !(allow_local && self.env.trees.contains_key(*b))
+                    && self.env.lookup_fn(module, b, allow_local).is_none()
+            })
+            .collect()
     }
 
     pub(super) fn bind_var(&mut self, name: String, binding: Binding) {
@@ -354,6 +365,13 @@ impl<'a> TreeLowerer<'a> {
                 && !self
                     .env
                     .is_bcon_table_name(&self.owner_module, name, self.in_object_scope))
+    }
+
+    /// `self` the running tree's object: [`Self::is_self_ident`], unless a local or parameter
+    /// named `self` (a `for self in ..` binding) shadows it.
+    pub(super) fn is_self_keyword(&self, name: &str) -> bool {
+        self.is_self_ident(name)
+            && matches!(self.lookup_var(name), None | Some(Binding::SelfHandle))
     }
 
     pub(super) fn is_self_ident(&self, name: &str) -> bool {

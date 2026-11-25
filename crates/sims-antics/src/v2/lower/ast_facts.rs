@@ -957,10 +957,22 @@ impl ExplicitStackOps {
                 }
                 _ => None,
             };
-            if self.assignments
-                && matches!(stmt, V2Stmt::Assign { target: V2Expr::Ident(_, n), .. } if n == "stack_obj")
-            {
-                return true;
+            if self.assignments {
+                if matches!(stmt, V2Stmt::Assign { target: V2Expr::Ident(_, n), .. } if n == "stack_obj")
+                {
+                    return true;
+                }
+                // Code a literal condition discards is never lowered (`check_discarded`).
+                if let V2Stmt::If {
+                    cond: V2Expr::Bool(_, taken),
+                    then_body,
+                    else_body,
+                    ..
+                } = stmt
+                {
+                    let body = if *taken { then_body } else { else_body };
+                    return self.in_stmts(body, env, owner, local);
+                }
             }
             if let Some(args) = let_some_search {
                 return args.iter().any(|a| self.in_expr(&a.value, env, owner, local))
@@ -986,9 +998,18 @@ impl ExplicitStackOps {
         local: bool,
     ) -> bool {
         let mut found = false;
+        let assignments = self.assignments;
         super::specialize::visit_expr(expr, &mut |expr| {
-            if !found
-                && let V2Expr::Call { callee, args, .. } = expr
+            if found {
+                return;
+            }
+            // `&mut stack_obj` hands the cursor to code that may write it.
+            if assignments
+                && let V2Expr::MutRef { inner, .. } = expr
+                && matches!(inner.as_ref(), V2Expr::Ident(_, n) if n == "stack_obj")
+            {
+                found = true;
+            } else if let V2Expr::Call { callee, args, .. } = expr
                 && let V2Expr::Ident(_, name) = callee.as_ref()
             {
                 found = self.in_call(name, args, env, owner, local);

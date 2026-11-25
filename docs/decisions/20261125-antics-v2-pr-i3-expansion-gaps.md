@@ -45,7 +45,8 @@ the false exit.
   - `self` in a Sim tree that steps the cursor (`destroy_self()` selects it there).
 - **Options:** `flags:`, `no_yield:` and `skip_resets:`, shared with `destroy_self()`.
 - **Where it works:** as a statement, a condition (`if !x.remove() { .. }`) and a bool value.
-  A `for o in ..` loop whose body removes `o` keeps `o` the cursor.
+  A `for o in ..` loop whose body removes `o` keeps `o` the cursor. A local named `self` (such
+  as a `for self in ..` binding) is that handle, not the running object.
 
 ### 2. `find_best_object(kind)` as a condition (`lower/cond.rs`, `lower/ast_facts.rs`)
 
@@ -60,8 +61,9 @@ A tree that uses it counts as one that steps its own cursor (`ExplicitStackOps`)
 tree's `self` stays the object the tree started on.
 
 The same holds in a `stack_obj.run_functional(..)` argument: the functional runs on the receiver,
-and the found object (or the object a helper argument assigned to `stack_obj`) is selected again
-after it, also right before the exit. A helper `fn find_best_object` still wins over
+and the found object is selected again after it, also right before the exit. The same goes for an
+object a helper argument assigns to `stack_obj` or writes through `&mut stack_obj`, in any tree.
+An assignment that a literal `if false` discards does not count. A helper `fn find_best_object` still wins over
 the search, as it does in value position.
 
 `let Some(x) = find_best_object(..)` already restores the cursor itself and is unchanged. The

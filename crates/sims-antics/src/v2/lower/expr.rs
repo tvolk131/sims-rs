@@ -948,7 +948,7 @@ impl<'a> TreeLowerer<'a> {
     /// with no cursor switch (see [`Self::read_stack_object_cell`]).
     pub(super) fn definition_cell_in_place(&self, handle: &str) -> bool {
         handle == "stack_obj"
-            || (self.is_self_ident(handle)
+            || (self.is_self_keyword(handle)
                 && !self.inherit_tree
                 && matches!(self.tree_ctx, TreeContext::SimOnObject { .. })
                 && self.self_stack_target() == "stack_obj")
@@ -978,7 +978,7 @@ impl<'a> TreeLowerer<'a> {
         };
         let lval = if handle == "stack_obj" {
             direct(ty)
-        } else if self.is_self_ident(handle) {
+        } else if self.is_self_keyword(handle) {
             if self.inherit_tree {
                 return Err(Error::at(
                     span,
