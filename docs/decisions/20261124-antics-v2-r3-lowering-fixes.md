@@ -116,8 +116,9 @@ The two passes are compared after canonical renaming (`canonical_locals`): `let`
 declaration order, so generated names no longer matter.
 
 - The Sim pass declares its implicit entry object (`__self_obj`) when the body reads it, as the
-  object pass declares `__saved_stack_obj`. A read is an `.air` token naming it. A comment does not
-  count, and neither does a raw block's own local of that name.
+  object pass declares `__saved_stack_obj`. A read is an `.air` token naming it, so a comment does
+  not count. A raw block may read `__self_obj` or `__saved_stack_obj` but may not declare a local,
+  constant or label of either name (`check_raw_reserved_names`).
 - A tree whose two lowerings differ still fails. The error points at the first source statement of
   the tree whose lowering differs (`differing_statement`, via the statement marks `TreeLowerer`
   records), such as a targetless `play_sound`.
@@ -130,19 +131,24 @@ declaration order, so generated names no longer matter.
   `break` arm keeps the old value live and the fall-through arm does not.
   - Disjoint inlined copies of a helper now share their local's word.
   - In `coalesce_locals`, a local written through an out-operand joins only classes of its own
-    declaration. Lowering records the declaration (`local_origins`: the helper and the `let`'s
-    position), so another helper's local of the same spelling is not a copy. It never joins the
-    cross-helper merge.
+    declaration, and never the cross-helper merge.
+    - Lowering records each inlined local's declaration (`local_origins`: the helper and the
+      innermost statement being lowered). That covers `let`, `let Some`, `for` and every other
+      binding, so another helper's local of the same spelling is not a copy.
+    - When any copy of a declaration is written through an out-operand, all its copies count as
+      written. A specialization that drops the write from one copy keeps them one group.
     Bookcases 4107 shows why: Maxis keeps a helper's `event` and `pick` in separate words, and
     merging them made the verifier's cut-point mode compare unequal slots.
 - **`self` before the first cursor move (`lower/stmt.rs` `lower_tree_body`).** In a Sim tree, the
   leading top-level statements before the first one that may move the cursor run with `stack_obj`
   still the entry object (`stmts_may_clobber_stack_obj`, which looks through called helpers). There
   `self` reads and writes the stack object in place, with no switch and no staging local.
-  - Source order is control order only when no raw block defines a label or branches to a node by
-    number (`raw_facts`). Otherwise a branch from after a move may jump back before it, so such a
-    tree gets no prefix. This includes raw blocks in the helpers the tree calls, transitively: a raw
-    block of the tree may branch to a label an inlined helper emits.
+  - Source order is control order only when no raw code defines a label or branches to a node by
+    number. Otherwise a branch from after a move may jump back before it. Lowering itself emits
+    neither, so the check reads the tree's finished `.air` (`raw_facts`). That covers raw code from
+    every route: the tree's own blocks, helpers it calls, parameter defaults, and helpers named like
+    statements. When a tree that used the prefix has such code, the object is lowered again with no
+    prefix in any tree (`ObjectEnv::entry_cursor_off`), as for the text fact.
   - A raw block in an inlined helper or under a cleanup may branch only to its own labels. That
     check now covers raw `loop` bodies too.
   - A padded raw primitive (`… pad 0xNN`) counts as the primitive it wraps, both for moving the

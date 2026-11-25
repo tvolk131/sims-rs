@@ -301,6 +301,12 @@ struct ObjectEnv<'a> {
     /// ([`mir::text_reads`](mod@crate::v2::mir)): every tree is finished with the object's final
     /// fact (`lower_object` lowers again when a later tree's inline dialog literal adds to it).
     text_reads: mir::TableLocals,
+    /// No tree gets the in-place `self` prefix (`lower_tree_body`): set when lowering the object
+    /// again after a tree that had one emitted raw control flow that may jump back into it.
+    entry_cursor_off: bool,
+    /// A tree had the in-place `self` prefix and emitted a raw label or a branch to a node by
+    /// number, so the object must be lowered again with [`Self::entry_cursor_off`].
+    entry_cursor_unsound: std::cell::Cell<bool>,
     local_fns: BTreeMap<String, (String, FnDecl)>,
     /// Object/template-local enums by short name -> canonical key.
     local_enums: BTreeMap<String, String>,
@@ -655,6 +661,11 @@ struct TreeLowerer<'a> {
     /// position): copies of one declaration are one source local, whatever their spelling shares
     /// with another helper's.
     local_origins: BTreeMap<String, String>,
+    /// The innermost statement being lowered (the origin of the locals it declares).
+    stmt_span: Option<Span>,
+    /// The tree's in-place `self` prefix applied ([`Self::entry_cursor`] in a tree that moves
+    /// the cursor), which `finish` checks against the emitted raw control flow.
+    entry_cursor_applied: bool,
     /// Declarations lowered so far, by lowering instance (the inline-helper instances and the
     /// defer instance around them) and source span. Lowering one source declaration twice in
     /// the same instance means it was copied (a const binding's region), and each copy has its

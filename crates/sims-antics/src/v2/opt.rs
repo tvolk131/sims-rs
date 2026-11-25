@@ -553,6 +553,17 @@ fn coalesce_locals(nodes: &mut Vec<Stmt>, text_reads: bool, origins: &BTreeMap<S
     let entry_live = lv.block(nodes, Set::new(), &Set::new(), &Set::new());
     let mut out_written = BTreeSet::new();
     collect_out_written(nodes, &locals, &mut out_written);
+    // A copy of a declaration that some copy writes through an out-operand counts as one too
+    // (a specialization may drop the write from one copy): copies of a declaration stay one
+    // group.
+    let written_origins: BTreeSet<&String> =
+        out_written.iter().filter_map(|n| origins.get(n)).collect();
+    out_written.extend(
+        locals
+            .iter()
+            .filter(|n| origins.get(*n).is_some_and(|o| written_origins.contains(o)))
+            .cloned(),
+    );
     let interferes = |a: &str, b: &str| {
         let (x, y) = if a < b { (a, b) } else { (b, a) };
         lv.edges.contains(&(x.to_owned(), y.to_owned()))

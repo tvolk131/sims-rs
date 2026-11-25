@@ -45,6 +45,8 @@ impl<'a> TreeLowerer<'a> {
             slot_span: None,
             pinned_locals: BTreeMap::new(),
             local_origins: BTreeMap::new(),
+            stmt_span: None,
+            entry_cursor_applied: false,
             seen_decls: BTreeSet::new(),
             inline_call_sites: Vec::new(),
             dup_decl: None,
@@ -109,12 +111,9 @@ impl<'a> TreeLowerer<'a> {
         } else {
             body
         };
-        // The body reads the entry object when an `.air` token names it: a comment does not, and
-        // neither does a raw block's own local of that name.
-        if self.inherited_entry_save
-            && !self.raw_declared.contains(mir::SELF_OBJ)
-            && names_token(&out, mir::SELF_OBJ)
-        {
+        // The body reads the entry object when an `.air` token names it (a comment does not; a
+        // raw block may read it but not declare its own, `check_raw_reserved_names`).
+        if self.inherited_entry_save && names_token(&out, mir::SELF_OBJ) {
             let save = mir::StackObjOp::Save(mir::SELF_OBJ).text();
             out = format!("    {save}\n{out}");
         }
@@ -123,6 +122,15 @@ impl<'a> TreeLowerer<'a> {
             // nothing else names an explicit local: the pin takes slot 0, and `.air` allocates
             // the named locals after it.
             out = replace_outside_strings(&out, PIN_SLOT, "0");
+        }
+        // Lowering emits no label and no branch by node number, so one in the body comes from
+        // raw code (the tree's or an inlined helper's), which may jump back into the in-place
+        // `self` prefix after a cursor move. (A body that does not parse counts as one.)
+        if self.entry_cursor_applied {
+            let raw = raw_facts::raw_facts(&out, None);
+            if raw.defines_label || raw.positional_target {
+                self.env.entry_cursor_unsound.set(true);
+            }
         }
         Ok(mir::finish_body(out, &facts))
     }
@@ -162,7 +170,16 @@ impl<'a> TreeLowerer<'a> {
         } else {
             ""
         };
-        format!("__{scope}{prefix}_{id}")
+        let name = format!("__{scope}{prefix}_{id}");
+        // An inlined helper's source local: copies of one declaration (the same helper and
+        // statement) get the same origin.
+        if !scope.is_empty()
+            && let (Some(helper), Some(at)) = (self.inline_call_stack.last(), self.stmt_span)
+        {
+            let origin = format!("{helper}::{prefix}@{}:{}", at.line, at.column);
+            self.local_origins.insert(name.clone(), origin);
+        }
+        name
     }
 
     pub(super) fn line(&mut self, text: String) {
@@ -396,12 +413,7 @@ impl<'a> TreeLowerer<'a> {
         span: Span,
     ) -> Result<String> {
         let Some(n) = slot else {
-            let air_name = self.fresh(&format!("v_{name}"));
-            if let Some(helper) = self.inline_call_stack.last() {
-                let origin = format!("{helper}::{name}@{}:{}", span.line, span.column);
-                self.local_origins.insert(air_name.clone(), origin);
-            }
-            return Ok(air_name);
+            return Ok(self.fresh(&format!("v_{name}")));
         };
         if !self.inline_call_stack.is_empty() || self.active_inline_fn.is_some() {
             return Err(Error::at(

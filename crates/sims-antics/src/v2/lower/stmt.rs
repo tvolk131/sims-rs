@@ -18,15 +18,15 @@ impl<'a> TreeLowerer<'a> {
     /// a cleanup still pending after it is lowered from its AST where it is emitted.
     ///
     /// Source order is control order only when no raw block branches by label or node number:
-    /// such a branch from after a move may jump back before it, so a tree with one, in its own
-    /// statements or a helper they call ([`Self::may_raw_branch_back`]), has no such prefix.
+    /// such a branch from after a move may jump back before it. `finish` checks the tree's
+    /// emitted `.air` for one when the prefix applied, and the object is then lowered again with
+    /// no prefix in any tree (`ObjectEnv::entry_cursor_off`).
     pub(super) fn lower_tree_body(&mut self, stmts: &[V2Stmt]) -> Result<()> {
         let sim = match &self.tree_ctx {
             TreeContext::SimOnObject { sim_name } => Some(sim_name.clone()),
             TreeContext::ObjectSelf => None,
         };
-        let mut prefix = sim.is_some()
-            && !self.may_raw_branch_back(stmts, &self.owner_module, self.in_object_scope, 0);
+        let mut prefix = sim.is_some() && !self.env.entry_cursor_off;
         for stmt in stmts {
             prefix = prefix
                 && !stmts_may_clobber_stack_obj(
@@ -38,6 +38,7 @@ impl<'a> TreeLowerer<'a> {
                     0,
                 );
             self.entry_cursor = prefix;
+            self.entry_cursor_applied |= prefix && self.explicit_stack_obj;
             let lowered = self.lower_stmt(stmt);
             self.entry_cursor = false;
             lowered?;
@@ -45,40 +46,12 @@ impl<'a> TreeLowerer<'a> {
         Ok(())
     }
 
-    /// Whether a raw block in `stmts`, or in a helper they call (transitively), defines a label
-    /// or branches to a node by number (`raw_facts`). A raw block in an inlined helper may only
-    /// branch to its own labels, but a raw block of the tree may branch to one of them.
-    fn may_raw_branch_back(
-        &self,
-        stmts: &[V2Stmt],
-        module: &str,
-        allow_local: bool,
-        depth: usize,
-    ) -> bool {
-        if depth > 32
-            || specialize::stmts_any(stmts, &|s| {
-                matches!(s, V2Stmt::RawAir { code, .. } if {
-                    let facts = raw_facts::raw_facts(code, None);
-                    facts.defines_label || facts.positional_target
-                })
-            })
-        {
-            return true;
-        }
-        let mut callees = Vec::new();
-        collect_callee_names(stmts, &mut callees);
-        callees.iter().any(|name| {
-            self.env
-                .lookup_fn(module, name, allow_local)
-                .is_some_and(|(m, d, l)| self.may_raw_branch_back(&d.body, &m, l, depth + 1))
-        })
-    }
-
     pub(super) fn lower_stmt(&mut self, stmt: &V2Stmt) -> Result<()> {
         if let Some(split) = self.split_inline_specialization(stmt)? {
             return self.lower_stmt(&split);
         }
         self.note_decl(stmt);
+        self.stmt_span = Some(crate::v2::specialize::stmt_span(stmt));
         if self.inline_call_stack.is_empty() {
             self.stmt_marks
                 .push((self.em.mark(), crate::v2::specialize::stmt_span(stmt)));
@@ -1109,6 +1082,7 @@ impl<'a> TreeLowerer<'a> {
                         "'raw { ... }' is not allowed inside a 'defer' block",
                     ));
                 }
+                check_raw_reserved_names(code, *span)?;
                 let prelude = self.collect_raw_consts(code, *span)?;
                 let facts = super::raw_facts::raw_facts(code, Some(&prelude));
                 if self.checking_discarded == 0 && facts.formats_text {

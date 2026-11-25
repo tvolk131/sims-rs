@@ -591,21 +591,38 @@ fn a_helper_raw_label_disables_in_place_self() {
     );
 }
 
-/// The inherit check reads the entry object from `.air` tokens: a comment naming it, or a raw
-/// block's own local of that name, is not a read.
+/// The inherit check reads the entry object from `.air` tokens, so a comment naming it is not a
+/// read; a raw block may not declare a local, constant or label of that name.
 #[test]
-fn inherit_check_ignores_comments_and_raw_locals_named_like_the_entry_object() {
-    for raw in [
-        "raw {\n            // __self_obj\n            temp[0] := 1;\n        }",
-        "raw {\n            let __self_obj = 1;\n            temp[0] := __self_obj;\n        }",
-    ] {
-        let src = obj(
+fn inherit_check_ignores_comments_and_raw_blocks_cannot_declare_the_entry_object() {
+    let quiet = |raw: &str| {
+        obj(
             "Plain",
             &format!(
                 "    @context(inherit) tree quiet {{\n        {raw}\n        return true;\n    }}"
             ),
+        )
+    };
+    expand(
+        "inherit_comment.antics",
+        &quiet("raw {\n            // __self_obj\n            temp[0] := 1;\n        }"),
+    );
+    for raw in [
+        "raw { let __self_obj = 1; temp[0] := __self_obj; }",
+        "raw { const __self_obj = 7; temp[0] := __self_obj; }",
+        "raw { @__self_obj: temp[0] := 1; }",
+        "raw { let __saved_stack_obj = 1; temp[0] := __saved_stack_obj; }",
+    ] {
+        let err = compile_v2_source(
+            "inherit_reserved.antics",
+            &quiet(raw),
+            &PackResolverConfig::default(),
+        )
+        .expect_err(raw);
+        assert!(
+            err.message.contains("compiler's entry object"),
+            "{raw}: {err}"
         );
-        expand("inherit_comment.antics", &src);
     }
 }
 
@@ -639,4 +656,93 @@ fn same_spelled_out_operand_locals_of_different_helpers_do_not_share() {
     assert_eq!(a.matches("let __inline_v_event_").count(), 2, "{a}");
     let b = tree(&air, "b");
     assert_eq!(b.matches("let __inline_v_event_").count(), 1, "{b}");
+}
+
+/// A raw label can reach the tree from routes the source does not show as a call: a parameter
+/// default that calls a helper, and a helper named like the `animate` statement. The emitted
+/// `.air` decides, so neither keeps the in-place `self` prefix.
+#[test]
+fn raw_labels_from_defaults_and_statement_named_helpers_disable_in_place_self() {
+    let tail = r#"
+        self.value += 1;
+        if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
+            return false;
+        }
+        raw { random(temp[2], 1) -> true: @again, false: false; }
+    }"#;
+    let default = format!(
+        r#"    fn checkpoint() -> bool {{
+        raw {{ @again: temp[3] := 1; }}
+        return temp[0] == 0;
+    }}
+    fn use_default(x: i16 = if checkpoint() {{ 1 }} else {{ 2 }}) {{
+        temp[0] = x;
+    }}
+    tree a (sim: Sim) {{
+        use_default();{tail}"#
+    );
+    let animate = format!(
+        r#"    fn animate() {{
+        raw {{ @again: temp[3] := 1; }}
+    }}
+    tree a (sim: Sim) {{
+        animate();{tail}"#
+    );
+    for (name, members) in [
+        ("raw_default.antics", default),
+        ("raw_animate.antics", animate),
+    ] {
+        let air = expand(name, &obj("Plain", &members));
+        let a = tree(&air, "a");
+        let write = a.find("stack.attr[0]").expect("the self write");
+        assert!(
+            a[..write].contains("stack_obj :="),
+            "{name}: the write switches to the entry object first:\n{a}"
+        );
+    }
+}
+
+/// `let Some(x)` bindings of different helpers are distinct declarations, and copies of one
+/// declaration stay one group even when a specialization drops the out-operand write from one.
+#[test]
+fn out_operand_groups_follow_declarations_through_let_some_and_specialization() {
+    let src = obj(
+        "Plain",
+        r#"    fn first(target: ObjectId) {
+        let Some(value) = target.run_functional::<i16>(prep) else { return; };
+        random_into(value, 4)?;
+        temp[3] = value;
+    }
+    fn second(target: ObjectId) {
+        let Some(value) = target.run_functional::<i16>(prep) else { return; };
+        random_into(value, 6)?;
+        temp[4] = value;
+    }
+    fn pick(draw: bool) {
+        let value: i16;
+        if draw {
+            random_into(value, 4)?;
+        } else {
+            value = temp[0];
+        }
+        temp[3] = value;
+        temp[4] = value;
+    }
+    fn nested(draw: bool) {
+        pick(draw);
+    }
+    tree a {
+        first(stack_obj);
+        second(stack_obj);
+    }
+    tree split_mode {
+        nested(true);
+        nested(false);
+    }"#,
+    );
+    let air = expand("origins.antics", &src);
+    let a = tree(&air, "a");
+    assert_eq!(a.matches("let __inline_v_value_").count(), 2, "{a}");
+    let split = tree(&air, "split_mode");
+    assert_eq!(split.matches("let __inline_v_value_").count(), 1, "{split}");
 }

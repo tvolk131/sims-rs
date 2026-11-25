@@ -133,6 +133,45 @@ pub(super) fn raw_air_stmts_clobber_stack_obj(stmts: &[crate::ast::Stmt]) -> boo
     })
 }
 
+/// A raw block may read the compiler's entry-object locals (`__self_obj`, `__saved_stack_obj`)
+/// but not declare a local, a constant or a label of that name: lowering decides from the names
+/// a tree's `.air` reads whether it needs the entry save.
+pub(super) fn check_raw_reserved_names(code: &str, span: Span) -> Result<()> {
+    use crate::lexer::TokenKind as T;
+    const RESERVED: [&str; 2] = [mir::SELF_OBJ, mir::SAVED_STACK_OBJ];
+    let reject = |name: &str| {
+        Err(Error::at(
+            span,
+            format!(
+                "'{name}' is the compiler's entry object: a raw block may read it but not \
+                 declare its own"
+            ),
+        ))
+    };
+    let Ok(tokens) = crate::lexer::tokenize(code) else {
+        return Ok(());
+    };
+    for pair in tokens.windows(2) {
+        if let (T::Ident(kw), T::Ident(name)) = (&pair[0].kind, &pair[1].kind)
+            && matches!(kw.as_str(), "let" | "local" | "const")
+            && RESERVED.contains(&name.as_str())
+        {
+            return reject(name);
+        }
+    }
+    let wrapped = format!("tree 4096 \"__raw_names\" {{\n{code}\n}}\n");
+    if let Ok(module) = crate::parser::parse_module_lenient(&wrapped)
+        && let Some(crate::ast::Item::Tree(tree)) = module.items.first()
+    {
+        let mut labels = BTreeSet::new();
+        collect_raw_air_labels(&tree.body, &mut labels);
+        if let Some(name) = RESERVED.iter().find(|n| labels.contains(**n)) {
+            return reject(name);
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn collect_raw_air_labels<'a>(
     stmts: &'a [crate::ast::Stmt],
     labels: &mut BTreeSet<&'a str>,
