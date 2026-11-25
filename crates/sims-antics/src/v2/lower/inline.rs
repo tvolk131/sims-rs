@@ -177,7 +177,10 @@ impl<'a> TreeLowerer<'a> {
         if stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name) {
             return Err(Error::at(
                 param.span,
-                format!("const parameter '{}' cannot be assigned or borrowed", param.name),
+                format!(
+                    "const parameter '{}' cannot be assigned or borrowed",
+                    param.name
+                ),
             ));
         }
         let binding = self.bind_helper_arg_value(

@@ -557,7 +557,10 @@ fn lower_object_with(
             d.guid
                 .as_ref()
                 .map(|(span, value)| {
-                    Ok((*span, resolve_guid_value(resolved, owner, &local_consts, value, *span)?))
+                    Ok((
+                        *span,
+                        resolve_guid_value(resolved, owner, &local_consts, value, *span)?,
+                    ))
                 })
                 .transpose()
         })
@@ -1763,8 +1766,12 @@ pub(super) fn resolve_guid_value(
                 format!("unknown const '{name}' in 'guid:' (expected a literal or a 'const')"),
             )
         })?;
-    u32::try_from(v)
-        .map_err(|_| Error::at(span, format!("guid const '{name}' = {v} is out of u32 range")))
+    u32::try_from(v).map_err(|_| {
+        Error::at(
+            span,
+            format!("guid const '{name}' = {v} is out of u32 range"),
+        )
+    })
 }
 
 /// Resolves `variant` declarations against the primary manifest and the standalone tree ids.
@@ -1793,8 +1800,8 @@ pub(super) fn resolve_variants(
                 "'variant' is not supported on multi-tile objects (their tiles own the OBJD group)",
             ));
         }
-        let (gspan, guid) = guid
-            .ok_or_else(|| Error::at(d.span, format!("variant '{}' needs a 'guid:'", d.name)))?;
+        let (gspan, guid) =
+            guid.ok_or_else(|| Error::at(d.span, format!("variant '{}' needs a 'guid:'", d.name)))?;
         if guid == manifest.guid || out.iter().any(|v| v.guid == guid) {
             return Err(Error::at(
                 gspan,

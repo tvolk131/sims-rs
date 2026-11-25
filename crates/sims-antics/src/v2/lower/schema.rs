@@ -363,13 +363,9 @@ pub(super) fn build_object_schema(
     }
 
     let guid = match &guid {
-        Some((owner, span, value)) => super::object::resolve_guid_value(
-            resolved,
-            owner,
-            &local_consts,
-            value,
-            *span,
-        )?,
+        Some((owner, span, value)) => {
+            super::object::resolve_guid_value(resolved, owner, &local_consts, value, *span)?
+        }
         None => {
             return Err(Error::at(
                 obj.span,

@@ -2107,15 +2107,33 @@ impl TreeLowerer<'_> {
 /// left). Calls and primitives that write temps as a side effect are not visible here.
 fn air_writes_cell(air: &str, cell: &str) -> bool {
     const WRITES: &[&str] = &[
-        ":=", "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "inc_lt", "dec_gt",
-        "flag_set", "flag_clear", "sqrt",
+        ":=",
+        "=",
+        "+=",
+        "-=",
+        "*=",
+        "/=",
+        "%=",
+        "&=",
+        "|=",
+        "^=",
+        "<<=",
+        ">>=",
+        "inc_lt",
+        "dec_gt",
+        "flag_set",
+        "flag_clear",
+        "sqrt",
     ];
     air.match_indices(cell).any(|(at, _)| {
         let before_ok = air[..at]
             .chars()
             .next_back()
             .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'));
-        let op = air[at + cell.len()..].split_whitespace().next().unwrap_or("");
+        let op = air[at + cell.len()..]
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
         before_ok && WRITES.contains(&op)
     })
 }

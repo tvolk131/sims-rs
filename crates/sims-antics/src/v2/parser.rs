@@ -5,10 +5,9 @@ use crate::audio::SoundPreset;
 use crate::error::{Error, Result, Span};
 use crate::parser::motive_by_name;
 use crate::v2::ast::{
-    GuidValue,
     AbiParam, AbiParamSlot, AdvertiseDecl, BconTableDecl, BitflagVariant, BitflagsDecl, CallArg,
     ConstDecl, ConstIntExpr, EnumDecl, EnumVariant, ExternBconDecl, ExternBconEntry, ExternFnDecl,
-    ExternModDecl, FnDecl, FnParam, ForEachIter, FunctionalDecl, GuardBody, GuardDecl,
+    ExternModDecl, FnDecl, FnParam, ForEachIter, FunctionalDecl, GuardBody, GuardDecl, GuidValue,
     InteractionDecl, LifecycleBlock, MatchArm, MatchExprArm, MatchPattern, MetaField,
     MetaFieldKind, ObjectDecl, ObjectMember, ParamAssignDecl, ParamDecl, ParamType, ParamValue,
     ReturnAbi, SlotDecl, SoundDecl, SpriteDecl, StateDecl, StateInitValue, StateType, StringsDecl,
@@ -437,8 +436,7 @@ impl Parser {
                 };
                 self.tails.remove(at);
                 let span = *span;
-                let V2Stmt::Expr { expr, .. } =
-                    std::mem::replace(last, V2Stmt::Break { span })
+                let V2Stmt::Expr { expr, .. } = std::mem::replace(last, V2Stmt::Break { span })
                 else {
                     unreachable!("matched above")
                 };
@@ -3057,7 +3055,10 @@ impl Parser {
         attrs.only(&["slot", "temp"], "a statement")?;
         if let Some((temp_span, t)) = attrs.temp {
             if attrs.slot.is_some() {
-                return Err(Error::at(span, "'#[slot]' and '#[temp]' cannot be combined"));
+                return Err(Error::at(
+                    span,
+                    "'#[slot]' and '#[temp]' cannot be combined",
+                ));
             }
             if !matches!(&self.peek().kind, TokenKind::Ident(kw) if kw == "for") {
                 return Err(Error::at(

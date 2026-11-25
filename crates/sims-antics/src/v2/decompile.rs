@@ -5206,7 +5206,10 @@ impl Translator<'_> {
             (6, _) => crate::v2::parser::WORLD_GLOBALS
                 .iter()
                 .find(|&&(_, index)| i16::from(index) == i)
-                .map_or_else(|| format!("global[{i}]"), |(name, _)| format!("world.{name}")),
+                .map_or_else(
+                    || format!("global[{i}]"),
+                    |(name, _)| format!("world.{name}"),
+                ),
             (10, _) if i == 0 => "stack_obj".to_owned(),
             (0, false) | (1, true) if i <= self.model.state_limit => format!("self.attr_{i}"),
             (3, false) => format!("self.data[{i}]"),

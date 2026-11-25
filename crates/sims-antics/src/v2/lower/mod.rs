@@ -15,10 +15,11 @@ use crate::parser::{motive_by_name, person_field_by_name, skill_by_name};
 use crate::v2::ast::{
     AbiParam, AbiParamSlot, BconTableDecl, BitflagsDecl, CallArg, ConstIntExpr, EnumDecl,
     ExternBconDecl, ExternModDecl, FnDecl, ForEachIter, FunctionalDecl, GuardBody, GuardDecl,
-    InteractionDecl, MatchArm, MatchExprArm, MatchPattern, MetaField, MetaFieldKind, ObjectDecl,
-    ObjectMember, ParamType, ParamValue, ReturnAbi, SlotDecl, SoundDecl, SpriteDecl, StateDecl,
-    StateInitValue, StateType, StringsDecl, TemplateDecl, TileDecl, TreeFrame, TreeMemberDecl,
-    GuidValue, V2AssignOp, V2BinOp, V2Expr, V2Stmt, V2Type, V2UnaryOp, VariantDecl, object_type_ident,
+    GuidValue, InteractionDecl, MatchArm, MatchExprArm, MatchPattern, MetaField, MetaFieldKind,
+    ObjectDecl, ObjectMember, ParamType, ParamValue, ReturnAbi, SlotDecl, SoundDecl, SpriteDecl,
+    StateDecl, StateInitValue, StateType, StringsDecl, TemplateDecl, TileDecl, TreeFrame,
+    TreeMemberDecl, V2AssignOp, V2BinOp, V2Expr, V2Stmt, V2Type, V2UnaryOp, VariantDecl,
+    object_type_ident,
 };
 use crate::v2::loader::{ModuleScope, ResolvedModule};
 use crate::v2::parser::snake_case_ident;

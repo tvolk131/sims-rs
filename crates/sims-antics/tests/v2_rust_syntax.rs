@@ -5,8 +5,11 @@
 
 use sims_antics::{PackResolverConfig, compile_v2_source, v2};
 
+/// `.air`, IFF bytes and WAV bank (event name, bytes) of one build.
+type Built = (String, Vec<u8>, Vec<(String, Vec<u8>)>);
+
 /// `.air`, IFF bytes and WAV bank of `src` (compiled under one fixed source name).
-fn build(src: &str) -> (String, Vec<u8>, Vec<(String, Vec<u8>)>) {
+fn build(src: &str) -> Built {
     let cfg = PackResolverConfig::default();
     let air = v2::expand_v2_source_to_objects("case.antics", src, &cfg)
         .unwrap_or_else(|e| panic!("must expand: {e}\n{src}"))
@@ -16,7 +19,11 @@ fn build(src: &str) -> (String, Vec<u8>, Vec<(String, Vec<u8>)>) {
         .air_source;
     let compiled = compile_v2_source("case.antics", src, &cfg)
         .unwrap_or_else(|e| panic!("must compile: {e}\n{src}"));
-    (air, compiled.iff_bytes, compiled.sounds_wav.into_iter().collect())
+    (
+        air,
+        compiled.iff_bytes,
+        compiled.sounds_wav.into_iter().collect(),
+    )
 }
 
 fn assert_same(case: &str, new: &str, old: &str) {
@@ -33,7 +40,10 @@ fn expect_err(src: &str, needle: &str) {
         .err()
         .unwrap_or_else(|| panic!("must fail with `{needle}`:\n{src}"))
         .to_string();
-    assert!(err.contains(needle), "expected `{needle}`, got `{err}`\n{src}");
+    assert!(
+        err.contains(needle),
+        "expected `{needle}`, got `{err}`\n{src}"
+    );
 }
 
 /// A synthetic object with states `n`, `m` around `members`.
@@ -53,16 +63,13 @@ fn obj(members: &str) -> String {
 fn diverging_let_arms_match_the_statement_form() {
     assert_same(
         "let if",
-        &obj(
-            "    interaction \"Use\" {
+        &obj("    interaction \"Use\" {
         run(sim) {
             let v = if self.n > 3 { self.n - 3 } else { return false; };
             self.m = v;
         }
-    }",
-        ),
-        &obj(
-            "    interaction \"Use\" {
+    }"),
+        &obj("    interaction \"Use\" {
         run(sim) {
             let v: i16;
             if self.n > 3 {
@@ -72,22 +79,18 @@ fn diverging_let_arms_match_the_statement_form() {
             }
             self.m = v;
         }
-    }",
-        ),
+    }"),
     );
     assert_same(
         "let match in a loop",
-        &obj(
-            "    main {
+        &obj("    main {
         loop {
             let step = match self.n { 0 => break, 1 => continue, _ => self.n };
             self.m += step;
             sleep(1);
         }
-    }",
-        ),
-        &obj(
-            "    main {
+    }"),
+        &obj("    main {
         loop {
             let step: i16;
             match self.n {
@@ -98,8 +101,7 @@ fn diverging_let_arms_match_the_statement_form() {
             self.m += step;
             sleep(1);
         }
-    }",
-        ),
+    }"),
     );
 }
 
@@ -107,8 +109,7 @@ fn diverging_let_arms_match_the_statement_form() {
 fn tail_expressions_are_returns() {
     assert_same(
         "tail",
-        &obj(
-            "    fn bigger(a: i16, b: i16) -> i16 {
+        &obj("    fn bigger(a: i16, b: i16) -> i16 {
         if a > b { a } else { b }
     }
     fn is_big(a: i16) -> bool {
@@ -120,10 +121,8 @@ fn tail_expressions_are_returns() {
             self.m = bigger(self.n, 4);
             return is_big(self.n);
         }
-    }",
-        ),
-        &obj(
-            "    fn bigger(a: i16, b: i16) -> i16 {
+    }"),
+        &obj("    fn bigger(a: i16, b: i16) -> i16 {
         if a > b {
             return a;
         } else {
@@ -139,8 +138,7 @@ fn tail_expressions_are_returns() {
             self.m = bigger(self.n, 4);
             return is_big(self.n);
         }
-    }",
-        ),
+    }"),
     );
     expect_err(
         &obj("    main { self.n = 1; self.m loop { sleep(1); } }"),
@@ -152,26 +150,22 @@ fn tail_expressions_are_returns() {
 fn typed_engine_fields_read_the_raw_cells() {
     assert_same(
         "world/object/person fields",
-        &obj(
-            "    interaction \"Use\" {
+        &obj("    interaction \"Use\" {
         run(sim) {
             self.n = world.hour + world.minute;
             if self.broken == 0 {
                 self.m = sim.job_level;
             }
         }
-    }",
-        ),
-        &obj(
-            "    interaction \"Use\" {
+    }"),
+        &obj("    interaction \"Use\" {
         run(sim) {
             self.n = global[0] + global[5];
             if self.data[15] == 0 {
                 self.m = sim.person[57];
             }
         }
-    }",
-        ),
+    }"),
     );
 }
 
@@ -318,8 +312,7 @@ fn const_params_specialize_and_require_constants() {
 
 #[test]
 fn temp_range_loops_count_in_the_temp() {
-    let (air, _, _) = build(&obj(
-        "    main {
+    let (air, _, _) = build(&obj("    main {
         #[temp(0)]
         for i in 0..18 {
             self.n += i;
@@ -332,10 +325,8 @@ fn temp_range_loops_count_in_the_temp() {
             self.m -= j;
         }
         loop { sleep(1); }
-    }",
-    ));
-    let (plain, _, _) = build(&obj(
-        "    main {
+    }"));
+    let (plain, _, _) = build(&obj("    main {
         for i in 0..18 {
             self.n += i;
         }
@@ -346,8 +337,7 @@ fn temp_range_loops_count_in_the_temp() {
             self.m -= j;
         }
         loop { sleep(1); }
-    }",
-    ));
+    }"));
     // The same nodes, with the counters in temps instead of frame locals.
     let renamed = plain
         .replace("let __v_i_0 = ", "temp[0] := ")
@@ -376,25 +366,21 @@ fn temp_range_loops_count_in_the_temp() {
 fn methods_match_the_call_forms() {
     assert_same(
         "methods",
-        &obj(
-            "    sound ping = fwav(3);
+        &obj("    sound ping = fwav(3);
     interaction \"Use\" {
         run(sim) {
             self.play_sound(ping);
             self.refresh(0);
             sim.debit_funds(5, category: 2);
         }
-    }",
-        ),
-        &obj(
-            "    sound ping = fwav(3);
+    }"),
+        &obj("    sound ping = fwav(3);
     interaction \"Use\" {
         run(sim) {
             play_sound(ping);
             refresh(target: self, mode: 0);
             debit_funds(5, category: 2);
         }
-    }",
-        ),
+    }"),
     );
 }
