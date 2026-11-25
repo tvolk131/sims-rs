@@ -273,6 +273,7 @@ pub fn decompile_iff_to_v2_report(
                     && !tree.is_some_and(|id| plan.add_frame(&model, id))
                     && !tree.is_some_and(|id| plan.keep_temps_raw(id, &generated))
                     && !tree.is_some_and(|id| plan.unmerge(id, &generated))
+                    && !tree.is_some_and(|id| plan.drop_wave2(id, &generated))
                     && !tree.is_some_and(|id| plan.name_builtin_locals_only(id, &generated))
                     && !tree.is_some_and(|id| plan.drop_inherit(&model, id))
                     && !tree.is_some_and(|id| plan.drop_extras(id, &generated))
@@ -291,6 +292,7 @@ pub fn decompile_iff_to_v2_report(
                             || plan.add_frame(&model, id)
                             || plan.keep_temps_raw(id, &generated)
                             || plan.unmerge(id, &generated)
+                            || plan.drop_wave2(id, &generated)
                             || plan.name_builtin_locals_only(id, &generated)
                             || plan.drop_inherit(&model, id)
                             || plan.drop_extras(id, &generated)
@@ -321,6 +323,7 @@ pub fn decompile_iff_to_v2_report(
                         changed |= plan.keep_temps_raw(id, &generated)
                             || plan.fix_locals(id)
                             || plan.unmerge(id, &generated)
+                            || plan.drop_wave2(id, &generated)
                             || plan.name_builtin_locals_only(id, &generated)
                             || plan.drop_inherit(&model, id)
                             || plan.drop_extras(id, &generated)
@@ -2973,7 +2976,6 @@ fn prim_operands<'a>(p: &'a PrimitiveCall, out: &mut Vec<&'a OperandRef>) {
         PrimitiveCall::AlterBudget { amount, .. } => out.push(amount),
         PrimitiveCall::TestObjectType { object, .. } => out.push(object),
         PrimitiveCall::Breakpoint { cond } => out.push(cond),
-        PrimitiveCall::SetToNext { dest: Some(d), .. } => out.push(d),
         PrimitiveCall::Padded { call, .. } => prim_operands(call, out),
         _ => {}
     }
@@ -3247,8 +3249,9 @@ fn call_params(arity: usize) -> impl Iterator<Item = String> {
     (0..arity).map(|i| format!("arg_{i}: i16"))
 }
 
-/// The highest slot that needs a named declaration for a primitive's local arguments.
-fn builtin_local(s: &Stmt) -> Option<u16> {
+/// The highest slot that needs a named declaration for a primitive's local arguments;
+/// `wave2` adds the operands only the wave 2 spellings name (see [`Translator::wave2`]).
+fn builtin_local(s: &Stmt, wave2: bool) -> Option<u16> {
     let prim = match s {
         Stmt::Primitive {
             prim,
@@ -3283,7 +3286,8 @@ fn builtin_local(s: &Stmt) -> Option<u16> {
             flags,
             ..
         } if flags & 1 != 0 || *i != 0 => Some(u16::from(*i)),
-        // Mode 9 reads a local; a `dest:` may be one.
+        // Mode 9 reads a local; the `dest:` of an `if` or a statement may be one. A loop's
+        // is not counted: as a `for`, v2 gives the cursor its own slot.
         PrimitiveCall::SetToNext {
             mode, local, dest, ..
         } => {
@@ -3293,6 +3297,7 @@ fn builtin_local(s: &Stmt) -> Option<u16> {
             };
             let dest = dest
                 .as_ref()
+                .filter(|_| wave2 && !matches!(s, Stmt::While { .. }))
                 .and_then(direct_local)
                 .and_then(|v| u16::try_from(v).ok());
             read.into_iter().chain(dest).max()
@@ -3304,6 +3309,10 @@ fn builtin_local(s: &Stmt) -> Option<u16> {
             ..
         } => {
             let value = direct_local(value).and_then(|v| u16::try_from(v).ok());
+            // Without wave 2 only a local value is spelled.
+            if value.is_none() && !wave2 {
+                return None;
+            }
             let local = (matches!(direction, 2 | 3) || *i != 0).then_some(u16::from(*i));
             value.into_iter().chain(local).max()
         }
@@ -3312,13 +3321,13 @@ fn builtin_local(s: &Stmt) -> Option<u16> {
             mode: 8 | 9,
             local: LocalRef::Index(i),
             ..
-        } => Some(u16::from(*i)),
+        } if wave2 => Some(u16::from(*i)),
         // Flag 0x01: the icon is read from a local.
         PrimitiveCall::PushInteraction {
             flags,
             icon_local: LocalRef::Index(i),
             ..
-        } if flags & 0x03 == 0x01 => Some(u16::from(*i)),
+        } if flags & 0x03 == 0x01 && wave2 => Some(u16::from(*i)),
         _ => None,
     }
 }
@@ -3395,6 +3404,9 @@ struct Plan {
     /// them (see [`Translator::call`]) did not compile or was not proven: v2 copies the temps
     /// through frame locals, which a dialog's `$Local` tokens may read.
     temps_raw: BTreeSet<u16>,
+    /// Trees written without the wave 2 spellings (see [`Translator::wave2`]), after a round
+    /// that used them did not compile or was not proven.
+    pre_wave2: BTreeSet<u16>,
     /// Trees that keep the original's locals, after a round with more (see
     /// [`Plan::grow_locals`]) was not proven: a dialog's `$Local` tokens read the frame, so
     /// the idiom that needed the words goes raw instead.
@@ -3481,6 +3493,7 @@ impl Plan {
             locals: BTreeMap::new(),
             unmerged: BTreeSet::new(),
             temps_raw: BTreeSet::new(),
+            pre_wave2: BTreeSet::new(),
             fixed_locals: BTreeSet::new(),
         }
     }
@@ -3562,8 +3575,6 @@ impl Plan {
         }
     }
 
-    /// Names tree `id`'s locals only where builtins address them from now on, when the last
-    /// round named others. `false` when it did not.
     /// Writes tree `id`'s `if` chains arm by arm from now on, when the last round merged
     /// arms. `false` when it did not.
     fn unmerge(&mut self, id: u16, generated: &Generated) -> bool {
@@ -3580,6 +3591,21 @@ impl Plan {
         changed
     }
 
+    /// Writes tree `id` without the wave 2 spellings from now on, with the original's
+    /// locals, when the last round used them. `false` when it did not. Tried before the
+    /// older extras are dropped, so a new spelling that breaks a tree costs it no more
+    /// than the new spellings.
+    fn drop_wave2(&mut self, id: u16, generated: &Generated) -> bool {
+        let changed = generated.wave2.contains(&id) && self.pre_wave2.insert(id);
+        if changed {
+            self.locals.remove(&id);
+            self.fixed_locals.insert(id);
+        }
+        changed
+    }
+
+    /// Names tree `id`'s locals only where builtins address them from now on, when the last
+    /// round named others. `false` when it did not.
     fn name_builtin_locals_only(&mut self, id: u16, generated: &Generated) -> bool {
         generated.named_other_locals.contains(&id) && self.builtin_locals_only.insert(id)
     }
@@ -3802,6 +3828,8 @@ struct Generated {
     merged: BTreeSet<u16>,
     /// Trees that named a temps call to a tree with arguments (see [`Plan::keep_temps_raw`]).
     temps_named: BTreeSet<u16>,
+    /// Trees that wrote a wave 2 spelling (see [`Plan::drop_wave2`]).
+    wave2: BTreeSet<u16>,
     /// Raw-level trees whose lines name BCON entries.
     raw_bcons_named: BTreeSet<u16>,
     /// 0-based lines holding the `variant` members.
@@ -3840,6 +3868,7 @@ impl Model {
         let mut named_other_locals = BTreeSet::new();
         let mut merged = BTreeSet::new();
         let mut temps_named = BTreeSet::new();
+        let mut wave2 = BTreeSet::new();
         let mut raw_bcons_named = BTreeSet::new();
         out.line("// Decompiled by `sims-antics lift --v2`.");
         if self.behavioral {
@@ -4080,8 +4109,9 @@ impl Model {
                     let mut named_locals = 0;
                     if as_lifecycle.is_none() && !plan.plain.contains(&t.id) {
                         let mut builtin_locals = 0;
+                        let wave2 = !plan.pre_wave2.contains(&t.id);
                         walk_stmts(body, &mut |s| {
-                            if let Some(index) = builtin_local(s)
+                            if let Some(index) = builtin_local(s, wave2)
                                 && index < t.original.locals
                             {
                                 builtin_locals = builtin_locals.max(index + 1);
@@ -4124,6 +4154,7 @@ impl Model {
                         extras: std::cell::Cell::new(false),
                         merged: false,
                         temps_named: std::cell::Cell::new(false),
+                        wave2_used: std::cell::Cell::new(false),
                         stack_moves: sim && assigns_stack_obj(body),
                     };
                     if named_locals > 0 && tr.extra() {
@@ -4151,6 +4182,9 @@ impl Model {
                     }
                     if tr.temps_named.get() {
                         temps_named.insert(t.id);
+                    }
+                    if tr.wave2_used.get() {
+                        wave2.insert(t.id);
                     }
                 }
                 _ => {
@@ -4234,6 +4268,7 @@ impl Model {
             named_other_locals,
             merged,
             temps_named,
+            wave2,
             raw_bcons_named,
             variant_lines,
             strings_lines,
@@ -4436,6 +4471,8 @@ struct Translator<'a> {
     merged: bool,
     /// Whether a temps call to a tree with arguments was named (see [`Plan::keep_temps_raw`]).
     temps_named: std::cell::Cell<bool>,
+    /// Whether a wave 2 spelling was written (see [`Translator::wave2`]).
+    wave2_used: std::cell::Cell<bool>,
     /// A Sim tree that assigns `stack_obj`: the stack object's cells are written
     /// `stack_obj.attr[i]` / `stack_obj.slot[i]` (the same operands), since `self` would
     /// name another object after the assignment (lint `stack_obj_clobber_after_self`).
@@ -4455,6 +4492,19 @@ impl Translator<'_> {
             return false;
         }
         self.extras.set(true);
+        true
+    }
+
+    /// [`Self::extra`] for the wave 2 spellings (`?`, joined arms, `.remove()`,
+    /// `set_to_next` into a cell, `find_best_object` and dialogs as conditions, the
+    /// definition and job cells, `create_object`, icon locals, relationship values, motive
+    /// changes, named temps calls), noting that one is written. A tree one of them breaks is
+    /// written without all of them ([`Plan::drop_wave2`]) before it loses the older extras.
+    fn wave2(&self) -> bool {
+        if self.plan.pre_wave2.contains(&self.tree.id) || !self.extra() {
+            return false;
+        }
+        self.wave2_used.set(true);
         true
     }
 
@@ -4589,7 +4639,7 @@ impl Translator<'_> {
                         Some(c.as_str())
                     })
                     .filter(|t| is_call_text(t))
-                    && self.extra()
+                    && self.wave2()
                 {
                     self.flush_raw(out);
                     let start = out.lines.len();
@@ -5032,7 +5082,7 @@ impl Translator<'_> {
                 changed = true;
             }
         }
-        if !changed || !self.extra() {
+        if !changed || !self.wave2() {
             return false;
         }
         let pad = " ".repeat(indent);
@@ -5825,7 +5875,7 @@ impl Translator<'_> {
             if let Some(&arity) = self.model.literal_calls.get(&id)
                 && self.model.behavioral
                 && !self.plan.temps_raw.contains(&self.tree.id)
-                && self.extra()
+                && self.wave2()
             {
                 self.temps_named.set(true);
                 params.extend((0..arity).map(|i| format!("temp[{i}]")));
@@ -5854,13 +5904,14 @@ impl Translator<'_> {
                     let not = if *op == CompareOp::Ne { "!" } else { "" };
                     return Some(format!("{not}{flags}.is_empty()"));
                 }
-                // `x.has_function[N]` is a bool: it is the test against 0. v2 names functions
-                // 0..=255.
+                // `x.has_function[N]` is a bool: it is the test against 0 (`!= 0` only; `> 0`
+                // differs for a negative cell, which the checker cannot rule out). v2 names
+                // functions 0..=255.
                 if let OperandRef::Direct(Operand { scope: 35, index }) = lhs
                     && (0..=255).contains(index)
                     && is_operand(rhs, 7, 0)
-                    && matches!(op, CompareOp::Eq | CompareOp::Ne | CompareOp::Gt)
-                    && self.extra()
+                    && matches!(op, CompareOp::Eq | CompareOp::Ne)
+                    && self.wave2()
                 {
                     let not = if *op == CompareOp::Eq { "!" } else { "" };
                     let handle = self.definition_handle()?;
@@ -5978,13 +6029,13 @@ impl Translator<'_> {
             }
             PrimitiveCall::Animate { .. } => self.animate(p),
             PrimitiveCall::RemoveObject { target, flags } => self.remove_object(*target, *flags),
-            PrimitiveCall::Dialog { .. } => self.dialog(p),
+            PrimitiveCall::Dialog { .. } if self.wave2() => self.dialog(p),
             // Find Best Object's own node: true selects the object found.
             PrimitiveCall::FindBestObject {
                 function,
                 flags,
                 origin: None,
-            } if self.cursor.is_none() && self.extra() => {
+            } if self.cursor.is_none() && self.wave2() => {
                 let kind = crate::parser::FUNCTION_KINDS
                     .iter()
                     .find(|k| k.function == *function)?;
@@ -6009,7 +6060,7 @@ impl Translator<'_> {
     /// (`self` in an object's own tree, `sim` in a Sim tree, `me` in an inherit tree), 1 the
     /// stack object (`stack_obj`, or the cursor binding that holds it).
     fn remove_object(&self, target: u16, flags: u8) -> Option<String> {
-        if !self.extra() {
+        if !self.wave2() {
             return None;
         }
         let receiver = match target {
@@ -6146,12 +6197,14 @@ impl Translator<'_> {
                 format!("stack_obj.run_functional({function}{icon})")
             }
             PrimitiveCall::SetToNext { .. } => return self.set_to_next(p),
-            PrimitiveCall::ClearMotiveChanges => "clear_motive_changes()".to_owned(),
+            PrimitiveCall::ClearMotiveChanges if self.wave2() => {
+                "clear_motive_changes()".to_owned()
+            }
             PrimitiveCall::SetMotiveChange {
                 motive,
                 delta_per_hour,
                 stop_at,
-            } if *motive < 16 && self.extra() => {
+            } if *motive < 16 && self.wave2() => {
                 const NAMES: [(u8, &str); 10] = [
                     (3, "Mood"),
                     (5, "Energy"),
@@ -6181,7 +6234,7 @@ impl Translator<'_> {
                 mode,
                 flags,
                 local: LocalRef::Index(local),
-            } if self.cursor.is_none() && self.extra() => {
+            } if self.cursor.is_none() && self.wave2() => {
                 let local = match (mode, local) {
                     (8 | 9, i) => format!(", local: {}", self.local_name(u16::from(*i))?),
                     (_, 0) => String::new(),
@@ -6227,7 +6280,7 @@ impl Translator<'_> {
                 priority,
                 flags,
                 icon_local: LocalRef::Index(icon),
-            } if flags & 0x03 == 0x01 && self.extra() => format!(
+            } if flags & 0x03 == 0x01 && self.wave2() => format!(
                 "push_interaction(menu: {menu}, object: {object_slot}, priority: {priority}, flags: {flags}, icon: {})",
                 self.local_name(u16::from(*icon))?
             ),
@@ -6326,8 +6379,12 @@ impl Translator<'_> {
                     OperandRef::Direct(Operand { scope: 25, index }) => {
                         self.local_name(u16::try_from(*index).ok()?)?
                     }
-                    OperandRef::Direct(Operand { scope: 8 | 9, .. }) => self.lvalue(value)?,
-                    OperandRef::Direct(Operand { scope: 7, index }) if flags & 4 != 0 => {
+                    OperandRef::Direct(Operand { scope: 8 | 9, .. }) if self.wave2() => {
+                        self.lvalue(value)?
+                    }
+                    OperandRef::Direct(Operand { scope: 7, index })
+                        if flags & 4 != 0 && self.wave2() =>
+                    {
                         index.to_string()
                     }
                     _ => return None,
@@ -6388,7 +6445,8 @@ impl Translator<'_> {
             Some(d) if is_operand(d, 10, 0) => ", dest: stack_obj".to_owned(),
             // A local, a parameter or a temp (`temp[0]` to `temp[7]`).
             Some(OperandRef::Direct(Operand { scope, index }))
-                if *scope == 25 || *scope == 9 || (*scope == 8 && (0..8).contains(index)) =>
+                if (*scope == 25 || *scope == 9 || (*scope == 8 && (0..8).contains(index)))
+                    && self.wave2() =>
             {
                 format!(", dest: {}", self.lvalue(dest.as_ref()?)?)
             }
@@ -6482,7 +6540,7 @@ impl Translator<'_> {
             }
             3 if self.sim && o.index == 2 && self.extra() => Some("sim.container".to_owned()),
             // The stack object's definition words (read-only).
-            21 if matches!(o.index, 9 | 11) && self.extra() => {
+            21 if matches!(o.index, 9 | 11) && self.wave2() => {
                 let field = if o.index == 9 {
                     "object_type"
                 } else {
@@ -6491,7 +6549,7 @@ impl Translator<'_> {
                 Some(format!("{}.{field}", self.definition_handle()?))
             }
             // A field of the job named by `temp[0]` (career) and `temp[1]` (level).
-            33 if o.index >= 0 && self.extra() => Some(format!("job_field({})", o.index)),
+            33 if o.index >= 0 && self.wave2() => Some(format!("job_field({})", o.index)),
             19 if o.index == 65 && self.person_binding().is_some() => {
                 Some(format!("{}.kind", self.person_binding()?))
             }

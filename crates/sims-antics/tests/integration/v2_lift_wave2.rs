@@ -343,3 +343,68 @@ fn shared_tails_keep_the_comments_before_them() {
     let trap = tree(&lifted, 4300);
     assert_eq!(trap.matches("breakpoint(1);").count(), 1, "{trap}");
 }
+
+#[test]
+fn function_cells_tested_above_zero_stay_scoped_and_cost_nothing_else() {
+    // `x.has_function[N]` is the test `!= 0`; `> 0` differs for a negative cell, so it
+    // keeps its scope spelling, and the rest of the tree lifts as before.
+    let source = r#"object "Fable Hearth" {
+    guid: 0x7E00_015A;
+    #[bhav(id = 4300, args = 1, locals = 3)]
+    fn go() {
+        raw {
+            local[0] := 0;
+            local[1] := 1000;
+            stack_obj := 0;
+            param[0] := 5;
+            while set_to_next(6, guid: 0x00000000, dest: stack_obj) {
+                if scope(35, 19) > 0 {
+                    get_distance_to(temp[0], from: my.data[11]);
+                    if temp[0] < local[1] {
+                        local[0] := stack_obj;
+                        local[1] := temp[0];
+                    }
+                }
+            }
+            if local[0] == 0 {
+                return true;
+            }
+            stack_obj := local[0];
+            temp[3] := 1;
+            return true;
+        }
+    }
+}"#;
+    for behavioral in [false, true] {
+        let lifted = lift(source, behavioral);
+        let go = tree(&lifted, 4300);
+        lacks(go, &["has_function"]);
+        assert!(go.matches("raw {").count() <= 1, "{go}");
+    }
+}
+
+#[test]
+fn for_loop_cursors_are_not_builtin_locals() {
+    let source = r#"object "Fable Sieve" {
+    guid: 0x7E00_015B;
+    #[bhav(id = 4300, locals = 2)]
+    fn scan() {
+        for p in lot.objects() {
+            raw {
+                temp[2] := scope(21, 30);
+            }
+            temp[3] = 7;
+        }
+        temp[1] = self.slot[3];
+    }
+}"#;
+    // Strict mode keeps the header; behavioral mode may give the cursor its own words
+    // instead of dropping the pins on the saved object's.
+    let strict = lift(source, false);
+    has(
+        tree(&strict, 4300),
+        &["temp[1] = self.slot[3];", "locals = 2,"],
+    );
+    let behavioral = lift(source, true);
+    has(tree(&behavioral, 4300), &["temp[1] = self.slot[3];"]);
+}
