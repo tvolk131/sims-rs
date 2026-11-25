@@ -304,18 +304,7 @@ pub fn decompile_iff_to_v2_report(
                 }
             }
             Ok(recompiled) => {
-                let mut checks = BTreeMap::new();
-                let mut unproven = Vec::new();
-                for t in model.trees.iter().filter(|t| t.omitted.is_none()) {
-                    let mut check = model.check_tree(t, &recompiled, &mut cache);
-                    if !matches!(check, TreeCheck::Identical | TreeCheck::Equivalent) {
-                        unproven.push(t.id);
-                    } else if let Some(gap) = model.object_gap(t, &recompiled) {
-                        // Settled: no other spelling of the tree closes it.
-                        check = TreeCheck::Inconclusive(gap);
-                    }
-                    checks.insert(t.id, check);
-                }
+                let (checks, unproven) = model.check_all(&recompiled, &mut cache);
                 // A block given its header may be all its callers were missing (a caller is
                 // proven only with its callees), so such a round lowers nothing else.
                 let mut changed = false;
@@ -335,15 +324,11 @@ pub fn decompile_iff_to_v2_report(
                 if changed {
                     continue;
                 }
-                // Engine cells with a typed name take it when the object builds to the same
-                // bytes, so every check above still holds.
-                let text = type_engine_fields(&generated.text)
-                    .filter(|typed| {
-                        model
-                            .compile(typed)
-                            .is_ok_and(|r| r.iff_bytes == recompiled.iff_bytes)
-                    })
-                    .unwrap_or_else(|| generated.text.clone());
+                let (text, recompiled, mut checks) = model.type_engine_fields(
+                    &generated.text,
+                    (recompiled, checks, &unproven),
+                    &mut cache,
+                );
                 let source = format_v2_source(&text)?;
                 let mut trees: Vec<DecompiledTree> = model
                     .trees
@@ -373,30 +358,82 @@ pub fn decompile_iff_to_v2_report(
     Err(Error::new("decompiler validation did not converge"))
 }
 
-/// `text` with every engine cell that lint `untyped_engine_field` finds spelled by number
-/// written by its typed name (`sim.slot[0]` is `sim.hand`), using the lint's own table and
-/// rules. `None` when there is none, or the text does not lint.
-fn type_engine_fields(text: &str) -> Option<String> {
-    let diags = crate::v2::lint::lint_v2_source(text, "decompiled.antics").ok()?;
-    let mut fixes: Vec<(usize, usize, &str)> = diags
-        .iter()
+/// Lint `untyped_engine_field`'s suggestion: `(line, column, typed name)`, 1-based, for the
+/// cell spelled from the column through its index's `]` (`global[3]`, `sim.slot[0]`).
+type EngineFieldFix = (usize, usize, String);
+
+/// Every engine cell spelled by number that has a typed name, by lint
+/// `untyped_engine_field`'s own table and rules. Empty when the text does not lint.
+fn engine_field_fixes(text: &str) -> Vec<EngineFieldFix> {
+    let Ok(diags) = crate::v2::lint::lint_v2_source(text, "decompiled.antics") else {
+        return Vec::new();
+    };
+    diags
+        .into_iter()
         .filter(|d| d.rule == crate::v2::lint::UNTYPED_ENGINE_FIELD)
-        .filter_map(|d| Some((d.line, d.column, d.suggestion.as_deref()?)))
-        .collect();
-    if fixes.is_empty() {
-        return None;
-    }
+        .filter_map(|d| Some((d.line, d.column, d.suggestion?)))
+        .collect()
+}
+
+/// `text` with `fixes` applied. `None` when one does not fit the text.
+fn apply_engine_field_fixes(text: &str, fixes: &[EngineFieldFix]) -> Option<String> {
+    let mut sorted: Vec<&EngineFieldFix> = fixes.iter().collect();
     // Right to left, so earlier columns on a line stay put.
-    fixes.sort_unstable_by(|a, b| b.cmp(a));
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
     let mut lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
-    for (line, column, typed) in fixes {
+    for (line, column, typed) in sorted {
         let l = lines.get_mut(line.checked_sub(1)?)?;
         let start = column.checked_sub(1)?;
-        // The finding spans the root through the index's `]` (`global[3]`, `sim.slot[0]`).
         let end = start + l.get(start..)?.find(']')? + 1;
         l.replace_range(start..end, typed);
     }
     Some(lines.join("\n"))
+}
+
+/// `text` with an `allow(untyped_engine_field)` line above each line holding a cell of
+/// `left` (whose typed name builds other nodes that are not proven the same).
+fn allow_engine_fields(text: &str, left: &[EngineFieldFix]) -> String {
+    let mut by_line: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
+    for (line, _, typed) in left {
+        let names = by_line.entry(*line).or_default();
+        if !names.contains(&typed.as_str()) {
+            names.push(typed);
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    for (n, l) in text.split('\n').enumerate() {
+        if n > 0 {
+            out.push('\n');
+        }
+        if let Some(names) = by_line.get(&(n + 1)) {
+            let indent = &l[..l.len() - l.trim_start().len()];
+            let names: Vec<String> = names.iter().map(|t| format!("`{t}`")).collect();
+            out.push_str(&format!(
+                "{indent}// antics-lint: allow(untyped_engine_field): {} builds other nodes, not proven the same here\n",
+                names.join(", ")
+            ));
+        }
+        out.push_str(l);
+    }
+    out
+}
+
+/// The fixes `ok` accepts, found by halving: a set `ok` refuses is split until each part is
+/// accepted or is one fix (which is dropped).
+fn keep_fixes(
+    fixes: &[EngineFieldFix],
+    ok: &dyn Fn(&[EngineFieldFix]) -> bool,
+) -> Vec<EngineFieldFix> {
+    if fixes.is_empty() || ok(fixes) {
+        return fixes.to_vec();
+    }
+    if fixes.len() == 1 {
+        return Vec::new();
+    }
+    let (a, b) = fixes.split_at(fixes.len() / 2);
+    let mut kept = keep_fixes(a, ok);
+    kept.extend(keep_fixes(b, ok));
+    kept
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1165,6 +1202,71 @@ impl Model {
         };
         cache.insert(key, check.clone());
         check
+    }
+
+    /// Checks every tree that is written: each tree's check, and the trees not proven.
+    fn check_all(
+        &self,
+        recompiled: &RecompiledFile,
+        cache: &mut BTreeMap<(u16, String, String), TreeCheck>,
+    ) -> (BTreeMap<u16, TreeCheck>, Vec<u16>) {
+        let mut checks = BTreeMap::new();
+        let mut unproven = Vec::new();
+        for t in self.trees.iter().filter(|t| t.omitted.is_none()) {
+            let mut check = self.check_tree(t, recompiled, cache);
+            if !matches!(check, TreeCheck::Identical | TreeCheck::Equivalent) {
+                unproven.push(t.id);
+            } else if let Some(gap) = self.object_gap(t, recompiled) {
+                // Settled: no other spelling of the tree closes it.
+                check = TreeCheck::Inconclusive(gap);
+            }
+            checks.insert(t.id, check);
+        }
+        (checks, unproven)
+    }
+
+    /// The final `text` with engine cells that have a typed name written by it (lint
+    /// `untyped_engine_field`'s suggestions), with what it compiles to and its checks.
+    /// - Every suggestion is taken when the object builds to the same bytes, or when every
+    ///   tree proven with the numbers is still proven (a typed name may lower to other
+    ///   nodes: `stack_obj = self.id` is not a copy of data word 11).
+    /// - Otherwise the suggestions that keep the bytes are taken, and each cell left by
+    ///   number carries an `allow` saying why.
+    fn type_engine_fields(
+        &self,
+        text: &str,
+        (recompiled, checks, unproven): (RecompiledFile, BTreeMap<u16, TreeCheck>, &[u16]),
+        cache: &mut BTreeMap<(u16, String, String), TreeCheck>,
+    ) -> (String, RecompiledFile, BTreeMap<u16, TreeCheck>) {
+        let fixes = engine_field_fixes(text);
+        let typed = |fixes: &[EngineFieldFix]| {
+            let t = apply_engine_field_fixes(text, fixes)?;
+            let r = self.compile(&t).ok()?;
+            Some((t, r))
+        };
+        let Some((all, all_compiled)) = (!fixes.is_empty()).then(|| typed(&fixes)).flatten() else {
+            return (text.to_owned(), recompiled, checks);
+        };
+        if all_compiled.iff_bytes == recompiled.iff_bytes {
+            return (all, recompiled, checks);
+        }
+        let (all_checks, all_unproven) = self.check_all(&all_compiled, cache);
+        if all_unproven.iter().all(|id| unproven.contains(id)) {
+            return (all, all_compiled, all_checks);
+        }
+        let same = |fixes: &[EngineFieldFix]| {
+            typed(fixes).is_some_and(|(_, r)| r.iff_bytes == recompiled.iff_bytes)
+        };
+        let mut kept = keep_fixes(&fixes, &same);
+        let base = match (!kept.is_empty()).then(|| typed(&kept)).flatten() {
+            Some((t, r)) if r.iff_bytes == recompiled.iff_bytes => t,
+            _ => {
+                kept.clear();
+                text.to_owned()
+            }
+        };
+        let left: Vec<EngineFieldFix> = fixes.into_iter().filter(|f| !kept.contains(f)).collect();
+        (allow_engine_fields(&base, &left), recompiled, checks)
     }
 
     /// Why tree `t`, proven by its code, still may not behave the same in the rebuilt
@@ -6643,6 +6745,29 @@ object "Fable Lamp" {
         has(
             &lifted,
             &["sim.posture = 1;", "self.in_use = 1;", "world.hour > 20"],
+        );
+    }
+
+    #[test]
+    fn typed_engine_fields_keep_what_builds_the_same_and_allow_the_rest() {
+        let text = "fn f() {\n    stack_obj = self.data[11];\n    x = sim.slot[0] + global[0];\n}";
+        let fix = |line, column, typed: &str| (line, column, typed.to_owned());
+        let fixes = vec![
+            fix(2, 17, "self.id"),
+            fix(3, 9, "sim.hand"),
+            fix(3, 23, "world.hour"),
+        ];
+        assert_eq!(
+            apply_engine_field_fixes(text, &fixes).as_deref(),
+            Some("fn f() {\n    stack_obj = self.id;\n    x = sim.hand + world.hour;\n}")
+        );
+        // Halving keeps every fix the check accepts and drops only the one it refuses.
+        let ok = |fs: &[EngineFieldFix]| fs.iter().all(|f| f.2 != "self.id");
+        assert_eq!(keep_fixes(&fixes, &ok), fixes[1..].to_vec());
+        assert_eq!(
+            allow_engine_fields(text, &fixes[..1]),
+            "fn f() {\n    // antics-lint: allow(untyped_engine_field): `self.id` builds other nodes, \
+             not proven the same here\n    stack_obj = self.data[11];\n    x = sim.slot[0] + global[0];\n}"
         );
     }
 

@@ -87,9 +87,16 @@ An engine cell spelled by number that has a typed name (`sim.slot[0]` is `sim.ha
 `self.data[25]` is `self.in_use`, `global[0]` is `world.hour`) is written by that name. The
 names and their rules (writable or not, `ObjectId` only where compared or assigned whole)
 are lint `untyped_engine_field`'s (#465). The lift runs that lint on its final text and
-applies its suggestions, so the two cannot disagree. The typed text is kept only when the
-object it builds is byte-identical to the proven one, so every check still holds.
-Otherwise the numbered spelling stays.
+applies its suggestions, so the two cannot disagree. Every check still holds:
+
+- The suggestions are all taken when the object builds byte-identical to the proven one.
+- A typed name is not always a copy of the cell: `stack_obj = self.id` lowers to other
+  nodes than `stack_obj = self.data[11]`, and so do some `me.room` and `sim.id` uses. When
+  the bytes differ, every tree is checked again. The suggestions are all taken if no tree
+  proven with the numbers loses its proof.
+- Otherwise the suggestions that keep the bytes are found by halving the set and taken.
+  Each cell left by number carries `// antics-lint: allow(untyped_engine_field): `..`
+  builds other nodes, not proven the same here`.
 
 ## What stays raw, and why
 
@@ -118,9 +125,11 @@ candidate entries (1,191 objects lifted, 0 timeouts) in each mode.
 | Lines inside `raw {}` blocks | 688,611 | 678,326 | 480,974 | 255,898 |
 | `bcon[N]` references | 36,235 | 4,597 | 25,785 | 4,664 |
 | Files with `more_globals` | 862 | 105 | 862 | 105 |
-| Lines | 978,887 | 971,896 | 1,200,670 | 1,138,150 |
+| Lines | 978,887 | 971,920 | 1,200,670 | 1,138,177 |
 | fmt-dirty files | 0 | 0 | 0 | 0 |
 | Lint findings | 7 | 12 | 102 | 100 |
+| `untyped_engine_field` (#465's lint, run on both) | 796 | 0 | 11,149 | 0 |
+| Cells left by number with an `allow` | – | 24 | – | 27 |
 
 - **Verdicts.** Every inconclusive tree is still inconclusive for an object-level reason, as
   before. Two strict trees and eight behavioral trees move from identical to equivalent: they
