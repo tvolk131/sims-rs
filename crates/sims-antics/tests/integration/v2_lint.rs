@@ -93,6 +93,11 @@ fn the_rule_table_lists_every_rule() {
         "dialog_local_slot_mismatch",
         "raw_bare_call_false_exit",
         "missing_sim_frame_args",
+        "shadowed_const",
+        "duplicate_std_global",
+        "untyped_engine_field",
+        "raw_syntax",
+        "object_tree_me_field",
     ] {
         assert!(names.contains(&expected), "{expected} missing");
     }
@@ -101,7 +106,14 @@ fn the_rule_table_lists_every_rule() {
         .filter(|r| !r.suppressible)
         .map(|r| r.name)
         .collect();
-    assert_eq!(unsuppressible, [ENUM_WILDCARD_ALL_COVERED]);
+    assert_eq!(
+        unsuppressible,
+        [
+            ENUM_WILDCARD_ALL_COVERED,
+            "raw_syntax",
+            "object_tree_me_field"
+        ]
+    );
 }
 
 #[test]
@@ -958,15 +970,15 @@ fn a_sim_tree_reading_param_in_raw_without_frame_args_is_flagged() {
 }
 
 #[test]
-fn a_const_written_as_its_value_in_raw_is_used() {
-    // The value written in place of the name is a use too.
-    none(
+fn a_const_written_as_its_value_in_raw_is_not_a_use() {
+    // Raw code resolves v2 constants by name, so the bare value is no use of the name
+    // (this was a use before docs/decisions/20261125-antics-v2-new-lints.md).
+    one(
         &obj(
             "    const LEVEL_SLOT = 7;\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { attr[7] := 1; }\n    }",
         ),
         "unused_decl",
     );
-    // A frame word (`temp[7]`) is not one.
     one(
         &obj(
             "    const LEVEL_SLOT = 7;\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { temp[7] := 1; }\n    }",
@@ -1835,4 +1847,421 @@ fn cli_lints_files_that_start_with_const() {
     assert_ne!(out.status.code(), Some(0));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("bad.antics"), "{err}");
+}
+
+// --- source detection -------------------------------------------------------------------------
+
+#[test]
+fn lint_reads_v2_files_that_start_with_consts_comments_and_attributes() {
+    let dir = scratch("detect");
+    let v2 = dir.join("consts_first.antics");
+    let air = dir.join("legacy.antics");
+    let mut head = String::from("// header comment\n/* block */\n");
+    for i in 0..40 {
+        head.push_str(&format!("const C{i} = {i};\n"));
+    }
+    std::fs::write(
+        &v2,
+        format!(
+            "{head}{}",
+            tree("        while true {\n            sleep(1);\n        }")
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &air,
+        "# an .air file\n// another comment\ntree 4096 \"Main\" {\n    temp[0] := 1;\n}\n",
+    )
+    .unwrap();
+    let (diags, sources) = lint_v2_paths(std::slice::from_ref(&dir)).expect("lint dir");
+    assert!(
+        sources.keys().any(|k| k.ends_with("consts_first.antics")),
+        "{sources:?}"
+    );
+    assert!(
+        !sources.keys().any(|k| k.ends_with("legacy.antics")),
+        "{sources:?}"
+    );
+    assert!(diags.iter().any(|d| d.rule == "while_true"), "{diags:#?}");
+    // The 40 leading constants are never used.
+    assert_eq!(diags.iter().filter(|d| d.rule == "unused_decl").count(), 40);
+    let out = cli(&[v2.as_os_str()]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("warning[while_true]"), "{text}");
+}
+
+#[test]
+fn every_command_detects_a_v2_file_that_starts_with_uses_and_externs() {
+    for head in [
+        "use std::globals::*;\n",
+        "extern mod synth_globals {\n    #[id(256)] fn tune() -> bool;\n}\n",
+        "#[inline]\nfn helper() {\n    sleep(1);\n}\n",
+        "/* tree 4096 \"NotAir\" { } */\n// bcon\n",
+    ] {
+        let dir = scratch("detect_cmds");
+        let path = dir.join("probe.antics");
+        std::fs::write(&path, format!("{head}{}", tree("        sleep(1);"))).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_sims-antics"))
+            .arg("check")
+            .arg(&path)
+            .output()
+            .expect("run check");
+        assert!(
+            out.status.success(),
+            "{head}\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+// --- shadowed_const ------------------------------------------------------------------------------
+
+#[test]
+fn a_block_const_shadowing_an_outer_const_is_flagged() {
+    let source = format!(
+        "const STYLE = 13;\n{}",
+        obj(
+            "    const PICK = 2;\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        \
+             const STYLE = if self.level == 1 { 4 } else { 5 };\n        \
+             const (PICK, OTHER) = match self.mode { Mode::Off => (1, 2), _ => (3, 4) };\n        \
+             self.level = STYLE + PICK + OTHER;\n    }"
+        )
+    );
+    let found = of(&source, "shadowed_const");
+    let mut messages: Vec<&str> = found.iter().map(|d| d.message.as_str()).collect();
+    messages.sort_unstable();
+    assert_eq!(
+        messages,
+        [
+            "block constant `PICK` shadows the constant `PICK` declared at line 9",
+            "block constant `STYLE` shadows the constant `STYLE` declared at line 1",
+        ],
+        "{found:#?}"
+    );
+    assert!(found.iter().all(|d| d.severity == Severity::Warning));
+    let style = found.iter().find(|d| d.message.contains("STYLE")).unwrap();
+    assert_eq!(style.line, line_of(&source, "const STYLE = if"));
+}
+
+#[test]
+fn object_consts_and_const_params_shadowing_file_consts_are_flagged() {
+    let source = format!(
+        "const LIMIT = 3;\nconst STEP = 1;\n#[inline]\nfn bump(const STEP: i16) -> i16 {{\n    return STEP + LIMIT;\n}}\n{}",
+        obj(
+            "    const LIMIT = 4;\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        self.level = bump(2) + LIMIT;\n    }"
+        )
+    );
+    let found = of(&source, "shadowed_const");
+    assert_eq!(found.len(), 2, "{found:#?}");
+    assert!(
+        found
+            .iter()
+            .any(|d| d.message.starts_with("`const` parameter `STEP`"))
+    );
+    assert!(
+        found
+            .iter()
+            .any(|d| d.message.starts_with("object constant `LIMIT`"))
+    );
+}
+
+#[test]
+fn distinct_names_do_not_shadow() {
+    let source = format!(
+        "const STYLE = 13;\n{}",
+        obj(
+            "    #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        \
+             const PICK = if self.level == 1 { STYLE } else { 5 };\n        self.level = PICK;\n    }"
+        )
+    );
+    none(&source, "shadowed_const");
+    none(&source, "unused_decl");
+}
+
+// --- unused_decl for constants -------------------------------------------------------------------
+
+#[test]
+fn unused_file_object_and_block_consts_are_flagged() {
+    let source = format!(
+        "const HOUR = 0;\nconst USED_TOP = 1;\n{}",
+        obj(
+            "    const SPARE = 4;\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        \
+             const UNREAD = if self.level == 1 { 4 } else { 5 };\n        \
+             self.level = USED_TOP;\n        raw { temp[0] := global[0]; }\n    }"
+        )
+    );
+    let found = of(&source, "unused_decl");
+    let mut messages: Vec<&str> = found.iter().map(|d| d.message.as_str()).collect();
+    messages.sort_unstable();
+    assert_eq!(
+        messages,
+        [
+            "block constant `UNREAD` is never used",
+            "constant `HOUR` is never used",
+            "constant `SPARE` is never used",
+        ],
+        "{found:#?}"
+    );
+}
+
+#[test]
+fn a_const_declared_in_two_files_is_judged_by_its_uses() {
+    // Each file declares `HOUR`; neither uses it. Before, the second declaration counted
+    // as a use of the first.
+    let a = LintInput {
+        name: "a.antics".to_owned(),
+        source: format!("const HOUR = 0;\n{}", tree("        sleep(1);")),
+        ..LintInput::default()
+    };
+    let b = LintInput {
+        name: "b.antics".to_owned(),
+        source: format!("const HOUR = 0;\n{}", tree("        sleep(2);")),
+        ..LintInput::default()
+    };
+    let diags = lint_v2_sources(&[a, b]).expect("lint");
+    let unused: Vec<_> = diags.iter().filter(|d| d.rule == "unused_decl").collect();
+    assert_eq!(unused.len(), 2, "{unused:#?}");
+}
+
+#[test]
+fn consts_used_by_guid_index_or_raw_name_are_used() {
+    let source = String::from(
+        "const PROBE_GUID = 0x7E00_0100;\nconst SLOT = 2;\nconst LOW = 1;\nconst RAW_NAMED = 9;\n\
+         enum Mode { Off, Low, High }\n\
+         object \"Synth Probe\" {\n    guid: PROBE_GUID;\n    price: 1;\n    \
+         sprite: Sprite::procedural(\"floor_lamp\", primary: #101010, accent: #202020, trim: #303030);\n    \
+         state mode: Mode;\n    \
+         #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        \
+         self.attr[SLOT] = LOW;\n        raw { temp[0] := RAW_NAMED; }\n    }\n}\n",
+    );
+    none(&source, "unused_decl");
+}
+
+// --- duplicate_std_global ---------------------------------------------------------------------------
+
+#[test]
+fn an_extern_matching_std_globals_is_flagged() {
+    let source = format!(
+        "extern mod globals {{\n    #[id(280)] fn wait_ticks(n: i16) -> Result;\n    #[id(288)] fn busy() -> bool;\n    #[id(300)] fn other() -> bool;\n}}\n{}",
+        tree(
+            "        globals::wait_ticks(1)?;\n        if globals::busy() && globals::other() { sleep(1); }"
+        )
+    );
+    let found = of(&source, "duplicate_std_global");
+    assert_eq!(found.len(), 2, "{found:#?}");
+    assert!(found[0].message.contains("global 280"), "{found:#?}");
+    assert!(
+        found[0].message.contains("globals::idle_ticks"),
+        "{found:#?}"
+    );
+    assert!(found[1].message.contains("globals::in_use"), "{found:#?}");
+    assert_eq!(found[0].line, 2);
+}
+
+#[test]
+fn an_extern_with_another_abi_is_not_a_duplicate() {
+    // 280 returning `bool`, 288 taking an argument: other ABIs, so other declarations.
+    let source = format!(
+        "extern mod more_globals {{\n    #[id(280)] fn wait_ticks(n: i16) -> bool;\n    #[id(288)] fn busy(x: i16) -> bool;\n}}\n{}",
+        tree("        if more_globals::wait_ticks(1) && more_globals::busy(2) { sleep(1); }")
+    );
+    none(&source, "duplicate_std_global");
+}
+
+// --- untyped_engine_field ---------------------------------------------------------------------------
+
+fn untyped(source: &str) -> Vec<String> {
+    of(source, "untyped_engine_field")
+        .into_iter()
+        .map(|d| d.suggestion.unwrap_or_default())
+        .collect()
+}
+
+#[test]
+fn indexed_cells_with_typed_names_are_flagged() {
+    assert_eq!(
+        untyped(&tree(
+            "        self.level = global[0] + global[5] + self.data[29] + self.data[7];\n        self.data[0] = 2;"
+        )),
+        [
+            "world.hour",
+            "world.minute",
+            "self.room",
+            "self.room_impact",
+            "self.graphic"
+        ]
+    );
+    assert_eq!(
+        untyped(&sim_tree(
+            "        self.level = sim.person[58] + sim.person[33] + me.person[57];\n        sim.person[57] = 1;\n        if sim.data[11] == stack_obj { sleep(1); }"
+        )),
+        [
+            "sim.age",
+            "sim.priority",
+            "me.job_level",
+            "sim.job_level",
+            "sim.id"
+        ]
+    );
+}
+
+#[test]
+fn indexed_cells_without_a_drop_in_name_are_not_flagged() {
+    for body in [
+        // No typed name.
+        "        self.level = global[2] + self.data[3] + self.attr[0];",
+        // Already typed.
+        "        self.level = world.hour + self.room;",
+        // Bitflags-typed names: an `i16` use of the cell does not type-check as them.
+        "        self.level = self.data[8] + self.data[4] + self.data[42];",
+        // A read-only name is not assigned.
+        "        self.data[29] = 1;",
+        // An `ObjectId` name is not arithmetic.
+        "        self.level = self.data[11] + 1;",
+        // Raw code is left alone.
+        "        raw { temp[0] := global[0]; }",
+        // `me` is the object here: its cells have no Sim names.
+        "        self.level = me.person[58] + me.data[11];",
+    ] {
+        none(&tree(body), "untyped_engine_field");
+    }
+    none(
+        &sim_tree("        self.level = sim.data[11] + 1;\n        sim.data[29] = 3;"),
+        "untyped_engine_field",
+    );
+}
+
+#[test]
+fn every_suggested_name_compiles_to_the_same_trees() {
+    let config = sims_antics::v2::PackResolverConfig::default();
+    let mut cases: Vec<(String, bool)> = Vec::new();
+    for g in [0, 1, 3, 4, 5, 6, 7, 8, 10, 17, 28, 30] {
+        cases.push((format!("self.level = global[{g}];"), false));
+        cases.push((format!("global[{g}] = 1;"), false));
+    }
+    for d in [0, 7, 13, 15, 25, 31, 32] {
+        cases.push((format!("self.level = self.data[{d}];"), false));
+        cases.push((format!("self.data[{d}] = 1;"), false));
+    }
+    cases.push(("self.level = self.data[29];".to_owned(), false));
+    cases.push((
+        "if self.data[11] == stack_obj { sleep(1); }".to_owned(),
+        false,
+    ));
+    cases.push(("self.level = self.data[11];".to_owned(), false));
+    for p in [0, 33, 34, 56, 57, 58, 61] {
+        cases.push((format!("self.level = sim.person[{p}];"), true));
+        cases.push((format!("sim.person[{p}] = 1;"), true));
+    }
+    cases.push(("self.level = sim.person[32];".to_owned(), true));
+    cases.push(("self.level = sim.data[29];".to_owned(), true));
+    cases.push((
+        "if sim.data[11] != stack_obj { sleep(1); }".to_owned(),
+        true,
+    ));
+    cases.push(("if sim.data[2] == stack_obj { sleep(1); }".to_owned(), true));
+    // Read back: a store to `stack_obj` nothing reads may be dropped.
+    for cell in ["data[11]", "slot[0]"] {
+        cases.push((
+            format!("stack_obj = sim.{cell};\n        self.level = stack_obj.attr[1];"),
+            true,
+        ));
+    }
+    cases.push(("self.level = me.person[58];".to_owned(), true));
+    for (stmt, sim) in cases {
+        let body = format!("        {stmt}");
+        let source = if sim { sim_tree(&body) } else { tree(&body) };
+        let d = one(&source, "untyped_engine_field");
+        let line = source.lines().nth(d.line - 1).unwrap();
+        let start = d.column - 1;
+        let end = start + line[start..].find(']').unwrap() + 1;
+        let fixed = format!(
+            "{}{}{}",
+            &line[..start],
+            d.suggestion.as_deref().unwrap(),
+            &line[end..]
+        );
+        let rewritten = source.replacen(line, &fixed, 1);
+        none(&rewritten, "untyped_engine_field");
+        let a = sims_antics::compile_v2_source("a.antics", &source, &config)
+            .unwrap_or_else(|e| panic!("{e}\n{source}"));
+        let b = sims_antics::compile_v2_source("b.antics", &rewritten, &config)
+            .unwrap_or_else(|e| panic!("{e}\n{rewritten}"));
+        assert!(
+            a.iff_bytes == b.iff_bytes,
+            "`{stmt}` and `{fixed}` compile apart"
+        );
+    }
+}
+
+// --- raw_syntax -------------------------------------------------------------------------------------
+
+#[test]
+fn raw_code_that_does_not_parse_is_an_error() {
+    let source =
+        tree("        raw {\n            temp[0] := 1;\n            temp[1] := ;\n        }");
+    let d = one(&source, "raw_syntax");
+    assert_eq!(d.severity, Severity::Error);
+    assert_eq!(d.line, line_of(&source, "temp[1] := ;"));
+    // It cannot be allowed: the file does not build.
+    let allowed = format!("//! antics-lint: allow(raw_syntax)\n{source}");
+    let d = one(&allowed, "raw_syntax");
+    assert!(
+        d.note
+            .as_deref()
+            .unwrap_or("")
+            .contains("cannot be allowed"),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn raw_code_naming_v2_consts_and_bcon_entries_parses() {
+    let source = format!(
+        "const SLOT = 2;\nconst OTHER_GUID = 0x7E00_0200;\n{}",
+        obj(
+            "    bcon 4097 \"Tuning\" { low = 1, high = 9 }\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        \
+             self.level = Tuning.high;\n        \
+             raw {\n            my.attr[SLOT] := Tuning.low;\n            temp[0] := SLOT;\n            create_object(OTHER_GUID, 0, 0);\n        }\n    }"
+        )
+    );
+    none(&source, "raw_syntax");
+}
+
+// --- object_tree_me_field ------------------------------------------------------------------------
+
+#[test]
+fn me_fields_in_an_objects_own_tree_are_an_error() {
+    let source = tree("        self.level = me.age;\n        self.level = me.motive.fun;");
+    let found = of(&source, "object_tree_me_field");
+    assert_eq!(found.len(), 2, "{found:#?}");
+    assert!(found.iter().all(|d| d.severity == Severity::Error));
+    assert!(
+        found[0].help.as_deref().unwrap_or("").contains("sim.age"),
+        "{found:#?}"
+    );
+    // The same in `main`.
+    one(
+        &obj("    main {\n        self.level = me.room;\n        self.mode = Mode::Off;\n    }"),
+        "object_tree_me_field",
+    );
+}
+
+#[test]
+fn me_cells_and_sim_context_me_fields_are_fine() {
+    none(
+        &tree("        self.level = me.attr[0] + me.data[3];"),
+        "object_tree_me_field",
+    );
+    none(
+        &sim_tree("        self.level = me.age;"),
+        "object_tree_me_field",
+    );
+    none(
+        &obj(
+            "    #[bhav(label = \"Probe\", context = inherit)] fn probe() {\n        self.level = me.age;\n        self.mode = Mode::Off;\n    }",
+        ),
+        "object_tree_me_field",
+    );
 }
