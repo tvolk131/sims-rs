@@ -39,7 +39,7 @@ pub fn restore_motive_loop(
         ticks: ticks,
         cap: cap,
     );
-    return completed;
+    completed
 }
 
 /// Cancel-safe dual-motive restoration loop with per-cycle counter updates.
@@ -88,7 +88,7 @@ pub fn restore_two_motives_loop(
         ticks: ticks,
         primary_cap: primary_cap,
     );
-    return completed;
+    completed
 }
 
 /// Sets a boolean toggle/power/lock state and plays the associated object sound.
@@ -127,7 +127,7 @@ pub fn repair_by_progress(
         cycles += 1;
     }
     *cycles_out = cycles;
-    return progress >= goal;
+    progress >= goal
 }
 
 /// Cancel-safe fixed-cycle work loop (e.g. plunging/unclogging).

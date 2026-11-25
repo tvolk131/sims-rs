@@ -4872,7 +4872,7 @@ impl Translator<'_> {
             PrimitiveCall::Breakpoint { cond } => format!("breakpoint({})", self.rvalue(cond)?),
             PrimitiveCall::Random { dst, range } => {
                 let range = self.rvalue(range)?;
-                if range.starts_with("global[") {
+                if range.starts_with("global[") || range.starts_with("world.") {
                     return None;
                 }
                 format!("random_into({}, {range})", self.lvalue(dst)?)
@@ -5203,7 +5203,10 @@ impl Translator<'_> {
         }
         Some(match (o.scope, self.sim) {
             (8, _) => format!("temp[{i}]"),
-            (6, _) => format!("global[{i}]"),
+            (6, _) => crate::v2::parser::WORLD_GLOBALS
+                .iter()
+                .find(|&&(_, index)| i16::from(index) == i)
+                .map_or_else(|| format!("global[{i}]"), |(name, _)| format!("world.{name}")),
             (10, _) if i == 0 => "stack_obj".to_owned(),
             (0, false) | (1, true) if i <= self.model.state_limit => format!("self.attr_{i}"),
             (3, false) => format!("self.data[{i}]"),

@@ -418,20 +418,50 @@ impl Parser {
     /// A function body; with `value`, a last expression without `;` is its `return`.
     fn parse_fn_body(&mut self, value: bool) -> Result<Vec<V2Stmt>> {
         let mut body = self.parse_block()?;
-        if value
-            && let Some(V2Stmt::Expr { span, .. }) = body.last()
-            && let Some(at) = self.tails.iter().position(|t| t == span)
-        {
-            self.tails.remove(at);
-            let Some(V2Stmt::Expr { span, expr }) = body.pop() else {
-                unreachable!("checked above")
-            };
-            body.push(V2Stmt::Return {
-                span,
-                value: Some(expr),
-            });
+        if value {
+            self.tails_to_returns(&mut body);
         }
         Ok(body)
+    }
+
+    /// Turns the tail expression ending `body` into `return <expr>;`, looking through a final
+    /// `if` / `match` statement into each of its branches (`if a > b { a } else { b }`).
+    fn tails_to_returns(&mut self, body: &mut [V2Stmt]) {
+        match body.last_mut() {
+            Some(last @ V2Stmt::Expr { .. }) => {
+                let V2Stmt::Expr { span, .. } = last else {
+                    unreachable!("matched above")
+                };
+                let Some(at) = self.tails.iter().position(|t| t == span) else {
+                    return;
+                };
+                self.tails.remove(at);
+                let span = *span;
+                let V2Stmt::Expr { expr, .. } =
+                    std::mem::replace(last, V2Stmt::Break { span })
+                else {
+                    unreachable!("matched above")
+                };
+                *last = V2Stmt::Return {
+                    span,
+                    value: Some(expr),
+                };
+            }
+            Some(V2Stmt::If {
+                then_body,
+                else_body,
+                ..
+            }) => {
+                self.tails_to_returns(then_body);
+                self.tails_to_returns(else_body);
+            }
+            Some(V2Stmt::Match { arms, .. }) => {
+                for arm in arms {
+                    self.tails_to_returns(&mut arm.body);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn parse_use(&mut self, span: Span) -> Result<UseDecl> {

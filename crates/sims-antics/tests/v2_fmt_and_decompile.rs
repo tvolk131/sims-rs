@@ -215,7 +215,7 @@ fn synthetic_lamp_round_trips_with_idioms() {
         "guid: 0x7E00_0001;",
         "bcon 4097 \"Tuning\" {",
         // The FWAV keeps its ID and event name.
-        "id: 1);",
+        "= fwav(1, wav: ",
     ] {
         assert!(source.contains(idiom), "missing `{idiom}` in:\n{source}");
     }
