@@ -347,9 +347,12 @@ pub(super) fn emit_guard_tree(
     tree_id: u16,
     label: &str,
     guard: &GuardDecl,
-    func_params: &[crate::v2::ast::FnParam],
-    object_reachable: bool,
+    // `Some(params)` for a functional's guard, which an object may run; `None` for an
+    // interaction's.
+    functional: Option<&[crate::v2::ast::FnParam]>,
 ) -> Result<()> {
+    let object_reachable = functional.is_some();
+    let func_params = functional.unwrap_or(&[]);
     let needs_self_save = match &guard.kind {
         GuardBody::Expr(e) => {
             expr_may_clobber_stack_obj(e, env, owner_module, true, Some(&guard.sim_binding), 0)

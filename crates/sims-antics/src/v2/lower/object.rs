@@ -1318,8 +1318,7 @@ fn lower_object_with(
                 gid,
                 &label,
                 guard,
-                &func.decl.params,
-                true,
+                Some(&func.decl.params),
             )?;
             Some(gid)
         } else {
@@ -1514,8 +1513,7 @@ fn lower_object_with(
                 gid,
                 &glabel,
                 guard,
-                &[],
-                false,
+                None,
             )?;
             Some(gid)
         } else {
