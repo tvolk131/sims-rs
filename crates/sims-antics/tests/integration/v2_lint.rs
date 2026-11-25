@@ -2507,3 +2507,58 @@ fn an_unused_binding_with_calls_keeps_them() {
     let d = one(&source, "unused_decl");
     assert!(d.help.as_deref().unwrap_or("").contains("keeping"), "{d:?}");
 }
+
+// --- review round 3 regressions ------------------------------------------------------------------
+
+#[test]
+fn the_unallowable_errors_need_check_to_reject_the_file() {
+    // Each reads like an error to the lint's approximation of lowering, and `check`
+    // accepts each: the lowered tree or scope differs from the source body.
+    for source in [
+        // A template's constant wins over the file's in its objects.
+        "const N = 65536;\ntemplate Base { const N = 1; }\nobject \"Probe\" from Base { guid: 1; init { raw { temp[N] := 1; } } }\n"
+            .to_owned(),
+        // The template's `init` and the object's join in one tree.
+        "template Base { init { raw { temp[0] := 1 } } }\nobject \"Probe\" from Base { guid: 1; init { raw { ; } } }\n"
+            .to_owned(),
+        // A template no object uses is not lowered.
+        "template Unused { init { temp[0] = me.room; raw { temp[0] := ; } } }\nobject \"Probe\" { guid: 1; init { temp[0] = 1; } }\n"
+            .to_owned(),
+    ] {
+        assert!(compiles(&source), "{source}");
+        none(&source, "raw_syntax");
+        none(&source, "object_tree_me_field");
+    }
+}
+
+#[test]
+fn a_raw_constant_after_a_closed_air_comment_is_used() {
+    // `.air` comments do not nest: `temp[N]` follows the first `*/`.
+    let source = "const N = 1;\nobject \"Probe\" { guid: 1; init { raw { /* a /* b */ temp[N] := 1; # */\n } } }\n";
+    assert!(compiles(source));
+    none(source, "unused_decl");
+}
+
+#[test]
+fn unused_binding_help_keeps_tuples_and_method_calls() {
+    let tuple =
+        init("const (USED, UNUSED) = if temp[0] == 1 { (1, 2) } else { (3, 4) }; temp[1] = USED;");
+    let d = one(&tuple, "unused_decl");
+    assert_eq!(d.help.as_deref(), Some("write `_` in its place"));
+    let method = "object \"Probe\" { guid: 1; #[bhav(label = \"Probe\")] fn probe(sim: Sim) { const UNUSED = if sim.debit_funds(1) { 1 } else { 2 }; temp[0] = 1; } }\n";
+    let d = one(method, "unused_decl");
+    assert!(d.help.as_deref().unwrap_or("").contains("keeping"), "{d:?}");
+}
+
+#[test]
+fn duplicate_std_global_help_offers_an_alias() {
+    let source = "const globals = 4;\nextern mod timing { #[id(280)] fn wait(ticks: i16) -> Result; }\nobject \"Probe\" { guid: 1; init { timing::wait(globals)?; } }\n";
+    let d = one(source, "duplicate_std_global");
+    assert!(
+        d.help
+            .as_deref()
+            .unwrap_or("")
+            .contains("globals as std_globals"),
+        "{d:?}"
+    );
+}

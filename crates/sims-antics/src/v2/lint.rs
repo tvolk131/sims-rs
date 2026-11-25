@@ -283,7 +283,10 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
     let mut out = Vec::new();
     for (input, ast, tokens) in &parsed {
         let directives = Directives::scan(&input.source, tokens);
-        let expanded = expand_for_lint(input);
+        let lowered = expand_for_lint(input);
+        let lower_error = lowered.as_ref().err().copied();
+        let expanded = lowered.ok();
+        let lowers = expanded.is_some();
         let frames = expanded.as_ref().map(|objects| {
             objects
                 .iter()
@@ -296,6 +299,7 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
                 .map(|e| crate::v2::compile_expanded_v2_object(e).ok())
                 .collect()
         });
+        let compiles = compiled.is_some();
         let frames = frames.map(|f| verified_frames(f, compiled.as_deref()));
         let mut cx = FileLinter {
             file: &input.name,
@@ -332,6 +336,21 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
         cx.duplicate_std_globals(ast);
         cx.frame_headroom(ast, compiled.as_deref());
         let mut diags = cx.diags;
+        // The two errors that cannot be allowed stand only where `check` rejects the file
+        // (the lint reads lowering's rules approximately): lowering stops on the line of one
+        // of them, or the `.air` it emits does not compile.
+        let stops_at = |rule: &str, diags: &[LintDiagnostic]| {
+            lower_error
+                .flatten()
+                .is_some_and(|at| diags.iter().any(|d| d.rule == rule && d.line == at.line))
+        };
+        let me_stands = stops_at(OBJECT_TREE_ME_FIELD, &diags);
+        let raw_stands = (lowers && !compiles) || stops_at(RAW_SYNTAX, &diags);
+        diags.retain(|d| match d.rule {
+            OBJECT_TREE_ME_FIELD => me_stands,
+            RAW_SYNTAX => raw_stands,
+            _ => true,
+        });
         for (line, column, name) in &directives.unknown {
             diags.push(LintDiagnostic {
                 rule: UNKNOWN_LINT_RULE,
@@ -1747,24 +1766,11 @@ fn blank_air_comments(code: &str) -> String {
                 i = end;
             }
             b'/' if b.get(i + 1) == Some(&b'*') => {
+                // `.air` block comments do not nest: the first `*/` ends one.
                 let start = i;
-                let mut depth = 0usize;
-                while i < b.len() {
-                    if b[i..].starts_with(b"/*") {
-                        depth += 1;
-                        i += 2;
-                    } else if b[i..].starts_with(b"*/") {
-                        depth -= 1;
-                        i += 2;
-                        if depth == 0 {
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-                let end = i.min(b.len());
+                let end = code[i + 2..].find("*/").map_or(b.len(), |n| i + 2 + n + 2);
                 blank(&mut out, start, end);
+                i = end;
             }
             _ => i += 1,
         }
@@ -2477,7 +2483,9 @@ impl FileLinter<'_> {
                         UNUSED_DECL,
                         at,
                         format!("block constant `{name}` is never used"),
-                        Some(if b.calls {
+                        Some(if b.names.len() > 1 {
+                            "write `_` in its place".to_owned()
+                        } else if b.calls {
                             "remove it, keeping as statements any calls in its value that have effects".to_owned()
                         } else {
                             "remove it".to_owned()
@@ -2536,7 +2544,8 @@ impl FileLinter<'_> {
                         m.name, f.name, f.id, std.name
                     ),
                     Some(format!(
-                        "drop it and call `globals::{}` after `use std::globals::*;`{}. A local `extern mod globals` hides all of `std::globals`: keep other globals in a module of another name",
+                        "drop it and call `globals::{}` after `use std::globals::*;` (if `globals` names something else here, `use std::globals::{{globals as std_globals}};` and `std_globals::{}`){}. A local `extern mod globals` hides all of `std::globals`: keep other globals in a module of another name",
+                        std.name,
                         std.name,
                         if std.params.iter().zip(&f.params).any(|(a, b)| a.name != b.name) {
                             format!(
@@ -4189,7 +4198,7 @@ struct ConstBinding {
 /// Whether the selector after the `=` at token `eq` (up to its `;`) holds a `return`,
 /// `break` or `continue`.
 fn selector_diverges(tokens: &[crate::v2::lexer::Token], eq: usize) -> bool {
-    selector_words(tokens, eq, |w, _| {
+    selector_words(tokens, eq, false, |w, _| {
         matches!(w, "return" | "break" | "continue")
     })
 }
@@ -4197,14 +4206,15 @@ fn selector_diverges(tokens: &[crate::v2::lexer::Token], eq: usize) -> bool {
 /// Whether the selector after the `=` at token `eq` (up to its `;`) calls a function or
 /// method.
 fn selector_calls(tokens: &[crate::v2::lexer::Token], eq: usize) -> bool {
-    selector_words(tokens, eq, |_, next| next == Some(&TokenKind::LParen))
+    selector_words(tokens, eq, true, |_, next| next == Some(&TokenKind::LParen))
 }
 
-/// Whether a word of the selector after the `=` at token `eq` (not a field or entry after
-/// a `.`) satisfies `pred(word, next token)`.
+/// Whether a word of the selector after the `=` at token `eq` (a field, method or entry
+/// after a `.` only with `members`) satisfies `pred(word, next token)`.
 fn selector_words(
     tokens: &[crate::v2::lexer::Token],
     eq: usize,
+    members: bool,
     pred: impl Fn(&str, Option<&TokenKind>) -> bool,
 ) -> bool {
     let mut depth = 0i32;
@@ -4214,7 +4224,7 @@ fn selector_words(
             TokenKind::RBrace | TokenKind::RParen | TokenKind::RBracket => depth -= 1,
             TokenKind::Semicolon if depth <= 0 => return false,
             TokenKind::Ident(w)
-                if tokens[i - 1].kind != TokenKind::Dot
+                if (members || tokens[i - 1].kind != TokenKind::Dot)
                     && pred(w, tokens.get(i + 1).map(|t| &t.kind)) =>
             {
                 return true;
@@ -4788,19 +4798,21 @@ fn verified_frames(
 }
 
 /// Expands a lint input's objects, or `None` when it does not expand on its own.
-fn expand_for_lint(input: &LintInput) -> Option<Vec<crate::v2::ExpandedV2Object>> {
-    match (&input.path, &input.pack_dir) {
-        (Some(path), Some(pack)) => {
-            let resolved = crate::v2::resolve_v2_file(path, Some(pack)).ok()?;
-            crate::v2::lower_resolved_module(&resolved).ok()
-        }
+/// The file's objects as `check` lowers them, or where lowering stopped (`None` when the
+/// error has no place).
+fn expand_for_lint(
+    input: &LintInput,
+) -> std::result::Result<Vec<crate::v2::ExpandedV2Object>, Option<Span>> {
+    let lowered = match (&input.path, &input.pack_dir) {
+        (Some(path), Some(pack)) => crate::v2::resolve_v2_file(path, Some(pack))
+            .and_then(|resolved| crate::v2::lower_resolved_module(&resolved)),
         _ => crate::v2::expand_v2_source_to_objects(
             &input.name,
             &input.source,
             &crate::v2::PackResolverConfig::default(),
-        )
-        .ok(),
-    }
+        ),
+    };
+    lowered.map_err(|e| e.span)
 }
 
 // ---------------------------------------------------------------------------------------

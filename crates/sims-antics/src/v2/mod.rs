@@ -77,13 +77,14 @@ use std::path::{Path, PathBuf};
 /// (to its matching `]`, past strings), and the next keyword may follow on the same line.
 #[must_use]
 pub fn is_v2_source(source: &str) -> bool {
-    if matches!(
-        first_word(source, false),
-        Some("tree" | "interaction" | "bcon" | "str")
-    ) {
-        return false;
+    let air_word = |w: Option<&str>| matches!(w, Some("tree" | "interaction" | "bcon" | "str"));
+    let v2 = first_word(source, true);
+    if air_word(first_word(source, false)) {
+        // The languages' comment rules can disagree (`.air` comments do not nest, and `#[`
+        // starts one): then the file is v2 only if it parses as v2.
+        return v2.is_some() && !air_word(v2) && parse_v2_file(source).is_ok();
     }
-    first_word(source, true).is_some()
+    v2.is_some()
 }
 
 /// The first word of `source` past whitespace, comments and, with `attributes`, v2
@@ -632,6 +633,8 @@ mod tests {
             "template T {}",
             // A mistyped keyword goes to the v2 parser and its diagnostic.
             "objekt \"A\" {}",
+            // A nested v2 comment hiding a line `.air` would read as a tree.
+            "/* a /* b */\ntree x\n*/\nobject \"A\" { guid: 1; }",
         ] {
             assert!(is_v2_source(source), "{source:?} is v2");
         }
@@ -652,6 +655,8 @@ mod tests {
             "#[tag] generated source\ntree 4096 \"T\" { return true; }",
             // `.air` block comments do not nest: the first `*/` ends this one.
             "/* an opening marker /* is text */\ntree 4096 \"T\" { return true; }\n# */ generated",
+            // `.air` reads a v2 comment's line as a tree; v2 does not parse it.
+            "/* a /* b */\ntree 4096 \"T\" { return true; }\n*/",
         ] {
             assert!(!is_v2_source(source), "{source:?} is .air");
         }

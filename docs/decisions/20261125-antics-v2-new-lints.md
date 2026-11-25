@@ -23,7 +23,7 @@ Separately, `check`, `equiv` and `fmt` used `is_v2_source`, which looked at the 
 
 `is_v2_source` reads the file's first word twice, after skipping whitespace and comments:
 
-1. **As `.air`.** It skips `//` comments, `/* */` comments ending at the first `*/` (they do not nest in `.air`), and `#` lines, which `.air` reads as comments, including `#[..]` lines. If the first word is `tree`, `interaction`, `bcon` or `str`, the file is `.air`.
+1. **As `.air`.** It skips `//` comments, `/* */` comments ending at the first `*/` (they do not nest in `.air`), and `#` lines, which `.air` reads as comments, including `#[..]` lines. If the first word is `tree`, `interaction`, `bcon` or `str`, the file is `.air`, unless the v2 reading finds another word there and the file parses as v2. The two comment rules can disagree, for example on a nested v2 comment hiding a line that starts with `tree`.
 2. **As v2.** It skips `//` comments, nested `/* */` comments, and `#[...]` attributes (balanced brackets, strings skipped). If any word follows, the file is v2: `use`, `const`, `fn`, `object`, `extern`, `enum` and so on. A mistyped keyword then gets the v2 parser's diagnostic.
 
 A file with no word at all is not v2.
@@ -45,6 +45,18 @@ Block `const` bindings are specialized away by the parser, so both constant rule
 
 `raw_syntax` and `object_tree_me_field` cannot be allowed, because an `allow` cannot make the file build. The note says so.
 
+**Both errors are gated on the real compiler.** `lint` already lowers and compiles each file for its frame checks. The lint's reading of lowering is approximate: templates join hooks, template constants win, lowering adds locals, and unused templates and helpers are never lowered. So each error stands only where `check` rejects the file:
+
+- `object_tree_me_field`: lowering stops on the line of one of its findings.
+- `raw_syntax`: lowering succeeds but the emitted `.air` does not compile, or lowering stops on the line of one of its findings.
+
+Otherwise the rule's findings are dropped. Where `lint` cannot lower the file, for example when its imports do not resolve, the rules stay silent and `check` reports the problem. The lint's own reading still places the error at the right `raw` block or `me.<field>`.
+
+Warning help never suggests an edit that breaks `check`:
+- an unused name in a `const (A, B)` binding is replaced with `_`, not removed;
+- a binding whose value calls something (a method included) keeps the calls;
+- `duplicate_std_global` offers `use std::globals::{globals as std_globals};` for files where `globals` names something else.
+
 ## Decision 3: `untyped_engine_field` fires only where the typed name is a drop-in
 
 Each entry was checked against lowering (`lower/expr.rs`, `lower/lvalue.rs`, `lower/tree.rs`) and the `.air` operand parser. An integration test compiles each flagged statement and its suggestion, and asserts byte-identical IFFs.
@@ -64,9 +76,9 @@ Each entry was checked against lowering (`lower/expr.rs`, `lower/lvalue.rs`, `lo
 
 Across corpus-v2, the rule reports 996 findings in 426 decompiled files. With every suggestion applied, all 426 files still pass `check`. The findings are real; the decompiler could print the typed names.
 
-## Decision 4: `raw_syntax` reports only what `check` rejects
+## Decision 4: how `raw_syntax` finds the block
 
-`raw_syntax` is an error that cannot be allowed, so it must not fire on code `check` accepts. It may miss some code `check` rejects: `check` is the authority.
+`raw_syntax` is an error that cannot be allowed, so it must not fire on code `check` accepts. The compiler gate in Decision 2 ensures that. The reading below decides which block to blame, and keeps the error off blocks the compiler would accept. It may miss some code `check` rejects: `check` is the authority.
 
 Each block is first parsed the way lowering validates it (`tree 4096 "__raw_check" { .. }`). It is preceded by the `const` lines lowering would declare for it:
 
