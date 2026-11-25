@@ -335,7 +335,16 @@ pub fn decompile_iff_to_v2_report(
                 if changed {
                     continue;
                 }
-                let source = format_v2_source(&generated.text)?;
+                // Engine cells with a typed name take it when the object builds to the same
+                // bytes, so every check above still holds.
+                let text = type_engine_fields(&generated.text)
+                    .filter(|typed| {
+                        model
+                            .compile(typed)
+                            .is_ok_and(|r| r.iff_bytes == recompiled.iff_bytes)
+                    })
+                    .unwrap_or_else(|| generated.text.clone());
+                let source = format_v2_source(&text)?;
                 let mut trees: Vec<DecompiledTree> = model
                     .trees
                     .iter()
@@ -362,6 +371,32 @@ pub fn decompile_iff_to_v2_report(
         }
     }
     Err(Error::new("decompiler validation did not converge"))
+}
+
+/// `text` with every engine cell that lint `untyped_engine_field` finds spelled by number
+/// written by its typed name (`sim.slot[0]` is `sim.hand`), using the lint's own table and
+/// rules. `None` when there is none, or the text does not lint.
+fn type_engine_fields(text: &str) -> Option<String> {
+    let diags = crate::v2::lint::lint_v2_source(text, "decompiled.antics").ok()?;
+    let mut fixes: Vec<(usize, usize, &str)> = diags
+        .iter()
+        .filter(|d| d.rule == crate::v2::lint::UNTYPED_ENGINE_FIELD)
+        .filter_map(|d| Some((d.line, d.column, d.suggestion.as_deref()?)))
+        .collect();
+    if fixes.is_empty() {
+        return None;
+    }
+    // Right to left, so earlier columns on a line stay put.
+    fixes.sort_unstable_by(|a, b| b.cmp(a));
+    let mut lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
+    for (line, column, typed) in fixes {
+        let l = lines.get_mut(line.checked_sub(1)?)?;
+        let start = column.checked_sub(1)?;
+        // The finding spans the root through the index's `]` (`global[3]`, `sim.slot[0]`).
+        let end = start + l.get(start..)?.find(']')? + 1;
+        l.replace_range(start..end, typed);
+    }
+    Some(lines.join("\n"))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1053,12 +1088,14 @@ impl Model {
             tree: e.span.and_then(|s| air_tree_at_line(&air, s.line)),
             message: e.message.clone(),
         })?;
+        let iff_bytes = compiled.iff_bytes.clone();
         let iff = Iff::parse(compiled.iff_bytes).map_err(|e| Failure::Air {
             tree: None,
             message: format!("the compiled IFF does not parse: {e}"),
         })?;
         let ctx = live_context(&iff, &self.library_arities);
         Ok(RecompiledFile {
+            iff_bytes,
             trees: compiled.behaviors,
             ctx,
             sounds: fwav_sounds(&iff),
@@ -1934,6 +1971,8 @@ fn definition_data(iff: &Iff) -> Option<Vec<(u16, u16, Vec<u8>)>> {
 }
 
 struct RecompiledFile {
+    /// The whole compiled object.
+    iff_bytes: Vec<u8>,
     trees: BTreeMap<u16, BhavChunk>,
     ctx: LiveContext,
     sounds: BTreeMap<u16, String>,
@@ -6504,7 +6543,7 @@ object "Fable Lamp" {
                 "sim.data[5] flag_set 3;",
                 "if temp[0] flag_test 2 {",
                 "self.data[4] flag_clear 1;",
-                "if !(sim.slot[0] == 0) {",
+                "if !(sim.hand == 0) {",
             ],
         );
         assert!(!lifted.contains("raw {"), "{lifted}");
@@ -6581,6 +6620,30 @@ object "Fable Lamp" {
         let leaf = &lifted[lifted.find("fn fade_4302").expect("leaf")..];
         assert!(!leaf.contains("raw {"), "{lifted}");
         has(leaf, &["self.attr_2 = 1;", "play_sound(5);"]);
+    }
+
+    #[test]
+    fn engine_cells_with_a_typed_name_take_it() {
+        let lifted = lift_source(
+            r#"object "Fable Lamp" {
+    guid: 0x7E00_0146;
+    #[bhav(id = 4300, label = "Glow", locals = 0)]
+    fn glow(sim: Sim) {
+        raw {
+            my.motive[1] := 2;
+            my.person[0] := 1;
+            stack.data[25] := 1;
+            if global[0] > 20 {
+                temp[0] := 1;
+            }
+        }
+    }
+}"#,
+        );
+        has(
+            &lifted,
+            &["sim.posture = 1;", "self.in_use = 1;", "world.hour > 20"],
+        );
     }
 
     #[test]

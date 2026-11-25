@@ -81,6 +81,16 @@ same address, so the nodes do not change. Library tables and labels `.air` reser
   has no lower style left. Its failure is about structure, which the names do not change,
   so dropping them earlier would cost a round and the names.
 
+## Decision 4: typed engine field names
+
+An engine cell spelled by number that has a typed name (`sim.slot[0]` is `sim.hand`,
+`self.data[25]` is `self.in_use`, `global[0]` is `world.hour`) is written by that name. The
+names and their rules (writable or not, `ObjectId` only where compared or assigned whole)
+are lint `untyped_engine_field`'s (#465). The lift runs that lint on its final text and
+applies its suggestions, so the two cannot disagree. The typed text is kept only when the
+object it builds is byte-identical to the proven one, so every check still holds.
+Otherwise the numbered spelling stays.
+
 ## What stays raw, and why
 
 - **Temps calls to a tree declared with literal parameters.** v2 passes non-constant
