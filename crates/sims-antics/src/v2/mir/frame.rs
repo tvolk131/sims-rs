@@ -521,6 +521,32 @@ pub(crate) fn out_operand_write(text: &str, name: &str) -> Option<(String, Write
     Some((rest, exit))
 }
 
+/// Whether `body` may read global 34, whose value depends on the scratch pointer every
+/// Expression sets (`sims-vm` `primitives/expression.rs`): a `global[34]` operand or one whose
+/// index is not a literal, a `scope(6, ..)` or `scope(<non-literal>, ..)` cell, or a raw `op`
+/// (its opcode a number or a constant) whose bytes may name it.
+/// A body that does not lex counts as reading it.
+pub(crate) fn may_read_global_34(body: &str) -> bool {
+    use crate::lexer::TokenKind as T;
+    let Ok(tokens) = crate::lexer::tokenize(body) else {
+        return true;
+    };
+    let kind = |i: usize| tokens.get(i).map(|t| &t.kind);
+    tokens.iter().enumerate().any(|(i, t)| match &t.kind {
+        T::Ident(id) if id == "global" => {
+            matches!(kind(i + 1), Some(T::LBracket))
+                && !(matches!(kind(i + 2), Some(T::Int(n)) if *n != 34)
+                    && matches!(kind(i + 3), Some(T::RBracket)))
+        }
+        T::Ident(id) if id == "scope" => {
+            matches!(kind(i + 1), Some(T::LParen))
+                && !matches!(kind(i + 2), Some(T::Int(n)) if *n != 6)
+        }
+        T::Ident(id) if id == "op" => matches!(kind(i + 1), Some(T::Int(_) | T::Ident(_))),
+        _ => false,
+    })
+}
+
 /// Whether a Random Number range operand (`.air` text) may resolve to a word pointer, which
 /// takes the draw in place of the destination. The VM resolves the range read-only, and the only
 /// cell that then comes back with a word pointer is global 34 (`resolve` in `sims-vm`'s

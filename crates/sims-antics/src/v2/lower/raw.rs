@@ -151,9 +151,12 @@ pub(super) fn check_raw_reserved_names(code: &str, span: Span) -> Result<()> {
     let Ok(tokens) = crate::lexer::tokenize(code) else {
         return Ok(());
     };
-    for pair in tokens.windows(2) {
+    for (i, pair) in tokens.windows(2).enumerate() {
+        // `const __self_obj.tuning = ..` declares a qualified constant, not the entry object.
+        let qualified = matches!(tokens.get(i + 2).map(|t| &t.kind), Some(T::Dot));
         if let (T::Ident(kw), T::Ident(name)) = (&pair[0].kind, &pair[1].kind)
             && matches!(kw.as_str(), "let" | "local" | "const")
+            && !qualified
             && RESERVED.contains(&name.as_str())
         {
             return reject(name);

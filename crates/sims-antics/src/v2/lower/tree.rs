@@ -77,7 +77,7 @@ impl<'a> TreeLowerer<'a> {
         // The frame words the tree's text may read: none unless it formats text.
         // A tree that may read global 34 keeps main's rule (every text tree reads): dropping
         // the entry save removes an Expression, whose scratch-pointer write that read depends on.
-        let text_reads = if formats_text && may_read_global_34(self.em.text()) {
+        let text_reads = if formats_text && mir::may_read_global_34(self.em.text()) {
             mir::TableLocals::Unknown
         } else if formats_text {
             self.env.text_reads.clone()
@@ -137,8 +137,13 @@ impl<'a> TreeLowerer<'a> {
         if self.entry_cursor_applied {
             let raw = raw_facts::raw_facts(&out, None);
             // The prefix also removes the Expression that staged a `self` read, so a later read
-            // of global 34 could see a scratch pointer no Expression has set yet.
-            if raw.defines_label || raw.positional_target || may_read_global_34(&out) {
+            // of global 34 could see a scratch pointer no Expression has set yet, and the staging
+            // local, so the named locals after it move down a word that text may read.
+            if raw.defines_label
+                || raw.positional_target
+                || mir::may_read_global_34(&out)
+                || mir::reads_a_word(&facts.text_reads)
+            {
                 self.env.entry_cursor_unsound.set(true);
             }
         }
@@ -473,33 +478,20 @@ impl<'a> TreeLowerer<'a> {
     }
 }
 
-/// Whether `body` may read global 34, whose value depends on the scratch pointer every
-/// Expression sets (`sims-vm` `primitives/expression.rs`): a `global[..]` operand, a
-/// `scope(6, ..)` or `scope(<non-literal>, ..)` cell, or a raw `op` whose bytes may name it.
-/// A body that does not lex counts as reading it.
-fn may_read_global_34(body: &str) -> bool {
-    use crate::lexer::TokenKind as T;
-    let Ok(tokens) = crate::lexer::tokenize(body) else {
-        return true;
-    };
-    let kind = |i: usize| tokens.get(i).map(|t| &t.kind);
-    tokens.iter().enumerate().any(|(i, t)| match &t.kind {
-        T::Ident(id) if id == "global" => true,
-        T::Ident(id) if id == "scope" => {
-            matches!(kind(i + 1), Some(T::LParen))
-                && !matches!(kind(i + 2), Some(T::Int(n)) if *n != 6)
-        }
-        T::Ident(id) if id == "op" => matches!(kind(i + 1), Some(T::Int(_))),
-        _ => false,
-    })
-}
-
-/// Whether an `.air` identifier token of `body` is `name` (comments and strings are not tokens).
-/// A body that does not lex counts as naming it.
+/// Whether an `.air` identifier token of `body` is `name` (comments and strings are not tokens,
+/// and neither is a part of a qualified constant's name such as `name.tuning`: a local has no
+/// fields). A body that does not lex counts as naming it.
 fn names_token(body: &str, name: &str) -> bool {
+    use crate::lexer::TokenKind as T;
     crate::lexer::tokenize(body).map_or(true, |tokens| {
-        tokens
-            .iter()
-            .any(|t| matches!(&t.kind, crate::lexer::TokenKind::Ident(n) if n == name))
+        let dot = |i: Option<usize>| {
+            i.and_then(|i| tokens.get(i))
+                .is_some_and(|t| matches!(t.kind, T::Dot))
+        };
+        tokens.iter().enumerate().any(|(i, t)| {
+            matches!(&t.kind, T::Ident(n) if n == name)
+                && !dot(i.checked_sub(1))
+                && !dot(Some(i + 1))
+        })
     })
 }

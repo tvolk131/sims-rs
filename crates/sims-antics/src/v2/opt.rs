@@ -42,6 +42,9 @@ pub(crate) fn optimize_tree_body(
         return body.to_owned();
     };
     let before = nodes.clone();
+    // A tree that may read global 34 keeps every Expression main keeps (`out_defs` off) and
+    // its entry save: the read depends on the scratch pointer an Expression sets.
+    let out_defs = !may_read_global_34(body);
     for _ in 0..8 {
         let snapshot = nodes.clone();
         drop_unreachable(&mut nodes);
@@ -49,12 +52,14 @@ pub(crate) fn optimize_tree_body(
         drop_dead_stack_obj_stores(&mut nodes);
         drop_stack_obj_stores_before_exit(&mut nodes, false);
         unwrap_single_pass_loops(&mut nodes);
-        drop_dead_local_stores(&mut nodes, text_reads);
-        forward_copies(&mut nodes, text_reads);
+        drop_dead_local_stores(&mut nodes, text_reads, out_defs);
+        forward_copies(&mut nodes, text_reads, out_defs);
         merge_duplicate_tails(&mut nodes);
-        coalesce_locals(&mut nodes, text_reads, origins);
+        coalesce_locals(&mut nodes, text_reads, origins, out_defs);
         drop_unused_decls(&mut nodes, text_reads);
-        drop_unread_entry_save_node(&mut nodes, text_reads);
+        if out_defs {
+            drop_unread_entry_save_node(&mut nodes, text_reads);
+        }
         if nodes == snapshot {
             break;
         }
@@ -281,7 +286,7 @@ fn unwrap_single_pass_loops(nodes: &mut Vec<Stmt>) {
 
 /// Drops plain stores (`let x = e;`, `x := e;` from a non-faulting operand) to v2 locals that
 /// are dead after the store. A dropped `let` keeps its declaration, which emits no node.
-fn drop_dead_local_stores(nodes: &mut Vec<Stmt>, text_reads: bool) {
+fn drop_dead_local_stores(nodes: &mut Vec<Stmt>, text_reads: bool, out_defs: bool) {
     // An `@slot` local's stores stay: the word is pinned so a frame matches one that other
     // code (a raw block, a later tree reusing the frame) reads by number.
     let mut names = Vec::new();
@@ -293,6 +298,7 @@ fn drop_dead_local_stores(nodes: &mut Vec<Stmt>, text_reads: bool) {
     let mut lv = Liveness {
         locals: &locals,
         text_reads_locals: text_reads && nodes_format_text(nodes),
+        out_defs,
         edges: BTreeSet::new(),
         dead_defs: BTreeMap::new(),
         live_out: BTreeMap::new(),
@@ -340,7 +346,7 @@ fn drop_dead_local_stores(nodes: &mut Vec<Stmt>, text_reads: bool) {
 
 /// `t := e; d := t;` with `t` a v2 local that is dead afterwards becomes `d := e;`: one
 /// expression node reading `e` where two read it in turn, with nothing in between.
-fn forward_copies(nodes: &mut Vec<Stmt>, text_reads: bool) {
+fn forward_copies(nodes: &mut Vec<Stmt>, text_reads: bool, out_defs: bool) {
     // An `@slot` local's stores stay: the word is pinned so a frame matches one that other
     // code (a raw block, a later tree reusing the frame) reads by number.
     let mut names = Vec::new();
@@ -352,6 +358,7 @@ fn forward_copies(nodes: &mut Vec<Stmt>, text_reads: bool) {
     let mut lv = Liveness {
         locals: &locals,
         text_reads_locals: text_reads && nodes_format_text(nodes),
+        out_defs,
         edges: BTreeSet::new(),
         dead_defs: BTreeMap::new(),
         live_out: BTreeMap::new(),
@@ -537,7 +544,12 @@ fn merge_duplicate_tails(nodes: &mut Vec<Stmt>) {
     });
 }
 
-fn coalesce_locals(nodes: &mut Vec<Stmt>, text_reads: bool, origins: &BTreeMap<String, String>) {
+fn coalesce_locals(
+    nodes: &mut Vec<Stmt>,
+    text_reads: bool,
+    origins: &BTreeMap<String, String>,
+    out_defs: bool,
+) {
     let mut order = Vec::new();
     collect_lets(nodes, &mut order);
     let mut seen = BTreeSet::new();
@@ -546,6 +558,7 @@ fn coalesce_locals(nodes: &mut Vec<Stmt>, text_reads: bool, origins: &BTreeMap<S
     let mut lv = Liveness {
         locals: &locals,
         text_reads_locals: text_reads && nodes_format_text(nodes),
+        out_defs,
         edges: BTreeSet::new(),
         dead_defs: BTreeMap::new(),
         live_out: BTreeMap::new(),

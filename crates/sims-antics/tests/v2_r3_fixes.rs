@@ -558,7 +558,8 @@ fn a_padded_raw_text_primitive_keeps_the_save() {
         }
         let n = sim.person[3];
         stack_obj.attr[0] = n;
-        raw { action_string(table: 301, index: 2) pad 0xff; }
+        // The space before `(` keeps the plain text scan from seeing the primitive.
+        raw { action_string (table: 301, index: 2) pad 0xff; }
     }"#;
     let air = expand("raw_padded_text.antics", &obj("Was $Local:0", members));
     assert!(tree(&air, "a").contains(SAVE), "{air}");
@@ -847,4 +848,123 @@ fn a_let_some_binding_keeps_its_declaration_after_the_else_body() {
 "#;
     let air = expand("let_some_origin.antics", src);
     assert!(tree(&air, "a").contains("(locals: 3)"), "{air}");
+}
+
+/// An out-operand store makes an earlier store dead, but a tree that may read global 34 keeps
+/// it: the store is an Expression, which sets the scratch pointer that read depends on.
+#[test]
+fn a_tree_that_may_read_global_34_keeps_stores_out_operands_kill() {
+    let src = obj(
+        "Plain",
+        r#"    tree a {
+        let n: i16 = 7;
+        if 0 == global[34] {
+            temp[2] = 1;
+        }
+        random_into(n, 1)?;
+        temp[1] = n;
+    }"#,
+    );
+    let air = expand("out_global34.antics", &src);
+    assert!(tree(&air, "a").contains("= 7;"), "{air}");
+    // Without the read, the store is dead.
+    let air = expand(
+        "out_no_global.antics",
+        &src.replace("global[34]", "global[5]"),
+    );
+    assert!(!tree(&air, "a").contains("= 7;"), "{air}");
+}
+
+/// A raw `op` whose opcode is a named constant may be an Expression reading global 34 too.
+#[test]
+fn a_raw_op_with_a_named_opcode_may_read_global_34() {
+    let src = obj(
+        "Plain",
+        r#"    const EXPR = 2;
+    tree a (sim: Sim) {
+        let r: i16;
+        random_into(r, 1);
+        stop_all_sounds(target: self);
+        raw { op EXPR (0, 0, 34, 0, 0, 3, 14, 6); }
+        set_to_next(all, dest: stack_obj);
+    }"#,
+    );
+    let air = expand("raw_named_op.antics", &src);
+    let a = tree(&air, "a");
+    assert!(
+        a.contains("stack_obj := __self_obj;"),
+        "self is selected by a switch:\n{a}"
+    );
+}
+
+/// Dropping the staging local of an in-place `self` read moves the named locals after it, so a
+/// tree whose text may read a frame word gets no prefix.
+#[test]
+fn text_that_reads_frame_words_disables_in_place_self() {
+    let src = obj(
+        "Number $Local:2",
+        r#"    tree a (sim: Sim) {
+        if self.value == 1 {
+            sim.person[4] = 1;
+        }
+        let n = sim.person[3];
+        stack_obj.attr[1] = n;
+        dialog(kind: ok, title: title, message: msg, icon_mode: 1);
+        set_to_next(all, dest: stack_obj);
+        stack_obj.attr[1] = self.value;
+    }"#,
+    );
+    let air = expand("text_prefix.antics", &src);
+    let a = tree(&air, "a");
+    assert!(
+        !a.contains("stack.attr[0] == 1"),
+        "the self read is staged:\n{a}"
+    );
+}
+
+/// The VM resolves a comparison's right operand first, so an in-place `self` read on the left
+/// is staged unless the right side is a constant: a faulting right operand must not fault
+/// before the `self` read does.
+#[test]
+fn an_in_place_self_comparison_keeps_its_operand_order() {
+    let src = |rhs: &str| {
+        obj(
+            "Plain",
+            &format!(
+                r#"    tree a (sim: Sim) {{
+        if self.value == {rhs} {{
+            return false;
+        }}
+        set_to_next(all, dest: stack_obj);
+    }}"#
+            ),
+        )
+    };
+    let air = expand("cmp_temp.antics", &src("temp[8]"));
+    let a = tree(&air, "a");
+    assert!(
+        a.contains("let __pre_stack_obj"),
+        "staged before a temp:\n{a}"
+    );
+    let air = expand("cmp_const.antics", &src("3"));
+    let a = tree(&air, "a");
+    assert!(
+        a.contains("if stack.attr[0] == 3"),
+        "in place against a constant:\n{a}"
+    );
+}
+
+/// A raw block may declare a qualified constant whose first part is spelled like the entry
+/// object: it declares neither the entry object nor a read of it.
+#[test]
+fn a_qualified_raw_constant_is_not_the_entry_object() {
+    let src = r#"object "Round Three" {
+    guid: 0x7F40_0900;
+    @context(inherit) tree a {
+        raw { const __self_obj.tuning = 42; temp[0] := __self_obj.tuning; }
+    }
+}
+"#;
+    let air = expand("raw_qualified.antics", src);
+    assert!(!tree(&air, "a").contains("= stack_obj"), "{air}");
 }

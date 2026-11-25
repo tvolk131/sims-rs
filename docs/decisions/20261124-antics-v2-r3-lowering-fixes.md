@@ -72,10 +72,16 @@ if it does not:
   word that would move.
 - **`Unknown`**: the save stays.
 
-A text tree whose `.air` may read global 34 takes `Unknown`, which is main's rule. Such a read is
-a `global[..]` operand, a `scope(6, ..)` cell, or a raw `op`. Every Expression node, the save
-included, sets the object's scratch pointer, and a read of global 34 depends on it (`sims-vm`
-`primitives/expression.rs`).
+**Global 34.** Every Expression node, the save included, sets the object's scratch pointer, and
+a read of global 34 depends on it (`sims-vm` `primitives/expression.rs`). So a tree whose `.air`
+may read global 34 (`may_read_global_34`) keeps every Expression main keeps:
+
+- such a read is a `global[34]` operand, a `global[..]` whose index is not a literal, a
+  `scope(6, ..)` cell, or a raw `op` (its opcode a number or a constant);
+- a text tree takes `Unknown`, which is main's rule;
+- out-operands are not definitions there (section 5), so they make no store dead;
+- the optimizer does not drop its entry save (`drop_unread_entry_save_node`), which main does in
+  a tree that formats no text.
 
 The rule is a permission, not an obligation. As on main, dead-store elimination drops an unread
 save whose next node ignores the last result. It does this whatever the text reads, because the
@@ -124,7 +130,8 @@ declaration order, so generated names no longer matter.
   object pass declares `__saved_stack_obj`. A read is an `.air` token naming it, so a comment does
   not count. A raw block may read `__self_obj` or `__saved_stack_obj` but may not declare a local,
   constant or label of either name (`check_raw_reserved_names`). A source constant named
-  `__self_obj` is a constant to the raw blocks that read it, not the entry object.
+  `__self_obj` is a constant to the raw blocks that read it, not the entry object, and so is a
+  qualified constant such as `__self_obj.tuning`, which a raw block may declare.
 - A tree whose two lowerings differ still fails. The error points at the first source statement of
   the tree whose lowering differs (`differing_statement`, via the statement marks `TreeLowerer`
   records), such as a targetless `play_sound`.
@@ -132,7 +139,8 @@ declaration order, so generated names no longer matter.
 ### 5. Rough edges
 
 - **Out-operands define locals (`mir/liveness.rs`).** Liveness now treats a primitive's out-operand
-  write as a definition on the exits that write it, through the shared `out_operand_write`. For
+  write as a definition on the exits that write it, through the shared `out_operand_write`. A tree
+  that may read global 34 keeps main's rule (`Liveness::out_defs`), as in section 1. For
   example, `animate(local:)` writes on its false exit, so in `if animate(..) { break; }` the
   `break` arm keeps the old value live and the fall-through arm does not.
   - Disjoint inlined copies of a helper now share their local's word.
@@ -157,9 +165,14 @@ declaration order, so generated names no longer matter.
     every route: the tree's own blocks, helpers it calls, parameter defaults, and helpers named like
     statements. When a tree that used the prefix has such code, the object is lowered again with no
     prefix in any tree (`ObjectEnv::entry_cursor_off`), as for the text fact.
-  - The prefix also drops the Expression that staged a `self` read. So the same fallback applies
-    when the finished `.air` may read global 34 (as in section 1), whose value depends on the
-    scratch pointer that Expression set.
+  - The prefix also drops the Expression that staged a `self` read and its local. So the same
+    fallback applies when the finished `.air` may read global 34 (section 1), whose value depends
+    on the scratch pointer that Expression set. It also applies when the tree's text may read a
+    frame word, because the named locals after the dropped local move down a word.
+  - The VM resolves a comparison's right operand before its left. So a `self` read on the left of
+    a comparison is staged first, as after a move, unless the right side is a compile-time
+    constant (as for `job_data`). Otherwise a faulting right operand would fault before the `self`
+    read.
   - The scratch pointer a tree leaves for its callees and callers is part of its lowered shape,
     which `verify-equiv` observes at every call and exit. It is not a rule of the source: main's
     entry-save drop in non-text trees already ignores it.

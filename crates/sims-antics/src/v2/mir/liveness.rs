@@ -10,6 +10,10 @@ pub(crate) struct Liveness<'a> {
     /// The tree formats text (a dialog or action string), which reads frame locals by number
     /// (`$Local:N`, `$TimeLocal:N`): every such node reads every source local.
     pub(crate) text_reads_locals: bool,
+    /// Primitive out-operands define their local ([`out_operand_write`]). Off in a tree that
+    /// may read global 34 ([`may_read_global_34`]): a store they make dead is an Expression
+    /// whose scratch-pointer write that read may depend on, so such a tree keeps main's rule.
+    pub(crate) out_defs: bool,
     pub(crate) edges: BTreeSet<(String, String)>,
     /// For each plain store to a v2 local (`__...`): whether the local is dead after it. Loops
     /// revisit their bodies with growing live sets; the last visit, with the final sets, wins.
@@ -173,6 +177,9 @@ impl Liveness<'_> {
     /// ([`out_operand_write`]): that local, the text with the operand blanked, and the exits
     /// that store.
     fn out_write(&self, text: &str) -> Option<(String, String, WriteExit)> {
+        if !self.out_defs {
+            return None;
+        }
         idents(text)
             .into_iter()
             .filter(|t| self.locals.contains(*t))

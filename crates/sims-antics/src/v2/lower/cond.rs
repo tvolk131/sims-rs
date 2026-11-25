@@ -161,10 +161,19 @@ impl<'a> TreeLowerer<'a> {
             Some(call) if self.eval_const_i16(rhs).is_ok() => Some(call),
             _ => None,
         };
-        let (l, l_ty) = match job_cell {
-            Some((args, jspan)) => self.lower_job_data_cell(args, jspan)?,
-            None => self.lower_value_expr(lhs)?,
+        // An in-place `self` read on the left (before the first cursor move) would likewise be
+        // read after the right operand, so unless that is a constant the left is staged first,
+        // as after a move.
+        let entry_cursor = self.entry_cursor;
+        if self.eval_const_i16(rhs).is_err() {
+            self.entry_cursor = false;
+        }
+        let lowered_lhs = match job_cell {
+            Some((args, jspan)) => self.lower_job_data_cell(args, jspan),
+            None => self.lower_value_expr(lhs),
         };
+        self.entry_cursor = entry_cursor;
+        let (l, l_ty) = lowered_lhs?;
         if op == V2BinOp::FlagTest
             && let ValueType::Bitflags(ref key) = l_ty
         {
