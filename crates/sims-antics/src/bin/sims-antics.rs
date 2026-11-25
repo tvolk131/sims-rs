@@ -2622,7 +2622,7 @@ fn cmd_lint(args: &[OsString]) -> Result<(), CliError> {
         let source =
             std::fs::read_to_string(&file).map_err(|e| format!("failed to read {shown}: {e}"))?;
         // A `.air` (Antics IR) file shares the extension; it is not v2.
-        if !sims_antics::v2::lint::is_lintable_v2(&source) {
+        if !is_v2_source(&source) {
             eprintln!("note: skipping {shown} (not .antics v2)");
             continue;
         }
