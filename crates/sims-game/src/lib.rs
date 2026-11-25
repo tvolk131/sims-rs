@@ -37,6 +37,7 @@ pub mod pace;
 pub mod people;
 pub mod pick;
 pub mod sound;
+pub mod user_files;
 pub mod view;
 
 pub use game::{Game, Options, Outcome};

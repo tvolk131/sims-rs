@@ -29,6 +29,7 @@ use sims_game::game::goth_house;
 use sims_game::hud::DialogKey;
 use sims_game::neighborhood::{LoadingPresenter, NeighborhoodShell, ScreenKind, ShellOutcome};
 use sims_game::sound::{self, Input};
+use sims_game::user_files;
 use sims_game::view::Move;
 use sims_game::{Game, Options};
 use sims_render::{Canvas, png};
@@ -1096,11 +1097,6 @@ fn live_macos_cursor_point(window: &Window, scale: u32) -> Option<[i32; 2]> {
         loc.y * winit_scale - f64::from(inner.y),
     );
     unclamped_canvas_point(phys, size, scale)
-}
-
-/// Path of the persisted user `Options.iff` (`Optn` 128) beside `saves`.
-fn options_path(saves: &std::path::Path) -> PathBuf {
-    saves.with_extension("options.iff")
 }
 
 impl App {
@@ -3232,12 +3228,12 @@ fn run() -> Result<(), String> {
             return std::fs::write(&still.file, png::encode(game.canvas()))
                 .map_err(|e| format!("{}: {e}", still.file.display()));
         }
-        let options_file = options_path(&config.saves);
-        if options_file.is_file()
-            && let Err(e) = game.load_options(&options_file)
+        if let Some(saved) = user_files::options_to_load(&config.saves)
+            && let Err(e) = game.load_options(&saved)
         {
-            eprintln!("sims-game: {}: {e}", options_file.display());
+            eprintln!("sims-game: {}: {e}", saved.display());
         }
+        let options_file = user_files::options_path(&config.saves);
         let saved_optn = game.options().to_optn();
         let sound = Sound::start_open_pack(game.open_pack_sounds(), config.mute);
         let save_slot = game.open_pack_save_slot().unwrap_or("open-pack").to_owned();
@@ -3342,12 +3338,12 @@ fn run() -> Result<(), String> {
             return std::fs::write(&still.file, png::encode(game.canvas()))
                 .map_err(|e| format!("{}: {e}", still.file.display()));
         }
-        let options_file = options_path(&config.saves);
-        if options_file.is_file()
-            && let Err(e) = game.load_options(&options_file)
+        if let Some(saved) = user_files::options_to_load(&config.saves)
+            && let Err(e) = game.load_options(&saved)
         {
-            eprintln!("sims-game: {}: {e}", options_file.display());
+            eprintln!("sims-game: {}: {e}", saved.display());
         }
+        let options_file = user_files::options_path(&config.saves);
         let saved_optn = game.options().to_optn();
         if let Some(name) = config.coop.player_name.clone() {
             game.coop_set_player_name(name);

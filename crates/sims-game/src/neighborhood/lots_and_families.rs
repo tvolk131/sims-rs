@@ -328,9 +328,7 @@ impl NeighborhoodShell {
             ));
         }
         self.stored = before_nh;
-        if self.options_file.is_file() {
-            let _ = game.load_options(&self.options_file);
-        }
+        self.load_saved_options(&mut game);
         game.coop_set_player_name(self.coop_player_name.clone());
         game.coop_set_iroh_config(self.coop_iroh_config);
         game.set_album_button_enabled(true);
@@ -628,9 +626,7 @@ impl NeighborhoodShell {
     pub(super) fn neighborhood_iff_dir(&self) -> PathBuf {
         // The whole file name, extension and all, so `slot.redb` and
         // `slot.backup` each have a folder of their own.
-        let mut dir = self.saves_path.clone().into_os_string();
-        dir.push(".userdata");
-        PathBuf::from(dir).join(&self.neighborhood_id)
+        user_files::userdata_dir(&self.saves_path).join(&self.neighborhood_id)
     }
 
     /// Writes the open neighborhood's committed record as `Neighborhood.iff`

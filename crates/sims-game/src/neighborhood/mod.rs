@@ -21,6 +21,7 @@ use crate::coop::default_player_name;
 use crate::game::{Game, InstallAssets, SpecialLotEntry};
 use crate::hud::{DIALOG_FADE_DURATION_MS, DialogKey};
 use crate::sound::{self, Input};
+use crate::user_files;
 use sims_audio::SoundEvent;
 use sims_audio::music::MusicMode;
 use sims_content::ui_graphics::UiGraphics;
@@ -566,7 +567,6 @@ pub struct NeighborhoodShell {
     autosave_worker: AutosaveWorker,
     migration_report: Option<StoreMigrationReport>,
     migration_error: Option<String>,
-    options_file: PathBuf,
     /// The neighborhood record ([`StoredNeighborhood::instance_id`] and
     /// [`StoredNeighborhood::revision`]) last written as `Neighborhood.iff`
     /// ([`NeighborhoodShell::neighborhood_iff_path`]), or the one opened.
@@ -1197,8 +1197,14 @@ fn splice_world_into_saved_bytes(
     Ok(rebuilt)
 }
 
+/// The `<saves stem>.caf-names.tsv` older builds kept household surnames
+/// in. Nothing writes it now; it is read once, by
+/// [`migrate_legacy_caf_sidecar_if_needed`], where those builds left it.
+/// Saves files whose names differ only in extension share it, but each row
+/// names its neighborhood and the store's instance ID, so it migrates only
+/// into the store that wrote it.
 fn caf_names_sidecar_path(saves_path: &Path) -> PathBuf {
-    saves_path.with_extension("caf-names.tsv")
+    user_files::legacy_sibling(saves_path, "caf-names.tsv")
 }
 
 /// One-time atomic read-only migration from any pre-v4 `<saves>.caf-names.tsv`

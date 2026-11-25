@@ -9,6 +9,10 @@
 //! another destination, and the shell carries the trip on there with
 //! `travel::travel_on_from_request_with_cache`, keeping its home.
 //!
+//! The shell keeps the user's Options in the saves file's own
+//! `<saves file name>.userdata` folder, loading one an older build saved
+//! as a `<saves stem>.options.iff` sibling until it saves its own.
+//!
 //! The shell writes `Neighborhood.iff` (`NeighborhoodStore::
 //! save_neighborhood_iff`) after each commit that changes the
 //! neighborhood, as the original saves it (0x4252cc) after a lot save and
@@ -20,7 +24,9 @@ use crate::common::install_root;
 use sims_game::Frames;
 use sims_game::hud::DialogKey;
 use sims_game::neighborhood::NeighborhoodShell;
+use sims_game::user_files;
 use sims_sim::neighborhood_store::{NeighborhoodStore, StoredNeighborhood};
+use sims_ui::command::VolumeChannel;
 use sims_vm::travel::TravelRequest;
 use std::path::{Path, PathBuf};
 
@@ -495,4 +501,56 @@ fn a_destination_go_somewhere_else_travels_on_through_the_shell() {
         "the traveler is home"
     );
     assert_eq!(game.run(10), 10, "the house plays on");
+}
+
+/// The music volume the open lot's Options hold.
+fn music_volume(shell: &NeighborhoodShell) -> u8 {
+    shell.game().expect("a lot").volumes()[1]
+}
+
+/// Options are saved in the saves file's own folder, which a saves file
+/// differing only in extension does not share, and load from there when
+/// a lot opens. A `<saves stem>.options.iff` an older build saved is
+/// loaded until then.
+#[test]
+fn options_are_saved_in_the_saves_files_own_folder() {
+    let Some(root) = install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to run the Options folder test");
+        return;
+    };
+    let dir = TempDir::new("options-folder");
+    let saves = dir.0.join("saves.redb");
+    let mut shell = open_shell(root.clone(), &dir.0);
+    shell.enter_lot(HOME).expect("enter the house");
+    let default = music_volume(&shell);
+    let changed = if default == 2 { 3 } else { 2 };
+    shell
+        .game_mut()
+        .expect("the house")
+        .set_volume(VolumeChannel::Music, changed);
+    shell.persist_options();
+    let saved = user_files::options_path(&saves);
+    assert_eq!(saved, dir.0.join("saves.redb.userdata/Options.iff"));
+    assert!(saved.is_file(), "the Options were saved in the folder");
+    assert!(
+        !dir.0.join("saves.options.iff").exists(),
+        "nothing was saved as a sibling"
+    );
+    assert_eq!(
+        user_files::options_to_load(&dir.0.join("saves.backup")),
+        None,
+        "another saves file does not share them"
+    );
+    drop(shell);
+    let mut shell = open_shell(root.clone(), &dir.0);
+    shell.enter_lot(HOME).expect("enter the house again");
+    assert_eq!(music_volume(&shell), changed, "the saved Options load");
+    drop(shell);
+
+    // An older build's sibling file loads for a saves file without its own.
+    let old = TempDir::new("options-sibling");
+    std::fs::copy(&saved, old.0.join("saves.options.iff")).expect("the old file");
+    let mut shell = open_shell(root, &old.0);
+    shell.enter_lot(HOME).expect("enter the house");
+    assert_eq!(music_volume(&shell), changed, "the old file loads");
 }

@@ -166,9 +166,7 @@ impl NeighborhoodShell {
                 return Err(err);
             }
         };
-        if self.options_file.is_file() {
-            let _ = game.load_options(&self.options_file);
-        }
+        self.load_saved_options(&mut game);
         game.coop_set_player_name(self.coop_player_name.clone());
         game.coop_set_iroh_config(self.coop_iroh_config);
         game.coop_set_travel_blocked(true);
@@ -751,9 +749,7 @@ impl NeighborhoodShell {
                 return Err(err);
             }
         };
-        if self.options_file.is_file() {
-            let _ = game.load_options(&self.options_file);
-        }
+        self.load_saved_options(&mut game);
         game.coop_set_player_name(self.coop_player_name.clone());
         game.coop_set_iroh_config(self.coop_iroh_config);
         game.coop_set_travel_blocked(true);
@@ -918,9 +914,7 @@ impl NeighborhoodShell {
                 return Err(err);
             }
         };
-        if self.options_file.is_file() {
-            let _ = game.load_options(&self.options_file);
-        }
+        self.load_saved_options(&mut game);
         game.set_album_button_enabled(true);
         game.set_neighborhood_slot(self.slot);
         game.set_special_lot_catalog(self.build_special_lot_catalog());
@@ -1047,9 +1041,7 @@ impl NeighborhoodShell {
                 return Err(err);
             }
         };
-        if self.options_file.is_file() {
-            let _ = game.load_options(&self.options_file);
-        }
+        self.load_saved_options(&mut game);
         game.coop_set_player_name(self.coop_player_name.clone());
         game.coop_set_iroh_config(self.coop_iroh_config);
         game.coop_set_travel_blocked(true);
