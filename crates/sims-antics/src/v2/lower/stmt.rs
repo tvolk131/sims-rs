@@ -1467,8 +1467,8 @@ impl<'a> TreeLowerer<'a> {
             let found_var = self.fresh(&format!("v_{name}"));
             let raw_var = self.fresh("fbo_raw");
             let cand_var = self.fresh("fbo_cand");
-            // The fallback takes a candidate only when its score word (the one Find Best
-            // Object reads for the kind) is positive.
+            // The fallback skips a candidate whose score word (the one Find Best Object reads
+            // for the kind) is 0, as the primitive does; any other score is eligible.
             let score_field = match plan.kind_name.as_str() {
                 "prep" => Some("stack.prep_score".to_owned()),
                 "cook" => Some("stack.cook_score".to_owned()),
@@ -1535,7 +1535,7 @@ impl<'a> TreeLowerer<'a> {
                     extra_blocks += 1;
                 }
                 if let (Some(sf), Some(bvar)) = (score_field.as_deref(), &best_var) {
-                    self.line(format!("if {sf} > 0 {{"));
+                    self.line(format!("if {sf} != 0 {{"));
                     self.em.indent();
                     self.line(format!("if {found_var} == 0 {{"));
                     self.em.indent();

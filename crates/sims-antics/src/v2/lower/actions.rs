@@ -152,11 +152,12 @@ impl<'a> TreeLowerer<'a> {
                 }
             }
         }
-        // Argument code that reads another object's cells moves the cursor and puts back the
-        // entry object, not the cursor the receiver named: save the cursor before it and select
-        // it again for the call (which leaves the caller's frame's cursor as it was).
+        // Argument code may move the cursor (reading another object's cells puts back the
+        // entry object, and a primitive such as `set_to_next` steps it), so when there is any,
+        // save the cursor before it and select it again for the call (which leaves the caller's
+        // frame's cursor as it was).
         let mut cursor_saved = false;
-        if receiver_is_cursor && self.em.since(args_at).contains("stack_obj :=") {
+        if receiver_is_cursor && !self.em.since(args_at).is_empty() {
             let args_text = self.em.split_off(args_at);
             let staged = self.fresh("rf_obj");
             self.emit_let(&staged, "stack_obj");

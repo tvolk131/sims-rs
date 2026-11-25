@@ -1236,6 +1236,14 @@ fn review_round_2_regressions() {
         if !stack_obj.run_functional(4, other.data[3]) { return false; }
         stack_obj.data[25] = 1;
         return true;
+    }
+    #[bhav]
+    fn c(sim: Sim) -> bool {
+        raw { if !find_best_object(15) { return false; } }
+        if !stack_obj.run_functional(4, set_to_next(guid, 0x7F40_0A53, dest: stack_obj)) {
+            return false;
+        }
+        return true;
     }"#))
     .0;
     // A literal argument leaves the cursor alone.
@@ -1251,6 +1259,15 @@ fn review_round_2_regressions() {
         .expect("cursor selected again");
     assert!(saved < moved && moved < reselect && reselect < call, "{b}");
     assert!(!b[call..].contains("stack_obj :="), "{b}");
+    // A primitive argument that steps the cursor: the receiver is still the found one.
+    let c = tree(&air, "c");
+    let saved = c.find("let __rf_obj").expect("cursor saved");
+    let step = c.find("set_to_next(").expect("argument step");
+    let reselect = c
+        .find("stack_obj := __rf_obj")
+        .expect("cursor selected again");
+    let call = c.find("run_functional_tree(4)").expect("call");
+    assert!(saved < step && step < reselect && reselect < call, "{c}");
     // A binding named `return` assigned in a short arm, and `return <name>` of a binding whose
     // name is an assignment word.
     let air = build(&obj(
@@ -1273,7 +1290,8 @@ fn review_round_2_regressions() {
 "#,
     )
     .0;
-    assert!(air.contains("if stack.data[64] > 0 {"), "{air}");
+    // Only a zero score is skipped, as the primitive skips it (a negative one still counts).
+    assert!(air.contains("if stack.data[64] != 0 {"), "{air}");
 }
 
 /// Round 2 extern merge regressions: exact duplicates still check every alias, built-in types

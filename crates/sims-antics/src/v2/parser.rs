@@ -3422,9 +3422,9 @@ impl Parser {
         short.map_err(|_| stmt_err)
     }
 
-    /// A match arm's short form, ended by `,` or the match's `}`: an assignment
-    /// (`1 => x = 2,`, also to a binding named `break` or `return`), a bare exit
-    /// (`1 => break,`, `_ => return false,`), or an expression (the arm's value).
+    /// A match arm's short form, ended by `,` or the match's `}`: a bare exit (`1 => break,`,
+    /// `_ => return false,`), an assignment (`1 => x = 2,`, also to a binding named `break` or
+    /// `return`), or an expression (the arm's value). The expression is parsed once.
     fn parse_short_arm(&mut self) -> Result<V2Stmt> {
         let span = self.span();
         let at = (self.pos, self.depth, self.tails.len(), self.arm_tails.len());
@@ -3436,21 +3436,7 @@ impl Parser {
         };
         let ends_arm =
             |p: &mut Self| p.eat(&TokenKind::Comma) || p.peek().kind == TokenKind::RBrace;
-        let assign = (|| {
-            let target = self.parse_expr().ok()?;
-            let op = self.try_eat_assign_op()?;
-            let value = self.parse_expr().ok()?;
-            ends_arm(self).then_some(V2Stmt::Assign {
-                span,
-                target,
-                op,
-                value,
-            })
-        })();
-        if let Some(stmt) = assign {
-            return Ok(stmt);
-        }
-        restore(self);
+        // A bare exit must end the arm; otherwise the keyword is a binding's name.
         if self.is_ident("break") || self.is_ident("continue") || self.is_ident("return") {
             if let Ok(Some(exit)) = self.parse_bare_exit()
                 && ends_arm(self)
@@ -3459,10 +3445,21 @@ impl Parser {
             }
             restore(self);
         }
-        let expr = self.parse_expr()?;
-        self.arm_tails.push(span);
+        let lhs = self.parse_expr()?;
+        let stmt = if let Some(op) = self.try_eat_assign_op() {
+            let value = self.parse_expr()?;
+            V2Stmt::Assign {
+                span,
+                target: lhs,
+                op,
+                value,
+            }
+        } else {
+            self.arm_tails.push(span);
+            V2Stmt::Expr { span, expr: lhs }
+        };
         if ends_arm(self) {
-            Ok(V2Stmt::Expr { span, expr })
+            Ok(stmt)
         } else {
             Err(Error::at(
                 self.span(),

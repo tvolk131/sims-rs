@@ -59,8 +59,9 @@ Three names stay but now mean the engine's function:
 `find_best_object(kind)` is refused for a kind the engine never searches, because it would always
 fail. The untyped search also takes `category4`, as raw `.air` does. A `functional` block's
 `score:` is accepted only for a scored kind. A typed search's fallback scan takes a candidate only
-when the kind's own score word is positive, for every scored kind (it checked only `prep` and
-`cook` before, which no longer covered the renamed kinds).
+when the kind's own score word is nonzero, for every scored kind. This matches the engine, which
+skips only a zero score (a negative score is eligible). Before this, the scan checked only `prep`
+and `cook`, and required a positive score.
 
 ### 2. A local `extern mod` merges with an imported one (`loader.rs` `merge_extern_mods`)
 
@@ -95,9 +96,10 @@ So a call whose receiver is already `stack_obj` leaves the caller's cursor where
 Before this, the call saved and restored the cursor through a local that never held the found
 object, so the cursor that a `find_best_object` had just found was clobbered.
 
-The receiver stays in place unless the argument code moves the cursor (reading another object's
-cells moves it and puts back the entry object). Then the cursor is saved before the argument code
-and selected again for the call, and nothing is restored after it.
+The receiver stays in place when the call has no argument code. Argument code may move the
+cursor (reading another object's cells moves it and puts back the entry object; a step such as
+`set_to_next(.., dest: stack_obj)` moves it on). So when there is any, the cursor is saved before
+the argument code and selected again for the call, and nothing is restored after it.
 
 ### 4. `me` is the Sim handle in inherit trees (`TreeLowerer::is_my_ident`)
 
@@ -130,10 +132,13 @@ extra local or node.
 
 A match arm's short form is, in order:
 
-1. an assignment ended by the arm's `,` or `}` (also to a binding named `break` or `return`:
-   `_ => break += 1,`, `_ => return.person[3] += 1,`);
-2. a bare exit ended by the arm's end (`1 => break,`, `_ => return flag_set,`);
-3. an expression (the arm's value).
+1. a bare exit ended by the arm's `,` or `}` (`1 => break,`, `_ => return flag_set,`);
+2. otherwise one expression, then an optional assignment operator and value (also to a binding
+   named `break` or `return`: `_ => break += 1,`, `_ => return.person[3] += 1,`). Without the
+   operator, the expression is the arm's value.
+
+An ordinary arm's text is parsed once, so nested `match` arms no longer reparse at every level.
+Only an arm starting with `break`, `continue` or `return` that is not a bare exit is parsed twice.
 
 So `1 => break,` lowers as the statement, and `fmt` keeps it.
 
@@ -208,7 +213,10 @@ idles (`AirLocalUsage::uses_idle_scratch`). Before this, the word was assumed fo
 
 ## Consequences
 
-- `open-pack` builds byte-identical, `open-pack` lint has 0 findings, and `fmt --check` is clean.
+- `open-pack` lint has 0 findings, and `fmt --check` is clean. `open-pack` builds byte-identical
+  except `open_fridge.iff`, whose two typed searches (`prep`, `cook`) now test their fallback score
+  with `!= 0` instead of `> 0` (section 1). That changes behaviour only for a negative score, which
+  the engine treats as eligible.
 - `.antics` sources using `serve`, `rest` or `pick_up` must be renamed. The error says to what.
 - Not changed here: `global[CONST]` is still counted as a global-34 read by
   `mir::may_read_global_34` (Tier B bug 6). That is conservative, not unsound.
