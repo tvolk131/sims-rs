@@ -794,6 +794,29 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// One branch of an `if` / `match` expression: a value, or (in a `let` initializer's chain,
+    /// `may_diverge`) a `{ ..; return ..; }` block that leaves on every path, lowered as a
+    /// statement arm. It writes no value, so the binding is never read unset.
+    pub(super) fn value_arm<'e>(&self, e: &'e V2Expr, may_diverge: bool) -> Result<ArmBody<'e>> {
+        let V2Expr::Block { span, body } = e else {
+            return Ok(ArmBody::Value(e));
+        };
+        if !may_diverge {
+            return Err(Error::at(
+                *span,
+                "a diverging '{ ..; return ..; }' branch can only be a branch of 'let x = if ..' or 'let x = match ..'",
+            ));
+        }
+        if !stmts_unconditionally_diverge(body, self.env, &self.owner_module, self.in_object_scope)
+        {
+            return Err(Error::at(
+                *span,
+                "this branch yields no value, so it must leave on every path (end it with 'return', 'break' or 'continue')",
+            ));
+        }
+        Ok(ArmBody::Stmts(body))
+    }
+
     /// `if c { a } else { b }` as a value, written to `dest` (or a fresh local). The condition
     /// takes the `if` statement's paths: constant fold (the untaken branch is still checked),
     /// short-circuit `||` / `&&`, a simple test, or a `__cond` local.
@@ -804,7 +827,12 @@ impl<'a> TreeLowerer<'a> {
         then_value: &V2Expr,
         else_value: &V2Expr,
         dest: Option<&str>,
+        may_diverge: bool,
     ) -> Result<(String, ValueType)> {
+        let (then_b, else_b) = (
+            self.value_arm(then_value, may_diverge)?,
+            self.value_arm(else_value, may_diverge)?,
+        );
         let dest = match dest {
             Some(d) => d.to_owned(),
             None => {
@@ -817,8 +845,8 @@ impl<'a> TreeLowerer<'a> {
             dest: dest.clone(),
             ty: None,
             if_expr: true,
+            may_diverge,
         };
-        let (then_b, else_b) = (ArmBody::Value(then_value), ArmBody::Value(else_value));
         if let Some(const_b) = self
             .try_eval_const_bool(cond)
             .or_else(|| self.try_fold_literal_cond(cond))
@@ -854,7 +882,7 @@ impl<'a> TreeLowerer<'a> {
         }
         let ty = result
             .ty
-            .ok_or_else(|| Error::at(span, "'if' expression has no value"))?;
+            .ok_or_else(|| Error::at(span, "'if' expression has no value (every branch leaves)"))?;
         Ok((dest, ty))
     }
 

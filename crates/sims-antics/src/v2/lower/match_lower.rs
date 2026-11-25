@@ -44,7 +44,12 @@ impl<'a> TreeLowerer<'a> {
         scrutinee: &V2Expr,
         arms: &[MatchExprArm],
         dest: Option<&str>,
+        may_diverge: bool,
     ) -> Result<(String, ValueType)> {
+        let arms = arms
+            .iter()
+            .map(|a| Ok((a.span, &a.pattern, self.value_arm(&a.value, may_diverge)?)))
+            .collect::<Result<Vec<(Span, &MatchPattern, ArmBody<'_>)>>>()?;
         let dest = match dest {
             Some(d) => d.to_owned(),
             None => {
@@ -53,14 +58,11 @@ impl<'a> TreeLowerer<'a> {
                 d
             }
         };
-        let arms: Vec<(Span, &MatchPattern, ArmBody<'_>)> = arms
-            .iter()
-            .map(|a| (a.span, &a.pattern, ArmBody::Value(&a.value)))
-            .collect();
         let mut result = MatchResult {
             dest: dest.clone(),
             ty: None,
             if_expr: false,
+            may_diverge,
         };
         self.lower_match_core(span, scrutinee, &arms, Some(&mut result))?;
         let ty = result
@@ -158,7 +160,7 @@ impl<'a> TreeLowerer<'a> {
                     arms,
                 } = expr
                 {
-                    self.lower_match_expr(*span, scrutinee, arms, Some(&dest))?
+                    self.lower_match_expr(*span, scrutinee, arms, Some(&dest), result.may_diverge)?
                         .1
                 } else if let V2Expr::If {
                     span,
@@ -167,8 +169,15 @@ impl<'a> TreeLowerer<'a> {
                     else_value,
                 } = expr
                 {
-                    self.lower_if_expr(*span, cond, then_value, else_value, Some(&dest))?
-                        .1
+                    self.lower_if_expr(
+                        *span,
+                        cond,
+                        then_value,
+                        else_value,
+                        Some(&dest),
+                        result.may_diverge,
+                    )?
+                    .1
                 } else {
                     let (air, ty) = self.lower_value_expr(expr)?;
                     self.emit_store(&dest, ":=", &air);
@@ -649,6 +658,7 @@ impl<'a> TreeLowerer<'a> {
                     dest: result.dest.clone(),
                     ty: result.ty.clone(),
                     if_expr: result.if_expr,
+                    may_diverge: result.may_diverge,
                 };
                 self.check_discarded(|c| c.lower_match_arm(body, Some(&mut scratch)))?;
                 if result.ty.is_none() {

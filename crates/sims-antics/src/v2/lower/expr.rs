@@ -34,7 +34,8 @@ impl<'a> TreeLowerer<'a> {
             | V2Expr::MethodCall { .. }
             | V2Expr::Try { .. }
             | V2Expr::Match { .. }
-            | V2Expr::If { .. } => true,
+            | V2Expr::If { .. }
+            | V2Expr::Block { .. } => true,
             V2Expr::Int(..)
             | V2Expr::Bool(..)
             | V2Expr::Str(..)
@@ -234,7 +235,8 @@ impl<'a> TreeLowerer<'a> {
             | V2Expr::MethodCall { .. }
             | V2Expr::Try { .. }
             | V2Expr::Match { .. }
-            | V2Expr::If { .. } => true,
+            | V2Expr::If { .. }
+            | V2Expr::Block { .. } => true,
         }
     }
 
@@ -574,13 +576,17 @@ impl<'a> TreeLowerer<'a> {
                 span,
                 scrutinee,
                 arms,
-            } => self.lower_match_expr(*span, scrutinee, arms, None),
+            } => self.lower_match_expr(*span, scrutinee, arms, None, false),
             V2Expr::If {
                 span,
                 cond,
                 then_value,
                 else_value,
-            } => self.lower_if_expr(*span, cond, then_value, else_value, None),
+            } => self.lower_if_expr(*span, cond, then_value, else_value, None, false),
+            V2Expr::Block { span, .. } => Err(Error::at(
+                *span,
+                "a diverging '{ ..; return ..; }' branch can only be a branch of 'let x = if ..' or 'let x = match ..'",
+            )),
             V2Expr::Unary { span, op, inner } => match op {
                 V2UnaryOp::Not => {
                     let tmp = self.fresh("not");

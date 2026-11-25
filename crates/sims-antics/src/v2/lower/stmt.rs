@@ -48,7 +48,7 @@ impl<'a> TreeLowerer<'a> {
                 {
                     // The arms write the binding directly (`let x;` emits no node).
                     self.line(format!("let {air_name};"));
-                    self.lower_match_expr(*mspan, scrutinee, arms, Some(&air_name))?
+                    self.lower_match_expr(*mspan, scrutinee, arms, Some(&air_name), true)?
                         .1
                 } else if let V2Expr::If {
                     span: ispan,
@@ -59,7 +59,7 @@ impl<'a> TreeLowerer<'a> {
                 {
                     // The branches write the binding directly.
                     self.line(format!("let {air_name};"));
-                    self.lower_if_expr(*ispan, cond, then_value, else_value, Some(&air_name))?
+                    self.lower_if_expr(*ispan, cond, then_value, else_value, Some(&air_name), true)?
                         .1
                 } else if let Some(ty) = self.try_lower_inline_into(init, &air_name)? {
                     ty

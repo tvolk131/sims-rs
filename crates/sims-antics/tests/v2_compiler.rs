@@ -8893,8 +8893,13 @@ fn pr_e_negative_diagnostics() {
     );
     expect_err(
         "match_block.antics",
-        &init("self.n = match self.n { 0 => { 1 }, _ => 2 };"),
-        "not a block",
+        &init("let v = match self.n { 0 => { self.n = 1; } _ => 2 }; self.n = v;"),
+        "must leave on every path",
+    );
+    expect_err(
+        "match_block_not_let.antics",
+        &init("self.n = match self.n { 0 => return, _ => 2 };"),
+        "only be a branch of 'let x = if ..'",
     );
     expect_err(
         "match_empty.antics",

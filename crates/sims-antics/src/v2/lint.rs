@@ -935,6 +935,8 @@ fn stmt_blocks(s: &V2Stmt) -> Vec<&[V2Stmt]> {
             ..
         } => vec![then_body, else_body],
         V2Stmt::Match { arms, .. } => arms.iter().map(|a| a.body.as_slice()).collect(),
+        // The diverging `{ ..; return ..; }` branches of `let x = if .. / match ..`.
+        V2Stmt::Let { init, .. } => crate::v2::specialize::init_blocks(init),
         _ => Vec::new(),
     }
 }

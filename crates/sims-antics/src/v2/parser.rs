@@ -32,6 +32,7 @@ pub fn parse_v2_file(source: &str) -> Result<V2File> {
         pos: 0,
         depth: 0,
         bound_vars: std::collections::BTreeSet::new(),
+        tails: Vec::new(),
     };
     parser.parse_file()
 }
@@ -44,6 +45,9 @@ struct Parser {
     /// bindings). A const binding may not yield one of these: a variable can change, or be
     /// written through a frame-word alias, between the test and a use in the region.
     bound_vars: std::collections::BTreeSet<String>,
+    /// Expression statements written without `;` before a `}`: only a value-returning
+    /// function body's last one is allowed (a tail expression, `return` of it).
+    tails: Vec<Span>,
 }
 
 impl Parser {
@@ -355,7 +359,32 @@ impl Parser {
                 }
             }
         }
+        if let Some(&span) = self.tails.first() {
+            return Err(Error::at(
+                span,
+                "expected ';' after this expression (one without ';' is a tail expression, allowed only as the last statement of a function that returns a value)",
+            ));
+        }
         Ok(V2File { uses, items })
+    }
+
+    /// A function body; with `value`, a last expression without `;` is its `return`.
+    fn parse_fn_body(&mut self, value: bool) -> Result<Vec<V2Stmt>> {
+        let mut body = self.parse_block()?;
+        if value
+            && let Some(V2Stmt::Expr { span, .. }) = body.last()
+            && let Some(at) = self.tails.iter().position(|t| t == span)
+        {
+            self.tails.remove(at);
+            let Some(V2Stmt::Expr { span, expr }) = body.pop() else {
+                unreachable!("checked above")
+            };
+            body.push(V2Stmt::Return {
+                span,
+                value: Some(expr),
+            });
+        }
+        Ok(body)
     }
 
     fn parse_use(&mut self, span: Span) -> Result<UseDecl> {
@@ -666,7 +695,7 @@ impl Parser {
         } else {
             None
         };
-        let body = self.parse_block()?;
+        let body = self.parse_fn_body(return_type.is_some())?;
         Ok(FnDecl {
             span,
             is_pub,
@@ -955,7 +984,7 @@ impl Parser {
         }
         let (sim_binding, params) = self.parse_abi_params(&what, true)?;
         let ret = self.parse_return_abi(&what, attrs.ret_temp)?;
-        let body = self.parse_block()?;
+        let body = self.parse_fn_body(ret != ReturnAbi::Void)?;
         Ok(TreeMemberDecl {
             span,
             pinned_id: attrs.id.map(|(_, id)| id),
@@ -2153,7 +2182,7 @@ impl Parser {
         let kind = if self.eat(&TokenKind::FatArrow) {
             GuardBody::Expr(self.parse_expr()?)
         } else {
-            GuardBody::Block(self.parse_block()?)
+            GuardBody::Block(self.parse_fn_body(true)?)
         };
         Ok(GuardDecl {
             span,
@@ -2639,7 +2668,7 @@ impl Parser {
         let span = self.span();
         if self.peek().kind == TokenKind::LBrace {
             // `{ value }` or a block of statements.
-            let (saved_pos, saved_depth) = (self.pos, self.depth);
+            let (saved_pos, saved_depth, saved_tails) = (self.pos, self.depth, self.tails.len());
             self.bump();
             let starts_stmt = matches!(
                 &self.peek().kind,
@@ -2653,39 +2682,13 @@ impl Parser {
             }
             self.pos = saved_pos;
             self.depth = saved_depth;
+            self.tails.truncate(saved_tails);
             return Ok(Arm::Diverge(self.parse_block()?));
         }
         if !in_match {
             return Err(Error::at(span, "expected '{' after the condition"));
         }
-        if self.is_ident("break") || self.is_ident("continue") || self.is_ident("return") {
-            let kw_span = self.span();
-            let stmt = if self.eat_ident("break") {
-                V2Stmt::Break { span: kw_span }
-            } else if self.eat_ident("continue") {
-                V2Stmt::Continue { span: kw_span }
-            } else {
-                self.bump(); // 'return'
-                if matches!(self.peek().kind, TokenKind::Comma | TokenKind::RBrace) {
-                    V2Stmt::Return {
-                        span: kw_span,
-                        value: None,
-                    }
-                } else if self.is_ident("error")
-                    && matches!(self.peek_at(1).kind, TokenKind::Comma | TokenKind::RBrace)
-                {
-                    self.bump();
-                    V2Stmt::ReturnError {
-                        span: kw_span,
-                        from_try: false,
-                    }
-                } else {
-                    V2Stmt::Return {
-                        span: kw_span,
-                        value: Some(self.parse_expr()?),
-                    }
-                }
-            };
+        if let Some(stmt) = self.parse_bare_exit()? {
             return Ok(Arm::Diverge(vec![stmt]));
         }
         Ok(values_arm(span, self.parse_expr()?))
@@ -2782,7 +2785,13 @@ impl Parser {
                 value,
             });
         }
-        self.expect(&TokenKind::Semicolon, "';'")?;
+        if self.peek().kind == TokenKind::RBrace {
+            // A tail expression if it ends a value-returning function body (else an error at
+            // the end of the file).
+            self.tails.push(span);
+        } else {
+            self.expect(&TokenKind::Semicolon, "';'")?;
+        }
         Ok(V2Stmt::Expr { span, expr: lhs })
     }
 
@@ -3211,9 +3220,13 @@ impl Parser {
     /// A match arm's body without braces: a statement (`return x;`), or an expression or
     /// assignment ended by `,` or by the match's closing `}` (`0 => f(),`, `1 => x = 2,`).
     fn parse_arm_stmt(&mut self) -> Result<V2Stmt> {
-        let (saved_pos, saved_depth) = (self.pos, self.depth);
+        let (saved_pos, saved_depth, saved_tails) = (self.pos, self.depth, self.tails.len());
         let stmt_err = match self.parse_stmt() {
             Ok(s) => {
+                // `_ => f() }`: the last arm's expression ends at the match's `}`.
+                if let V2Stmt::Expr { span, .. } = &s {
+                    self.tails.retain(|t| t != span);
+                }
                 let _ = self.eat(&TokenKind::Comma);
                 return Ok(s);
             }
@@ -3221,6 +3234,7 @@ impl Parser {
         };
         self.pos = saved_pos;
         self.depth = saved_depth;
+        self.tails.truncate(saved_tails);
         let span = self.span();
         let short = (|| {
             let lhs = self.parse_expr()?;
@@ -3329,19 +3343,24 @@ impl Parser {
                 let arm_span = self.span();
                 let pattern = self.parse_match_pattern()?;
                 self.expect(&TokenKind::FatArrow, "'=>'")?;
-                if self.peek().kind == TokenKind::LBrace {
-                    return Err(Error::at(
-                        self.span(),
-                        "a 'match' expression arm is a value ('Pattern => expr'), not a block",
-                    ));
-                }
-                let value = self.parse_expr()?;
+                let braced = self.peek().kind == TokenKind::LBrace;
+                let value = if braced {
+                    self.parse_value_branch()?
+                } else if let Some(stmt) = self.parse_bare_exit()? {
+                    V2Expr::Block {
+                        span: arm_span,
+                        body: vec![stmt],
+                    }
+                } else {
+                    self.parse_expr()?
+                };
                 arms.push(MatchExprArm {
                     span: arm_span,
                     pattern,
                     value,
                 });
-                if !self.eat(&TokenKind::Comma) {
+                // A `{ .. }` arm needs no `,` before the next arm (as in Rust).
+                if !self.eat(&TokenKind::Comma) && !braced {
                     self.expect(&TokenKind::RBrace, "',' or '}'")?;
                     return Ok(());
                 }
@@ -3396,18 +3415,94 @@ impl Parser {
         res
     }
 
-    /// `{ value }`: one branch of an `if` expression.
+    /// One branch of an `if` expression.
     fn parse_if_expr_branch(&mut self) -> Result<V2Expr> {
+        if self.peek().kind != TokenKind::LBrace {
+            return Err(Error::at(self.span(), "expected '{'"));
+        }
+        self.parse_value_branch()
+    }
+
+    /// `{ value }`, or a diverging block `{ ..; return x; }` (a `V2Expr::Block`, which lowering
+    /// accepts only in a `let` initializer and checks leaves on every path). A block that starts
+    /// with a statement keyword is a block; otherwise a lone expression before `}` is a value.
+    fn parse_value_branch(&mut self) -> Result<V2Expr> {
+        let span = self.span();
+        let (saved_pos, saved_depth, saved_tails) = (self.pos, self.depth, self.tails.len());
         self.expect(&TokenKind::LBrace, "'{'")?;
-        let value = self.parse_expr()?;
-        if self.peek().kind != TokenKind::RBrace {
+        let starts_stmt = matches!(
+            &self.peek().kind,
+            TokenKind::Ident(k) if matches!(k.as_str(), "break" | "continue" | "return" | "let" | "while" | "loop" | "for" | "repeat" | "with" | "defer" | "animate")
+        ) || matches!(
+            self.peek().kind,
+            TokenKind::RawBlock(_) | TokenKind::HashBracket
+        );
+        if !starts_stmt {
+            match self.parse_expr() {
+                Ok(value) if self.eat(&TokenKind::RBrace) => return Ok(value),
+                Ok(_) => {}
+                // Not a lone value: a block of statements (`if a { return 1; } return 2;`)
+                // may still parse; if it does not, the value's error is the one to show.
+                Err(e) => {
+                    self.pos = saved_pos;
+                    self.depth = saved_depth;
+                    self.tails.truncate(saved_tails);
+                    return match self.parse_block() {
+                        Ok(body) => self.diverging_block(span, body),
+                        Err(_) => Err(e),
+                    };
+                }
+            }
+        }
+        self.pos = saved_pos;
+        self.depth = saved_depth;
+        self.tails.truncate(saved_tails);
+        let body = self.parse_block()?;
+        self.diverging_block(span, body)
+    }
+
+    /// A branch block, which yields no value: one ending in an expression without `;` is
+    /// rejected (blocks that compute a value are not supported).
+    fn diverging_block(&mut self, span: Span, body: Vec<V2Stmt>) -> Result<V2Expr> {
+        if let Some(V2Stmt::Expr { span: tail, .. }) = body.last()
+            && self.tails.contains(tail)
+        {
             return Err(Error::at(
-                self.span(),
-                "an 'if' expression branch is one value ('{ expr }'), not a block of statements",
+                *tail,
+                "a branch value is one expression ('{ expr }'), not a block of statements ending in a value (a block branch must leave: '{ ..; return x; }')",
             ));
         }
-        self.bump();
-        Ok(value)
+        Ok(V2Expr::Block { span, body })
+    }
+
+    /// A bare `break`, `continue`, `return`, `return error` or `return value` as a `match` arm
+    /// (`_ => return false,`), ending before the arm's `,` / `}`.
+    fn parse_bare_exit(&mut self) -> Result<Option<V2Stmt>> {
+        let span = self.span();
+        Ok(Some(if self.eat_ident("break") {
+            V2Stmt::Break { span }
+        } else if self.eat_ident("continue") {
+            V2Stmt::Continue { span }
+        } else if self.eat_ident("return") {
+            if matches!(self.peek().kind, TokenKind::Comma | TokenKind::RBrace) {
+                V2Stmt::Return { span, value: None }
+            } else if self.is_ident("error")
+                && matches!(self.peek_at(1).kind, TokenKind::Comma | TokenKind::RBrace)
+            {
+                self.bump();
+                V2Stmt::ReturnError {
+                    span,
+                    from_try: false,
+                }
+            } else {
+                V2Stmt::Return {
+                    span,
+                    value: Some(self.parse_expr()?),
+                }
+            }
+        } else {
+            return Ok(None);
+        }))
     }
 
     /// A match pattern, with `A | B | ..` alternatives.

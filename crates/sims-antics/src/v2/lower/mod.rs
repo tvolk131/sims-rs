@@ -738,6 +738,8 @@ struct MatchResult {
     ty: Option<ValueType>,
     /// `if` expression (for diagnostics): its arms are "branches".
     if_expr: bool,
+    /// A `let` initializer's chain: an arm may be a diverging `{ ..; return ..; }` block.
+    may_diverge: bool,
 }
 
 const SLOT_WITH_PIN: &str = "push_interaction(object: <handle>) cannot share a tree with '#[slot(N)] let': the pinned object slot is local[0], which the frame layout around '#[slot]' locals does not reserve; pass a constant parameter index or move one of them to its own tree";

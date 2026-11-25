@@ -838,6 +838,13 @@ pub enum V2Expr {
         then_value: Box<V2Expr>,
         else_value: Box<V2Expr>,
     },
+    /// A diverging branch of an `if` / `match` expression: `{ ..; return false; }`, or a
+    /// bare `return` / `break` / `continue` arm. It yields no value: every path through it
+    /// leaves (checked when it is lowered). The parser makes one only as such a branch.
+    Block {
+        span: Span,
+        body: Vec<V2Stmt>,
+    },
 }
 
 impl V2Expr {
@@ -860,7 +867,8 @@ impl V2Expr {
             | Self::MethodCall { span: s, .. }
             | Self::Try { span: s, .. }
             | Self::Match { span: s, .. }
-            | Self::If { span: s, .. } => *s,
+            | Self::If { span: s, .. }
+            | Self::Block { span: s, .. } => *s,
         }
     }
 }
