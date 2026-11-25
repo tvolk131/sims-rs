@@ -26,6 +26,8 @@ pub(crate) struct FrameFacts<'a> {
     pub(crate) has_slots: bool,
     /// The `@slot(N)` locals.
     pub(crate) pinned_locals: &'a BTreeMap<String, usize>,
+    /// Each inlined helper local's declaration (`TreeLowerer::local_origins`).
+    pub(crate) local_origins: &'a BTreeMap<String, String>,
     /// The `min_locals` floor the tree's header will carry (0 for none).
     pub(crate) min_locals: usize,
 }
@@ -43,7 +45,7 @@ pub(crate) fn finish_body(out: String, facts: &FrameFacts<'_>) -> String {
             out
         }
     } else {
-        let out = crate::v2::opt::optimize_tree_body(&out, reads_text);
+        let out = crate::v2::opt::optimize_tree_body(&out, reads_text, facts.local_origins);
         let out = if facts.pinned {
             pin_in_place(&out)
         } else {

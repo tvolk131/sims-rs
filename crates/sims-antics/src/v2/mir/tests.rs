@@ -98,6 +98,7 @@ fn instructions_have_a_typed_view() {
 #[test]
 fn pipeline_applies_frame_facts() {
     let no_slots = BTreeMap::new();
+    let no_origins = BTreeMap::new();
     let no_consts = BTreeMap::new();
     let no_names = BTreeSet::new();
     let mut consts = BTreeMap::new();
@@ -114,6 +115,7 @@ fn pipeline_applies_frame_facts() {
         raw_declared: &declared,
         has_slots: false,
         pinned_locals: &no_slots,
+        local_origins: &no_origins,
         min_locals: 0,
     };
     // Layout kept: only the unread entry save goes; undeclared raw constants are prepended.

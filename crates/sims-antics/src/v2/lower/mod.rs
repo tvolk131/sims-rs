@@ -651,6 +651,10 @@ struct TreeLowerer<'a> {
     /// The `.air` names of the tree's `@slot(N) let` locals and their word numbers: the only
     /// names `opt::assign_frame_slots` pins (a raw block's own `__slot..` name is not one).
     pinned_locals: BTreeMap<String, usize>,
+    /// Each inlined helper's local and the declaration it copies (the helper and the `let`'s
+    /// position): copies of one declaration are one source local, whatever their spelling shares
+    /// with another helper's.
+    local_origins: BTreeMap<String, String>,
     /// Declarations lowered so far, by lowering instance (the inline-helper instances and the
     /// defer instance around them) and source span. Lowering one source declaration twice in
     /// the same instance means it was copied (a const binding's region), and each copy has its

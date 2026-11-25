@@ -116,7 +116,8 @@ The two passes are compared after canonical renaming (`canonical_locals`): `let`
 declaration order, so generated names no longer matter.
 
 - The Sim pass declares its implicit entry object (`__self_obj`) when the body reads it, as the
-  object pass declares `__saved_stack_obj`.
+  object pass declares `__saved_stack_obj`. A read is an `.air` token naming it. A comment does not
+  count, and neither does a raw block's own local of that name.
 - A tree whose two lowerings differ still fails. The error points at the first source statement of
   the tree whose lowering differs (`differing_statement`, via the statement marks `TreeLowerer`
   records), such as a targetless `play_sound`.
@@ -129,7 +130,9 @@ declaration order, so generated names no longer matter.
   `break` arm keeps the old value live and the fall-through arm does not.
   - Disjoint inlined copies of a helper now share their local's word.
   - In `coalesce_locals`, a local written through an out-operand joins only classes of its own
-    group (other copies of the same source local). It never joins the cross-helper merge.
+    declaration. Lowering records the declaration (`local_origins`: the helper and the `let`'s
+    position), so another helper's local of the same spelling is not a copy. It never joins the
+    cross-helper merge.
     Bookcases 4107 shows why: Maxis keeps a helper's `event` and `pick` in separate words, and
     merging them made the verifier's cut-point mode compare unequal slots.
 - **`self` before the first cursor move (`lower/stmt.rs` `lower_tree_body`).** In a Sim tree, the
@@ -138,7 +141,8 @@ declaration order, so generated names no longer matter.
   `self` reads and writes the stack object in place, with no switch and no staging local.
   - Source order is control order only when no raw block defines a label or branches to a node by
     number (`raw_facts`). Otherwise a branch from after a move may jump back before it, so such a
-    tree gets no prefix.
+    tree gets no prefix. This includes raw blocks in the helpers the tree calls, transitively: a raw
+    block of the tree may branch to a label an inlined helper emits.
   - A raw block in an inlined helper or under a cleanup may branch only to its own labels. That
     check now covers raw `loop` bodies too.
   - A padded raw primitive (`… pad 0xNN`) counts as the primitive it wraps, both for moving the

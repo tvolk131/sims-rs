@@ -44,6 +44,7 @@ impl<'a> TreeLowerer<'a> {
             raw_formats_text: false,
             slot_span: None,
             pinned_locals: BTreeMap::new(),
+            local_origins: BTreeMap::new(),
             seen_decls: BTreeSet::new(),
             inline_call_sites: Vec::new(),
             dup_decl: None,
@@ -98,6 +99,7 @@ impl<'a> TreeLowerer<'a> {
             raw_declared: &self.raw_declared,
             has_slots: self.slot_span.is_some(),
             pinned_locals: &self.pinned_locals,
+            local_origins: &self.local_origins,
             min_locals: self.frame_floor().unwrap_or(0),
         };
         let body = self.em.into_text();
@@ -107,7 +109,11 @@ impl<'a> TreeLowerer<'a> {
         } else {
             body
         };
-        if self.inherited_entry_save && out.lines().any(|l| mir::idents(l).contains(&mir::SELF_OBJ))
+        // The body reads the entry object when an `.air` token names it: a comment does not, and
+        // neither does a raw block's own local of that name.
+        if self.inherited_entry_save
+            && !self.raw_declared.contains(mir::SELF_OBJ)
+            && names_token(&out, mir::SELF_OBJ)
         {
             let save = mir::StackObjOp::Save(mir::SELF_OBJ).text();
             out = format!("    {save}\n{out}");
@@ -390,7 +396,12 @@ impl<'a> TreeLowerer<'a> {
         span: Span,
     ) -> Result<String> {
         let Some(n) = slot else {
-            return Ok(self.fresh(&format!("v_{name}")));
+            let air_name = self.fresh(&format!("v_{name}"));
+            if let Some(helper) = self.inline_call_stack.last() {
+                let origin = format!("{helper}::{name}@{}:{}", span.line, span.column);
+                self.local_origins.insert(air_name.clone(), origin);
+            }
+            return Ok(air_name);
         };
         if !self.inline_call_stack.is_empty() || self.active_inline_fn.is_some() {
             return Err(Error::at(
@@ -438,4 +449,14 @@ impl<'a> TreeLowerer<'a> {
         }
         Ok(air_name)
     }
+}
+
+/// Whether an `.air` identifier token of `body` is `name` (comments and strings are not tokens).
+/// A body that does not lex counts as naming it.
+fn names_token(body: &str, name: &str) -> bool {
+    crate::lexer::tokenize(body).map_or(true, |tokens| {
+        tokens
+            .iter()
+            .any(|t| matches!(&t.kind, crate::lexer::TokenKind::Ident(n) if n == name))
+    })
 }

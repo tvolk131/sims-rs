@@ -18,21 +18,15 @@ impl<'a> TreeLowerer<'a> {
     /// a cleanup still pending after it is lowered from its AST where it is emitted.
     ///
     /// Source order is control order only when no raw block branches by label or node number:
-    /// such a branch from after a move may jump back before it, so a tree with one has no such
-    /// prefix. (A raw block in an inlined helper or under a cleanup may only branch to its own
-    /// labels.)
+    /// such a branch from after a move may jump back before it, so a tree with one, in its own
+    /// statements or a helper they call ([`Self::may_raw_branch_back`]), has no such prefix.
     pub(super) fn lower_tree_body(&mut self, stmts: &[V2Stmt]) -> Result<()> {
         let sim = match &self.tree_ctx {
             TreeContext::SimOnObject { sim_name } => Some(sim_name.clone()),
             TreeContext::ObjectSelf => None,
         };
         let mut prefix = sim.is_some()
-            && !specialize::stmts_any(stmts, &|s| {
-                matches!(s, V2Stmt::RawAir { code, .. } if {
-                    let facts = raw_facts::raw_facts(code, None);
-                    facts.defines_label || facts.positional_target
-                })
-            });
+            && !self.may_raw_branch_back(stmts, &self.owner_module, self.in_object_scope, 0);
         for stmt in stmts {
             prefix = prefix
                 && !stmts_may_clobber_stack_obj(
@@ -49,6 +43,35 @@ impl<'a> TreeLowerer<'a> {
             lowered?;
         }
         Ok(())
+    }
+
+    /// Whether a raw block in `stmts`, or in a helper they call (transitively), defines a label
+    /// or branches to a node by number (`raw_facts`). A raw block in an inlined helper may only
+    /// branch to its own labels, but a raw block of the tree may branch to one of them.
+    fn may_raw_branch_back(
+        &self,
+        stmts: &[V2Stmt],
+        module: &str,
+        allow_local: bool,
+        depth: usize,
+    ) -> bool {
+        if depth > 32
+            || specialize::stmts_any(stmts, &|s| {
+                matches!(s, V2Stmt::RawAir { code, .. } if {
+                    let facts = raw_facts::raw_facts(code, None);
+                    facts.defines_label || facts.positional_target
+                })
+            })
+        {
+            return true;
+        }
+        let mut callees = Vec::new();
+        collect_callee_names(stmts, &mut callees);
+        callees.iter().any(|name| {
+            self.env
+                .lookup_fn(module, name, allow_local)
+                .is_some_and(|(m, d, l)| self.may_raw_branch_back(&d.body, &m, l, depth + 1))
+        })
     }
 
     pub(super) fn lower_stmt(&mut self, stmt: &V2Stmt) -> Result<()> {

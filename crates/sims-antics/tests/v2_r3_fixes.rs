@@ -563,3 +563,80 @@ fn frame_locals_sets_no_allocation_floor() {
     // `@slot` placement puts the kept save in word 0.
     assert!(a.contains("local[0] := stack_obj;"), "{a}");
 }
+
+/// A raw block of the tree may branch to a label an inlined helper's raw block emits, so a
+/// helper's label also rules out in-place `self`.
+#[test]
+fn a_helper_raw_label_disables_in_place_self() {
+    let src = obj(
+        "Plain",
+        r#"    fn checkpoint() {
+        raw { @again: temp[3] := 1; }
+    }
+    tree a (sim: Sim) {
+        checkpoint();
+        self.value += 1;
+        if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
+            return false;
+        }
+        raw { random(temp[2], 1) -> true: @again, false: false; }
+    }"#,
+    );
+    let air = expand("raw_helper_label.antics", &src);
+    let a = tree(&air, "a");
+    let write = a.find("stack.attr[0]").expect("the self write");
+    assert!(
+        a[..write].contains("stack_obj :="),
+        "the write switches to the entry object first:\n{a}"
+    );
+}
+
+/// The inherit check reads the entry object from `.air` tokens: a comment naming it, or a raw
+/// block's own local of that name, is not a read.
+#[test]
+fn inherit_check_ignores_comments_and_raw_locals_named_like_the_entry_object() {
+    for raw in [
+        "raw {\n            // __self_obj\n            temp[0] := 1;\n        }",
+        "raw {\n            let __self_obj = 1;\n            temp[0] := __self_obj;\n        }",
+    ] {
+        let src = obj(
+            "Plain",
+            &format!(
+                "    @context(inherit) tree quiet {{\n        {raw}\n        return true;\n    }}"
+            ),
+        );
+        expand("inherit_comment.antics", &src);
+    }
+}
+
+/// Two helpers' out-operand locals that happen to share a spelling are distinct source locals:
+/// they keep their own words, while copies of one declaration still share.
+#[test]
+fn same_spelled_out_operand_locals_of_different_helpers_do_not_share() {
+    let src = obj(
+        "Plain",
+        r#"    fn first() {
+        let event: i16 = me.attr[5];
+        me.attr[5] = 0;
+        me.attr[1] = event;
+    }
+    fn second() {
+        let event: i16;
+        random_into(event, 4)?;
+        me.attr[2] = event;
+    }
+    tree a {
+        first();
+        second();
+    }
+    tree b {
+        second();
+        second();
+    }"#,
+    );
+    let air = expand("inline_same_spelling.antics", &src);
+    let a = tree(&air, "a");
+    assert_eq!(a.matches("let __inline_v_event_").count(), 2, "{a}");
+    let b = tree(&air, "b");
+    assert_eq!(b.matches("let __inline_v_event_").count(), 1, "{b}");
+}
