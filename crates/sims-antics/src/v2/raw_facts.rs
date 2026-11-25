@@ -18,6 +18,8 @@ pub(crate) struct RawFacts {
     pub declares_local: bool,
     /// A branch target names a node by number (`4`, `raw(4)`), which depends on the layout.
     pub positional_target: bool,
+    /// A branch target names a label (`-> true: @x`), which may sit outside the block.
+    pub label_target: bool,
     /// A `break` outside every loop of the block, which leaves the loop the block sits in.
     pub breaks_enclosing_loop: bool,
     /// A `continue` outside every loop of the block, which jumps to the head of the loop the
@@ -33,11 +35,18 @@ impl RawFacts {
         self.breaks_enclosing_loop || self.continues_enclosing_loop
     }
 
+    /// A jump that may leave the code around the block: a `break` of the enclosing loop, or
+    /// a branch to a label or a node number.
+    pub fn may_jump_out(&self) -> bool {
+        self.breaks_enclosing_loop || self.label_target || self.positional_target
+    }
+
     fn all() -> Self {
         Self {
             defines_label: true,
             declares_local: true,
             positional_target: true,
+            label_target: true,
             breaks_enclosing_loop: true,
             continues_enclosing_loop: true,
             formats_text: true,
@@ -172,6 +181,7 @@ fn note_branches(b: &Branches, facts: &mut RawFacts) {
 
 fn note_target(t: &Target, facts: &mut RawFacts) {
     facts.positional_target |= matches!(t, Target::Node(_) | Target::Raw(_));
+    facts.label_target |= matches!(t, Target::Label(_));
 }
 
 fn prim_formats_text(prim: &PrimitiveCall) -> bool {

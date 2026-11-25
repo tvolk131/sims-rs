@@ -86,7 +86,8 @@ fn index_of(lines: &[&str], pred: impl Fn(&str) -> bool, body: &str) -> usize {
 fn cursor_loops_reread_indexed_self_cells() {
     let air = expand(
         "cursor_head.antics",
-        &obj(r#"    tree scan (sim: Sim) {
+        &obj(r#"    #[bhav]
+    fn scan(sim: Sim) {
         while self.attr[0] != 0 {
             self.attr[0] = 0;
             set_to_next(all, dest: stack_obj);
@@ -123,10 +124,12 @@ fn inline_returns_from_for_else_leave_the_helper() {
         temp[2] = 44;
         return false;
     }
-    tree a {
+    #[bhav]
+    fn a() {
         temp[0] = f();
     }
-    tree b {
+    #[bhav]
+    fn b() {
         if g() { temp[3] = 1; } else { temp[3] = 2; }
     }"#),
     );
@@ -147,7 +150,8 @@ fn inline_returns_from_for_else_leave_the_helper() {
 fn multiline_numeric_targets_keep_the_entry_save() {
     let air = expand(
         "multiline_targets.antics",
-        &obj(r#"    tree a (sim: Sim) {
+        &obj(r#"    #[bhav]
+    fn a(sim: Sim) {
         stack_obj = sim.container;
         raw {
             random(temp[0], 2) ->
@@ -170,11 +174,12 @@ fn multiline_numeric_targets_keep_the_entry_save() {
 fn shadowed_slots_captured_by_a_defer_stay_occupied() {
     expect_err(
         "slot_defer.antics",
-        &obj(r#"    tree a {
-        @slot(0) let x = 1;
+        &obj(r#"    #[bhav]
+    fn a() {
+        #[slot(0)] let x = 1;
         defer { temp[0] = x; }
         let x = 2;
-        @slot(0) let z = 3;
+        #[slot(0)] let z = 3;
         raw { temp[2] := local[0]; }
     }"#),
         "already holds 'x'",
@@ -192,9 +197,10 @@ fn inline_helpers_do_not_publish_into_pinned_words_early() {
         defer { dialog(kind: ok, title: title, message: msg); }
         return 9;
     }
-    tree a {
+    #[bhav]
+    fn a() {
         raw { local[0] := 7; }
-        @slot(0) let x = f();
+        #[slot(0)] let x = f();
         temp[0] = x;
     }
 "#),
@@ -216,8 +222,9 @@ fn pinned_arguments_are_copied() {
         raw { local[3] := 44; }
         return a;
     }
-    tree a {
-        @slot(3) let x = 17;
+    #[bhav]
+    fn a() {
+        #[slot(3)] let x = 17;
         temp[0] = f(x);
     }"#),
     );
@@ -239,13 +246,15 @@ fn pinned_arguments_are_copied() {
 fn entry_save_stays_when_locals_can_be_unwritten_or_observed() {
     let air = expand(
         "entry_save.antics",
-        &obj(r#"    tree a (sim: Sim) {
+        &obj(r#"    #[bhav]
+    fn a(sim: Sim) {
         let a: i16;
         stack_obj = sim.container;
         relationship(column: 0, dir: 0, flags: 1, value: a);
         raw { temp[0] := __v_a_0; }
     }
-    tree b (sim: Sim) {
+    #[bhav]
+    fn b(sim: Sim) {
         let a = 7;
         stack_obj = sim.container;
         raw {
@@ -255,7 +264,8 @@ fn entry_save_stays_when_locals_can_be_unwritten_or_observed() {
         let b = 8;
         raw { @skip: temp[1] := __v_b_1; }
     }
-    tree c (sim: Sim) {
+    #[bhav]
+    fn c(sim: Sim) {
         let a = 1;
         stack_obj = sim.container;
         raw { temp[0] := __v_a_0; }
@@ -276,7 +286,8 @@ fn entry_save_stays_when_locals_can_be_unwritten_or_observed() {
 fn for_else_keeps_the_last_result_for_its_exhaustion_block() {
     let air = expand(
         "for_else_result.antics",
-        &obj(r#"    tree scan (sim: Sim) {
+        &obj(r#"    #[bhav]
+    fn scan(sim: Sim) {
         for item in lot.objects() {} else { raw { gosub_found_action(); } }
     }"#),
     );
@@ -293,7 +304,8 @@ fn for_else_keeps_the_last_result_for_its_exhaustion_block() {
 fn const_bindings_yield_only_stable_operands() {
     expect_err(
         "yield_var.antics",
-        &obj(r#"    tree a {
+        &obj(r#"    #[bhav]
+    fn a() {
         let y = temp[0];
         const X = if temp[1] == 1 { y } else { y };
         temp[2] = X;
@@ -302,7 +314,8 @@ fn const_bindings_yield_only_stable_operands() {
     );
     expect_err(
         "yield_stack_obj.antics",
-        &obj(r#"    tree a {
+        &obj(r#"    #[bhav]
+    fn a() {
         const X = if temp[1] == 1 { stack_obj } else { 0 };
         temp[2] = X;
     }"#),
@@ -310,7 +323,8 @@ fn const_bindings_yield_only_stable_operands() {
     );
     expect_err(
         "write_through.antics",
-        &obj(r#"    tree a {
+        &obj(r#"    #[bhav]
+    fn a() {
         const X = if temp[1] == 1 { 1 } else { 2 };
         X = 9;
         temp[2] = X;
@@ -325,7 +339,8 @@ fn const_bindings_yield_only_stable_operands() {
 fn const_regions_reject_layout_sensitive_code() {
     expect_err(
         "region_label.antics",
-        &obj(r#"    tree a {
+        &obj(r#"    #[bhav]
+    fn a() {
         const X = if temp[1] == 1 { 1 } else { 2 };
         raw { @done: temp[1] := 9; }
         temp[0] = X;
@@ -334,7 +349,8 @@ fn const_regions_reject_layout_sensitive_code() {
     );
     expect_err(
         "region_text.antics",
-        &obj(r#"    tree a {
+        &obj(r#"    #[bhav]
+    fn a() {
         const X = if temp[1] == 1 { 10 } else { 20 };
         let y = X;
         temp[2] = y;
@@ -345,7 +361,8 @@ fn const_regions_reject_layout_sensitive_code() {
     // Without text the copies are independent locals, as before.
     expand(
         "region_plain.antics",
-        &obj(r#"    tree a {
+        &obj(r#"    #[bhav]
+    fn a() {
         const X = if temp[1] == 1 { 10 } else { 20 };
         let y = X;
         temp[2] = y;
@@ -361,7 +378,8 @@ fn raw_consts_leave_air_words_and_targets_alone() {
         "raw_words.antics",
         &obj(r#"    const part = 0;
     const done = 0;
-    tree a {
+    #[bhav]
+    fn a() {
         raw {
             set_to_next(part, dest: stack_obj);
             random(temp[0], 2) ->
@@ -383,10 +401,12 @@ fn raw_consts_leave_air_words_and_targets_alone() {
     assert_eq!(
         nodes(&obj(r#"    const part = 0;
     const done = 0;
-    @id(4300) tree a {
+    #[bhav(id = 4300)]
+    fn a() {
         raw { set_to_next(part, dest: stack_obj); temp[1] := done; }
     }"#)),
-        nodes(&obj(r#"    @id(4300) tree a {
+        nodes(&obj(r#"    #[bhav(id = 4300)]
+    fn a() {
         raw { set_to_next(part, dest: stack_obj); temp[1] := 0; }
     }"#)),
         "operands still resolve"
@@ -399,8 +419,9 @@ fn raw_consts_leave_air_words_and_targets_alone() {
 fn slot_rewriting_leaves_labels_alone() {
     let air = expand(
         "slot_label.antics",
-        &obj(r#"    tree a {
-        @slot(3) let a = 17;
+        &obj(r#"    #[bhav]
+    fn a() {
+        #[slot(3)] let a = 17;
         raw { @__slot3_a_0: temp[0] := __slot3_a_0; }
     }"#),
     );
@@ -424,9 +445,9 @@ fn raw_targets_stay_labels_past_comments() {
             temp[1] += 1; }"#;
     assert_eq!(
         nodes(&obj(&format!(
-            "    const done = 3;\n    @id(4300) tree a {{ {raw} }}"
+            "    const done = 3;\n    #[bhav(id = 4300)] fn a() {{ {raw} }}"
         ))),
-        nodes(&obj(&format!("    @id(4300) tree a {{ {raw} }}"))),
+        nodes(&obj(&format!("    #[bhav(id = 4300)] fn a() {{ {raw} }}"))),
     );
 }
 
@@ -440,7 +461,8 @@ fn helpers_with_raw_code_get_copied_arguments() {
         raw { __v_x_0 := 44; }
         return a;
     }
-    tree a {
+    #[bhav]
+    fn a() {
         let x = 17;
         temp[0] = f(x);
     }"#),
@@ -456,7 +478,8 @@ fn helpers_with_raw_code_get_copied_arguments() {
 fn inline_operands_are_read_before_a_writing_selector() {
     let air = expand(
         "motive_order.antics",
-        &obj(r#"    tree a {
+        &obj(r#"    #[bhav]
+    fn a() {
         set_motive_change(hunger, temp[0], if inc_lt(&mut temp[0], 2) { 10 } else { 20 });
     }"#),
     );
@@ -467,21 +490,21 @@ fn inline_operands_are_read_before_a_writing_selector() {
     assert!(read < select, "{body}");
 }
 
-/// An `@slot` store is kept even when the tree itself never reads it again (another tree using
-/// the same frame word may), and a slot must lie inside an explicit `@frame(locals: L)`.
+/// An `#[slot]` store is kept even when the tree itself never reads it again (another tree using
+/// the same frame word may), and a slot must lie inside an explicit `#[frame(locals = L)]`.
 #[test]
 fn pinned_stores_survive_and_fit_the_frame() {
     let air = expand(
         "pin_reuse.antics",
-        &obj(
-            r#"    @id(4200) tree seed { @slot(10) let x = 17; temp[1] = x; }
-    @id(4201) tree read { @slot(10) let x: i16; temp[0] = x; }"#,
-        ),
+        &obj(r#"    #[bhav(id = 4200)]
+    fn seed() { #[slot(10)] let x = 17; temp[1] = x; }
+    #[bhav(id = 4201)]
+    fn read() { #[slot(10)] let x: i16; temp[0] = x; }"#),
     );
     assert!(tree(&air, "seed").contains("local[10] := 17;"), "{air}");
     expect_err(
         "pin_frame.antics",
-        &obj("    @frame(locals: 3) tree a { @slot(3) let x: i16; temp[0] = x; }"),
+        &obj("    #[bhav(locals = 3)] fn a() { #[slot(3)] let x: i16; temp[0] = x; }"),
         "gives the tree 3 local word(s)",
     );
 }
@@ -493,8 +516,9 @@ fn pinned_stores_survive_and_fit_the_frame() {
 fn slot_placement_follows_provenance_and_tokens() {
     let air = expand(
         "slot_target.antics",
-        &obj(r#"    tree a {
-        @slot(3) let a = 17;
+        &obj(r#"    #[bhav]
+    fn a() {
+        #[slot(3)] let a = 17;
         raw { random(temp[0], 2) -> true: __slot3_a_0, false: __slot3_a_0;
               __slot3_a_0: temp[0] := __slot3_a_0; }
     }"#),
@@ -507,8 +531,9 @@ fn slot_placement_follows_provenance_and_tokens() {
     assert!(body.contains("__slot3_a_0: temp[0] := local[3];"), "{body}");
     let air = expand(
         "slot_raw.antics",
-        &obj(r#"    tree a {
-        @slot(3) let a = 17;
+        &obj(r#"    #[bhav]
+    fn a() {
+        #[slot(3)] let a = 17;
         raw { let __slot3_raw_99 = 44; temp[1] := __slot3_raw_99; }
         temp[0] = a;
     }"#),
@@ -524,7 +549,8 @@ fn slot_placement_follows_provenance_and_tokens() {
 fn random_with_a_pointer_range_is_no_definite_write() {
     let air = expand(
         "entry_random.antics",
-        &obj(r#"    tree a (sim: Sim) {
+        &obj(r#"    #[bhav]
+    fn a(sim: Sim) {
         let a: i16;
         stack_obj = sim.container;
         raw { random(__v_a_0, global[34]); temp[1] := __v_a_0; }
@@ -542,7 +568,8 @@ fn random_with_a_pointer_range_is_no_definite_write() {
 fn for_else_field_reads_leave_no_exhaustion_restore() {
     let air = expand(
         "cursor_foreign.antics",
-        &obj(r#"    tree a (sim: Sim) {
+        &obj(r#"    #[bhav]
+    fn a(sim: Sim) {
         for item in lot.objects() {
             if item.attr[0] == 1 { temp[1] = 1; }
         } else { raw { gosub_found_action(); } }
@@ -564,7 +591,8 @@ fn bool_helpers_with_defers_branch_on_a_saved_flag() {
         defer { temp[1] = 99; }
         return false;
     }
-    tree a (sim: Sim) {
+    #[bhav]
+    fn a(sim: Sim) {
         if f() {} else { gosub_found_action(); }
     }"#),
     );
@@ -582,7 +610,8 @@ fn bool_helpers_with_defers_branch_on_a_saved_flag() {
 fn const_regions_tell_reads_from_writes_and_reject_uncopyable_raw() {
     expect_err(
         "region_field.antics",
-        &obj(r#"    tree a {
+        &obj(r#"    #[bhav]
+    fn a() {
         let X = self.id;
         const C = if temp[0] == 0 { X.graphic } else { 0 };
         self.graphic = 42;
@@ -594,7 +623,8 @@ fn const_regions_tell_reads_from_writes_and_reject_uncopyable_raw() {
         "region_call.antics",
         &obj(r#"    const K = 7;
     fn f(a: i16) -> i16 { return a; }
-    tree a {
+    #[bhav]
+    fn a() {
         const C = if temp[0] == 0 { K } else { 9 };
         temp[1] = f(K);
         temp[2] = C;
@@ -616,7 +646,8 @@ fn const_regions_tell_reads_from_writes_and_reject_uncopyable_raw() {
         expect_err(
             name,
             &obj(&format!(
-                "    tree a {{
+                "    #[bhav]
+    fn a() {{
         const C = if temp[0] == 0 {{ 7 }} else {{ 9 }};
         {raw}
         temp[3] = C;
@@ -639,7 +670,8 @@ fn text_formatting_is_found_by_parse_not_spelling() {
         expect_err(
             name,
             &obj(&format!(
-                "    tree a {{
+                "    #[bhav]
+    fn a() {{
         const C = if temp[0] == 0 {{ 7 }} else {{ 9 }};
         let a = C;
         temp[1] = a;
@@ -652,7 +684,8 @@ fn text_formatting_is_found_by_parse_not_spelling() {
     expect_err(
         "text_inline.antics",
         &obj(r#"    fn f() -> i16 { let x = 5; return x; }
-    tree a {
+    #[bhav]
+    fn a() {
         const C = if temp[0] == 0 { 7 } else { 9 };
         temp[1] = f() + C;
         action_label(table: 301, index: 1);
@@ -667,17 +700,21 @@ fn text_formatting_is_found_by_parse_not_spelling() {
 fn raw_consts_follow_tokens_not_text() {
     assert_eq!(
         nodes(&obj(r#"    const K = 7;
-    @id(4300) tree a {
+    #[bhav(id = 4300)]
+    fn a() {
         raw { // let K is an explanatory comment
               temp[1] := K; }
     }"#)),
-        nodes(&obj("    @id(4300) tree a { raw { temp[1] := 7; } }")),
+        nodes(&obj(
+            "    #[bhav(id = 4300)] fn a() { raw { temp[1] := 7; } }"
+        )),
     );
     assert_eq!(
         nodes(&obj(r#"    const part = 7;
-    @id(4300) tree a { raw { set_to_next(part, dest: stack_obj); temp[0] := part; } }"#)),
+    #[bhav(id = 4300)]
+    fn a() { raw { set_to_next(part, dest: stack_obj); temp[0] := part; } }"#)),
         nodes(&obj(
-            "    @id(4300) tree a { raw { set_to_next(part, dest: stack_obj); temp[0] := 7; } }"
+            "    #[bhav(id = 4300)] fn a() { raw { set_to_next(part, dest: stack_obj); temp[0] := 7; } }"
         )),
     );
 }
@@ -693,7 +730,8 @@ fn raw_nested_loops_do_not_exit_a_for_else() {
         expand(
             "for_raw.antics",
             &obj(&format!(
-                "    tree a {{
+                "    #[bhav]
+    fn a() {{
         for item in lot.sims() {{}} else {{ {raw} }}
     }}"
             )),
@@ -711,17 +749,19 @@ fn raw_nested_loops_do_not_exit_a_for_else() {
 #[test]
 fn raw_consts_survive_inlining_discarded_code_and_keywords() {
     let literal = nodes(&obj(
-        "    @id(4300) tree a { raw { temp[0] := 7; temp[1] := 7; } }",
+        "    #[bhav(id = 4300)] fn a() { raw { temp[0] := 7; temp[1] := 7; } }",
     ));
     assert_eq!(
         nodes(&obj(r#"    const K = 7;
     fn f() { raw { temp[0] := K; temp[1] := K; } }
-    @id(4300) tree a { f(); }"#)),
+    #[bhav(id = 4300)]
+    fn a() { f(); }"#)),
         literal,
     );
     assert_eq!(
         nodes(&obj(r#"    const K = 7;
-    @id(4300) tree a {
+    #[bhav(id = 4300)]
+    fn a() {
         if false { raw { local K; } }
         raw { temp[0] := K; temp[1] := K; }
     }"#)),
@@ -729,28 +769,31 @@ fn raw_consts_survive_inlining_discarded_code_and_keywords() {
     );
     assert_eq!(
         nodes(&obj(r#"    const temp = 17;
-    @id(4300) tree a { raw { temp[0] := 7; temp[1] := 7; } }"#)),
+    #[bhav(id = 4300)]
+    fn a() { raw { temp[0] := 7; temp[1] := 7; } }"#)),
         literal,
     );
     assert_eq!(
         nodes(&obj(r#"    const L = 1;
-    @id(4300) tree a { raw { animate(clip: 1, table: 0, events: 0, local: L); } }"#)),
+    #[bhav(id = 4300)]
+    fn a() { raw { animate(clip: 1, table: 0, events: 0, local: L); } }"#)),
         nodes(&obj(
-            "    @id(4300) tree a { raw { animate(clip: 1, table: 0, events: 0, local: 1); } }"
+            "    #[bhav(id = 4300)] fn a() { raw { animate(clip: 1, table: 0, events: 0, local: 1); } }"
         )),
     );
 }
 
-/// Only live `@slot` lets pin a word: a slot in discarded code pins nothing, and a raw block's own
+/// Only live `#[slot]` lets pin a word: a slot in discarded code pins nothing, and a raw block's own
 /// local spelled like a slot name keeps its `.air` placement. A call target spelled like a pinned
 /// local stays a call target.
 #[test]
 fn slot_pins_come_from_live_code_and_leave_call_targets_alone() {
     let air = expand(
         "slot_dead.antics",
-        &obj(r#"    tree a {
-        if false { @slot(7) let x: i16; }
-        @slot(3) let q = 1;
+        &obj(r#"    #[bhav]
+    fn a() {
+        if false { #[slot(7)] let x: i16; }
+        #[slot(3)] let q = 1;
         raw { local __slot7_x_0; __slot7_x_0 := 9; temp[0] := local[7]; }
     }"#),
     );
@@ -759,9 +802,11 @@ fn slot_pins_come_from_live_code_and_leave_call_targets_alone() {
     assert!(!body.contains("local[7] := 9;"), "{body}");
     let air = expand(
         "slot_call.antics",
-        &obj(r#"    tree __slot3_x_0 { return true; }
-    tree a {
-        @slot(3) let x = 7;
+        &obj(r#"    #[bhav]
+    fn __slot3_x_0() { return true; }
+    #[bhav]
+    fn a() {
+        #[slot(3)] let x = 7;
         raw { call __slot3_x_0() -> true: true, false: false; }
     }"#),
     );
@@ -783,7 +828,8 @@ fn raw_stack_obj_targets_restore_but_calls_do_not() {
         let air = expand(
             "cursor_raw.antics",
             &obj(&format!(
-                "    tree a (sim: Sim) {{
+                "    #[bhav]
+    fn a(sim: Sim) {{
         for item in lot.objects() {{ raw {{ {raw} }} }} else {{ raw {{ temp[1] := stack_obj; }} }}
     }}"
             )),
@@ -795,8 +841,10 @@ fn raw_stack_obj_targets_restore_but_calls_do_not() {
     }
     let air = expand(
         "cursor_call.antics",
-        &obj(r#"    @id(4300) tree b { raw { stack_obj := 9; } }
-    tree a (sim: Sim) {
+        &obj(r#"    #[bhav(id = 4300)]
+    fn b() { raw { stack_obj := 9; } }
+    #[bhav]
+    fn a(sim: Sim) {
         for item in lot.objects() {
             raw { if call 4300() { temp[1] := 1; } }
         } else { gosub_found_action(); }
@@ -831,7 +879,8 @@ fn air_constants_cannot_name_cells() {
 #[test]
 fn unparsed_raw_exhaustion_blocks_keep_the_loop_shape() {
     let src = obj(r#"    const K = 7;
-    tree a {
+    #[bhav]
+    fn a() {
         for item in lot.objects() {}
         else { raw { refresh(target: K); } }
     }"#);
@@ -863,12 +912,13 @@ fn restore_before(members: &str, first: &str) -> bool {
     ls[at - 1] == "stack_obj := __self_obj;"
 }
 
-/// An `@slot` word stays in the frame even when nothing in the tree names it again (`.air`'s
+/// An `#[slot]` word stays in the frame even when nothing in the tree names it again (`.air`'s
 /// `min_locals` header): a raw primitive or text may read it by number.
 #[test]
 fn uninitialized_slots_keep_their_frame_word() {
-    let (locals, _) = nodes(&obj(r#"    @id(4300) tree a {
-        @slot(3) let x: i16;
+    let (locals, _) = nodes(&obj(r#"    #[bhav(id = 4300)]
+    fn a() {
+        #[slot(3)] let x: i16;
         raw { op 2 (0, 0, 3, 0, 0, 5, 8, 25); }
     }"#));
     assert_eq!(locals, 4);
@@ -880,14 +930,16 @@ fn uninitialized_slots_keep_their_frame_word() {
 #[test]
 fn exhaustion_restores_follow_writes_and_paths() {
     assert!(restore_before(
-        r#"    tree a (sim: Sim) {
+        r#"    #[bhav]
+    fn a(sim: Sim) {
         for item in lot.objects() { raw { scope (10, 0):=9; } }
         else { raw { temp[1] := stack_obj; } }
     }"#,
         "temp[1] := stack_obj;",
     ));
     assert!(restore_before(
-        r#"    tree a (sim: Sim) {
+        r#"    #[bhav]
+    fn a(sim: Sim) {
         for item in lot.objects() {
             while temp[0] != 0 {
                 if temp[1] != 0 {
@@ -908,8 +960,10 @@ fn exhaustion_restores_follow_writes_and_paths() {
         let air = expand(
             "cursor_quiet.antics",
             &obj(&format!(
-                "    @id(4300) tree b {{ return true; }}
-    tree a (sim: Sim) {{
+                "    #[bhav(id = 4300)]
+    fn b() {{ return true; }}
+    #[bhav]
+    fn a(sim: Sim) {{
         for item in lot.objects() {{ {body} }} else {{ gosub_found_action(); }}
     }}"
             )),
@@ -927,7 +981,8 @@ fn exhaustion_restores_follow_writes_and_paths() {
 fn raw_loop_exits_cannot_skip_loop_work() {
     expect_err(
         "raw_break.antics",
-        &obj(r#"    tree a (sim: Sim) {
+        &obj(r#"    #[bhav]
+    fn a(sim: Sim) {
         for item in lot.objects() { raw { stack_obj := 9; break; } } else { temp[2] = 1; }
         temp[1] = self.attr[0];
     }"#),
@@ -945,7 +1000,8 @@ fn lock_helpers_branch_on_a_saved_flag() {
     fn f() -> bool {
         with lock(self.occupied) { return temp[0] == 0; }
     }
-    tree a (sim: Sim) {
+    #[bhav]
+    fn a(sim: Sim) {
         if f() {} else { gosub_found_action(); }
     }"#),
     );
@@ -961,9 +1017,11 @@ fn lock_helpers_branch_on_a_saved_flag() {
 fn subroutine_targets_keep_slot_names() {
     let air = expand(
         "slot_subroutine.antics",
-        &obj(r#"    tree __slot3_x_0 { return true; }
-    tree a {
-        @slot(3) let x = 1;
+        &obj(r#"    #[bhav]
+    fn __slot3_x_0() { return true; }
+    #[bhav]
+    fn a() {
+        #[slot(3)] let x = 1;
         raw { subroutine(__slot3_x_0); }
     }"#),
     );
@@ -981,17 +1039,20 @@ fn air_constants_index_strings_and_stay_read_only() {
 "#;
     assert_eq!(
         nodes(&obj(&format!(
-            "{strings}    const MSG = 1;\n    @id(4300) tree a {{ raw {{ dialog(message: MSG); }} }}"
+            "{strings}    const MSG = 1;\n    #[bhav(id = 4300)] fn a() {{ raw {{ dialog(message: MSG); }} }}"
         ))),
         nodes(&obj(&format!(
-            "{strings}    @id(4300) tree a {{ raw {{ dialog(message: 1); }} }}"
+            "{strings}    #[bhav(id = 4300)] fn a() {{ raw {{ dialog(message: 1); }} }}"
         ))),
     );
     assert_eq!(
         nodes(&obj(r#"    const K = 7;
     fn f() { raw { const K = 9; temp[0] := K; } }
-    @id(4300) tree a { f(); }"#)),
-        nodes(&obj("    @id(4300) tree a { raw { temp[0] := 9; } }")),
+    #[bhav(id = 4300)]
+    fn a() { f(); }"#)),
+        nodes(&obj(
+            "    #[bhav(id = 4300)] fn a() { raw { temp[0] := 9; } }"
+        )),
     );
     for stmt in [
         "expr(X := 17);",
@@ -1026,8 +1087,10 @@ fn exhaustion_restores_skip_reads_unreachable_code_and_calls() {
         let air = expand(
             "cursor_quiet.antics",
             &obj(&format!(
-                "    @id(4300) tree b {{ return true; }}
-    tree a (sim: Sim) {{
+                "    #[bhav(id = 4300)]
+    fn b() {{ return true; }}
+    #[bhav]
+    fn a(sim: Sim) {{
         for item in lot.objects() {{
             {body}
         }} else {{ gosub_found_action(); }}
@@ -1049,10 +1112,11 @@ fn exhaustion_restores_skip_reads_unreachable_code_and_calls() {
 fn raw_loop_exits_are_judged_per_edge() {
     expand(
         "repeat_break.antics",
-        &obj("    tree a { repeat 2 { raw { break; } } temp[0] = 1; }"),
+        &obj("    #[bhav] fn a() { repeat 2 { raw { break; } } temp[0] = 1; }"),
     );
     assert!(restore_before(
-        r#"    tree a (sim: Sim) {
+        r#"    #[bhav]
+    fn a(sim: Sim) {
         for item in lot.objects() { raw { stack_obj := 9; continue; } }
         else { raw { temp[2] := stack_obj; } }
     }"#,
@@ -1060,12 +1124,13 @@ fn raw_loop_exits_are_judged_per_edge() {
     ));
     expect_err(
         "repeat_continue.antics",
-        &obj("    tree a { repeat 2 { raw { temp[0] := 1; continue; } } }"),
+        &obj("    #[bhav] fn a() { repeat 2 { raw { temp[0] := 1; continue; } } }"),
         "cannot break/continue out of a loop whose exits do work",
     );
     expand(
         "repeat_inner.antics",
-        &obj(r#"    tree a {
+        &obj(r#"    #[bhav]
+    fn a() {
         repeat 2 {
             raw { const K = 0; while temp[K] != 0 { break; } }
         }
@@ -1073,13 +1138,14 @@ fn raw_loop_exits_are_judged_per_edge() {
     );
 }
 
-/// A raw block's own constant is owned by its full name: it moves no `@slot` binding, hides no
+/// A raw block's own constant is owned by its full name: it moves no `#[slot]` binding, hides no
 /// tuning entry (`Tuning.dear` with an own `Tuning`), and a helper inlined twice declares it twice
 /// with the same value, which `.air` accepts.
 #[test]
 fn raw_own_constants_are_owned_by_full_name() {
-    let (locals, _) = nodes(&obj(r#"    @id(4300) tree a {
-        @slot(3) let x = 1;
+    let (locals, _) = nodes(&obj(r#"    #[bhav(id = 4300)]
+    fn a() {
+        #[slot(3)] let x = 1;
         raw { const __slot3_x_0 = 2; }
         temp[0] = x;
     }"#));
@@ -1087,14 +1153,16 @@ fn raw_own_constants_are_owned_by_full_name() {
     let air = expand(
         "own_tuning.antics",
         &obj(r#"    bcon 4097 "Tuning" { dear = 25 }
-    tree a { raw { const Tuning = 9; temp[0] := Tuning.dear; } }"#),
+    #[bhav]
+    fn a() { raw { const Tuning = 9; temp[0] := Tuning.dear; } }"#),
     );
     assert!(tree(&air, "a").contains("const Tuning.dear = "), "{air}");
     assert_eq!(
         nodes(&obj(r#"    fn f() { raw { const K = 2; temp[0] := K; } }
-    @id(4300) tree a { f(); f(); }"#)),
+    #[bhav(id = 4300)]
+    fn a() { f(); f(); }"#)),
         nodes(&obj(
-            "    @id(4300) tree a { raw { temp[0] := 2; temp[0] := 2; } }"
+            "    #[bhav(id = 4300)] fn a() { raw { temp[0] := 2; temp[0] := 2; } }"
         )),
     );
 }
@@ -1130,29 +1198,30 @@ fn raw_constants_belong_to_one_block() {
     const SHARED: &str = "a raw constant's name appears only in its own block";
     expect_err(
         "label_shared.antics",
-        &obj("    tree a { raw { const K = 2; temp[0] := K; } raw { K: temp[1] := 3; } }"),
+        &obj("    #[bhav] fn a() { raw { const K = 2; temp[0] := K; } raw { K: temp[1] := 3; } }"),
         SHARED,
     );
     expect_err(
         "pad_shared.antics",
-        &obj("    tree a { raw { const K = 0; } raw { pad(K: 0xA0); } }"),
+        &obj("    #[bhav] fn a() { raw { const K = 0; } raw { pad(K: 0xA0); } }"),
         SHARED,
     );
     assert_eq!(
         nodes(&obj(
-            "    const K = 0;\n    @id(4300) tree a { raw { temp[0] := bcon[K:0]; } }"
+            "    const K = 0;\n    #[bhav(id = 4300)] fn a() { raw { temp[0] := bcon[K:0]; } }"
         )),
         nodes(&obj(
-            "    @id(4300) tree a { raw { temp[0] := bcon[0:0]; } }"
+            "    #[bhav(id = 4300)] fn a() { raw { temp[0] := bcon[0:0]; } }"
         )),
     );
     nodes(&obj(
-        "    @id(4300) tree a { raw { const: temp[0] := 1; } }",
+        "    #[bhav(id = 4300)] fn a() { raw { const: temp[0] := 1; } }",
     ));
     expect_err(
         "dotted_shared.antics",
         &obj(r#"    bcon 4097 "Tuning" { valid = 25 }
-    tree a {
+    #[bhav]
+    fn a() {
         raw { const Tuning.extra = 2; }
         raw { temp[0] := Tuning.extra; }
     }"#),
@@ -1160,7 +1229,8 @@ fn raw_constants_belong_to_one_block() {
     );
     expect_err(
         "text_op_shared.antics",
-        &obj(r#"    tree a {
+        &obj(r#"    #[bhav]
+    fn a() {
         raw { const TextOp = 50; }
         raw { op TextOp (45, 1, 0, 0, 1, 0, 0, 0); }
     }"#),
@@ -1168,17 +1238,17 @@ fn raw_constants_belong_to_one_block() {
     );
     expect_err(
         "redeclared.antics",
-        &obj("    tree a { raw { const K = 1; } raw { const K = 1; temp[0] := K; } }"),
+        &obj("    #[bhav] fn a() { raw { const K = 1; } raw { const K = 1; temp[0] := K; } }"),
         SHARED,
     );
     expect_err(
         "discarded_redeclared.antics",
-        &obj("    tree a { raw { const K = 1; } if false { raw { const K = 2; } } }"),
+        &obj("    #[bhav] fn a() { raw { const K = 1; } if false { raw { const K = 2; } } }"),
         SHARED,
     );
     expect_err(
         "split.antics",
-        &obj("    tree a { raw { const K = 9 } raw { ; temp[0] := 1; } }"),
+        &obj("    #[bhav] fn a() { raw { const K = 9 } raw { ; temp[0] := 1; } }"),
         "must end with ';' in its own raw block",
     );
     let seeded = |body: &str| {
@@ -1188,25 +1258,29 @@ fn raw_constants_belong_to_one_block() {
     };
     seeded(
         r#"    fn f() { raw { const K = literal(SEED); temp[0] := K; } }
-    @id(4300) tree a { f(); f(); }"#,
+    #[bhav(id = 4300)]
+    fn a() { f(); f(); }"#,
     );
     assert_eq!(
         seeded(
-            r#"    @id(4300) tree a (sim: Sim) {
+            r#"    #[bhav(id = 4300)]
+    fn a(sim: Sim) {
         raw { const K = literal(SEED); }
         raw { if gosub_found_action() { temp[1] := 3; } else { temp[1] := 4; } }
         stack_obj = sim.container;
     }"#
         ),
         seeded(
-            r#"    @id(4300) tree a (sim: Sim) {
+            r#"    #[bhav(id = 4300)]
+    fn a(sim: Sim) {
         raw { if gosub_found_action() { temp[1] := 3; } else { temp[1] := 4; } }
         stack_obj = sim.container;
     }"#
         ),
     );
     seeded(
-        r#"    @id(4300) tree a {
+        r#"    #[bhav(id = 4300)]
+    fn a() {
         raw { const K = literal(SEED); }
         const C = if temp[0] == 0 { 7 } else { 9 };
         let x = C;

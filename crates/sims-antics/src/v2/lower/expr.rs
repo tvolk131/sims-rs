@@ -34,12 +34,16 @@ impl<'a> TreeLowerer<'a> {
             | V2Expr::MethodCall { .. }
             | V2Expr::Try { .. }
             | V2Expr::Match { .. }
-            | V2Expr::If { .. } => true,
+            | V2Expr::If { .. }
+            | V2Expr::Block { .. } => true,
             V2Expr::Int(..)
             | V2Expr::Bool(..)
             | V2Expr::Str(..)
             | V2Expr::Ident(..)
-            | V2Expr::Path(..) => false,
+            | V2Expr::Path(..) => {
+                // `Table::entry` reads like `Table.entry` (an `extern bcon` read may trap).
+                matches!(self.bcon_field_ref(expr), Some(r) if !matches!(r, Ok((_, Some(_)))))
+            }
         }
     }
 
@@ -150,19 +154,25 @@ impl<'a> TreeLowerer<'a> {
                             "in_use" => format!("{}.data[25]", self.self_prefix()),
                             "id" => format!("{}.data[11]", self.self_prefix()),
                             "room" => format!("{}.data[29]", self.self_prefix()),
-                            _ => return true,
+                            other => match object_data_field(other) {
+                                Some(i) => format!("{}.data[{i}]", self.self_prefix()),
+                                None => return true,
+                            },
                         };
                         return prop_air == canon_target;
                     }
                     if self.is_sim_ident(bname) {
                         let sim_air = match field.as_str() {
-                            "id" => "my.data[11]",
-                            "priority" => "my.person[33]",
-                            "room" => "my.data[29]",
-                            "hand" => "my.slot[0]",
-                            "age" => "my.person[58]",
-                            "visitor_kind" => "my.person[32]",
-                            _ => return true,
+                            "id" => "my.data[11]".to_owned(),
+                            "priority" => "my.person[33]".to_owned(),
+                            "room" => "my.data[29]".to_owned(),
+                            "hand" => "my.slot[0]".to_owned(),
+                            "age" => "my.person[58]".to_owned(),
+                            "visitor_kind" => "my.person[32]".to_owned(),
+                            other => match sim_person_field(other) {
+                                Some(i) => format!("my.person[{i}]"),
+                                None => return true,
+                            },
                         };
                         return sim_air == canon_target;
                     }
@@ -234,7 +244,8 @@ impl<'a> TreeLowerer<'a> {
             | V2Expr::MethodCall { .. }
             | V2Expr::Try { .. }
             | V2Expr::Match { .. }
-            | V2Expr::If { .. } => true,
+            | V2Expr::If { .. }
+            | V2Expr::Block { .. } => true,
         }
     }
 
@@ -368,6 +379,9 @@ impl<'a> TreeLowerer<'a> {
             }
             V2Expr::Bool(_, b) => Ok((if *b { "1" } else { "0" }.to_owned(), ValueType::Bool)),
             V2Expr::Path(span, segs) => {
+                if let Some(r) = self.bcon_field_ref(expr) {
+                    return Ok((r?.0, ValueType::I16));
+                }
                 if segs.len() != 2 {
                     return Err(Error::at(
                         *span,
@@ -530,10 +544,17 @@ impl<'a> TreeLowerer<'a> {
                             "visitor_kind" => Ok(("my.person[32]".to_owned(), ValueType::I16)),
                             // Object data word 2: the object whose slot holds the Sim (read-only).
                             "container" => Ok(("my.data[2]".to_owned(), ValueType::ObjectId)),
+                            other if sim_person_field(other).is_some() => Ok((
+                                format!(
+                                    "my.person[{}]",
+                                    sim_person_field(other).unwrap_or_default()
+                                ),
+                                ValueType::I16,
+                            )),
                             other => Err(Error::at(
                                 *span,
                                 format!(
-                                    "unknown Sim property '{bname}.{other}' (expected motive, skill, personality, id, priority, room, hand, age, visitor_kind, container, attr[i], data[i], slot[i], or person[i]; use 'self.<state>' for object state)"
+                                    "unknown Sim property '{bname}.{other}' (expected motive, skill, personality, id, priority, room, hand, age, visitor_kind, container, posture, pets_outside, job_type, job_level, family, attr[i], data[i], slot[i], or person[i]; use 'self.<state>' for object state)"
                                 ),
                             )),
                         };
@@ -574,13 +595,17 @@ impl<'a> TreeLowerer<'a> {
                 span,
                 scrutinee,
                 arms,
-            } => self.lower_match_expr(*span, scrutinee, arms, None),
+            } => self.lower_match_expr(*span, scrutinee, arms, None, false),
             V2Expr::If {
                 span,
                 cond,
                 then_value,
                 else_value,
-            } => self.lower_if_expr(*span, cond, then_value, else_value, None),
+            } => self.lower_if_expr(*span, cond, then_value, else_value, None, false),
+            V2Expr::Block { span, .. } => Err(Error::at(
+                *span,
+                "a diverging '{ ..; return ..; }' branch can only be a branch of 'let x = if ..' or 'let x = match ..'",
+            )),
             V2Expr::Unary { span, op, inner } => match op {
                 V2UnaryOp::Not => {
                     let tmp = self.fresh("not");
@@ -780,7 +805,7 @@ impl<'a> TreeLowerer<'a> {
                 }
                 Err(Error::at(
                     *span,
-                    "'?' in an expression needs a call to an 'extern mod' fn or 'tree' (use 'cond?;' as a statement for plain bool checks)",
+                    "'?' in an expression needs a call to an 'extern mod' fn or '#[bhav] fn' (use 'cond?;' as a statement for plain bool checks)",
                 ))
             }
             other => Err(Error::at(

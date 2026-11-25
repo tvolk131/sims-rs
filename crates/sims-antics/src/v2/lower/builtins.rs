@@ -300,14 +300,14 @@ impl<'a> TreeLowerer<'a> {
             let Some(locals) = self.frame_locals else {
                 return Err(Error::at(
                     a.span,
-                    "animate(event_local:) needs the tree's frame size: add @frame(locals: K) with K <= the slot",
+                    "animate(event_local:) needs the tree's frame size: add #[frame(locals = K)] with K <= the slot",
                 ));
             };
             if slot < i64::from(locals) {
                 return Err(Error::at(
                     a.span,
                     format!(
-                        "animate(event_local: {slot}) is inside the frame (@frame(locals: {locals})); use 'local:' with a variable instead"
+                        "animate(event_local: {slot}) is inside the frame (#[frame(locals = {locals})]); use 'local:' with a variable instead"
                     ),
                 ));
             }
@@ -610,8 +610,8 @@ impl<'a> TreeLowerer<'a> {
         if let Some(missing) = required.iter().find(|k| !named.contains_key(**k)) {
             return Err(Error::at(span, format!("{fname}() requires '{missing}:'")));
         }
-        // `push_interaction(object: <@slot(N) handle>)`: the handle already lives in frame word
-        // N, which `@slot` fixes, so the VM reads it from there (flag 0x02) with no copy.
+        // `push_interaction(object: <#[slot(N)] handle>)`: the handle already lives in frame word
+        // N, which `#[slot]` fixes, so the VM reads it from there (flag 0x02) with no copy.
         let slot_object = match named.get("object") {
             Some(CallArg {
                 value: V2Expr::Ident(_, name),
@@ -859,7 +859,7 @@ impl<'a> TreeLowerer<'a> {
     }
 }
 
-/// The frame word an `@slot(N) let` local's `.air` name (`__slot<N>_...`) fixes.
+/// The frame word an `#[slot(N)] let` local's `.air` name (`__slot<N>_...`) fixes.
 fn slot_word(air_name: &str) -> Option<u8> {
     let rest = air_name.strip_prefix("__slot")?;
     let (n, _) = rest.split_once('_')?;

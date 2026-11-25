@@ -4,14 +4,9 @@
 [subject]
 antics = "../objects/open-wall-phone.antics"
 pack = ".."
-# Its Main returns at once (v2's default Main), which faults the game's lot update (error
-# 0x3e9): the interaction cases run with an idle loop in its place, an assumption every case
-# reports. Drop this once the object's Main loops.
-idle_main = true
 
 [lot]
-# The fridge's Main returns at once too: the same assumption, reported with every case.
-also = [{ antics = "../objects/open-fridge.antics", pack = "..", idle_main = true }]
+also = [{ antics = "../objects/open-fridge.antics", pack = ".." }]
 
 [sim]
 motives = { social = 0, fun = 0, comfort = 0 }

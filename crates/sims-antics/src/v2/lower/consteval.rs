@@ -287,7 +287,7 @@ impl<'a> TreeLowerer<'a> {
                 }
                 Ok(None)
             }
-            V2Expr::Field { .. } => match self.bcon_field_ref(expr) {
+            V2Expr::Field { .. } | V2Expr::Path(..) => match self.bcon_field_ref(expr) {
                 Some(r) => {
                     let (air, val) = r?;
                     Ok(val.map(|v| (air, v)))
@@ -590,7 +590,7 @@ impl<'a> TreeLowerer<'a> {
                     Error::at(*span, format!("expected constant i16, found '{name}'"))
                 })
             }
-            V2Expr::Field { span, .. } => match self.bcon_field_ref(expr) {
+            V2Expr::Field { span, .. } | V2Expr::Path(span, _) => match self.bcon_field_ref(expr) {
                 Some(r) => r?.1.ok_or_else(|| {
                     Error::at(
                         *span,

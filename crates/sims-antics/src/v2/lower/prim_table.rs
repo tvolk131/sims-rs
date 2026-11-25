@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// Built-in v2 call names a standalone `tree` identifier may not shadow.
+/// Built-in v2 call names a standalone `#[bhav] fn` identifier may not shadow.
 pub(super) const BUILTIN_CALL_NAMES: &[&str] = &[
     "sleep",
     "idle",
@@ -207,7 +207,7 @@ pub(super) fn personality_trait(span: Span, name: &str) -> Result<u8> {
     }
 }
 
-/// Builtins added after user helpers could already use these names: a user `fn`, `tree`, or
+/// Builtins added after user helpers could already use these names: a user `fn`, `#[bhav] fn`, or
 /// `extern` with the same name takes precedence.
 pub(super) fn is_prim_builtin_name(name: &str) -> bool {
     PRIM_BUILTINS.iter().any(|b| b.v2 == name)

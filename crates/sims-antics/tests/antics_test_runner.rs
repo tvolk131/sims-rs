@@ -49,6 +49,8 @@ fn every_open_pack_spec_passes() {
         let text = stdout(&out);
         assert!(out.status.success(), "{}:\n{text}\n{out:?}", file.display());
         assert!(!text.contains("FAIL"), "{text}");
+        // Every open-pack Main loops, so no case runs under an assumption.
+        assert!(!text.contains("ASSUME"), "{text}");
         let summary = text.lines().last().unwrap_or_default();
         assert!(summary.ends_with(" passed, 0 failed"), "{summary}");
         let passed: usize = summary.split(' ').next().unwrap().parse().unwrap();
@@ -60,9 +62,37 @@ fn every_open_pack_spec_passes() {
     }
 }
 
+/// A Main that returns faults the lot update (error 0x3e9), so `idle_main` runs the cases
+/// with an idle loop in its place and says so before every case. The open-pack objects all
+/// loop (v2's default Main idles), so the subject here is the mailbox given a returning Main.
 #[test]
 fn idle_main_prints_an_assume_line_with_every_case() {
-    let file = open_pack().join("tests/open-mailbox.test.toml");
+    let dir = scratch("idle-main");
+    let pack = open_pack();
+    let source = std::fs::read_to_string(pack.join("objects/open-mailbox.antics")).unwrap();
+    let at = source.find("    interaction ").expect("an interaction");
+    let returning = format!(
+        "{}    main {{\n        return true;\n    }}\n\n{}",
+        &source[..at],
+        &source[at..]
+    );
+    let object = dir.join("returning-mailbox.antics");
+    std::fs::write(&object, returning).unwrap();
+    let spec_text = std::fs::read_to_string(pack.join("tests/open-mailbox.test.toml")).unwrap();
+    let spec_text = spec_text
+        .replace(
+            "antics = \"../objects/open-mailbox.antics\"",
+            &format!("antics = {:?}", object.display().to_string()),
+        )
+        // The mailbox imports nothing, so its copy needs no pack.
+        .replace("pack = \"..\"", "idle_main = true")
+        // Its Main returns at once now, as the real Main of a case runs.
+        .replace(
+            "turns = 4\nexpect = { result = \"yield\" }",
+            "expect = { result = true, turns = 0 }",
+        );
+    let file = dir.join("returning-mailbox.test.toml");
+    std::fs::write(&file, spec_text).unwrap();
     let out = sims_antics(&[&file]);
     let text = stdout(&out);
     assert!(out.status.success(), "{text}\n{out:?}");
@@ -75,7 +105,7 @@ fn idle_main_prints_an_assume_line_with_every_case() {
         assert!(
             i > 0
                 && lines[i - 1].starts_with("ASSUME ")
-                && lines[i - 1].contains("open-mailbox.test.toml: subject Main (OBJD #")
+                && lines[i - 1].contains("returning-mailbox.test.toml: subject Main (OBJD #")
                 && lines[i - 1].ends_with(") replaced by an idle loop (idle_main)"),
             "{text}"
         );

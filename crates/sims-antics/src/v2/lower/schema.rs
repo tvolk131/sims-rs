@@ -134,7 +134,7 @@ pub(super) fn resolve_bcon_tables(
     Ok(out)
 }
 
-/// Resolves standalone `tree` call signatures (IDs are filled in after allocation).
+/// Resolves standalone `#[bhav] fn` call signatures (IDs are filled in after allocation).
 pub(super) fn resolve_tree_sigs(
     env: &ObjectEnv<'_>,
     trees: &[OwnedTree],
@@ -211,7 +211,8 @@ pub(super) fn build_object_schema(
     all_enums: &mut BTreeMap<String, ResolvedEnum>,
     all_bitflags: &mut BTreeMap<String, ResolvedBitflags>,
 ) -> Result<ResolvedObjectSchema> {
-    let mut guid: Option<u32> = None;
+    let mut guid: Option<(String, Span, GuidValue)> = None;
+    let mut local_consts: BTreeMap<String, i64> = BTreeMap::new();
     let mut tiles: Vec<crate::v2::ast::TileDecl> = Vec::new();
     let mut raw_states: Vec<(String, String, StateDecl)> = Vec::new();
     let mut seen_states = BTreeSet::new();
@@ -224,9 +225,12 @@ pub(super) fn build_object_schema(
         for member in members {
             match member {
                 ObjectMember::Meta(MetaField {
+                    span,
                     kind: MetaFieldKind::Guid(g),
-                    ..
-                }) => guid = Some(*g),
+                }) => guid = Some((m_owner.to_owned(), *span, g.clone())),
+                ObjectMember::Const(c) => {
+                    local_consts.insert(c.name.clone(), c.value);
+                }
                 ObjectMember::Meta(MetaField {
                     kind: MetaFieldKind::Tiles(t),
                     ..
@@ -358,12 +362,17 @@ pub(super) fn build_object_schema(
         );
     }
 
-    let guid = guid.ok_or_else(|| {
-        Error::at(
-            obj.span,
-            format!("imported object '{display_name}' is missing required 'guid' field"),
-        )
-    })?;
+    let guid = match &guid {
+        Some((owner, span, value)) => {
+            super::object::resolve_guid_value(resolved, owner, &local_consts, value, *span)?
+        }
+        None => {
+            return Err(Error::at(
+                obj.span,
+                format!("imported object '{display_name}' is missing required 'guid' field"),
+            ));
+        }
+    };
     let lead_guid = select_lead_tile_guid(&tiles, guid);
     let tile_guids = if tiles.is_empty() {
         vec![guid]

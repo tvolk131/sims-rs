@@ -163,11 +163,67 @@ impl<'a> TreeLowerer<'a> {
         arg_span: Span,
         call_args: &[&V2Expr],
     ) -> Result<Binding> {
+        if !param.is_const {
+            return self.bind_helper_arg_value(
+                fn_mod,
+                is_local_fn,
+                fn_decl,
+                param,
+                arg_expr,
+                arg_span,
+                call_args,
+            );
+        }
+        if stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name) {
+            return Err(Error::at(
+                param.span,
+                format!(
+                    "const parameter '{}' cannot be assigned or borrowed",
+                    param.name
+                ),
+            ));
+        }
+        let binding = self.bind_helper_arg_value(
+            fn_mod,
+            is_local_fn,
+            fn_decl,
+            param,
+            arg_expr,
+            arg_span,
+            call_args,
+        )?;
+        match binding {
+            // A tunable `param` binds as its BCON read: still a run-time value.
+            Binding::ConstI16 { ref air, .. } if air.parse::<i16>().is_ok() => Ok(binding),
+            Binding::ConstBool(_) | Binding::ConstEnum { .. } | Binding::ConstBitflag { .. } => {
+                Ok(binding)
+            }
+            _ => Err(Error::at(
+                arg_span,
+                format!(
+                    "const parameter '{}' of '{}' needs a compile-time constant argument",
+                    param.name, fn_decl.name
+                ),
+            )),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_helper_arg_value(
+        &mut self,
+        fn_mod: &str,
+        is_local_fn: bool,
+        fn_decl: &FnDecl,
+        param: &crate::v2::ast::FnParam,
+        arg_expr: &V2Expr,
+        arg_span: Span,
+        call_args: &[&V2Expr],
+    ) -> Result<Binding> {
         let read_only = !stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name);
         // A caller local passed by value needs no `__arg_*` copy when nothing can change it
         // while the helper runs: the helper never mutates or borrows the parameter, and no
         // argument of this call borrows the local (`&mut x`, or a local-writing builtin). An
-        // `@slot` local lives in an explicit frame word, which helper raw code can write as
+        // `#[slot]` local lives in an explicit frame word, which helper raw code can write as
         // `local[N]`, so it is always copied. So is any local when the helper, or a helper an
         // argument calls, runs raw code (directly or through the helpers it calls): raw code
         // can write any frame word by number or by its `.air` name.
@@ -496,7 +552,7 @@ impl<'a> TreeLowerer<'a> {
             return Ok(None);
         };
         // Into mode stores the result in `dest` at the helper's `return`, before its defers
-        // run, and an `@slot` word is visible to raw code by number: either could observe the
+        // run, and an `#[slot]` word is visible to raw code by number: either could observe the
         // early store, so those keep the general path (store after the helper finishes).
         if decl.return_type.is_none()
             || dest.starts_with("__slot")

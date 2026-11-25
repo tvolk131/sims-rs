@@ -13,7 +13,7 @@ object "Open Privacy Shower" from PlumbingFixture {
     param base_repair_step: i16 = 20;
     param mechanic_divisor: i16 = 20;
 
-    state reserved: i16 = 0;
+    state reserved: i16 = 0; // antics-lint: allow(unused_decl) keeps the attribute layout of saved lots
     state last_repair_cycles: i16 = 0;
 
     sound spray = preset("shower_spray", wav: "open_shower_spray");

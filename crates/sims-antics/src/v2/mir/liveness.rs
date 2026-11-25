@@ -63,7 +63,7 @@ impl Liveness<'_> {
                     InstKind::Break => return brk.clone(),
                     InstKind::Continue => return cont.clone(),
                     InstKind::Let { init: None, .. } => return out,
-                    // A name outside `locals` (a pinned `@slot` word) is never a dead def.
+                    // A name outside `locals` (a pinned `#[slot]` word) is never a dead def.
                     InstKind::Let {
                         name,
                         init: Some(init),
@@ -220,7 +220,7 @@ fn stored_and(reads: &Set, kill: &Option<(String, bool, bool)>) -> Set {
     all
 }
 
-/// A local the source names (`let x`, an inlined helper's `let x`, `@slot(N) let x`), as
+/// A local the source names (`let x`, an inlined helper's `let x`, `#[slot(N)] let x`), as
 /// opposed to a compiler temporary: a tree that formats text may read its word by number.
 pub(crate) fn is_source_local(name: &str) -> bool {
     name.starts_with("__v_") || name.starts_with("__inline_v_") || name.starts_with("__slot")

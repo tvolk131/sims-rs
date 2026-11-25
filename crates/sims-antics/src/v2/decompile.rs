@@ -165,8 +165,8 @@ pub enum TreeCheck {
 pub struct DecompiledTree {
     pub id: u16,
     pub style: TreeStyle,
-    /// An `init`/`main` tree written as a plain `tree`, because an `init`/`main` block
-    /// (which takes no `@frame`) did not reproduce it. The compiler then adds its own
+    /// An `init`/`main` tree written as a plain `#[bhav] fn`, because an `init`/`main` block
+    /// (which takes no `#[frame]`) did not reproduce it. The compiler then adds its own
     /// lifecycle tree at a fresh ID.
     pub standalone_lifecycle: bool,
     /// Statements left as `raw` inside an idiomatic body.
@@ -768,7 +768,7 @@ impl Model {
         }
 
         // Sounds: v2 can pin an FWAV's ID and event name when the name is a plain file
-        // name (`sound s = preset(.., wav: "name", id: N)`).
+        // name (`sound s = fwav(N, wav: "name")`).
         let original_sounds = fwav_sounds(iff);
         let mut sounds = BTreeMap::new();
         let mut sounds_skipped = BTreeMap::new();
@@ -2793,9 +2793,9 @@ struct Plan {
     styles: BTreeMap<u16, Level>,
     /// Tree ID -> pre-order statement indices written `raw`.
     raw_stmts: BTreeMap<u16, BTreeSet<usize>>,
-    /// `init`/`main` trees written as plain `tree`s.
+    /// `init`/`main` trees written as plain `#[bhav] fn`s.
     standalone: BTreeSet<u16>,
-    /// Lifecycle blocks written with their whole header as `@frame(..)`: those the default
+    /// Lifecycle blocks written with their whole header as `#[frame(..)]`: those the default
     /// header does not reproduce.
     framed: BTreeSet<u16>,
     /// Why the catalog variants are left out (the compiler rejected them).
@@ -2805,7 +2805,7 @@ struct Plan {
     /// Trees written without the extra idioms (see [`Translator::extra`]), after a round
     /// that used them was not proven.
     plain: BTreeSet<u16>,
-    /// Trees some caller runs in the other context: written `@context(inherit)` (an extra
+    /// Trees some caller runs in the other context: written `#[context(inherit)]` (an extra
     /// idiom) so that either context may call them.
     inherit: BTreeSet<u16>,
 }
@@ -2824,8 +2824,8 @@ impl Plan {
                 (t.id, level)
             })
             .collect();
-        // A lifecycle block carries any other header as `@frame(..)`, but never an empty
-        // one (entering a 0-node tree faults; v2 refuses `@frame(empty)` there), so a
+        // A lifecycle block carries any other header as `#[frame(..)]`, but never an empty
+        // one (entering a 0-node tree faults; v2 refuses `#[frame(empty)]` there), so a
         // 0-node lifecycle tree starts plain.
         let standalone = model
             .trees
@@ -2834,7 +2834,7 @@ impl Plan {
             .map(|t| t.id)
             .collect();
         // Formats, kinds and revisions the compiler never gives a block by default start
-        // with `@frame`; anything else gets one when the default header does not compile or
+        // with `#[frame]`; anything else gets one when the default header does not compile or
         // is not proven (see `add_frame`).
         let framed = model
             .trees
@@ -2876,14 +2876,14 @@ impl Plan {
         }
     }
 
-    /// Whether tree `t` is written `@context(inherit)` this round.
+    /// Whether tree `t` is written `#[context(inherit)]` this round.
     fn inherits(&self, t: &TreeModel) -> bool {
         self.inherit.contains(&t.id) && !self.plain.contains(&t.id) && self.level(t).idiomatic()
     }
 
     /// Turns off tree `id`'s extra idioms when the last round used them. `false` when it
     /// did not, so the tree has to move down a style instead.
-    /// Writes lifecycle block `id` with its whole header as `@frame(..)` from now on, when
+    /// Writes lifecycle block `id` with its whole header as `#[frame(..)]` from now on, when
     /// it is still written with the default one. Tried before anything else: the header is
     /// the original's, so it only ever helps.
     fn add_frame(&mut self, model: &Model, id: u16) -> bool {
@@ -3132,7 +3132,9 @@ impl Model {
                         _ => (String::new(), String::new()),
                     };
                 let ident = &self.extern_calls[id];
-                out.line(format!("@id({id}) fn {ident}({params}) -> bool;{comment}"));
+                out.line(format!(
+                    "#[id({id})] fn {ident}({params}) -> bool;{comment}"
+                ));
             }
             out.indent -= 1;
             out.line("}");
@@ -3142,7 +3144,7 @@ impl Model {
             out.line("extern bcon library_consts {");
             out.indent += 1;
             for (addr, name) in &self.extern_bcons {
-                out.line(format!("{name} @ {addr};"));
+                out.line(format!("#[addr({addr})] {name};"));
             }
             out.indent -= 1;
             out.line("}");
@@ -3211,14 +3213,14 @@ impl Model {
         }
         let strings_lines = strings_start..out.lines.len();
         for s in &self.states {
-            out.line(format!("state attr_{s} @ {s}: i16;"));
+            out.line(format!("#[slot({s})] state attr_{s}: i16;"));
         }
         if !self.sounds.is_empty() {
             out.line("");
         }
         for (id, sound) in &self.sounds {
             out.line(format!(
-                "sound {} = preset(\"ui_click\", wav: \"{}\", id: {id});",
+                "sound {} = fwav({id}, wav: \"{}\");",
                 sound.ident, sound.wav
             ));
         }
@@ -3242,7 +3244,8 @@ impl Model {
             let as_lifecycle = t.lifecycle.filter(|_| !plan.standalone.contains(&t.id));
             match as_lifecycle {
                 Some(kind) if !plan.framed.contains(&t.id) => {
-                    out.line(format!("@id({}) {} {{", t.id, kind.keyword()));
+                    out.line(format!("#[id({})]", t.id));
+                    out.line(format!("{} {{", kind.keyword()));
                 }
                 Some(kind) => {
                     // The block keeps the tree's own header, as a plain tree does.
@@ -3250,17 +3253,13 @@ impl Model {
                     let frame_kind = if b.kind == 0 {
                         String::new()
                     } else {
-                        format!(", kind: {}", b.kind)
+                        format!(", kind = {}", b.kind)
                     };
                     out.line(format!(
-                        "@id({}) @frame(args: {}, locals: {}, format: {:#06x}, revision: {}{frame_kind}) {} {{",
-                        t.id,
-                        b.args,
-                        b.locals,
-                        b.format,
-                        b.revision,
-                        kind.keyword()
+                        "#[bhav(id = {}, args = {}, locals = {}, format = {:#06x}, revision = {}{frame_kind})]",
+                        t.id, b.args, b.locals, b.format, b.revision,
                     ));
+                    out.line(format!("{} {{", kind.keyword()));
                 }
                 None => {
                     if let Some(kind) = t.lifecycle {
@@ -3277,36 +3276,31 @@ impl Model {
                     if let Some(&arity) = self.literal_calls.get(&t.id) {
                         params.extend(call_params(arity));
                     }
-                    let ctx = if params.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", params.join(", "))
-                    };
                     let mut kind = if b.kind == 0 {
                         String::new()
                     } else {
-                        format!(", kind: {}", b.kind)
+                        format!(", kind = {}", b.kind)
                     };
-                    // A 0-node tree (entering it faults) is `@frame(empty)` with a `{}` body.
+                    // A 0-node tree (entering it faults) is `empty` with a `{}` body.
                     if b.instructions.is_empty() {
                         kind.push_str(", empty");
                     }
                     let context = if plan.inherits(t) {
                         extras.insert(t.id);
-                        " @context(inherit)"
+                        ", context = inherit"
                     } else {
                         ""
                     };
+                    let label = if t.label == t.ident {
+                        String::new()
+                    } else {
+                        format!(", label = \"{}\"", v2_string_literal(&t.label))
+                    };
                     out.line(format!(
-                        "@id({}) @frame(args: {}, locals: {}, format: {:#06x}, revision: {}{kind}){context} tree {} \"{}\"{ctx} {{",
-                        t.id,
-                        b.args,
-                        b.locals,
-                        b.format,
-                        b.revision,
-                        t.ident,
-                        v2_string_literal(&t.label)
+                        "#[bhav(id = {}{label}, args = {}, locals = {}, format = {:#06x}, revision = {}{kind}{context})]",
+                        t.id, b.args, b.locals, b.format, b.revision,
                     ));
+                    out.line(format!("fn {}({}) {{", t.ident, params.join(", ")));
                 }
             }
             out.indent += 1;
@@ -3342,10 +3336,10 @@ impl Model {
                         extras: std::cell::Cell::new(false),
                     };
                     if named_locals > 0 && tr.extra() {
-                        // `@slot` pins each word the builtins address by number; the
+                        // `#[slot]` pins each word the builtins address by number; the
                         // build keeps a pinned word in the frame even when nothing names it.
                         for i in 0..named_locals {
-                            out.line(format!("@slot({i}) let slot_{i}: i16;"));
+                            out.line(format!("#[slot({i})] let slot_{i}: i16;"));
                         }
                     }
                     let body = match tr.hoisted_save {
@@ -3527,7 +3521,7 @@ struct Translator<'a> {
     plan: &'a Plan,
     tree: &'a TreeModel,
     sim: bool,
-    /// `@context(inherit)`: the runner's cells are `me.*` and the stack object's
+    /// `#[context(inherit)]`: the runner's cells are `me.*` and the stack object's
     /// `stack_obj.*`; `self` and `sim` are not written.
     inherit: bool,
     /// Pre-order index of the next statement.
@@ -3965,7 +3959,7 @@ impl Translator<'_> {
             || then_arm.len() != else_arm.len()
             || then_arm.iter().any(|l| {
                 let t = l.trim_start();
-                l.contains("raw {") || t.starts_with('@') || t.starts_with("let ") || t.is_empty()
+                l.contains("raw {") || t.starts_with("#[") || t.starts_with("let ") || t.is_empty()
             })
         {
             return;
@@ -4326,7 +4320,8 @@ impl Translator<'_> {
     /// - `local[0] := <object>; push_interaction(.., object: 0, flags: f | 2)` as
     ///   `push_interaction(.., object: <object>, flags: f)`;
     /// - in a Sim context, `temp[0] := i; scope(27, 0) := v` as
-    ///   `set_dynamic_sprite(index: i, value: v)`.
+    ///   `set_dynamic_sprite(index: i, value: v)`;
+    /// - `param[0] := n; sleep(param[0])` as `sleep(n)`.
     fn pair(&mut self, rest: &[Stmt], out: &mut Out) -> Option<usize> {
         let [first, second, ..] = rest else {
             return None;
@@ -4405,6 +4400,18 @@ impl Translator<'_> {
                 return None;
             };
             format!("{dest} {op} {source};")
+        } else if let Some(ticks) = set(first, 9, 0)
+            && let Stmt::Primitive {
+                prim: PrimitiveCall::Sleep { param_index: 0 },
+                branches: None,
+                ..
+            } = second
+        {
+            let ticks = self.rvalue(ticks)?;
+            if ticks.contains("param[") {
+                return None;
+            }
+            format!("sleep({ticks});")
         } else {
             return None;
         };
@@ -4865,7 +4872,7 @@ impl Translator<'_> {
             PrimitiveCall::Breakpoint { cond } => format!("breakpoint({})", self.rvalue(cond)?),
             PrimitiveCall::Random { dst, range } => {
                 let range = self.rvalue(range)?;
-                if range.starts_with("global[") {
+                if range.starts_with("global[") || range.starts_with("world.") {
                     return None;
                 }
                 format!("random_into({}, {range})", self.lvalue(dst)?)
@@ -5196,7 +5203,13 @@ impl Translator<'_> {
         }
         Some(match (o.scope, self.sim) {
             (8, _) => format!("temp[{i}]"),
-            (6, _) => format!("global[{i}]"),
+            (6, _) => crate::v2::parser::WORLD_GLOBALS
+                .iter()
+                .find(|&&(_, index)| i16::from(index) == i)
+                .map_or_else(
+                    || format!("global[{i}]"),
+                    |(name, _)| format!("world.{name}"),
+                ),
             (10, _) if i == 0 => "stack_obj".to_owned(),
             (0, false) | (1, true) if i <= self.model.state_limit => format!("self.attr_{i}"),
             (3, false) => format!("self.data[{i}]"),
@@ -5235,7 +5248,7 @@ fn assign_operator(op: &AssignOp) -> Option<&'static str> {
 }
 
 /// The part of a tree's header the code checker does not compare but the game reads and
-/// `@frame` writes: the revision (saved objects are matched against it). The label is
+/// `#[frame]` writes: the revision (saved objects are matched against it). The label is
 /// [`Model::object_gap`]'s.
 fn header_gap(original: &BhavChunk, rebuilt: &BhavChunk) -> Option<String> {
     (original.revision != rebuilt.revision).then(|| {

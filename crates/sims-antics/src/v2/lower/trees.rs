@@ -3,7 +3,7 @@
 
 use super::*;
 
-/// Lowers and emits one standalone `tree` member as a real (non-inlined) BHAV.
+/// Lowers and emits one standalone `#[bhav] fn` member as a real (non-inlined) BHAV.
 pub(super) fn emit_standalone_tree(
     trees_air: &mut String,
     env: &ObjectEnv<'_>,
@@ -21,7 +21,7 @@ pub(super) fn emit_standalone_tree(
         *env.dialog_strings.borrow_mut() = strings;
         let context_error = || {
             format!(
-                "@context(inherit) tree '{}' depends on the caller's context (use explicit 'me' cells or 'stack_obj')",
+                "'context = inherit' fn '{}' depends on the caller's context (use explicit 'me' cells or 'stack_obj')",
                 t.decl.ident
             )
         };
@@ -114,7 +114,7 @@ pub(super) fn lower_standalone_tree(
         return Err(Error::at(
             frame.span,
             format!(
-                "@frame(empty) tree '{}' has no nodes, so its body must be '{{}}'",
+                "'empty' fn '{}' has no nodes, so its body must be '{{}}'",
                 d.ident
             ),
         ));
@@ -174,7 +174,7 @@ pub(super) fn lower_standalone_tree(
             ctx.value_return = Some(ValueReturnAbi {
                 ty: ty.clone(),
                 temp: *temp,
-                // `Result<T @ temp[N]>` trees take the false exit with `return None;` (or
+                // `Result<T>` with `#[ret(temp = N)]` trees take the false exit with `return None;` (or
                 // `return false;` when T is not bool), so a caller's `?` runs its own cleanups.
                 allow_none: matches!(sig.ret, ResolvedReturnAbi::ResultValue { .. }),
                 in_place: true,
@@ -235,7 +235,7 @@ pub(super) fn air_header(parts: &[String]) -> String {
     }
 }
 
-/// Finishes `ctx` and writes it as tree `id` with the `.air` header of its `@frame(...)`
+/// Finishes `ctx` and writes it as tree `id` with the `.air` header of its `#[frame(...)]`
 /// (`frame` is the default when there is none), checked against its `positional` parameter
 /// count. `name` is the tree's name in diagnostics.
 pub(super) fn write_framed_tree(
@@ -254,7 +254,7 @@ pub(super) fn write_framed_tree(
             return Err(Error::at(
                 frame.span,
                 format!(
-                    "@frame(args: {args}) on tree '{name}' is below its {positional} positional parameter(s)"
+                    "'args = {args}' on fn '{name}' is below its {positional} positional parameter(s)"
                 ),
             ));
         }
@@ -272,7 +272,7 @@ pub(super) fn write_framed_tree(
             return Err(Error::at(
                 frame.span,
                 format!(
-                    "@frame(format: {format:#06x}) on tree '{name}' is not a supported BHAV format (0x8000, 0x8001, or 0x8002)"
+                    "'format = {format:#06x}' on fn '{name}' is not a supported BHAV format (0x8000, 0x8001, or 0x8002)"
                 ),
             ));
         }
@@ -282,7 +282,7 @@ pub(super) fn write_framed_tree(
             return Err(Error::at(
                 frame.span,
                 format!(
-                    "@frame(format: {format:#06x}) on tree '{name}' allows at most 4 arguments, not {args}"
+                    "'format = {format:#06x}' on fn '{name}' allows at most 4 arguments, not {args}"
                 ),
             ));
         }
@@ -317,7 +317,7 @@ pub(super) fn write_framed_tree(
             return Err(Error::at(
                 espan,
                 format!(
-                    "animate(event_local: {slot}) must lie outside the frame, but tree '{name}' needs {used} local(s) and declares @frame(locals: {locals})"
+                    "animate(event_local: {slot}) must lie outside the frame, but tree '{name}' needs {used} local(s) and declares 'locals = {locals}'"
                 ),
             ));
         }

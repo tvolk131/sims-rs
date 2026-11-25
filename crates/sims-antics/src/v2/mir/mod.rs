@@ -41,7 +41,7 @@
 //! - [`inst`]: the typed instruction view and operand facts;
 //! - [`effects`]: `stack_obj` and last-result effects;
 //! - [`liveness`]: local liveness for dead stores, copy forwarding and coalescing;
-//! - [`frame`]: frame allocation (pinned slot, `@slot(N)` placement, local renaming);
+//! - [`frame`]: frame allocation (pinned slot, `#[slot(N)]` placement, local renaming);
 //! - [`entry_save`](mod@entry_save): the Sim-tree `stack_obj` entry save;
 //! - [`emit`]: the emitter lowering writes a body through;
 //! - [`pipeline`]: the per-tree backend pipeline from a lowered body to final `.air`;

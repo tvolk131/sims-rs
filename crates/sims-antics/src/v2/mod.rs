@@ -25,6 +25,7 @@
 //! object and temporary cursor moves preserve the current value.
 
 pub mod ast;
+mod attrs;
 pub mod decompile;
 pub mod fmt;
 pub mod lexer;

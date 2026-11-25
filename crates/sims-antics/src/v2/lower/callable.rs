@@ -4,7 +4,7 @@
 use super::*;
 
 impl<'a> TreeLowerer<'a> {
-    /// Whether a user `fn`, `tree`, or `extern` answers to `callee` (it then wins over a builtin
+    /// Whether a user `fn`, `#[bhav] fn`, or `extern` answers to `callee` (it then wins over a builtin
     /// of the same name).
     pub(super) fn user_callable_named(&self, callee: &V2Expr, span: Span) -> Result<bool> {
         if self.resolve_callable(callee, span)?.is_some() {
@@ -58,7 +58,7 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
-    /// Evaluates call arguments, writes `@ temp[N]` / `call(temps)` operands, and returns the
+    /// Evaluates call arguments, writes `#[temp(N)]` / `call(temps)` operands, and returns the
     /// `.air` call text (`call ID`, `call ID(1, 2)`, or `call ID(temps)`).
     pub(super) fn prepare_callable_call(
         &mut self,
@@ -357,7 +357,7 @@ impl<'a> TreeLowerer<'a> {
             (_, true) => Err(Error::at(
                 span,
                 format!(
-                    "'?' in value position needs a call returning 'Result<T @ temp[N]>', but {} does not",
+                    "'?' in value position needs a call returning 'Result<T>' with '#[ret(temp = N)]', but {} does not",
                     sig.display
                 ),
             )),
@@ -373,8 +373,8 @@ impl<'a> TreeLowerer<'a> {
         tmp
     }
 
-    /// If `expr` is a value-returning callable (`f(..)` with `-> T @ temp[N]`, or `f(..)?` with
-    /// `-> Result<T @ temp[N]>`), lowers the call and returns the raw `temp[N]` operand.
+    /// If `expr` is a value-returning callable (`f(..)` with `#[ret(temp = N)] .. -> T`, or `f(..)?` with
+    /// `#[ret(temp = N)] .. -> Result<T>`), lowers the call and returns the raw `temp[N]` operand.
     pub(super) fn try_lower_callable_value_raw(
         &mut self,
         expr: &V2Expr,
@@ -420,14 +420,33 @@ impl<'a> TreeLowerer<'a> {
                 .is_bcon_table_name(&self.owner_module, name, self.in_object_scope)
     }
 
-    /// Resolves `Table.entry` to its `bcon[addr]` operand (and compile-time value for private
-    /// tables). `None` if `expr` is not a BCON table entry reference.
+    /// Resolves `Table.entry` (or the path form `Table::entry`) to its `bcon[addr]` operand (and
+    /// compile-time value for private tables). `None` if `expr` is not a BCON table entry reference.
+    /// An enum or bitflags type of the same name wins the path form.
     pub(super) fn bcon_field_ref(&self, expr: &V2Expr) -> Option<Result<(String, Option<i16>)>> {
-        let V2Expr::Field { span, base, field } = expr else {
-            return None;
-        };
-        let V2Expr::Ident(_, bname) = base.as_ref() else {
-            return None;
+        let (span, bname, field) = match expr {
+            V2Expr::Field { span, base, field } => {
+                let V2Expr::Ident(_, bname) = base.as_ref() else {
+                    return None;
+                };
+                (span, bname, field)
+            }
+            V2Expr::Path(span, segs) if segs.len() == 2 => {
+                let bname = &segs[0];
+                if self
+                    .env
+                    .lookup_enum(&self.owner_module, bname, self.in_object_scope)
+                    .is_some()
+                    || self
+                        .env
+                        .lookup_bitflags(&self.owner_module, bname, self.in_object_scope)
+                        .is_some()
+                {
+                    return None;
+                }
+                (span, bname, &segs[1])
+            }
+            _ => return None,
         };
         if !self.is_bcon_table_ref(bname) {
             return None;

@@ -1,6 +1,7 @@
 //! Syntactic facts about AST statements and expressions: mutation/borrow of an identifier,
 //! divergence, loop exits, returns, helper-cell preservation and `stack_obj` clobbering.
 
+use super::specialize::init_blocks;
 use super::*;
 
 /// `obj.run_functional(..)` or `!obj.run_functional(..)` without type arguments, as
@@ -241,6 +242,7 @@ pub(super) fn expr_borrows_ident_in(expr: &V2Expr, target_name: &str, w: &[&str]
                     .iter()
                     .any(|a| expr_borrows_ident_in(&a.value, target_name, w))
         }
+        V2Expr::Block { body, .. } => stmts_mutate_or_borrow_ident_in(body, target_name, w),
         V2Expr::Int(..)
         | V2Expr::Bool(..)
         | V2Expr::Str(..)
@@ -308,6 +310,7 @@ pub(super) fn loop_body_breaks(stmts: &[V2Stmt]) -> bool {
         V2Stmt::WithLock { body, .. } | V2Stmt::Defer { body, .. } => loop_body_breaks(body),
         V2Stmt::LetSome { else_body, .. } => loop_body_breaks(else_body),
         V2Stmt::ForEach { else_body, .. } => else_body.as_deref().is_some_and(loop_body_breaks),
+        V2Stmt::Let { init, .. } => init_blocks(init).into_iter().any(loop_body_breaks),
         _ => false,
     })
 }
@@ -328,6 +331,7 @@ pub(super) fn stmts_exit_loop(stmts: &[V2Stmt]) -> bool {
         V2Stmt::RawAir { code, .. } => {
             super::raw_facts::raw_facts(code, None).exits_enclosing_loop()
         }
+        V2Stmt::Let { init, .. } => init_blocks(init).into_iter().any(stmts_exit_loop),
         _ => false,
     })
 }
@@ -351,6 +355,7 @@ pub(super) fn stmts_have_return(stmts: &[V2Stmt]) -> bool {
             ..
         } => stmts_have_return(then_body) || stmts_have_return(else_body),
         V2Stmt::Match { arms, .. } => arms.iter().any(|a| stmts_have_return(&a.body)),
+        V2Stmt::Let { init, .. } => init_blocks(init).into_iter().any(stmts_have_return),
         _ => false,
     })
 }
@@ -377,6 +382,7 @@ pub(super) fn stmts_return_through_loop(stmts: &[V2Stmt]) -> bool {
             stmts_return_through_loop(body)
         }
         V2Stmt::LetSome { else_body, .. } => stmts_return_through_loop(else_body),
+        V2Stmt::Let { init, .. } => init_blocks(init).into_iter().any(stmts_return_through_loop),
         _ => false,
     })
 }
@@ -919,6 +925,9 @@ pub(super) fn expr_may_clobber_stack_obj(
         } => [cond, then_value, else_value].iter().any(|e| {
             expr_may_clobber_stack_obj(e, env, owner_mod, allow_local_fns, sim_name, depth)
         }),
+        V2Expr::Block { body, .. } => {
+            stmts_may_clobber_stack_obj(body, env, owner_mod, allow_local_fns, sim_name, depth)
+        }
         _ => false,
     }
 }

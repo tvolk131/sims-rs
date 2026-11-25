@@ -45,7 +45,7 @@ object "Open Double Bed" from BedBase {
     wake_energy: 95;
 
     state occupancy: BedSide = BedSide::None;
-    state reserved: i16 = 0;
+    state reserved: i16 = 0; // antics-lint: allow(unused_decl) keeps the attribute layout of saved lots
     state completed_cycles: i16 = 0;
 
     sound settle = preset("soft_thud", wav: "open_double_bed_settle");

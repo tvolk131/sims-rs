@@ -48,7 +48,7 @@ impl<'a> TreeLowerer<'a> {
                 {
                     // The arms write the binding directly (`let x;` emits no node).
                     self.line(format!("let {air_name};"));
-                    self.lower_match_expr(*mspan, scrutinee, arms, Some(&air_name))?
+                    self.lower_match_expr(*mspan, scrutinee, arms, Some(&air_name), true)?
                         .1
                 } else if let V2Expr::If {
                     span: ispan,
@@ -59,7 +59,7 @@ impl<'a> TreeLowerer<'a> {
                 {
                     // The branches write the binding directly.
                     self.line(format!("let {air_name};"));
-                    self.lower_if_expr(*ispan, cond, then_value, else_value, Some(&air_name))?
+                    self.lower_if_expr(*ispan, cond, then_value, else_value, Some(&air_name), true)?
                         .1
                 } else if let Some(ty) = self.try_lower_inline_into(init, &air_name)? {
                     ty
@@ -139,7 +139,7 @@ impl<'a> TreeLowerer<'a> {
                 event,
                 body,
             } => {
-                // A user `fn`/`tree`/`extern` named `animate` wins over the builtin.
+                // A user `fn`/`#[bhav] fn`/`extern` named `animate` wins over the builtin.
                 let callee = V2Expr::Ident(*span, "animate".to_owned());
                 if self.user_callable_named(&callee, *span)? {
                     if event.is_some() {
@@ -535,9 +535,11 @@ impl<'a> TreeLowerer<'a> {
                     end,
                     inclusive,
                     rev,
+                    temp,
                 } = iter
                 {
-                    return self.lower_range_for(binding, start, end, *inclusive, *rev, body);
+                    return self
+                        .lower_range_for(binding, start, end, *inclusive, *rev, *temp, body);
                 }
                 if else_body.as_deref().is_some_and(stmts_exit_loop) {
                     return Err(Error::at(
@@ -957,7 +959,7 @@ impl<'a> TreeLowerer<'a> {
                     ));
                 }
 
-                // Value-returning `functional kind(...) -> T` tree / `tree ... -> T @ temp[N]`:
+                // Value-returning `functional kind(...) -> T` tree / `#[bhav] fn .. -> T` with `#[ret(temp = N)]`:
                 // `return None;` / `return false;` (functionals, non-bool T) exits with `return false;`
                 // `return Some(expr);` / `return expr;` writes `temp[N] := val;` and exits `return true;`
                 if let Some(abi) = self.value_return.clone() {
@@ -1043,6 +1045,7 @@ impl<'a> TreeLowerer<'a> {
             }
             V2Stmt::Expr { span: _, expr } => self.lower_expr_stmt(expr),
             V2Stmt::RawAir { span, code } => {
+                self.raw_blocks += 1;
                 // Discarded code emits nothing, so only emitted raw blocks count.
                 if self.checking_discarded == 0 {
                     self.raw_span.get_or_insert(*span);
@@ -1129,6 +1132,7 @@ impl<'a> TreeLowerer<'a> {
     /// edge) uses the edge-safe form `if a < b { i := first; while true { ...; if i == last {
     /// break; } i ±= 1; } }`, which never steps past the last value. Non-literal bounds are read
     /// once, start first; the loop variable is read-only.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn lower_range_for(
         &mut self,
         binding: &str,
@@ -1136,6 +1140,7 @@ impl<'a> TreeLowerer<'a> {
         end: &V2Expr,
         inclusive: bool,
         rev: bool,
+        temp: Option<u8>,
         body: &[V2Stmt],
     ) -> Result<()> {
         if self.stmts_write_ident(body, binding)? {
@@ -1170,7 +1175,18 @@ impl<'a> TreeLowerer<'a> {
         };
         let lo = snapshot(self, start)?;
         let hi = snapshot(self, end)?;
-        let iter_var = self.fresh(&format!("v_{binding}"));
+        // `#[temp(N)]`: the counter is `temp[N]` itself, set by a plain store.
+        let iter_var = match temp {
+            Some(t) => format!("temp[{t}]"),
+            None => self.fresh(&format!("v_{binding}")),
+        };
+        let set_iter = |c: &mut Self, value: &str| {
+            if temp.is_some() {
+                c.emit_store(&iter_var, ":=", value);
+            } else {
+                c.emit_let(&iter_var, value);
+            }
+        };
         let one_node = match (&lo, &hi, rev) {
             (_, _, false) if !inclusive => true,
             (_, Bound::Lit(h), false) => *h < i16::MAX,
@@ -1207,10 +1223,10 @@ impl<'a> TreeLowerer<'a> {
             let lo_adj = adjust(self, &lo, -1);
             let hi_adj = adjust(self, &hi, i16::from(inclusive));
             if rev {
-                self.emit_let(&iter_var, &hi_adj);
+                set_iter(self, &hi_adj);
                 self.line(format!("while {iter_var} dec_gt {lo_adj} {{"));
             } else {
-                self.emit_let(&iter_var, &lo_adj);
+                set_iter(self, &lo_adj);
                 self.line(format!("while {iter_var} inc_lt {hi_adj} {{"));
             }
         } else {
@@ -1235,7 +1251,7 @@ impl<'a> TreeLowerer<'a> {
             } else {
                 (lo_air, last_hi, "+=")
             };
-            self.emit_let(&iter_var, &first);
+            set_iter(self, &first);
             self.line("while true {".to_owned());
             edge_step = Some(ContinueStep::Range {
                 var: iter_var.clone(),
@@ -1254,13 +1270,21 @@ impl<'a> TreeLowerer<'a> {
             restore_stack_on_break: false,
             continue_step: edge_step.clone(),
         });
-        self.bind_var(
-            binding.to_owned(),
-            Binding::Local {
-                air_name: iter_var,
+        // A `#[temp]` counter is a read-only operand, not a frame local: a helper it is passed
+        // to gets its own copy.
+        let counter = if temp.is_some() {
+            Binding::Operand {
+                air: iter_var.clone(),
                 ty: ValueType::I16,
-            },
-        );
+            }
+        } else {
+            Binding::Local {
+                air_name: iter_var.clone(),
+                ty: ValueType::I16,
+            }
+        };
+        self.bind_var(binding.to_owned(), counter);
+        let (body_mark, raw_before) = (self.em.mark(), self.raw_blocks);
         let res = self.lower_stmts(body);
         let pop_res = self.pop_scope_and_run_cleanups();
         if let Some(step) = &edge_step {
@@ -1273,8 +1297,51 @@ impl<'a> TreeLowerer<'a> {
             self.line("}".to_owned());
         }
         res.and(pop_res)?;
+        if temp.is_some() {
+            self.check_temp_counter_untouched(start.span(), &iter_var, body_mark, raw_before)?;
+        }
         self.emit_inline_fn_return_propagation(false)?;
         self.emit_cancel_propagation(false)?;
+        Ok(())
+    }
+
+    /// A `#[temp(N)]` loop's body (its `defer` cleanups and the helpers it inlines included)
+    /// may not write the counter. The loop's own steps are spelled `scope(8, N)` (see
+    /// [`Self::emit_continue_step`]), which nothing else emits outside raw code, so every
+    /// `temp[N]` write left in the body text is the body's. Raw code, which could spell either,
+    /// is rejected.
+    fn check_temp_counter_untouched(
+        &self,
+        span: Span,
+        counter: &str,
+        body_mark: usize,
+        raw_before: usize,
+    ) -> Result<()> {
+        if self.raw_blocks > raw_before {
+            return Err(Error::at(
+                span,
+                format!(
+                    "the body of this '#[temp]' loop (or a helper it calls) contains 'raw {{ .. }}', which could write its counter '{counter}'; use an ordinary range loop"
+                ),
+            ));
+        }
+        let body = self.em.since(body_mark);
+        if air_writes_cell(body, counter) {
+            return Err(Error::at(
+                span,
+                format!(
+                    "the body of this '#[temp]' loop writes its counter '{counter}' (directly, in a 'defer', or through a nested '#[temp]' loop)"
+                ),
+            ));
+        }
+        if !counter_only_read(body, counter) {
+            return Err(Error::at(
+                span,
+                format!(
+                    "the body of this '#[temp]' loop passes its counter '{counter}' to a primitive or call that may write it; copy it into a 'let' first"
+                ),
+            ));
+        }
         Ok(())
     }
 
@@ -1838,6 +1905,79 @@ impl<'a> TreeLowerer<'a> {
                     self.emit_run_functional(receiver, args, *span, None)?;
                     Ok(())
                 }
+                // `x.play_sound(s)`, `x.stop_all_sounds()`, `x.refresh(mode)`: the builtin with
+                // `target: x` (the same primitive as the call form).
+                "play_sound" | "stop_all_sounds" | "refresh" => {
+                    if !type_args.is_empty() {
+                        return Err(Error::at(
+                            *span,
+                            format!("'.{method}()' does not accept type arguments"),
+                        ));
+                    }
+                    if let Some(a) = args.iter().find(|a| a.name.as_deref() == Some("target")) {
+                        return Err(Error::at(
+                            a.span,
+                            format!("'.{method}()' takes no 'target:'; the receiver is the target"),
+                        ));
+                    }
+                    let mut full = args.clone();
+                    if method == "refresh" {
+                        // `x.refresh(mode)`: its one positional argument is the mode.
+                        for a in &mut full {
+                            if a.name.is_none() {
+                                a.name = Some("mode".to_owned());
+                            }
+                        }
+                    }
+                    full.push(CallArg {
+                        span: receiver.span(),
+                        name: Some("target".to_owned()),
+                        value: (**receiver).clone(),
+                    });
+                    match method.as_str() {
+                        "refresh" => {
+                            let prim = self
+                                .format_prim_builtin("refresh", &full, *span)?
+                                .expect("refresh is a primitive builtin");
+                            self.line(format!("{prim};"));
+                        }
+                        _ => {
+                            let (prim, on_self) = if method == "play_sound" {
+                                self.format_play_sound(&full, *span)?
+                            } else {
+                                self.format_stop_all_sounds(&full)?
+                            };
+                            if on_self {
+                                self.emit_on_self(prim);
+                            } else {
+                                self.line(format!("{prim};"));
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                // `sim.debit_funds(n)` / `sim.credit_funds(n)`: the Sim's household budget (the
+                // lot's family; the same primitive as `debit_funds(n)`).
+                "debit_funds" | "credit_funds" => {
+                    if !type_args.is_empty() {
+                        return Err(Error::at(
+                            *span,
+                            format!("'.{method}()' does not accept type arguments"),
+                        ));
+                    }
+                    if !matches!(receiver.as_ref(), V2Expr::Ident(_, n) if self.is_sim_ident(n)) {
+                        return Err(Error::at(
+                            receiver.span(),
+                            format!(
+                                "'.{method}()' is called on the interaction's Sim (its household's budget)"
+                            ),
+                        ));
+                    }
+                    let s =
+                        self.format_alter_budget(args, *span, false, method == "credit_funds")?;
+                    self.line(format!("{s};"));
+                    Ok(())
+                }
                 "set" => {
                     if !type_args.is_empty() {
                         return Err(Error::at(*span, "'.set()' does not accept type arguments"));
@@ -1964,4 +2104,69 @@ impl<'a> TreeLowerer<'a> {
             self.emit_lvalue_assign(&lval, V2AssignOp::BitAnd, &inv)
         }
     }
+}
+
+/// Whether every use of `cell` in the `.air` text is a read: the right side of an assignment or
+/// an operator, a side of a comparison, or the input of `idle` / `random`. Anything else (a
+/// primitive's argument, which may be an output) may write it.
+fn counter_only_read(air: &str, cell: &str) -> bool {
+    const AFTER_READS: &[&str] = &["==", "!=", "<=", ">=", "<", ">", "flag_test"];
+    const BEFORE_READS: &[&str] = &[
+        "=",
+        "<",
+        ">",
+        "flag_test",
+        "inc_lt",
+        "dec_gt",
+        "flag_set",
+        "flag_clear",
+        "sqrt",
+    ];
+    air.match_indices(cell).all(|(at, _)| {
+        let before = air[..at].trim_end();
+        let after = air[at + cell.len()..].trim_start();
+        let line = before.rsplit('\n').next().unwrap_or("").trim_start();
+        BEFORE_READS.iter().any(|op| before.ends_with(op))
+            || (AFTER_READS.iter().any(|op| after.starts_with(op)) && !after.starts_with("<<="))
+            || (line == "idle(" && after.starts_with(')'))
+            || (line.starts_with("random(") && line.ends_with(',') && after.starts_with(')'))
+    })
+}
+
+/// Whether the `.air` text stores into `cell` (an assignment, compound assignment, or one of the
+/// in-place operators `inc_lt` / `dec_gt` / `flag_set` / `flag_clear` / `sqrt` with `cell` on the
+/// left). Calls and primitives that write temps as a side effect are not visible here.
+fn air_writes_cell(air: &str, cell: &str) -> bool {
+    const WRITES: &[&str] = &[
+        ":=",
+        "=",
+        "+=",
+        "-=",
+        "*=",
+        "/=",
+        "%=",
+        "&=",
+        "|=",
+        "^=",
+        "<<=",
+        ">>=",
+        "inc_lt",
+        "dec_gt",
+        "flag_set",
+        "flag_clear",
+        "sqrt",
+    ];
+    air.match_indices(cell).any(|(at, _)| {
+        let before_ok = air[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'));
+        let op = air[at + cell.len()..]
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        // A primitive's output argument (`dest: temp[0]`) writes it too.
+        let is_dest = air[..at].trim_end().ends_with("dest:");
+        before_ok && (WRITES.contains(&op) || is_dest)
+    })
 }

@@ -436,8 +436,33 @@ pub(super) fn stmt_bodies(s: &V2Stmt) -> Vec<&[V2Stmt]> {
             ..
         } => vec![then_body, else_body],
         V2Stmt::Match { arms, .. } => arms.iter().map(|a| a.body.as_slice()).collect(),
+        V2Stmt::Let { init, .. } => init_blocks(init),
         _ => vec![],
     }
+}
+
+/// The bodies of the diverging `{ ..; return ..; }` branches of a `let` initializer
+/// (`let x = if c { v } else { return false; };`). The parser allows such a branch only as an
+/// arm of the initializer's `if` / `match` chain, so this follows only that chain.
+pub(super) fn init_blocks(init: &V2Expr) -> Vec<&[V2Stmt]> {
+    fn walk<'e>(e: &'e V2Expr, out: &mut Vec<&'e [V2Stmt]>) {
+        match e {
+            V2Expr::Block { body, .. } => out.push(body),
+            V2Expr::If {
+                then_value,
+                else_value,
+                ..
+            } => {
+                walk(then_value, out);
+                walk(else_value, out);
+            }
+            V2Expr::Match { arms, .. } => arms.iter().for_each(|a| walk(&a.value, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(init, &mut out);
+    out
 }
 
 /// Whether `pred` holds for any statement of `stmts`, nested bodies included.
@@ -488,11 +513,14 @@ fn expr_mentions(e: &V2Expr, name: &str) -> bool {
     found
 }
 
-/// Calls `f` on `e` and every expression inside it, except a call's callee name.
+/// Calls `f` on `e` and every expression inside it, except a call's callee name. The
+/// statements of a diverging branch (`V2Expr::Block`) are not visited: they are a nested body
+/// (see [`stmt_bodies`]).
 pub(super) fn visit_expr(e: &V2Expr, f: &mut dyn FnMut(&V2Expr)) {
     f(e);
     match e {
-        V2Expr::Int(..)
+        V2Expr::Block { .. }
+        | V2Expr::Int(..)
         | V2Expr::Bool(..)
         | V2Expr::Str(..)
         | V2Expr::Ident(..)
@@ -898,6 +926,7 @@ fn subst_expr(e: &mut V2Expr, pairs: &[(String, V2Expr)]) -> Result<()> {
             subst_expr(then_value, pairs)?;
             subst_expr(else_value, pairs)?;
         }
+        V2Expr::Block { body, .. } => subst_stmts(body, pairs)?,
     }
     Ok(())
 }

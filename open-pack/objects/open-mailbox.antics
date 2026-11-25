@@ -22,10 +22,6 @@ object "Open Street Mailbox" {
 
     slot front = routing([0.0, -0.75, 0.0]);
 
-    main {
-        return true;
-    }
-
     interaction "Pay Bills" {
         autonomy: 70,
         advertises: [room +25],

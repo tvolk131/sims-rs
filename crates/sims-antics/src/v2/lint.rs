@@ -884,7 +884,7 @@ impl Symbols {
     }
 }
 
-/// A `tree` or `extern` fn's return kind. A `-> bool` tree is often run for what it does
+/// A `#[bhav] fn` or `extern` fn's return kind. A `-> bool` tree is often run for what it does
 /// (a test that also acts), so only a dropped `Result` counts for these.
 fn ret_kind(r: &ReturnAbi) -> RetKind {
     match r {
@@ -935,6 +935,8 @@ fn stmt_blocks(s: &V2Stmt) -> Vec<&[V2Stmt]> {
             ..
         } => vec![then_body, else_body],
         V2Stmt::Match { arms, .. } => arms.iter().map(|a| a.body.as_slice()).collect(),
+        // The diverging `{ ..; return ..; }` branches of `let x = if .. / match ..`.
+        V2Stmt::Let { init, .. } => crate::v2::specialize::init_blocks(init),
         _ => Vec::new(),
     }
 }
@@ -1207,7 +1209,18 @@ const NON_YIELDING_CALLS: &[&str] = &[
 ];
 
 /// Methods that never yield.
-const NON_YIELDING_METHODS: &[&str] = &["is_type", "set", "clear", "contains", "is_empty"];
+const NON_YIELDING_METHODS: &[&str] = &[
+    "is_type",
+    "set",
+    "clear",
+    "contains",
+    "is_empty",
+    "play_sound",
+    "stop_all_sounds",
+    "refresh",
+    "debit_funds",
+    "credit_funds",
+];
 
 /// `.air` primitives a v2 builtin spells with the same operands, with that spelling.
 ///
@@ -2185,12 +2198,12 @@ impl FileLinter<'_> {
     }
 
     /// `missing_sim_frame_args`: a `(sim: Sim)` tree with no parameters whose `raw` blocks
-    /// read `param[n]` past its `@frame(args:)`.
+    /// read `param[n]` past its `#[frame(args = )]`.
     fn missing_sim_frame_args(&mut self, t: &crate::v2::ast::TreeMemberDecl) {
         if t.sim_binding.is_none() || !t.params.is_empty() {
             return;
         }
-        // A pinned `@frame(args:)` declares the frame (a read past it does not compile).
+        // A pinned `#[frame(args = )]` declares the frame (a read past it does not compile).
         if t.frame.as_ref().is_some_and(|f| f.args.is_some()) {
             return;
         }
@@ -2220,11 +2233,11 @@ impl FileLinter<'_> {
                 "this Sim tree's `raw` block reads `param[{n}]`, but the tree declares no argument words"
             ),
             Some(format!(
-                "declare its arguments: pin `@frame(args: {})` (or the original's count), or declare the parameters; `(sim: Sim)` is the frame's Sim, not an argument word",
+                "declare its arguments: pin `#[frame(args = {})]` (or the original's count), or declare the parameters; `(sim: Sim)` is the frame's Sim, not an argument word",
                 n + 1
             )),
             None,
-            Some("the compiled header takes its argument count from the raw read alone, and only a caller that passes `temps` fills those words; a lifted tree keeps the original's `@frame(args:)` so the count matches".to_owned()),
+            Some("the compiled header takes its argument count from the raw read alone, and only a caller that passes `temps` fills those words; a lifted tree keeps the original's `#[frame(args = N)]` so the count matches".to_owned()),
         );
     }
 
@@ -2964,7 +2977,7 @@ impl FileLinter<'_> {
             V2Stmt::LetUninit { span, name, .. } => (*span, name, true),
             _ => return,
         };
-        // `@slot(N) let`: the frame word is pinned so that code addressing it by number
+        // `#[slot(N)] let`: the frame word is pinned so that code addressing it by number
         // (raw `op` bytes, a primitive, another tree sharing the frame) can read or fill
         // it; the source does not say which, and the build keeps every store to it.
         if name.starts_with('_')
@@ -3644,7 +3657,7 @@ fn parse_air_frames(air: &str) -> Vec<AirFrame> {
 }
 
 /// Keeps the frames whose slot count is the compiled tree's local count, so a slot
-/// layout the scan got wrong (a reserved slot it does not see, `@frame(locals:)`) is
+/// layout the scan got wrong (a reserved slot it does not see, `#[frame(locals = )]`) is
 /// dropped rather than trusted.
 fn verified_frames(
     frames: BTreeMap<String, Vec<AirFrame>>,

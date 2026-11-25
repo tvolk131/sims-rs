@@ -25,12 +25,13 @@ const LAMP: &str = r#"object "Synth Lamp" {
 
     param boost: i16 = 35;
     state power: bool = false;
-    state level @ 5: i16;
+    #[slot(5)] state level: i16;
     sound click = preset("ui_click");
 
     bcon 4097 "Tuning" { cheap = 10, bright = 25 }
 
-    @id(4200) tree helper "Helper Tree" (sim: Sim) {
+    #[bhav(id = 4200, label = "Helper Tree")]
+    fn helper(sim: Sim) {
         loop {
             if self.level > Tuning.bright { break; }
             self.level += 1;
@@ -70,12 +71,13 @@ const COUNTER: &str = r#"object "Synth Counter" {
     price: 25;
     sprite: Sprite::procedural("floor_lamp", primary: #6A5A48, accent: #CFC2A8, trim: #3A2E22);
 
-    state count @ 3: i16;
-    state limit @ 4: i16;
+    #[slot(3)] state count: i16;
+    #[slot(4)] state limit: i16;
 
     bcon 4100 "Limits" { low = 2, high = 9 }
 
-    @id(4300) tree bump "Bump" {
+    #[bhav(id = 4300, label = "Bump")]
+    fn bump() {
         if self.count < Limits.high {
             self.count += 1;
         } else {
@@ -84,7 +86,8 @@ const COUNTER: &str = r#"object "Synth Counter" {
         return true;
     }
 
-    @id(4302) tree census "Census" {
+    #[bhav(id = 4302, label = "Census")]
+    fn census() {
         temp[0] = 0;
         for o in lot.objects() {
             temp[0] += 1;
@@ -92,7 +95,8 @@ const COUNTER: &str = r#"object "Synth Counter" {
         return true;
     }
 
-    @id(4301) tree drain "Drain" {
+    #[bhav(id = 4301, label = "Drain")]
+    fn drain() {
         while self.count > 0 {
             self.count -= 1;
             bump();
@@ -193,10 +197,11 @@ fn assert_round_trip(name: &str, source: &str) -> String {
 fn synthetic_lamp_round_trips_with_idioms() {
     let source = assert_round_trip("synth-lamp.antics", LAMP);
     for idiom in [
-        // A lifecycle block takes `@frame` only when the default header does not do: `main`
-        // reads `param[0]`.
-        "@id(4096) init {",
-        "@id(4097) @frame(args: 1, locals: 0, format: 0x8002, revision: 0) main {",
+        // A lifecycle block takes a header only when the default one does not do: `main`'s
+        // `sleep(30)` stages its ticks in `param[0]`, which the default header gives it.
+        "#[id(4096)]\n    init {",
+        "#[id(4097)]\n    main {",
+        "sleep(30);",
         "loop {",
         "if self.attr_0 != 0 {",
         "animate(clip: 3, table: 1, flags: 0, events: 0) |event| {",
@@ -204,12 +209,13 @@ fn synthetic_lamp_round_trips_with_idioms() {
         "if !can_afford(5, category: 0) {",
         "debit_funds(5, category: 0);",
         "random_into(temp[2], 10);",
-        "tree can_turn_on_4098 \"Can_TurnOn\" (sim: Sim) {",
+        "label = \"Can_TurnOn\"",
+        "fn can_turn_on_4098(sim: Sim) {",
         "sim.motive[13] += SynthLampTuning.e0;",
         "guid: 0x7E00_0001;",
         "bcon 4097 \"Tuning\" {",
         // The FWAV keeps its ID and event name.
-        "id: 1);",
+        "= fwav(1, wav: ",
     ] {
         assert!(source.contains(idiom), "missing `{idiom}` in:\n{source}");
     }
@@ -221,12 +227,12 @@ fn synthetic_lamp_round_trips_with_idioms() {
 fn synthetic_counter_round_trips() {
     let source = assert_round_trip("synth-counter.antics", COUNTER);
     assert!(source.contains("while self.attr_3 > 0"), "{source}");
-    assert!(source.contains("state attr_3 @ 3: i16;"), "{source}");
+    assert!(source.contains("#[slot(3)] state attr_3: i16;"), "{source}");
     assert!(source.contains("Limits.e1"), "{source}");
     // The census loop's cursor is `stack_obj` itself (no loop local) since v2 PR F.
     assert!(source.contains("for o in lot.objects() {"), "{source}");
     assert!(!source.contains("set_to_next"), "{source}");
-    assert!(source.contains("@id(4096) init {"), "{source}");
+    assert!(source.contains("#[id(4096)]\n    init {"), "{source}");
 }
 
 /// v2 PR F shapes: `for` loops whose cursor is `stack_obj` itself, sound ID 0, two FWAVs
@@ -239,7 +245,8 @@ const CURSOR: &str = r#"object "Synth Cursor" {
     sound chime = preset("ui_click", wav: "synth_chime", id: 0);
     sound chime_again = preset("ui_click", wav: "synth_chime", id: 7);
 
-    @id(4302) tree census "Census" {
+    #[bhav(id = 4302, label = "Census")]
+    fn census() {
         temp[0] = 0;
         for o in lot.objects() {
             if o.data[3] > 0 {
@@ -249,7 +256,8 @@ const CURSOR: &str = r#"object "Synth Cursor" {
         return true;
     }
 
-    @id(4303) tree people "People" {
+    #[bhav(id = 4303, label = "People")]
+    fn people() {
         temp[1] = 0;
         for p in lot.sims() {
             if p.kind == 0 {
@@ -259,13 +267,15 @@ const CURSOR: &str = r#"object "Synth Cursor" {
         return true;
     }
 
-    @id(4304) @frame(kind: 3) tree kinded "Kinded" {
+    #[bhav(id = 4304, label = "Kinded", kind = 3)]
+    fn kinded() {
         play_sound(chime);
         play_sound(chime_again);
         return true;
     }
 
-    @id(4305) tree chime_for "Chime For" (sim: Sim) {
+    #[bhav(id = 4305, label = "Chime For")]
+    fn chime_for(sim: Sim) {
         sim.motive[13] += 1;
         play_sound(chime);
         play_sound(chime, sim);
@@ -293,9 +303,9 @@ fn zero_local_loops_sounds_and_frame_kinds_round_trip() {
         "for p in lot.sims() {",
         "if p.kind == 0 {",
         "temp[1] += p.personality.playful;",
-        "@id(4304) @frame(args: 0, locals: 0, format: 0x8002, revision: 0, kind: 3) tree",
-        "sound sound_0 = preset(\"ui_click\", wav: \"synth_chime\", id: 0);",
-        "sound sound_7 = preset(\"ui_click\", wav: \"synth_chime\", id: 7);",
+        "#[bhav(id = 4304, label = \"Kinded\", args = 0, locals = 0, format = 0x8002, revision = 0, kind = 3)]\n    fn kinded_4304() {",
+        "sound sound_0 = fwav(0, wav: \"synth_chime\");",
+        "sound sound_7 = fwav(7, wav: \"synth_chime\");",
         "play_sound(sound_0);",
         "play_sound(sound_7);",
         // In an interaction the default target is the object, `sim` the other one.
@@ -306,14 +316,14 @@ fn zero_local_loops_sounds_and_frame_kinds_round_trip() {
     assert!(!source.contains("set_to_next"), "{source}");
     // Trees without a kind keep the plain frame.
     assert!(
-        source.contains("@id(4303) @frame(args: 0, locals: 0, format: 0x8002, revision: 0) tree"),
+        source.contains("#[bhav(id = 4303, label = \"People\", args = 0, locals = 0, format = 0x8002, revision = 0)]\n"),
         "{source}"
     );
     // `census` prefers the Sim context (it reads the stack object's attributes) but `main`
     // calls it: it is written for either context.
     assert!(
         source.contains(
-            "@id(4302) @frame(args: 0, locals: 0, format: 0x8002, revision: 0) @context(inherit) tree"
+            "#[bhav(id = 4302, label = \"Census\", args = 0, locals = 0, format = 0x8002, revision = 0, context = inherit)]\n"
         ),
         "{source}"
     );
@@ -324,8 +334,9 @@ object "Synth Picker" {
     guid: 0x7E00_0007; price: 40;
     sprite: Sprite::procedural("floor_lamp", primary: #504030, accent: #A09080, trim: #201810);
     state mode: Mode;
-    state level @ 2: i16;
-    @id(4200)   @frame( kind:3 ) tree pick "Pick" {
+    #[slot(2)] state level: i16;
+    #[bhav(id = 4200, label = "Pick", kind = 3)]
+    fn pick() {
         self.level = if self.level>3 {1} else if self.level > 1 { 2 }   else {3};
         self.level = match self.mode { Mode::Off|Mode::Low => 1,
             Mode::High => 2 };
@@ -348,7 +359,7 @@ fn formatter_handles_if_expressions_or_patterns_and_frame_kinds() {
         "idempotent"
     );
     for expected in [
-        "    @id(4200) @frame(kind: 3) tree pick \"Pick\" {\n",
+        "    #[bhav(id = 4200, label = \"Pick\", kind = 3)]\n    fn pick() {\n",
         "        self.level = if self.level > 3 {\n            1\n        } else if self.level > 1 {\n            2\n        } else {\n            3\n        };\n",
         "            Mode::Off | Mode::Low => 1,\n",
         "            Mode::Off | Mode::Low => {\n                self.level += 1;\n            }\n",
@@ -492,9 +503,10 @@ const SPARSE: &str = r#"object "Synth Sparse" {
     attributes: 4;
     sprite: Sprite::procedural("floor_lamp", primary: #504030, accent: #A09080, trim: #201810);
 
-    state level @ 2: i16;
+    #[slot(2)] state level: i16;
 
-    @id(4500) tree poke "Poke" {
+    #[bhav(id = 4500, label = "Poke")]
+    fn poke() {
         self.level += 1;
         raw { my.attr[20] := 1; }
         return true;
@@ -514,7 +526,7 @@ fn the_attribute_count_is_kept_and_bounds_states() {
     let source = &report.source;
     assert!(source.contains("attributes: 4;"), "{source}");
     // A `state` past the count would grow the object, so attribute 20 stays `raw`.
-    assert!(source.contains("state attr_2 @ 2: i16;"), "{source}");
+    assert!(source.contains("#[slot(2)] state attr_2: i16;"), "{source}");
     assert!(!source.contains("attr_20"), "{source}");
     assert!(
         report.trees.iter().all(|t| proven(&t.check)),
@@ -663,7 +675,7 @@ object "Synth Dimmer" {
     guid: 0x7E00_0004; price: 40;
     sprite: Sprite::procedural("floor_lamp", primary: #504030, accent: #A09080, trim: #201810);
     state mode: Mode;
-    state level @ 2: i16;
+    #[slot(2)] state level: i16;
     fn pick(mode: Mode) -> i16 { return match mode { Mode::Off => 0, Mode::Low => 10, Mode::High => 20 }; }
     fn band(x: i16) -> i16 {
         return match x { -32768..=-1 => -1, 0 => 0, 1..=9 => 1, _ => 2 };
@@ -676,8 +688,10 @@ object "Synth Dimmer" {
         let big = match self.level { 0 => self.level > 3, _ => !(self.level > 5) };
         if big { self.level = 1; }
     }
-    tree init_budget "Init Budget" { self.level = 2; }
-    tree main_budget "Main Budget" { loop { sleep(20); self.level += 1; } }
+    #[bhav(label = "Init Budget")]
+    fn init_budget() { self.level = 2; }
+    #[bhav(label = "Main Budget")]
+    fn main_budget() { loop { sleep(20); self.level += 1; } }
     variant "Budget Dimmer" { guid: 0x7E00_0005, price: 15, description: "A cheaper dimmer.", init: init_budget, main: main_budget }
     /// Same trees, another price.
     variant "Plain Dimmer" { guid: 0x7E00_0006 }
@@ -689,8 +703,10 @@ fn formatter_keeps_empty_frames() {
     let source = r#"object "Synth Empty" {
     guid: 0x7E00_0008; price: 1;
     sprite: Sprite::procedural("floor_lamp", primary: #504030, accent: #A09080, trim: #201810);
-    @id(4300)   @frame( empty ) tree a "A" {   }
-    @id(4301) @frame(args:4,empty) tree b "B" {
+    #[bhav(id = 4300, label = "A", empty)]
+    fn a() {   }
+    #[bhav(id = 4301, label = "B", args = 4, empty)]
+    fn b() {
     }
 }
 "#;
@@ -702,8 +718,8 @@ fn formatter_keeps_empty_frames() {
         "idempotent"
     );
     for expected in [
-        "    @id(4300) @frame(empty) tree a \"A\" {}\n",
-        "    @id(4301) @frame(args: 4, empty) tree b \"B\" {}\n",
+        "    #[bhav(id = 4300, label = \"A\", empty)]\n    fn a() {}\n",
+        "    #[bhav(id = 4301, label = \"B\", args = 4, empty)]\n    fn b() {}\n",
     ] {
         assert!(
             formatted.contains(expected),
@@ -724,12 +740,13 @@ fn formatter_handles_pr_h_attributes_and_constant_bindings() {
     let source = r#"object "Synth PR H" {
     guid: 0x7E00_0009; price: 1;
     sprite: Sprite::procedural("floor_lamp", primary: #504030, accent: #A09080, trim: #201810);
-    state level @ 2: i16;
-    @id(4300)  @ context( inherit )
-    tree helper "Helper" { me.attr[2] = 1; }
-    @id(4301) @frame(args: 4) main { temp[0] = 1; }
-    @id(4302) tree probe "Probe" {
-        @ slot( 3 ) let x: i16;
+    #[slot(2)] state level: i16;
+    #[bhav(id = 4300, label = "Helper", context = inherit)]
+    fn helper() { me.attr[2] = 1; }
+    #[id(4301)] #[frame(args = 4)] main { temp[0] = 1; }
+    #[bhav(id = 4302, label = "Probe")]
+    fn probe() {
+        #[slot( 3 )] let x: i16;
         const(A, B) = if temp[0] > 0 {(1, 2)}   else {  (3, 4) };
         const C = if temp[1] > 0 { 5 } else { 6 };
         const D = if temp[1] > 1 {
@@ -751,8 +768,8 @@ fn formatter_handles_pr_h_attributes_and_constant_bindings() {
         "idempotent"
     );
     for expected in [
-        "    @id(4300) @context(inherit)\n    tree helper \"Helper\" {\n",
-        "        @slot(3) let x: i16;\n",
+        "    #[bhav(id = 4300, label = \"Helper\", context = inherit)]\n    fn helper() {\n",
+        "        #[slot(3)] let x: i16;\n",
         "        const (A, B) = if temp[0] > 0 { (1, 2) } else { (3, 4) };\n",
         "        const C = if temp[1] > 0 { 5 } else { 6 };\n",
         "        const D = if temp[1] > 1 {\n            7\n        } else {\n            8\n        };\n",
@@ -907,9 +924,10 @@ const MESSY: &str = r#"/// Doc comment on the object.
 object   "Synth Messy"{guid:0x7E00_0003;price:5;
 sprite: Sprite::procedural("floor_lamp", primary: #101010, accent: #202020, trim: #303030);
     // A line comment before a state.
-  state  n @ 3 : i16; /* trailing block /* nested */ comment */
+  #[slot(3)] state n: i16; /* trailing block /* nested */ comment */
     bcon 4097 "K" { a = 1, b = 2 }
-    @id(4200) tree t "T" {
+    #[bhav(id = 4200, label = "T")]
+    fn t() {
         if self.n>K.a{self.n-=1;}else{self.n=-K.b;}   // trailing line comment
         raw {
               temp[0] := 1;
@@ -953,7 +971,7 @@ fn formatter_is_idempotent_and_keeps_comments() {
 
 #[test]
 fn formatter_handles_unicode_indentation_and_raw_comments() {
-    let source = "object \"Synth Odd\" {\n    guid: 0x7E00_0004;\n    @id(4200) tree t \"T\" {\n        raw // why raw\n        {\n            temp[0] := 1;\n \u{a0}           temp[1] := 2;\n        }\n        raw /* a */ { temp[2] := 3; }\n        return true;\n    }\n}\n";
+    let source = "object \"Synth Odd\" {\n    guid: 0x7E00_0004;\n    #[bhav(id = 4200, label = \"T\")] fn t() {\n        raw // why raw\n        {\n            temp[0] := 1;\n \u{a0}           temp[1] := 2;\n        }\n        raw /* a */ { temp[2] := 3; }\n        return true;\n    }\n}\n";
     compile("odd.antics", source);
     let once = format_v2_source(source).expect("format");
     assert_eq!(format_v2_source(&once).expect("format twice"), once);
@@ -969,7 +987,7 @@ fn formatter_handles_unicode_indentation_and_raw_comments() {
 fn end_of_line_comments_stay_on_the_line_they_end() {
     // A one-line block the formatter expands keeps a trailing comment (and lint
     // directive) on its opening line, not after the closing `}`.
-    let source = "object \"Synth Eol\" {\n    guid: 0x7E00_0005;\n    price: 1;\n    state level @ 2: i16;\n    state on: bool;\n    fn on() -> bool {\n        if !self.on { return false; } // antics-lint: allow(redundant_bool_return)\n        return true;\n    }\n    tree t \"T\" {\n        if self.level > 2 { self.level = 0; } // gap: why\n        self.on = on();\n    }\n}\n";
+    let source = "object \"Synth Eol\" {\n    guid: 0x7E00_0005;\n    price: 1;\n    #[slot(2)] state level: i16;\n    state on: bool;\n    fn on() -> bool {\n        if !self.on { return false; } // antics-lint: allow(redundant_bool_return)\n        return true;\n    }\n    #[bhav(label = \"T\")] fn t() {\n        if self.level > 2 { self.level = 0; } // gap: why\n        self.on = on();\n    }\n}\n";
     let once = format_v2_source(source).expect("format");
     assert_eq!(format_v2_source(&once).expect("format twice"), once);
     assert!(
@@ -1002,7 +1020,7 @@ fn end_of_line_comments_stay_on_the_line_they_end() {
 fn end_of_line_directives_cover_else_arms_and_follow_raw_blocks() {
     // The directive lands in the first arm; it covers the whole `if` / `else` chain. A
     // multi-line `raw` block earlier in the tree does not stop the relocation.
-    let source = "object \"Synth Eol\" {\n    guid: 0x7E00_0006;\n    price: 1;\n    state level @ 2: i16;\n    tree t \"T\" {\n        raw {\n            temp[0] := 1;\n        }\n        if self.level > 2 { self.level = 0; } // gap: why\n        if self.level > 1 { sleep(1); } else { while true { sleep(1); } } // antics-lint: allow(while_true)\n    }\n}\n";
+    let source = "object \"Synth Eol\" {\n    guid: 0x7E00_0006;\n    price: 1;\n    #[slot(2)] state level: i16;\n    #[bhav(label = \"T\")] fn t() {\n        raw {\n            temp[0] := 1;\n        }\n        if self.level > 2 { self.level = 0; } // gap: why\n        if self.level > 1 { sleep(1); } else { while true { sleep(1); } } // antics-lint: allow(while_true)\n    }\n}\n";
     let once = format_v2_source(source).expect("format");
     assert_eq!(format_v2_source(&once).expect("format twice"), once);
     assert!(
@@ -1023,7 +1041,7 @@ fn end_of_line_directives_cover_else_arms_and_follow_raw_blocks() {
         );
     }
     // The block opens on the line a multi-line raw block ends on.
-    let source = "object \"Synth Eol\" {\n    guid: 0x7E00_0007;\n    price: 1;\n    state level @ 2: i16;\n    tree t \"T\" {\n        raw {\n            temp[0] := 1;\n        } if self.level > 1 { while true { sleep(1); } } // antics-lint: allow(while_true)\n    }\n}\n";
+    let source = "object \"Synth Eol\" {\n    guid: 0x7E00_0007;\n    price: 1;\n    #[slot(2)] state level: i16;\n    #[bhav(label = \"T\")] fn t() {\n        raw {\n            temp[0] := 1;\n        } if self.level > 1 { while true { sleep(1); } } // antics-lint: allow(while_true)\n    }\n}\n";
     let once = format_v2_source(source).expect("format");
     assert_eq!(format_v2_source(&once).expect("format twice"), once);
     for text in [source, once.as_str()] {
@@ -1203,10 +1221,11 @@ const PR_E_IDIOMS: &str = r#"object "Synth Switchboard" {
     guid: 0x7E00_0007;
     price: 5;
     sprite: Sprite::procedural("floor_lamp", primary: #101010, accent: #202020, trim: #303030);
-    state level @ 2: i16;
-    state mode @ 3: i16;
+    #[slot(2)] state level: i16;
+    #[slot(3)] state mode: i16;
 
-    @id(4400) tree chain "Chain" {
+    #[bhav(id = 4400, label = "Chain")]
+    fn chain() {
         if self.level == 1 {
             self.mode = 4;
         } else if self.level == 2 {
@@ -1226,7 +1245,8 @@ const PR_E_IDIOMS: &str = r#"object "Synth Switchboard" {
         self.mode = 0;
     }
 
-    @id(4401) tree counted "Counted" {
+    #[bhav(id = 4401, label = "Counted")]
+    fn counted() {
         temp[0] = 0;
         while inc_lt(&mut temp[0], 5) {
             self.level += 1;
@@ -1236,21 +1256,24 @@ const PR_E_IDIOMS: &str = r#"object "Synth Switchboard" {
         }
     }
 
-    @id(4402) @frame(args: 2) tree slots "Slots" {
+    #[bhav(id = 4402, label = "Slots", args = 2)]
+    fn slots() {
         self.level = self.slot[0];
         notify_out_of_idle();
         param[1] = 3;
         self.mode = param[0];
     }
 
-    @id(4403) tree sim_side "Sim Side" (sim: Sim) {
+    #[bhav(id = 4403, label = "Sim Side")]
+    fn sim_side(sim: Sim) {
         set_dynamic_sprite(index: 2, value: 1);
         self.level = self.slot[1];
         push_interaction(menu: 2, object: self, priority: 50, flags: 0);
         push_interaction(menu: 3, object: sim, priority: 40, flags: 4);
     }
 
-    @id(4404) tree pushes "Pushes" {
+    #[bhav(id = 4404, label = "Pushes")]
+    fn pushes() {
         push_interaction(menu: 2, object: self, priority: 50, flags: 0);
         push_interaction(menu: 2, object: stack_obj, priority: 50, flags: 0);
     }
@@ -1301,9 +1324,10 @@ fn a_relowering_idiom_that_is_not_proven_falls_back_inside_the_tree() {
     guid: 0x7E00_0008;
     price: 5;
     sprite: Sprite::procedural("floor_lamp", primary: #101010, accent: #202020, trim: #303030);
-    state level @ 2: i16;
+    #[slot(2)] state level: i16;
 
-    @id(4410) tree relay "Relay" {
+    #[bhav(id = 4410, label = "Relay")]
+    fn relay() {
         stack_obj = 0;
         raw { run_functional_tree(4); }
         self.level = 3;
@@ -1333,7 +1357,8 @@ fn an_extra_idiom_that_does_not_compile_is_dropped_before_the_tree_is_lowered() 
     price: 5;
     sprite: Sprite::procedural("floor_lamp", primary: #101010, accent: #202020, trim: #303030);
 
-    @id(4420) tree patch "Patch" {
+    #[bhav(id = 4420, label = "Patch")]
+    fn patch() {
         raw {
             local[0] := my.id;
             push_interaction(menu: 0, object: 0, priority: 0, flags: 2);

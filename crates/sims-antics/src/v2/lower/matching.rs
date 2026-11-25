@@ -9,11 +9,14 @@ impl MatchCase<'_> {
     }
 }
 
-/// An arm's statements (none for a value arm).
-pub(super) fn arm_stmts(b: ArmBody<'_>) -> &[V2Stmt] {
+/// Whether an arm may `break` / `continue` the loop it sits in: through its statements, or
+/// through a diverging block of a value arm (`else if c { break; }`, `0 => break`).
+pub(super) fn arm_exits_loop(b: ArmBody<'_>) -> bool {
     match b {
-        ArmBody::Stmts(s) => s,
-        ArmBody::Value(_) => &[],
+        ArmBody::Stmts(s) => stmts_exit_loop(s),
+        ArmBody::Value(e) => super::specialize::init_blocks(e)
+            .into_iter()
+            .any(stmts_exit_loop),
     }
 }
 

@@ -16,21 +16,21 @@ fn obj(members: &str) -> String {
         "enum Mode {{ Off, Low, High }}\n\
          object \"Synth Probe\" {{\n    guid: 0x7E00_0100;\n    price: 1;\n    \
          sprite: Sprite::procedural(\"floor_lamp\", primary: #101010, accent: #202020, trim: #303030);\n    \
-         state level @ 2: i16;\n    state mode: Mode;\n{members}\n}}\n"
+         #[slot(2)] state level: i16;\n    state mode: Mode;\n{members}\n}}\n"
     )
 }
 
 /// Wraps statements in an object-context tree that uses `level` and `mode`.
 fn tree(body: &str) -> String {
     obj(&format!(
-        "    tree probe \"Probe\" {{\n        self.level = 0;\n        self.mode = Mode::Off;\n{body}\n    }}"
+        "    #[bhav(label = \"Probe\")] fn probe() {{\n        self.level = 0;\n        self.mode = Mode::Off;\n{body}\n    }}"
     ))
 }
 
 /// Wraps statements in a Sim-context tree.
 fn sim_tree(body: &str) -> String {
     obj(&format!(
-        "    tree probe \"Probe\" (sim: Sim) {{\n        self.level = 0;\n        self.mode = Mode::Off;\n{body}\n    }}"
+        "    #[bhav(label = \"Probe\")] fn probe(sim: Sim) {{\n        self.level = 0;\n        self.mode = Mode::Off;\n{body}\n    }}"
     ))
 }
 
@@ -231,7 +231,7 @@ fn if_expressions_are_walked_like_other_expressions() {
 fn wildcard_rules_resolve_the_enum_through_imports() {
     // `Mode` here is `Wider` imported under another name; an unrelated two-variant `Mode`
     // elsewhere in the set must not make the `_` arm look redundant.
-    let user = obj("    tree probe \"Probe\" {\n        match self.mode {\n            Mode::Off => { self.level = 1; }\n            Mode::Low => { self.level = 2; }\n            _ => { self.level = 3; }\n        }\n    }")
+    let user = obj("    #[bhav(label = \"Probe\")] fn probe() {\n        match self.mode {\n            Mode::Off => { self.level = 1; }\n            Mode::Low => { self.level = 2; }\n            _ => { self.level = 3; }\n        }\n    }")
         .replace(
             "enum Mode { Off, Low, High }\n",
             "use crate::shared::wide::Wider as Mode;\n",
@@ -328,11 +328,13 @@ fn enum_wildcard_all_covered_cannot_be_allowed() {
 #[test]
 fn dropped_bool_and_result_calls_are_flagged() {
     let source = format!(
-        "extern mod synth_globals {{\n    @id(256) fn try_light(power: i16) -> Result;\n}}\n{}",
+        "extern mod synth_globals {{\n    #[id(256)] fn try_light(power: i16) -> Result;\n}}\n{}",
         obj(
             "    fn is_bright() -> bool { return self.level > 5; }\n    \
-             tree check \"Check\" -> bool { return self.level > 1; }\n    \
-             tree probe \"Probe\" {\n        self.level = 0;\n        self.mode = Mode::Off;\n        \
+             #[bhav(label = \"Check\")]
+             fn check() -> bool { return self.level > 1; }\n    \
+             #[bhav(label = \"Probe\")]
+             fn probe() {\n        self.level = 0;\n        self.mode = Mode::Off;\n        \
              is_bright();\n        check();\n        synth_globals::try_light(3);\n        \
              can_afford(5);\n        stack_obj.is_type(0x7E00_0200);\n    }"
         )
@@ -359,7 +361,8 @@ fn used_bool_calls_and_out_param_helpers_are_fine() {
         "    fn is_bright() -> bool { return self.level > 5; }\n    \
          fn bump(n: &mut i16) -> bool { *n += 1; return *n > 3; }\n    \
          fn touch() { self.level += 1; }\n    \
-         tree probe \"Probe\" {\n        self.level = 0;\n        self.mode = Mode::Off;\n        \
+         #[bhav(label = \"Probe\")]
+         fn probe() {\n        self.level = 0;\n        self.mode = Mode::Off;\n        \
          if is_bright() { self.level = 1; }\n        is_bright()?;\n        touch();\n        \
          bump(&mut self.level);\n        debit_funds(5);\n        return is_bright();\n    }",
     );
@@ -497,7 +500,8 @@ fn unused_locals_states_consts_and_bcon_entries_are_flagged() {
     let source = obj(
         "    const SPARE = 4;\n    const USED = 2;\n    state spare_state: i16;\n    \
          bcon 4097 \"Tuning\" { low = 1, high = 9 }\n    \
-         tree probe \"Probe\" {\n        self.level = Tuning.low + USED;\n        self.mode = Mode::Off;\n        \
+         #[bhav(label = \"Probe\")]
+         fn probe() {\n        self.level = Tuning.low + USED;\n        self.mode = Mode::Off;\n        \
          let unused = random(5);\n        let used = random(5);\n        self.level += used;\n    }",
     );
     let found = of(&source, "unused_decl");
@@ -545,7 +549,8 @@ fn locals_are_not_judged_when_raw_code_addresses_locals_by_number() {
 #[test]
 fn bcon_entries_are_not_judged_when_something_reads_them_by_number() {
     let members = "    bcon 4097 \"Tuning\" { low = 1, high = 9 }\n    \
-         tree probe \"Probe\" {\n        self.level = Tuning.low;\n        self.mode = Mode::Off;\n";
+         #[bhav(label = \"Probe\")]
+         fn probe() {\n        self.level = Tuning.low;\n        self.mode = Mode::Off;\n";
     let flagged = obj(&format!("{members}    }}"));
     assert_eq!(of(&flagged, "unused_decl").len(), 1, "{flagged}");
     for read in [
@@ -560,7 +565,7 @@ fn bcon_entries_are_not_judged_when_something_reads_them_by_number() {
         none(&raw, "unused_decl");
     }
     let external = format!(
-        "extern mod synth_globals {{\n    @id(256) fn tune() -> bool;\n}}\n{}",
+        "extern mod synth_globals {{\n    #[id(256)] fn tune() -> bool;\n}}\n{}",
         obj(&format!("{members}        synth_globals::tune();\n    }}"))
     );
     none(&external, "unused_decl");
@@ -584,7 +589,7 @@ fn uninitialized_local_read_before_assignment_is_flagged() {
     );
     none(
         &obj(
-            "    fn put(v: &mut i16) { *v = 2; }\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        let x: i16;\n        put(&mut x);\n        self.level = x;\n    }",
+            "    fn put(v: &mut i16) { *v = 2; }\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        let x: i16;\n        put(&mut x);\n        self.level = x;\n    }",
         ),
         "uninitialized_local_read",
     );
@@ -592,11 +597,11 @@ fn uninitialized_local_read_before_assignment_is_flagged() {
 
 #[test]
 fn a_slot_pinned_local_is_neither_unread_nor_uninitialized() {
-    // `@slot(N)` pins the frame word for code that addresses it by number, which may
+    // `#[slot(N)]` pins the frame word for code that addresses it by number, which may
     // fill or read it: no `uninitialized_local_read`, no `unused_decl`.
     for body in [
-        "        @slot(2) let x: i16;\n        self.level = x;\n        x = 3;\n        self.level += x;",
-        "        @slot(2) let y: i16 = 1;\n        self.level = 2;",
+        "        #[slot(2)] let x: i16;\n        self.level = x;\n        x = 3;\n        self.level += x;",
+        "        #[slot(2)] let y: i16 = 1;\n        self.level = 2;",
     ] {
         let source = tree(body);
         none(&source, "uninitialized_local_read");
@@ -682,7 +687,7 @@ fn relationship_reads_into_its_value_local() {
 /// A Sim tree whose dialog shows the string `hi`.
 fn dialog_tree(text: &str, body: &str) -> String {
     obj(&format!(
-        "    strings 301 \"Dialog prim string set\" {{ hi = \"{text}\" }}\n    tree probe \"Probe\" (sim: Sim) {{\n        self.level = 0;\n        self.mode = Mode::Off;\n{body}\n        dialog(kind: 0, message: hi, title: hi)?;\n    }}"
+        "    strings 301 \"Dialog prim string set\" {{ hi = \"{text}\" }}\n    #[bhav(label = \"Probe\")] fn probe(sim: Sim) {{\n        self.level = 0;\n        self.mode = Mode::Off;\n{body}\n        dialog(kind: 0, message: hi, title: hi)?;\n    }}"
     ))
 }
 
@@ -701,7 +706,7 @@ fn locals_of_trees_showing_strings_the_file_does_not_hold_may_be_read() {
         ("", "action_label(table: 431, index: 2);"),
     ] {
         let source = obj(&format!(
-            "{members}    tree probe \"Probe\" (sim: Sim) {{\n        self.level = 0;\n        self.mode = Mode::Off;\n{unread}\n        {call}\n    }}"
+            "{members}    #[bhav(label = \"Probe\")] fn probe(sim: Sim) {{\n        self.level = 0;\n        self.mode = Mode::Off;\n{unread}\n        {call}\n    }}"
         ));
         none(&source, "unused_decl");
     }
@@ -713,13 +718,13 @@ fn locals_of_trees_showing_strings_the_file_does_not_hold_may_be_read() {
 #[test]
 fn a_local_read_by_an_action_label_token_is_used() {
     let source = obj(
-        "    strings 431 \"Labels\" { a = \"$Local:1\" }\n    tree probe \"Probe\" (sim: Sim) {\n        self.level = 0;\n        self.mode = Mode::Off;\n        let shown = random(7);\n        action_label(table: 431, index: 1);\n    }",
+        "    strings 431 \"Labels\" { a = \"$Local:1\" }\n    #[bhav(label = \"Probe\")] fn probe(sim: Sim) {\n        self.level = 0;\n        self.mode = Mode::Off;\n        let shown = random(7);\n        action_label(table: 431, index: 1);\n    }",
     );
     none(&source, "unused_decl");
     none(&source, "dialog_local_slot_mismatch");
     // Show String formats no token: its text reads nothing.
     let source = obj(
-        "    strings 431 \"Labels\" { a = \"$Local:1\" }\n    tree probe \"Probe\" (sim: Sim) {\n        self.level = 0;\n        self.mode = Mode::Off;\n        let shown = random(7);\n        show_string(table: 431, index: 1);\n    }",
+        "    strings 431 \"Labels\" { a = \"$Local:1\" }\n    #[bhav(label = \"Probe\")] fn probe(sim: Sim) {\n        self.level = 0;\n        self.mode = Mode::Off;\n        let shown = random(7);\n        show_string(table: 431, index: 1);\n    }",
     );
     one(&source, "unused_decl");
 }
@@ -784,14 +789,14 @@ fn string_tokens_follow_hex_raw_locals_and_numeric_dialog_strings() {
     assert!(d.message.contains("compiler temporary"), "{d:?}");
     // A dialog's numeric string is 1-based into `STR#` 301.
     let numeric = obj(
-        "    strings 301 \"Dialog prim string set\" { hi = \"you got $Local:4\" }\n    tree probe \"Probe\" (sim: Sim) {\n        self.level = 0;\n        self.mode = Mode::Off;\n        let shown = random(7);\n        dialog(kind: 0, message: 1, title: 1)?;\n    }",
+        "    strings 301 \"Dialog prim string set\" { hi = \"you got $Local:4\" }\n    #[bhav(label = \"Probe\")] fn probe(sim: Sim) {\n        self.level = 0;\n        self.mode = Mode::Off;\n        let shown = random(7);\n        dialog(kind: 0, message: 1, title: 1)?;\n    }",
     );
     let d = one(&numeric, "dialog_local_slot_mismatch");
     assert!(d.message.contains("dialog string 1"), "{d:?}");
     // `kind: 2` is a number, not dialog string 2; a `buttons` tuple names strings.
     let two = |call: &str| {
         obj(&format!(
-            "    strings 301 \"Dialog prim string set\" {{ msg = \"Go on?\", a = \"$Local:4\", b = \"No\" }}\n    tree probe \"Probe\" (sim: Sim) {{\n        self.level = 0;\n        self.mode = Mode::Off;\n        {call}\n    }}"
+            "    strings 301 \"Dialog prim string set\" {{ msg = \"Go on?\", a = \"$Local:4\", b = \"No\" }}\n    #[bhav(label = \"Probe\")] fn probe(sim: Sim) {{\n        self.level = 0;\n        self.mode = Mode::Off;\n        {call}\n    }}"
         ))
     };
     none(
@@ -805,7 +810,7 @@ fn string_tokens_follow_hex_raw_locals_and_numeric_dialog_strings() {
     // A state with a string's name is not the string.
     none(
         &obj(
-            "    strings 301 \"Dialog prim string set\" { hi = \"you got $Local:4\" }\n    state hi: i16;\n    tree probe \"Probe\" {\n        self.level = 0;\n        self.mode = Mode::Off;\n        self.hi = 1;\n    }",
+            "    strings 301 \"Dialog prim string set\" { hi = \"you got $Local:4\" }\n    state hi: i16;\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.level = 0;\n        self.mode = Mode::Off;\n        self.hi = 1;\n    }",
         ),
         "dialog_local_slot_mismatch",
     );
@@ -816,7 +821,7 @@ fn string_tokens_follow_hex_raw_locals_and_numeric_dialog_strings() {
 #[test]
 fn a_raw_block_ending_in_a_bare_call_before_more_code_is_flagged() {
     let source = obj(
-        "    @id(4300) tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        raw {\n            temp[0] := 1;\n            call 4301(temps); // why\n        }\n        self.level = 1;\n    }\n    @id(4301) tree other \"Other\" { return true; }",
+        "    #[bhav(id = 4300, label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        raw {\n            temp[0] := 1;\n            call 4301(temps); // why\n        }\n        self.level = 1;\n    }\n    #[bhav(id = 4301, label = \"Other\")] fn other() { return true; }",
     );
     let d = one(&source, "raw_bare_call_false_exit");
     assert_eq!(d.line, line_of(&source, "call 4301(temps);"));
@@ -833,7 +838,7 @@ fn a_raw_block_ending_in_a_bare_call_before_more_code_is_flagged() {
 fn allow_directives_work_inside_raw() {
     let wrap = |raw: &str| {
         obj(&format!(
-            "    @id(4300) tree probe \"Probe\" {{\n        self.mode = Mode::Off;\n        raw {{\n            temp[0] := 1;\n{raw}\n        }}\n        self.level = 1;\n    }}\n    @id(4301) tree other \"Other\" {{ return true; }}"
+            "    #[bhav(id = 4300, label = \"Probe\")] fn probe() {{\n        self.mode = Mode::Off;\n        raw {{\n            temp[0] := 1;\n{raw}\n        }}\n        self.level = 1;\n    }}\n    #[bhav(id = 4301, label = \"Other\")] fn other() {{ return true; }}"
         ))
     };
     // Trailing the call's line, in `.air`'s `//` or `#` comment form.
@@ -866,7 +871,7 @@ fn allow_directives_work_inside_raw() {
 
 #[test]
 fn guarded_or_final_raw_calls_are_fine() {
-    let other = "\n    @id(4301) tree other \"Other\" { return true; }";
+    let other = "\n    #[bhav(id = 4301, label = \"Other\")] fn other() { return true; }";
     for body in [
         // Both results go on.
         "        raw { if call 4301(temps) {} }\n        self.level = 1;",
@@ -877,7 +882,7 @@ fn guarded_or_final_raw_calls_are_fine() {
     ] {
         none(
             &obj(&format!(
-                "    @id(4300) tree probe \"Probe\" {{\n        self.mode = Mode::Off;\n{body}\n    }}{other}"
+                "    #[bhav(id = 4300, label = \"Probe\")] fn probe() {{\n        self.mode = Mode::Off;\n{body}\n    }}{other}"
             )),
             "raw_bare_call_false_exit",
         );
@@ -888,7 +893,7 @@ fn guarded_or_final_raw_calls_are_fine() {
 fn raw_calls_with_their_own_edges_or_nested_in_an_arm() {
     let wrap = |body: &str| {
         obj(&format!(
-            "    @id(4300) tree probe \"Probe\" {{\n        self.mode = Mode::Off;\n{body}\n    }}\n    @id(4301) tree other \"Other\" {{ return true; }}"
+            "    #[bhav(id = 4300, label = \"Probe\")] fn probe() {{\n        self.mode = Mode::Off;\n{body}\n    }}\n    #[bhav(id = 4301, label = \"Other\")] fn other() {{ return true; }}"
         ))
     };
     // The call names both edges.
@@ -929,20 +934,20 @@ fn a_sim_tree_reading_param_in_raw_without_frame_args_is_flagged() {
     assert!(d.message.contains("`param[1]`"), "{d:?}");
     assert!(d.message.contains("declares no argument words"), "{d:?}");
     assert!(
-        d.help.as_deref().unwrap().contains("@frame(args: 2)"),
+        d.help.as_deref().unwrap().contains("#[frame(args = 2)]"),
         "{d:?}"
     );
     // Pinned arguments (any count: the frame is declared), an object-context tree, or
     // declared parameters: fine.
     none(
         &obj(
-            "    @frame(args: 1) tree probe \"Probe\" (sim: Sim) {\n        self.level = 0;\n        self.mode = Mode::Off;\n        raw { temp[0] := param[1]; }\n        sim.motive[1] = 1;\n    }",
+            "    #[bhav(label = \"Probe\", args = 1)] fn probe(sim: Sim) {\n        self.level = 0;\n        self.mode = Mode::Off;\n        raw { temp[0] := param[1]; }\n        sim.motive[1] = 1;\n    }",
         ),
         "missing_sim_frame_args",
     );
     none(
         &obj(
-            "    @frame(args: 2) tree probe \"Probe\" (sim: Sim) {\n        self.level = 0;\n        self.mode = Mode::Off;\n        raw { temp[0] := param[1]; }\n        sim.motive[1] = 1;\n    }",
+            "    #[bhav(label = \"Probe\", args = 2)] fn probe(sim: Sim) {\n        self.level = 0;\n        self.mode = Mode::Off;\n        raw { temp[0] := param[1]; }\n        sim.motive[1] = 1;\n    }",
         ),
         "missing_sim_frame_args",
     );
@@ -957,14 +962,14 @@ fn a_const_written_as_its_value_in_raw_is_used() {
     // The value written in place of the name is a use too.
     none(
         &obj(
-            "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { attr[7] := 1; }\n    }",
+            "    const LEVEL_SLOT = 7;\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { attr[7] := 1; }\n    }",
         ),
         "unused_decl",
     );
     // A frame word (`temp[7]`) is not one.
     one(
         &obj(
-            "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { temp[7] := 1; }\n    }",
+            "    const LEVEL_SLOT = 7;\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { temp[7] := 1; }\n    }",
         ),
         "unused_decl",
     );
@@ -974,14 +979,14 @@ fn a_const_written_as_its_value_in_raw_is_used() {
 fn a_const_named_in_raw_is_used() {
     // Lowering declares a v2 `const` a raw block names as an `.air` constant.
     let source = obj(
-        "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { temp[0] := LEVEL_SLOT; }\n    }",
+        "    const LEVEL_SLOT = 7;\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { temp[0] := LEVEL_SLOT; }\n    }",
     );
     none(&source, "unused_decl");
     assert!(lint(&source).is_empty(), "{:?}", lint(&source));
     // A block's own `.air` constant of the same name is not the v2 one.
     one(
         &obj(
-            "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { const LEVEL_SLOT = 3; temp[0] := LEVEL_SLOT; }\n    }",
+            "    const LEVEL_SLOT = 7;\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { const LEVEL_SLOT = 3; temp[0] := LEVEL_SLOT; }\n    }",
         ),
         "unused_decl",
     );
@@ -992,7 +997,7 @@ fn a_const_named_in_raw_is_used() {
     ] {
         none(
             &obj(&format!(
-                "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {{\n        self.mode = Mode::Off;\n        self.level = 0;\n        {raw}\n    }}"
+                "    const LEVEL_SLOT = 7;\n    #[bhav(label = \"Probe\")] fn probe() {{\n        self.mode = Mode::Off;\n        self.level = 0;\n        {raw}\n    }}"
             )),
             "unused_decl",
         );
@@ -1001,20 +1006,20 @@ fn a_const_named_in_raw_is_used() {
     // nothing.
     one(
         &obj(
-            "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { const LEVEL_SLOT.e = 2; temp[0] := LEVEL_SLOT.e; }\n    }",
+            "    const LEVEL_SLOT = 7;\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { const LEVEL_SLOT.e = 2; temp[0] := LEVEL_SLOT.e; }\n    }",
         ),
         "unused_decl",
     );
     none(
         &obj(
-            "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { const Tune.const = LEVEL_SLOT; temp[0] := Tune.const; }\n    }",
+            "    const LEVEL_SLOT = 7;\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { const Tune.const = LEVEL_SLOT; temp[0] := Tune.const; }\n    }",
         ),
         "unused_decl",
     );
     // A field after `.` is not the constant.
     one(
         &obj(
-            "    const room = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { temp[0] := my.room; }\n    }",
+            "    const room = 7;\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { temp[0] := my.room; }\n    }",
         ),
         "unused_decl",
     );
@@ -1029,7 +1034,7 @@ fn a_const_named_in_a_raw_comment_or_string_is_just_unused() {
     ] {
         let d = one(
             &obj(&format!(
-                "    const ROOM = 2;\n    tree probe \"Probe\" {{\n        self.mode = Mode::Off;\n        self.level = 0;\n        {raw}\n    }}"
+                "    const ROOM = 2;\n    #[bhav(label = \"Probe\")] fn probe() {{\n        self.mode = Mode::Off;\n        self.level = 0;\n        {raw}\n    }}"
             )),
             "unused_decl",
         );
@@ -1049,7 +1054,7 @@ fn negated_comparisons_storing_a_local_are_fine() {
     // A `const` cannot.
     one(
         &obj(
-            "    const K = 2;\n    tree probe \"Probe\" {\n        self.level = 0;\n        if !(temp[0] > 0) { temp[1] = K; } else { temp[1] = 0; }\n        temp[2] = 3;\n    }",
+            "    const K = 2;\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.level = 0;\n        if !(temp[0] > 0) { temp[1] = K; } else { temp[1] = 0; }\n        temp[2] = 3;\n    }",
         ),
         "negated_comparison",
     );
@@ -1058,7 +1063,7 @@ fn negated_comparisons_storing_a_local_are_fine() {
 #[test]
 fn a_raw_action_string_may_read_any_local() {
     let source = obj(
-        "    strings 431 \"Labels\" { a = \"$Local:0\" }\n    tree probe \"Probe\" {\n        self.level = 0;\n        self.mode = Mode::Off;\n        let shown = 7;\n        raw { action_string(table: 431, index: 1); }\n    }",
+        "    strings 431 \"Labels\" { a = \"$Local:0\" }\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.level = 0;\n        self.mode = Mode::Off;\n        let shown = 7;\n        raw { action_string(table: 431, index: 1); }\n    }",
     );
     none(&source, "unused_decl");
 }
@@ -1067,7 +1072,7 @@ fn a_raw_action_string_may_read_any_local() {
 fn a_const_matching_an_index_in_a_raw_label_is_unused() {
     let d = one(
         &obj(
-            "    const ROOM = 7;\n    @id(4300) tree probe \"Probe\" {\n        self.level = 0;\n        self.mode = Mode::Off;\n        raw { call \"ROOM attr[7]\"(temps); }\n    }\n    @id(4301) tree other \"ROOM attr[7]\" { return true; }",
+            "    const ROOM = 7;\n    #[bhav(id = 4300, label = \"Probe\")] fn probe() {\n        self.level = 0;\n        self.mode = Mode::Off;\n        raw { call \"ROOM attr[7]\"(temps); }\n    }\n    #[bhav(id = 4301, label = \"ROOM attr[7]\")] fn other() { return true; }",
         ),
         "unused_decl",
     );
@@ -1078,7 +1083,7 @@ fn a_const_matching_an_index_in_a_raw_label_is_unused() {
 fn raw_bare_calls_are_reported_on_their_own_line() {
     let wrap = |pre: &str, raw: &str| {
         obj(&format!(
-            "    @id(4300) tree probe \"Probe\" {{\n        self.mode = Mode::Off;\n{pre}{raw}\n        self.level = 1;\n    }}\n    @id(4301) tree other \"Other\" {{ return true; }}"
+            "    #[bhav(id = 4300, label = \"Probe\")] fn probe() {{\n        self.mode = Mode::Off;\n{pre}{raw}\n        self.level = 1;\n    }}\n    #[bhav(id = 4301, label = \"Other\")] fn other() {{ return true; }}"
         ))
     };
     let line_of = |source: &str, needle: &str| {
@@ -1124,7 +1129,7 @@ fn raw_bare_calls_are_reported_on_their_own_line() {
 fn raw_directives_after_labels_and_before_the_brace() {
     let wrap = |raw: &str| {
         obj(&format!(
-            "    @id(4300) tree probe \"Probe\" {{\n        self.mode = Mode::Off;\n{raw}\n        self.level = 1;\n    }}\n    @id(4301) tree other \"Other\" {{ return true; }}"
+            "    #[bhav(id = 4300, label = \"Probe\")] fn probe() {{\n        self.mode = Mode::Off;\n{raw}\n        self.level = 1;\n    }}\n    #[bhav(id = 4301, label = \"Other\")] fn other() {{ return true; }}"
         ))
     };
     // A label on its own line: the call's trailing directive covers it.
@@ -1162,9 +1167,10 @@ fn odd_raw_text_does_not_crash_the_linter() {
 
 #[test]
 fn used_underscored_raw_and_shared_declarations_are_fine() {
-    let source = obj("    state slot_state @ 6: i16;\n    \
+    let source = obj("    #[slot(6)] state slot_state: i16;\n    \
          bcon 4097 \"Tuning\" { low = 1, high = 9 }\n    \
-         tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        \
+         #[bhav(label = \"Probe\")]
+         fn probe() {\n        self.mode = Mode::Off;\n        \
          let _ignored = random(5);\n        let in_raw = random(5);\n        \
          raw { my.attr[6] := in_raw; }\n        self.level = self.attr[6];\n    }");
     none(&format!("pub const SHARED = 4;\n{source}"), "unused_decl");
@@ -1198,18 +1204,18 @@ fn used_underscored_raw_and_shared_declarations_are_fine() {
 fn big_trees_and_many_locals_are_flagged() {
     let many_nodes: String = (0..205).map(|_| "        self.level += 1;\n").collect();
     let source = obj(&format!(
-        "    tree big \"Big Tree\" {{\n        self.mode = Mode::Off;\n{many_nodes}    }}"
+        "    #[bhav(label = \"Big Tree\")] fn big() {{\n        self.mode = Mode::Off;\n{many_nodes}    }}"
     ));
     let d = one(&source, "frame_headroom");
     assert!(d.message.contains("nodes"), "{d:?}");
-    assert_eq!(d.line, line_of(&source, "tree big"));
+    assert_eq!(d.line, line_of(&source, "fn big()"));
 
     let lets: String = (0..14)
         .map(|i| format!("        let v{i} = random(9);\n"))
         .collect();
     let sum: Vec<String> = (0..14).map(|i| format!("v{i}")).collect();
     let source = obj(&format!(
-        "    tree wide \"Wide Tree\" {{\n        self.mode = Mode::Off;\n{lets}        self.level = {};\n    }}",
+        "    #[bhav(label = \"Wide Tree\")] fn wide() {{\n        self.mode = Mode::Off;\n{lets}        self.level = {};\n    }}",
         sum.join(" + ")
     ));
     let d = one(&source, "frame_headroom");
@@ -1217,7 +1223,7 @@ fn big_trees_and_many_locals_are_flagged() {
 
     // Raw slots push the named locals up: the message says so.
     let source = obj(
-        "    tree wide \"Wide Tree\" {\n        self.mode = Mode::Off;\n        raw { local[11] := temp[0]; temp[1] := local[11]; }\n        let a = random(9);\n        self.level = a;\n    }",
+        "    #[bhav(label = \"Wide Tree\")] fn wide() {\n        self.mode = Mode::Off;\n        raw { local[11] := temp[0]; temp[1] := local[11]; }\n        let a = random(9);\n        self.level = a;\n    }",
     );
     let d = one(&source, "frame_headroom");
     assert!(
@@ -1231,19 +1237,19 @@ fn frame_headroom_points_at_the_tree_in_its_own_object() {
     // Two objects in one file, each with a tree labeled "Shared"; only the first is big.
     let many_nodes: String = (0..205).map(|_| "        self.level += 1;\n").collect();
     let big = obj(&format!(
-        "    @id(4200) tree shared \"Shared\" {{\n        self.mode = Mode::Off;\n{many_nodes}    }}"
+        "    #[bhav(id = 4200, label = \"Shared\")] fn shared() {{\n        self.mode = Mode::Off;\n{many_nodes}    }}"
     ));
-    let small = obj("    @id(4201) tree shared \"Shared\" {\n        self.mode = Mode::Off;\n        self.level += 1;\n    }")
+    let small = obj("    #[bhav(id = 4201, label = \"Shared\")] fn shared() {\n        self.mode = Mode::Off;\n        self.level += 1;\n    }")
         .replace("enum Mode { Off, Low, High }\n", "")
         .replace("Synth Probe", "Synth Probe Two")
         .replace("0x7E00_0100", "0x7E00_0101");
     let source = format!("{big}{small}");
     let d = one(&source, "frame_headroom");
     assert!(d.message.contains("tree 4200"), "{d:?}");
-    assert_eq!(d.line, line_of(&source, "@id(4200)"), "{d:?}");
+    assert_eq!(d.line, line_of(&source, "#[bhav(id = 4200"), "{d:?}");
     // Two unpinned trees sharing a label in one object: the object, not the wrong tree.
     let source = obj(&format!(
-        "    tree a \"Shared\" {{\n        self.mode = Mode::Off;\n    }}\n    tree b \"Shared\" {{\n        self.mode = Mode::Off;\n{many_nodes}    }}"
+        "    #[bhav(label = \"Shared\")] fn a() {{\n        self.mode = Mode::Off;\n    }}\n    #[bhav(label = \"Shared\")] fn b() {{\n        self.mode = Mode::Off;\n{many_nodes}    }}"
     ));
     let d = one(&source, "frame_headroom");
     assert_eq!(d.line, line_of(&source, "object \"Synth Probe\""), "{d:?}");
@@ -1347,7 +1353,7 @@ fn suggestions_spell_valid_v2() {
     // An operand that is itself a comparison keeps its parentheses.
     let d = one(
         &obj(
-            "    state on: bool;\n    tree probe \"Probe\" {\n        self.level = 0;\n        if !((temp[0] > 0) == self.on) { temp[1] = 1; } else { temp[1] = 2; }\n        temp[2] = 3;\n    }",
+            "    state on: bool;\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.level = 0;\n        if !((temp[0] > 0) == self.on) { temp[1] = 1; } else { temp[1] = 2; }\n        temp[2] = 3;\n    }",
         ),
         "negated_comparison",
     );
@@ -1496,7 +1502,7 @@ fn inline_guid_literals_in_bodies_are_flagged() {
     );
     none(
         &obj(
-            "    const OTHER = 0x7E00_0200;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        if stack_obj.is_type(OTHER) { self.level = 1; }\n    }",
+            "    const OTHER = 0x7E00_0200;\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        if stack_obj.is_type(OTHER) { self.level = 1; }\n    }",
         ),
         "magic_guid_literal",
     );
@@ -1581,7 +1587,7 @@ fn negated_comparisons_before_a_call_or_a_fault_are_fine() {
 fn plain_negation_is_fine() {
     none(
         &obj(
-            "    state on: bool;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        if !self.on { sleep(1); }\n        if !(self.on && self.level > 0) { sleep(1); }\n    }",
+            "    state on: bool;\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        self.level = 0;\n        if !self.on { sleep(1); }\n        if !(self.on && self.level > 0) { sleep(1); }\n    }",
         ),
         "negated_comparison",
     );

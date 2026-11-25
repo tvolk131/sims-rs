@@ -794,6 +794,41 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// One branch of an `if` / `match` expression: a value, or (in a `let` initializer's chain,
+    /// `may_diverge`) a `{ ..; return ..; }` block that leaves on every path, lowered as a
+    /// statement arm. It writes no value, so the binding is never read unset.
+    pub(super) fn value_arm<'e>(&self, e: &'e V2Expr, may_diverge: bool) -> Result<ArmBody<'e>> {
+        let V2Expr::Block { span, body } = e else {
+            return Ok(ArmBody::Value(e));
+        };
+        if !may_diverge {
+            return Err(Error::at(
+                *span,
+                "a diverging '{ ..; return ..; }' branch can only be a branch of 'let x = if ..' or 'let x = match ..'",
+            ));
+        }
+        // Raw code that may jump out (a `break`, a branch to a label or node) could reach the
+        // join without a value, so the leaving analysis cannot vouch for it.
+        let raw_jumps = super::specialize::stmts_any(body, &|s| {
+            matches!(s, V2Stmt::RawAir { code, .. }
+                if super::raw_facts::raw_facts(code, None).may_jump_out())
+        });
+        if raw_jumps {
+            return Err(Error::at(
+                *span,
+                "this branch yields no value, and its 'raw { .. }' code may jump out of it ('break', or a branch to a label or node), so it cannot be checked to leave; write the branch without raw jumps",
+            ));
+        }
+        if !stmts_unconditionally_diverge(body, self.env, &self.owner_module, self.in_object_scope)
+        {
+            return Err(Error::at(
+                *span,
+                "this branch yields no value, so it must leave on every path (end it with 'return', 'break' or 'continue')",
+            ));
+        }
+        Ok(ArmBody::Stmts(body))
+    }
+
     /// `if c { a } else { b }` as a value, written to `dest` (or a fresh local). The condition
     /// takes the `if` statement's paths: constant fold (the untaken branch is still checked),
     /// short-circuit `||` / `&&`, a simple test, or a `__cond` local.
@@ -804,7 +839,29 @@ impl<'a> TreeLowerer<'a> {
         then_value: &V2Expr,
         else_value: &V2Expr,
         dest: Option<&str>,
+        may_diverge: bool,
     ) -> Result<(String, ValueType)> {
+        let (dest, ty) = self.lower_if_expr_opt(cond, then_value, else_value, dest, may_diverge)?;
+        let ty = ty
+            .ok_or_else(|| Error::at(span, "'if' expression has no value (every branch leaves)"))?;
+        Ok((dest, ty))
+    }
+
+    /// [`Self::lower_if_expr`], with no type when every branch leaves (a nested chain of a
+    /// `let` initializer, whose enclosing chain has the value: `else if c { return 1; } else
+    /// { return 2; }`).
+    pub(super) fn lower_if_expr_opt(
+        &mut self,
+        cond: &V2Expr,
+        then_value: &V2Expr,
+        else_value: &V2Expr,
+        dest: Option<&str>,
+        may_diverge: bool,
+    ) -> Result<(String, Option<ValueType>)> {
+        let (then_b, else_b) = (
+            self.value_arm(then_value, may_diverge)?,
+            self.value_arm(else_value, may_diverge)?,
+        );
         let dest = match dest {
             Some(d) => d.to_owned(),
             None => {
@@ -817,8 +874,8 @@ impl<'a> TreeLowerer<'a> {
             dest: dest.clone(),
             ty: None,
             if_expr: true,
+            may_diverge,
         };
-        let (then_b, else_b) = (ArmBody::Value(then_value), ArmBody::Value(else_value));
         if let Some(const_b) = self
             .try_eval_const_bool(cond)
             .or_else(|| self.try_fold_literal_cond(cond))
@@ -852,19 +909,16 @@ impl<'a> TreeLowerer<'a> {
             r2?;
             self.line("}".to_owned());
         }
-        let ty = result
-            .ty
-            .ok_or_else(|| Error::at(span, "'if' expression has no value"))?;
-        Ok((dest, ty))
+        Ok((dest, result.ty))
     }
 
     /// Whether `if` bodies may sit inside a condition-free single-pass loop: nothing in them,
     /// or in what lowering adds, may `break` / `continue` an enclosing loop.
-    pub(super) fn single_pass_loop_ok(&self, bodies: &[&[V2Stmt]]) -> bool {
+    pub(super) fn single_pass_loop_ok(&self, bodies: &[ArmBody<'_>]) -> bool {
         self.active_inline_fn.is_none()
             && !self.in_defer()
             && self.enclosing_cancel_flag().is_none()
-            && !bodies.iter().any(|b| stmts_exit_loop(b))
+            && !bodies.iter().any(|&b| arm_exits_loop(b))
     }
 
     /// `if` on a flat `a || b || ..` or `a && b && ..` of simple conditions, without a `__cond`
@@ -892,7 +946,7 @@ impl<'a> TreeLowerer<'a> {
         flatten_logic_chain(cond, op, &mut leaves);
         let has_else = !matches!(else_body, ArmBody::Stmts(s) if s.is_empty());
         let looped = op == V2BinOp::Or || has_else;
-        if looped && !self.single_pass_loop_ok(&[arm_stmts(then_body), arm_stmts(else_body)]) {
+        if looped && !self.single_pass_loop_ok(&[then_body, else_body]) {
             return Ok(false);
         }
         let (mark, indent) = (self.em.mark(), self.em.depth());
