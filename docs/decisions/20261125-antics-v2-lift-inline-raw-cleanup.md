@@ -103,14 +103,14 @@ candidate entries (1,191 objects lifted, 0 timeouts) in each mode.
 | Identical / equivalent / inconclusive / omitted | 886 / 4,635 / 20,684 / 1 | 884 / 4,637 / 20,684 / 1 | 878 / 4,643 / 20,684 / 1 | 870 / 4,651 / 20,684 / 1 |
 | DIFFERENT | 0 | 0 | 0 | 0 |
 | Idiomatic / raw-fallback trees | 8,472 / 17,733 | 8,482 / 17,723 | 25,296 / 909 | 25,296 / 909 |
-| Inline `raw {}` statements | 7,580 | 3,694 | 78,794 | 29,997 |
-| `raw {}` blocks (inline and whole-tree) | 22,597 | 19,943 | 49,001 | 23,924 |
-| Lines inside `raw {}` blocks | 688,611 | 678,466 | 480,974 | 268,069 |
-| `bcon[N]` references | 36,235 | 4,602 | 25,785 | 4,870 |
+| Inline `raw {}` statements | 7,580 | 3,657 | 78,794 | 28,700 |
+| `raw {}` blocks (inline and whole-tree) | 22,597 | 19,918 | 49,001 | 23,216 |
+| Lines inside `raw {}` blocks | 688,611 | 678,326 | 480,974 | 255,898 |
+| `bcon[N]` references | 36,235 | 4,597 | 25,785 | 4,664 |
 | Files with `more_globals` | 862 | 105 | 862 | 105 |
-| Lines | 978,887 | 971,964 | 1,200,670 | 1,140,471 |
+| Lines | 978,887 | 971,896 | 1,200,670 | 1,138,150 |
 | fmt-dirty files | 0 | 0 | 0 | 0 |
-| Lint findings | 7 | 12 | 102 | 102 |
+| Lint findings | 7 | 12 | 102 | 100 |
 
 - **Verdicts.** Every inconclusive tree is still inconclusive for an object-level reason, as
   before. Two strict trees and eight behavioral trees move from identical to equivalent: they
@@ -118,12 +118,13 @@ candidate entries (1,191 objects lifted, 0 timeouts) in each mode.
 - **Lint.**
   - Strict: 5 more `negated_comparison` findings, from the 10 trees that now lift
     idiomatically. They come from the original's negated compare nodes, as in behavioral mode.
-  - Behavioral: the total is unchanged. One `frame_headroom` moves to one
-    `collapsible_if_chain`.
+  - Behavioral: 2 fewer `frame_headroom` findings.
 - **Library tables.** The remaining `bcon[N]` references are mostly library tables and
   labels `.air` reserves.
-- **Time.** Within noise (the host is shared). Summed per-file lift time is 679 s → 717 s
-  strict and 732 s → 938 s behavioral. Run alone, the slowest file took 14 s.
+- **Time.** Wall time with 10 workers is 76 s → 83 s strict and 85 s → 109 s behavioral.
+  Summed per-file time is 679 s → 754 s and 732 s → 952 s. The after runs were measured on a
+  shared host with a load average near 77, so part of this is load. Part is real: the new
+  fallback steps can cost a tree extra rounds. Run alone, the slowest file took 14 s.
 
 ## Follow-ups
 
