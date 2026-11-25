@@ -47,6 +47,6 @@ backlog of what is still to mine.
 The remaining crates' `Cargo.toml` files still name the removed crates as
 dependencies. That doesn't matter, because nothing here is built.
 
-`fixtures/suites/` holds the suite manifests of the removed `sims-runtime`
-conformance runner (`legacy-final:crates/sims-runtime/src/conformance/`).
-Nothing reads them now.
+The suite manifests of the removed `sims-runtime` conformance runner,
+`fixtures/suites/`, were removed on 2026-11-25 because nothing read them.
+They are at `legacy-final:fixtures/suites/`.

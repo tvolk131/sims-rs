@@ -38,6 +38,16 @@ use sims_sim::{Object, World};
 /// modeled.
 pub const TURN_BUDGET: usize = 100_000;
 
+/// How deeply creations may nest: a new object's Init or first turn may
+/// make another object, whose own may make another, this many deep. The
+/// next creation faults before it registers anything, so an object that
+/// makes copies of itself faults at once rather than nesting until the
+/// lot runs out of object IDs (32,767), which overflows the stack first.
+/// The original's own behaviour for nested creation is not known, and is
+/// not modeled; the bound keeps every nesting within a default 2 MiB
+/// test thread's stack in a debug build.
+pub const MAX_CREATION_DEPTH: u16 = 16;
+
 /// Where a new object stands until something places it: off the lot, on
 /// level 1.
 const OFF_LOT: [i32; 3] = [-16, -16, 1];
@@ -152,12 +162,34 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    /// This interpreter one creation deeper, to run a new object's Init
+    /// and first turn with, or a fault (object 0, before anything is
+    /// registered) once creations nest [`MAX_CREATION_DEPTH`] deep.
+    pub(crate) fn creating(&self, guid: u32) -> Result<Self, Fault> {
+        if self.creation_depth >= MAX_CREATION_DEPTH {
+            return Err(Fault {
+                object: 0,
+                at: None,
+                trap: Trap::Unsupported(format!(
+                    "creating an object of type 0x{guid:08X} inside {MAX_CREATION_DEPTH} \
+                     nested creations (each a new object's Init or first turn making the \
+                     next); the original's limit is not modeled"
+                )),
+            });
+        }
+        Ok(Self {
+            creation_depth: self.creation_depth + 1,
+            ..*self
+        })
+    }
+
     fn create_single(&self, world: &mut World, guid: u32) -> Result<u16, Fault> {
         let fail = |object, trap| Fault {
             object,
             at: None,
             trap,
         };
+        let inner = self.creating(guid)?;
         let id = (1..=i16::MAX as u16)
             .find(|id| !world.objects.contains_key(id))
             .ok_or_else(|| fail(0, Trap::Unsupported("no unused object ID".into())))?;
@@ -170,9 +202,9 @@ impl Interpreter<'_> {
             .and_then(|run_init| machine.install_main().map(|()| run_init))
             .map_err(|trap| fail(id, trap))?;
         if run_init {
-            self.init(world, id)?;
+            inner.init(world, id)?;
         }
-        self.turn(world, id, TURN_BUDGET)?;
+        inner.turn(world, id, TURN_BUDGET)?;
         self.machine(world, id, 0, false)
             .finish(words)
             .map_err(|trap| fail(id, trap))?;
