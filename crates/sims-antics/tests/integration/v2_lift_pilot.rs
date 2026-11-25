@@ -814,7 +814,7 @@ fn lifts_sim_attributes_data_container_and_personality() {
     let lifted = round_trip(&iff, &DecompileV2Options::default());
     for spelling in [
         "sim.attr[3] = 1;",
-        "sim.data[4] = sim.attr[3];",
+        "sim.allowed_heights = sim.attr[3];",
         "temp[2] = sim.container;",
         "sim.personality.nice = sim.personality.active;",
         "sim.personality.playful = sim.personality.outgoing;",
@@ -846,9 +846,9 @@ fn lifts_handle_flags_and_preserves_numeric_flag_operations() {
         "stack_obj.flags = self.flags;",
         "if stack_obj.flags.is_empty() {",
         "self.flags = stack_obj.flags;",
-        "stack_obj.data[8] flag_set 13;",
-        "stack_obj.data[8] flag_test 13",
-        "stack_obj.data[8] flag_clear 13;",
+        "stack_obj.flags flag_set 13;",
+        "stack_obj.flags flag_test 13",
+        "stack_obj.flags flag_clear 13;",
     ] {
         assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
     }
