@@ -268,13 +268,15 @@ pub fn decompile_iff_to_v2_report(
                 // An extra idiom is turned off before anything is lowered: it may be what
                 // clashes with the rest of the tree.
                 let unblamed = tree.is_none()
-                    && (plan.drop_all_wave2(&generated)
+                    && (plan.drop_all_wave3(&generated)
+                        || plan.drop_all_wave2(&generated)
                         || plan.drop_all_extras(&generated)
                         || plan.number_all_raw_bcons(&generated));
                 if !unblamed
                     && !tree.is_some_and(|id| plan.add_frame(&model, id))
                     && !tree.is_some_and(|id| plan.keep_temps_raw(id, &generated))
                     && !tree.is_some_and(|id| plan.unmerge(id, &generated))
+                    && !tree.is_some_and(|id| plan.drop_wave3(id, &generated))
                     && !tree.is_some_and(|id| plan.drop_wave2(id, &generated))
                     && !tree.is_some_and(|id| plan.name_builtin_locals_only(id, &generated))
                     && !tree.is_some_and(|id| plan.drop_inherit(&model, id))
@@ -309,7 +311,8 @@ pub fn decompile_iff_to_v2_report(
                         handled
                     }
                     None => {
-                        plan.drop_all_wave2(&generated)
+                        plan.drop_all_wave3(&generated)
+                            || plan.drop_all_wave2(&generated)
                             || plan.drop_all_extras(&generated)
                             || plan.number_all_raw_bcons(&generated)
                             || plan.lower_all(&model)
@@ -332,6 +335,7 @@ pub fn decompile_iff_to_v2_report(
                         changed |= plan.keep_temps_raw(id, &generated)
                             || plan.fix_locals(id)
                             || plan.unmerge(id, &generated)
+                            || plan.drop_wave3(id, &generated)
                             || plan.drop_wave2(id, &generated)
                             || plan.name_builtin_locals_only(id, &generated)
                             || plan.drop_inherit(&model, id)
@@ -349,6 +353,7 @@ pub fn decompile_iff_to_v2_report(
                     (recompiled, checks, &unproven),
                     &mut cache,
                 );
+                let text = model.lint_spellings(text, &recompiled);
                 let source = format_v2_source(&text)?;
                 let mut trees: Vec<DecompiledTree> = model
                     .trees
@@ -455,6 +460,252 @@ fn keep_fixes(
     kept.extend(keep_fixes(b, ok));
     kept
 }
+
+/// A lint wave 3 suggestion (`untyped_engine_constant`, `prefer_method_syntax`,
+/// `prefer_question_mark`): bytes `start..end` of the text become `text`, with the `use`
+/// line it needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LintSpelling {
+    start: usize,
+    end: usize,
+    text: String,
+    import: Option<String>,
+}
+
+/// The lint's suggestions for the three spelling rules in `text`, each with the source range
+/// it replaces, read back from where the finding points. A finding whose range does not read
+/// back as the rule's shape is left out. Empty when the text does not lint.
+fn lint_spellings(text: &str) -> Vec<LintSpelling> {
+    use crate::v2::lint::{PREFER_METHOD_SYNTAX, PREFER_QUESTION_MARK, UNTYPED_ENGINE_CONSTANT};
+    let Ok(diags) = crate::v2::lint::lint_v2_source(text, "decompiled.antics") else {
+        return Vec::new();
+    };
+    let mut line_starts = vec![0];
+    line_starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
+    let mut out = Vec::new();
+    for d in diags {
+        let Some(suggestion) = d.suggestion.clone() else {
+            continue;
+        };
+        let Some(start) = d
+            .line
+            .checked_sub(1)
+            .and_then(|l| line_starts.get(l))
+            .and_then(|&l| Some(l + d.column.checked_sub(1)?))
+            .filter(|&s| text.is_char_boundary(s))
+        else {
+            continue;
+        };
+        let rest = &text[start..];
+        let end = match d.rule {
+            UNTYPED_ENGINE_CONSTANT => {
+                // The message quotes the literal: `3` is bit 3 of ..
+                let quoted = d.message.split('`').nth(1).unwrap_or_default();
+                let len = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                if quoted.is_empty()
+                    || &rest[..len] != quoted
+                    || !quoted.starts_with(|c: char| c.is_ascii_digit())
+                {
+                    continue;
+                }
+                start + len
+            }
+            PREFER_METHOD_SYNTAX => {
+                let name = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                if name == 0 || !rest[name..].starts_with('(') {
+                    continue;
+                }
+                let Some(end) = group_end(text, start + name) else {
+                    continue;
+                };
+                end
+            }
+            PREFER_QUESTION_MARK => {
+                let Some(end) = question_mark_end(text, start, &suggestion) else {
+                    continue;
+                };
+                end
+            }
+            _ => continue,
+        };
+        // `.. and add `use std::flags::ObjectFlags;`; it builds ..`
+        let import = d.help.as_deref().and_then(|h| {
+            let (_, after) = h.split_once("add `")?;
+            let line = after.split('`').next()?;
+            line.starts_with("use std::").then(|| line.to_owned())
+        });
+        out.push(LintSpelling {
+            start,
+            end,
+            text: suggestion,
+            import,
+        });
+    }
+    out.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+    // Overlapping edits (a `refresh` constant inside the call's method form): the outer one
+    // first; the inner one is found again on the next pass.
+    let mut last_end = 0;
+    out.retain(|f| {
+        let keep = f.start >= last_end;
+        if keep {
+            last_end = f.end;
+        }
+        keep
+    });
+    out
+}
+
+/// The end of the `if` statement at `start` that lint `prefer_question_mark` rewrites to
+/// `suggestion` (`f(..)?;`): `if !f(..) { return error; }`, or
+/// `if f(..) {} else { return error; }`. `None` when the text is not that statement.
+fn question_mark_end(text: &str, start: usize, suggestion: &str) -> Option<usize> {
+    let call = suggestion.strip_suffix("?;")?;
+    let rest = text.get(start..)?.strip_prefix("if ")?;
+    let (negated, rest) = match rest.strip_prefix('!') {
+        Some(r) => (true, r),
+        None => (false, rest),
+    };
+    let rest = rest.strip_prefix(call)?;
+    let mut at = text.len() - rest.len();
+    at += rest.len() - rest.trim_start().len();
+    if !text[at..].starts_with('{') {
+        return None;
+    }
+    let then_end = group_end(text, at)?;
+    let then_body = text[at + 1..then_end - 1].trim();
+    if negated {
+        return (then_body == "return error;").then_some(then_end);
+    }
+    if !then_body.is_empty() {
+        return None;
+    }
+    let after = &text[then_end..];
+    let at = then_end + (after.len() - after.trim_start().len());
+    let rest = text[at..].strip_prefix("else")?;
+    let at = text.len() - rest.len();
+    let at = at + (rest.len() - rest.trim_start().len());
+    if !text[at..].starts_with('{') {
+        return None;
+    }
+    let end = group_end(text, at)?;
+    (text[at + 1..end - 1].trim() == "return error;").then_some(end)
+}
+
+/// The end of the bracketed group opening at `open` (`(`, `[` or `{`), past string literals.
+/// `None` when it does not close, or a comment is inside.
+fn group_end(text: &str, open: usize) -> Option<usize> {
+    let b = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < b.len() {
+        match b[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += usize::from(b[i] == b'\\') + 1;
+                }
+            }
+            b'/' if matches!(b.get(i + 1), Some(b'/' | b'*')) => return None,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `text` with `fixes` applied (right to left) and their `use` lines added at the top.
+fn apply_lint_spellings(text: &str, fixes: &[LintSpelling]) -> String {
+    let mut out = text.to_owned();
+    let mut sorted: Vec<&LintSpelling> = fixes.iter().collect();
+    sorted.sort_by_key(|f| std::cmp::Reverse(f.start));
+    for f in sorted {
+        out.replace_range(f.start..f.end, &f.text);
+    }
+    let imports: BTreeSet<&str> = fixes.iter().filter_map(|f| f.import.as_deref()).collect();
+    if imports.is_empty() {
+        return out;
+    }
+    insert_imports(&out, imports)
+}
+
+/// `text` with `imports` joined to its `use` block: the one after the header comments, made
+/// when there is none. The block is sorted and holds each line once.
+fn insert_imports(text: &str, imports: BTreeSet<&str>) -> String {
+    let header: usize = text
+        .split_inclusive('\n')
+        .take_while(|l| l.starts_with("//"))
+        .map(str::len)
+        .sum();
+    let rest = &text[header..];
+    let block = header + rest.len() - rest.trim_start_matches('\n').len();
+    let mut uses: BTreeSet<&str> = imports;
+    let mut end = block;
+    for line in text[block..].split_inclusive('\n') {
+        let l = line.trim_end();
+        if !(l.starts_with("use ") && l.ends_with(';')) {
+            break;
+        }
+        uses.insert(l);
+        end += line.len();
+    }
+    let mut out = text[..header].to_owned();
+    if header > 0 {
+        out.push('\n');
+    }
+    for line in uses {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !text[end..].starts_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&text[end..]);
+    out
+}
+
+/// The largest run of `fixes` found to pass `ok` together: each part joins what is kept only
+/// if `ok` holds for both, and a part that does not is split in halves. At most `budget`
+/// calls of `ok`.
+fn keep_joint<T: Clone>(fixes: &[T], ok: &dyn Fn(&[T]) -> bool, budget: usize) -> Vec<T> {
+    fn go<T: Clone>(kept: &mut Vec<T>, part: &[T], ok: &dyn Fn(&[T]) -> bool, budget: &mut usize) {
+        if part.is_empty() || *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        let mut trial = kept.clone();
+        trial.extend_from_slice(part);
+        if ok(&trial) {
+            *kept = trial;
+            return;
+        }
+        if part.len() > 1 {
+            let (a, b) = part.split_at(part.len() / 2);
+            go(kept, a, ok, budget);
+            go(kept, b, ok, budget);
+        }
+    }
+    let mut kept = Vec::new();
+    let mut budget = budget;
+    go(&mut kept, fixes, ok, &mut budget);
+    kept
+}
+
+/// The most passes [`Model::lint_spellings`] makes over a file.
+const LINT_SPELLING_PASSES: usize = 3;
+
+/// The most builds one pass of [`Model::lint_spellings`] may take.
+const LINT_SPELLING_BUILDS: usize = 24;
 
 // ---------------------------------------------------------------------------------------
 // Model: what the file holds
@@ -1313,6 +1564,31 @@ impl Model {
         };
         let left: Vec<EngineFieldFix> = fixes.into_iter().filter(|f| !kept.contains(f)).collect();
         (allow_engine_fields(&base, &left), recompiled, checks)
+    }
+
+    /// The final `text` with lint wave 3's spellings written: typed `std` constants
+    /// (`untyped_engine_constant`), method forms (`prefer_method_syntax`) and `?`
+    /// (`prefer_question_mark`). The lint proposes each only when the file builds to the same
+    /// bytes with it; they are taken together only when the object still builds to the
+    /// bytes of `recompiled`, so every check stands. A pass may uncover more (a constant
+    /// inside a call written as a method), so it runs again, a few times at most.
+    fn lint_spellings(&self, mut text: String, recompiled: &RecompiledFile) -> String {
+        for _ in 0..LINT_SPELLING_PASSES {
+            let fixes = lint_spellings(&text);
+            if fixes.is_empty() {
+                break;
+            }
+            let same = |fixes: &[LintSpelling]| {
+                self.compile(&apply_lint_spellings(&text, fixes))
+                    .is_ok_and(|r| r.iff_bytes == recompiled.iff_bytes)
+            };
+            let kept = keep_joint(&fixes, &same, LINT_SPELLING_BUILDS);
+            if kept.is_empty() {
+                break;
+            }
+            text = apply_lint_spellings(&text, &kept);
+        }
+        text
     }
 
     /// Why tree `t`, proven by its code, still may not behave the same in the rebuilt
@@ -2682,8 +2958,9 @@ fn library_bcon_name(addr: u16) -> Option<String> {
     }
 }
 
-/// Whether a body reads mostly the Sim (`my.motive`, `my.person`) and the object as the
-/// stack object (`stack.attr`), as interaction trees do.
+/// Whether a body reads mostly the Sim (`my.motive`, `my.person`, `my.person[temp]`) and
+/// the object as the stack object (`stack.attr`), as interaction trees do. Only a Sim tree
+/// names `my.person[temp[k]]` (`sim.person[temp[k]]`).
 fn prefers_sim_context(body: &[Stmt]) -> bool {
     let (mut sim, mut obj) = (0usize, 0usize);
     walk_stmts(body, &mut |s| {
@@ -2692,7 +2969,7 @@ fn prefers_sim_context(body: &[Stmt]) -> bool {
                 match (o.scope, o.index) {
                     // `my.id` is `sim` in one context and `self` in the other.
                     (3, 11) => {}
-                    (1 | 14 | 16 | 18, _) => sim += 1,
+                    (1 | 14 | 16 | 18 | 30, _) => sim += 1,
                     (0 | 3, _) => obj += 1,
                     _ => {}
                 }
@@ -3285,8 +3562,9 @@ fn call_params(arity: usize) -> impl Iterator<Item = String> {
 }
 
 /// The highest slot that needs a named declaration for a primitive's local arguments;
-/// `wave2` adds the operands only the wave 2 spellings name (see [`Translator::wave2`]).
-fn builtin_local(s: &Stmt, wave2: bool) -> Option<u16> {
+/// `wave2` adds the operands only the wave 2 spellings name (see [`Translator::wave2`]),
+/// and `wave3` (which implies `wave2`) those only the wave 3 ones name.
+fn builtin_local(s: &Stmt, wave2: bool, wave3: bool) -> Option<u16> {
     let prim = match s {
         Stmt::Primitive {
             prim,
@@ -3363,6 +3641,13 @@ fn builtin_local(s: &Stmt, wave2: bool) -> Option<u16> {
             icon_local: LocalRef::Index(i),
             ..
         } if flags & 0x03 == 0x01 && wave2 => Some(u16::from(*i)),
+        // Skin, age and sex are read from locals.
+        PrimitiveCall::MakeNewCharacter {
+            skin: LocalRef::Index(skin),
+            age: LocalRef::Index(age),
+            sex: LocalRef::Index(sex),
+            species,
+        } if *species <= 2 && wave3 => [skin, age, sex].into_iter().copied().max().map(u16::from),
         _ => None,
     }
 }
@@ -3442,6 +3727,9 @@ struct Plan {
     /// Trees written without the wave 2 spellings (see [`Translator::wave2`]), after a round
     /// that used them did not compile or was not proven.
     pre_wave2: BTreeSet<u16>,
+    /// Trees written without the wave 3 spellings (see [`Translator::wave3`]), after a round
+    /// that used them did not compile or was not proven.
+    pre_wave3: BTreeSet<u16>,
     /// Trees that keep the original's locals, after a round with more (see
     /// [`Plan::grow_locals`]) was not proven: a dialog's `$Local` tokens read the frame, so
     /// the idiom that needed the words goes raw instead.
@@ -3529,6 +3817,7 @@ impl Plan {
             unmerged: BTreeSet::new(),
             temps_raw: BTreeSet::new(),
             pre_wave2: BTreeSet::new(),
+            pre_wave3: BTreeSet::new(),
             fixed_locals: BTreeSet::new(),
         }
     }
@@ -3601,6 +3890,7 @@ impl Plan {
             || self.add_frame(model, id)
             || self.keep_temps_raw(id, generated)
             || self.unmerge(id, generated)
+            || self.drop_wave3(id, generated)
             || self.drop_wave2(id, generated)
             || self.name_builtin_locals_only(id, generated)
             || self.drop_inherit(model, id)
@@ -3660,6 +3950,22 @@ impl Plan {
         if changed {
             self.locals.remove(&id);
             self.fixed_locals.insert(id);
+        }
+        changed
+    }
+
+    /// Writes tree `id` without the wave 3 spellings from now on, when the last round used
+    /// them. `false` when it did not. Tried before the wave 2 spellings are dropped, so a
+    /// wave 3 spelling that breaks a tree costs it no more than the wave 3 spellings.
+    fn drop_wave3(&mut self, id: u16, generated: &Generated) -> bool {
+        generated.wave3.contains(&id) && self.pre_wave3.insert(id)
+    }
+
+    /// [`Self::drop_wave3`] for every tree, for a failure no one tree is blamed for.
+    fn drop_all_wave3(&mut self, generated: &Generated) -> bool {
+        let mut changed = false;
+        for &id in &generated.wave3 {
+            changed |= self.drop_wave3(id, generated);
         }
         changed
     }
@@ -3905,6 +4211,8 @@ struct Generated {
     temps_named: BTreeSet<u16>,
     /// Trees that wrote a wave 2 spelling (see [`Plan::drop_wave2`]).
     wave2: BTreeSet<u16>,
+    /// Trees that wrote a wave 3 spelling (see [`Plan::drop_wave3`]).
+    wave3: BTreeSet<u16>,
     /// Raw-level trees whose lines name BCON entries.
     raw_bcons_named: BTreeSet<u16>,
     /// 0-based lines holding the `variant` members.
@@ -3944,6 +4252,7 @@ impl Model {
         let mut merged = BTreeSet::new();
         let mut temps_named = BTreeSet::new();
         let mut wave2_trees = BTreeSet::new();
+        let mut wave3_trees = BTreeSet::new();
         let mut raw_bcons_named = BTreeSet::new();
         out.line("// Decompiled by `sims-antics lift --v2`.");
         if self.behavioral {
@@ -4185,11 +4494,18 @@ impl Model {
                     if as_lifecycle.is_none() && !plan.plain.contains(&t.id) {
                         let mut builtin_locals = 0;
                         let wave2 = !plan.pre_wave2.contains(&t.id);
+                        let wave3 = wave2 && !plan.pre_wave3.contains(&t.id);
                         walk_stmts(body, &mut |s| {
-                            let local = builtin_local(s, wave2);
-                            // A local only a wave 2 spelling names is that spelling's, even
-                            // when the spelling is not written: `drop_wave2` drops the pin.
-                            if wave2 && local != builtin_local(s, false) {
+                            let local = builtin_local(s, wave2, wave3);
+                            // A local only a wave 2 (wave 3) spelling names is that
+                            // spelling's, even when the spelling is not written:
+                            // `drop_wave2` (`drop_wave3`) drops the pin.
+                            if wave3 && local != builtin_local(s, wave2, false) {
+                                wave3_trees.insert(t.id);
+                            }
+                            if wave2
+                                && builtin_local(s, wave2, false) != builtin_local(s, false, false)
+                            {
                                 wave2_trees.insert(t.id);
                             }
                             if let Some(index) = local
@@ -4236,6 +4552,7 @@ impl Model {
                         merged: false,
                         temps_named: std::cell::Cell::new(false),
                         wave2_used: std::cell::Cell::new(false),
+                        wave3_used: std::cell::Cell::new(false),
                         stack_moves: sim && assigns_stack_obj(body),
                     };
                     if named_locals > 0 && tr.extra() {
@@ -4266,6 +4583,9 @@ impl Model {
                     }
                     if tr.wave2_used.get() {
                         wave2_trees.insert(t.id);
+                    }
+                    if tr.wave3_used.get() {
+                        wave3_trees.insert(t.id);
                     }
                 }
                 _ => {
@@ -4350,6 +4670,7 @@ impl Model {
             merged,
             temps_named,
             wave2: wave2_trees,
+            wave3: wave3_trees,
             raw_bcons_named,
             variant_lines,
             strings_lines,
@@ -4594,10 +4915,27 @@ struct Translator<'a> {
     temps_named: std::cell::Cell<bool>,
     /// Whether a wave 2 spelling was written (see [`Translator::wave2`]).
     wave2_used: std::cell::Cell<bool>,
+    /// Whether a wave 3 spelling was written (see [`Translator::wave3`]).
+    wave3_used: std::cell::Cell<bool>,
     /// A Sim tree that assigns `stack_obj`: the stack object's cells are written
     /// `stack_obj.attr[i]` / `stack_obj.slot[i]` (the same operands), since `self` would
     /// name another object after the assignment (lint `stack_obj_clobber_after_self`).
     stack_moves: bool,
+}
+
+/// The person word `fame` names.
+const FAME: i16 = 81;
+
+/// Clear Motive Changes' operands (opcode 29), as the lowering writes them.
+const CLEAR_MOTIVE_CHANGES: [u8; 8] = [0, 0, 0, 1, 0, 0, 0, 0];
+
+/// PR I-4's `padN: 0xNN` options: one per operand byte that differs from what the call
+/// writes without them, in byte order.
+fn pad_options(operands: &[u8; 8], base: &[u8; 8]) -> Vec<String> {
+    (0..8)
+        .filter(|&i| operands[i] != base[i])
+        .map(|i| format!("pad{i}: {:#04x}", operands[i]))
+        .collect()
 }
 
 impl Translator<'_> {
@@ -4626,6 +4964,18 @@ impl Translator<'_> {
             return false;
         }
         self.wave2_used.set(true);
+        true
+    }
+
+    /// Whether this tree may use the wave 3 spellings (the temp-indexed, neighbor and
+    /// advertisement cells PR I-4 named), noting that one is written. They sit under the
+    /// wave 2 switch: a tree one of them breaks is written without them
+    /// ([`Plan::drop_wave3`]) before it loses the wave 2 spellings.
+    fn wave3(&self) -> bool {
+        if self.plan.pre_wave3.contains(&self.tree.id) || !self.wave2() {
+            return false;
+        }
+        self.wave3_used.set(true);
         true
     }
 
@@ -4825,22 +5175,42 @@ impl Translator<'_> {
                 self.flush_raw(out);
                 // A primitive whose true branch is itself: the original's own loop (a
                 // breakpoint trap, for one), which runs until the VM errors the object out.
-                let allow = if let [
-                    Stmt::Primitive {
-                        prim,
-                        branches: None,
-                        ..
-                    },
-                ] = body.as_slice()
-                {
-                    out.line(if matches!(unpadded(prim), PrimitiveCall::Breakpoint { .. }) {
-                        "// antics-lint: allow(unbounded_loop_without_yield): the original's breakpoint loops on itself"
-                    } else {
-                        "// antics-lint: allow(unbounded_loop_without_yield): the original's node loops on itself"
-                    });
-                    Some(out.lines.len() - 1)
-                } else {
-                    None
+                // A comparison with both branches back to itself (`if dec_gt(..) {}`) loops
+                // the same way; a comparison never yields.
+                let self_compare = |c: &Condition| match c {
+                    Condition::Compare { .. } => true,
+                    Condition::Not(c) => matches!(c.as_ref(), Condition::Compare { .. }),
+                    _ => false,
+                };
+                let allow = match body.as_slice() {
+                    [
+                        Stmt::Primitive {
+                            prim,
+                            branches: None,
+                            ..
+                        },
+                    ] => {
+                        out.line(if matches!(unpadded(prim), PrimitiveCall::Breakpoint { .. }) {
+                            "// antics-lint: allow(unbounded_loop_without_yield): the original's breakpoint loops on itself"
+                        } else {
+                            "// antics-lint: allow(unbounded_loop_without_yield): the original's node loops on itself"
+                        });
+                        Some(out.lines.len() - 1)
+                    }
+                    [
+                        Stmt::If {
+                            cond,
+                            then_body,
+                            else_body,
+                            ..
+                        },
+                    ] if then_body.is_empty() && else_body.is_empty() && self_compare(cond) => {
+                        out.line(
+                            "// antics-lint: allow(unbounded_loop_without_yield): the original's node loops on itself",
+                        );
+                        Some(out.lines.len() - 1)
+                    }
+                    _ => None,
                 };
                 let start = out.lines.len();
                 out.line("loop {");
@@ -6130,12 +6500,11 @@ impl Translator<'_> {
                 let obj = self.rvalue(object)?;
                 let receiver = if self.sim && obj == "stack_obj" && !self.stack_moves {
                     "self".to_owned()
-                } else if let Some(base) = obj
-                    .strip_suffix(".data[11]")
-                    .filter(|b| *b == "self" || (self.sim && *b == "sim"))
-                {
+                } else if let Some(base) = obj.strip_suffix(".data[11]").filter(|b| {
+                    *b == "self" || (self.sim && *b == "sim") || (self.inherit && *b == "me")
+                }) {
                     // Object data word 11 is the object's id; `.is_type` needs it typed as a
-                    // handle, which only the `.id` spelling gives.
+                    // handle, which only the `.id` spelling gives (`me.id` in an inherit tree).
                     format!("{base}.id")
                 } else if let Some(base) = obj
                     .strip_suffix(".data[2]")
@@ -6238,9 +6607,31 @@ impl Translator<'_> {
             PrimitiveCall::Padded { call, pad } => match call.as_ref() {
                 PrimitiveCall::PlaySound { sound_id, flags } => {
                     let [lo, hi] = sound_id.to_le_bytes();
-                    let operands =
-                        apply_operand_pad(23, [lo, hi, 0, 0, *flags, 0, 0, 0], pad).ok()?;
-                    self.play_sound(*sound_id, operands[4])
+                    let base = [lo, hi, 0, 0, *flags, 0, 0, 0];
+                    let operands = apply_operand_pad(23, base, pad).ok()?;
+                    let text = self.play_sound(*sound_id, operands[4])?;
+                    // PR I-4's `padN:` spells the bytes the call's arguments do not (0, 1
+                    // and 4 are the sound and the flags).
+                    let pads = pad_options(&operands, &[lo, hi, 0, 0, operands[4], 0, 0, 0]);
+                    if operands[..2] != [lo, hi] {
+                        return None;
+                    }
+                    // Without them, the pad covers only bytes the VM reads no differently.
+                    if pads.is_empty() || !self.wave3() {
+                        return Some(text);
+                    }
+                    let text = text.strip_suffix(')')?;
+                    let sep = if text.ends_with('(') { "" } else { ", " };
+                    Some(format!("{text}{sep}{})", pads.join(", ")))
+                }
+                PrimitiveCall::ClearMotiveChanges => {
+                    let operands = apply_operand_pad(29, CLEAR_MOTIVE_CHANGES, pad).ok()?;
+                    let pads = pad_options(&operands, &CLEAR_MOTIVE_CHANGES);
+                    if !pads.is_empty() && self.wave2() && self.wave3() {
+                        return Some(format!("clear_motive_changes({})", pads.join(", ")));
+                    }
+                    self.builtin(p)
+                        .or_else(|| self.extra().then(|| self.prim_stmt(call)).flatten())
                 }
                 PrimitiveCall::StopAllSounds { .. } if self.extra() => self.prim_stmt(call),
                 // The pad covers only bytes the VM reads no differently.
@@ -6490,6 +6881,38 @@ impl Translator<'_> {
                 src: SlotSpec::Literal(src),
                 dst: SlotSpec::Literal(dst),
             } => format!("drop_onto(src: {src}, dst: {dst})"),
+            // PR I-4: a slot read from a tree parameter.
+            PrimitiveCall::DropOnto { src, dst } if self.wave3() => format!(
+                "drop_onto(src: {}, dst: {})",
+                self.slot_spec(src)?,
+                self.slot_spec(dst)?
+            ),
+            // PR I-4: mode 1 reads the slot from a parameter; the others read none (an
+            // omitted `slot:` encodes parameter 0).
+            PrimitiveCall::Reach {
+                mode,
+                moves,
+                slot_param,
+            } if self.wave3() => match (*mode, *slot_param) {
+                (1, p) => format!(
+                    "reach(mode: 1, moves: {moves}, slot: {})",
+                    self.param_slot(p)?
+                ),
+                (m, 0) => format!("reach(mode: {m}, moves: {moves})"),
+                _ => return None,
+            },
+            // PR I-4: skin, age and sex are read from `i16` locals.
+            PrimitiveCall::MakeNewCharacter {
+                skin: LocalRef::Index(skin),
+                age: LocalRef::Index(age),
+                sex: LocalRef::Index(sex),
+                species,
+            } if *species <= 2 && self.wave3() => format!(
+                "make_new_character(skin: {}, age: {}, sex: {}, species: {species})",
+                self.local_name(u16::from(*skin))?,
+                self.local_name(u16::from(*age))?,
+                self.local_name(u16::from(*sex))?
+            ),
             PrimitiveCall::FindLocation {
                 mode,
                 flags,
@@ -6638,6 +7061,20 @@ impl Translator<'_> {
         format!("{prim}({slot}{flags}{extra})")
     }
 
+    /// A slot operand of `drop_onto`: a number, or the tree parameter that holds it.
+    fn slot_spec(&self, spec: &SlotSpec) -> Option<String> {
+        match spec {
+            SlotSpec::Literal(n) => Some(n.to_string()),
+            SlotSpec::Param(p) => self.param_slot(*p),
+        }
+    }
+
+    /// `param[p]`, which a slot argument reads by index. Inside an animation handler too:
+    /// the argument names the parameter by index, not the handler's `event` binding.
+    fn param_slot(&self, p: i16) -> Option<String> {
+        (p >= 0).then(|| format!("param[{p}]"))
+    }
+
     fn local_name(&self, slot: u16) -> Option<String> {
         (slot < self.named_locals && self.extra()).then(|| format!("slot_{slot}"))
     }
@@ -6689,6 +7126,36 @@ impl Translator<'_> {
             19 if o.index == 65 && self.person_binding().is_some() => {
                 Some(format!("{}.kind", self.person_binding()?))
             }
+            // The stack object's neighborhood record, read-only: its fields (24) and its
+            // person's words (32).
+            24 | 32
+                if (0..=if o.scope == 24 { 9 } else { 255 }).contains(&o.index)
+                    && self.neighbor_handle().is_some()
+                    && self.wave3() =>
+            {
+                let handle = self.neighbor_handle()?;
+                // The `i16` cells PR I-4 names (the `ObjectId`, `bool` and enum ones would
+                // type their uses differently).
+                let name = match (o.scope, o.index) {
+                    (24, 2) => Some("age"),
+                    (24, 5) => Some("friend_count"),
+                    (24, 6) => Some("family_house"),
+                    (24, 9) => Some("family_friend_count"),
+                    (32, 0) => Some("posture"),
+                    (32, 34) => Some("pets_outside"),
+                    (32, 56) => Some("job_type"),
+                    (32, 57) => Some("job_level"),
+                    (32, 61) => Some("family"),
+                    (32, 77) => Some("date_partner"),
+                    (32, FAME) => Some("fame"),
+                    _ => None,
+                };
+                Some(match name {
+                    Some(name) => format!("{handle}.neighbor.{name}"),
+                    None if o.scope == 24 => format!("{handle}.neighbor.field[{}]", o.index),
+                    None => format!("{handle}.neighbor.person[{}]", o.index),
+                })
+            }
             _ => self.lvalue(r),
         }
     }
@@ -6699,6 +7166,28 @@ impl Translator<'_> {
     /// stack object.
     fn definition_handle(&self) -> Option<&'static str> {
         if self.cursor.is_some() {
+            return None;
+        }
+        Some(if self.sim && !self.inherit && !self.stack_moves {
+            "self"
+        } else {
+            "stack_obj"
+        })
+    }
+
+    /// The handle the stack object's neighborhood record is read through: the cursor
+    /// binding inside a `for` loop whose cursor is `stack_obj`, else [`Self::stack_handle`].
+    fn neighbor_handle(&self) -> Option<&str> {
+        match &self.cursor {
+            Some(c) => Some(c),
+            None => self.stack_handle(),
+        }
+    }
+
+    /// The handle the stack object's cells are read through in place, outside cursor and
+    /// Sim loops: `stack_obj`, or `self` in a Sim tree that never moves the stack object.
+    fn stack_handle(&self) -> Option<&'static str> {
+        if self.cursor.is_some() || self.sims_loop.is_some() {
             return None;
         }
         Some(if self.sim && !self.inherit && !self.stack_moves {
@@ -6756,6 +7245,8 @@ impl Translator<'_> {
                 4 => return Some(format!("{c}.data[{i}]")),
                 16 => return Some(format!("{c}.slot[{i}]")),
                 19 if i == 65 => return Some(format!("{c}.kind")),
+                19 if i == FAME && self.wave3() => return Some(format!("{c}.fame")),
+                31 if i < 8 && self.wave3() => return Some(format!("{c}.person[temp[{i}]]")),
                 19 => {
                     return self
                         .personality(c, i)
@@ -6766,6 +7257,15 @@ impl Translator<'_> {
             }
         }
         if self.inherit {
+            // `me` is whatever runs the tree; its person words and the stack object's.
+            match o.scope {
+                18 if i == FAME && self.wave3() => return Some("me.fame".to_owned()),
+                19 if i == FAME && self.person_binding().is_none() && self.wave3() => {
+                    return Some("stack_obj.fame".to_owned());
+                }
+                30 if i < 8 && self.wave3() => return Some(format!("me.person[temp[{i}]]")),
+                _ => {}
+            }
             let cell = match o.scope {
                 0 => Some(("me", "attr")),
                 3 => Some(("me", "data")),
@@ -6812,6 +7312,11 @@ impl Translator<'_> {
             }
             (15, _) if i <= 255 && self.extra() => format!("stack_obj.motive[{i}]"),
             (14, true) => format!("sim.motive[{i}]"),
+            // PR I-4's typed person word (the lint's table does not name it).
+            (18, true) if i == FAME && self.wave3() => "sim.fame".to_owned(),
+            (19, _) if i == FAME && self.wave3() => {
+                format!("{}.fame", self.person_binding().unwrap_or("stack_obj"))
+            }
             (18, true) => self
                 .personality("sim", i)
                 .unwrap_or_else(|| format!("sim.person[{i}]")),
@@ -6825,6 +7330,27 @@ impl Translator<'_> {
                     })?
             }
             (25, _) => self.local_name(i as u16)?,
+            // The check tree's advertisement: its motive deltas (12), personality (28) and
+            // minimums (29).
+            (12 | 28 | 29, _) if i < 16 && self.wave3() => {
+                let field = match o.scope {
+                    12 => "delta",
+                    28 => "personality",
+                    _ => "minimum",
+                };
+                format!("advert.{field}[{i}]")
+            }
+            // The cells whose number is in `temp[i]`: the stack object's sprite flag (27),
+            // the running Sim's person word (30) and the stack object's (31).
+            (27, _) if i < 8 && self.stack_handle().is_some() && self.wave3() => {
+                format!("{}.sprite_flags[temp[{i}]]", self.stack_handle()?)
+            }
+            (30, true) if i < 8 && !self.inherit && self.wave3() => {
+                format!("sim.person[temp[{i}]]")
+            }
+            (31, _) if i < 8 && self.stack_handle().is_some() && self.wave3() => {
+                format!("stack_obj.person[temp[{i}]]")
+            }
             _ => return None,
         })
     }
@@ -6994,17 +7520,7 @@ mod tests {
             report.source
         );
         compile(&report.source);
-        let mut lints = crate::v2::lint_v2_source(&report.source, "lifted.antics").expect("lint");
-        // The lift does not emit the lint wave 3 spellings yet (typed constants, `?`, method
-        // forms); Track 9 Stream 3b tightens this back once it does.
-        lints.retain(|d| {
-            !matches!(
-                d.rule,
-                crate::v2::lint::UNTYPED_ENGINE_CONSTANT
-                    | crate::v2::lint::PREFER_QUESTION_MARK
-                    | crate::v2::lint::PREFER_METHOD_SYNTAX
-            )
-        });
+        let lints = crate::v2::lint_v2_source(&report.source, "lifted.antics").expect("lint");
         assert!(lints.is_empty(), "{lints:?}\n{}", report.source);
         report.source
     }
@@ -7147,7 +7663,7 @@ object "Fable Lamp" {
             &[
                 "return ready_4300();",
                 "return !ready_4300();",
-                "return !(self.flags flag_test 6);",
+                "return !(self.flags flag_test ObjectFlags::InUse);",
                 "} else {\n            return ready_4300();",
             ],
         );
@@ -7404,13 +7920,35 @@ object "Fable Lamp" {
         has(
             &lifted,
             &[
-                "sim.wall_adjacency flag_set 3;",
+                "sim.wall_adjacency flag_set WallAdjacency::WallFront;",
                 "if temp[0] flag_test 2 {",
-                "self.allowed_heights flag_clear 1;",
+                "self.allowed_heights flag_clear Height::Floor;",
                 "if !(sim.hand == 0) {",
             ],
         );
         assert!(!lifted.contains("raw {"), "{lifted}");
+    }
+
+    /// The lint pass on its own: both `?` shapes are rewritten, and the file builds to the
+    /// same bytes with the rewrite.
+    #[test]
+    fn lint_spellings_rewrite_both_question_mark_shapes_to_the_same_bytes() {
+        let text = "use std::globals::*;\n\nobject \"Fable Wave3 Query\" {\n    guid: 0x7E00_016B;\n    #[bhav(id = 4300)]\n    fn t() {\n        if !globals::init_object() {\n            return error;\n        }\n        if globals::init_object() {\n        } else {\n            return error;\n        }\n        return true;\n    }\n}\n";
+        let fixes = lint_spellings(text);
+        assert_eq!(fixes.len(), 2, "{text}");
+        let rewritten = apply_lint_spellings(text, &fixes);
+        assert_eq!(
+            rewritten.matches("globals::init_object()?;").count(),
+            2,
+            "{rewritten}"
+        );
+        assert!(!rewritten.contains("if "), "{rewritten}");
+        let bytes = |t: &str| {
+            crate::compile_v2_source("q.antics", t, &PackResolverConfig::default())
+                .unwrap_or_else(|e| panic!("{e}\n{t}"))
+                .iff_bytes
+        };
+        assert_eq!(bytes(text), bytes(&rewritten));
     }
 
     #[test]
@@ -7444,7 +7982,7 @@ object "Fable Lamp" {
 }"#,
         );
         assert!(!lifted.contains("raw {"), "{lifted}");
-        has(&lifted, &["play_sound(5, me);"]);
+        has(&lifted, &["me.play_sound(5);"]);
         assert_eq!(lifted.matches("context = inherit").count(), 2, "{lifted}");
     }
 
