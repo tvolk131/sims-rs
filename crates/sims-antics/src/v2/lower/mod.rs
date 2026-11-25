@@ -63,7 +63,7 @@ use self::object::*;
 use self::prim_table::*;
 use self::raw::*;
 use self::schema::*;
-use self::tree::{object_data_field, sim_person_field};
+use self::tree::{definition_field, object_data_field, sim_person_field};
 use self::trees::*;
 
 const MAX_INLINE_DEPTH: usize = 16;
@@ -429,6 +429,23 @@ impl ValueType {
     }
 }
 
+/// Whether an `.air` operand reads the temps: a `temp[i]` cell, or job data (`scope(33, F)`,
+/// which reads the career and level in `temp[0]` and `temp[1]`). Staging that writes temps
+/// copies such an operand first.
+fn reads_temps(air: &str) -> bool {
+    air.contains("temp[") || air.contains("scope(33,")
+}
+
+/// Whether a single operand reads a cell of the current stack object: `stack_obj` itself, a
+/// `stack.` cell, or its definition (`scope(21, ..)`, `scope(35, ..)`; `sims-vm` `memory.rs`).
+/// Code that moves the cursor before reading such an operand copies it first.
+fn reads_stack_obj(air: &str) -> bool {
+    air == "stack_obj"
+        || air.starts_with("stack.")
+        || air.starts_with("scope(21,")
+        || air.starts_with("scope(35,")
+}
+
 fn types_compatible_for_assign(target: &ValueType, value: &ValueType) -> bool {
     if target == value {
         return true;
@@ -626,6 +643,10 @@ struct TreeLowerer<'a> {
     /// This tree explicitly uses the frame's stack object as a persistent cursor. Temporary
     /// moves must restore its pre-operation value, which may differ from the entry object.
     explicit_stack_obj: bool,
+    /// The source assigns `stack_obj` itself (`stack_obj = x;`), so the stack object the tree
+    /// leaves at exit is the source's: no store of it is dropped as dead at the exit
+    /// (`mir::FrameFacts::keeps_exit_stack_obj`).
+    sets_stack_obj: bool,
     /// Set to `true` when an `ObjectSelf` lifecycle tree (`init`/`main`/`load`/`reset`/`cleanup`)
     /// touches `stack_obj` for a foreign object access, so `finish()` preserves the incoming
     /// `stack_obj` (e.g. the cancelling Sim in `cleanup` / OBJf 4) into `__saved_stack_obj`.
@@ -775,4 +796,6 @@ const PIN_SLOT: &str = "@pin@";
 #[derive(Default)]
 struct ExplicitStackOps {
     visited: BTreeSet<(String, String, bool)>,
+    /// Also count a `stack_obj = x;` statement (in a helper body).
+    assignments: bool,
 }

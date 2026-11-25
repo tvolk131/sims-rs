@@ -21,6 +21,7 @@ impl<'a> TreeLowerer<'a> {
             in_object_scope: true,
             has_self_obj_local,
             explicit_stack_obj: false,
+            sets_stack_obj: false,
             used_saved_stack_obj: false,
             value_return: None,
             em: mir::Emitter::new(1),
@@ -91,7 +92,7 @@ impl<'a> TreeLowerer<'a> {
             || self.inherited_entry_save)
             && self.frame_args == 0;
         let body = replace_outside_strings(self.em.text(), PIN_SLOT, "0");
-        let body_reads_global_34 = mir::may_read_global_34(&body);
+        let body_reads_global_34 = mir::may_read_global_34(&body, &self.raw_consts);
         if body_reads_global_34 {
             self.env.saw_global_34.set(true);
         }
@@ -136,6 +137,7 @@ impl<'a> TreeLowerer<'a> {
             fixed_frame: self.frame_locals.is_some() || self.frame_format.is_some(),
             text_reads,
             text_reads_besides_me,
+            keeps_exit_stack_obj: self.sets_stack_obj,
             keep_layout: self.keep_layout,
             has_self_obj_local: self.has_self_obj_local,
             pinned: self.pin_span.is_some(),
@@ -272,6 +274,23 @@ impl<'a> TreeLowerer<'a> {
         Ok(stmts_mutate_or_borrow_ident_in(stmts, name, &active))
     }
 
+    /// [`LOCAL_WRITING_BUILTINS`] less the names a tree or helper shadows in `module` (object
+    /// trees and local helpers only where `allow_local`), as a helper body there resolves them.
+    pub(super) fn local_writing_builtins_in(
+        &self,
+        module: &str,
+        allow_local: bool,
+    ) -> Vec<&'static str> {
+        LOCAL_WRITING_BUILTINS
+            .iter()
+            .copied()
+            .filter(|b| {
+                !(allow_local && self.env.trees.contains_key(*b))
+                    && self.env.lookup_fn(module, b, allow_local).is_none()
+            })
+            .collect()
+    }
+
     pub(super) fn bind_var(&mut self, name: String, binding: Binding) {
         if let Some(top) = self.var_scopes.last_mut()
             && let Some(old) = top.insert(name.clone(), binding)
@@ -346,6 +365,13 @@ impl<'a> TreeLowerer<'a> {
                 && !self
                     .env
                     .is_bcon_table_name(&self.owner_module, name, self.in_object_scope))
+    }
+
+    /// `self` the running tree's object: [`Self::is_self_ident`], unless a local or parameter
+    /// named `self` (a `for self in ..` binding) shadows it.
+    pub(super) fn is_self_keyword(&self, name: &str) -> bool {
+        self.is_self_ident(name)
+            && matches!(self.lookup_var(name), None | Some(Binding::SelfHandle))
     }
 
     pub(super) fn is_self_ident(&self, name: &str) -> bool {
@@ -596,6 +622,19 @@ const SIM_PERSON_FIELDS: &[(&str, u8)] = &[
     ("job_level", 57),
     ("family", 61),
 ];
+
+/// Read-only words of an object's definition, read through the stack object (`sims-vm`
+/// `memory.rs` scope 21, the stack object's definition as words; the word meanings are the
+/// engine's, `factory.rs` `word`): `object_type` is word 9 (2 for a person) and `sub_index`
+/// word 11, a tile's place in its group (high byte, signed, its first offset; low byte its
+/// second; -1 the group's catalog master).
+pub(super) fn definition_field(name: &str) -> Option<u8> {
+    match name {
+        "object_type" => Some(9),
+        "sub_index" => Some(11),
+        _ => None,
+    }
+}
 
 /// The object-data word of a named object field (`broken` → 15).
 pub(super) fn object_data_field(name: &str) -> Option<u8> {

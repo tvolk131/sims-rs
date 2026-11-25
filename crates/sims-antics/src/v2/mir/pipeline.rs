@@ -22,6 +22,11 @@ pub(crate) struct FrameFacts<'a> {
     /// ([`strings_read_besides_me`]); `Unknown` too when the layout itself is observable (a
     /// bottom frame, or main's rules).
     pub(crate) text_reads_besides_me: TableLocals,
+    /// The source assigns `stack_obj` itself, so the stack object at exit is the source's: the
+    /// frame's header keeps it in the frame storage after the return, and the store is an
+    /// Expression (scratch pointer). No `stack_obj` store is then dropped for being dead at the
+    /// exit; one overwritten first, or already holding its value, still goes.
+    pub(crate) keeps_exit_stack_obj: bool,
     /// Keep the body's node layout: a raw block, `local[N]` read, or `#[slot]` in the tree may
     /// depend on it, so only the unread entry save may go.
     pub(crate) keep_layout: bool,
@@ -70,7 +75,7 @@ fn finish_frame(out: String, facts: &FrameFacts<'_>) -> String {
     // Expressions, whose scratch-pointer writes that read depends on, so the tree neither
     // keeps nor drops one where main would not. So does every tree of its object, since a call
     // carries the scratch pointer between trees, and a tree that pins (`FrameFacts::main_rules`).
-    let main_rules = facts.main_rules || may_read_global_34(&out);
+    let main_rules = facts.main_rules || may_read_global_34(&out, facts.raw_consts);
     let ranges = DrawRanges::for_tree(main_rules);
     if facts.keep_layout {
         if facts.has_self_obj_local
@@ -88,6 +93,7 @@ fn finish_frame(out: String, facts: &FrameFacts<'_>) -> String {
                 facts.local_origins,
                 decl_groups,
                 main_rules,
+                facts.keeps_exit_stack_obj,
             )
         };
         // Declaration groups keep some words main's coalescing shares, so a tree they leave

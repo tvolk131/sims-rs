@@ -222,5 +222,6 @@ pub(super) fn is_prim_builtin_name(name: &str) -> bool {
                 | "set_dynamic_sprite"
                 | "generic_call"
                 | "set_to_next"
+                | "remove_object"
         )
 }

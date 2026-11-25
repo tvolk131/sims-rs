@@ -111,6 +111,7 @@ fn pipeline_applies_frame_facts() {
         fixed_frame: false,
         text_reads: TableLocals::Known(BTreeSet::new()),
         text_reads_besides_me: TableLocals::Known(BTreeSet::new()),
+        keeps_exit_stack_obj: false,
         keep_layout: true,
         has_self_obj_local: true,
         pinned: false,
