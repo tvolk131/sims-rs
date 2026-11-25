@@ -9,7 +9,9 @@
 //! and so does water (0x478f4a).
 //!
 //! The original keeps the result in the room (0x46795a) and works it out
-//! again only when the room changes. It is worked out on each use here:
+//! again only when the room changes, or after going live, which empties
+//! it in each room whose +0x34 is set (0x467436). It is worked out on
+//! each use here:
 //! nothing ported changes walls, floors, tile flags or doors between two
 //! uses, so the two agree. That a room's kept rectangles were never
 //! worked out from an older lot is **unverified**.
