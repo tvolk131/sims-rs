@@ -208,10 +208,14 @@ preserve signed lower wrap, and append only below the 32,767-entry limit.
 Zero quantity succeeds and marks inventory dirty without inserting an entry;
 a failed capacity check does neither. Other unsupported operations remain
 faults. Asset-free regressions include both owners, duplicates, GUID fallback,
-unchanged VM/RNG state, and cold storage boundaries:
+unchanged VM/RNG state, and cold storage boundaries. Those tests are
+`legacy/crates/sims-vm/tests/inventory_operations.rs`, which is outside the
+workspace and is not built. The workspace's Manage Inventory tests are the
+`neighbors::manage_inventory_*` cases of `sims-vm`'s asset-free `interpreter`
+binary:
 
 ```sh
-cargo test --locked -p sims-vm --test inventory_operations -- --test-threads=1
+cargo test --locked -p sims-vm --test interpreter neighbors::manage_inventory
 ```
 
 To attempt collection, keep the same asset/source/actor/routing settings and

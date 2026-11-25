@@ -7,6 +7,7 @@ mod album;
 mod book;
 mod build;
 mod buy;
+mod buy_load;
 mod caf;
 mod cheat_console;
 mod common;
