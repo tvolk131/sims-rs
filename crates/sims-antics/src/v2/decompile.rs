@@ -2577,15 +2577,27 @@ fn direct_local(r: &OperandRef) -> Option<i16> {
     }
 }
 
-/// Whether a body assigns `stack_obj`.
+/// Whether a body may assign `stack_obj` (`verify.rs` lists the primitives that write it).
 fn assigns_stack_obj(body: &[Stmt]) -> bool {
     fn prim_moves(p: &PrimitiveCall) -> bool {
         match unpadded(p) {
-            PrimitiveCall::FindBestInteraction => true,
+            // Searches and creations select what they find or make.
+            PrimitiveCall::FindBestInteraction
+            | PrimitiveCall::FindBestObject { .. }
+            | PrimitiveCall::MakeNewCharacter { .. }
+            | PrimitiveCall::CreateObject { .. } => true,
             PrimitiveCall::ExprRaw { lhs, operator, .. } => {
-                is_operand(lhs, 10, 0) && assign_op_of(*operator).is_some()
+                is_operand(lhs, 10, 0)
+                    && (assign_op_of(*operator).is_some()
+                        || matches!(
+                            compare_op_of(*operator),
+                            Some(CompareOp::IncLt | CompareOp::DecGt)
+                        ))
             }
-            PrimitiveCall::Random { dst, .. } => is_operand(dst, 10, 0),
+            PrimitiveCall::Random { dst, .. } | PrimitiveCall::GetDirectionTo { dst, .. } => {
+                is_operand(dst, 10, 0)
+            }
+            PrimitiveCall::Relationship { value, .. } => is_operand(value, 10, 0),
             // Without bit 7 the step writes `stack_obj`, whatever `dest` says.
             PrimitiveCall::SetToNext { mode, dest, .. } => {
                 mode & 0x80 == 0 || dest.as_ref().is_some_and(|d| is_operand(d, 10, 0))
@@ -2593,9 +2605,15 @@ fn assigns_stack_obj(body: &[Stmt]) -> bool {
             _ => false,
         }
     }
+    // An unparsed node of an opcode that can write `stack_obj` (expression, random,
+    // direction, searches, new character, relationship, set-to-next, create) may.
+    fn raw_moves(opcode: u16) -> bool {
+        matches!(opcode, 2 | 8 | 12 | 14 | 19 | 26 | 31 | 42)
+    }
     fn cond_moves(c: &Condition) -> bool {
         match c {
             Condition::Primitive { prim, .. } => prim_moves(prim),
+            Condition::RawOp { opcode, .. } => raw_moves(*opcode),
             Condition::Compare {
                 lhs,
                 op: CompareOp::IncLt | CompareOp::DecGt,
@@ -2610,6 +2628,7 @@ fn assigns_stack_obj(body: &[Stmt]) -> bool {
         found |= match s {
             Stmt::Assign { lhs, .. } => is_operand(lhs, 10, 0),
             Stmt::Primitive { prim, .. } => prim_moves(prim),
+            Stmt::RawOp { opcode, .. } | Stmt::InlineRawOp { opcode, .. } => raw_moves(*opcode),
             Stmt::If { cond, .. } | Stmt::While { cond, .. } => cond_moves(cond),
             _ => false,
         };
@@ -3188,6 +3207,9 @@ struct Plan {
     /// Trees some caller runs in the other context: written `#[context(inherit)]` (an extra
     /// idiom) so that either context may call them.
     inherit: BTreeSet<u16>,
+    /// Inherit trees [`Self::drop_inherit`] took out: a new order or context tries them
+    /// again, as it does the extras.
+    inherit_dropped: BTreeSet<u16>,
     /// Tree ID -> the level at which its branch order was last swapped (see
     /// [`Plan::other_order`]).
     swapped: BTreeMap<u16, Level>,
@@ -3268,6 +3290,7 @@ impl Plan {
             builtin_locals_only: BTreeSet::new(),
             raw_bcons_numbered: BTreeSet::new(),
             inherit,
+            inherit_dropped: BTreeSet::new(),
             swapped: BTreeMap::new(),
         }
     }
@@ -3292,7 +3315,17 @@ impl Plan {
     /// inherit. Tried before its other extras: a callee the closure made inherit may depend
     /// on the context, and its other idioms may still hold in its own.
     fn drop_inherit(&mut self, model: &Model, id: u16) -> bool {
-        model.tree(id).is_some_and(|t| self.inherits(t)) && self.inherit.remove(&id)
+        model.tree(id).is_some_and(|t| self.inherits(t))
+            && self.inherit.remove(&id)
+            && self.inherit_dropped.insert(id)
+    }
+
+    /// Gives tree `id` its extras, inherit included, another try.
+    fn retry_extras(&mut self, id: u16) {
+        self.plain.remove(&id);
+        if self.inherit_dropped.remove(&id) {
+            self.inherit.insert(id);
+        }
     }
 
     /// Names tree `id`'s locals only where builtins address them from now on, when the last
@@ -3362,7 +3395,7 @@ impl Plan {
         }
         model.swap_order(id);
         self.swapped.insert(id, level);
-        self.plain.remove(&id);
+        self.retry_extras(id);
         self.raw_stmts.remove(&id);
         true
     }
@@ -3375,7 +3408,7 @@ impl Plan {
         let next = match self.level(t) {
             Level::Idiomatic if t.sim_ctx => {
                 // The extra idioms get another try in the object's context.
-                self.plain.remove(&id);
+                self.retry_extras(id);
                 Level::IdiomaticObject
             }
             Level::Idiomatic | Level::IdiomaticObject if t.structured => Level::Raw,
@@ -6392,8 +6425,9 @@ object "Fable Lamp" {
     }
 
     #[test]
-    fn a_sim_tree_whose_step_moves_stack_obj_names_its_cells_by_stack_obj() {
-        // A step with no destination moves `stack_obj` itself.
+    fn a_sim_tree_whose_step_search_or_creation_moves_stack_obj_names_its_cells_by_stack_obj() {
+        // A step with no destination, a search, a creation and a direction read into
+        // `stack_obj` all move it.
         let lifted = lift_source(
             r#"object "Fable Quill" {
     guid: 0x7E00_0143;
@@ -6406,10 +6440,41 @@ object "Fable Lamp" {
             }
         }
     }
+    #[bhav(id = 4301, label = "Seek", locals = 0)]
+    fn seek(sim: Sim) {
+        raw {
+            my.motive[1] := 2;
+            if find_best_object(0, 0) {
+                stack.data[26] := 100;
+            }
+        }
+    }
+    #[bhav(id = 4302, label = "Make", locals = 0)]
+    fn make(sim: Sim) {
+        raw {
+            my.motive[1] := 2;
+            if create_object(0x7E00_0143) {
+                stack.data[27] := 100;
+            }
+        }
+    }
+    #[bhav(id = 4303, label = "Turn", locals = 0)]
+    fn turn(sim: Sim) {
+        raw {
+            my.motive[1] := 2;
+            get_direction_to(stack_obj);
+            stack.data[28] := 100;
+        }
+    }
 }"#,
         );
-        has(&lifted, &["stack_obj.data[25] = 100;"]);
-        assert!(!lifted.contains("self.data[25]"), "{lifted}");
+        for i in 25..=28 {
+            assert!(!lifted.contains(&format!("self.data[{i}]")), "{lifted}");
+        }
+        has(
+            &lifted,
+            &["stack_obj.data[25] = 100;", "stack_obj.data[28] = 100;"],
+        );
     }
 
     #[test]

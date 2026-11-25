@@ -55,16 +55,18 @@ Each is an extra idiom (`Translator::extra`), so a tree it breaks is rewritten w
   form depends on the caller's context, which `context = inherit` refuses. Callees of an
   inherit tree are written inherit too: lowered in both contexts, it may call only inherit
   trees. A callee whose body depends on the context fails as inherit and drops back to its own
-  context. That is tried before its other extras, which may still hold there.
+  context. That is tried before its other extras, which may still hold there. A new node
+  order or the object's context gives it inherit back for another try, as it does the
+  extras.
 - **Self-loops.** A loop whose whole body is one primitive (the original's node loops on
   itself) carries the same `unbounded_loop_without_yield` allow that breakpoint traps already
   had.
-- **A search moves `stack_obj`.** A Sim tree that calls `find_best_interaction()`, steps
-  `set_to_next` into `stack_obj` (its default destination), draws a random number into
-  `stack_obj`, counts it with `inc_lt`/`dec_gt`, or assigns it through `expr(..)` names the
-  stack object's cells
-  `stack_obj.*`, so `self` never means the found object (lint
-  `stack_obj_clobber_after_self`).
+- **A search moves `stack_obj`.** A Sim tree with any primitive that may write `stack_obj`
+  names the stack object's cells `stack_obj.*`. That covers searches (interaction, best
+  object), creations (object, new character), `set_to_next` into its default destination,
+  and a random draw, direction, relationship value, `inc_lt`/`dec_gt` or `expr(..)`
+  assignment into `stack_obj`. An unparsed node of an opcode that may write it counts too.
+  So `self` never means the found object (lint `stack_obj_clobber_after_self`).
 
 ## Decision 3: BCON paths in raw lines
 
