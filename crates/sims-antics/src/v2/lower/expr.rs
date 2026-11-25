@@ -291,7 +291,7 @@ impl<'a> TreeLowerer<'a> {
                     ValueType::I16
                 } else {
                     let (v_air, v_ty) = self.lower_value_expr(inner)?;
-                    if v_ty != ValueType::I16 {
+                    if v_ty != ValueType::I16 && !is_engine_flags(&v_ty) {
                         return Err(Error::at(
                             *span,
                             format!(
@@ -329,9 +329,10 @@ impl<'a> TreeLowerer<'a> {
             }
         };
 
+        let mut base_ty = base_ty;
         for (op, rhs) in ops {
-            if matches!(base_ty, ValueType::Bitflags(_))
-                && !matches!(op, V2BinOp::BitAnd | V2BinOp::BitOr | V2BinOp::BitXor)
+            let is_bit_op = matches!(op, V2BinOp::BitAnd | V2BinOp::BitOr | V2BinOp::BitXor);
+            if matches!(base_ty, ValueType::Bitflags(_)) && !is_bit_op && !is_engine_flags(&base_ty)
             {
                 return Err(Error::at(
                     rhs.span(),
@@ -342,6 +343,17 @@ impl<'a> TreeLowerer<'a> {
                 ));
             }
             let (r_air, r_ty) = self.lower_value_expr(rhs)?;
+            // An engine word in arithmetic, or mixed with a raw word, is a plain `i16`.
+            if (is_engine_flags(&base_ty) && (r_ty == ValueType::I16 || !is_bit_op))
+                || (base_ty == ValueType::I16 && is_engine_flags(&r_ty))
+            {
+                base_ty = ValueType::I16;
+            }
+            let r_ty = if base_ty == ValueType::I16 && is_engine_flags(&r_ty) {
+                ValueType::I16
+            } else {
+                r_ty
+            };
             if r_ty != base_ty {
                 return Err(Error::at(
                     rhs.span(),
@@ -667,6 +679,12 @@ impl<'a> TreeLowerer<'a> {
                     let ty = self.lower_arith_into_dest(expr, &tmp, true)?;
                     Ok((tmp, ty))
                 }
+                // `e as i16`: the operand of `e` itself, retyped (no `.air` nodes).
+                V2UnaryOp::AsI16 => {
+                    let (air, ty) = self.lower_value_expr(inner)?;
+                    self.check_as_i16_source(*span, &ty)?;
+                    Ok((air, ValueType::I16))
+                }
             },
             V2Expr::Binary { op, .. } => match op {
                 V2BinOp::And
@@ -706,6 +724,9 @@ impl<'a> TreeLowerer<'a> {
                 type_args,
                 args,
             } => {
+                if let Some(target) = self.raw_conversion_target(callee) {
+                    return self.lower_from_raw(*span, target, type_args, args);
+                }
                 if matches!(callee.as_ref(), V2Expr::Ident(_, name) if name == "create_object")
                     && has_create_dest(args)
                     && !self.user_callable_named(callee, *span)?
@@ -1111,5 +1132,77 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
         Ok(air)
+    }
+
+    /// The type `T` of a `T::from_raw(..)` call, when `T` names an enum or bitflags type in
+    /// scope (`from_raw` is a built-in conversion, not a user function).
+    pub(super) fn raw_conversion_target(&self, callee: &V2Expr) -> Option<ValueType> {
+        let V2Expr::Path(_, segs) = callee else {
+            return None;
+        };
+        let [tname, method] = segs.as_slice() else {
+            return None;
+        };
+        if method != "from_raw" {
+            return None;
+        }
+        match self
+            .env
+            .lookup_named_type(&self.owner_module, tname, self.in_object_scope)?
+        {
+            ResolvedNamedType::Enum(k) if self.env.all_enums.contains_key(&k) => {
+                Some(ValueType::Enum(k))
+            }
+            ResolvedNamedType::Bitflags(k) if self.env.all_bitflags.contains_key(&k) => {
+                Some(ValueType::Bitflags(k))
+            }
+            _ => None,
+        }
+    }
+
+    /// `T::from_raw(e)`: the operand of the `i16` expression `e`, typed `T` (no `.air` nodes).
+    /// Any word is accepted: engine enums stay open, so a `match` on one needs a `_` arm.
+    pub(super) fn lower_from_raw(
+        &mut self,
+        span: Span,
+        target: ValueType,
+        type_args: &[V2Type],
+        args: &[CallArg],
+    ) -> Result<(String, ValueType)> {
+        let name = self.env.display_value_type(&target);
+        if !type_args.is_empty() || args.len() != 1 || args[0].name.is_some() {
+            return Err(Error::at(
+                span,
+                format!("'{name}::from_raw' takes exactly one positional i16 argument"),
+            ));
+        }
+        let (air, ty) = self.lower_value_expr(&args[0].value)?;
+        if ty != ValueType::I16 && ty != target {
+            return Err(Error::at(
+                args[0].value.span(),
+                format!(
+                    "'{name}::from_raw' expects an i16, found '{}' (use 'as i16' first)",
+                    self.env.display_value_type(&ty)
+                ),
+            ));
+        }
+        Ok((air, target))
+    }
+
+    /// `e as i16` accepts integers, bools, enums and bitflags; object handles already
+    /// convert to and from `i16` implicitly.
+    pub(super) fn check_as_i16_source(&self, span: Span, ty: &ValueType) -> Result<()> {
+        match ty {
+            ValueType::I16 | ValueType::Bool | ValueType::Enum(_) | ValueType::Bitflags(_) => {
+                Ok(())
+            }
+            ValueType::ObjectId | ValueType::ObjectRef(_) => Err(Error::at(
+                span,
+                format!(
+                    "'as i16' does not apply to '{}' (object ids already convert to i16)",
+                    self.env.display_value_type(ty)
+                ),
+            )),
+        }
     }
 }

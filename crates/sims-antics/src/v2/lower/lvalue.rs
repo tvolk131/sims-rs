@@ -228,13 +228,11 @@ impl<'a> TreeLowerer<'a> {
                                 "data[8]",
                                 ValueType::Bitflags(ANY_BITFLAGS.to_owned()),
                             )),
-                            "allowed_heights" => Ok(self.self_cell(
-                                "data[4]",
-                                ValueType::Bitflags("builtin::Height".to_owned()),
-                            )),
+                            "allowed_heights" => Ok(self
+                                .self_cell("data[4]", ValueType::Bitflags(HEIGHT_KEY.to_owned()))),
                             "placement" => Ok(self.self_cell(
                                 "data[42]",
-                                ValueType::Bitflags("builtin::Placement".to_owned()),
+                                ValueType::Bitflags(PLACEMENT_KEY.to_owned()),
                             )),
                             "prep_score" => Ok(self.self_cell("prep_score", ValueType::I16)),
                             "cook_score" => Ok(self.self_cell("cook_score", ValueType::I16)),
@@ -327,13 +325,13 @@ impl<'a> TreeLowerer<'a> {
                                     cell: "stack.data[4]".to_owned(),
                                     setup: None,
                                     obj_air,
-                                    ty: ValueType::Bitflags("builtin::Height".to_owned()),
+                                    ty: ValueType::Bitflags(HEIGHT_KEY.to_owned()),
                                 }),
                                 "placement" => Ok(LValue::ForeignCell {
                                     cell: "stack.data[42]".to_owned(),
                                     setup: None,
                                     obj_air,
-                                    ty: ValueType::Bitflags("builtin::Placement".to_owned()),
+                                    ty: ValueType::Bitflags(PLACEMENT_KEY.to_owned()),
                                 }),
                                 other => match Self::handle_field_cell(other, false) {
                                     Some((cell, ty)) => Ok(LValue::ForeignCell {

@@ -608,6 +608,8 @@ pub enum V2BinOp {
 pub enum V2UnaryOp {
     Not,
     Neg,
+    /// Postfix `expr as i16`: the operand's raw word, typed `i16` (no `.air` nodes).
+    AsI16,
 }
 
 /// Statements inside v2 function / interaction / lifecycle bodies.
@@ -910,6 +912,12 @@ pub(crate) fn object_type_ident(name: &str) -> String {
     } else {
         out
     }
+}
+
+/// The reserved type names `std::flags` declares (the prelude types every module sees).
+#[must_use]
+pub(crate) fn is_std_prelude_type_name(name: &str) -> bool {
+    matches!(name, "Height" | "Placement")
 }
 
 /// Returns `true` if `name` is a built-in/reserved type name that user `enum`, `bitflags`,

@@ -58,6 +58,32 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// Resolves a compile-time constant of any enum (`Enum::Variant` or `Binding::ConstEnum`).
+    pub(super) fn try_eval_any_const_enum(&self, expr: &V2Expr) -> Result<Option<i16>> {
+        match expr {
+            V2Expr::Path(span, segs) if segs.len() == 2 => {
+                let Some(e) =
+                    self.env
+                        .lookup_enum(&self.owner_module, &segs[0], self.in_object_scope)
+                else {
+                    return Ok(None);
+                };
+                let &val = e.variants.get(&segs[1]).ok_or_else(|| {
+                    Error::at(
+                        *span,
+                        format!("enum '{}' has no variant '{}'", e.display_name, segs[1]),
+                    )
+                })?;
+                Ok(Some(val))
+            }
+            V2Expr::Ident(_, name) => match self.lookup_var(name) {
+                Some(Binding::ConstEnum { value, .. }) => Ok(Some(*value)),
+                _ => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
     /// Resolves a compile-time `Bitflags` constant expression (single flag, `None`, or `|`/`&`/`^` of constants),
     /// returning `(mask, single_bit_1_based)` when constant!
     pub(super) fn try_eval_const_bitflag(
@@ -560,6 +586,20 @@ impl<'a> TreeLowerer<'a> {
                 inner_v
                     .checked_neg()
                     .ok_or_else(|| Error::at(*span, "i16 negation overflow"))
+            }
+            // `Enum::Variant as i16`, `Flags::A | Flags::B as i16`, or an i16 constant.
+            V2Expr::Unary {
+                op: V2UnaryOp::AsI16,
+                inner,
+                ..
+            } => {
+                if let Some((_, mask, _)) = self.try_eval_any_const_bitflag(inner)? {
+                    return Ok(mask);
+                }
+                if let Some(v) = self.try_eval_any_const_enum(inner)? {
+                    return Ok(v);
+                }
+                self.eval_const_i16(inner)
             }
             V2Expr::Ident(span, name) => {
                 if let Some(binding) = self.lookup_var(name) {

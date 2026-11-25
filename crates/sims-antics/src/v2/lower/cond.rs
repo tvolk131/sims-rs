@@ -167,10 +167,14 @@ impl<'a> TreeLowerer<'a> {
         span: Span,
     ) -> Result<(String, String)> {
         let (l, l_ty) = self.lower_value_expr(lhs)?;
+        // An engine word also takes a raw bit number (`w flag_test 3`), compared below exactly
+        // as an `i16` word is.
         if op == V2BinOp::FlagTest
             && let ValueType::Bitflags(ref key) = l_ty
+            && let const_bit = self.try_eval_const_bitflag(rhs, key)?
+            && (const_bit.is_some() || !is_engine_flags(&l_ty))
         {
-            let Some((_, Some(bit))) = self.try_eval_const_bitflag(rhs, key)? else {
+            let Some((_, Some(bit))) = const_bit else {
                 return Err(Error::at(
                     rhs.span(),
                     format!(
@@ -219,7 +223,10 @@ impl<'a> TreeLowerer<'a> {
                     ));
                 }
             }
-            V2BinOp::FlagTest if l_ty != ValueType::I16 || r_ty != ValueType::I16 => {
+            V2BinOp::FlagTest
+                if !(l_ty == ValueType::I16 || is_engine_flags(&l_ty))
+                    || r_ty != ValueType::I16 =>
+            {
                 return Err(Error::at(
                     span,
                     format!(

@@ -18,7 +18,7 @@ use crate::v2::ast::{
     GuidValue, InteractionDecl, MatchArm, MatchExprArm, MatchPattern, MetaField, MetaFieldKind,
     ObjectDecl, ObjectMember, ParamType, ParamValue, ReturnAbi, SlotDecl, SoundDecl, SpriteDecl,
     StateDecl, StateInitValue, StateType, StringsDecl, TemplateDecl, TileDecl, TreeFrame,
-    TreeMemberDecl, V2AssignOp, V2BinOp, V2Expr, V2Stmt, V2Type, V2UnaryOp, VariantDecl,
+    TreeMemberDecl, V2AssignOp, V2BinOp, V2Expr, V2Item, V2Stmt, V2Type, V2UnaryOp, VariantDecl,
     object_type_ident,
 };
 use crate::v2::loader::{ModuleScope, ResolvedModule};
@@ -446,6 +446,18 @@ fn reads_stack_obj(air: &str) -> bool {
         || air.starts_with("scope(35,")
 }
 
+/// Whether bitflags `key` is an engine bit-field word: a `std::flags` type or `self.flags`'s
+/// any-bitflags type. Such a word also takes raw `i16` operands (`w flag_set 3`, `w = 0`,
+/// `w & 4`) exactly as an `i16` cell does, so typing an engine field never breaks numeric code.
+fn is_engine_flags_key(key: &str) -> bool {
+    key == ANY_BITFLAGS || key.starts_with("bitflags::std::flags::")
+}
+
+/// [`is_engine_flags_key`] of a value type.
+fn is_engine_flags(ty: &ValueType) -> bool {
+    matches!(ty, ValueType::Bitflags(k) if is_engine_flags_key(k))
+}
+
 fn types_compatible_for_assign(target: &ValueType, value: &ValueType) -> bool {
     if target == value {
         return true;
@@ -454,6 +466,12 @@ fn types_compatible_for_assign(target: &ValueType, value: &ValueType) -> bool {
         // `self.flags` takes (and yields) any bitflags type.
         (ValueType::Bitflags(t), ValueType::Bitflags(v))
             if t == ANY_BITFLAGS || v == ANY_BITFLAGS =>
+        {
+            true
+        }
+        // Engine bit-field words (`std::flags` types, `self.flags`) also take raw words.
+        (ValueType::Bitflags(k), ValueType::I16) | (ValueType::I16, ValueType::Bitflags(k))
+            if is_engine_flags_key(k) =>
         {
             true
         }

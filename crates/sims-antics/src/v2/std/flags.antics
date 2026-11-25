@@ -1,0 +1,31 @@
+// Built-in `std::flags`: the engine's bit-field words, as `bitflags` types.
+//
+// Bits are 1-based (`Floor = 1` is mask 0x0001). Every bit below is one the engine reads or
+// writes (see `crates/sims-vm`); a bit with no confirmed meaning is left out, and a raw word
+// still converts both ways (`ObjectFlags::from_raw(w)`, `flags as i16`). The names are our own
+// descriptions; only the word and bit positions are engine facts.
+//
+// `Height` and `Placement` are prelude types: every module sees them without a `use`.
+
+// Object data word 4: the surface heights an object may be placed at.
+pub bitflags Height {
+    Floor = 1,
+    LowTable = 2,
+    Table = 3,
+    Counter = 4,
+    NonStandard = 5,
+    InHand = 6,
+    Sitting = 7,
+    EndTable = 8,
+}
+
+// The tile kinds an object may be placed on.
+pub bitflags Placement {
+    Floor = 1,
+    Terrain = 2,
+    Water = 3,
+    Sloped = 9,
+    Air = 10,
+    Pool = 12,
+    WaterOnly = 14,
+}

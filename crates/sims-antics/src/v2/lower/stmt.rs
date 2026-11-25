@@ -170,10 +170,14 @@ impl<'a> TreeLowerer<'a> {
                 let lval = self.resolve_lvalue(target)?;
                 let target_ty = lval.value_type().clone();
                 // Handle bitflags `flag_set` / `flag_clear` explicitly (1-based bit index!).
+                // An engine word also takes a raw bit number (`w flag_set 3`), lowered below
+                // exactly as for an `i16` cell.
                 if matches!(op, V2AssignOp::FlagSet | V2AssignOp::FlagClear)
                     && let ValueType::Bitflags(ref key) = target_ty
+                    && let const_bit = self.try_eval_const_bitflag(value, key)?
+                    && (const_bit.is_some() || !is_engine_flags(&target_ty))
                 {
-                    let Some((_, Some(bit))) = self.try_eval_const_bitflag(value, key)? else {
+                    let Some((_, Some(bit))) = const_bit else {
                         return Err(Error::at(
                             value.span(),
                             format!(
@@ -231,6 +235,9 @@ impl<'a> TreeLowerer<'a> {
                                 ),
                             ));
                         }
+                        // An engine word takes any compound assignment from a raw word.
+                        ValueType::Bitflags(_)
+                            if is_engine_flags(&target_ty) && val_ty == ValueType::I16 => {}
                         ValueType::Bitflags(_) => {
                             if !matches!(
                                 op,
