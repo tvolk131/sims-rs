@@ -7,6 +7,12 @@ use super::*;
 
 /// What the backend needs to know about a lowered tree besides its body text.
 pub(crate) struct FrameFacts<'a> {
+    /// The tree formats text (a raw block's, or a dialog or action string in the body).
+    pub(crate) formats_text: bool,
+    /// The tree may run as an object's bottom frame (an object-self tree with no arguments,
+    /// which is what an object's `main` or a variant's is), whose first word Create Object
+    /// writes.
+    pub(crate) may_be_bottom_frame: bool,
     /// The frame words the tree's text may read: what the object's strings read
     /// ([`text_reads`](mod@super::text_reads)) when the tree formats text (a raw block's, or a
     /// dialog or action string in the body), and none when it does not.
@@ -34,15 +40,49 @@ pub(crate) struct FrameFacts<'a> {
 
 /// Runs the backend passes over one lowered tree body.
 pub(crate) fn finish_body(out: String, facts: &FrameFacts<'_>) -> String {
-    let reads_text = reads_a_word(&facts.text_reads);
-    let unmoved = |before: &str, after: &str| text_words_unmoved(before, after, facts);
+    let mut body = finish_frame(&out, facts, &facts.text_reads);
+    // A bottom frame with no word is observable: Create Object with flag 0x10 (or 0x02) writes
+    // the new object's bottom frame's first word and faults when it has none. Main never lets a
+    // text tree's passes drop a declaration or its entry save, so when the text rules empty a
+    // frame that main's text rule (`Unknown`) keeps a word in, the tree takes main's result.
+    if facts.may_be_bottom_frame
+        && facts.formats_text
+        && !matches!(facts.text_reads, TableLocals::Unknown)
+        && !has_frame_word(&body)
+    {
+        let main_rule = finish_frame(&out, facts, &TableLocals::Unknown);
+        if has_frame_word(&main_rule) {
+            body = main_rule;
+        }
+    }
+    // The raw blocks' constants, which no pass before this one reads.
+    let mut consts = String::new();
+    for (name, value) in facts.raw_consts {
+        if !facts.raw_declared.contains(name) {
+            consts.push_str(&format!("    const {name} = {value};\n"));
+        }
+    }
+    let out = consts + &body;
+    if facts.has_slots {
+        assign_frame_slots(&out, facts.pinned_locals, facts.raw_declared)
+    } else {
+        out
+    }
+}
+
+/// The entry-save drop or the optimizer, and the pinned slot, with the tree's text taken to
+/// read `text_reads`.
+fn finish_frame(out: &str, facts: &FrameFacts<'_>, text_reads: &TableLocals) -> String {
+    let out = out.to_owned();
+    let reads_text = reads_a_word(text_reads);
+    let unmoved = |before: &str, after: &str| text_words_unmoved(before, after, text_reads, facts);
     // A tree that may read global 34 keeps main's rules: the entry save and the pin's copies are
     // Expressions, whose scratch-pointer writes that read may depend on, so the tree neither
     // keeps nor drops one where main would not. Its text reads are `Unknown` when it formats
     // text (`TreeLowerer::finish`), which keeps the save as main's text rule does.
     let may_read_global_34 = may_read_global_34(&out);
     let ranges = DrawRanges::for_tree(may_read_global_34);
-    let out = if facts.keep_layout {
+    if facts.keep_layout {
         if facts.has_self_obj_local
             && let Some(trimmed) = drop_unread_entry_save(&out, &unmoved, ranges)
         {
@@ -52,13 +92,15 @@ pub(crate) fn finish_body(out: String, facts: &FrameFacts<'_>) -> String {
         }
     } else {
         let out = crate::v2::opt::optimize_tree_body(&out, reads_text, facts.local_origins);
-        // Pinning moves every named local down a word and fills word 0 from the start, so a
-        // tree whose text may read a frame word keeps its copies unless the text reads neither
-        // word 0 nor a word that changes hands. A tree that may read global 34 pins as on main.
+        // Pinning moves every named local down a word and fills word 0 from the start. Main
+        // pins whenever its literal-range analysis lets it, and the tree does too. Where only
+        // this branch's wider range rule lets it pin, a tree whose text may read a frame word
+        // keeps its copies unless the text reads neither word 0 nor a word that changes hands.
         let out = if facts.pinned {
             let pinned = pin_in_place(&out, ranges);
-            let text_ok = may_read_global_34
-                || match &facts.text_reads {
+            let main_pins = may_read_global_34 || pin_in_place(&out, DrawRanges::Literal) != out;
+            let text_ok = main_pins
+                || match text_reads {
                     TableLocals::Known(words) if words.is_empty() => true,
                     TableLocals::Known(words) => !words.contains(&0) && unmoved(&out, &pinned),
                     TableLocals::Unknown => false,
@@ -82,28 +124,20 @@ pub(crate) fn finish_body(out: String, facts: &FrameFacts<'_>) -> String {
         } else {
             out
         }
-    };
-    // The raw blocks' constants, which no pass before this one reads.
-    let mut consts = String::new();
-    for (name, value) in facts.raw_consts {
-        if !facts.raw_declared.contains(name) {
-            consts.push_str(&format!("    const {name} = {value};\n"));
-        }
-    }
-    let out = consts + &out;
-    if facts.has_slots {
-        assign_frame_slots(&out, facts.pinned_locals, facts.raw_declared)
-    } else {
-        out
     }
 }
 
 /// Whether dropping the entry save from `before` (giving `after`) leaves every frame word the
-/// tree's text may read ([`FrameFacts::text_reads`]) holding the same local
-/// ([`frame_occupancy`]). The save's own word changes hands, so text that may read it keeps
-/// the save; so does text that may read any word.
-fn text_words_unmoved(before: &str, after: &str, facts: &FrameFacts<'_>) -> bool {
-    let words = match &facts.text_reads {
+/// tree's text may read (`text_reads`) holding the same local ([`frame_occupancy`]). The save's
+/// own word changes hands, so text that may read it keeps the save; so does text that may read
+/// any word.
+fn text_words_unmoved(
+    before: &str,
+    after: &str,
+    text_reads: &TableLocals,
+    facts: &FrameFacts<'_>,
+) -> bool {
+    let words = match text_reads {
         TableLocals::Unknown => return false,
         TableLocals::Known(words) if words.is_empty() => return true,
         TableLocals::Known(words) => words,

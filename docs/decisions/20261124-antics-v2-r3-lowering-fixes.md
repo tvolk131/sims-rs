@@ -87,7 +87,9 @@ Expression faults on main and succeeds after a kept save. So such a tree takes m
   rule from section 2), wherever that decides whether the entry save or a pin's copies go;
 - the entry save goes where main drops it, in the optimizer (`drop_unread_entry_save_node`) and
   the raw-layout path, and the text checks keep it as main's text rule does;
-- the pinned slot pins as on main, without section 5's text guard.
+- the pinned slot pins as on main, without section 5's text guard;
+- out-operand locals coalesce as on main (no `decl:` groups), so the tree fits the frame main
+  fits it in.
 
 The rule is a permission, not an obligation. As on main, dead-store elimination drops an unread
 save whose next node ignores the last result. It does this whatever the text reads, because the
@@ -157,7 +159,8 @@ declaration order, so generated names no longer matter.
   `break` arm keeps the old value live and the fall-through arm does not.
   - Disjoint inlined copies of a helper now share their local's word.
   - In `coalesce_locals`, a local written through an out-operand joins only classes of its own
-    declaration, and never the cross-helper merge.
+    declaration, and never the cross-helper merge (except in a tree that may read global 34,
+    section 1).
     - Lowering records each inlined local's declaration (`local_origins`: the helper and the
       innermost statement being lowered). That covers `let`, `let Some`, `for` and every other
       binding, so another helper's local of the same spelling is not a copy. The statement is
@@ -188,8 +191,10 @@ declaration order, so generated names no longer matter.
 - **The pinned `push_interaction` slot (`mir/pipeline.rs`).** `pin_in_place` makes a pushed
   handle live in word 0 and drops its copies, which moves every named local down a word and fills
   word 0 from the start. Section 2 lets it apply to more trees (a `random` with a BCON range now
-  defines its destination), so a tree whose text may read a frame word keeps the copies unless
-  the text reads neither word 0 nor a word that changes hands. Before the body is final, the slot
+  defines its destination). Where main's literal-range analysis pins too, the tree pins as main
+  does, since main's layout is the one its text already reads. Where only the wider range rule
+  pins, a tree whose text may read a frame word keeps the copies unless the text reads neither
+  word 0 nor a word that changes hands. Before the body is final, the slot
   is a placeholder (`@pin@`) that the lexer does not read. Global 34 is checked on the body with
   word 0 in its place, so a pinned text tree is no longer `Unknown` for that reason alone.
 - **`push_interaction(object: <@slot(N) handle>)` (`lower/builtins.rs`).** It emits `object: N`
@@ -211,6 +216,13 @@ declaration order, so generated names no longer matter.
   moved word (section 1) and a pin enabled by a BCON range (above). It adds no rule of its own
   that removes an Expression. A tree that may read global 34 is the exception to applying them
   more widely: there the branch keeps and drops exactly what main does (section 1).
+- **An empty bottom frame.** Create Object with flag 0x10 (or 0x02) writes the first word of the
+  new object's bottom frame and faults when the frame has none. Main's passes never drop a text
+  tree's declarations or entry save, so the text rules (section 1) could empty a frame main keeps
+  a word in. A tree that may run as a bottom frame (an object-self tree with no arguments: an
+  object's or a variant's `main`) whose frame the text rules leave empty takes main's text rule
+  (`Unknown`) instead, when that keeps a word (`finish_body`, `has_frame_word`). Main's own
+  passes still empty a frame in a tree that formats no text, as before.
 
 ## Verification
 

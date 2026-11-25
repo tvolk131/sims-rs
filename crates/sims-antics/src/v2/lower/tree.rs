@@ -99,6 +99,9 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
         let facts = mir::FrameFacts {
+            formats_text,
+            may_be_bottom_frame: matches!(self.tree_ctx, TreeContext::ObjectSelf)
+                && self.frame_args == 0,
             text_reads,
             keep_layout: self.keep_layout,
             has_self_obj_local: self.has_self_obj_local,

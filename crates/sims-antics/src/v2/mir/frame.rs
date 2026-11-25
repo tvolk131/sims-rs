@@ -71,6 +71,12 @@ pub(crate) fn assign_frame_slots(
     place_locals(body, &slots).unwrap_or_else(|| body.to_owned())
 }
 
+/// Whether `.air` gives the tree body `body` a frame word: an explicit `local[N]` or a named
+/// local. A body `.air` cannot parse counts as having one.
+pub(crate) fn has_frame_word(body: &str) -> bool {
+    body_local_usage(body).is_none_or(|u| !u.explicit.is_empty() || !u.lets.is_empty())
+}
+
 /// The `.air` compiler's local-slot scan of a tree body, or `None` if `.air` cannot parse it.
 fn body_local_usage(body: &str) -> Option<crate::lower::AirLocalUsage> {
     let wrapped = format!("tree 4096 \"__slots\" {{\n{body}\n}}\n");

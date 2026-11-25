@@ -564,8 +564,11 @@ fn coalesce_locals(
         live_out: BTreeMap::new(),
     };
     let entry_live = lv.block(nodes, Set::new(), &Set::new(), &Set::new());
+    // A tree that may read global 34 (`out_defs` off) shares out-operand locals as main does.
     let mut out_written = BTreeSet::new();
-    collect_out_written(nodes, &locals, &mut out_written);
+    if out_defs {
+        collect_out_written(nodes, &locals, &mut out_written);
+    }
     // A copy of a declaration that some copy writes through an out-operand counts as one too
     // (a specialization may drop the write from one copy): copies of a declaration stay one
     // group.

@@ -135,8 +135,11 @@ fn a_later_dialog_literal_reaches_earlier_trees() {
 /// destination on both exits, so the destination is written before it is read.
 #[test]
 fn random_into_a_constant_range_defines_its_destination() {
+    // (The raw statement keeps ordinary dead-store elimination from dropping the save before
+    // the analysis sees it.)
     let members = r#"    tree a (sim: Sim) {
         let n: i16;
+        raw { temp[7] := 0; }
         stack_obj = 0;
         if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
             return false;
@@ -147,8 +150,7 @@ fn random_into_a_constant_range_defines_its_destination() {
     const LIMIT = 6;"#;
     let air = expand("random_range.antics", &obj("Plain", members));
     assert!(!tree(&air, "a").contains(SAVE), "{air}");
-    // A BCON range stays a `bcon[..]` cell in `.air`. (The raw statement keeps ordinary
-    // dead-store elimination from dropping the save before the analysis sees it.)
+    // A BCON range stays a `bcon[..]` cell in `.air`.
     let members = r#"    tree a (sim: Sim) {
         let n: i16;
         raw { temp[7] := 0; }
@@ -828,4 +830,54 @@ fn text_that_reads_a_moved_word_keeps_the_push_interaction_copy() {
     let air = expand("pin_plain.antics", &obj("Plain", members));
     let a = tree(&air, "a");
     assert!(a.contains("local[0] := stack_obj;"), "pinned:\n{a}");
+    // A literal range lets main pin too, whatever the text reads, and the tree pins as main.
+    let literal = members.replace("Limits.draw", "1");
+    let air = expand("pin_literal.antics", &obj("Was $Local:1", &literal));
+    let a = tree(&air, "a");
+    assert!(a.contains("local[0] := stack_obj;"), "pinned:\n{a}");
+}
+
+/// A frame with no word makes Create Object with flag 0x10 fault, so a text tree whose text
+/// rules would empty its frame keeps main's text rule; a tree with no text empties it as on main.
+#[test]
+fn a_text_tree_keeps_a_frame_word_main_keeps() {
+    let src = |text: &str| {
+        obj(
+            "Plain",
+            &format!(
+                "    main {{\n        let spare: i16 = 7;\n        temp[1] = 1;\n        {text}\n    }}"
+            ),
+        )
+    };
+    let (locals, _) = compiled(&src("dialog(kind: ok, title: title, message: msg);"), 4097);
+    assert_eq!(locals, 1);
+    let (locals, _) = compiled(&src(""), 4097);
+    assert_eq!(locals, 0);
+}
+
+/// A tree that may read global 34 shares inlined out-operand locals as main does, so it fits
+/// the frame main fits it in.
+#[test]
+fn a_tree_that_may_read_global_34_shares_out_operand_locals_as_main() {
+    let src = r#"object "Round Three" {
+    guid: 0x7F40_0900;
+    fn first() {
+        let event: i16 = temp[5];
+        temp[4] = 0;
+        temp[1] = event;
+    }
+    fn second() {
+        let event: i16 = temp[6];
+        temp[5] = 0;
+        random_into(event, 4)?;
+        temp[2] = event;
+    }
+    @frame(locals: 1) tree a {
+        first();
+        second();
+        temp[3] = global[34];
+    }
+}
+"#;
+    expand("global34_frame.antics", src);
 }
