@@ -267,10 +267,14 @@ pub fn decompile_iff_to_v2_report(
                 let tree = line.and_then(|l| generated.tree_at_line(l.saturating_sub(1)));
                 // An extra idiom is turned off before anything is lowered: it may be what
                 // clashes with the rest of the tree.
-                let unblamed = tree.is_none() && plan.drop_all_extras(&generated);
+                let unblamed = tree.is_none()
+                    && (plan.drop_all_extras(&generated) || plan.number_all_raw_bcons(&generated));
                 if !unblamed
                     && !tree.is_some_and(|id| plan.add_frame(&model, id))
+                    && !tree.is_some_and(|id| plan.name_builtin_locals_only(id, &generated))
+                    && !tree.is_some_and(|id| plan.drop_inherit(&model, id))
                     && !tree.is_some_and(|id| plan.drop_extras(id, &generated))
+                    && !tree.is_some_and(|id| plan.number_raw_bcons(id, &generated))
                     && !plan.lower_at_line(&model, &generated, line)
                     // A tree that fails at its lowest level is left out.
                     && !tree.is_some_and(|id| model.omit(id, &message))
@@ -282,29 +286,25 @@ pub fn decompile_iff_to_v2_report(
                 let handled = match tree {
                     Some(id) => {
                         plan.add_frame(&model, id)
+                            || plan.name_builtin_locals_only(id, &generated)
+                            || plan.drop_inherit(&model, id)
                             || plan.drop_extras(id, &generated)
+                            || plan.number_raw_bcons(id, &generated)
                             || plan.lower_tree(&model, id)
                             || model.omit(id, &message)
                     }
-                    None => plan.drop_all_extras(&generated) || plan.lower_all(&model),
+                    None => {
+                        plan.drop_all_extras(&generated)
+                            || plan.number_all_raw_bcons(&generated)
+                            || plan.lower_all(&model)
+                    }
                 };
                 if !handled {
                     return Err(no_compile(&message));
                 }
             }
             Ok(recompiled) => {
-                let mut checks = BTreeMap::new();
-                let mut unproven = Vec::new();
-                for t in model.trees.iter().filter(|t| t.omitted.is_none()) {
-                    let mut check = model.check_tree(t, &recompiled, &mut cache);
-                    if !matches!(check, TreeCheck::Identical | TreeCheck::Equivalent) {
-                        unproven.push(t.id);
-                    } else if let Some(gap) = model.object_gap(t, &recompiled) {
-                        // Settled: no other spelling of the tree closes it.
-                        check = TreeCheck::Inconclusive(gap);
-                    }
-                    checks.insert(t.id, check);
-                }
+                let (checks, unproven) = model.check_all(&recompiled, &mut cache);
                 // A block given its header may be all its callers were missing (a caller is
                 // proven only with its callees), so such a round lowers nothing else.
                 let mut changed = false;
@@ -313,15 +313,23 @@ pub fn decompile_iff_to_v2_report(
                 }
                 if !changed {
                     for &id in &unproven {
-                        changed |= plan.drop_extras(id, &generated)
+                        changed |= plan.name_builtin_locals_only(id, &generated)
+                            || plan.drop_inherit(&model, id)
+                            || plan.drop_extras(id, &generated)
                             || plan.other_order(&mut model, id)
-                            || plan.lower_tree(&model, id);
+                            || plan.lower_tree(&model, id)
+                            || plan.number_raw_bcons(id, &generated);
                     }
                 }
                 if changed {
                     continue;
                 }
-                let source = format_v2_source(&generated.text)?;
+                let (text, recompiled, mut checks) = model.type_engine_fields(
+                    &generated.text,
+                    (recompiled, checks, &unproven),
+                    &mut cache,
+                );
+                let source = format_v2_source(&text)?;
                 let mut trees: Vec<DecompiledTree> = model
                     .trees
                     .iter()
@@ -348,6 +356,84 @@ pub fn decompile_iff_to_v2_report(
         }
     }
     Err(Error::new("decompiler validation did not converge"))
+}
+
+/// Lint `untyped_engine_field`'s suggestion: `(line, column, typed name)`, 1-based, for the
+/// cell spelled from the column through its index's `]` (`global[3]`, `sim.slot[0]`).
+type EngineFieldFix = (usize, usize, String);
+
+/// Every engine cell spelled by number that has a typed name, by lint
+/// `untyped_engine_field`'s own table and rules. Empty when the text does not lint.
+fn engine_field_fixes(text: &str) -> Vec<EngineFieldFix> {
+    let Ok(diags) = crate::v2::lint::lint_v2_source(text, "decompiled.antics") else {
+        return Vec::new();
+    };
+    diags
+        .into_iter()
+        .filter(|d| d.rule == crate::v2::lint::UNTYPED_ENGINE_FIELD)
+        .filter_map(|d| Some((d.line, d.column, d.suggestion?)))
+        .collect()
+}
+
+/// `text` with `fixes` applied. `None` when one does not fit the text.
+fn apply_engine_field_fixes(text: &str, fixes: &[EngineFieldFix]) -> Option<String> {
+    let mut sorted: Vec<&EngineFieldFix> = fixes.iter().collect();
+    // Right to left, so earlier columns on a line stay put.
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    let mut lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
+    for (line, column, typed) in sorted {
+        let l = lines.get_mut(line.checked_sub(1)?)?;
+        let start = column.checked_sub(1)?;
+        let end = start + l.get(start..)?.find(']')? + 1;
+        l.replace_range(start..end, typed);
+    }
+    Some(lines.join("\n"))
+}
+
+/// `text` with an `allow(untyped_engine_field)` line above each line holding a cell of
+/// `left` (whose typed name builds other nodes that are not proven the same).
+fn allow_engine_fields(text: &str, left: &[EngineFieldFix]) -> String {
+    let mut by_line: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
+    for (line, _, typed) in left {
+        let names = by_line.entry(*line).or_default();
+        if !names.contains(&typed.as_str()) {
+            names.push(typed);
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    for (n, l) in text.split('\n').enumerate() {
+        if n > 0 {
+            out.push('\n');
+        }
+        if let Some(names) = by_line.get(&(n + 1)) {
+            let indent = &l[..l.len() - l.trim_start().len()];
+            let names: Vec<String> = names.iter().map(|t| format!("`{t}`")).collect();
+            out.push_str(&format!(
+                "{indent}// antics-lint: allow(untyped_engine_field): {} builds other nodes, not proven the same here\n",
+                names.join(", ")
+            ));
+        }
+        out.push_str(l);
+    }
+    out
+}
+
+/// The fixes `ok` accepts, found by halving: a set `ok` refuses is split until each part is
+/// accepted or is one fix (which is dropped).
+fn keep_fixes(
+    fixes: &[EngineFieldFix],
+    ok: &dyn Fn(&[EngineFieldFix]) -> bool,
+) -> Vec<EngineFieldFix> {
+    if fixes.is_empty() || ok(fixes) {
+        return fixes.to_vec();
+    }
+    if fixes.len() == 1 {
+        return Vec::new();
+    }
+    let (a, b) = fixes.split_at(fixes.len() / 2);
+    let mut kept = keep_fixes(a, ok);
+    kept.extend(keep_fixes(b, ok));
+    kept
 }
 
 // ---------------------------------------------------------------------------------------
@@ -501,6 +587,9 @@ struct Model {
     extern_calls: BTreeMap<u16, String>,
     /// Library trees called through `use std::globals::*;`.
     std_globals: BTreeSet<u16>,
+    /// A local library declaration clashes with `std::globals` (see
+    /// [`Model::globals_module`]).
+    local_globals_clash: bool,
     /// Callable trees with a known arity and a structured inline call.
     literal_calls: BTreeMap<u16, usize>,
     trees: Vec<TreeModel>,
@@ -897,7 +986,7 @@ impl Model {
                     .is_some_and(|g| g.params == literal_calls.get(id).copied().unwrap_or(0))
             })
             .collect();
-        let extern_calls = extern_calls
+        let extern_calls: BTreeMap<u16, String> = extern_calls
             .into_iter()
             .map(|id| {
                 if let Some(g) = std_global(id).filter(|_| std_globals.contains(&id)) {
@@ -917,6 +1006,14 @@ impl Model {
                 (id, ident)
             })
             .collect();
+        // `use std::globals::*;` merges with a local `extern mod globals`, unless a local
+        // declaration takes a tree id or a name `std::globals` declares (another arity, or
+        // another tree): the merge refuses that, so those files keep `more_globals`.
+        let local_globals_clash = extern_calls.iter().any(|(id, ident)| {
+            *id < 8192
+                && !std_globals.contains(id)
+                && (std_global(*id).is_some() || std_global_names().contains(ident.as_str()))
+        });
 
         let ctx_original = live_context(iff, &options.library_arities);
         let strings = strings_models(iff, &trees);
@@ -938,6 +1035,7 @@ impl Model {
             guid_consts,
             extern_calls,
             std_globals,
+            local_globals_clash,
             literal_calls,
             trees,
             interactions,
@@ -955,10 +1053,34 @@ impl Model {
         })
     }
 
-    /// The local block's name for library trees: a local `globals` would hide
-    /// `std::globals`.
+    /// The local block's name for library trees: `globals`, which merges with the
+    /// `std::globals` import, unless a local declaration clashes with it.
+    /// The v2 path of the object's own BCON entry at operand address `addr`
+    /// (`Table.entry`). A raw block resolves the path to the same address.
+    fn bcon_path(&self, addr: u16) -> Option<String> {
+        let (table, entry) = (addr >> 7, addr & 0x7F);
+        if table >= 64 {
+            return None;
+        }
+        let bcon = self.bcons.iter().find(|b| b.id == 4096 + table)?;
+        let (field, _) = bcon.entries.get(usize::from(entry))?;
+        Some(format!("{}.{field}", bcon.label))
+    }
+
+    /// `line` (lifted `.air`) with each `bcon[addr]` of the object's own tables written as
+    /// its v2 path, except under a label `.air` reserves.
+    fn name_bcons(&self, line: &str) -> String {
+        rewrite_bcons(line, |addr| {
+            self.bcon_path(addr).filter(|path| {
+                path.split('.')
+                    .next()
+                    .is_some_and(|label| !crate::parser::is_reserved_ident(label))
+            })
+        })
+    }
+
     fn globals_module(&self) -> &'static str {
-        if self.std_globals.is_empty() {
+        if self.std_globals.is_empty() || !self.local_globals_clash {
             "globals"
         } else {
             "more_globals"
@@ -1003,12 +1125,14 @@ impl Model {
             tree: e.span.and_then(|s| air_tree_at_line(&air, s.line)),
             message: e.message.clone(),
         })?;
+        let iff_bytes = compiled.iff_bytes.clone();
         let iff = Iff::parse(compiled.iff_bytes).map_err(|e| Failure::Air {
             tree: None,
             message: format!("the compiled IFF does not parse: {e}"),
         })?;
         let ctx = live_context(&iff, &self.library_arities);
         Ok(RecompiledFile {
+            iff_bytes,
             trees: compiled.behaviors,
             ctx,
             sounds: fwav_sounds(&iff),
@@ -1078,6 +1202,71 @@ impl Model {
         };
         cache.insert(key, check.clone());
         check
+    }
+
+    /// Checks every tree that is written: each tree's check, and the trees not proven.
+    fn check_all(
+        &self,
+        recompiled: &RecompiledFile,
+        cache: &mut BTreeMap<(u16, String, String), TreeCheck>,
+    ) -> (BTreeMap<u16, TreeCheck>, Vec<u16>) {
+        let mut checks = BTreeMap::new();
+        let mut unproven = Vec::new();
+        for t in self.trees.iter().filter(|t| t.omitted.is_none()) {
+            let mut check = self.check_tree(t, recompiled, cache);
+            if !matches!(check, TreeCheck::Identical | TreeCheck::Equivalent) {
+                unproven.push(t.id);
+            } else if let Some(gap) = self.object_gap(t, recompiled) {
+                // Settled: no other spelling of the tree closes it.
+                check = TreeCheck::Inconclusive(gap);
+            }
+            checks.insert(t.id, check);
+        }
+        (checks, unproven)
+    }
+
+    /// The final `text` with engine cells that have a typed name written by it (lint
+    /// `untyped_engine_field`'s suggestions), with what it compiles to and its checks.
+    /// - Every suggestion is taken when the object builds to the same bytes, or when every
+    ///   tree proven with the numbers is still proven (a typed name may lower to other
+    ///   nodes: `stack_obj = self.id` is not a copy of data word 11).
+    /// - Otherwise the suggestions that keep the bytes are taken, and each cell left by
+    ///   number carries an `allow` saying why.
+    fn type_engine_fields(
+        &self,
+        text: &str,
+        (recompiled, checks, unproven): (RecompiledFile, BTreeMap<u16, TreeCheck>, &[u16]),
+        cache: &mut BTreeMap<(u16, String, String), TreeCheck>,
+    ) -> (String, RecompiledFile, BTreeMap<u16, TreeCheck>) {
+        let fixes = engine_field_fixes(text);
+        let typed = |fixes: &[EngineFieldFix]| {
+            let t = apply_engine_field_fixes(text, fixes)?;
+            let r = self.compile(&t).ok()?;
+            Some((t, r))
+        };
+        let Some((all, all_compiled)) = (!fixes.is_empty()).then(|| typed(&fixes)).flatten() else {
+            return (text.to_owned(), recompiled, checks);
+        };
+        if all_compiled.iff_bytes == recompiled.iff_bytes {
+            return (all, recompiled, checks);
+        }
+        let (all_checks, all_unproven) = self.check_all(&all_compiled, cache);
+        if all_unproven.iter().all(|id| unproven.contains(id)) {
+            return (all, all_compiled, all_checks);
+        }
+        let same = |fixes: &[EngineFieldFix]| {
+            typed(fixes).is_some_and(|(_, r)| r.iff_bytes == recompiled.iff_bytes)
+        };
+        let mut kept = keep_fixes(&fixes, &same);
+        let base = match (!kept.is_empty()).then(|| typed(&kept)).flatten() {
+            Some((t, r)) if r.iff_bytes == recompiled.iff_bytes => t,
+            _ => {
+                kept.clear();
+                text.to_owned()
+            }
+        };
+        let left: Vec<EngineFieldFix> = fixes.into_iter().filter(|f| !kept.contains(f)).collect();
+        (allow_engine_fields(&base, &left), recompiled, checks)
     }
 
     /// Why tree `t`, proven by its code, still may not behave the same in the rebuilt
@@ -1884,6 +2073,8 @@ fn definition_data(iff: &Iff) -> Option<Vec<(u16, u16, Vec<u8>)>> {
 }
 
 struct RecompiledFile {
+    /// The whole compiled object.
+    iff_bytes: Vec<u8>,
     trees: BTreeMap<u16, BhavChunk>,
     ctx: LiveContext,
     sounds: BTreeMap<u16, String>,
@@ -2527,11 +2718,61 @@ fn direct_local(r: &OperandRef) -> Option<i16> {
     }
 }
 
-/// Whether a body assigns `stack_obj`.
+/// Whether a body may assign `stack_obj` (`verify.rs` lists the primitives that write it).
 fn assigns_stack_obj(body: &[Stmt]) -> bool {
+    fn prim_moves(p: &PrimitiveCall) -> bool {
+        match unpadded(p) {
+            // Searches and creations select what they find or make.
+            PrimitiveCall::FindBestInteraction
+            | PrimitiveCall::FindBestObject { .. }
+            | PrimitiveCall::MakeNewCharacter { .. }
+            | PrimitiveCall::CreateObject { .. } => true,
+            PrimitiveCall::ExprRaw { lhs, operator, .. } => {
+                is_operand(lhs, 10, 0)
+                    && (assign_op_of(*operator).is_some()
+                        || matches!(
+                            compare_op_of(*operator),
+                            Some(CompareOp::IncLt | CompareOp::DecGt)
+                        ))
+            }
+            PrimitiveCall::Random { dst, .. } | PrimitiveCall::GetDirectionTo { dst, .. } => {
+                is_operand(dst, 10, 0)
+            }
+            PrimitiveCall::Relationship { value, .. } => is_operand(value, 10, 0),
+            // Without bit 7 the step writes `stack_obj`, whatever `dest` says.
+            PrimitiveCall::SetToNext { mode, dest, .. } => {
+                mode & 0x80 == 0 || dest.as_ref().is_some_and(|d| is_operand(d, 10, 0))
+            }
+            _ => false,
+        }
+    }
+    // An unparsed node of an opcode that can write `stack_obj` (expression, random,
+    // direction, searches, new character, relationship, set-to-next, create) may.
+    fn raw_moves(opcode: u16) -> bool {
+        matches!(opcode, 2 | 8 | 12 | 14 | 19 | 26 | 31 | 42)
+    }
+    fn cond_moves(c: &Condition) -> bool {
+        match c {
+            Condition::Primitive { prim, .. } => prim_moves(prim),
+            Condition::RawOp { opcode, .. } => raw_moves(*opcode),
+            Condition::Compare {
+                lhs,
+                op: CompareOp::IncLt | CompareOp::DecGt,
+                ..
+            } => is_operand(lhs, 10, 0),
+            Condition::Not(inner) => cond_moves(inner),
+            _ => false,
+        }
+    }
     let mut found = false;
     walk_stmts(body, &mut |s| {
-        found |= matches!(s, Stmt::Assign { lhs, .. } if is_operand(lhs, 10, 0));
+        found |= match s {
+            Stmt::Assign { lhs, .. } => is_operand(lhs, 10, 0),
+            Stmt::Primitive { prim, .. } => prim_moves(prim),
+            Stmt::RawOp { opcode, .. } | Stmt::InlineRawOp { opcode, .. } => raw_moves(*opcode),
+            Stmt::If { cond, .. } | Stmt::While { cond, .. } => cond_moves(cond),
+            _ => false,
+        };
     });
     found
 }
@@ -2847,40 +3088,146 @@ struct StdGlobal {
 
 /// The tree `std::globals` declares with this ID.
 fn std_global(id: u16) -> Option<StdGlobal> {
+    std_global_table().get(&id).copied()
+}
+
+/// Every function name `std::globals` declares.
+fn std_global_names() -> &'static BTreeSet<&'static str> {
+    static NAMES: std::sync::OnceLock<BTreeSet<&'static str>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        include_str!("std/globals.antics")
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("#[id(")?;
+                let (_, rest) = rest.split_once(")]")?;
+                let (name, _) = rest.trim().strip_prefix("fn ")?.split_once('(')?;
+                Some(name)
+            })
+            .collect()
+    })
+}
+
+fn std_global_table() -> &'static BTreeMap<u16, StdGlobal> {
     static TABLE: std::sync::OnceLock<BTreeMap<u16, StdGlobal>> = std::sync::OnceLock::new();
-    TABLE
-        .get_or_init(|| {
-            include_str!("std/globals.antics")
-                .lines()
-                .filter_map(|line| {
-                    let rest = line.trim().strip_prefix("#[id(")?;
-                    let (id, rest) = rest.split_once(")]")?;
-                    let rest = rest.trim().strip_prefix("fn ")?;
-                    let (name, rest) = rest.split_once('(')?;
-                    let (params, ret) = rest.split_once(')')?;
-                    let params = if params.trim().is_empty() {
-                        0
-                    } else {
-                        params.split(',').count()
-                    };
-                    let result = match ret.trim() {
-                        "-> Result;" => true,
-                        "-> bool;" => false,
-                        _ => return None,
-                    };
-                    Some((
-                        id.parse().ok()?,
-                        StdGlobal {
-                            name,
-                            params,
-                            result,
-                        },
-                    ))
-                })
-                .collect()
-        })
-        .get(&id)
-        .copied()
+    TABLE.get_or_init(|| {
+        include_str!("std/globals.antics")
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("#[id(")?;
+                let (id, rest) = rest.split_once(")]")?;
+                let rest = rest.trim().strip_prefix("fn ")?;
+                let (name, rest) = rest.split_once('(')?;
+                let (params, ret) = rest.split_once(')')?;
+                let params = if params.trim().is_empty() {
+                    0
+                } else {
+                    params.split(',').count()
+                };
+                let result = match ret.trim() {
+                    "-> Result;" => true,
+                    "-> bool;" => false,
+                    _ => return None,
+                };
+                Some((
+                    id.parse().ok()?,
+                    StdGlobal {
+                        name,
+                        params,
+                        result,
+                    },
+                ))
+            })
+            .collect()
+    })
+}
+
+/// Whether `text` has a space outside brackets: a binary expression, which `!` must
+/// parenthesize.
+fn has_top_level_space(text: &str) -> bool {
+    let mut depth = 0i32;
+    for c in text.chars() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ' ' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `line` with each standalone `bcon[addr]` that `path` names replaced by the name.
+fn rewrite_bcons(line: &str, path: impl Fn(u16) -> Option<String>) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find("bcon[") {
+        out.push_str(&rest[..at]);
+        let ident_before = out
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+        let inner = &rest[at + "bcon[".len()..];
+        let named = inner.find(']').filter(|_| !ident_before).and_then(|end| {
+            let addr = inner[..end].parse::<u16>().ok()?;
+            Some((path(addr)?, end))
+        });
+        match named {
+            Some((name, end)) => {
+                out.push_str(&name);
+                rest = &inner[end + 1..];
+            }
+            None => {
+                out.push_str("bcon[");
+                rest = inner;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// An Expression primitive the lift wrote as `expr(..)` (padded or not): its operands and
+/// operator byte.
+fn expr_parts(p: &PrimitiveCall) -> Option<(&OperandRef, u8, &OperandRef)> {
+    match unpadded(p) {
+        PrimitiveCall::ExprRaw { lhs, operator, rhs } => Some((lhs, *operator, rhs)),
+        _ => None,
+    }
+}
+
+fn assign_op_of(code: u8) -> Option<AssignOp> {
+    [
+        AssignOp::Set,
+        AssignOp::Add,
+        AssignOp::Sub,
+        AssignOp::Mul,
+        AssignOp::Div,
+        AssignOp::Mod,
+        AssignOp::BitAnd,
+        AssignOp::BitOr,
+        AssignOp::BitXor,
+        AssignOp::FlagSet,
+        AssignOp::FlagClear,
+        AssignOp::Sqrt,
+    ]
+    .into_iter()
+    .find(|op| op.code() == code)
+}
+
+fn compare_op_of(code: u8) -> Option<CompareOp> {
+    [
+        CompareOp::Gt,
+        CompareOp::Lt,
+        CompareOp::Eq,
+        CompareOp::FlagTest,
+        CompareOp::IncLt,
+        CompareOp::Ge,
+        CompareOp::Le,
+        CompareOp::Ne,
+        CompareOp::DecGt,
+    ]
+    .into_iter()
+    .find(|op| op.code() == code)
 }
 
 fn call_params(arity: usize) -> impl Iterator<Item = String> {
@@ -2991,9 +3338,19 @@ struct Plan {
     /// Trees written without the extra idioms (see [`Translator::extra`]), after a round
     /// that used them was not proven.
     plain: BTreeSet<u16>,
+    /// Trees whose locals are named only where a builtin addresses them, after a round that
+    /// named every local was not proven (a pinned word can take the frame word an idiom
+    /// needs); tried before [`Self::plain`].
+    builtin_locals_only: BTreeSet<u16>,
+    /// Raw-level trees whose lines keep `bcon[addr]`, after a round naming the entries did
+    /// not compile (see [`Model::name_bcons`]).
+    raw_bcons_numbered: BTreeSet<u16>,
     /// Trees some caller runs in the other context: written `#[context(inherit)]` (an extra
     /// idiom) so that either context may call them.
     inherit: BTreeSet<u16>,
+    /// Inherit trees [`Self::drop_inherit`] took out: a new order or context tries them
+    /// again, as it does the extras.
+    inherit_dropped: BTreeSet<u16>,
     /// Tree ID -> the level at which its branch order was last swapped (see
     /// [`Plan::other_order`]).
     swapped: BTreeMap<u16, Level>,
@@ -3035,23 +3392,33 @@ impl Plan {
             .map(|t| t.id)
             .collect();
         // A private tree called from a tree of the other context (by the contexts the
-        // trees prefer); never a lifecycle tree or a variant's init/main.
+        // trees prefer), or from an inherit tree (which, lowered in both contexts, calls
+        // only inherit trees); never a lifecycle tree or a variant's init/main. A tree whose
+        // body depends on the context fails to compile as inherit and drops back to its own
+        // context (`drop_inherit`), keeping its other extras.
         let mut inherit = BTreeSet::new();
-        for caller in &model.trees {
-            let Some(body) = &caller.body else {
-                continue;
-            };
-            walk_stmts(body, &mut |s| {
-                if let Some((id, _)) = stmt_call(s)
-                    && let Some(callee) = model.tree(id)
-                    && callee.sim_ctx != caller.sim_ctx
-                    && callee.body.is_some()
-                    && callee.lifecycle.is_none()
-                    && !model.variants.iter().any(|v| v.init == id || v.main == id)
-                {
-                    inherit.insert(id);
-                }
-            });
+        loop {
+            let before = inherit.len();
+            for caller in &model.trees {
+                let Some(body) = &caller.body else {
+                    continue;
+                };
+                let caller_inherits = inherit.contains(&caller.id);
+                walk_stmts(body, &mut |s| {
+                    if let Some((id, _)) = stmt_call(s)
+                        && let Some(callee) = model.tree(id)
+                        && (caller_inherits || callee.sim_ctx != caller.sim_ctx)
+                        && callee.body.is_some()
+                        && callee.lifecycle.is_none()
+                        && !model.variants.iter().any(|v| v.init == id || v.main == id)
+                    {
+                        inherit.insert(id);
+                    }
+                });
+            }
+            if inherit.len() == before {
+                break;
+            }
         }
         Self {
             styles,
@@ -3061,7 +3428,10 @@ impl Plan {
             variants_off: None,
             strings_off: None,
             plain: BTreeSet::new(),
+            builtin_locals_only: BTreeSet::new(),
+            raw_bcons_numbered: BTreeSet::new(),
             inherit,
+            inherit_dropped: BTreeSet::new(),
             swapped: BTreeMap::new(),
         }
     }
@@ -3080,6 +3450,43 @@ impl Plan {
         model.tree(id).is_some_and(|t| t.lifecycle.is_some())
             && !self.standalone.contains(&id)
             && self.framed.insert(id)
+    }
+
+    /// Writes tree `id` in its own context from now on, when the last round wrote it
+    /// inherit. Tried before its other extras: a callee the closure made inherit may depend
+    /// on the context, and its other idioms may still hold in its own.
+    fn drop_inherit(&mut self, model: &Model, id: u16) -> bool {
+        model.tree(id).is_some_and(|t| self.inherits(t))
+            && self.inherit.remove(&id)
+            && self.inherit_dropped.insert(id)
+    }
+
+    /// Gives tree `id` its extras, inherit included, another try.
+    fn retry_extras(&mut self, id: u16) {
+        self.plain.remove(&id);
+        if self.inherit_dropped.remove(&id) {
+            self.inherit.insert(id);
+        }
+    }
+
+    /// Names tree `id`'s locals only where builtins address them from now on, when the last
+    /// round named others. `false` when it did not.
+    fn name_builtin_locals_only(&mut self, id: u16, generated: &Generated) -> bool {
+        generated.named_other_locals.contains(&id) && self.builtin_locals_only.insert(id)
+    }
+
+    /// Writes raw-level tree `id`'s constants as `bcon[addr]` from now on, when the last
+    /// round named them. `false` when it did not.
+    fn number_raw_bcons(&mut self, id: u16, generated: &Generated) -> bool {
+        generated.raw_bcons_named.contains(&id) && self.raw_bcons_numbered.insert(id)
+    }
+
+    /// [`Self::number_raw_bcons`] for every tree, for a failure no one tree is blamed for.
+    fn number_all_raw_bcons(&mut self, generated: &Generated) -> bool {
+        let before = self.raw_bcons_numbered.len();
+        self.raw_bcons_numbered
+            .extend(generated.raw_bcons_named.iter().copied());
+        self.raw_bcons_numbered.len() != before
     }
 
     fn drop_extras(&mut self, id: u16, generated: &Generated) -> bool {
@@ -3129,7 +3536,7 @@ impl Plan {
         }
         model.swap_order(id);
         self.swapped.insert(id, level);
-        self.plain.remove(&id);
+        self.retry_extras(id);
         self.raw_stmts.remove(&id);
         true
     }
@@ -3142,7 +3549,7 @@ impl Plan {
         let next = match self.level(t) {
             Level::Idiomatic if t.sim_ctx => {
                 // The extra idioms get another try in the object's context.
-                self.plain.remove(&id);
+                self.retry_extras(id);
                 Level::IdiomaticObject
             }
             Level::Idiomatic | Level::IdiomaticObject if t.structured => Level::Raw,
@@ -3276,6 +3683,10 @@ struct Generated {
     raw_counts: BTreeMap<u16, usize>,
     /// Trees that used an extra idiom (see [`Translator::extra`]).
     extras: BTreeSet<u16>,
+    /// Trees that named a local no builtin addresses (see [`Plan::name_builtin_locals_only`]).
+    named_other_locals: BTreeSet<u16>,
+    /// Raw-level trees whose lines name BCON entries.
+    raw_bcons_named: BTreeSet<u16>,
     /// 0-based lines holding the `variant` members.
     variant_lines: std::ops::Range<usize>,
     /// 0-based lines holding the `strings` members.
@@ -3309,6 +3720,8 @@ impl Model {
         let mut tree_ranges = Vec::new();
         let mut raw_counts = BTreeMap::new();
         let mut extras = BTreeSet::new();
+        let mut named_other_locals = BTreeSet::new();
+        let mut raw_bcons_named = BTreeSet::new();
         out.line("// Decompiled by `sims-antics lift --v2`.");
         if self.behavioral {
             for line in BEHAVIORAL_HEADER {
@@ -3539,13 +3952,31 @@ impl Model {
                 Some(body) if level.idiomatic() => {
                     let mut named_locals = 0;
                     if as_lifecycle.is_none() && !plan.plain.contains(&t.id) {
+                        let mut builtin_locals = 0;
                         walk_stmts(body, &mut |s| {
                             if let Some(index) = builtin_local(s)
                                 && index < t.original.locals
                             {
-                                named_locals = named_locals.max(index + 1);
+                                builtin_locals = builtin_locals.max(index + 1);
+                            }
+                            // Every local the body reads or writes gets a pinned name.
+                            for op in stmt_operands(s) {
+                                if let OperandRef::Direct(o) = op
+                                    && o.scope == 25
+                                    && let Ok(index) = u16::try_from(o.index)
+                                    && index < t.original.locals
+                                {
+                                    named_locals = named_locals.max(index + 1);
+                                }
                             }
                         });
+                        if plan.builtin_locals_only.contains(&t.id)
+                            || named_locals <= builtin_locals
+                        {
+                            named_locals = builtin_locals;
+                        } else {
+                            named_other_locals.insert(t.id);
+                        }
                     }
                     let mut tr = Translator {
                         model: self,
@@ -3588,16 +4019,28 @@ impl Model {
                     }
                 }
                 _ => {
-                    if level == Level::Raw {
+                    let mut lines = if level == Level::Raw {
                         let (head, close) = t.body_lines;
                         let lines: Vec<&str> = t.lifted[head + 1..close.min(t.lifted.len())]
                             .iter()
                             .map(String::as_str)
                             .collect();
-                        write_raw_block(&mut out, &dedent(&lines));
+                        dedent(&lines)
                     } else {
-                        write_raw_block(&mut out, &t.labeled);
+                        t.labeled.clone()
+                    };
+                    // The names compile to the same addresses, so only a compile failure (or a
+                    // tree with no lower style left) turns them off.
+                    if !plan.raw_bcons_numbered.contains(&t.id)
+                        && lines.iter().any(|l| l.contains("bcon["))
+                    {
+                        let named: Vec<String> = lines.iter().map(|l| self.name_bcons(l)).collect();
+                        if named != lines {
+                            raw_bcons_named.insert(t.id);
+                            lines = named;
+                        }
                     }
+                    write_raw_block(&mut out, &lines);
                 }
             }
             out.indent -= 1;
@@ -3653,6 +4096,8 @@ impl Model {
             tree_ranges,
             raw_counts,
             extras,
+            named_other_locals,
+            raw_bcons_named,
             variant_lines,
             strings_lines,
         }
@@ -3872,7 +4317,10 @@ impl Translator<'_> {
     }
 
     fn emit_raw(&mut self, s: &Stmt) {
-        let lines = self.lifted_lines(s);
+        let mut lines = self.lifted_lines(s);
+        if lines.iter().any(|l| l.contains("bcon[")) && self.extra() {
+            lines = lines.iter().map(|l| self.model.name_bcons(l)).collect();
+        }
         self.raw.extend(lines);
         self.raw_count += 1;
     }
@@ -3981,19 +4429,21 @@ impl Translator<'_> {
             }
             Stmt::Loop { body, .. } => {
                 self.flush_raw(out);
-                // A breakpoint whose true branch is itself: the original's own trap, which
-                // runs until the VM errors the object out.
+                // A primitive whose true branch is itself: the original's own loop (a
+                // breakpoint trap, for one), which runs until the VM errors the object out.
                 if let [
                     Stmt::Primitive {
-                        prim: PrimitiveCall::Breakpoint { .. },
+                        prim,
                         branches: None,
                         ..
                     },
                 ] = body.as_slice()
                 {
-                    out.line(
-                        "// antics-lint: allow(unbounded_loop_without_yield): the original's breakpoint loops on itself",
-                    );
+                    out.line(if matches!(unpadded(prim), PrimitiveCall::Breakpoint { .. }) {
+                        "// antics-lint: allow(unbounded_loop_without_yield): the original's breakpoint loops on itself"
+                    } else {
+                        "// antics-lint: allow(unbounded_loop_without_yield): the original's node loops on itself"
+                    });
                 }
                 let start = out.lines.len();
                 out.line("loop {");
@@ -4875,9 +5325,9 @@ impl Translator<'_> {
                     return Some(format!("{lhs} {} {rhs};", assign_operator(op)?));
                 }
                 let op = match op {
-                    AssignOp::FlagSet | AssignOp::FlagClear
-                        if self.flags_place(lhs).is_some() && self.extra() =>
-                    {
+                    // On a bitflags place or any other `i16` cell (whose bit number v2
+                    // passes through).
+                    AssignOp::FlagSet | AssignOp::FlagClear if self.extra() => {
                         if *op == AssignOp::FlagSet {
                             "flag_set"
                         } else {
@@ -4886,7 +5336,33 @@ impl Translator<'_> {
                     }
                     _ => assign_operator(op)?,
                 };
-                Some(format!("{} {op} {};", self.lvalue(lhs)?, self.rvalue(rhs)?))
+                let (lhs, mut rhs) = (self.lvalue(lhs)?, self.rvalue(rhs)?);
+                // `stack_obj` takes a handle: an object's data word 11 is its id.
+                if lhs == "stack_obj"
+                    && op == "="
+                    && let Some(base) = rhs.strip_suffix(".data[11]")
+                    && matches!(base, "self" | "sim" | "stack_obj" | "me")
+                    && self.extra()
+                {
+                    rhs = format!("{base}.id");
+                }
+                Some(format!("{lhs} {op} {rhs};"))
+            }
+            // An `expr(..)` written for its operand padding is the plain assignment.
+            Stmt::Primitive {
+                span,
+                prim,
+                branches: None,
+            } if let Some((lhs, code, rhs)) = expr_parts(prim)
+                && let Some(op) = assign_op_of(code)
+                && self.extra() =>
+            {
+                self.simple(&Stmt::Assign {
+                    span: *span,
+                    lhs: lhs.clone(),
+                    op,
+                    rhs: rhs.clone(),
+                })
             }
             Stmt::Return {
                 target: Target::ReturnTrue,
@@ -4997,9 +5473,9 @@ impl Translator<'_> {
                             .extra()
                             .then(|| format!("{name}(&mut {place}, {bound})"));
                     }
-                    CompareOp::FlagTest if self.flags_place(lhs).is_some() && self.extra() => {
-                        "flag_test"
-                    }
+                    // Bitflags places, and any other `i16` cell (v2 types both sides as
+                    // `i16` there).
+                    CompareOp::FlagTest if self.extra() => "flag_test",
                     CompareOp::FlagTest => return None,
                 };
                 Some(format!("{} {op} {}", self.rvalue(lhs)?, self.rvalue(rhs)?))
@@ -5010,10 +5486,28 @@ impl Translator<'_> {
                 pass_temps,
                 ..
             } => self.call(*id, args, *pass_temps),
+            // An `expr(..)` written for its operand padding is the plain comparison.
+            Condition::Primitive { span, prim }
+                if let Some((lhs, code, rhs)) = expr_parts(prim)
+                    && let Some(op) = compare_op_of(code) =>
+            {
+                if !self.extra() {
+                    return None;
+                }
+                self.cond(&Condition::Compare {
+                    span: *span,
+                    lhs: lhs.clone(),
+                    op,
+                    rhs: rhs.clone(),
+                })
+            }
             Condition::Primitive { prim, .. } => self.prim_cond(prim),
             Condition::Not(inner) => {
                 let text = self.cond(inner)?;
-                if matches!(inner.as_ref(), Condition::Compare { .. }) {
+                // Any binary condition (a compare, or a padded `expr` written as one) binds
+                // looser than `!`.
+                if matches!(inner.as_ref(), Condition::Compare { .. }) || has_top_level_space(&text)
+                {
                     Some(format!("!({text})"))
                 } else {
                     Some(format!("!{text}"))
@@ -5072,6 +5566,10 @@ impl Translator<'_> {
                 ))
             }
             PrimitiveCall::Animate { .. } => self.animate(p),
+            // The pad covers only bytes the VM reads no differently.
+            PrimitiveCall::Padded { call, .. } => self
+                .builtin(p)
+                .or_else(|| self.extra().then(|| self.prim_cond(call)).flatten()),
             other => self.builtin(other),
         }
     }
@@ -5103,7 +5601,10 @@ impl Translator<'_> {
                     self.play_sound(*sound_id, operands[4])
                 }
                 PrimitiveCall::StopAllSounds { .. } if self.extra() => self.prim_stmt(call),
-                _ => self.builtin(p),
+                // The pad covers only bytes the VM reads no differently.
+                _ => self
+                    .builtin(p)
+                    .or_else(|| self.extra().then(|| self.prim_stmt(call)).flatten()),
             },
             PrimitiveCall::StopAllSounds { use_stack_object } => {
                 let target = self.sound_target(*use_stack_object);
@@ -5131,6 +5632,8 @@ impl Translator<'_> {
     /// stack object in a Sim-context tree.
     fn sound_target(&self, stack: bool) -> &'static str {
         match (self.sim, stack) {
+            // An inherit tree's default target depends on the caller; `me` does not.
+            (false, false) if self.inherit => "me",
             (false, false) | (true, true) => "",
             (true, false) => "sim",
             (false, true) => "stack_obj",
@@ -5262,6 +5765,10 @@ impl Translator<'_> {
             } if flags & 0x20 == 0 => format!(
                 "special_effect(duration: {duration}, kind: {kind}, size: {size}, flags: {flags}, str_index: {str_index})"
             ),
+            // The pad covers only bytes the VM reads no differently.
+            PrimitiveCall::Padded { call, .. } if self.extra() => {
+                return self.builtin(call).or_else(|| self.pilot_builtin(p));
+            }
             _ => self.pilot_builtin(p)?,
         })
     }
@@ -5420,11 +5927,9 @@ impl Translator<'_> {
             7 => Some(o.index.to_string()),
             26 => {
                 let addr = o.index as u16;
-                let (table, entry) = (addr >> 7, addr & 0x7F);
+                let table = addr >> 7;
                 if table < 64 {
-                    let bcon = self.model.bcons.iter().find(|b| b.id == 4096 + table)?;
-                    let (field, _) = bcon.entries.get(usize::from(entry))?;
-                    Some(format!("{}.{field}", bcon.label))
+                    self.model.bcon_path(addr)
                 } else {
                     let name = self.model.extern_bcons.get(&addr)?;
                     Some(format!("library_consts.{name}"))
@@ -5434,6 +5939,9 @@ impl Translator<'_> {
             9 if o.index == 0 && self.in_handler => Some("event".to_owned()),
             20 if !self.sim && !self.inherit && o.index >= 0 && self.extra() => {
                 Some(format!("self.slot[{}]", o.index))
+            }
+            20 if self.sim && (0..=255).contains(&o.index) && self.extra() => {
+                Some(format!("sim.slot[{}]", o.index))
             }
             16 if self.sim && o.index >= 0 && self.extra() => {
                 let handle = if self.stack_moves {
@@ -5541,6 +6049,19 @@ impl Translator<'_> {
             (0, true) if i <= 255 && self.extra() => format!("sim.attr[{i}]"),
             (3, true) if i <= 255 && self.extra() => format!("sim.data[{i}]"),
             (4, _) if i == 8 && self.extra() => "stack_obj.data[8]".to_owned(),
+            // The stack object's cells: `stack_obj.*` in an object tree; in a Sim tree,
+            // where the stack object is `self`, `self.*` unless the tree moves `stack_obj`.
+            (0, false) if i <= 255 && self.extra() => format!("self.attr[{i}]"),
+            (1, _) | (4, _) if i <= 255 && self.extra() => {
+                let handle = if self.sim && !self.stack_moves {
+                    "self"
+                } else {
+                    "stack_obj"
+                };
+                let field = if o.scope == 1 { "attr" } else { "data" };
+                format!("{handle}.{field}[{i}]")
+            }
+            (15, _) if i <= 255 && self.extra() => format!("stack_obj.motive[{i}]"),
             (14, true) => format!("sim.motive[{i}]"),
             (18, true) => self
                 .personality("sim", i)
@@ -5549,7 +6070,10 @@ impl Translator<'_> {
             (19, _) => {
                 let binding = self.person_binding();
                 self.personality(binding.unwrap_or("stack_obj"), i)
-                    .or_else(|| binding.map(|p| format!("{p}.person[{i}]")))?
+                    .or_else(|| binding.map(|p| format!("{p}.person[{i}]")))
+                    .or_else(|| {
+                        (i <= 255 && self.extra()).then(|| format!("stack_obj.person[{i}]"))
+                    })?
             }
             (25, _) => self.local_name(i as u16)?,
             _ => return None,
@@ -5733,7 +6257,7 @@ mod tests {
     }
 
     #[test]
-    fn std_globals_are_used_and_the_rest_stay_local() {
+    fn std_globals_are_used_and_the_rest_merge_into_a_local_globals() {
         let lifted = lift_source(
             r#"use std::globals::*;
 
@@ -5759,15 +6283,49 @@ object "Fable Lamp" {
             &lifted,
             &[
                 "use std::globals::*;",
-                "extern mod more_globals {",
+                "extern mod globals {",
                 "#[id(300)] fn global_300() -> bool;",
                 "globals::standard_entry()",
                 "globals::am_i_a_child()",
-                "more_globals::global_300()",
+                "globals::global_300()",
+            ],
+        );
+        assert!(!lifted.contains("more_globals"), "{lifted}");
+        assert!(!lifted.contains("#[id(272)]"), "{lifted}");
+    }
+
+    #[test]
+    fn a_local_declaration_of_a_std_tree_keeps_more_globals() {
+        // 273 is called passing temps, but `std::globals` declares it with one argument:
+        // merging the two declarations would be refused.
+        let lifted = lift_source(
+            r#"use std::globals::*;
+
+extern mod more_globals {
+    #[id(273)] fn exit_now() -> bool;
+}
+
+object "Fable Lamp" {
+    guid: 0x7E00_013A;
+    #[bhav(id = 4300, label = "Use", locals = 0)]
+    fn use_it() {
+        globals::standard_entry()?;
+        if more_globals::exit_now() {
+            temp[0] = 1;
+        }
+    }
+}"#,
+        );
+        has(
+            &lifted,
+            &[
+                "use std::globals::*;",
+                "extern mod more_globals {",
+                "#[id(273)]",
+                "globals::standard_entry()",
             ],
         );
         assert!(!lifted.contains("extern mod globals"), "{lifted}");
-        assert!(!lifted.contains("#[id(272)]"), "{lifted}");
     }
 
     #[test]
@@ -5896,6 +6454,355 @@ object "Fable Lamp" {
 }"#,
         );
         has(&lifted, &["stack_obj = temp[1];", "stack_obj.attr[0] = 2;"]);
+    }
+
+    #[test]
+    fn every_local_a_tree_uses_is_named() {
+        let lifted = lift_source(
+            r#"object "Fable Kiln" {
+    guid: 0x7E00_013B;
+    #[bhav(id = 4300, label = "Fire", locals = 2)]
+    fn fire() {
+        raw {
+            local[0] := temp[0];
+            local[1] := local[0];
+            temp[1] := local[1];
+            my.attr[2] := local[0];
+        }
+    }
+}"#,
+        );
+        has(
+            &lifted,
+            &[
+                "#[slot(0)] let slot_0: i16;",
+                "#[slot(1)] let slot_1: i16;",
+                "slot_1 = slot_0;",
+                "temp[1] = slot_1;",
+            ],
+        );
+        assert!(!lifted.contains("raw {"), "{lifted}");
+    }
+
+    #[test]
+    fn object_and_stack_cells_and_ids_leave_raw() {
+        let lifted = lift_source(
+            r#"object "Fable Loom" {
+    guid: 0x7E00_013C;
+    #[bhav(id = 4300, label = "Weave", locals = 0)]
+    fn weave() {
+        raw {
+            my.attr[3] := 4;
+            stack_obj := temp[0];
+            stack.attr[1] := my.attr[3];
+            stack.data[2] := 5;
+            temp[1] := stack.person[4];
+            stack_obj := my.data[11];
+            stack.motive[2] := 1;
+        }
+    }
+}"#,
+        );
+        has(
+            &lifted,
+            &[
+                "self.attr_3 = 4;",
+                "stack_obj.attr[1] = self.attr_3;",
+                "stack_obj.data[2] = 5;",
+                "temp[1] = stack_obj.person[4];",
+                "stack_obj = self.id;",
+                "stack_obj.motive[2] = 1;",
+            ],
+        );
+        assert!(!lifted.contains("raw {"), "{lifted}");
+    }
+
+    #[test]
+    fn padded_expressions_and_primitives_leave_raw() {
+        let lifted = lift_source(
+            r#"object "Fable Lathe" {
+    guid: 0x7E00_013D;
+    #[bhav(id = 4300, label = "Turn", locals = 0)]
+    fn turn() {
+        raw {
+            expr(temp[0] := 3) pad 0xff;
+            expr(temp[1] += temp[0]) pad 0xff;
+            if expr(temp[1] > 2) pad 0xff {
+                notify_idle() pad 0xff;
+            }
+        }
+    }
+}"#,
+        );
+        has(
+            &lifted,
+            &[
+                "temp[0] = 3;",
+                "temp[1] += temp[0];",
+                "if !(temp[1] > 2) {",
+                "notify_out_of_idle();",
+            ],
+        );
+        assert!(!lifted.contains("raw {"), "{lifted}");
+    }
+
+    #[test]
+    fn a_sim_tree_whose_search_moves_stack_obj_names_its_cells_by_stack_obj() {
+        let lifted = lift_source(
+            r#"object "Fable Quill" {
+    guid: 0x7E00_013E;
+    #[bhav(id = 4300, label = "Look", locals = 0)]
+    fn look(sim: Sim) {
+        raw {
+            if find_best_interaction() {
+                stack.data[25] := 100;
+            }
+        }
+    }
+}"#,
+        );
+        has(&lifted, &["stack_obj.data[25] = 100;"]);
+        assert!(!lifted.contains("self.data[25]"), "{lifted}");
+    }
+
+    #[test]
+    fn a_sim_tree_whose_step_search_or_creation_moves_stack_obj_names_its_cells_by_stack_obj() {
+        // A step with no destination, a search, a creation and a direction read into
+        // `stack_obj` all move it.
+        let lifted = lift_source(
+            r#"object "Fable Quill" {
+    guid: 0x7E00_0143;
+    #[bhav(id = 4300, label = "Look", locals = 0)]
+    fn look(sim: Sim) {
+        raw {
+            my.motive[1] := 2;
+            if set_to_next(person) {
+                stack.data[25] := 100;
+            }
+        }
+    }
+    #[bhav(id = 4301, label = "Seek", locals = 0)]
+    fn seek(sim: Sim) {
+        raw {
+            my.motive[1] := 2;
+            if find_best_object(0, 0) {
+                stack.data[26] := 100;
+            }
+        }
+    }
+    #[bhav(id = 4302, label = "Make", locals = 0)]
+    fn make(sim: Sim) {
+        raw {
+            my.motive[1] := 2;
+            if create_object(0x7E00_0143) {
+                stack.data[27] := 100;
+            }
+        }
+    }
+    #[bhav(id = 4303, label = "Turn", locals = 0)]
+    fn turn(sim: Sim) {
+        raw {
+            my.motive[1] := 2;
+            get_direction_to(stack_obj);
+            stack.data[28] := 100;
+        }
+    }
+}"#,
+        );
+        for i in 25..=28 {
+            assert!(!lifted.contains(&format!("self.data[{i}]")), "{lifted}");
+        }
+        has(
+            &lifted,
+            &["stack_obj.data[25] = 100;", "stack_obj.data[28] = 100;"],
+        );
+    }
+
+    #[test]
+    fn bit_operations_and_sim_slots_leave_raw() {
+        let lifted = lift_source(
+            r#"object "Fable Spool" {
+    guid: 0x7E00_013F;
+    #[bhav(id = 4300, label = "Tidy", locals = 0)]
+    fn tidy(sim: Sim) {
+        raw {
+            my.motive[1] := 2;
+            my.motive[2] := 3;
+            my.data[5] flag_set 3;
+            if temp[0] flag_test 2 {
+                stack.data[4] flag_clear 1;
+            }
+            if my.slot[0] == 0 {
+                temp[1] := 1;
+            }
+        }
+    }
+}"#,
+        );
+        has(
+            &lifted,
+            &[
+                "sim.data[5] flag_set 3;",
+                "if temp[0] flag_test 2 {",
+                "self.data[4] flag_clear 1;",
+                "if !(sim.hand == 0) {",
+            ],
+        );
+        assert!(!lifted.contains("raw {"), "{lifted}");
+    }
+
+    #[test]
+    fn an_inherit_trees_callees_inherit_and_its_sounds_name_me() {
+        let lifted = lift_source(
+            r#"object "Fable Bell" {
+    guid: 0x7E00_0140;
+    #[bhav(id = 4300, label = "Ring", locals = 0)]
+    fn ring(sim: Sim) {
+        raw {
+            my.motive[1] := 2;
+            if call 4301(temps) {
+                temp[0] := 1;
+            }
+        }
+    }
+    #[bhav(id = 4301, label = "Chime", locals = 0)]
+    fn chime() {
+        raw {
+            if call 4302(temps) {
+                temp[1] := 1;
+            }
+        }
+    }
+    #[bhav(id = 4302, label = "Tone", locals = 0)]
+    fn tone() {
+        raw {
+            play_sound(5);
+        }
+    }
+}"#,
+        );
+        assert!(!lifted.contains("raw {"), "{lifted}");
+        has(&lifted, &["play_sound(5, me);"]);
+        assert_eq!(lifted.matches("context = inherit").count(), 2, "{lifted}");
+    }
+
+    #[test]
+    fn a_callee_that_fails_as_inherit_keeps_its_other_idioms() {
+        let lifted = lift_source(
+            r#"object "Fable Gong" {
+    guid: 0x7E00_0145;
+    #[bhav(id = 4300, label = "Strike", locals = 0)]
+    fn strike(sim: Sim) {
+        raw {
+            my.motive[1] := 2;
+            if call 4301(temps) {
+                temp[0] := 1;
+            }
+        }
+    }
+    #[bhav(id = 4301, label = "Swing", locals = 0)]
+    fn swing() {
+        raw {
+            if call 4302(temps) {
+                temp[1] := 1;
+            }
+        }
+    }
+    #[bhav(id = 4302, label = "Fade", locals = 0)]
+    fn fade() {
+        raw {
+            my.attr[2] := 1;
+            play_sound(5);
+            remove_object(me);
+        }
+    }
+}"#,
+        );
+        // The leaf drops back to the object's context and keeps its idioms.
+        let leaf = &lifted[lifted.find("fn fade_4302").expect("leaf")..];
+        assert!(!leaf.contains("raw {"), "{lifted}");
+        has(leaf, &["self.attr_2 = 1;", "play_sound(5);"]);
+    }
+
+    #[test]
+    fn engine_cells_with_a_typed_name_take_it() {
+        let lifted = lift_source(
+            r#"object "Fable Lamp" {
+    guid: 0x7E00_0146;
+    #[bhav(id = 4300, label = "Glow", locals = 0)]
+    fn glow(sim: Sim) {
+        raw {
+            my.motive[1] := 2;
+            my.person[0] := 1;
+            stack.data[25] := 1;
+            if global[0] > 20 {
+                temp[0] := 1;
+            }
+        }
+    }
+}"#,
+        );
+        has(
+            &lifted,
+            &["sim.posture = 1;", "self.in_use = 1;", "world.hour > 20"],
+        );
+    }
+
+    #[test]
+    fn typed_engine_fields_keep_what_builds_the_same_and_allow_the_rest() {
+        let text = "fn f() {\n    stack_obj = self.data[11];\n    x = sim.slot[0] + global[0];\n}";
+        let fix = |line, column, typed: &str| (line, column, typed.to_owned());
+        let fixes = vec![
+            fix(2, 17, "self.id"),
+            fix(3, 9, "sim.hand"),
+            fix(3, 23, "world.hour"),
+        ];
+        assert_eq!(
+            apply_engine_field_fixes(text, &fixes).as_deref(),
+            Some("fn f() {\n    stack_obj = self.id;\n    x = sim.hand + world.hour;\n}")
+        );
+        // Halving keeps every fix the check accepts and drops only the one it refuses.
+        let ok = |fs: &[EngineFieldFix]| fs.iter().all(|f| f.2 != "self.id");
+        assert_eq!(keep_fixes(&fixes, &ok), fixes[1..].to_vec());
+        assert_eq!(
+            allow_engine_fields(text, &fixes[..1]),
+            "fn f() {\n    // antics-lint: allow(untyped_engine_field): `self.id` builds other nodes, \
+             not proven the same here\n    stack_obj = self.data[11];\n    x = sim.slot[0] + global[0];\n}"
+        );
+    }
+
+    #[test]
+    fn raw_lines_name_the_objects_own_bcon_entries() {
+        let lifted = lift_source(
+            r#"object "Fable Gauge" {
+    guid: 0x7E00_0142;
+    bcon 4096 "Tuning" {
+        speed = 5,
+        size = 7,
+    }
+    #[bhav(id = 4300, label = "Read", locals = 0)]
+    fn read() {
+        raw {
+            scope(21, 3) := bcon[1];
+        }
+        temp[0] = Tuning.speed;
+        temp[1] = Tuning.size;
+    }
+}"#,
+        );
+        has(
+            &lifted,
+            &["scope(21, 3) := Tuning.e1;", "temp[0] = Tuning.e0;"],
+        );
+        assert!(!lifted.contains("bcon["), "{lifted}");
+        let path = |addr: u16| (addr == 1).then(|| "Tuning.size".to_owned());
+        assert_eq!(
+            rewrite_bcons(
+                "x := bcon[1]; y := my_bcon[1]; z := bcon[300] + bcon[1];",
+                path
+            ),
+            "x := Tuning.size; y := my_bcon[1]; z := bcon[300] + Tuning.size;"
+        );
     }
 
     #[test]
