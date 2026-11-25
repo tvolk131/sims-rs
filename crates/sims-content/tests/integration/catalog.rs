@@ -1,6 +1,4 @@
-mod common;
-
-use common::{Tree, far, iff, objd};
+use crate::common::{Tree, far, iff, objd};
 use sims_content::{Catalog, Index, Install};
 
 fn catalog(tree: &Tree) -> (Index, Catalog) {

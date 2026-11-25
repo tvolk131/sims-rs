@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 
 use sims_content::family_import::{
     ImportInput, ImportOptions, TEMPLATE_CAT, TEMPLATE_DOG, TEMPLATE_PERSON, clone_character,

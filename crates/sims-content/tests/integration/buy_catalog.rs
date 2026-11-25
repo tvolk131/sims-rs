@@ -1,9 +1,7 @@
 //! The Buy catalog's eligibility, catalog text and category labels, on
 //! synthetic resources. No game data.
 
-mod common;
-
-use common::{Tree, far};
+use crate::common::{Tree, far};
 use sims_content::{
     BuyDefinition, BuyEligibility, BuyLabels, Catalog, CatalogText, Index, Install,
     has_interactions, master_of,

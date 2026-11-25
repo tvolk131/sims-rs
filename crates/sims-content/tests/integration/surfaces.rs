@@ -1,6 +1,4 @@
-mod common;
-
-use common::{Tree, iff};
+use crate::common::{Tree, iff};
 use sims_content::{Install, Surfaces};
 
 /// A pattern file in a subdirectory is in the catalog (the scan goes into

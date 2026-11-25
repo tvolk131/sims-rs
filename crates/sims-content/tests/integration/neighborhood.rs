@@ -1,6 +1,4 @@
-mod common;
-
-use common::{Tree, far, iff, objd};
+use crate::common::{Tree, far, iff, objd};
 use sims_content::{Catalog, House, Index, Install, Neighborhood};
 
 fn saved(magic: &[u8; 4], version: u32) -> Vec<u8> {
