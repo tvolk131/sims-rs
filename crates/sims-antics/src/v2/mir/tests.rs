@@ -114,6 +114,7 @@ fn pipeline_applies_frame_facts() {
         raw_declared: &declared,
         has_slots: false,
         pinned_locals: &no_slots,
+        min_locals: 0,
     };
     // Layout kept: only the unread entry save goes; undeclared raw constants are prepended.
     let body = "    let __self_obj = stack_obj;\n    my.attr[0] := K;\n    return true;\n";

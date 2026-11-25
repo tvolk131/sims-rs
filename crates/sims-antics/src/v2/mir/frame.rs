@@ -111,41 +111,41 @@ fn plan_frame_slots(
 }
 
 /// Which local occupies each frame word of the finished tree `body` (before `@slot(N)`
-/// placement, which `has_slots` says runs): an explicit `local[N]` holds itself, a placed local
-/// its [`assign_frame_slots`] word, and every other `let` the word `.air` gives it, after the
-/// highest explicit or placed word and the `min_locals` floor (`push_frame_floor`: the highest
-/// `@slot` word plus one), in declaration order. The word right after those holds
-/// [`IDLE_SCRATCH`]: `.air` saves `param[0]` there around an `idle` when the tree uses both
-/// (a fact the slot scan does not report, so the word is always counted as taken). `None` if
-/// `.air` cannot parse the body.
+/// placement, which `has_slots` says runs), read the way `.air` reads the placed body: a word
+/// the placed body names (`local[N]`) holds the local placed there, or itself, and every
+/// remaining `let` takes the word `.air` gives it, after the highest named word and the
+/// header's `min_locals` floor (0 when the header has none), in declaration order. A placed
+/// local the body never names past its `let x;` is gone from the placed body and holds no
+/// word. The word right after the named locals holds [`IDLE_SCRATCH`]: `.air` saves `param[0]`
+/// there around an `idle` when the tree uses both (a fact the slot scan does not report, so the
+/// word is always counted as taken). `None` if `.air` cannot parse the body.
 pub(crate) fn frame_occupancy(
     body: &str,
     pinned: &BTreeMap<String, usize>,
     raw_declared: &BTreeSet<String>,
     has_slots: bool,
+    min_locals: usize,
 ) -> Option<BTreeMap<usize, String>> {
     let (usage, slots) = if has_slots {
-        plan_frame_slots(body, pinned, raw_declared)?
+        let (_, slots) = plan_frame_slots(body, pinned, raw_declared)?;
+        (body_local_usage(&place_locals(body, &slots)?)?, slots)
     } else {
         (body_local_usage(body)?, BTreeMap::new())
     };
+    let placed: BTreeMap<usize, &String> = slots.iter().map(|(name, &w)| (w, name)).collect();
     let mut words: BTreeMap<usize, String> = usage
         .explicit
         .iter()
-        .map(|&w| (w, format!("local[{w}]")))
+        .map(|&w| {
+            let occupant = placed
+                .get(&w)
+                .map_or_else(|| format!("local[{w}]"), |n| (*n).clone());
+            (w, occupant)
+        })
         .collect();
-    for (name, &w) in &slots {
-        words.insert(w, name.clone());
-    }
-    let floor = if has_slots {
-        pinned.values().max().map_or(0, |top| top + 1)
-    } else {
-        0
-    };
-    let first = words.keys().last().map_or(0, |w| w + 1).max(floor);
-    let placed = usage.lets.iter().filter(|n| !slots.contains_key(*n));
+    let first = words.keys().last().map_or(0, |w| w + 1).max(min_locals);
     let mut end = first;
-    for (word, name) in (first..).zip(placed) {
+    for (word, name) in (first..).zip(&usage.lets) {
         words.insert(word, name.clone());
         end = word + 1;
     }

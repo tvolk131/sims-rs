@@ -92,6 +92,8 @@ pub(super) fn raw_primitive_clobbers_stack_obj(prim: &crate::ast::PrimitiveCall)
         P::ExprRaw { lhs, .. } => is_stack_obj_operand(lhs),
         P::Random { dst, .. } | P::GetDirectionTo { dst, .. } => is_stack_obj_operand(dst),
         P::Relationship { value, .. } => is_stack_obj_operand(value),
+        // A padded encoding runs the primitive it wraps.
+        P::Padded { call, .. } => raw_primitive_clobbers_stack_obj(call),
         _ => false,
     }
 }
@@ -131,23 +133,6 @@ pub(super) fn raw_air_stmts_clobber_stack_obj(stmts: &[crate::ast::Stmt]) -> boo
     })
 }
 
-/// Whether a raw block defines a label (another raw block may branch to it). A block that does
-/// not parse on its own counts as defining one.
-pub(super) fn raw_air_defines_label(code: &str) -> bool {
-    let wrapped = format!("tree 4096 \"__raw_labels\" {{\n{code}\n}}\n");
-    match crate::parser::parse_module(&wrapped) {
-        Ok(module) => match module.items.first() {
-            Some(crate::ast::Item::Tree(tree)) => {
-                let mut labels = BTreeSet::new();
-                collect_raw_air_labels(&tree.body, &mut labels);
-                !labels.is_empty()
-            }
-            _ => true,
-        },
-        Err(_) => true,
-    }
-}
-
 pub(super) fn collect_raw_air_labels<'a>(
     stmts: &'a [crate::ast::Stmt],
     labels: &mut BTreeSet<&'a str>,
@@ -165,7 +150,7 @@ pub(super) fn collect_raw_air_labels<'a>(
                 collect_raw_air_labels(then_body, labels);
                 collect_raw_air_labels(else_body, labels);
             }
-            crate::ast::Stmt::While { body, .. } => {
+            crate::ast::Stmt::While { body, .. } | crate::ast::Stmt::Loop { body, .. } => {
                 collect_raw_air_labels(body, labels);
             }
             _ => {}
@@ -241,7 +226,7 @@ pub(super) fn validate_raw_air_stmts(
                 validate_raw_air_stmts(then_body, in_raw_loop, defined_labels, span)?;
                 validate_raw_air_stmts(else_body, in_raw_loop, defined_labels, span)?;
             }
-            crate::ast::Stmt::While { body, .. } => {
+            crate::ast::Stmt::While { body, .. } | crate::ast::Stmt::Loop { body, .. } => {
                 validate_raw_air_stmts(body, true, defined_labels, span)?;
             }
             _ => {}

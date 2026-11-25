@@ -98,6 +98,7 @@ impl<'a> TreeLowerer<'a> {
             raw_declared: &self.raw_declared,
             has_slots: self.slot_span.is_some(),
             pinned_locals: &self.pinned_locals,
+            min_locals: self.frame_floor().unwrap_or(0),
         };
         let body = self.em.into_text();
         let mut out = if self.used_saved_stack_obj {
@@ -130,10 +131,21 @@ impl<'a> TreeLowerer<'a> {
     /// Adds `min_locals: N` to a tree header when an `@slot(N - 1)` word must be in the frame:
     /// the tree may never name it again (an uninitialized slot a raw primitive or text reads by
     /// number), and `.air` sizes the frame by the words the body names.
+    /// The header's `@frame(locals: K)` sets the frame size in its place, with no floor
+    /// (`write_framed_tree`).
     pub(super) fn push_frame_floor(&self, header: &mut Vec<String>) {
-        if let Some(top) = self.pinned_locals.values().max() {
-            header.push(format!("min_locals: {}", top + 1));
+        if let Some(floor) = self.frame_floor() {
+            header.push(format!("min_locals: {floor}"));
         }
+    }
+
+    /// The `min_locals` floor [`Self::push_frame_floor`] puts in the header: the highest
+    /// `@slot` word plus one, unless the tree has `@frame(locals: K)`.
+    pub(super) fn frame_floor(&self) -> Option<usize> {
+        if self.frame_locals.is_some() {
+            return None;
+        }
+        self.pinned_locals.values().max().map(|top| top + 1)
     }
 
     pub(super) fn fresh(&mut self, prefix: &str) -> String {

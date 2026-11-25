@@ -17,19 +17,22 @@ impl<'a> TreeLowerer<'a> {
     /// Whatever a statement lowers, including a `return`'s cleanups, is emitted inside it, and
     /// a cleanup still pending after it is lowered from its AST where it is emitted.
     ///
-    /// Source order is control order only without raw labels: a raw branch from after a move
-    /// may jump back to a label before it, so a tree whose raw blocks define a label has no
-    /// such prefix.
+    /// Source order is control order only when no raw block branches by label or node number:
+    /// such a branch from after a move may jump back before it, so a tree with one has no such
+    /// prefix. (A raw block in an inlined helper or under a cleanup may only branch to its own
+    /// labels.)
     pub(super) fn lower_tree_body(&mut self, stmts: &[V2Stmt]) -> Result<()> {
         let sim = match &self.tree_ctx {
             TreeContext::SimOnObject { sim_name } => Some(sim_name.clone()),
             TreeContext::ObjectSelf => None,
         };
         let mut prefix = sim.is_some()
-            && !specialize::stmts_any(
-                stmts,
-                &|s| matches!(s, V2Stmt::RawAir { code, .. } if raw_air_defines_label(code)),
-            );
+            && !specialize::stmts_any(stmts, &|s| {
+                matches!(s, V2Stmt::RawAir { code, .. } if {
+                    let facts = raw_facts::raw_facts(code, None);
+                    facts.defines_label || facts.positional_target
+                })
+            });
         for stmt in stmts {
             prefix = prefix
                 && !stmts_may_clobber_stack_obj(

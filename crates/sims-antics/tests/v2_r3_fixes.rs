@@ -481,3 +481,85 @@ fn an_out_operand_keeps_the_old_value_on_the_exit_it_does_not_write() {
     let a = tree(&air, "a");
     assert!(a.contains("= 7;"), "the initial store stays:\n{a}");
 }
+
+/// A raw branch to a node by number may also jump back before the first move.
+#[test]
+fn a_positional_raw_branch_disables_in_place_self() {
+    let src = obj(
+        "Plain",
+        r#"    tree a (sim: Sim) {
+        self.value += 1;
+        if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
+            return false;
+        }
+        raw { random(temp[2], 1) -> true: 1, false: false; }
+    }"#,
+    );
+    let air = expand("raw_positional.antics", &src);
+    let a = tree(&air, "a");
+    let write = a.find("stack.attr[0]").expect("the self write");
+    assert!(
+        a[..write].contains("stack_obj :="),
+        "the write switches to the entry object first:\n{a}"
+    );
+}
+
+/// A padded raw primitive runs the primitive it wraps: a padded search moves the cursor, so
+/// it ends the in-place prefix.
+#[test]
+fn a_padded_raw_search_ends_the_in_place_prefix() {
+    let src = obj(
+        "Plain",
+        r#"    tree a (sim: Sim) {
+        raw { set_to_next(all) pad 0xA5; }
+        self.value += 1;
+        if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
+            return false;
+        }
+    }"#,
+    );
+    let air = expand("raw_padded_search.antics", &src);
+    let a = tree(&air, "a");
+    let write = a.find("stack.attr[0]").expect("the self write");
+    assert!(
+        a[..write].contains("stack_obj :="),
+        "the write switches to the entry object first:\n{a}"
+    );
+}
+
+/// A padded raw action string formats text like a plain one, so a string that may read a
+/// moved word keeps the save.
+#[test]
+fn a_padded_raw_text_primitive_keeps_the_save() {
+    let members = r#"    tree a (sim: Sim) {
+        if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
+            return false;
+        }
+        let n = sim.person[3];
+        stack_obj.attr[0] = n;
+        raw { action_string(table: 301, index: 2) pad 0xff; }
+    }"#;
+    let air = expand("raw_padded_text.antics", &obj("Was $Local:0", members));
+    assert!(tree(&air, "a").contains(SAVE), "{air}");
+}
+
+/// `@frame(locals: K)` sizes the frame with no `min_locals` floor, so an `@slot` word the body
+/// never names does not hold the named locals above it: dropping the save would move the
+/// `idle` scratch word that `$Local:1` reads.
+#[test]
+fn frame_locals_sets_no_allocation_floor() {
+    let members = r#"    @frame(args: 1, locals: 8) tree a (sim: Sim) {
+        @slot(7) let spare: i16;
+        if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
+            return false;
+        }
+        temp[2] = param[0];
+        sleep(1);
+        dialog(kind: ok, title: title, message: msg);
+    }"#;
+    let air = expand("frame_floor.antics", &obj("Was $Local:1", members));
+    let a = tree(&air, "a");
+    assert!(!a.contains("min_locals"), "{a}");
+    // `@slot` placement puts the kept save in word 0.
+    assert!(a.contains("local[0] := stack_obj;"), "{a}");
+}

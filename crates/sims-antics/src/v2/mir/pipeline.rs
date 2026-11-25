@@ -26,6 +26,8 @@ pub(crate) struct FrameFacts<'a> {
     pub(crate) has_slots: bool,
     /// The `@slot(N)` locals.
     pub(crate) pinned_locals: &'a BTreeMap<String, usize>,
+    /// The `min_locals` floor the tree's header will carry (0 for none).
+    pub(crate) min_locals: usize,
 }
 
 /// Runs the backend passes over one lowered tree body.
@@ -90,6 +92,7 @@ fn text_words_unmoved(before: &str, after: &str, facts: &FrameFacts<'_>) -> bool
             facts.pinned_locals,
             facts.raw_declared,
             facts.has_slots,
+            facts.min_locals,
         )
     };
     let (Some(was), Some(now)) = (occupancy(before), occupancy(after)) else {

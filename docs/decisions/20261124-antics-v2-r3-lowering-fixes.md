@@ -60,10 +60,14 @@ if it does not:
   for text trees are lifted: source locals keeping their stores and words, no cross-helper sharing,
   and no `let` in a `const` binding's region. Any other result keeps those rules.
 - **`Known(S)`**: the unread save is dropped only if every word in `S` keeps the same occupant
-  (`frame_occupancy`, in the frame layout `.air` will assign) with and without the save. The save's
-  own word always changes hands. So does the word after the named locals, where `.air` keeps
-  `param[0]` around an `idle` when the tree uses both. The slot scan does not report that, so the
-  word is always counted as taken. So this drops the save when every named local is
+  with and without the save. `frame_occupancy` computes the occupants the way `.air` reads the
+  placed body:
+  - an `@slot` local that the body names only in its `let x;` holds no word;
+  - the floor is the `min_locals` the header actually carries, and `@frame(locals: K)` gives none.
+
+  The save's own word always changes hands. So does the word after the named locals, where `.air`
+  keeps `param[0]` around an `idle` when the tree uses both. The slot scan does not report that, so
+  the word is always counted as taken. So this drops the save when every named local is
   `@slot`-pinned or the save is the highest word, and keeps it whenever `$Local:N` could read a
   word that would move.
 - **`Unknown`**: the save stays.
@@ -131,10 +135,14 @@ declaration order, so generated names no longer matter.
 - **`self` before the first cursor move (`lower/stmt.rs` `lower_tree_body`).** In a Sim tree, the
   leading top-level statements before the first one that may move the cursor run with `stack_obj`
   still the entry object (`stmts_may_clobber_stack_obj`, which looks through called helpers). There
-  `self` reads and writes the stack object in place, with no switch and no staging local. Source
-  order is control order only without raw labels: a raw branch from after a move may jump back to
-  a label before it. So a tree whose raw blocks define a label gets no such prefix. A raw block in
-  an inlined helper or under a cleanup must hold its own labels, so it cannot jump back.
+  `self` reads and writes the stack object in place, with no switch and no staging local.
+  - Source order is control order only when no raw block defines a label or branches to a node by
+    number (`raw_facts`). Otherwise a branch from after a move may jump back before it, so such a
+    tree gets no prefix.
+  - A raw block in an inlined helper or under a cleanup may branch only to its own labels. That
+    check now covers raw `loop` bodies too.
+  - A padded raw primitive (`… pad 0xNN`) counts as the primitive it wraps, both for moving the
+    cursor and for formatting text.
 - **`push_interaction(object: <@slot(N) handle>)` (`lower/builtins.rs`).** It emits `object: N`
   with flag 0x02, so the VM reads the handle from its own pinned word. There is no copy into word 0
   and no pin, so it can share a tree with other `@slot` lets. An explicit flag 0x02 is refused, as
