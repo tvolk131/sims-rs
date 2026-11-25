@@ -810,3 +810,82 @@ fn me_reads_like_the_sim_handle_in_inherit_trees() {
         "unknown field 'me.job_level' (nothing in scope has it)",
     );
 }
+
+#[test]
+fn budget_methods_are_bool_expressions() {
+    // `sim.debit_funds(..)` / `sim.credit_funds(..)` test like the call forms: in conditions,
+    // under `!` and `&&`, as values and as tails, with no extra locals or nodes.
+    let pair = |method_form: &str| {
+        let call_form = method_form
+            .replace("sim.debit_funds(", "debit_funds(")
+            .replace("sim.credit_funds(", "credit_funds(");
+        (obj(method_form), obj(&call_form))
+    };
+    for (case, body) in [
+        (
+            "condition",
+            "    interaction \"Use\" {
+        run(sim) {
+            if !sim.credit_funds(self.n, category: 2) {
+                return false;
+            }
+            if sim.debit_funds(5) && self.n > 0 {
+                self.m = 1;
+            }
+            while sim.debit_funds(1) {
+                self.m += 1;
+                sleep(1);
+            }
+        }
+    }",
+        ),
+        (
+            "value",
+            "    interaction \"Use\" {
+        run(sim) {
+            let paid = sim.debit_funds(5);
+            if paid {
+                self.m = 1;
+            }
+        }
+    }",
+        ),
+        (
+            "tail",
+            "    fn pay(sim: Sim) -> bool {
+        sim.credit_funds(5)
+    }
+    interaction \"Use\" {
+        run(sim) {
+            if !pay(sim) {
+                return false;
+            }
+            self.m = 1;
+        }
+    }",
+        ),
+    ] {
+        let (new, old) = pair(body);
+        assert_same(case, &new, &old);
+    }
+    let (air, _, _) = build(&obj("    fn pay(sim: Sim) -> bool {
+        sim.credit_funds(5)
+    }
+    interaction \"Use\" {
+        run(sim) {
+            if !pay(sim) {
+                return false;
+            }
+            self.m = 1;
+        }
+    }"));
+    assert!(!air.contains("let "), "a tail needs no local:\n{air}");
+    expect_err(
+        &obj("    interaction \"Use\" {
+        run(sim) {
+            if self.debit_funds(5) { self.m = 1; }
+        }
+    }"),
+        "'.debit_funds()' is called on the interaction's Sim",
+    );
+}

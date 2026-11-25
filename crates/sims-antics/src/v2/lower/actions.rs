@@ -496,6 +496,31 @@ impl<'a> TreeLowerer<'a> {
         ))
     }
 
+    /// `sim.debit_funds(n)` / `sim.credit_funds(n)`: the Sim's household budget, the same
+    /// primitive as the call form (a statement, a condition, or a bool value).
+    pub(super) fn format_budget_method(
+        &mut self,
+        receiver: &V2Expr,
+        method: &str,
+        type_args: &[V2Type],
+        args: &[CallArg],
+        span: Span,
+    ) -> Result<String> {
+        if !type_args.is_empty() {
+            return Err(Error::at(
+                span,
+                format!("'.{method}()' does not accept type arguments"),
+            ));
+        }
+        if !matches!(receiver, V2Expr::Ident(_, n) if self.is_sim_ident(n)) {
+            return Err(Error::at(
+                receiver.span(),
+                format!("'.{method}()' is called on the interaction's Sim (its household's budget)"),
+            ));
+        }
+        self.format_alter_budget(args, span, false, method == "credit_funds")
+    }
+
     pub(super) fn format_alter_budget(
         &mut self,
         args: &[CallArg],

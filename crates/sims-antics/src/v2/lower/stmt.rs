@@ -1959,22 +1959,7 @@ impl<'a> TreeLowerer<'a> {
                 // `sim.debit_funds(n)` / `sim.credit_funds(n)`: the Sim's household budget (the
                 // lot's family; the same primitive as `debit_funds(n)`).
                 "debit_funds" | "credit_funds" => {
-                    if !type_args.is_empty() {
-                        return Err(Error::at(
-                            *span,
-                            format!("'.{method}()' does not accept type arguments"),
-                        ));
-                    }
-                    if !matches!(receiver.as_ref(), V2Expr::Ident(_, n) if self.is_sim_ident(n)) {
-                        return Err(Error::at(
-                            receiver.span(),
-                            format!(
-                                "'.{method}()' is called on the interaction's Sim (its household's budget)"
-                            ),
-                        ));
-                    }
-                    let s =
-                        self.format_alter_budget(args, *span, false, method == "credit_funds")?;
+                    let s = self.format_budget_method(receiver, method, type_args, args, *span)?;
                     self.line(format!("{s};"));
                     Ok(())
                 }

@@ -469,6 +469,15 @@ impl<'a> TreeLowerer<'a> {
                 method,
                 type_args,
                 args,
+            } if matches!(method.as_str(), "debit_funds" | "credit_funds") => Ok(Some(
+                self.format_budget_method(receiver, method, type_args, args, *span)?,
+            )),
+            V2Expr::MethodCall {
+                span,
+                receiver,
+                method,
+                type_args,
+                args,
             } if matches!(method.as_str(), "contains" | "intersects" | "is_empty") => {
                 if !type_args.is_empty() {
                     return Err(Error::at(
@@ -561,6 +570,16 @@ impl<'a> TreeLowerer<'a> {
             } if method == "is_type" && type_args.is_empty() => Ok(Some(format!(
                 "!{}",
                 self.format_is_type(receiver, args, *span)?
+            ))),
+            V2Expr::MethodCall {
+                span,
+                receiver,
+                method,
+                type_args,
+                args,
+            } if matches!(method.as_str(), "debit_funds" | "credit_funds") => Ok(Some(format!(
+                "!{}",
+                self.format_budget_method(receiver, method, type_args, args, *span)?
             ))),
             V2Expr::MethodCall {
                 span,

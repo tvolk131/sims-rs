@@ -759,7 +759,9 @@ impl<'a> TreeLowerer<'a> {
             }
             V2Expr::MethodCall {
                 method, type_args, ..
-            } if method == "is_type" && type_args.is_empty() => {
+            } if (method == "is_type" && type_args.is_empty())
+                || matches!(method.as_str(), "debit_funds" | "credit_funds") =>
+            {
                 let tmp = self.fresh("call");
                 self.line(format!("let {tmp} = 0;"));
                 self.emit_bool_into_local(expr, &tmp)?;
