@@ -160,6 +160,10 @@ pub const MAGIC_HOLE_FARE: i32 = 0;
 /// limo (1.0 star = 10 half-stars in `0x446c15` / `0x52d3e6`).
 pub const STUDIO_LIMO_MIN_FAME: i16 = 10;
 
+/// Magic Town's middle ped marker (EP7 PedMarkersMagic, tree 0x100e "main
+/// - middle ped marker"), which places the arriving family's people.
+const MAGIC_TOWN_MIDDLE_PED_MARKER_GUID: u32 = 0x12e8_4823;
+
 /// Vacation hotel-key inventory token (`ExpansionPack4.far::Tokens.iff`,
 /// `OBJD #16810`, type `0xd`, inventory kind `0`, `0x43e21a`).
 pub const HOTEL_KEY_TOKEN_GUID: u32 = 0x3ac0_22d6;
@@ -408,8 +412,13 @@ pub enum ArrivalFamily {
     /// A trip with no native arrival: [`TravelParty::HouseholdGroup`],
     /// which no native mode asks for, or a destination 0x4f1ae9 makes no
     /// arrival on (Magic Town's residential 90–92). The game holds the
-    /// traveler's family, as in [`Self::Family`], and the travelers are put
-    /// beside the arrival portal as before this type existed.
+    /// traveler's family, as in [`Self::Family`], and no departure tokens
+    /// are written. Where the lot has a native arrival and holds Magic
+    /// Town's middle ped marker (a household group on Magic Town 93–99),
+    /// the travelers are left off the lot and the marker places every
+    /// person of the held family, as for [`Self::Family`]. Elsewhere (90–92,
+    /// or a lot whose marker was sold), nothing would place them, so they
+    /// are put beside the arrival portal.
     Group,
 }
 
@@ -5595,6 +5604,23 @@ fn boot_destination_lot(
         };
         let anchor = find_arrival_anchor(&world, Some(transport));
         let residential = !TravelDestination::is_community_mode(dest_house, &program.zoning);
+        // A group's travelers are left for the lot's arrival marker only
+        // where 0x4f1ae9 makes an arrival (a household group goes only to
+        // Magic Town) and the lot holds Magic Town's middle ped marker,
+        // which places every person of the held family. Elsewhere (Magic
+        // Town's residential 90–92, or a lot whose marker was taken off
+        // with `move_objects`) nothing would place them, so the port puts
+        // them beside the portal.
+        let marker_places =
+            TravelDestination::classify(dest_house, &program.zoning).is_some_and(|destination| {
+                destination == TravelDestination::MagicTown
+                    && has_native_arrival(destination, dest_house, &program.zoning)
+            }) && world.objects.values().any(|object| {
+                object.guid == MAGIC_TOWN_MIDDLE_PED_MARKER_GUID
+                    && object.position[0] >= 0
+                    && object.position[1] >= 0
+            });
+        let portal_placement = arrival == ArrivalFamily::Group && !marker_places;
         let mut records = Vec::with_capacity(snapshots.len());
         let mut leader_obj_id = None;
         let mut used_tiles = BTreeSet::new();
@@ -5700,10 +5726,14 @@ fn boot_destination_lot(
                 }
             }
             // The person factory leaves a traveler off the lot (0x4e9719 →
-            // 0x440b2d), and so does the port's reuse above; the middle ped
-            // marker's Find Location places it. Only a household group, which
-            // no native mode makes, is still put beside the arrival portal.
-            if arrival == ArrivalFamily::Group {
+            // 0x440b2d), and so does the port's reuse above; the arrival
+            // marker's Find Location places it. A household group, which no
+            // native mode makes, is placed the same way: the marker places
+            // every person of the held family (Generic Sims Call 26's
+            // temp 1 = 1). Put beside the portal first, it would walk back
+            // there after the marker's put. Only where no marker places
+            // anyone is a traveler put beside the arrival portal.
+            if portal_placement {
                 let tile_pos = find_free_arrival_position(
                     &interpreter,
                     &mut world,
@@ -9114,6 +9144,208 @@ mod tests {
                     "house {house}: the return left neighbor {nid}'s tokens"
                 );
             }
+        }
+    }
+
+    /// Routine 17's saved-state tokens (kind 2) across a whole-family trip
+    /// to a Magic Town community lot and back:
+    ///
+    /// 1. The departure writes each traveler's motives 9, 6, 5, 15, 7, 8
+    ///    and 14 cut toward zero (GUIDs 0 to 6; a motive cut to 0 gets no
+    ///    token), and member 0's inventory gets the arrival clock (GUIDs 7
+    ///    and 8, 0x45a785), in the world and in the stored neighborhood.
+    /// 2. The middle ped marker's routine 21 (0x45098a) restores them as it
+    ///    places each traveler. A motive with no token keeps the value the
+    ///    traveler was made with. The clock tokens name nothing for routine
+    ///    21 (0x450a53), so they stay.
+    /// 3. The return brings the motives the travelers have on the
+    ///    destination home and takes every kind-2 token back out, the clock
+    ///    included.
+    #[test]
+    fn saved_motives_and_the_arrival_clock_go_there_and_back() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard) = live_store(&root, "round-trip-tokens");
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let members = nh.family_in(5).unwrap().1.members.clone();
+        let mut home =
+            crate::lifecycle::enter_lot(&root, &store, "UserData", 5, &[3], Frames::default())
+                .unwrap();
+        // Token GUID → motive, as 0x45a40a writes them (+0x7b0, +0x7a4,
+        // +0x7a0, +0x7c8, +0x7a8, +0x7ac and +0x7c4, the motives starting at
+        // +0x78c), written out apart from `trip::SAVED_STATE`.
+        let saved_motives = || {
+            [
+                (0u32, 9usize),
+                (1, 6),
+                (2, 5),
+                (3, 15),
+                (4, 7),
+                (5, 8),
+                (6, 14),
+            ]
+            .into_iter()
+        };
+        // Distinct motives with a fraction, some negative; member 2's motive
+        // 5 (GUID 2) is 0.6, which cuts to 0.
+        let mut expected = Vec::new();
+        for (k, &guid) in members.iter().enumerate() {
+            let id = person_with_guid(&home.world, guid).unwrap();
+            let person = home
+                .world
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .person
+                .as_mut()
+                .unwrap();
+            let mut tokens = Vec::new();
+            for (i, (token, motive)) in saved_motives().enumerate() {
+                let value = (k as f32) * 11.0 + (i as f32) * 9.0 - 40.0 + 0.6;
+                person.motives[motive] = value;
+                let cut = trip::ftol_word(value);
+                if cut != 0 {
+                    tokens.push((token, cut as u16));
+                }
+            }
+            expected.push(tokens);
+        }
+        assert!(
+            !expected[2].iter().any(|&(guid, _)| guid == 2),
+            "member 2's motive 5 cuts to 0"
+        );
+        let destination = TravelDestination::MagicTown;
+        let (hour, minute) = arrival_time(destination, &mut home.world.lot_rng.clone());
+        let clock = trip::arrival_clock(
+            home.world.globals[GLOBAL_HOURS],
+            home.world.globals[GLOBAL_MINUTES],
+            hour,
+            minute,
+            false,
+        );
+        expected[0].push((trip::ARRIVAL_HOUR_GUID, clock.0 as u16));
+        expected[0].push((trip::ARRIVAL_MINUTE_GUID, clock.1 as u16));
+
+        let request = TravelRequest::magic_town(
+            93,
+            TravelParty::WholeFamily {
+                leader_guid: members[0],
+            },
+            TravelTransport::MagicHole,
+        );
+        let departed =
+            depart_to_destination(&root, &store, "UserData", &mut home, &request).unwrap();
+        let mut lot = departed.destination_lot;
+        let nids: Vec<i16> = members
+            .iter()
+            .map(|&guid| lot.world.neighbors.first_of(guid).unwrap().id)
+            .collect();
+        let stored = store.load_neighborhood("UserData").unwrap().unwrap();
+        for (k, &nid) in nids.iter().enumerate() {
+            assert_eq!(
+                saved_state_tokens(&lot.world, nid),
+                expected[k],
+                "member {k}'s departure tokens"
+            );
+            assert_eq!(
+                stored_tokens(&stored, nid, trip::SAVED_STATE_KIND),
+                expected[k],
+                "member {k}'s stored tokens"
+            );
+        }
+        let made: Vec<[f32; 16]> = members
+            .iter()
+            .map(|&guid| {
+                let id = person_with_guid(&lot.world, guid).unwrap();
+                lot.world.objects[&id].person.as_ref().unwrap().motives
+            })
+            .collect();
+
+        let on_lot = |world: &World| {
+            members.iter().all(|&guid| {
+                let id = person_with_guid(world, guid).unwrap();
+                world.objects[&id].position[0] >= 0
+            })
+        };
+        let mut ticks = 0;
+        while !on_lot(&lot.world) {
+            assert!(ticks < 40, "the marker placed nobody in 40 ticks");
+            lot.step_play().unwrap();
+            ticks += 1;
+        }
+        for (k, &guid) in members.iter().enumerate() {
+            let id = person_with_guid(&lot.world, guid).unwrap();
+            let motives = lot.world.objects[&id].person.as_ref().unwrap().motives;
+            for (token, motive) in saved_motives() {
+                match expected[k].iter().find(|&&(g, _)| g == token) {
+                    Some(&(_, count)) => assert_eq!(
+                        motives[motive],
+                        f32::from(count as i16),
+                        "member {k}'s motive {motive}"
+                    ),
+                    // Not restored: the made value, as the lot has run it.
+                    None => assert!(
+                        (motives[motive] - made[k][motive]).abs() < 1.0,
+                        "member {k}'s motive {motive} is {}, made {}",
+                        motives[motive],
+                        made[k][motive]
+                    ),
+                }
+            }
+            let left = if k == 0 {
+                vec![
+                    (trip::ARRIVAL_HOUR_GUID, clock.0 as u16),
+                    (trip::ARRIVAL_MINUTE_GUID, clock.1 as u16),
+                ]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                saved_state_tokens(&lot.world, nids[k]),
+                left,
+                "member {k}'s tokens after routine 21"
+            );
+        }
+
+        for _ in 0..30 {
+            lot.step_play().unwrap();
+        }
+        let live: Vec<[f32; 16]> = members
+            .iter()
+            .map(|&guid| {
+                let id = person_with_guid(&lot.world, guid).unwrap();
+                lot.world.objects[&id].person.as_ref().unwrap().motives
+            })
+            .collect();
+        let returned = return_from_destination(
+            &root,
+            &store,
+            &departed.session,
+            &mut lot,
+            &[3],
+            Frames::default(),
+        )
+        .unwrap();
+        let world = &returned.home_lot.world;
+        let stored = store.load_neighborhood("UserData").unwrap().unwrap();
+        for (k, &guid) in members.iter().enumerate() {
+            let id = person_with_guid(world, guid).unwrap();
+            assert_eq!(
+                world.objects[&id].person.as_ref().unwrap().motives,
+                live[k],
+                "member {k} came home with other motives"
+            );
+            assert_eq!(
+                saved_state_tokens(world, nids[k]),
+                [],
+                "member {k}'s tokens"
+            );
+            assert_eq!(
+                stored_tokens(&stored, nids[k], trip::SAVED_STATE_KIND),
+                [],
+                "member {k}'s stored tokens"
+            );
         }
     }
 

@@ -564,9 +564,14 @@ impl Interpreter<'_> {
     /// contexts are marked to start again from what they have, and every
     /// portal's costs become 10001.
     ///
-    /// Not modeled: each room's cached route rectangles are dropped
-    /// (0x467436). In a trace of a Goth load that changes nothing
-    /// compared.
+    /// Before all that, 0x467436 walks the rooms and, for each whose +0x34
+    /// is set, empties its kept planner rectangles (the 20-byte entries at
+    /// room +0x28 to +0x2c, 0x468761 → 0x4689f8), so the next route works
+    /// them out again from
+    /// the lot as it is (0x46795a → 0x482347). The port keeps no
+    /// rectangles: `routing/rooms.rs` works them out on every use, which
+    /// is what the original does after this call, so there is nothing to
+    /// drop here.
     pub fn go_live(&self, world: &mut World) -> Result<(), Fault> {
         world.mark_all_rooms();
         self.forget_routes(world).map_err(|trap| fault(0, trap))?;
