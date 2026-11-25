@@ -487,9 +487,12 @@ fn a_tree_run_by_name_is_proven_only_with_the_tree_it_runs() {
     for id in [4300, 4302, 4304] {
         assert!(!proven(check_of(&report, id)), "{:?}", report.trees);
     }
+    // A lookup may also fall through to another file's tree, which sees this object's
+    // texts; either reason leaves the caller unproven.
     for id in [4301, 4303, 4305, 4306] {
         assert!(
-            matches!(check_of(&report, id), TreeCheck::Inconclusive(why) if why.contains("not proven")),
+            matches!(check_of(&report, id), TreeCheck::Inconclusive(why)
+                if why.contains("not proven") || why.contains("outside this file's private trees")),
             "{id}: {:?}",
             report.trees
         );
@@ -1040,7 +1043,7 @@ fn a_global_tree_runs_with_this_object_as_owner() {
     let renamed = report(&relabel(&iff, 4300, &long));
     assert!(!proven(check_of(&renamed, 4300)), "{:?}", renamed.trees);
     assert!(
-        matches!(check_of(&renamed, 4301), TreeCheck::Inconclusive(why) if why.contains("global or semi-global")),
+        matches!(check_of(&renamed, 4301), TreeCheck::Inconclusive(why) if why.contains("outside this file's private trees")),
         "{:?}",
         renamed.trees
     );
@@ -1095,6 +1098,128 @@ fn a_deleted_definition_does_not_stand_in_for_the_live_one() {
     let report = report(&original);
     assert!(
         matches!(check_of(&report, 4301), TreeCheck::Inconclusive(why) if why.contains("definition's words")),
+        "{:?}",
+        report.trees
+    );
+}
+
+/// `source` compiled, with its OBJD's VM word 47 (byte 94) set to 123.
+fn with_definition_word(source: &str) -> Iff {
+    rebuild(
+        &compile(source),
+        |c| {
+            if &c.tag == b"OBJD" {
+                c.data[94..96].copy_from_slice(&123i16.to_le_bytes());
+            }
+        },
+        Vec::new(),
+    )
+}
+
+fn runs_outside(report: &sims_antics::v2::DecompileV2Report, id: u16) {
+    assert!(
+        matches!(check_of(report, id), TreeCheck::Inconclusive(why) if why.contains("outside this file's private trees")),
+        "{:?}",
+        report.trees
+    );
+}
+
+#[test]
+fn a_name_this_file_lacks_may_run_another_files_tree() {
+    // No tree here is labelled `GlobalOnly`, so the VM goes on to the semi-global and
+    // global files, and runs what it finds there with this object as owner. That tree
+    // may read this object's definition, which the rebuilt object gives differently.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_0140;
+    strings 303 "Tree names" {
+        a = "GlobalOnly",
+    }
+    @id(4301) @frame(locals: 0) tree caller "Caller" {
+        raw { run_tree_by_name(table: 303, index: 1, mode: 0); }
+    }
+}"#;
+    runs_outside(&report(&with_definition_word(source)), 4301);
+}
+
+#[test]
+fn a_global_tree_sees_the_owners_slots() {
+    // Global tree 256 may create another object of this type, whose slots come from
+    // this file's SLOT table; the rebuilt object drops a container entry.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_0141;
+    @id(4301) @frame(locals: 0) tree caller "Caller" {
+        raw { op 0x0100 (0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff); }
+    }
+}"#;
+    let iff = compile(source);
+    let objd = iff.chunks.iter().find(|c| &c.tag == b"OBJD").expect("OBJD");
+    let slots = u16::from_le_bytes([iff.data(objd)[40], iff.data(objd)[41]]);
+    let original = rebuild(
+        &iff,
+        |c| {
+            if &c.tag == b"SLOT" && c.id == slots {
+                c.data = [
+                    0u32.to_le_bytes().as_slice(),
+                    &4u32.to_le_bytes(),
+                    b"TOLS",
+                    &1u32.to_le_bytes(),
+                    &[0; 34],
+                ]
+                .concat();
+            }
+        },
+        Vec::new(),
+    );
+    assert!(
+        original
+            .chunks
+            .iter()
+            .any(|c| &c.tag == b"SLOT" && c.id == slots),
+        "no SLOT {slots}"
+    );
+    runs_outside(&report(&original), 4301);
+}
+
+#[test]
+fn a_functional_call_may_run_another_objects_callback() {
+    // The stack object may be another object, whose callback (a global tree) runs on
+    // this thread and may read this object's definition.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_0142;
+    @id(4301) @frame(locals: 0) tree caller "Caller" {
+        raw { op 0x0014 (0, 0, 0, 0, 0, 0, 0, 0); }
+    }
+}"#;
+    runs_outside(&report(&with_definition_word(source)), 4301);
+}
+
+#[test]
+fn a_global_call_waits_on_every_private_tree() {
+    // The owner's data is unchanged, but its `init` is not proven (its header is edited
+    // past what the lift writes), so a caller of a global tree, which may run `init`
+    // by name, is not proven either.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_0143;
+    @id(4301) @frame(locals: 0) tree caller "Caller" {
+        raw { op 0x0100 (0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff); }
+    }
+}"#;
+    let iff = compile(source);
+    let (init, _) = init_and_main(&iff);
+    let original = rebuild(
+        &iff,
+        |c| {
+            if &c.tag == b"BHAV" && c.id == init {
+                c.data[..2].copy_from_slice(&0x8000u16.to_le_bytes());
+                c.data[5] = 5;
+            }
+        },
+        Vec::new(),
+    );
+    let report = report(&original);
+    assert!(!proven(check_of(&report, init)), "{:?}", report.trees);
+    assert!(
+        matches!(check_of(&report, 4301), TreeCheck::Inconclusive(why) if *why == format!("calls tree {init}, which is not proven the same")),
         "{:?}",
         report.trees
     );

@@ -1048,14 +1048,6 @@ impl Model {
                     );
                 }
             }
-            if self.runs_shared_code(i) && !self.same_owner_environment(recompiled) {
-                return Some(
-                    "runs a global or semi-global tree, which runs with this object as owner \
-                     and may read tree labels, texts, sounds, definitions or callback tables \
-                     the rebuilt object gives differently"
-                        .to_owned(),
-                );
-            }
             if i.opcode == CREATE_OBJECT && callbacks() != Some(true) {
                 return Some(
                     "creates an object, whose callbacks the rebuilt object's tables give \
@@ -1097,6 +1089,14 @@ impl Model {
                          tables give another tree"
                     ));
                 }
+            }
+            if self.runs_shared_code(i) && !self.same_owner_environment(recompiled) {
+                return Some(
+                    "may run code outside this file's private trees (a global or semi-global \
+                     tree, a tree found by name, a callback, a created object), which may read \
+                     this object's data the rebuilt object gives differently"
+                        .to_owned(),
+                );
             }
         }
         let slots = |c: &Option<Callbacks>| {
@@ -1181,23 +1181,33 @@ impl Model {
             .filter(|&id| id != 0)
     }
 
-    /// Whether instruction `i` may run a global or semi-global tree: directly, or as a
-    /// tree it runs by function or as a created object's callback. That tree runs with
-    /// this object as its owner, so it may run any of this file's trees by name, create
-    /// an object or read this file's resources, none of which the lift sees.
+    /// Whether instruction `i` may run code outside this file's private trees, which
+    /// the lift does not see:
+    /// - a global or semi-global tree, called by number;
+    /// - a tree found by name, which may be another file's when this one has no match;
+    /// - a callback run by function, from whichever object is the stack object;
+    /// - a created object's callbacks (and its slots and other data).
+    ///
+    /// Such code may run on this thread with this object as owner, so it may run any
+    /// of this file's trees by name, create an object, or read any of its data.
     fn runs_shared_code(&self, i: &sims_formats::behavior::Instruction) -> bool {
         (i.opcode >= 0x100 && !PRIVATE_TREES.contains(&i.opcode))
+            || i.opcode == RUN_FUNCTIONAL_TREE
+            || i.opcode == CREATE_OBJECT
+            || !self.names_run(i, &self.original_strings).is_empty()
             || self
                 .direct_named_callees(i)
                 .iter()
                 .any(|id| !PRIVATE_TREES.contains(id))
     }
 
-    /// Whether the rebuilt object gives a global or semi-global tree running with it as
-    /// owner the same environment: tree labels and `GLOB` link, text tables, sounds,
-    /// definitions and callback tables.
+    /// Whether the rebuilt object gives code running with it as owner
+    /// ([`Self::runs_shared_code`]) the same environment: every resource as the VM
+    /// loads it, tree labels and `GLOB` link, text tables, sounds, definitions and
+    /// callback tables.
     fn same_owner_environment(&self, recompiled: &RecompiledFile) -> bool {
-        self.original_lookup == recompiled.lookup
+        self.original_resources == recompiled.resources
+            && self.original_lookup == recompiled.lookup
             && self.original_strings == recompiled.strings
             && self.original_sounds == recompiled.sounds
             && self.original_definitions.is_some()
@@ -1209,7 +1219,7 @@ impl Model {
 
     /// The trees of this file instruction `i` may run in the original other than by
     /// number: [`Self::direct_named_callees`], and every private tree when it may run
-    /// a global or semi-global tree ([`Self::runs_shared_code`]).
+    /// code outside them ([`Self::runs_shared_code`]).
     fn named_callees(&self, i: &sims_formats::behavior::Instruction) -> Vec<u16> {
         let mut out = self.direct_named_callees(i);
         if self.runs_shared_code(i) {
