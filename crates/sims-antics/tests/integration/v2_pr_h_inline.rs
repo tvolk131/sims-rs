@@ -390,7 +390,7 @@ fn helpers_with_defers_decide_the_bool_before_any_cleanup() {
 fn loop_exits_and_raw_arms_use_ordinary_if_lowering() {
     for call in [
         "loop { if choose() { break; } self.n += 1; } return true;",
-        "if choose() { raw { temp[0] := 1; } } return true;",
+        "if choose() { raw { const ONE = 1; temp[0] := ONE; } } return true;",
     ] {
         let src = source(
             "fn choose() -> bool { if temp[0] > 0 { return true; } return false; }",

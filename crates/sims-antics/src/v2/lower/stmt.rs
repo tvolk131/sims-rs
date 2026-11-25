@@ -1077,7 +1077,9 @@ impl<'a> TreeLowerer<'a> {
                 // Discarded code emits nothing, so only emitted raw blocks count.
                 if self.checking_discarded == 0 {
                     self.raw_span.get_or_insert(*span);
-                    self.keep_layout = true;
+                    if !raw_block_is_layout_free(code) {
+                        self.keep_layout = true;
+                    }
                     if self.pin_span.is_some() {
                         return Err(Error::at(*span, RAW_WITH_PIN));
                     }

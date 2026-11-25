@@ -9107,7 +9107,8 @@ object "Pr E Layout" {
     #[bhav(id = 4411, label = "With Raw")]
     fn with_raw() {
         let unused = 5;
-        raw { my.attr[0] := 1; }
+        // A raw constant keeps the layout (a call-only raw block would not).
+        raw { const ONE = 1; my.attr[0] := ONE; }
     }
 
     #[bhav(id = 4412, label = "Caller")]

@@ -264,3 +264,89 @@ pub(super) fn validate_raw_air_stmts(
     }
     Ok(())
 }
+
+/// Whether a raw block leaves the tree's node layout free for the backend optimizer
+/// (`TreeLowerer::keep_layout` stays off for it). The block must be built only from text the
+/// lowering itself emits, touching no frame word and reading no instruction bytes beyond its own:
+///
+/// - calls are `call N(temps)` (the temps pass-through ABI: the callee reads no literal words, so
+///   none from the next instruction, and has its own frame);
+/// - the only primitives are ones that read neither the caller's frame words nor bytes past their
+///   own operands (`find_best_object`, `run_functional_tree`, `play_sound`; checked in `sims-vm`);
+/// - every other word is control flow (`if`, `else`, `while`, `break`, `continue`, `return`) or a
+///   temp, parameter, global, own, Sim or stack-object cell, or a primitive's named argument: no
+///   `local[N]` or named local (so no frame word, and no name the optimizer could rename or
+///   coalesce), no `let`/`local`/`const` declaration, no string, no node label or `->` graph,
+///   no `scope(..)`/`expr(..)`/`pad` spelling.
+///
+/// Such a block's text is one the lowering could have produced, so whatever the optimizer
+/// proves of lowered text holds for it. Anything else keeps the whole tree's layout.
+pub(super) fn raw_block_is_layout_free(code: &str) -> bool {
+    use crate::lexer::TokenKind as T;
+    const WORDS: &[&str] = &[
+        "if",
+        "else",
+        "while",
+        "break",
+        "continue",
+        "return",
+        "true",
+        "false",
+        "error",
+        "temp",
+        "param",
+        "global",
+        "my",
+        "stack",
+        "attr",
+        "data",
+        "person",
+        "stack_obj",
+        "flag_set",
+        "flag_clear",
+        "flag_test",
+    ];
+    const PRIMS: &[&str] = &["find_best_object", "run_functional_tree", "play_sound"];
+    let Ok(tokens) = crate::lexer::tokenize(code) else {
+        return false;
+    };
+    let kind = |i: usize| tokens.get(i).map(|t| &t.kind);
+    let mut depth = 0i32;
+    let mut i = 0;
+    while let Some(k) = kind(i) {
+        match k {
+            T::Eof => break,
+            T::Label(_) | T::Arrow | T::Str(_) => return false,
+            T::LParen => depth += 1,
+            T::RParen => depth -= 1,
+            T::Colon if depth == 0 => return false,
+            T::Ident(w) if w == "call" => {
+                let temps_call = matches!(kind(i + 1), Some(T::Int(_)))
+                    && kind(i + 2) == Some(&T::LParen)
+                    && matches!(kind(i + 3), Some(T::Ident(t)) if t == "temps")
+                    && kind(i + 4) == Some(&T::RParen);
+                if !temps_call {
+                    return false;
+                }
+                i += 5;
+                continue;
+            }
+            T::Ident(w) => {
+                let ok = if kind(i + 1) == Some(&T::LParen) {
+                    PRIMS.contains(&w.as_str())
+                } else if depth > 0 && kind(i + 1) == Some(&T::Colon) {
+                    // A primitive's named argument (`flags: 0`).
+                    true
+                } else {
+                    WORDS.contains(&w.as_str())
+                };
+                if !ok {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    depth == 0
+}
