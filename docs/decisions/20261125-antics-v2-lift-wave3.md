@@ -134,12 +134,20 @@ The corpus is all 1,191 lifted objects, at 10 workers. "Main" is main after #471
 | `untyped_engine_constant` | 12,789 | **0** | 1,291 | **0** |
 | `prefer_method_syntax` | 11,204 | **0** | 686 | **0** |
 | `prefer_question_mark` | 213 | **0** | 91 | **0** |
-| lint findings, all rules | 24,322 | 116 | 2,080 | 12 |
-| sweep time | 74.6 s | 64.6 s | 83.3 s | 82.0 s |
+| lint findings, all rules (#470 lint) | 24,322 | 116 | 2,080 | 12 |
+| lint findings, all rules (#472 lint) | 25,591 | 266 | 2,124 | 13 |
+| `manual_raw_has_builtin` (#472 lint) | 1,223 | 214 | 38 | 3 |
+| `untyped_engine_field` (#472 lint) | 110 | 0 | 8 | 0 |
+| sweep time | 74.6 s | 65.2 s | 83.3 s | 82.6 s |
 
-- **What lint still reports** is unchanged from main: 116 behavioral (`manual_raw_has_builtin`
-  64, `frame_headroom` 46, `negated_comparison` 3, `collapsible_if_chain` 2,
-  `stale_lint_allow` 1) and 12 strict.
+- **What lint still reports.**
+  - Under #470's lint, nothing new against main: 116 behavioral (`manual_raw_has_builtin` 64,
+    `frame_headroom` 46, `negated_comparison` 3, `collapsible_if_chain` 2,
+    `stale_lint_allow` 1) and 12 strict.
+  - #472 (lint wave 4, merged during this work) counts the #469 raw forms as
+    `manual_raw_has_builtin` and names `fame`. With its lint, the 1,223 behavioral
+    `manual_raw_has_builtin` findings on main fall to 214. The lift's output is the same
+    under either lint.
 - **Raw statements per file.** In seven behavioral files the count rises by one or two. In
   each, a raw block splits around newly lifted code (a neighbor `if`, or an inherit tree's
   `me.id.is_type` chain), so the raw text there is shorter.
