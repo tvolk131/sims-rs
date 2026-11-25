@@ -544,7 +544,10 @@ pub(crate) fn merge_extern_mods(
         if let Some(b) = base.fns.iter().find(|b| b.name == f.name) {
             let same = b.id == f.id
                 && same_extern_abi(b, f)
-                && b.params.iter().zip(&f.params).all(|(x, y)| x.name == y.name);
+                && b.params
+                    .iter()
+                    .zip(&f.params)
+                    .all(|(x, y)| x.name == y.name);
             if same {
                 continue;
             }
@@ -765,13 +768,13 @@ impl<'a> ModuleLoader<'a> {
                             // Two `extern mod` blocks of one name merge instead.
                             (extern_mods.contains_key(n) && target.pub_extern_mods.contains_key(n))
                                 || !(functions.contains_key(n)
-                                || templates.contains_key(n)
-                                || enums.contains_key(n)
-                                || bitflags.contains_key(n)
-                                || imported_objects.contains_key(n)
-                                || extern_mods.contains_key(n)
-                                || extern_bcons.contains_key(n)
-                                || consts.contains_key(n))
+                                    || templates.contains_key(n)
+                                    || enums.contains_key(n)
+                                    || bitflags.contains_key(n)
+                                    || imported_objects.contains_key(n)
+                                    || extern_mods.contains_key(n)
+                                    || extern_bcons.contains_key(n)
+                                    || consts.contains_key(n))
                         })
                         .map(|name| crate::v2::ast::UseItem {
                             span: only.span,

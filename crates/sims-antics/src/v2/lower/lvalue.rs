@@ -364,7 +364,11 @@ impl<'a> TreeLowerer<'a> {
                 }
                 let path = match base.as_ref() {
                     V2Expr::Ident(_, b) => format!("'{b}.{field}'"),
-                    V2Expr::Field { base: root, field: group, .. } => match root.as_ref() {
+                    V2Expr::Field {
+                        base: root,
+                        field: group,
+                        ..
+                    } => match root.as_ref() {
                         V2Expr::Ident(_, r) => format!("'{r}.{group}.{field}'"),
                         _ => format!("'.{field}'"),
                     },

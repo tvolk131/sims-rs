@@ -515,7 +515,9 @@ impl<'a> TreeLowerer<'a> {
         if !matches!(receiver, V2Expr::Ident(_, n) if self.is_sim_ident(n)) {
             return Err(Error::at(
                 receiver.span(),
-                format!("'.{method}()' is called on the interaction's Sim (its household's budget)"),
+                format!(
+                    "'.{method}()' is called on the interaction's Sim (its household's budget)"
+                ),
             ));
         }
         self.format_alter_budget(args, span, false, method == "credit_funds")

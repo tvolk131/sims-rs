@@ -38,8 +38,18 @@ pub(crate) enum FunctionSearch {
 /// The OBJf functions by number (sims-vm `run_functional_tree.rs` and `find_best_object.rs`).
 pub(crate) const FUNCTION_KINDS: [FunctionKind; 15] = {
     use FunctionSearch::{Fixed, None as Never, Score};
-    const fn k(name: &'static str, function: u16, callback: usize, search: FunctionSearch) -> FunctionKind {
-        FunctionKind { name, function, callback, search }
+    const fn k(
+        name: &'static str,
+        function: u16,
+        callback: usize,
+        search: FunctionSearch,
+    ) -> FunctionKind {
+        FunctionKind {
+            name,
+            function,
+            callback,
+            search,
+        }
     }
     [
         k("prep", 0, 0x12, Score(31)),

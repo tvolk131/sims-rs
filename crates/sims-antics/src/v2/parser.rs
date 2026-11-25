@@ -3419,18 +3419,23 @@ impl Parser {
         self.arm_tails.truncate(saved_arm_tails);
         let span = self.span();
         let short = (|| {
-            let lhs = self.parse_expr()?;
-            let stmt = if let Some(op) = self.try_eat_assign_op() {
-                let value = self.parse_expr()?;
-                V2Stmt::Assign {
-                    span,
-                    target: lhs,
-                    op,
-                    value,
-                }
+            // `1 => break,` / `_ => return false,`: the exit itself (not a name `break`).
+            let stmt = if let Some(exit) = self.parse_bare_exit()? {
+                exit
             } else {
-                self.arm_tails.push(span);
-                V2Stmt::Expr { span, expr: lhs }
+                let lhs = self.parse_expr()?;
+                if let Some(op) = self.try_eat_assign_op() {
+                    let value = self.parse_expr()?;
+                    V2Stmt::Assign {
+                        span,
+                        target: lhs,
+                        op,
+                        value,
+                    }
+                } else {
+                    self.arm_tails.push(span);
+                    V2Stmt::Expr { span, expr: lhs }
+                }
             };
             if self.eat(&TokenKind::Comma) || self.peek().kind == TokenKind::RBrace {
                 Ok(stmt)

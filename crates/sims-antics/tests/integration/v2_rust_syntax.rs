@@ -623,12 +623,16 @@ fn functional_kind_names_follow_the_engine_table() {
             &obj(&format!(
                 "    main {{ let Some(_o) = find_best_object({old}) else {{ return; }}; loop {{ sleep(1); }} }}"
             )),
-            &format!("unknown functional kind '{old}': the function this name used to give is '{new}'"),
+            &format!(
+                "unknown functional kind '{old}': the function this name used to give is '{new}'"
+            ),
         );
     }
     // v2 refuses a search the engine never answers.
     expect_err(
-        &obj("    main { let Some(_o) = find_best_object(stand) else { return; }; loop { sleep(1); } }"),
+        &obj(
+            "    main { let Some(_o) = find_best_object(stand) else { return; }; loop { sleep(1); } }",
+        ),
         "find_best_object(stand) always fails",
     );
     // A v2 `functional gardening` is OBJf entry 16, found by function 12, scored by word 64.
@@ -644,8 +648,13 @@ fn functional_kind_names_follow_the_engine_table() {
 }
 "#;
     let (air, _, _) = build(garden);
-    assert!(air.contains("my.data[64] := 7;"), "score word 64 missing:\n{air}");
-    let finder = obj("    main { let Some(_o) = find_best_object(gardening) else { return; }; loop { sleep(1); } }");
+    assert!(
+        air.contains("my.data[64] := 7;"),
+        "score word 64 missing:\n{air}"
+    );
+    let finder = obj(
+        "    main { let Some(_o) = find_best_object(gardening) else { return; }; loop { sleep(1); } }",
+    );
     let (air, _, _) = build(&finder);
     assert!(air.contains("find_best_object(gardening"), "{air}");
 }
@@ -696,7 +705,9 @@ fn local_extern_globals_merge_with_std() {
         "object block merges",
         &format!(
             "use std::globals::*;\n\n{}",
-            body("    extern mod globals {\n        #[id(4000)] fn robot_hum(level: i16) -> Result;\n    }\n")
+            body(
+                "    extern mod globals {\n        #[id(4000)] fn robot_hum(level: i16) -> Result;\n    }\n"
+            )
         ),
         &expected,
     );
@@ -705,7 +716,9 @@ fn local_extern_globals_merge_with_std() {
         "alias of one tree",
         &format!(
             "use std::globals::*;\n\n{}",
-            body("    extern mod globals {\n        #[id(4000)] fn robot_hum(level: i16) -> Result;\n        #[id(272)] fn enter() -> Result;\n    }\n")
+            body(
+                "    extern mod globals {\n        #[id(4000)] fn robot_hum(level: i16) -> Result;\n        #[id(272)] fn enter() -> Result;\n    }\n"
+            )
         ),
         &expected,
     );
@@ -713,7 +726,9 @@ fn local_extern_globals_merge_with_std() {
     expect_err(
         &format!(
             "use std::globals::*;\n\n{}",
-            body("    extern mod globals {\n        #[id(4000)] fn robot_hum(level: i16) -> Result;\n        #[id(274)] fn standard_entry() -> Result;\n    }\n")
+            body(
+                "    extern mod globals {\n        #[id(4000)] fn robot_hum(level: i16) -> Result;\n        #[id(274)] fn standard_entry() -> Result;\n    }\n"
+            )
         ),
         "extern mod 'globals' declares fn 'standard_entry' twice, differently: `#[id(274)] fn standard_entry() -> Result`",
     );
@@ -760,8 +775,13 @@ fn run_functional_on_stack_obj_keeps_a_found_cursor() {
     );
     // (The raw form prints on one line; the trees are the same.)
     assert!(
-        build(&src("if !stack_obj.run_functional(clean) { return false; }")).1
-            == build(&src("raw { if !run_functional_tree(clean) { return false; } }")).1,
+        build(&src(
+            "if !stack_obj.run_functional(clean) { return false; }"
+        ))
+        .1 == build(&src(
+            "raw { if !run_functional_tree(clean) { return false; } }"
+        ))
+        .1,
         "condition: IFF bytes differ"
     );
 }
@@ -888,4 +908,48 @@ fn budget_methods_are_bool_expressions() {
     }"),
         "'.debit_funds()' is called on the interaction's Sim",
     );
+}
+
+#[test]
+fn bare_exit_match_arms_are_statements() {
+    let looped = |arms: &str| {
+        obj(&format!(
+            "    main {{
+        loop {{
+            match self.n {{
+{arms}
+            }}
+            sleep(1);
+        }}
+        loop {{ sleep(1); }}
+    }}"
+        ))
+    };
+    assert_same(
+        "break / continue arms",
+        &looped("                1 => break,\n                2 => continue,\n                _ => self.n += 1,"),
+        &looped("                1 => { break; }\n                2 => { continue; }\n                _ => { self.n += 1; }"),
+    );
+    let returns = |arms: &str| {
+        obj(&format!(
+            "    interaction \"Use\" {{
+        run(sim) {{
+            match self.n {{
+{arms}
+            }}
+            self.m = 1;
+        }}
+    }}"
+        ))
+    };
+    assert_same(
+        "return arms",
+        &returns("                0 => return false,\n                1 => return,\n                _ => {}"),
+        &returns("                0 => { return false; }\n                1 => { return; }\n                _ => {}"),
+    );
+    // The formatter keeps the bare forms parseable and stable.
+    let src = looped("                1 => break,\n                2 => continue,\n                _ => self.n += 1,");
+    let once = v2::format_v2_source(&src).expect("formats");
+    assert_eq!(v2::format_v2_source(&once).expect("formats again"), once);
+    assert_same("formatted", &once, &src);
 }
