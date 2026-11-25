@@ -24,7 +24,6 @@ const MAX_NESTING_DEPTH: usize = 64;
 /// Highest explicit `#[slot(N)] state name` attribute index accepted by the parser.
 pub(crate) const MAX_STATE_SLOT: u16 = 255;
 
-/// Parses a `.antics` v2 source file into a [`V2File`] AST.
 /// The engine globals `world.<name>` names (`world.hour` is `global[0]`), as the engine uses
 /// them (sims-vm `tick.rs`, `daily.rs`, `selection.rs`, `coop.rs`).
 pub(crate) const WORLD_GLOBALS: &[(&str, u8)] = &[
@@ -41,6 +40,8 @@ pub(crate) const WORLD_GLOBALS: &[(&str, u8)] = &[
     // The lot (house number) being played.
     ("house", 10),
     ("paused", 17),
+    // The installed-expansions mask (`std::flags::Expansions`).
+    ("expansions", 20),
     ("days_played", 28),
     ("free_will", 30),
 ];
@@ -53,7 +54,18 @@ pub(crate) fn world_global(name: &str) -> Option<u8> {
         .map(|&(_, i)| i)
 }
 
+/// Parses a `.antics` v2 source file into a [`V2File`] AST.
 pub fn parse_v2_file(source: &str) -> Result<V2File> {
+    parse_v2_source(source, false)
+}
+
+/// Parses a built-in `std` module, which alone may declare the prelude types (`Height`,
+/// `Placement`).
+pub(crate) fn parse_v2_std_file(source: &str) -> Result<V2File> {
+    parse_v2_source(source, true)
+}
+
+fn parse_v2_source(source: &str, std_module: bool) -> Result<V2File> {
     let tokens = tokenize(source)?;
     let mut parser = Parser {
         tokens,
@@ -62,6 +74,7 @@ pub fn parse_v2_file(source: &str) -> Result<V2File> {
         bound_vars: std::collections::BTreeSet::new(),
         tails: Vec::new(),
         arm_tails: Vec::new(),
+        std_module,
     };
     parser.parse_file()
 }
@@ -80,6 +93,8 @@ struct Parser {
     /// Bare match-arm expressions (`0 => f(),`): statements in general, but the value of a
     /// value-returning function's final `match` (`match a { 0 => 1, _ => 2 }`).
     arm_tails: Vec<Span>,
+    /// Parsing a built-in `std` module (`parse_v2_std_file`).
+    std_module: bool,
 }
 
 impl Parser {
@@ -543,7 +558,9 @@ impl Parser {
 
     fn parse_enum(&mut self, span: Span, is_pub: bool) -> Result<EnumDecl> {
         let (name, nspan) = self.expect_ident("enum name")?;
-        if crate::v2::ast::is_reserved_type_name(&name) {
+        if crate::v2::ast::is_reserved_type_name(&name)
+            && !(self.std_module && crate::v2::ast::is_std_prelude_type_name(&name))
+        {
             return Err(Error::at(
                 nspan,
                 format!("'{name}' is a reserved built-in type name"),
@@ -609,7 +626,9 @@ impl Parser {
 
     fn parse_bitflags(&mut self, span: Span, is_pub: bool) -> Result<BitflagsDecl> {
         let (name, nspan) = self.expect_ident("bitflags name")?;
-        if crate::v2::ast::is_reserved_type_name(&name) {
+        if crate::v2::ast::is_reserved_type_name(&name)
+            && !(self.std_module && crate::v2::ast::is_std_prelude_type_name(&name))
+        {
             return Err(Error::at(
                 nspan,
                 format!("'{name}' is a reserved built-in type name"),
@@ -3842,13 +3861,52 @@ impl Parser {
         }
     }
 
+    /// A prefix-unary expression followed by any number of `as i16` casts. As in Rust, `as`
+    /// binds looser than the prefix operators (`-x as i16` is `(-x) as i16`) and tighter than
+    /// every binary operator.
     fn parse_unary_expr(&mut self) -> Result<V2Expr> {
+        let mut expr = self.parse_prefix_expr()?;
+        // Each cast nests the expression one level deeper, so it counts toward the limit.
+        let mut casts = 0;
+        while matches!(&self.peek().kind, TokenKind::Ident(s) if s == "as") {
+            let span = self.span();
+            self.bump();
+            self.enter_nesting(span)?;
+            casts += 1;
+            if !self.eat_ident("i16") {
+                return Err(Error::at(
+                    self.span(),
+                    "expected 'i16' after 'as' (only 'as i16' casts are supported; use 'T::from_raw(..)' to build an enum or bitflags value)",
+                ));
+            }
+            // `x as i16 as i16` is `x as i16`: a chain adds one node, however long.
+            if !matches!(
+                expr,
+                V2Expr::Unary {
+                    op: V2UnaryOp::AsI16,
+                    ..
+                }
+            ) {
+                expr = V2Expr::Unary {
+                    span,
+                    op: V2UnaryOp::AsI16,
+                    inner: Box::new(expr),
+                };
+            }
+        }
+        for _ in 0..casts {
+            self.leave_nesting();
+        }
+        Ok(expr)
+    }
+
+    fn parse_prefix_expr(&mut self) -> Result<V2Expr> {
         let span = self.span();
         match self.peek().kind {
             TokenKind::Bang => {
                 self.bump();
                 self.enter_nesting(span)?;
-                let inner = self.parse_unary_expr();
+                let inner = self.parse_prefix_expr();
                 self.leave_nesting();
                 Ok(V2Expr::Unary {
                     span,
@@ -3859,7 +3917,7 @@ impl Parser {
             TokenKind::Minus => {
                 self.bump();
                 self.enter_nesting(span)?;
-                let inner = self.parse_unary_expr();
+                let inner = self.parse_prefix_expr();
                 self.leave_nesting();
                 Ok(V2Expr::Unary {
                     span,
@@ -3870,7 +3928,7 @@ impl Parser {
             TokenKind::Star => {
                 self.bump();
                 self.enter_nesting(span)?;
-                let inner = self.parse_unary_expr();
+                let inner = self.parse_prefix_expr();
                 self.leave_nesting();
                 Ok(V2Expr::Deref {
                     span,
@@ -3886,7 +3944,7 @@ impl Parser {
                     ));
                 }
                 self.enter_nesting(span)?;
-                let inner = self.parse_unary_expr();
+                let inner = self.parse_prefix_expr();
                 self.leave_nesting();
                 Ok(V2Expr::MutRef {
                     span,

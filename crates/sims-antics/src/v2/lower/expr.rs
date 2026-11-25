@@ -146,16 +146,13 @@ impl<'a> TreeLowerer<'a> {
                         }
                         let prop_air = match field.as_str() {
                             "graphic" => format!("{}.data[0]", self.self_prefix()),
-                            "flags" => format!("{}.data[8]", self.self_prefix()),
-                            "allowed_heights" => format!("{}.data[4]", self.self_prefix()),
-                            "placement" => format!("{}.data[42]", self.self_prefix()),
                             "prep_score" => format!("{}.data[31]", self.self_prefix()),
                             "cook_score" => format!("{}.data[32]", self.self_prefix()),
                             "in_use" => format!("{}.data[25]", self.self_prefix()),
                             "id" => format!("{}.data[11]", self.self_prefix()),
                             "room" => format!("{}.data[29]", self.self_prefix()),
-                            other => match object_data_field(other) {
-                                Some(i) => format!("{}.data[{i}]", self.self_prefix()),
+                            other => match object_data_word(other) {
+                                Some(w) => format!("{}.data[{}]", self.self_prefix(), w.index),
                                 None => return true,
                             },
                         };
@@ -169,9 +166,10 @@ impl<'a> TreeLowerer<'a> {
                             "hand" => "my.slot[0]".to_owned(),
                             "age" => "my.person[58]".to_owned(),
                             "visitor_kind" => "my.person[32]".to_owned(),
-                            other => match sim_person_field(other) {
-                                Some(i) => format!("my.person[{i}]"),
-                                None => return true,
+                            other => match (sim_person_word(other), object_data_word(other)) {
+                                (Some(w), _) => format!("my.person[{}]", w.index),
+                                (None, Some(w)) => format!("my.data[{}]", w.index),
+                                (None, None) => return true,
                             },
                         };
                         return sim_air == canon_target;
@@ -291,7 +289,7 @@ impl<'a> TreeLowerer<'a> {
                     ValueType::I16
                 } else {
                     let (v_air, v_ty) = self.lower_value_expr(inner)?;
-                    if v_ty != ValueType::I16 {
+                    if v_ty != ValueType::I16 && !is_engine_flags(&v_ty) {
                         return Err(Error::at(
                             *span,
                             format!(
@@ -329,9 +327,10 @@ impl<'a> TreeLowerer<'a> {
             }
         };
 
+        let mut base_ty = base_ty;
         for (op, rhs) in ops {
-            if matches!(base_ty, ValueType::Bitflags(_))
-                && !matches!(op, V2BinOp::BitAnd | V2BinOp::BitOr | V2BinOp::BitXor)
+            let is_bit_op = matches!(op, V2BinOp::BitAnd | V2BinOp::BitOr | V2BinOp::BitXor);
+            if matches!(base_ty, ValueType::Bitflags(_)) && !is_bit_op && !is_engine_flags(&base_ty)
             {
                 return Err(Error::at(
                     rhs.span(),
@@ -342,6 +341,17 @@ impl<'a> TreeLowerer<'a> {
                 ));
             }
             let (r_air, r_ty) = self.lower_value_expr(rhs)?;
+            // An engine word in arithmetic, or mixed with a raw word, is a plain `i16`.
+            if (is_engine_flags(&base_ty) && (r_ty == ValueType::I16 || !is_bit_op))
+                || (base_ty == ValueType::I16 && is_engine_flags(&r_ty))
+            {
+                base_ty = ValueType::I16;
+            }
+            let r_ty = if base_ty == ValueType::I16 && is_engine_flags(&r_ty) {
+                ValueType::I16
+            } else {
+                r_ty
+            };
             if r_ty != base_ty {
                 return Err(Error::at(
                     rhs.span(),
@@ -542,19 +552,18 @@ impl<'a> TreeLowerer<'a> {
                             "hand" => Ok(("my.slot[0]".to_owned(), ValueType::ObjectId)),
                             "age" => Ok(("my.person[58]".to_owned(), ValueType::I16)),
                             "visitor_kind" => Ok(("my.person[32]".to_owned(), ValueType::I16)),
-                            // Object data word 2: the object whose slot holds the Sim (read-only).
-                            "container" => Ok(("my.data[2]".to_owned(), ValueType::ObjectId)),
-                            other if sim_person_field(other).is_some() => Ok((
-                                format!(
-                                    "my.person[{}]",
-                                    sim_person_field(other).unwrap_or_default()
-                                ),
-                                ValueType::I16,
-                            )),
+                            other if let Some(w) = sim_person_word(other) => {
+                                Ok((format!("my.person[{}]", w.index), w.value_type()))
+                            }
+                            // The named object-data words (`container` is word 2, the object
+                            // whose slot holds the Sim).
+                            other if let Some(w) = object_data_word(other) => {
+                                Ok((format!("my.data[{}]", w.index), w.value_type()))
+                            }
                             other => Err(Error::at(
                                 *span,
                                 format!(
-                                    "unknown Sim property '{bname}.{other}' (expected motive, skill, personality, id, priority, room, hand, age, visitor_kind, container, posture, pets_outside, job_type, job_level, family, attr[i], data[i], slot[i], or person[i]; use 'self.<state>' for object state)"
+                                    "unknown Sim property '{bname}.{other}' (expected motive, skill, personality, id, priority, room, hand, age, visitor_kind, a named person word (posture, job_level, gender_kind, date_partner, ...), a named object-data word (container, facing, flags, value, ...), attr[i], data[i], slot[i], or person[i]; use 'self.<state>' for object state)"
                                 ),
                             )),
                         };
@@ -565,6 +574,7 @@ impl<'a> TreeLowerer<'a> {
                             "'sim' is not available in init/main (object lifecycle context)",
                         ));
                     }
+                    // `self.id` and `self.room` read their words (data 11 and 29) by name.
                     if self.is_self_ident(bname) {
                         match field.as_str() {
                             "id" => {
@@ -667,6 +677,23 @@ impl<'a> TreeLowerer<'a> {
                     let ty = self.lower_arith_into_dest(expr, &tmp, true)?;
                     Ok((tmp, ty))
                 }
+                // `e as i16`: the operand of `e` itself, retyped (no `.air` nodes).
+                V2UnaryOp::AsI16 => {
+                    if let Some(b) = self.try_eval_cast_bool(inner) {
+                        return Ok((i16::from(b).to_string(), ValueType::I16));
+                    }
+                    let (air, ty) = self.lower_value_expr(inner)?;
+                    self.check_as_i16_source(*span, &ty)?;
+                    // A bool word may hold any nonzero value (a visitor's person word 32 is
+                    // 2 for some), so only a constant bool converts in place.
+                    if ty == ValueType::Bool && air != "0" && air != "1" {
+                        return Err(Error::at(
+                            *span,
+                            "'as i16' converts only a constant bool (a bool word may hold any nonzero value); write 'if b { 1 } else { 0 }'",
+                        ));
+                    }
+                    Ok((air, ValueType::I16))
+                }
             },
             V2Expr::Binary { op, .. } => match op {
                 V2BinOp::And
@@ -706,6 +733,9 @@ impl<'a> TreeLowerer<'a> {
                 type_args,
                 args,
             } => {
+                if let Some(target) = self.raw_conversion_target(callee) {
+                    return self.lower_from_raw(*span, target, type_args, args);
+                }
                 if matches!(callee.as_ref(), V2Expr::Ident(_, name) if name == "create_object")
                     && has_create_dest(args)
                     && !self.user_callable_named(callee, *span)?
@@ -1111,5 +1141,123 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
         Ok(air)
+    }
+
+    /// The type `T` of a `T::from_raw(..)` call, when `T` names an enum or bitflags type in
+    /// scope (`from_raw` is a built-in conversion, not a user function).
+    pub(super) fn raw_conversion_target(&self, callee: &V2Expr) -> Option<ValueType> {
+        let V2Expr::Path(_, segs) = callee else {
+            return None;
+        };
+        let [tname, method] = segs.as_slice() else {
+            return None;
+        };
+        if method != "from_raw" {
+            return None;
+        }
+        // An `extern mod` named like the type owns the path, in every position: the call
+        // then resolves (or fails) as that module's fn.
+        if self
+            .env
+            .lookup_extern_mod(&self.owner_module, tname, self.in_object_scope)
+            .is_some()
+        {
+            return None;
+        }
+        match self
+            .env
+            .lookup_named_type(&self.owner_module, tname, self.in_object_scope)?
+        {
+            ResolvedNamedType::Enum(k) if self.env.all_enums.contains_key(&k) => {
+                Some(ValueType::Enum(k))
+            }
+            ResolvedNamedType::Bitflags(k) if self.env.all_bitflags.contains_key(&k) => {
+                Some(ValueType::Bitflags(k))
+            }
+            _ => None,
+        }
+    }
+
+    /// `T::from_raw(e)`: the operand of the `i16` expression `e`, typed `T` (no `.air` nodes),
+    /// for a bitflags type or a `std::engine` enum. Any word is accepted: engine enums stay
+    /// open, so a `match` on one needs a `_` arm.
+    pub(super) fn lower_from_raw(
+        &mut self,
+        span: Span,
+        target: ValueType,
+        type_args: &[V2Type],
+        args: &[CallArg],
+    ) -> Result<(String, ValueType)> {
+        self.check_from_raw_call(span, &target, type_args, args)?;
+        let (air, ty) = self.lower_value_expr(&args[0].value)?;
+        self.check_from_raw_arg(&args[0].value, &target, &ty)?;
+        Ok((air, target))
+    }
+
+    /// The shape rules of `T::from_raw(..)`, shared by value lowering and constant evaluation.
+    pub(super) fn check_from_raw_call(
+        &self,
+        span: Span,
+        target: &ValueType,
+        type_args: &[V2Type],
+        args: &[CallArg],
+    ) -> Result<()> {
+        let name = self.env.display_value_type(target);
+        if !type_args.is_empty() || args.len() != 1 || args[0].name.is_some() {
+            return Err(Error::at(
+                span,
+                format!("'{name}::from_raw' takes exactly one positional i16 argument"),
+            ));
+        }
+        // A user enum is closed: a `match` lists its variants with no `_`, so a word with no
+        // variant must not reach one.
+        if let ValueType::Enum(key) = target
+            && !is_engine_enum_key(key)
+        {
+            return Err(Error::at(
+                span,
+                format!(
+                    "'{name}::from_raw' is only for 'std::engine' enums and bitflags types: '{name}' is a closed enum, so a word with no variant would match a listed arm"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `T::from_raw(e)` takes an `i16` or a `T`.
+    pub(super) fn check_from_raw_arg(
+        &self,
+        arg: &V2Expr,
+        target: &ValueType,
+        ty: &ValueType,
+    ) -> Result<()> {
+        if *ty != ValueType::I16 && ty != target {
+            return Err(Error::at(
+                arg.span(),
+                format!(
+                    "'{}::from_raw' expects an i16, found '{}' (use 'as i16' first)",
+                    self.env.display_value_type(target),
+                    self.env.display_value_type(ty)
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `e as i16` accepts integers, bools, enums and bitflags; object handles already
+    /// convert to and from `i16` implicitly.
+    pub(super) fn check_as_i16_source(&self, span: Span, ty: &ValueType) -> Result<()> {
+        match ty {
+            ValueType::I16 | ValueType::Bool | ValueType::Enum(_) | ValueType::Bitflags(_) => {
+                Ok(())
+            }
+            ValueType::ObjectId | ValueType::ObjectRef(_) => Err(Error::at(
+                span,
+                format!(
+                    "'as i16' does not apply to '{}' (object ids already convert to i16)",
+                    self.env.display_value_type(ty)
+                ),
+            )),
+        }
     }
 }

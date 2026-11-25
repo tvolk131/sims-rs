@@ -288,8 +288,8 @@ pub(super) fn build_object_schema(
                     return Ok(ValueType::Bitflags(k.clone()));
                 }
                 match tname.as_str() {
-                    "Height" => return Ok(ValueType::Bitflags("builtin::Height".to_owned())),
-                    "Placement" => return Ok(ValueType::Bitflags("builtin::Placement".to_owned())),
+                    "Height" => return Ok(ValueType::Bitflags(HEIGHT_KEY.to_owned())),
+                    "Placement" => return Ok(ValueType::Bitflags(PLACEMENT_KEY.to_owned())),
                     "Self" => return Ok(ValueType::ObjectRef(canonical_key.to_owned())),
                     _ => {}
                 }

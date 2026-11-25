@@ -634,8 +634,9 @@ fn lower_object_with(
     }
 
     // 3b. Resolve all enums and bitflags (built-in + module-level + object/template-local).
-    let mut all_enums: BTreeMap<String, ResolvedEnum> = BTreeMap::new();
-    let mut all_bitflags: BTreeMap<String, ResolvedBitflags> = builtin_bitflags();
+    let std_types = std_types()?;
+    let mut all_enums: BTreeMap<String, ResolvedEnum> = std_types.enums.clone();
+    let mut all_bitflags: BTreeMap<String, ResolvedBitflags> = std_types.bitflags.clone();
     for scope in resolved.module_scopes.values() {
         for (def_mod, edecl) in scope.enums.values() {
             let key = format!("enum::{def_mod}::{}", edecl.name);
@@ -701,8 +702,8 @@ fn lower_object_with(
                     return Ok(ValueType::Bitflags(k.clone()));
                 }
                 match tname.as_str() {
-                    "Height" => return Ok(ValueType::Bitflags("builtin::Height".to_owned())),
-                    "Placement" => return Ok(ValueType::Bitflags("builtin::Placement".to_owned())),
+                    "Height" => return Ok(ValueType::Bitflags(HEIGHT_KEY.to_owned())),
+                    "Placement" => return Ok(ValueType::Bitflags(PLACEMENT_KEY.to_owned())),
                     "Self" => return Ok(ValueType::ObjectRef(self_object_key.clone())),
                     _ => {}
                 }

@@ -90,7 +90,8 @@ pub(super) fn match_is_exhaustive(
     if let Some(key) = enum_key
         && let Some(e) = env.all_enums.get(&key)
     {
-        return e.variants.values().all(|v| covered.contains(v));
+        // An engine enum is open: only a `_` arm covers it.
+        return !is_engine_enum_key(&key) && e.variants.values().all(|v| covered.contains(v));
     }
     false
 }
