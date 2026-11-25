@@ -211,9 +211,7 @@ impl NeighborhoodShell {
              in this neighborhood or install."
         );
         for mut new_game in candidates {
-            if self.options_file.is_file() {
-                let _ = new_game.load_options(&self.options_file);
-            }
+            self.load_saved_options(&mut new_game);
             new_game.coop_set_player_name(self.coop_player_name.clone());
             new_game.coop_set_iroh_config(self.coop_iroh_config);
             new_game.set_album_button_enabled(true);

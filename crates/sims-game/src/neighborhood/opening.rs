@@ -27,7 +27,7 @@ impl NeighborhoodShell {
             }
         };
         let autosave_worker = AutosaveWorker::spawn(store.autosaves());
-        let options_file = saves_path.with_extension("options.iff");
+        let options_file = user_files::options_to_load(&saves_path);
         let slot = slot.clamp(MIN_NEIGHBORHOOD, MAX_NEIGHBORHOOD);
         let kind = default_map_kind(&install, slot);
         let neighborhood_id = neighborhood_id_for_slot(slot);
@@ -105,8 +105,8 @@ impl NeighborhoodShell {
                     ))
                 });
                 let strings_handle = scope.spawn(|| {
-                    let options_state = if options_file.is_file() {
-                        OptionsState::load_iff(&options_file)
+                    let options_state = if let Some(options_file) = &options_file {
+                        OptionsState::load_iff(options_file)
                             .or_else(|_| OptionsState::load_install(&install))
                             .unwrap_or_default()
                     } else {
@@ -260,7 +260,6 @@ impl NeighborhoodShell {
             autosave_worker,
             migration_report,
             migration_error,
-            options_file,
             neighborhood_iff_synced: Some((
                 neighborhood_id.clone(),
                 stored.instance_id,

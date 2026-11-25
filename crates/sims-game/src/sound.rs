@@ -1141,19 +1141,34 @@ pub struct Mixer {
     reported: BTreeSet<String>,
 }
 
+/// A [`Mixer`]'s mode music, radio and ambience players and voice catalog.
+type StreamedPlayers = (
+    ModeMusicPlayer<Arc<SoundFiles>>,
+    RadioPlayer<Arc<SoundFiles>>,
+    AmbienceMixer<Arc<SoundFiles>>,
+    VoiceCatalog,
+);
+
+/// The mode music, radio and ambience players and the voice catalog over
+/// `files`.
+fn streamed_players(files: &Arc<SoundFiles>) -> StreamedPlayers {
+    let catalog = ModeCatalog::from_sound_files(files, true, ALL_EXPANSIONS);
+    let music = ModeMusicPlayer::new(catalog, Arc::clone(files), SEED);
+    let radio_catalog = RadioCatalog::from_sound_files(files);
+    let radio = RadioPlayer::new(radio_catalog, Arc::clone(files), SEED ^ 0x5241_4449);
+    let ambience_catalog = AmbienceCatalog::from_sound_files(files);
+    let ambience = AmbienceMixer::new(ambience_catalog, Arc::clone(files));
+    let voices = VoiceCatalog::from_shared_sound_files(Arc::clone(files));
+    (music, radio, ambience, voices)
+}
+
 impl Mixer {
     /// Reads the install's sound files at `root`.
     pub fn open(root: &Path) -> Result<Self, String> {
         let files = Arc::new(SoundFiles::scan(root).map_err(|e| format!("sound files: {e}"))?);
         let modules = Module::load_all(&files).map_err(|e| format!("sound modules: {e}"))?;
         let lists = StationLists::build(&files);
-        let catalog = ModeCatalog::from_sound_files(&files, true, ALL_EXPANSIONS);
-        let music = ModeMusicPlayer::new(catalog, Arc::clone(&files), SEED);
-        let radio_catalog = RadioCatalog::from_sound_files(&files);
-        let radio = RadioPlayer::new(radio_catalog, Arc::clone(&files), SEED ^ 0x5241_4449);
-        let ambience_catalog = AmbienceCatalog::from_sound_files(&files);
-        let ambience = AmbienceMixer::new(ambience_catalog, Arc::clone(&files));
-        let voices = VoiceCatalog::from_shared_sound_files(Arc::clone(&files));
+        let (music, radio, ambience, voices) = streamed_players(&files);
         let mut player = Player::new(modules, Arc::clone(&files), SEED);
         player.add_stations(&lists);
         player.add_scores(&files);
@@ -1181,13 +1196,7 @@ impl Mixer {
     /// PCM WAV clips from `open-pack/` (zero commercial `SoundData` required).
     pub fn open_pack(wavs: &BTreeMap<String, Vec<u8>>) -> Self {
         let files = Arc::new(SoundFiles::default());
-        let catalog = ModeCatalog::from_sound_files(&files, true, ALL_EXPANSIONS);
-        let music = ModeMusicPlayer::new(catalog, Arc::clone(&files), SEED);
-        let radio_catalog = RadioCatalog::from_sound_files(&files);
-        let radio = RadioPlayer::new(radio_catalog, Arc::clone(&files), SEED ^ 0x5241_4449);
-        let ambience_catalog = AmbienceCatalog::from_sound_files(&files);
-        let ambience = AmbienceMixer::new(ambience_catalog, Arc::clone(&files));
-        let voices = VoiceCatalog::from_shared_sound_files(Arc::clone(&files));
+        let (music, radio, ambience, voices) = streamed_players(&files);
         let mut player = Player::new(Vec::new(), Arc::clone(&files), SEED);
         player.set_global(SPEED_REGISTER, speed_register(Speed::Normal));
         Self {
