@@ -34,6 +34,17 @@ impl<'a> TreeLowerer<'a> {
             explicit_stack_obj && matches!(self.tree_ctx, TreeContext::SimOnObject { .. });
     }
 
+    /// Whether evaluating `expr` moves the cursor on purpose: a search, `set_to_next`, a
+    /// `create_object` with a destination (as [`ExplicitStackOps`] counts them), or a helper that
+    /// assigns `stack_obj`.
+    pub(super) fn arg_moves_cursor(&self, expr: &V2Expr) -> bool {
+        ExplicitStackOps {
+            assignments: true,
+            ..Default::default()
+        }
+        .in_expr(expr, self.env, &self.owner_module, self.in_object_scope)
+    }
+
     pub(super) fn save_stack_obj_for_move(&mut self) -> Option<String> {
         self.explicit_stack_obj.then(|| {
             let saved = self.fresh("pre_stack_obj");
@@ -129,6 +140,10 @@ impl<'a> TreeLowerer<'a> {
                 .as_ref()
                 .is_none_or(|v| self.cursor_expr_ok(v, cursor)),
             V2Stmt::Break { .. } | V2Stmt::Continue { .. } | V2Stmt::ReturnError { .. } => true,
+            V2Stmt::Expr {
+                expr: e @ V2Expr::MethodCall { method, .. },
+                ..
+            } if method == "remove" => self.cursor_expr_ok(e, cursor),
             V2Stmt::Let { name, init, .. } => {
                 self.cursor_fresh_name(name, cursor) && self.cursor_expr_ok(init, cursor)
             }
@@ -172,6 +187,14 @@ impl<'a> TreeLowerer<'a> {
     pub(super) fn cursor_place_ok(&self, place: &V2Expr, cursor: &str) -> bool {
         match place {
             V2Expr::Field { field, .. } if field == "sprite_flags" => false,
+            // A definition cell reads the stack object, so only the cursor's own is in place.
+            V2Expr::Field { base, field, .. }
+                if definition_field(field).is_some()
+                    && matches!(base.as_ref(), V2Expr::Ident(_, root)
+                        if !self.handle_has_state(root, field)) =>
+            {
+                matches!(base.as_ref(), V2Expr::Ident(_, root) if root == cursor)
+            }
             V2Expr::Field { base, .. } => match base.as_ref() {
                 V2Expr::Ident(_, root) => self.cursor_cell_root_ok(root, cursor),
                 V2Expr::Field { base: inner, .. } => {
@@ -183,6 +206,11 @@ impl<'a> TreeLowerer<'a> {
                 let base_ok = match base.as_ref() {
                     V2Expr::Ident(_, name) => {
                         matches!(name.as_str(), "temp" | "param") && self.lookup_var(name).is_none()
+                    }
+                    V2Expr::Field {
+                        base: root, field, ..
+                    } if field == "has_function" => {
+                        matches!(root.as_ref(), V2Expr::Ident(_, r) if r == cursor)
                     }
                     V2Expr::Field {
                         base: root, field, ..
@@ -224,15 +252,21 @@ impl<'a> TreeLowerer<'a> {
                 args,
                 ..
             } => {
-                method == "is_type"
-                    && type_args.is_empty()
-                    && matches!(receiver.as_ref(), V2Expr::Ident(_, r) if r == cursor)
-                    && args.iter().all(|a| {
-                        matches!(
-                            a.value,
-                            V2Expr::Int(..) | V2Expr::Ident(..) | V2Expr::Path(..)
-                        )
-                    })
+                let literal_args = args.iter().all(|a| {
+                    matches!(
+                        a.value,
+                        V2Expr::Int(..) | V2Expr::Ident(..) | V2Expr::Path(..)
+                    )
+                });
+                let on_cursor = matches!(receiver.as_ref(), V2Expr::Ident(_, r) if r == cursor);
+                type_args.is_empty()
+                    && on_cursor
+                    && (method == "is_type"
+                        // Remove Object of the stack object, with literal options.
+                        || (method == "remove"
+                            && args.iter().all(|a| a.name.is_some())
+                            && args.iter().all(|a| matches!(a.value, V2Expr::Int(..) | V2Expr::Bool(..)))))
+                    && (method != "is_type" || literal_args)
             }
             _ => false,
         }

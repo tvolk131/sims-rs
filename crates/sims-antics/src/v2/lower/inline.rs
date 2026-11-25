@@ -174,7 +174,8 @@ impl<'a> TreeLowerer<'a> {
                 call_args,
             );
         }
-        if stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name) {
+        let active = self.local_writing_builtins_in(fn_mod, is_local_fn);
+        if stmts_mutate_or_borrow_ident_in(&fn_decl.body, &param.name, &active) {
             return Err(Error::at(
                 param.span,
                 format!(
@@ -219,7 +220,8 @@ impl<'a> TreeLowerer<'a> {
         arg_span: Span,
         call_args: &[&V2Expr],
     ) -> Result<Binding> {
-        let read_only = !stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name);
+        let active = self.local_writing_builtins_in(fn_mod, is_local_fn);
+        let read_only = !stmts_mutate_or_borrow_ident_in(&fn_decl.body, &param.name, &active);
         // A caller local passed by value needs no `__arg_*` copy when nothing can change it
         // while the helper runs: the helper never mutates or borrows the parameter, and no
         // argument of this call borrows the local (`&mut x`, or a local-writing builtin). An

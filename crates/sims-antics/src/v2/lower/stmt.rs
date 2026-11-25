@@ -1774,46 +1774,7 @@ impl<'a> TreeLowerer<'a> {
                             return Ok(());
                         }
                         "destroy_self" => {
-                            let mut flags = 0u8;
-                            for a in args {
-                                let Some(aname) = &a.name else {
-                                    return Err(Error::at(
-                                        a.span,
-                                        "destroy_self() only takes named options ('flags:', 'no_yield:', 'skip_resets:')",
-                                    ));
-                                };
-                                match aname.as_str() {
-                                    "flags" => {
-                                        let v = self.eval_const_i16(&a.value)?;
-                                        flags |= u8::try_from(v).map_err(|_| {
-                                            Error::at(
-                                                a.span,
-                                                format!(
-                                                    "destroy_self flags {v} out of range 0..=255"
-                                                ),
-                                            )
-                                        })?;
-                                    }
-                                    "no_yield" => {
-                                        if self.eval_const_bool_required(&a.value, a.span)? {
-                                            flags |= 1;
-                                        }
-                                    }
-                                    "skip_resets" => {
-                                        if self.eval_const_bool_required(&a.value, a.span)? {
-                                            flags |= 2;
-                                        }
-                                    }
-                                    other => {
-                                        return Err(Error::at(
-                                            a.span,
-                                            format!(
-                                                "unknown destroy_self option '{other}' (expected 'flags', 'no_yield', or 'skip_resets')"
-                                            ),
-                                        ));
-                                    }
-                                }
-                            }
+                            let flags = self.remove_object_flags("destroy_self", args)?;
                             let target = match self.tree_ctx {
                                 TreeContext::ObjectSelf => "me",
                                 TreeContext::SimOnObject { .. } => "stack_obj",
@@ -2011,6 +1972,11 @@ impl<'a> TreeLowerer<'a> {
                     let prim = self
                         .format_prim_builtin("push_interaction", &full, *span)?
                         .expect("push_interaction is a primitive builtin");
+                    self.line(format!("{prim};"));
+                    Ok(())
+                }
+                "remove" => {
+                    let prim = self.format_remove_method(receiver, type_args, args, *span)?;
                     self.line(format!("{prim};"));
                     Ok(())
                 }

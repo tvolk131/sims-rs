@@ -51,6 +51,7 @@ pub(super) const LOCAL_WRITING_BUILTINS: &[&str] = &[
     "relationship",
     "create_object",
     "find_location",
+    "set_to_next",
 ];
 
 pub(super) fn stmts_mutate_or_borrow_ident(stmts: &[V2Stmt], target_name: &str) -> bool {
@@ -182,6 +183,10 @@ pub(super) fn builtin_args_write_ident(
         "relationship" => args
             .iter()
             .any(|a| matches!(a.name.as_deref(), Some("value" | "local")) && is_target(&a.value)),
+        // Set To Next writes the next object into its destination.
+        "set_to_next" => args
+            .iter()
+            .any(|a| a.name.as_deref() == Some("dest") && is_target(&a.value)),
         _ => false,
     }
 }
@@ -746,10 +751,9 @@ pub(super) fn expr_may_clobber_stack_obj(
     match expr {
         V2Expr::Call { callee, args, .. } => {
             if let V2Expr::Ident(_, fname) = callee.as_ref() {
-                if matches!(
-                    fname.as_str(),
-                    "find_best_object" | "create_object" | "set_to_next"
-                ) {
+                if matches!(fname.as_str(), "find_best_object" | "create_object")
+                    || (fname == "set_to_next" && set_to_next_steps_stack_obj(args))
+                {
                     return true;
                 }
                 // `distance_to` points `stack_obj` at its target unless that already is it.
@@ -941,6 +945,41 @@ impl ExplicitStackOps {
         local: bool,
     ) -> bool {
         stmts.iter().any(|stmt| {
+            // `let Some(x) = find_best_object(..) else {..}` puts the cursor back itself; only
+            // its arguments can move it. Anywhere else (a condition, a bool value) Find Best
+            // Object leaves the found object in `stack_obj`.
+            let let_some_search = match stmt {
+                V2Stmt::LetSome {
+                    init: V2Expr::Call { callee, args, .. },
+                    ..
+                } if matches!(callee.as_ref(), V2Expr::Ident(_, n) if n == "find_best_object") => {
+                    Some(args)
+                }
+                _ => None,
+            };
+            if self.assignments {
+                if matches!(stmt, V2Stmt::Assign { target: V2Expr::Ident(_, n), .. } if n == "stack_obj")
+                {
+                    return true;
+                }
+                // Code a literal condition discards is never lowered (`check_discarded`).
+                if let V2Stmt::If {
+                    cond: V2Expr::Bool(_, taken),
+                    then_body,
+                    else_body,
+                    ..
+                } = stmt
+                {
+                    let body = if *taken { then_body } else { else_body };
+                    return self.in_stmts(body, env, owner, local);
+                }
+            }
+            if let Some(args) = let_some_search {
+                return args.iter().any(|a| self.in_expr(&a.value, env, owner, local))
+                    || super::specialize::stmt_bodies(stmt)
+                        .into_iter()
+                        .any(|body| self.in_stmts(body, env, owner, local));
+            }
             super::specialize::stmt_exprs(stmt)
                 .into_iter()
                 .any(|expr| self.in_expr(expr, env, owner, local))
@@ -959,9 +998,18 @@ impl ExplicitStackOps {
         local: bool,
     ) -> bool {
         let mut found = false;
+        let assignments = self.assignments;
         super::specialize::visit_expr(expr, &mut |expr| {
-            if !found
-                && let V2Expr::Call { callee, args, .. } = expr
+            if found {
+                return;
+            }
+            // `&mut stack_obj` hands the cursor to code that may write it.
+            if assignments
+                && let V2Expr::MutRef { inner, .. } = expr
+                && matches!(inner.as_ref(), V2Expr::Ident(_, n) if n == "stack_obj")
+            {
+                found = true;
+            } else if let V2Expr::Call { callee, args, .. } = expr
                 && let V2Expr::Ident(_, name) = callee.as_ref()
             {
                 found = self.in_call(name, args, env, owner, local);
@@ -990,9 +1038,20 @@ impl ExplicitStackOps {
                         .filter_map(|p| p.default.as_ref())
                         .any(|expr| self.in_expr(expr, env, &module, is_local)))
         } else {
-            name == "set_to_next" || (name == "create_object" && has_create_dest(args))
+            name == "find_best_object"
+                || (name == "set_to_next" && set_to_next_steps_stack_obj(args))
+                || (name == "create_object" && has_create_dest(args))
         }
     }
+}
+
+/// Whether a `set_to_next` call steps `stack_obj`: it does unless its `dest:` names another
+/// cell (a local, `param[N]` or `temp[N]`), which is then the only cell it writes (`sims-vm`
+/// `primitives/set_to_next.rs`).
+pub(super) fn set_to_next_steps_stack_obj(args: &[CallArg]) -> bool {
+    args.iter()
+        .find(|a| a.name.as_deref() == Some("dest"))
+        .is_none_or(|a| matches!(&a.value, V2Expr::Ident(_, n) if n == "stack_obj"))
 }
 
 pub(super) fn has_create_dest(args: &[CallArg]) -> bool {

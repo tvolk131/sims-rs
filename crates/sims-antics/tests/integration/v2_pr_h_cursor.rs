@@ -272,7 +272,10 @@ fn cursor_syntax_rejects_unsupported_forms() {
             "for o in lot.objects() {} else { temp[0] = o; }",
             "unknown identifier 'o'",
         ),
-        ("set_to_next(part, dest: temp[0]);", "expects stack_obj"),
+        (
+            "set_to_next(part, dest: self.value);",
+            "steps 'stack_obj', a local",
+        ),
         ("set_to_next(128);", "out of range"),
         ("create_object(PROBE, dest: temp[0]);", "expects stack_obj"),
     ] {
