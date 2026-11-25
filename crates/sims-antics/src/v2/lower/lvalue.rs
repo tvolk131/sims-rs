@@ -712,8 +712,7 @@ impl<'a> TreeLowerer<'a> {
                 ..
             } => {
                 let switches = obj_air != "stack_obj";
-                let clobbers_temp0 = setup.is_some()
-                    && (rhs_air.contains("temp[0]") || rhs_air.contains("scope(33,"));
+                let clobbers_temp0 = setup.is_some() && reads_temp0(rhs_air);
                 let effective_rhs = if (switches && reads_stack_obj(rhs_air)) || clobbers_temp0 {
                     let snap = self.fresh("frhs");
                     self.emit_let(&snap, rhs_air);

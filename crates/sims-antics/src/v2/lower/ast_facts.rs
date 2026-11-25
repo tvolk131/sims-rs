@@ -988,6 +988,13 @@ impl ExplicitStackOps {
                     return self.in_stmts(body, env, owner, local);
                 }
             }
+            // A raw block that may write the cursor leaves it there.
+            if self.raw_writes
+                && let V2Stmt::RawAir { code, .. } = stmt
+                && super::raw::raw_air_may_clobber_stack_obj(code)
+            {
+                return true;
+            }
             if let Some(args) = let_some_search {
                 return args.iter().any(|a| self.in_expr(&a.value, env, owner, local))
                     || super::specialize::stmt_bodies(stmt)

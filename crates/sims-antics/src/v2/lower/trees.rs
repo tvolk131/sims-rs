@@ -348,6 +348,7 @@ pub(super) fn emit_guard_tree(
     label: &str,
     guard: &GuardDecl,
     func_params: &[crate::v2::ast::FnParam],
+    object_reachable: bool,
 ) -> Result<()> {
     let needs_self_save = match &guard.kind {
         GuardBody::Expr(e) => {
@@ -365,6 +366,7 @@ pub(super) fn emit_guard_tree(
         owner_module,
         needs_self_save,
     );
+    ctx.object_reachable = object_reachable;
     let mut stack_ops = ExplicitStackOps::default();
     ctx.reassigns_stack_obj = match &guard.kind {
         GuardBody::Expr(e) => ExplicitStackOps::for_tree().in_expr(e, env, owner_module, true),

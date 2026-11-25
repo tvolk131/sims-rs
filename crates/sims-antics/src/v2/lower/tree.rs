@@ -22,6 +22,7 @@ impl<'a> TreeLowerer<'a> {
             has_self_obj_local,
             explicit_stack_obj: false,
             reassigns_stack_obj: false,
+            raw_moves_cursor: false,
             sets_stack_obj: false,
             used_saved_stack_obj: false,
             value_return: None,
@@ -62,6 +63,7 @@ impl<'a> TreeLowerer<'a> {
             inherited_entry_save: false,
             inherit_tree: false,
             tree_display: None,
+            object_reachable: false,
             raw_reserved: Vec::new(),
         }
     }

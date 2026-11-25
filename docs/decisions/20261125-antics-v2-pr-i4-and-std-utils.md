@@ -70,7 +70,8 @@ semantics nothing checks.
 
 **`make_new_character(skin:, age:, sex:, species:)`** (opcode 19):
 
-- skin, age and sex must be `i16` locals (the VM reads locals at operand bytes 0–2).
+- skin, age and sex must be `i16` locals (the VM reads locals at operand bytes 0–2). An `enum`
+  local is refused: the VM reads the code whole, with no range.
 - species is a constant 0..=2: person, dog or cat. Other species are Unsupported in the VM.
 
 **`drop_onto(src:, dst:)`** accepts a constant or a tree parameter, spelled `param[N]`.
@@ -86,7 +87,10 @@ semantics nothing checks.
   tree, and any inherit tree that calls one of those (computed to a fixpoint), is refused when
   called from an object's own tree (init, main, other lifecycle hooks, `fn` trees without a
   Sim).
-- Calls from interactions, functionals, Sim trees and other inherit trees are allowed.
+- A functional's action and guard count as object callers too: `run_functional` and Find Best
+  Object run them on whichever object asks.
+- Calls from interactions, Sim trees and other inherit trees are allowed.
+- Code a literal condition discards emits no call, so it adds no fact.
 - A Sim tree reached this way follows PR D's rule: its `self` is the stack object, which may be
   wherever the inherit tree moved the cursor. For example, the studio's session trees run with
   the cursor on the console.
@@ -98,11 +102,16 @@ semantics nothing checks.
 `can_forward_helper_cell`, `HelperCell::Pure`). A read-only inline helper parameter now reads
 any plain cell in place when both of these hold:
 
-- **The cell's read cannot fault.** `expr_may_fault_read` decides this. Reads that qualify:
-  - a global;
-  - `my`/`self` attribute and data words;
-  - the Sim's person words, but only in a Sim tree, where the runner is a Sim;
-  - a `self` read through the cursor, only in a tree that never moves the cursor.
+- **The cell's read cannot fault or wake anything.** `safe_cell_air` decides this, with bounds
+  from `sims-vm` `memory.rs`. Reads that qualify:
+  - `temp[0..8]`, a parameter below the tree's argument count, `global[0..32]` (older saves
+    keep 32);
+  - a declared `my`/`self` attribute, and data words below 64 (the smallest object), except
+    word 25, whose read wakes the object;
+  - the runner's person words below 80 and motives below 16, only in a Sim tree, where the
+    runner is a Sim (not an inherit tree, whose runner may be an object);
+  - a `self` read through the cursor, only in a Sim tree where nothing has moved the cursor
+    (no `stack_obj` assignment, no explicit stepping, no raw block that may write it).
 
   Because the read cannot fault, moving it into the body, repeating it, or dropping it is
   unobservable.
@@ -122,7 +131,7 @@ emits:
 - temp, parameter, global, own, Sim and stack-object cells.
 
 It must contain no `local[N]`, named local, declaration, `const`, string, label or `->` graph,
-`scope(..)`, `expr(..)`, `pad`, or block comment. The invariants that make this sound:
+`scope(..)`, `expr(..)`, `pad`, block comment or `#` comment (the line printer strips only `//`). The invariants that make this sound:
 
 1. **No frame word is named.** There is no local, so coalescing, renaming and pinning cannot
    change what the block reads.
@@ -133,6 +142,14 @@ It must contain no `local[N]`, named local, declaration, `const`, string, label 
    prints its own code, so the backend passes parse it and see exactly what structured code
    would give them. The test compares each such block with its structured spelling and gets
    identical trees.
+
+Two more rules keep the optimizer from changing what such a block does:
+
+- A block that may write the cursor marks the tree like a source `stack_obj = x`, so its cursor
+  stores are not dropped as dead at the exit, whose result they set.
+- An inlined helper's arms that hold raw code keep the single-copy branch lowering, so the raw
+  code is not copied to each return site (a tree's author counted one copy against the node
+  limit).
 
 Every other raw block keeps the old behaviour: the whole tree's layout is kept and only the
 unread entry save may go. The tests that pinned that path now use a raw `const` to keep it.
@@ -158,6 +175,10 @@ put back the entry object after the read, not `o`.
   `&mut`).
 - In such a tree, foreign reads, `emit_on_self`, distance, `run_functional` and lvalue moves
   save and restore the current cursor (`__pre_stack_obj_N`).
+- A raw block that may write the cursor has the same effect from that point in lowering order.
+  A loop whose body holds one sets it before the body, since the next iteration runs the code
+  before the block again. A raw block after a loop does not change the loop (PR H's `for ..
+  else` shape is kept).
 - PR D's `self` rule is unchanged, and so is the explicit-tree classification.
 - `for` loops still restore the entry object on exit (PR H's rule, pinned by its tests).
   Treating reassigning trees as explicit there changed both, so it was not done.
@@ -170,12 +191,19 @@ put back the entry object after the read, not `o`.
   been written.
 - In-place arithmetic into any cell other than a fresh local now goes through `__arith` when an
   operand after the first, or a negated base, may fault.
-- What may fault: any read through the stack object, a foreign handle, a neighbor or a
-  definition, and `self` read through a cursor the tree may move.
-- `self` reads are trusted when the destination is written through that same cursor. The first
-  write would fault before anything is stored.
+- What may fault: any read that is not one of the safe cells listed under read-only helper
+  parameters (`safe_cell_air`). That covers reads through the stack object, a foreign handle, a
+  neighbor or a definition, words past the smallest owner's count, and `self` read through a
+  cursor the tree may move, even when the destination goes through the same cursor (a word past
+  the object's count faults after the first write lands).
+- A temp-indexed destination (`scope(27|30|31, k)`) is always staged: its index may alias a
+  cell the right side reads.
 - A Sim tree that never moves the cursor keeps `temp[4] := 1; temp[4] += stack.attr[0];`, which
   is the open-pack shape, so the pack is unchanged.
+
+**Temp staging reads.** The sprite-flags setup and Job Data's career both write `temp[0]`
+first. An operand read through a cell indexed by `temp[0]` (`scope(27|30|31, 0)`), not only
+`temp[0]` itself or job data, is now copied before (`lower/mod.rs` `reads_temp0`).
 
 ### 4. `std::math`, `std::motives`, `std::budget` (Stream 1b)
 
@@ -208,4 +236,7 @@ put back the entry object after the read, not `o`.
     - the lift corpus effect of `from_raw` constant folding is unchecked.
 - Not done:
   - checking a raw `call N` to a Sim tree from an inherit tree;
+  - a short-circuit condition with a constant leaf (`temp[0] == 1 && false`) can still leave the
+    previous node's result as the tree's last result. That predates this PR and is left for a
+    follow-up;
   - named `play_sound` volume and loop options, which wait on a VM reading of those bytes.

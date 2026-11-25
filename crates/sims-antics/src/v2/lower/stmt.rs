@@ -424,6 +424,7 @@ impl<'a> TreeLowerer<'a> {
                 cancel_on_abort,
                 body,
             } => {
+                self.note_loop_raw_cursor(Some(cond), body);
                 if *cancel_on_abort && matches!(self.tree_ctx, TreeContext::ObjectSelf) {
                     return Err(Error::at(
                         *span,
@@ -557,6 +558,8 @@ impl<'a> TreeLowerer<'a> {
                 body,
                 else_body,
             } => {
+                // The exhaustion block runs once, after the loop.
+                self.note_loop_raw_cursor(None, body);
                 if let ForEachIter::Range {
                     start,
                     end,
@@ -1078,8 +1081,14 @@ impl<'a> TreeLowerer<'a> {
                 // Discarded code emits nothing, so only emitted raw blocks count.
                 if self.checking_discarded == 0 {
                     self.raw_span.get_or_insert(*span);
+                    let moves_cursor = raw_air_may_clobber_stack_obj(code);
+                    self.raw_moves_cursor |= moves_cursor;
                     if !layout_free {
                         self.keep_layout = true;
+                    } else if moves_cursor {
+                        // Like a source `stack_obj = x`: the backend keeps the block's cursor
+                        // stores, whose Expression result the exit may record.
+                        self.sets_stack_obj = true;
                     }
                     if self.pin_span.is_some() {
                         return Err(Error::at(*span, RAW_WITH_PIN));

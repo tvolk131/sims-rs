@@ -103,7 +103,9 @@ impl<'a> TreeLowerer<'a> {
                         },
                     ));
                 }
+                // Discarded code emits no call.
                 if self.inherit_tree
+                    && self.checking_discarded == 0
                     && let Some(caller) = &self.tree_display
                 {
                     self.env
@@ -124,13 +126,13 @@ impl<'a> TreeLowerer<'a> {
                     ),
                 ));
             }
-            CallContext::Inherit => {
+            CallContext::Inherit if self.checking_discarded == 0 => {
                 let caller = self
                     .inherit_tree
                     .then(|| self.tree_display.clone())
                     .flatten();
-                let from_object =
-                    !self.inherit_tree && matches!(self.tree_ctx, TreeContext::ObjectSelf);
+                let from_object = self.object_reachable
+                    || (!self.inherit_tree && matches!(self.tree_ctx, TreeContext::ObjectSelf));
                 self.env.inherit_calls.borrow_mut().edges.push((
                     caller,
                     from_object,
@@ -138,7 +140,7 @@ impl<'a> TreeLowerer<'a> {
                     span,
                 ));
             }
-            CallContext::ObjectSelf | CallContext::Extern => {}
+            CallContext::Inherit | CallContext::ObjectSelf | CallContext::Extern => {}
         }
 
         // Match arguments to parameters (positional first, then by name).

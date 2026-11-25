@@ -267,7 +267,8 @@ fn check_inherit_calls(facts: &InheritCallFacts) -> Result<()> {
                 *span,
                 format!(
                     "{callee} is 'context = inherit' but runs a Sim tree on its runner, so it can \
-                     only be called from interactions, functionals, Sim trees, or other inherit trees"
+                     only be called from interactions, Sim trees, or other inherit trees (an object \
+                     can run a functional)"
                 ),
             ));
         }
@@ -498,6 +499,17 @@ impl ValueType {
 fn reads_temps(air: &str) -> bool {
     air.contains("temp[")
         || ["scope(27,", "scope(30,", "scope(31,", "scope(33,"]
+            .iter()
+            .any(|s| air.contains(s))
+}
+
+/// Whether an `.air` operand reads `temp[0]`: the cell itself, job data (which reads the career
+/// there), or a cell indexed by it (`scope(27, 0)`, `scope(30, 0)`, `scope(31, 0)`). Staging
+/// that writes only `temp[0]` copies such an operand first.
+fn reads_temp0(air: &str) -> bool {
+    air.contains("temp[0]")
+        || air.contains("scope(33,")
+        || ["scope(27, 0)", "scope(30, 0)", "scope(31, 0)"]
             .iter()
             .any(|s| air.contains(s))
 }
@@ -766,6 +778,10 @@ struct TreeLowerer<'a> {
     /// steps it explicitly: the cursor may rest on another object than the entry object, so a
     /// builtin that moves it saves and restores it rather than putting back the entry object.
     reassigns_stack_obj: bool,
+    /// A raw block lowered so far, or one in a loop being lowered, may write the cursor: like
+    /// [`Self::reassigns_stack_obj`] from that point on. Set in lowering order, so a raw block
+    /// after a loop does not change how the loop lowers.
+    raw_moves_cursor: bool,
     /// The source assigns `stack_obj` itself (`stack_obj = x;`), so the stack object the tree
     /// leaves at exit is the source's: no store of it is dropped as dead at the exit
     /// (`mir::FrameFacts::keeps_exit_stack_obj`).
@@ -865,6 +881,10 @@ struct TreeLowerer<'a> {
     inherit_tree: bool,
     /// The standalone tree being lowered (`tree 'x'`), for [`InheritCallFacts`].
     tree_display: Option<String>,
+    /// A functional's action or guard: lowered as a Sim tree, but `run_functional` and Find
+    /// Best Object run it on whichever object asks, so an object may be its runner
+    /// ([`InheritCallFacts`]).
+    object_reachable: bool,
     /// The compiler's entry-object locals that a raw block of the tree declares, with the
     /// block's span: an error when the tree's lowering declares the same name (`finish`).
     raw_reserved: Vec<(&'static str, Span)>,
@@ -923,4 +943,6 @@ struct ExplicitStackOps {
     visited: BTreeSet<(String, String, bool)>,
     /// Also count a `stack_obj = x;` statement (in a helper body).
     assignments: bool,
+    /// Also count a raw block that may write the cursor.
+    raw_writes: bool,
 }

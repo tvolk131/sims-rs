@@ -1319,6 +1319,7 @@ fn lower_object_with(
                 &label,
                 guard,
                 &func.decl.params,
+                true,
             )?;
             Some(gid)
         } else {
@@ -1359,6 +1360,7 @@ fn lower_object_with(
             &func.owner_module,
             needs_self_save,
         );
+        ctx.object_reachable = true;
         ctx.reassigns_stack_obj =
             ExplicitStackOps::for_tree().in_stmts(&func.decl.body, &env, &func.owner_module, true);
         ctx.begin_body(ExplicitStackOps::default().in_stmts(
@@ -1513,6 +1515,7 @@ fn lower_object_with(
                 &glabel,
                 guard,
                 &[],
+                false,
             )?;
             Some(gid)
         } else {

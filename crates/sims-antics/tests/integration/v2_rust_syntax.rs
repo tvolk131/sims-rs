@@ -1251,11 +1251,11 @@ fn review_round_2_regressions() {
     assert!(!a.contains("stack_obj :="), "{a}");
     // Argument code that moves the cursor: the found one is saved first and selected again.
     let b = tree(&air, "b");
-    let saved = b.find("let __rf_obj_1 = stack_obj;").expect("cursor saved");
+    let saved = b.find("let __rf_obj").expect("cursor saved");
     let moved = b.find("stack_obj := param[0];").expect("argument read");
     let call = b.find("run_functional_tree(4)").expect("call");
     let reselect = b
-        .find("stack_obj := __rf_obj_1;")
+        .find("stack_obj := __rf_obj")
         .expect("cursor selected again");
     assert!(saved < moved && moved < reselect && reselect < call, "{b}");
     assert!(!b[call..].contains("stack_obj :="), "{b}");

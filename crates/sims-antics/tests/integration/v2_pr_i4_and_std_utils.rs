@@ -955,7 +955,8 @@ object "Pr I4 Tail" {
                 &t,
                 &["__arith_0 += stack.attr[0];", "temp[3] := __arith_0;"],
             );
-            // Writing `self` through the cursor faults first on a gone object.
+            // Writing `self` through the moved cursor is staged too: the first write can land
+            // and the read still fault (a word past the object's own count, say).
             let t = t_air(
                 "partial_self.antics",
                 "",
@@ -965,7 +966,11 @@ object "Pr I4 Tail" {
             expect_seq(
                 "partial_self",
                 &t,
-                &["stack.attr[0] := 1;", "stack.attr[0] += stack.data[0];"],
+                &[
+                    "let __arith_0 = 1;",
+                    "__arith_0 += stack.data[0];",
+                    "stack.attr[0] := __arith_0;",
+                ],
             );
         }
     }
@@ -1135,6 +1140,196 @@ object "Pr I4 Tail" {
                 let t = layout(raw);
                 assert!(t.contains(" = 5;"), "{raw}:\n{t}");
             }
+        }
+    }
+
+    /// Regressions from the first review round.
+    mod review_round_1 {
+        use super::*;
+
+        fn object(members: &str) -> String {
+            format!(
+                "object \"Pr I4 R1\" {{\n    guid: 0x7F40_0263;\n    state n: i16;\n{members}\n}}\n"
+            )
+        }
+
+        fn t_of(name: &str, members: &str) -> String {
+            tree(&expand(name, &object(members)), "t").to_owned()
+        }
+
+        /// The line printer strips only `//` comments, so a `#` comment keeps the layout.
+        #[test]
+        fn hash_comments_keep_the_raw_layout() {
+            let t = t_of(
+                "raw_hash.antics",
+                "    #[bhav] fn t() { raw {\n        # note; temp[0] := 7;\n    } }",
+            );
+            assert!(t.contains("# note; temp[0] := 7;"), "{t}");
+        }
+
+        /// An inlined helper's early return does not copy a raw arm to each return site.
+        #[test]
+        fn raw_arms_are_not_copied_per_return_site() {
+            let t = t_of(
+                "raw_arm.antics",
+                "    fn check() -> bool { if temp[0] == 1 { return true; } true }\n    \
+                 #[bhav] fn t() { if check() { raw { temp[1] := 9; } } }",
+            );
+            assert_eq!(t.matches("temp[1] := 9;").count(), 1, "{t}");
+        }
+
+        /// A raw block's cursor stores survive to the exit.
+        #[test]
+        fn raw_cursor_stores_reach_the_exit() {
+            let t = t_of(
+                "raw_exit.antics",
+                "    #[bhav] fn t(sim: Sim) { raw { find_best_object(4); stack_obj := 0; } }",
+            );
+            assert!(t.contains("stack_obj := 0;"), "{t}");
+        }
+
+        /// After a raw block moves the cursor, a foreign read puts back that cursor, not the
+        /// entry object; in a loop, so does a read before the block.
+        #[test]
+        fn raw_cursor_writes_are_saved_around_moves() {
+            let t = t_of(
+                "raw_cursor.antics",
+                "    #[bhav] fn t(sim: Sim, o: ObjectId, p: ObjectId) {\n        \
+                 raw { stack_obj := param[0]; }\n        temp[0] = p.attr[3];\n    }",
+            );
+            expect_seq(
+                "raw_cursor",
+                &t,
+                &[
+                    "stack_obj := param[0];",
+                    "let __pre_stack_obj_1 = stack_obj;",
+                    "stack_obj := param[1];",
+                    "let __fattr_0 = stack.attr[3];",
+                    "stack_obj := __pre_stack_obj_1;",
+                ],
+            );
+            let t = t_of(
+                "raw_cursor_loop.antics",
+                "    #[bhav] fn t(sim: Sim, o: ObjectId, p: ObjectId) {\n        \
+                 while temp[1] < 3 {\n            temp[0] = p.attr[3];\n            \
+                 temp[2] = stack_obj.attr[1];\n            \
+                 raw { stack_obj := param[0]; }\n            temp[1] += 1;\n        }\n    }",
+            );
+            // The second iteration's `stack_obj.attr[1]` reads the raw block's cursor.
+            assert!(t.contains("let __pre_stack_obj"), "{t}");
+            assert!(!t.contains("__self_obj"), "{t}");
+        }
+
+        /// A word past what every object has is staged even when the destination goes through
+        /// the same cursor, and so is an inherit tree's motive read (its runner may be an
+        /// object).
+        #[test]
+        fn bounds_and_runner_decide_in_place_arithmetic() {
+            let t = t_of(
+                "arith_bounds.antics",
+                "    #[bhav] fn t(sim: Sim) { stack_obj = temp[0]; self.n = 1 + self.attr[100]; }",
+            );
+            expect_seq(
+                "arith_bounds",
+                &t,
+                &["let __arith_0 = 1;", "__arith_0 += stack.attr[100];"],
+            );
+            let air = expand(
+                "arith_inherit.antics",
+                &object(
+                    "    #[bhav] #[context(inherit)] fn t() { temp[2] = 1 + me.motive.hunger; }\n    \
+                     main { t(); }",
+                ),
+            );
+            let t = tree(&air, "t");
+            assert!(!t.contains("temp[2] := 1;"), "{t}");
+        }
+
+        /// An object reaches a functional's action and guard (`run_functional`, Find Best
+        /// Object), so neither may call an inherit tree that runs a Sim tree.
+        #[test]
+        fn functionals_cannot_reach_sim_only_inherit_trees() {
+            let msg =
+                "so it can only be called from interactions, Sim trees, or other inherit trees";
+            expect_err(
+                "inherit_functional.antics",
+                &object(
+                    "    #[bhav] fn s(sim: Sim) { temp[0] = sim.fame; }\n    \
+                     #[bhav] #[context(inherit)] fn g() { s(me); }\n    \
+                     functional cook { run(sim) { g(); } }",
+                ),
+                msg,
+            );
+            expect_err(
+                "inherit_guard.antics",
+                &object(
+                    "    #[bhav] fn s(sim: Sim) -> bool { sim.fame > 0 }\n    \
+                     #[bhav] #[context(inherit)] fn g() -> bool { s(me) }\n    \
+                     functional cook { score: 50, guard(sim) => g(), run(sim) {} }",
+                ),
+                msg,
+            );
+        }
+
+        /// Code a literal condition discards emits no call, so it adds no inherit fact.
+        #[test]
+        fn discarded_calls_add_no_inherit_facts() {
+            expand(
+                "inherit_dead.antics",
+                &object(
+                    "    #[bhav] fn s(sim: Sim) { temp[0] = sim.fame; }\n    \
+                     #[bhav] #[context(inherit)] fn g() { if false { s(me); } }\n    \
+                     main { g(); }",
+                ),
+            );
+        }
+
+        /// A read-only helper argument that wakes the object (data word 25) is still copied.
+        #[test]
+        fn waking_reads_are_not_forwarded() {
+            let t = t_of(
+                "helper_wake.antics",
+                "    fn ignore(x: i16 = self.data[25]) {}\n    #[bhav] fn t() { ignore(); }",
+            );
+            assert!(t.contains("= my.data[25];"), "{t}");
+        }
+
+        /// A temp-indexed destination never takes in-place arithmetic: the index may alias a
+        /// cell the right side reads.
+        #[test]
+        fn temp_indexed_destinations_are_staged() {
+            let t = t_of(
+                "dynamic_alias.antics",
+                "    #[bhav] fn t(sim: Sim) { temp[1] = 81; sim.person[temp[1]] = 1 + sim.fame; }",
+            );
+            assert!(t.contains("scope(30, 1) := __arith_0;"), "{t}");
+        }
+
+        /// A staged level reading `scope(30, 0)` is copied before the career goes into
+        /// `temp[0]`.
+        #[test]
+        fn job_staging_copies_cells_indexed_by_temp_0() {
+            let t = t_of(
+                "job_scope30.antics",
+                "    #[bhav] fn t(sim: Sim) { temp[0] = 5; temp[1] = job_data(3, sim.person[temp[0]], 1); }",
+            );
+            expect_seq(
+                "job_scope30",
+                &t,
+                &["let __job_level_0 = scope(30, 0);", "temp[0] := 3;"],
+            );
+        }
+
+        #[test]
+        fn make_new_character_needs_i16_locals() {
+            expect_err(
+                "make_enum.antics",
+                &object(
+                    "    enum Look { Old = 3 }\n    #[bhav] fn t(sim: Sim) {\n        \
+                     let i: Look = Look::Old;\n        make_new_character(skin: i, age: i, sex: i);\n    }",
+                ),
+                "make_new_character(skin:) must name an i16 local",
+            );
         }
     }
 }

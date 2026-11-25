@@ -833,6 +833,13 @@ impl<'a> TreeLowerer<'a> {
                 PrimArg::Local if fname == "push_interaction" && key == "icon" => {
                     self.push_icon_local(&a.value, named.get("object").copied(), pinned_object)?
                 }
+                // Make New Character's skin, age and sex locals hold codes the VM reads whole,
+                // with no enum range, so only a plain `i16` names them.
+                PrimArg::Local if fname == "make_new_character" => self.builtin_local_arg_typed(
+                    &a.value,
+                    &format!("{fname}({key}:)"),
+                    false,
+                )?,
                 PrimArg::Local => self.builtin_local_arg(&a.value, &format!("{fname}({key}:)"))?,
                 PrimArg::SlotOrParam => match self.builtin_param_index(&a.value)? {
                     Some(index) => format!("param[{index}]"),

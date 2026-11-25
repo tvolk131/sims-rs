@@ -307,7 +307,8 @@ pub(super) fn raw_block_is_layout_free(code: &str) -> bool {
         "flag_test",
     ];
     const PRIMS: &[&str] = &["find_best_object", "run_functional_tree", "play_sound"];
-    if code.contains("/*") {
+    // The line printer strips only `//` comments.
+    if code.contains("/*") || code.contains('#') {
         return false;
     }
     let Ok(tokens) = crate::lexer::tokenize(code) else {

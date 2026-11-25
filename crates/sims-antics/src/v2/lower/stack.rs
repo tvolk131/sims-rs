@@ -45,8 +45,29 @@ impl<'a> TreeLowerer<'a> {
         .in_expr(expr, self.env, &self.owner_module, self.in_object_scope)
     }
 
+    /// Whether the cursor may rest on another object than the entry object here
+    /// ([`Self::reassigns_stack_obj`], [`Self::raw_moves_cursor`]).
+    pub(super) fn cursor_may_be_moved(&self) -> bool {
+        self.reassigns_stack_obj || self.raw_moves_cursor
+    }
+
+    /// Sets [`Self::raw_moves_cursor`] before a loop whose body (or condition) has a raw block
+    /// that may write the cursor: the next iteration runs earlier code after it.
+    pub(super) fn note_loop_raw_cursor(&mut self, cond: Option<&V2Expr>, body: &[V2Stmt]) {
+        let mut ops = ExplicitStackOps {
+            raw_writes: true,
+            ..Default::default()
+        };
+        let (env, owner, local) = (self.env, self.owner_module.clone(), self.in_object_scope);
+        if cond.is_some_and(|c| ops.in_expr(c, env, &owner, local))
+            || ops.in_stmts(body, env, &owner, local)
+        {
+            self.raw_moves_cursor = true;
+        }
+    }
+
     pub(super) fn save_stack_obj_for_move(&mut self) -> Option<String> {
-        (self.explicit_stack_obj || self.reassigns_stack_obj).then(|| {
+        (self.explicit_stack_obj || self.cursor_may_be_moved()).then(|| {
             let saved = self.fresh("pre_stack_obj");
             self.stack_op(mir::StackObjOp::Save(&saved));
             saved
