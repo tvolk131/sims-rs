@@ -42,7 +42,7 @@ pub enum V2Item {
     ExternBcon(ExternBconDecl),
 }
 
-/// Where a BHAV-call ABI parameter is passed (`a: i16` positional or `a: i16 @ temp[N]`).
+/// Where a BHAV-call ABI parameter is passed (`a: i16` positional or `#[temp(N)] a: i16`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbiParamSlot {
     /// Passed positionally as callee `param[i]` (literal call operands, or `temp[i]` via `call(temps)`).
@@ -51,7 +51,7 @@ pub enum AbiParamSlot {
     Temp(u8),
 }
 
-/// One parameter of an `extern mod` function or standalone `tree` declaration.
+/// One parameter of an `extern mod` function or standalone `#[bhav] fn` declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbiParam {
     pub span: Span,
@@ -60,7 +60,7 @@ pub struct AbiParam {
     pub slot: AbiParamSlot,
 }
 
-/// Explicit SimAntics return ABI of an `extern mod` function or standalone `tree`.
+/// Explicit SimAntics return ABI of an `extern mod` function or standalone `#[bhav] fn`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReturnAbi {
     /// No declared result: the call's true/false exit is ignored by callers.
@@ -69,13 +69,13 @@ pub enum ReturnAbi {
     Bool,
     /// `-> Result`: true exit = success, false exit = failure (`?` propagates `return error;`).
     Result,
-    /// `-> T @ temp[N]`: the callee leaves a value in `temp[N]` (true/false exit ignored).
+    /// `#[ret(temp = N)] .. -> T`: the callee leaves a value in `temp[N]` (true/false exit ignored).
     Value { ty: V2Type, temp: u8 },
-    /// `-> Result<T @ temp[N]>`: true exit = success with the value in `temp[N]`, false = failure.
+    /// `#[ret(temp = N)] .. -> Result<T>`: true exit = success with the value in `temp[N]`, false = failure.
     ResultValue { ty: V2Type, temp: u8 },
 }
 
-/// One callable external BHAV inside an `extern mod` block (`@id(N) fn name(...) -> Abi;`).
+/// One callable external BHAV inside an `extern mod` block (`#[id(N)] fn name(...) -> Abi;`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternFnDecl {
     pub span: Span,
@@ -131,7 +131,7 @@ pub struct BconTableDecl {
     pub entries: Vec<(Span, String, i16)>,
 }
 
-/// Standalone non-inlined BHAV (`[@id(N)] tree [ident] ["Label"] [(params)] [-> Abi] { ... }`).
+/// Standalone non-inlined BHAV (`[#[id(N)]] tree [ident] ["Label"] [(params)] [-> Abi] { ... }`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TreeMemberDecl {
     pub span: Span,
@@ -142,16 +142,16 @@ pub struct TreeMemberDecl {
     pub label: String,
     /// `Some(name)` when the first parameter is `name: Sim` (Sim-on-object context).
     pub sim_binding: Option<String>,
-    /// `@context(inherit)` lets callers supply either frame context unchanged.
+    /// `#[context(inherit)]` lets callers supply either frame context unchanged.
     pub inherit_context: bool,
     pub params: Vec<AbiParam>,
     pub ret: ReturnAbi,
     pub body: Vec<V2Stmt>,
-    /// `@frame(args: N, locals: M, format: F, revision: R, kind: K)` header pins (all optional).
+    /// `#[frame(args = N, locals = M, format = F, revision = R, kind = K)]` header pins (all optional).
     pub frame: Option<TreeFrame>,
 }
 
-/// Explicit BHAV header fields for a standalone `tree` (`@frame(...)`).
+/// Explicit BHAV header fields for a standalone `#[bhav] fn` (`#[frame(...)]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TreeFrame {
     pub span: Span,
@@ -161,7 +161,7 @@ pub struct TreeFrame {
     pub revision: Option<u32>,
     /// The header's kind byte (`.air` `kind:`).
     pub kind: Option<u8>,
-    /// `@frame(empty)`: a 0-node BHAV (the body must be `{}`). Entering one faults, as the
+    /// `#[frame(empty)]`: a 0-node BHAV (the body must be `{}`). Entering one faults, as the
     /// original's do; a plain `{}` body is `return true;`.
     pub empty: bool,
 }
@@ -312,7 +312,7 @@ pub struct VariantDecl {
     pub guid: Option<(Span, u32)>,
     pub price: Option<(Span, i64)>,
     pub description: Option<String>,
-    /// Standalone `tree` names replacing the primary OBJD's init / main trees.
+    /// Standalone `#[bhav] fn` names replacing the primary OBJD's init / main trees.
     pub init: Option<(Span, String)>,
     pub main: Option<(Span, String)>,
 }
@@ -479,7 +479,7 @@ pub struct StringsDecl {
 pub struct LifecycleBlock {
     pub span: Span,
     pub pinned_id: Option<u16>,
-    /// `@frame(...)`: the lifecycle tree's BHAV header, as on a standalone `tree`.
+    /// `#[frame(...)]`: the lifecycle tree's BHAV header, as on a standalone `#[bhav] fn`.
     pub frame: Option<TreeFrame>,
     pub body: Vec<V2Stmt>,
 }
@@ -607,7 +607,7 @@ pub enum V2Stmt {
         name: String,
         ty: Option<V2Type>,
         init: V2Expr,
-        /// `@slot(N) let ..`: the frame word (`local[N]`) the variable lives in.
+        /// `#[slot(N)] let ..`: the frame word (`local[N]`) the variable lives in.
         slot: Option<u8>,
     },
     LetSome {
@@ -693,7 +693,7 @@ pub enum V2Stmt {
         span: Span,
         name: String,
         ty: V2Type,
-        /// `@slot(N) let ..`: the frame word (`local[N]`) the variable lives in.
+        /// `#[slot(N)] let ..`: the frame word (`local[N]`) the variable lives in.
         slot: Option<u8>,
     },
     /// `animate(...);` (play to completion) or `animate(...) |event| { ... }` (run the body

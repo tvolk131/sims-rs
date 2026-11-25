@@ -134,7 +134,7 @@ pub(super) fn resolve_bcon_tables(
     Ok(out)
 }
 
-/// Resolves standalone `tree` call signatures (IDs are filled in after allocation).
+/// Resolves standalone `#[bhav] fn` call signatures (IDs are filled in after allocation).
 pub(super) fn resolve_tree_sigs(
     env: &ObjectEnv<'_>,
     trees: &[OwnedTree],

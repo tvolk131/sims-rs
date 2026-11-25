@@ -1,5 +1,5 @@
-//! `lift --v2` writes v2 PR H's spellings: lifecycle `@frame`, in-place `set_to_next`,
-//! `return error`, `@slot` lets, `const` branch specialization and `@context(inherit)`.
+//! `lift --v2` writes v2 PR H's spellings: lifecycle `#[frame]`, in-place `set_to_next`,
+//! `return error`, `#[slot]` lets, `const` branch specialization and `#[context(inherit)]`.
 //! Every object is synthetic (GUIDs in the clean-room 0x7E00_xxxx range).
 
 use sims_antics::compile_v2_source;
@@ -76,10 +76,10 @@ fn lifecycle_trees_stay_blocks_with_their_header() {
     has(
         &lifted,
         &[
-            "#[id(4200)] @frame(args: 4, locals: 1, format: 0x8002, revision: ",
-            ") main {",
-            // The default header reproduces `init`, so it takes no `@frame`.
-            "#[id(4201)] init {",
+            "#[bhav(id = 4200, args = 4, locals = 1, format = 0x8002, revision = ",
+            ")]\n    main {",
+            // The default header reproduces `init`, so it takes no `#[frame]`.
+            "#[id(4201)]\n    init {",
             "temp[0] = param[1];",
         ],
     );
@@ -202,7 +202,8 @@ fn a_tree_both_contexts_call_is_written_inherit() {
     has(
         &lifted,
         &[
-            "#[bhav(label = \"Ring\", context = inherit)] fn ring_4300() {",
+            "label = \"Ring\"",
+            "context = inherit)]\n    fn ring_4300() {",
             "me.person[3] = 1;",
             "me.motive[2] = 4;",
             "temp[0] = stack_obj.attr[1];",
@@ -266,7 +267,7 @@ fn a_lifecycle_tree_the_compiler_would_rename_is_not_proven() {
     );
     let report = report(&iff);
     assert!(
-        report.source.contains("#[id(4200)] main {"),
+        report.source.contains("#[id(4200)]\n    main {"),
         "{}",
         report.source
     );
@@ -293,7 +294,7 @@ fn labels_keep_quotes_spaces_and_western_letters() {
         let (lifted, _) = lift_iff(&relabel(&compile(source), 4300, label));
         let written = label.replace('"', "\\\"");
         assert!(
-            lifted.contains(&format!("\"{written}\" {{")),
+            lifted.contains(&format!("label = \"{written}\"")),
             "{label:?}:\n{lifted}"
         );
     }
@@ -315,7 +316,7 @@ fn a_lifecycle_revision_is_kept() {
     #[id(4200)] #[frame(revision = 7)] main { temp[0] = 1; }
 }"#,
     );
-    has(&lifted, &["revision: 7) main {"]);
+    has(&lifted, &["revision = 7)]\n    main {"]);
 }
 
 #[test]

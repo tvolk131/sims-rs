@@ -780,7 +780,7 @@ impl<'a> TreeLowerer<'a> {
                 }
                 Err(Error::at(
                     *span,
-                    "'?' in an expression needs a call to an 'extern mod' fn or 'tree' (use 'cond?;' as a statement for plain bool checks)",
+                    "'?' in an expression needs a call to an 'extern mod' fn or '#[bhav] fn' (use 'cond?;' as a statement for plain bool checks)",
                 ))
             }
             other => Err(Error::at(

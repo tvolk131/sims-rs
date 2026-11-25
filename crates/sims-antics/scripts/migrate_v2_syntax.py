@@ -5,6 +5,9 @@ attributes and `#[bhav] fn` (docs/decisions/20261125-antics-v2-rust-like-syntax.
     migrate_v2_syntax.py FILE...        rewrite .antics files in place
     migrate_v2_syntax.py --rust FILE... rewrite the string literals of Rust sources in place
 
+An `.antics` object that declares no `main` is given `main { return true; }`: the Main the
+old default wrote, which the new default (an idle loop) replaces.
+
 `.air` text is left alone: an `.air` tree header always names its numeric id
 (`tree 4096 "Init"`), and its `@label`s never take the `@name(` / `name @ N` shapes below.
 The migration is purely textual; `sims-antics fmt` gives the canonical layout afterwards.
@@ -129,6 +132,60 @@ def migrate_fn_ret(m: re.Match) -> str:
     return f"#[ret(temp = {t})] fn {m.group('name')}{m.group('params')} -> {ret}"
 
 
+OBJECT = re.compile(r'^(?P<indent>[ \t]*)object[ \t]+"[^"\n]*"[ \t]*\{', re.M)
+MAIN = re.compile(r"^[ \t]*(?:#\[[^\]\n]*\][ \t]*)*main[ \t]*\{")
+
+
+def object_spans(text: str):
+    """(start of body, index of the closing brace, indent) of each `object` block: braces are
+    matched outside strings and comments."""
+    for m in OBJECT.finditer(text):
+        depth, i, n = 1, m.end(), len(text)
+        while i < n and depth:
+            c = text[i]
+            if text.startswith("//", i):
+                j = text.find("\n", i)
+                i = n if j < 0 else j
+                continue
+            if c == '"':
+                i += 1
+                while i < n and text[i] != '"':
+                    i += 2 if text[i] == "\\" else 1
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if not depth:
+                    yield m.end(), i, m.group("indent")
+                    break
+            i += 1
+
+
+def keep_returning_main(text: str) -> str:
+    """An object without `main` got a Main that returns at once; the new default idles
+    (`loop { sleep(1); }`), so the migration writes the old Main out to keep the bytes."""
+    out, pos = [], 0
+    for body, close, indent in object_spans(text):
+        lines = text[body:close].split("\n")
+        depth, has_main = 0, False
+        for line in lines:
+            if depth == 0 and MAIN.match(line):
+                has_main = True
+            code = re.sub(r'"(?:[^"\\]|\\.)*"', '""', line.split("//", 1)[0])
+            depth += code.count("{") - code.count("}")
+        if has_main:
+            continue
+        inner = indent + "    "
+        line_start = text.rfind("\n", 0, close) + 1
+        at = line_start if text[line_start:close].strip() == "" else close
+        out.append(text[pos:at])
+        out.append(f"{inner}// The Main the pre-#[bhav] default gave this object.\n"
+                   f"{inner}main {{\n{inner}    return true;\n{inner}}}\n")
+        pos = at
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def migrate(text: str) -> str:
     text = TREE.sub(migrate_tree, text)
     text = FN_RET.sub(migrate_fn_ret, text)
@@ -192,7 +249,7 @@ def main(argv):
             files.append(a)
     for f in files:
         src = open(f, encoding="utf-8").read()
-        new = migrate_rust(src) if rust else migrate(src)
+        new = migrate_rust(src) if rust else keep_returning_main(migrate(src))
         if new != src:
             open(f, "w", encoding="utf-8").write(new)
             print(f"migrated {f}")

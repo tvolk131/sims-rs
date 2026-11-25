@@ -186,18 +186,18 @@ impl<'a> TreeLowerer<'a> {
         Ok(mir::finish_body(out, &facts))
     }
 
-    /// A lifecycle tree's `@frame(...)`: `param[0..args]` become addressable and `locals` bounds
-    /// the frame, as on a standalone `tree`.
+    /// A lifecycle tree's `#[frame(...)]`: `param[0..args]` become addressable and `locals` bounds
+    /// the frame, as on a standalone `#[bhav] fn`.
     pub(super) fn set_lifecycle_frame(&mut self, frame: &TreeFrame) {
         self.frame_locals = frame.locals;
         self.frame_format = frame.format;
         self.frame_args = frame.args.map_or(0, usize::from);
     }
 
-    /// Adds `min_locals: N` to a tree header when an `@slot(N - 1)` word must be in the frame:
+    /// Adds `min_locals: N` to a tree header when an `#[slot(N - 1)]` word must be in the frame:
     /// the tree may never name it again (an uninitialized slot a raw primitive or text reads by
     /// number), and `.air` sizes the frame by the words the body names.
-    /// The header's `@frame(locals: K)` sets the frame size in its place, with no floor
+    /// The header's `#[frame(locals = K)]` sets the frame size in its place, with no floor
     /// (`write_framed_tree`).
     pub(super) fn push_frame_floor(&self, header: &mut Vec<String>) {
         if let Some(floor) = self.frame_floor() {
@@ -206,7 +206,7 @@ impl<'a> TreeLowerer<'a> {
     }
 
     /// The `min_locals` floor [`Self::push_frame_floor`] puts in the header: the highest
-    /// `@slot` word plus one, unless the tree has `@frame(locals: K)`.
+    /// `#[slot]` word plus one, unless the tree has `#[frame(locals = K)]`.
     pub(super) fn frame_floor(&self) -> Option<usize> {
         if self.frame_locals.is_some() {
             return None;
@@ -268,7 +268,7 @@ impl<'a> TreeLowerer<'a> {
             && let Some(old) = top.insert(name.clone(), binding)
             && matches!(&old, Binding::Local { air_name, .. } if air_name.starts_with("__slot"))
         {
-            // A `defer` registered before the shadowing still uses the old `@slot` variable,
+            // A `defer` registered before the shadowing still uses the old `#[slot]` variable,
             // so its frame word stays taken until the scope ends. The key is no identifier, so
             // only the slot conflict check in `local_air_name` sees it.
             let mut k = 0;
@@ -454,10 +454,10 @@ impl<'a> TreeLowerer<'a> {
     }
 
     /// The `.air` name of a new `let` variable: `__v_<name>_<n>`, or `__slot<N>_<name>_<n>` for
-    /// `@slot(N) let`, which the optimizer never merges and `opt::assign_frame_slots` turns into
-    /// `local[N]`. A slot belongs to the tree's frame, so `@slot` is refused in an inline helper
+    /// `#[slot(N)] let`, which the optimizer never merges and `opt::assign_frame_slots` turns into
+    /// `local[N]`. A slot belongs to the tree's frame, so `#[slot]` is refused in an inline helper
     /// (each caller's frame differs), next to a pinned `push_interaction` object slot, and while
-    /// another `@slot` variable of the same slot is in scope.
+    /// another `#[slot]` variable of the same slot is in scope.
     pub(super) fn local_air_name(
         &mut self,
         name: &str,
@@ -470,7 +470,7 @@ impl<'a> TreeLowerer<'a> {
         if !self.inline_call_stack.is_empty() || self.active_inline_fn.is_some() {
             return Err(Error::at(
                 span,
-                "'@slot(N) let' names a frame word of the tree, so it is not allowed in an inlined helper",
+                "'#[slot(N)] let' names a frame word of the tree, so it is not allowed in an inlined helper",
             ));
         }
         if let Some(locals) = self.frame_locals
@@ -479,7 +479,7 @@ impl<'a> TreeLowerer<'a> {
             return Err(Error::at(
                 span,
                 format!(
-                    "'@slot({n})' names local[{n}], but '@frame(locals: {locals})' gives the tree {locals} local word(s)"
+                    "'#[slot({n})]' names local[{n}], but '#[frame(locals = {locals})]' gives the tree {locals} local word(s)"
                 ),
             ));
         }

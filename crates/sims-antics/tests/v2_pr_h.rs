@@ -608,7 +608,9 @@ fn specialize_rejects_unsound_bindings() {
     ] {
         expect_err(
             name,
-            &obj(&format!("    #[bhav] fn t(k: i16) {{ {body} return true; }}")),
+            &obj(&format!(
+                "    #[bhav] fn t(k: i16) {{ {body} return true; }}"
+            )),
             needle,
         );
     }
@@ -746,7 +748,7 @@ fn raw_locals_shadow_consts_tree_wide() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Tier 2: `@slot(N) let`
+// Tier 2: `#[slot(N)] let`
 // ---------------------------------------------------------------------------------------------
 
 /// BHAV `id` of the compiled object.
@@ -893,7 +895,7 @@ fn slot_lets_reject_unsound_pins() {
     );
 }
 
-/// Disjoint scopes may reuse a slot, and `@slot` survives `fmt` and `lint`.
+/// Disjoint scopes may reuse a slot, and `#[slot]` survives `fmt` and `lint`.
 #[test]
 fn slot_lets_reuse_across_scopes_and_survive_fmt() {
     let src = obj(r#"    #[bhav]
@@ -907,10 +909,8 @@ fn slot_lets_reuse_across_scopes_and_survive_fmt() {
         }
     }
 "#);
-    // `fmt` (owned by the lint track) does not know the attribute yet and writes `@ slot(2)`,
-    // which parses the same.
     let formatted = sims_antics::v2::format_v2_source(&src).expect("fmt");
-    assert!(formatted.contains("slot(2) let a = 1;"), "{formatted}");
+    assert!(formatted.contains("#[slot(2)] let a = 1;"), "{formatted}");
     assert_eq!(
         sims_antics::v2::format_v2_source(&formatted).expect("fmt again"),
         formatted
@@ -922,10 +922,10 @@ fn slot_lets_reuse_across_scopes_and_survive_fmt() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Tier 2: `@frame(...)` on lifecycle blocks
+// Tier 2: `#[frame(...)]` on lifecycle blocks
 // ---------------------------------------------------------------------------------------------
 
-/// `init`, `main` and the OBJf hooks take `@frame(...)` like a standalone tree, so an object
+/// `init`, `main` and the OBJf hooks take `#[frame(...)]` like a standalone tree, so an object
 /// whose main declares four arguments is written as `main { }` (no extra stub tree), and
 /// `param[N]` below the declared count is addressable.
 #[test]
@@ -963,7 +963,7 @@ fn lifecycle_frames_are_checked() {
     expect_err(
         "lifeempty.antics",
         &obj("    #[frame(empty)] main { }\n"),
-        "#[frame(empty)] is only allowed on a standalone 'tree'",
+        "'empty' is only allowed on a standalone '#[bhav] fn'",
     );
     expect_err(
         "lifeparam.antics",
@@ -973,6 +973,6 @@ fn lifecycle_frames_are_checked() {
     expect_err(
         "lifeconst.antics",
         &obj("    #[frame(locals = 1)] const K = 1;\n"),
-        "#[frame(...)] is only allowed on a standalone 'tree' or on init, main",
+        "'#[frame]' is not allowed on 'const'",
     );
 }

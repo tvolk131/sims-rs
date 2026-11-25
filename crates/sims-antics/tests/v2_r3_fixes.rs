@@ -1,6 +1,6 @@
 //! `.antics` v2 Round 3 lowering fixes: the dialog entry save, out-operand writes, the
-//! `@context(inherit)` check, `self` before the first cursor move, `push_interaction` on an
-//! `@slot` handle and `job_data` comparisons. All sources are synthetic.
+//! `#[context(inherit)]` check, `self` before the first cursor move, `push_interaction` on an
+//! `#[slot]` handle and `job_data` comparisons. All sources are synthetic.
 
 use sims_antics::{PackResolverConfig, compile_v2_source, v2};
 
@@ -256,7 +256,7 @@ fn inherit_check_points_at_the_differing_statement() {
         "{err}"
     );
     let span = err.span.expect("span");
-    assert_eq!((span.line, span.column), (7, 13), "{err}");
+    assert_eq!((span.line, span.column), (8, 13), "{err}");
 }
 
 /// Disjoint inlined copies of a helper share their local's word even when a primitive writes it
@@ -366,7 +366,7 @@ fn self_is_switched_to_before_the_first_cursor_move() {
     );
 }
 
-/// `push_interaction(object: h)` with `h` an `@slot(N)` handle reads the object from word N.
+/// `push_interaction(object: h)` with `h` an `#[slot(N)]` handle reads the object from word N.
 #[test]
 fn push_interaction_reads_a_slot_handle_in_place() {
     let src = obj(
@@ -462,7 +462,7 @@ fn an_out_operand_keeps_the_old_value_on_the_exit_it_does_not_write() {
     assert!(a.contains("= 7;"), "the initial store stays:\n{a}");
 }
 
-/// `@frame(locals: K)` sizes the frame with no `min_locals` floor, so an `@slot` word the body
+/// `#[frame(locals = K)]` sizes the frame with no `min_locals` floor, so an `#[slot]` word the body
 /// never names does not hold the named locals above it: dropping the save would move the
 /// `idle` scratch word that `$Local:1` reads.
 #[test]
@@ -480,7 +480,7 @@ fn frame_locals_sets_no_allocation_floor() {
     let air = expand("frame_floor.antics", &obj("Was $Local:1", members));
     let a = tree(&air, "a");
     assert!(!a.contains("min_locals"), "{a}");
-    // `@slot` placement puts the kept save in word 0.
+    // `#[slot]` placement puts the kept save in word 0.
     assert!(a.contains("local[0] := stack_obj;"), "{a}");
 }
 
@@ -1087,7 +1087,7 @@ fn a_tree_that_may_read_global_34_shares_out_operand_locals_as_main() {
     );
 }
 
-/// `@frame(format: 0x8001)` holds four locals, so its tree shares inlined out-operand locals as
+/// `#[frame(format = 0x8001)]` holds four locals, so its tree shares inlined out-operand locals as
 /// main does and fits them.
 #[test]
 fn a_format_limited_frame_shares_out_operand_locals_as_main() {

@@ -108,7 +108,7 @@ fn lower_object_with(
     let mut reset_pinned_id: Option<u16> = None;
     let mut cleanup_blocks: Vec<OwnedStmtBlock> = Vec::new();
     let mut cleanup_pinned_id: Option<u16> = None;
-    // `@frame(...)` per lifecycle tree ("Init", "Main", "Load", "Reset", "Cleanup").
+    // `#[frame(...)]` per lifecycle tree ("Init", "Main", "Load", "Reset", "Cleanup").
     let mut lifecycle_frames: BTreeMap<&'static str, TreeFrame> = BTreeMap::new();
     let mut note_lifecycle_frame = |label: &'static str, frame: Option<TreeFrame>| -> Result<()> {
         let Some(f) = frame else {
@@ -117,13 +117,13 @@ fn lower_object_with(
         if f.empty {
             return Err(Error::at(
                 f.span,
-                "@frame(empty) is only allowed on a standalone 'tree' (a lifecycle tree always has nodes)",
+                "'empty' is only allowed on a standalone '#[bhav] fn' (a lifecycle tree always has nodes)",
             ));
         }
         if lifecycle_frames.insert(label, f).is_some() {
             return Err(Error::at(
                 f.span,
-                format!("@frame(...) on more than one block of the '{label}' tree"),
+                format!("'#[frame]' on more than one block of the '{label}' tree"),
             ));
         }
         Ok(())
@@ -705,7 +705,7 @@ fn lower_object_with(
         }
     };
 
-    // 4. Allocate state attribute indices (explicit `@ slot` states first, then the lowest free
+    // 4. Allocate state attribute indices (explicit `#[slot]` states first, then the lowest free
     // slot in declaration order; without explicit slots this is exactly `0..N`).
     let state_slots = allocate_state_slots(
         state_order
@@ -943,17 +943,20 @@ fn lower_object_with(
         env
     };
 
-    // 7. Allocate deterministic private BHAV IDs (`4096..=8191`), respecting `@id` / `@guard_id`.
+    // 7. Allocate deterministic private BHAV IDs (`4096..=8191`), respecting `#[id]` / `#[guard_id]`.
     let mut pinned_ids = BTreeSet::new();
     let mut register_pinned = |id: u16, span: Span| -> Result<()> {
         if !(4096..=8191).contains(&id) {
             return Err(Error::at(
                 span,
-                format!("@id({id}) must be in private BHAV range 4096..=8191"),
+                format!("#[id({id})] must be in private BHAV range 4096..=8191"),
             ));
         }
         if !pinned_ids.insert(id) {
-            return Err(Error::at(span, format!("duplicate pinned BHAV @id({id})")));
+            return Err(Error::at(
+                span,
+                format!("duplicate pinned BHAV #[id({id})]"),
+            ));
         }
         Ok(())
     };
@@ -1023,7 +1026,7 @@ fn lower_object_with(
 
     let init_id = alloc_tree_id(init_pinned_id, Some(4096), obj.span)?;
     let main_id = alloc_tree_id(main_pinned_id, Some(4097), obj.span)?;
-    // Standalone `tree` IDs are allocated up front so bodies (and siblings) can `call` them.
+    // Standalone `#[bhav] fn` IDs are allocated up front so bodies (and siblings) can `call` them.
     let mut tree_ids: BTreeMap<String, u16> = BTreeMap::new();
     for t in &tree_members {
         let id = alloc_tree_id(t.decl.pinned_id, None, t.decl.span)?;
@@ -1170,7 +1173,13 @@ fn lower_object_with(
                 ctx.line("return true;".to_owned());
             }
         } else {
-            ctx.line("return true;".to_owned());
+            // An object with no `main` idles: `loop { sleep(1); }`. A Main that returns is
+            // an error (0x3e9) in the original engine, so the default never returns.
+            ctx.line("while true {".to_owned());
+            ctx.em.indent();
+            ctx.line("idle(1);".to_owned());
+            ctx.em.dedent();
+            ctx.line("}".to_owned());
         }
         write_framed_tree(&mut trees_air, ctx, main_id, "Main", &frame, 0, "Main")?;
     }
@@ -1498,7 +1507,7 @@ fn lower_object_with(
         });
     }
 
-    // 8h. Standalone `tree` declarations (non-inlined BHAVs callable via `.air` `call`).
+    // 8h. Standalone `#[bhav] fn` declarations (non-inlined BHAVs callable via `.air` `call`).
     for t in &tree_members {
         emit_standalone_tree(&mut trees_air, &env, t)?;
     }
@@ -1751,7 +1760,7 @@ pub(super) fn resolve_variants(
                         Error::at(
                             *tspan,
                             format!(
-                                "variant tree '{ident}' is not a standalone 'tree' of this object"
+                                "variant tree '{ident}' is not a standalone '#[bhav] fn' of this object"
                             ),
                         )
                     })?;

@@ -490,18 +490,16 @@ fn inline_operands_are_read_before_a_writing_selector() {
     assert!(read < select, "{body}");
 }
 
-/// An `@slot` store is kept even when the tree itself never reads it again (another tree using
-/// the same frame word may), and a slot must lie inside an explicit `@frame(locals: L)`.
+/// An `#[slot]` store is kept even when the tree itself never reads it again (another tree using
+/// the same frame word may), and a slot must lie inside an explicit `#[frame(locals = L)]`.
 #[test]
 fn pinned_stores_survive_and_fit_the_frame() {
     let air = expand(
         "pin_reuse.antics",
-        &obj(
-            r#"    #[bhav(id = 4200)]
+        &obj(r#"    #[bhav(id = 4200)]
     fn seed() { #[slot(10)] let x = 17; temp[1] = x; }
     #[bhav(id = 4201)]
-    fn read() { #[slot(10)] let x: i16; temp[0] = x; }"#,
-        ),
+    fn read() { #[slot(10)] let x: i16; temp[0] = x; }"#),
     );
     assert!(tree(&air, "seed").contains("local[10] := 17;"), "{air}");
     expect_err(
@@ -707,7 +705,9 @@ fn raw_consts_follow_tokens_not_text() {
         raw { // let K is an explanatory comment
               temp[1] := K; }
     }"#)),
-        nodes(&obj("    #[bhav(id = 4300)] fn a() { raw { temp[1] := 7; } }")),
+        nodes(&obj(
+            "    #[bhav(id = 4300)] fn a() { raw { temp[1] := 7; } }"
+        )),
     );
     assert_eq!(
         nodes(&obj(r#"    const part = 7;
@@ -783,7 +783,7 @@ fn raw_consts_survive_inlining_discarded_code_and_keywords() {
     );
 }
 
-/// Only live `@slot` lets pin a word: a slot in discarded code pins nothing, and a raw block's own
+/// Only live `#[slot]` lets pin a word: a slot in discarded code pins nothing, and a raw block's own
 /// local spelled like a slot name keeps its `.air` placement. A call target spelled like a pinned
 /// local stays a call target.
 #[test]
@@ -912,7 +912,7 @@ fn restore_before(members: &str, first: &str) -> bool {
     ls[at - 1] == "stack_obj := __self_obj;"
 }
 
-/// An `@slot` word stays in the frame even when nothing in the tree names it again (`.air`'s
+/// An `#[slot]` word stays in the frame even when nothing in the tree names it again (`.air`'s
 /// `min_locals` header): a raw primitive or text may read it by number.
 #[test]
 fn uninitialized_slots_keep_their_frame_word() {
@@ -1050,7 +1050,9 @@ fn air_constants_index_strings_and_stay_read_only() {
     fn f() { raw { const K = 9; temp[0] := K; } }
     #[bhav(id = 4300)]
     fn a() { f(); }"#)),
-        nodes(&obj("    #[bhav(id = 4300)] fn a() { raw { temp[0] := 9; } }")),
+        nodes(&obj(
+            "    #[bhav(id = 4300)] fn a() { raw { temp[0] := 9; } }"
+        )),
     );
     for stmt in [
         "expr(X := 17);",
@@ -1136,7 +1138,7 @@ fn raw_loop_exits_are_judged_per_edge() {
     );
 }
 
-/// A raw block's own constant is owned by its full name: it moves no `@slot` binding, hides no
+/// A raw block's own constant is owned by its full name: it moves no `#[slot]` binding, hides no
 /// tuning entry (`Tuning.dear` with an own `Tuning`), and a helper inlined twice declares it twice
 /// with the same value, which `.air` accepts.
 #[test]

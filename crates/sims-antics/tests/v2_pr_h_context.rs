@@ -189,23 +189,23 @@ fn rejects_unproven_frame_assumptions() {
     );
     expect_err(
         "#[bhav(context = inherit)] fn a() { self.charge = 1; }",
-        "#[context(inherit)] tree 'a' depends on the caller's context",
+        "'context = inherit' fn 'a' depends on the caller's context",
     );
     expect_err(
         "#[bhav(context = inherit)] fn a() { b(); } #[bhav] fn b() {}",
-        "#[context(inherit)] tree 'a' depends on the caller's context",
+        "'context = inherit' fn 'a' depends on the caller's context",
     );
     expect_err(
         "#[bhav(context = inherit)] fn a() { destroy_self(); }",
-        "#[context(inherit)] tree 'a' depends on the caller's context",
+        "'context = inherit' fn 'a' depends on the caller's context",
     );
     expect_err(
         "#[bhav(context = inherit)] fn a(actor: Sim) {}",
-        "#[context(inherit)] cannot declare a Sim parameter",
+        "'context = inherit' cannot declare a Sim parameter",
     );
     expect_err(
         "#[context(inherit)] main {}",
-        "#[context(inherit)] is only allowed on a standalone 'tree'",
+        "'#[context]' is not allowed on 'main'",
     );
     expect_err("#[bhav] fn a() { me.person[256] = 0; }", "me.person index");
     expect_err(

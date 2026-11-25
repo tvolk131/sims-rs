@@ -567,7 +567,7 @@ fn zero_node_trees_lift_as_frame_empty() {
     );
     let lifted = round_trip(&iff, &DecompileV2Options::default());
     assert!(
-        lifted.contains("revision: 0, empty) #[bhav(label = \"start fire\")] fn start_fire_4300() {}"),
+        lifted.contains("revision = 0, empty)]\n    fn start_fire_4300() {}"),
         "{lifted}"
     );
 }
@@ -660,7 +660,7 @@ fn lifts_location_local_and_generic_calls() {
         "if find_location(mode: 3, flags: 1, local: slot_1) {",
         "generic_call(41);",
         "find_location(mode: 1, flags: 0);",
-        // `@slot` keeps slot 1 where the primitive reads it.
+        // `#[slot]` keeps slot 1 where the primitive reads it.
         "find_location(mode: 1, flags: 1, local: slot_1);",
         "temp[4] = 2;",
     ] {
@@ -705,7 +705,7 @@ fn lifts_relationship_locals_and_keeps_other_value_operands_raw() {
     ] {
         assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
     }
-    // Only the non-local values stay raw: `@slot` pins the named locals without a raw
+    // Only the non-local values stay raw: `#[slot]` pins the named locals without a raw
     // block.
     assert_eq!(lifted.matches("raw {").count(), 1, "{lifted}");
     assert!(lifted.contains("#[slot(1)] let slot_1: i16;"), "{lifted}");

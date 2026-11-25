@@ -139,7 +139,7 @@ impl<'a> TreeLowerer<'a> {
                 event,
                 body,
             } => {
-                // A user `fn`/`tree`/`extern` named `animate` wins over the builtin.
+                // A user `fn`/`#[bhav] fn`/`extern` named `animate` wins over the builtin.
                 let callee = V2Expr::Ident(*span, "animate".to_owned());
                 if self.user_callable_named(&callee, *span)? {
                     if event.is_some() {
@@ -957,7 +957,7 @@ impl<'a> TreeLowerer<'a> {
                     ));
                 }
 
-                // Value-returning `functional kind(...) -> T` tree / `tree ... -> T @ temp[N]`:
+                // Value-returning `functional kind(...) -> T` tree / `#[bhav] fn .. -> T` with `#[ret(temp = N)]`:
                 // `return None;` / `return false;` (functionals, non-bool T) exits with `return false;`
                 // `return Some(expr);` / `return expr;` writes `temp[N] := val;` and exits `return true;`
                 if let Some(abi) = self.value_return.clone() {

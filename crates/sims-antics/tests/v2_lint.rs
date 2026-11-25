@@ -597,7 +597,7 @@ fn uninitialized_local_read_before_assignment_is_flagged() {
 
 #[test]
 fn a_slot_pinned_local_is_neither_unread_nor_uninitialized() {
-    // `@slot(N)` pins the frame word for code that addresses it by number, which may
+    // `#[slot(N)]` pins the frame word for code that addresses it by number, which may
     // fill or read it: no `uninitialized_local_read`, no `unused_decl`.
     for body in [
         "        #[slot(2)] let x: i16;\n        self.level = x;\n        x = 3;\n        self.level += x;",
@@ -1208,7 +1208,7 @@ fn big_trees_and_many_locals_are_flagged() {
     ));
     let d = one(&source, "frame_headroom");
     assert!(d.message.contains("nodes"), "{d:?}");
-    assert_eq!(d.line, line_of(&source, "tree big"));
+    assert_eq!(d.line, line_of(&source, "fn big()"));
 
     let lets: String = (0..14)
         .map(|i| format!("        let v{i} = random(9);\n"))
@@ -1246,7 +1246,7 @@ fn frame_headroom_points_at_the_tree_in_its_own_object() {
     let source = format!("{big}{small}");
     let d = one(&source, "frame_headroom");
     assert!(d.message.contains("tree 4200"), "{d:?}");
-    assert_eq!(d.line, line_of(&source, "#[id(4200)]"), "{d:?}");
+    assert_eq!(d.line, line_of(&source, "#[bhav(id = 4200"), "{d:?}");
     // Two unpinned trees sharing a label in one object: the object, not the wrong tree.
     let source = obj(&format!(
         "    #[bhav(label = \"Shared\")] fn a() {{\n        self.mode = Mode::Off;\n    }}\n    #[bhav(label = \"Shared\")] fn b() {{\n        self.mode = Mode::Off;\n{many_nodes}    }}"

@@ -105,7 +105,12 @@ impl ItemAttrs {
     fn apply(&mut self, attr: Attr) -> Result<()> {
         let Attr { span, name, args } = attr;
         let needs_args = |args: Option<Vec<AttrArg>>| {
-            args.ok_or_else(|| Error::at(span, format!("'#[{name}]' needs arguments: '#[{name}(..)]'")))
+            args.ok_or_else(|| {
+                Error::at(
+                    span,
+                    format!("'#[{name}]' needs arguments: '#[{name}(..)]'"),
+                )
+            })
         };
         match name.as_str() {
             "bhav" => {
@@ -210,7 +215,12 @@ impl ItemAttrs {
                             ),
                         )
                     })?;
-                set_once(&mut self.address, span, (arg.span, address), "constant address")?;
+                set_once(
+                    &mut self.address,
+                    span,
+                    (arg.span, address),
+                    "constant address",
+                )?;
             }
             "bcon" => {
                 let args = needs_args(args)?;
@@ -296,7 +306,10 @@ impl ItemAttrs {
             }
         };
         if dup {
-            return Err(Error::at(arg.span, format!("duplicate header field '{key}'")));
+            return Err(Error::at(
+                arg.span,
+                format!("duplicate header field '{key}'"),
+            ));
         }
         Ok(())
     }
@@ -360,7 +373,10 @@ fn arg_temp(arg: &AttrArg, what: &str) -> Result<u8> {
                 TEMP_COUNT - 1
             ),
         )),
-        _ => Err(Error::at(arg.span, format!("{what} temp slot must be an integer"))),
+        _ => Err(Error::at(
+            arg.span,
+            format!("{what} temp slot must be an integer"),
+        )),
     }
 }
 

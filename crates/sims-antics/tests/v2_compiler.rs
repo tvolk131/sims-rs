@@ -3177,8 +3177,8 @@ fn on_disk_open_pack_is_pure_v2_expands_all_20_objects_and_passes_safety() {
                 file.display()
             );
             assert!(
-                !src.contains("@id(") && !src.contains("@guard_id("),
-                "migrated open-pack v2 file should not pin raw @id/@guard_id: {}",
+                !src.contains("#[id(") && !src.contains("#[guard_id("),
+                "migrated open-pack v2 file should not pin raw #[id]/#[guard_id]: {}",
                 file.display()
             );
             assert!(
@@ -7002,7 +7002,7 @@ fn maxis_interop_extern_calls_bcon_tables_sparse_states_and_trees_lower_exactly(
     );
 
     // extern mod: literal call (const args incl. a private BCON value), temps call, temp
-    // binding, `?` on Result / Result<T @ temp[1]>, and direct return capture.
+    // binding, `?` on Result / Result<T> (#[ret(temp = 1)]), and direct return capture.
     for needle in [
         "if call 256(2, 10) {\n    }\n    my.attr[1] := temp[0];",
         "temp[0] := my.attr[0];\n    temp[1] := bcon[129];\n    if call 256(temps) {\n    }\n    my.attr[2] := temp[0];",
@@ -7339,7 +7339,7 @@ fn maxis_interop_negative_diagnostics() {
     expect_err(
         "dup_temp.antics",
         &obj("    extern mod m { #[id(256)] fn f(#[temp(2)] a: i16, #[temp(2)] b: i16); }"),
-        "duplicate '@ temp[2]' binding",
+        "duplicate '#[temp(2)]' binding",
     );
     expect_err(
         "temp_range.antics",
@@ -7375,7 +7375,9 @@ fn maxis_interop_negative_diagnostics() {
     );
     expect_err(
         "try_value.antics",
-        &obj("    extern mod m { #[id(256)] #[ret(temp = 0)] fn f() -> i16; }\n    init { m::f()?; }"),
+        &obj(
+            "    extern mod m { #[id(256)] #[ret(temp = 0)] fn f() -> i16; }\n    init { m::f()?; }",
+        ),
         "'?' needs a call returning 'bool' or 'Result'",
     );
     expect_err(
@@ -7390,7 +7392,9 @@ fn maxis_interop_negative_diagnostics() {
     );
     expect_err(
         "tree_paths.antics",
-        &obj("    state q: i16;\n    #[bhav(ret_temp = 0)] fn t() -> i16 { if self.q > 0 { return 1; } }"),
+        &obj(
+            "    state q: i16;\n    #[bhav(ret_temp = 0)] fn t() -> i16 { if self.q > 0 { return 1; } }",
+        ),
         "must return on all control-flow paths",
     );
     expect_err(
@@ -7926,7 +7930,7 @@ fn readability_negative_diagnostics() {
         "does not fit in i16; use it where a GUID is expected",
     );
 
-    // @frame.
+    // #[frame].
     expect_err(
         "frame_args.antics",
         &obj("    #[frame(args = 1)]\n    #[bhav] fn t(a: i16, b: i16) { }"),
@@ -7940,7 +7944,7 @@ fn readability_negative_diagnostics() {
     expect_err(
         "frame_on_fn.antics",
         &obj("    #[frame(args = 1)]\n    fn f() { }"),
-        "only allowed on a standalone 'tree'",
+        "mark the fn '#[bhav]'",
     );
 
     // Builtins.
@@ -8060,7 +8064,9 @@ fn readability_negative_diagnostics() {
     );
     expect_err(
         "frame_format_args.antics",
-        &obj("    #[frame(format = 0x8000)]\n    #[bhav] fn t(a: i16, b: i16, c: i16, d: i16, e: i16) { }"),
+        &obj(
+            "    #[frame(format = 0x8000)]\n    #[bhav] fn t(a: i16, b: i16, c: i16, d: i16, e: i16) { }",
+        ),
         "allows at most 4 arguments, not 5",
     );
     expect_err(
@@ -9416,7 +9422,7 @@ fn pr_f_zero_raw_and_decompiler_gaps_run_live() {
     assert_eq!(obj.sounds_wav.len(), 2, "{:?}", obj.sounds_wav.keys());
     assert!(obj.sounds_wav.keys().all(|k| !k.contains("shared")));
 
-    // `@frame(kind:)` and `animate(event_local:)` outside a zero-local frame.
+    // `#[frame(kind = )]` and `animate(event_local:)` outside a zero-local frame.
     let waves =
         Behavior::parse(iff.data(iff.get(b"BHAV", 4305).expect("BHAV"))).expect("BHAV parse");
     assert_eq!((waves.kind, waves.locals), (3, 0));
@@ -9623,7 +9629,9 @@ fn pr_f_negative_diagnostics() {
     );
     expect_err(
         "event_local_inside.antics",
-        &obj("    #[frame(locals = 4)]\n    #[bhav] fn t(sim: Sim) { animate(clip: 3, event_local: 2); }"),
+        &obj(
+            "    #[frame(locals = 4)]\n    #[bhav] fn t(sim: Sim) { animate(clip: 3, event_local: 2); }",
+        ),
         "is inside the frame",
     );
     expect_err(
@@ -9650,7 +9658,7 @@ fn pr_f_negative_diagnostics() {
     expect_err(
         "frame_kind.antics",
         &obj("    #[frame(kind = 256)]\n    #[bhav] fn t(sim: Sim) { }"),
-        "@frame kind must fit in a byte",
+        "'kind' must fit in a byte",
     );
 
     // Shared sound names.

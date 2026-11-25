@@ -381,14 +381,14 @@ impl<'a> TreeLowerer<'a> {
                             ));
                         }
                         // `param[n]`: the call frame's argument word, readable and assignable
-                        // inside the frame (positional params, `@frame(args:)`, functionals).
+                        // inside the frame (positional params, `#[frame(args = )]`, functionals).
                         "param" if self.lookup_var("param").is_none() => {
                             let idx = self.eval_builtin_int(index, "param index", 0, 255)?;
                             if idx as usize >= self.frame_args {
                                 return Err(Error::at(
                                     *span,
                                     format!(
-                                        "param[{idx}] is outside this tree's {} argument(s) (declare the parameter or pin '@frame(args: N)')",
+                                        "param[{idx}] is outside this tree's {} argument(s) (declare the parameter or pin '#[frame(args = N)]')",
                                         self.frame_args
                                     ),
                                 ));

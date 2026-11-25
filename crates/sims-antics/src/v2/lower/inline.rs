@@ -167,7 +167,7 @@ impl<'a> TreeLowerer<'a> {
         // A caller local passed by value needs no `__arg_*` copy when nothing can change it
         // while the helper runs: the helper never mutates or borrows the parameter, and no
         // argument of this call borrows the local (`&mut x`, or a local-writing builtin). An
-        // `@slot` local lives in an explicit frame word, which helper raw code can write as
+        // `#[slot]` local lives in an explicit frame word, which helper raw code can write as
         // `local[N]`, so it is always copied. So is any local when the helper, or a helper an
         // argument calls, runs raw code (directly or through the helpers it calls): raw code
         // can write any frame word by number or by its `.air` name.
@@ -496,7 +496,7 @@ impl<'a> TreeLowerer<'a> {
             return Ok(None);
         };
         // Into mode stores the result in `dest` at the helper's `return`, before its defers
-        // run, and an `@slot` word is visible to raw code by number: either could observe the
+        // run, and an `#[slot]` word is visible to raw code by number: either could observe the
         // early store, so those keep the general path (store after the helper finishes).
         if decl.return_type.is_none()
             || dest.starts_with("__slot")

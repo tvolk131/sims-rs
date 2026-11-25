@@ -5,6 +5,7 @@ use sims_antics::{CompiledObject, PackResolverConfig, compile_v2_source};
 const PROBE: u16 = 4300;
 
 fn source(helpers: &str, args: &str, body: &str) -> String {
+    let args = if args.is_empty() { "()" } else { args };
     format!(
         r#"object "Inline Probe" {{
     guid: 0x7F40_0501;
@@ -13,7 +14,7 @@ fn source(helpers: &str, args: &str, body: &str) -> String {
     const TEST_GUID = 0x7F40_0502;
     {helpers}
     #[bhav(id = {PROBE}, label = "Probe")]
-    fn probe() {args} {{
+    fn probe{args} {{
         {body}
     }}
 }}

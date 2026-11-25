@@ -165,8 +165,8 @@ pub enum TreeCheck {
 pub struct DecompiledTree {
     pub id: u16,
     pub style: TreeStyle,
-    /// An `init`/`main` tree written as a plain `tree`, because an `init`/`main` block
-    /// (which takes no `@frame`) did not reproduce it. The compiler then adds its own
+    /// An `init`/`main` tree written as a plain `#[bhav] fn`, because an `init`/`main` block
+    /// (which takes no `#[frame]`) did not reproduce it. The compiler then adds its own
     /// lifecycle tree at a fresh ID.
     pub standalone_lifecycle: bool,
     /// Statements left as `raw` inside an idiomatic body.
@@ -2793,9 +2793,9 @@ struct Plan {
     styles: BTreeMap<u16, Level>,
     /// Tree ID -> pre-order statement indices written `raw`.
     raw_stmts: BTreeMap<u16, BTreeSet<usize>>,
-    /// `init`/`main` trees written as plain `tree`s.
+    /// `init`/`main` trees written as plain `#[bhav] fn`s.
     standalone: BTreeSet<u16>,
-    /// Lifecycle blocks written with their whole header as `@frame(..)`: those the default
+    /// Lifecycle blocks written with their whole header as `#[frame(..)]`: those the default
     /// header does not reproduce.
     framed: BTreeSet<u16>,
     /// Why the catalog variants are left out (the compiler rejected them).
@@ -2805,7 +2805,7 @@ struct Plan {
     /// Trees written without the extra idioms (see [`Translator::extra`]), after a round
     /// that used them was not proven.
     plain: BTreeSet<u16>,
-    /// Trees some caller runs in the other context: written `@context(inherit)` (an extra
+    /// Trees some caller runs in the other context: written `#[context(inherit)]` (an extra
     /// idiom) so that either context may call them.
     inherit: BTreeSet<u16>,
 }
@@ -2824,8 +2824,8 @@ impl Plan {
                 (t.id, level)
             })
             .collect();
-        // A lifecycle block carries any other header as `@frame(..)`, but never an empty
-        // one (entering a 0-node tree faults; v2 refuses `@frame(empty)` there), so a
+        // A lifecycle block carries any other header as `#[frame(..)]`, but never an empty
+        // one (entering a 0-node tree faults; v2 refuses `#[frame(empty)]` there), so a
         // 0-node lifecycle tree starts plain.
         let standalone = model
             .trees
@@ -2834,7 +2834,7 @@ impl Plan {
             .map(|t| t.id)
             .collect();
         // Formats, kinds and revisions the compiler never gives a block by default start
-        // with `@frame`; anything else gets one when the default header does not compile or
+        // with `#[frame]`; anything else gets one when the default header does not compile or
         // is not proven (see `add_frame`).
         let framed = model
             .trees
@@ -2876,14 +2876,14 @@ impl Plan {
         }
     }
 
-    /// Whether tree `t` is written `@context(inherit)` this round.
+    /// Whether tree `t` is written `#[context(inherit)]` this round.
     fn inherits(&self, t: &TreeModel) -> bool {
         self.inherit.contains(&t.id) && !self.plain.contains(&t.id) && self.level(t).idiomatic()
     }
 
     /// Turns off tree `id`'s extra idioms when the last round used them. `false` when it
     /// did not, so the tree has to move down a style instead.
-    /// Writes lifecycle block `id` with its whole header as `@frame(..)` from now on, when
+    /// Writes lifecycle block `id` with its whole header as `#[frame(..)]` from now on, when
     /// it is still written with the default one. Tried before anything else: the header is
     /// the original's, so it only ever helps.
     fn add_frame(&mut self, model: &Model, id: u16) -> bool {
@@ -3132,7 +3132,9 @@ impl Model {
                         _ => (String::new(), String::new()),
                     };
                 let ident = &self.extern_calls[id];
-                out.line(format!("#[id({id})] fn {ident}({params}) -> bool;{comment}"));
+                out.line(format!(
+                    "#[id({id})] fn {ident}({params}) -> bool;{comment}"
+                ));
             }
             out.indent -= 1;
             out.line("}");
@@ -3519,7 +3521,7 @@ struct Translator<'a> {
     plan: &'a Plan,
     tree: &'a TreeModel,
     sim: bool,
-    /// `@context(inherit)`: the runner's cells are `me.*` and the stack object's
+    /// `#[context(inherit)]`: the runner's cells are `me.*` and the stack object's
     /// `stack_obj.*`; `self` and `sim` are not written.
     inherit: bool,
     /// Pre-order index of the next statement.
@@ -4318,7 +4320,8 @@ impl Translator<'_> {
     /// - `local[0] := <object>; push_interaction(.., object: 0, flags: f | 2)` as
     ///   `push_interaction(.., object: <object>, flags: f)`;
     /// - in a Sim context, `temp[0] := i; scope(27, 0) := v` as
-    ///   `set_dynamic_sprite(index: i, value: v)`.
+    ///   `set_dynamic_sprite(index: i, value: v)`;
+    /// - `param[0] := n; sleep(param[0])` as `sleep(n)`.
     fn pair(&mut self, rest: &[Stmt], out: &mut Out) -> Option<usize> {
         let [first, second, ..] = rest else {
             return None;
@@ -4397,6 +4400,18 @@ impl Translator<'_> {
                 return None;
             };
             format!("{dest} {op} {source};")
+        } else if let Some(ticks) = set(first, 9, 0)
+            && let Stmt::Primitive {
+                prim: PrimitiveCall::Sleep { param_index: 0 },
+                branches: None,
+                ..
+            } = second
+        {
+            let ticks = self.rvalue(ticks)?;
+            if ticks.contains("param[") {
+                return None;
+            }
+            format!("sleep({ticks});")
         } else {
             return None;
         };
@@ -5227,7 +5242,7 @@ fn assign_operator(op: &AssignOp) -> Option<&'static str> {
 }
 
 /// The part of a tree's header the code checker does not compare but the game reads and
-/// `@frame` writes: the revision (saved objects are matched against it). The label is
+/// `#[frame]` writes: the revision (saved objects are matched against it). The label is
 /// [`Model::object_gap`]'s.
 fn header_gap(original: &BhavChunk, rebuilt: &BhavChunk) -> Option<String> {
     (original.revision != rebuilt.revision).then(|| {

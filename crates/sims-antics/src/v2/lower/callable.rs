@@ -4,7 +4,7 @@
 use super::*;
 
 impl<'a> TreeLowerer<'a> {
-    /// Whether a user `fn`, `tree`, or `extern` answers to `callee` (it then wins over a builtin
+    /// Whether a user `fn`, `#[bhav] fn`, or `extern` answers to `callee` (it then wins over a builtin
     /// of the same name).
     pub(super) fn user_callable_named(&self, callee: &V2Expr, span: Span) -> Result<bool> {
         if self.resolve_callable(callee, span)?.is_some() {
@@ -58,7 +58,7 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
-    /// Evaluates call arguments, writes `@ temp[N]` / `call(temps)` operands, and returns the
+    /// Evaluates call arguments, writes `#[temp(N)]` / `call(temps)` operands, and returns the
     /// `.air` call text (`call ID`, `call ID(1, 2)`, or `call ID(temps)`).
     pub(super) fn prepare_callable_call(
         &mut self,
@@ -357,7 +357,7 @@ impl<'a> TreeLowerer<'a> {
             (_, true) => Err(Error::at(
                 span,
                 format!(
-                    "'?' in value position needs a call returning 'Result<T @ temp[N]>', but {} does not",
+                    "'?' in value position needs a call returning 'Result<T>' with '#[ret(temp = N)]', but {} does not",
                     sig.display
                 ),
             )),
@@ -373,8 +373,8 @@ impl<'a> TreeLowerer<'a> {
         tmp
     }
 
-    /// If `expr` is a value-returning callable (`f(..)` with `-> T @ temp[N]`, or `f(..)?` with
-    /// `-> Result<T @ temp[N]>`), lowers the call and returns the raw `temp[N]` operand.
+    /// If `expr` is a value-returning callable (`f(..)` with `#[ret(temp = N)] .. -> T`, or `f(..)?` with
+    /// `#[ret(temp = N)] .. -> Result<T>`), lowers the call and returns the raw `temp[N]` operand.
     pub(super) fn try_lower_callable_value_raw(
         &mut self,
         expr: &V2Expr,

@@ -4,10 +4,6 @@
 [subject]
 antics = "../objects/open-shower.antics"
 pack = ".."
-# Its Main returns at once (v2's default Main), which faults the game's lot update (error
-# 0x3e9): the interaction cases run with an idle loop in its place, an assumption every case
-# reports. Drop this once the object's Main loops.
-idle_main = true
 
 [sim]
 motives = { hygiene = 0 }

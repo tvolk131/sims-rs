@@ -193,7 +193,7 @@ struct ResolvedObjectSchema {
     functionals: BTreeMap<String, ResolvedFunctionalSig>,
 }
 
-/// Resolved return ABI of a callable BHAV (`extern mod` fn or standalone `tree`).
+/// Resolved return ABI of a callable BHAV (`extern mod` fn or standalone `#[bhav] fn`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResolvedReturnAbi {
     Void,
@@ -219,7 +219,7 @@ enum CallContext {
     Extern,
 }
 
-/// Fully resolved call signature of an `extern mod` fn or a sibling standalone `tree`.
+/// Fully resolved call signature of an `extern mod` fn or a sibling standalone `#[bhav] fn`.
 #[derive(Debug, Clone)]
 struct CallableSig {
     /// Human-readable name for diagnostics (`light_globals::init_floor`, `tree 'is_fridge'`).
@@ -228,7 +228,7 @@ struct CallableSig {
     context: CallContext,
     params: Vec<ResolvedAbiParam>,
     ret: ResolvedReturnAbi,
-    /// Argument words the callee's frame reads: `@frame(args:)` for a standalone tree, else
+    /// Argument words the callee's frame reads: `#[frame(args = )]` for a standalone tree, else
     /// the positional parameter count (an `extern` is trusted to declare its whole frame).
     /// `None` when unknown.
     frame_args: Option<usize>,
@@ -245,7 +245,7 @@ struct ResolvedBconTable {
     values: Vec<(String, i16)>,
 }
 
-/// Standalone `tree` member ready for lowering.
+/// Standalone `#[bhav] fn` member ready for lowering.
 #[derive(Debug, Clone)]
 struct OwnedTree {
     owner_module: String,
@@ -261,7 +261,7 @@ struct ValueReturnAbi {
     allow_none: bool,
     /// `true` to lower compound arithmetic returns directly into `temp[N]` when alias/trap-safe.
     in_place: bool,
-    /// Diagnostic noun (`functional` / `tree`).
+    /// Diagnostic noun (`functional` / `#[bhav] fn`).
     what: &'static str,
 }
 
@@ -616,7 +616,7 @@ struct TreeLowerer<'a> {
     /// `stack_obj` (e.g. the cancelling Sim in `cleanup` / OBJf 4) into `__saved_stack_obj`.
     used_saved_stack_obj: bool,
     /// Non-`None` when lowering a body that returns a value in `temp[N]` (typed
-    /// `functional kind(...) -> T` or a standalone `tree ... -> T @ temp[N]`).
+    /// `functional kind(...) -> T` or a standalone `#[bhav] fn .. -> T` with `#[ret(temp = N)]`).
     value_return: Option<ValueReturnAbi>,
     /// The body being written.
     em: mir::Emitter,
@@ -652,10 +652,10 @@ struct TreeLowerer<'a> {
     raw_names: BTreeMap<String, BTreeSet<RawBlockKey>>,
     /// A raw block of the tree formats text (see `raw_facts`), however it is spelled.
     raw_formats_text: bool,
-    /// The tree's first `@slot(N) let`: its pinned locals are named `__slot<N>_..` through the
+    /// The tree's first `#[slot(N)] let`: its pinned locals are named `__slot<N>_..` through the
     /// optimizer and placed by `opt::assign_frame_slots` when the tree is finished.
     slot_span: Option<Span>,
-    /// The `.air` names of the tree's `@slot(N) let` locals and their word numbers: the only
+    /// The `.air` names of the tree's `#[slot(N)] let` locals and their word numbers: the only
     /// names `opt::assign_frame_slots` pins (a raw block's own `__slot..` name is not one).
     pinned_locals: BTreeMap<String, usize>,
     /// Each inlined helper's local and the declaration it copies (the helper and the `let`'s
@@ -680,9 +680,9 @@ struct TreeLowerer<'a> {
     /// One past the highest `param[n]` the tree names, so a functional's header can declare
     /// the words it reads.
     param_words_used: usize,
-    /// The tree's `@frame(locals: K)`, which `animate(event_local:)` must stay outside.
+    /// The tree's `#[frame(locals = K)]`, which `animate(event_local:)` must stay outside.
     frame_locals: Option<u16>,
-    /// The tree's `@frame(format: F)`, whose format may bound the frame (`0x8000`/`0x8001` hold
+    /// The tree's `#[frame(format = F)]`, whose format may bound the frame (`0x8000`/`0x8001` hold
     /// four locals).
     frame_format: Option<u16>,
     /// The first `animate(event_local: N)`, as `(span, N)`.
@@ -691,10 +691,10 @@ struct TreeLowerer<'a> {
     /// with a raw op such as `animate(event_local:)`.
     sleep_span: Option<Span>,
     /// Where each source statement of the tree itself (not of an inlined helper) starts in the
-    /// emitted text, as `(mark, span)`: the `@context(inherit)` check points its error at the
+    /// emitted text, as `(mark, span)`: the `#[context(inherit)]` check points its error at the
     /// statement whose lowering differs between the caller contexts.
     stmt_marks: Vec<(usize, Span)>,
-    /// The Sim pass of the `@context(inherit)` check, which emits no entry save up front: like
+    /// The Sim pass of the `#[context(inherit)]` check, which emits no entry save up front: like
     /// the object pass's `__saved_stack_obj`, `finish` declares `__self_obj` (the entry stack
     /// object) first when the body reads it.
     inherited_entry_save: bool,
@@ -740,7 +740,7 @@ struct MatchResult {
     if_expr: bool,
 }
 
-const SLOT_WITH_PIN: &str = "push_interaction(object: <handle>) cannot share a tree with '@slot(N) let': the pinned object slot is local[0], which the frame layout around '@slot' locals does not reserve; pass a constant parameter index or move one of them to its own tree";
+const SLOT_WITH_PIN: &str = "push_interaction(object: <handle>) cannot share a tree with '#[slot(N)] let': the pinned object slot is local[0], which the frame layout around '#[slot]' locals does not reserve; pass a constant parameter index or move one of them to its own tree";
 const RAW_WITH_PIN: &str = "push_interaction(object: <handle>) cannot share a tree with 'raw { ... }' or a 'local[N]' read: they may name local slots the pinned object slot could collide with; pass a constant parameter index or move the raw block to its own tree";
 
 /// Placeholder for the per-tree pinned local slot of `push_interaction(object: <handle>)`,

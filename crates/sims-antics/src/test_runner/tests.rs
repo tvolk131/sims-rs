@@ -786,7 +786,7 @@ mod harness_tests {
     sprite: Sprite::procedural("floor_lamp", primary: #101010, accent: #202020, trim: #303030);
 
     extern mod g {
-        @id(300) fn probe() -> bool;
+        #[id(300)] fn probe() -> bool;
     }
 
     state count: i16 = 3;
@@ -801,35 +801,41 @@ mod harness_tests {
 
     sound beep = preset("chime", wav: "runner_beep");
 
-    @id(4400) tree bump "Bump" {
+    #[bhav(id = 4400, label = "Bump")]
+    fn bump() {
         self.count += 1;
         play_sound(beep);
         return true;
     }
 
-    @id(4401) tree nap "Nap" {
+    #[bhav(id = 4401, label = "Nap")]
+    fn nap() {
         sleep(3);
         self.count += 10;
     }
 
-    @id(4402) tree loop_forever "Loop" {
+    #[bhav(id = 4402, label = "Loop")]
+    fn loop_forever() {
         while 0 == 0 {
             self.count += 1;
         }
     }
 
-    @id(4403) tree ask "Ask" {
+    #[bhav(id = 4403, label = "Ask")]
+    fn ask() {
         if g::probe() {
             return true;
         }
         return false;
     }
 
-    @id(4404) @frame(args: 1) tree look "Look" {
+    #[bhav(id = 4404, label = "Look", args = 1)]
+    fn look() {
         self.seen = param[0];
     }
 
-    @id(4405) tree pay "Pay" {
+    #[bhav(id = 4405, label = "Pay")]
+    fn pay() {
         if debit_funds(25) {
             return true;
         }
@@ -1559,7 +1565,8 @@ expect = { attrs = { count = 13 }, sim = { person = { 27 = 0 } } }
         }
     }
 
-    @id(4410) tree remove_self "Remove Self" {
+    #[bhav(id = 4410, label = "Remove Self")]
+    fn remove_self() {
         destroy_self(no_yield: true);
         sleep(1);
         return true;
@@ -2388,13 +2395,17 @@ expect = { result = "yield" }
         assert_bed(&r);
     }
 
-    /// An object whose Main returns at once (v2's default Main: it declares none).
+    /// An object whose Main returns at once (v2's default Main idles, so it says so).
     const RETURNING: &str = r#"object "Runner Returning" {
     guid: 0x7E00_7E21;
     price: 1;
     sprite: Sprite::procedural("floor_lamp", primary: #101010, accent: #202020, trim: #303030);
 
     state count: i16 = 0;
+
+    main {
+        return true;
+    }
 
     interaction "Poke" {
         run(sim) {
@@ -2411,6 +2422,10 @@ expect = { result = "yield" }
     sprite: Sprite::procedural("floor_lamp", primary: #101010, accent: #202020, trim: #303030);
 
     state count: i16 = 0;
+
+    main {
+        return true;
+    }
 }
 "#;
 
@@ -2536,7 +2551,9 @@ expect = { result = true, turns = 0 }
     guid: 0x7E00_7E23;
     price: 1;
     sprite: Sprite::procedural("floor_lamp", primary: #101010, accent: #202020, trim: #303030);
-    tree probe "Probe" {
+    main { return true; }
+    #[bhav(label = "Probe")]
+    fn probe() {
         raw { call 8191(); }
     }
 }
@@ -2754,7 +2771,7 @@ expect = { error = "tree 0x012c is missing", attrs = { checked = 2 } }
         // A second definition of the subject's file whose Main returns too: the subject's
         // key is not its, so it still stops the case, naming it.
         let dir = scratch("idle-main-sibling");
-        let (_, beta) = two_definitions_with(&dir, "");
+        let (_, beta) = two_definitions_with(&dir, "main {\n        return true;\n    }");
         let path = dir.join("sibling.test.toml");
         std::fs::write(
             &path,

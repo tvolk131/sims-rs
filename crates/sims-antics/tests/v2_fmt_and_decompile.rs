@@ -197,10 +197,11 @@ fn assert_round_trip(name: &str, source: &str) -> String {
 fn synthetic_lamp_round_trips_with_idioms() {
     let source = assert_round_trip("synth-lamp.antics", LAMP);
     for idiom in [
-        // A lifecycle block takes `@frame` only when the default header does not do: `main`
-        // reads `param[0]`.
-        "#[id(4096)] init {",
-        "#[id(4097)] #[frame(args = 1, locals = 0, format = 0x8002, revision = 0)] main {",
+        // A lifecycle block takes a header only when the default one does not do: `main`'s
+        // `sleep(30)` stages its ticks in `param[0]`, which the default header gives it.
+        "#[id(4096)]\n    init {",
+        "#[id(4097)]\n    main {",
+        "sleep(30);",
         "loop {",
         "if self.attr_0 != 0 {",
         "animate(clip: 3, table: 1, flags: 0, events: 0) |event| {",
@@ -208,7 +209,8 @@ fn synthetic_lamp_round_trips_with_idioms() {
         "if !can_afford(5, category: 0) {",
         "debit_funds(5, category: 0);",
         "random_into(temp[2], 10);",
-        "#[bhav(label = \"Can_TurnOn\")] fn can_turn_on_4098(sim: Sim) {",
+        "label = \"Can_TurnOn\"",
+        "fn can_turn_on_4098(sim: Sim) {",
         "sim.motive[13] += SynthLampTuning.e0;",
         "guid: 0x7E00_0001;",
         "bcon 4097 \"Tuning\" {",
@@ -230,7 +232,7 @@ fn synthetic_counter_round_trips() {
     // The census loop's cursor is `stack_obj` itself (no loop local) since v2 PR F.
     assert!(source.contains("for o in lot.objects() {"), "{source}");
     assert!(!source.contains("set_to_next"), "{source}");
-    assert!(source.contains("#[id(4096)] init {"), "{source}");
+    assert!(source.contains("#[id(4096)]\n    init {"), "{source}");
 }
 
 /// v2 PR F shapes: `for` loops whose cursor is `stack_obj` itself, sound ID 0, two FWAVs
@@ -301,7 +303,7 @@ fn zero_local_loops_sounds_and_frame_kinds_round_trip() {
         "for p in lot.sims() {",
         "if p.kind == 0 {",
         "temp[1] += p.personality.playful;",
-        "#[id(4304)] #[frame(args = 0, locals = 0, format = 0x8002, revision = 0, kind = 3)] tree",
+        "#[bhav(id = 4304, label = \"Kinded\", args = 0, locals = 0, format = 0x8002, revision = 0, kind = 3)]\n    fn kinded_4304() {",
         "sound sound_0 = preset(\"ui_click\", wav: \"synth_chime\", id: 0);",
         "sound sound_7 = preset(\"ui_click\", wav: \"synth_chime\", id: 7);",
         "play_sound(sound_0);",
@@ -314,14 +316,14 @@ fn zero_local_loops_sounds_and_frame_kinds_round_trip() {
     assert!(!source.contains("set_to_next"), "{source}");
     // Trees without a kind keep the plain frame.
     assert!(
-        source.contains("#[id(4303)] #[frame(args = 0, locals = 0, format = 0x8002, revision = 0)] tree"),
+        source.contains("#[bhav(id = 4303, label = \"People\", args = 0, locals = 0, format = 0x8002, revision = 0)]\n"),
         "{source}"
     );
     // `census` prefers the Sim context (it reads the stack object's attributes) but `main`
     // calls it: it is written for either context.
     assert!(
         source.contains(
-            "#[id(4302)] #[frame(args = 0, locals = 0, format = 0x8002, revision = 0)] #[context(inherit)] tree"
+            "#[bhav(id = 4302, label = \"Census\", args = 0, locals = 0, format = 0x8002, revision = 0, context = inherit)]\n"
         ),
         "{source}"
     );
@@ -357,7 +359,7 @@ fn formatter_handles_if_expressions_or_patterns_and_frame_kinds() {
         "idempotent"
     );
     for expected in [
-        "    #[bhav(id = 4200, label = \"Pick\", kind = 3)] fn pick() {\n",
+        "    #[bhav(id = 4200, label = \"Pick\", kind = 3)]\n    fn pick() {\n",
         "        self.level = if self.level > 3 {\n            1\n        } else if self.level > 1 {\n            2\n        } else {\n            3\n        };\n",
         "            Mode::Off | Mode::Low => 1,\n",
         "            Mode::Off | Mode::Low => {\n                self.level += 1;\n            }\n",
@@ -716,8 +718,8 @@ fn formatter_keeps_empty_frames() {
         "idempotent"
     );
     for expected in [
-        "    #[bhav(id = 4300, label = \"A\", empty)] fn a() {}\n",
-        "    #[bhav(id = 4301, label = \"B\", args = 4, empty)] fn b() {}\n",
+        "    #[bhav(id = 4300, label = \"A\", empty)]\n    fn a() {}\n",
+        "    #[bhav(id = 4301, label = \"B\", args = 4, empty)]\n    fn b() {}\n",
     ] {
         assert!(
             formatted.contains(expected),
@@ -766,7 +768,7 @@ fn formatter_handles_pr_h_attributes_and_constant_bindings() {
         "idempotent"
     );
     for expected in [
-        "    #[id(4300)] #[context(inherit)]\n    #[bhav(label = \"Helper\")] fn helper() {\n",
+        "    #[bhav(id = 4300, label = \"Helper\", context = inherit)]\n    fn helper() {\n",
         "        #[slot(3)] let x: i16;\n",
         "        const (A, B) = if temp[0] > 0 { (1, 2) } else { (3, 4) };\n",
         "        const C = if temp[1] > 0 { 5 } else { 6 };\n",

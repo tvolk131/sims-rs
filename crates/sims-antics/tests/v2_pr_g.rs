@@ -209,14 +209,12 @@ fn n2_entry_save_only_when_the_entry_stack_object_is_read_after_a_move() {
 #[test]
 fn empty_frame_tree_has_zero_nodes_and_plain_braces_still_return_true() {
     let cfg = PackResolverConfig::default();
-    let src = obj(
-        "    #[bhav(id = 4200, label = \"Unused\", empty)]
+    let src = obj("    #[bhav(id = 4200, label = \"Unused\", empty)]
     fn unused(sim: Sim, a: i16) {}\n    \
          #[bhav(id = 4201, label = \"Plain\")]
          fn plain() {}\n    \
          #[bhav(id = 4202, label = \"Pinned\", args = 2, empty, locals = 1)]
-         fn pinned() {}",
-    );
+         fn pinned() {}");
     let air = expand("empty.antics", &src);
     assert!(air.contains("tree 4200 \"Unused\" (args: 1) {\n}"), "{air}");
     assert!(
@@ -243,12 +241,12 @@ fn empty_frame_tree_has_zero_nodes_and_plain_braces_still_return_true() {
     expect_err(
         "empty_body.antics",
         &obj("    #[bhav(empty)] fn t() { self.n = 1; }"),
-        "#[frame(empty)] tree 't' has no nodes, so its body must be '{}'",
+        "'empty' fn 't' has no nodes, so its body must be '{}'",
     );
     expect_err(
         "empty_dup.antics",
         &obj("    #[bhav(empty, empty)] fn t() {}"),
-        "duplicate @frame field 'empty'",
+        "duplicate header field 'empty'",
     );
     // A return value is not required of a tree that has no nodes.
     expand(
@@ -363,7 +361,8 @@ fn tier2_primitives_lower_to_their_opcodes() {
 fn tier2_sim_and_handle_fields() {
     let air = expand(
         "fields.antics",
-        &obj("    bitflags Marks { High = 3 }\n    #[bhav] fn t(sim: Sim) { \
+        &obj(
+            "    bitflags Marks { High = 3 }\n    #[bhav] fn t(sim: Sim) { \
              sim.attr[1] = 4; \
              sim.data[3] = sim.attr[1]; \
              sim.priority = 50; \
@@ -371,7 +370,8 @@ fn tier2_sim_and_handle_fields() {
              let c = sim.container; \
              if c == stack_obj { sim.data[4] = 1; } \
              if stack_obj.flags.contains(Marks::High) { self.n = 2; } \
-             stack_obj.flags.set(Marks::High); }"),
+             stack_obj.flags.set(Marks::High); }",
+        ),
     );
     for needle in [
         "my.attr[1] := 4;",

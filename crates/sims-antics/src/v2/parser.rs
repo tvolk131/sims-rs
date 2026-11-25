@@ -11,8 +11,8 @@ use crate::v2::ast::{
     InteractionDecl, LifecycleBlock, MatchArm, MatchExprArm, MatchPattern, MetaField,
     MetaFieldKind, ObjectDecl, ObjectMember, ParamAssignDecl, ParamDecl, ParamType, ParamValue,
     ReturnAbi, SlotDecl, SoundDecl, SpriteDecl, StateDecl, StateInitValue, StateType, StringsDecl,
-    TemplateDecl, TileDecl, TreeMemberDecl, UseDecl, UseItem, V2AssignOp, V2BinOp,
-    V2Expr, V2File, V2Item, V2Stmt, V2Type, V2UnaryOp, VariantDecl,
+    TemplateDecl, TileDecl, TreeMemberDecl, UseDecl, UseItem, V2AssignOp, V2BinOp, V2Expr, V2File,
+    V2Item, V2Stmt, V2Type, V2UnaryOp, VariantDecl,
 };
 use crate::v2::attrs::{Attr, AttrArg, AttrValue, ItemAttrs};
 use crate::v2::lexer::{Token, TokenKind, tokenize};
@@ -706,7 +706,9 @@ impl Parser {
                 if let Some((tspan, _)) = attrs.temp {
                     return Err(Error::at(
                         tspan,
-                        format!("'{name}: Sim' selects the frame context and takes no '#[temp(N)]'"),
+                        format!(
+                            "'{name}: Sim' selects the frame context and takes no '#[temp(N)]'"
+                        ),
                     ));
                 }
                 if !(allow_sim && first) {
@@ -1039,7 +1041,9 @@ impl Parser {
                     {
                         return Err(Error::at(
                             span,
-                            format!("{what} takes only the BHAV id and header fields ('#[bhav(id = N, locals = L, ..)]')"),
+                            format!(
+                                "{what} takes only the BHAV id and header fields ('#[bhav(id = N, locals = L, ..)]')"
+                            ),
                         ));
                     }
                 }
@@ -1092,7 +1096,9 @@ impl Parser {
                              declare flat top-level 'state name: bool = false;' items instead",
                         ));
                     }
-                    members.push(ObjectMember::State(self.parse_state_decl(kw_span, attrs.slot)?));
+                    members.push(ObjectMember::State(
+                        self.parse_state_decl(kw_span, attrs.slot)?,
+                    ));
                 }
                 "sound" => {
                     members.push(ObjectMember::Sound(self.parse_sound_decl(kw_span)?));

@@ -3,10 +3,6 @@
 [subject]
 antics = "../objects/open-mailbox.antics"
 pack = ".."
-# Its Main returns at once (v2's default Main), which faults the game's lot update (error
-# 0x3e9): the interaction cases run with an idle loop in its place, an assumption every case
-# reports. Drop this once the object's Main loops.
-idle_main = true
 
 [sim]
 motives = { fun = 0 }
@@ -50,6 +46,7 @@ given = { attrs = { unpaid_bills = 0 } }
 expect = { attrs = { unpaid_bills = 1 }, sim = { motives = { fun = 8 } }, sounds = ["open_mailbox_latch"] }
 
 [[test]]
-name = "the main loop returns at once"
+name = "the main loop idles"
 tree = "Main"
-expect = { result = true, turns = 0 }
+turns = 4
+expect = { result = "yield" }
