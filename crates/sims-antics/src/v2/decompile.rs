@@ -80,6 +80,15 @@ const CREATE_OBJECT: u16 = 42;
 const CREATE_FROM_RECORD: u8 = 0x04;
 /// Run Functional Tree: the stack object runs the callback a function names.
 const RUN_FUNCTIONAL_TREE: u16 = 20;
+/// Primitives whose VM work may run object callbacks (`sims-vm` `.callback(`): of the
+/// object they move, of its container, or of the target of a queued action they
+/// cancel. Grab (4), Drop (5), Burn (9), Push Interaction (13), Find Location For (16),
+/// Idle For Input (17), Remove Object Instance (18), Go To Relative Position (27), UI
+/// Effect (34), Create Object Instance (42), Drop Onto (43), Go To Routing Slot (45),
+/// Snap (46) and Reach (47); Dialog (36) too when it builds a portrait person
+/// ([`runs_callbacks`]).
+const CALLBACK_PRIMITIVES: [u16; 14] = [4, 5, 9, 13, 16, 17, 18, 27, 34, 42, 43, 45, 46, 47];
+const DIALOG: u16 = 36;
 /// Expression, and the operand scopes through which it reads object definitions
 /// (`sims-vm` `memory.rs`): the stack object's words (21), the type-attribute record
 /// that definition words 92 and 93 of me (36) or the stack object (37) may name, and
@@ -1051,10 +1060,11 @@ impl Model {
                     );
                 }
             }
-            if i.opcode == CREATE_OBJECT && callbacks() != Some(true) {
+            if runs_callbacks(i) && callbacks() != Some(true) {
                 return Some(
-                    "creates an object, whose callbacks the rebuilt object's tables give \
-                     differently"
+                    "may run object callbacks (creating, moving or removing an object, building a \
+                     portrait person or cancelling an action), which the rebuilt object's \
+                     tables give differently"
                         .to_owned(),
                 );
             }
@@ -1096,8 +1106,8 @@ impl Model {
             if self.runs_shared_code(i) && !self.same_owner_environment(recompiled) {
                 return Some(
                     "may run code outside this file's private trees (a global or semi-global \
-                     tree, a tree found by name, a callback, a created object), which may read \
-                     this object's data the rebuilt object gives differently"
+                     tree, a tree found by name, a callback), which may read this object's \
+                     data the rebuilt object gives differently"
                         .to_owned(),
                 );
             }
@@ -1189,14 +1199,16 @@ impl Model {
     /// - a global or semi-global tree, called by number;
     /// - a tree found by name, which may be another file's when this one has no match;
     /// - a callback run by function, from whichever object is the stack object;
-    /// - a created object's callbacks (and its slots and other data).
+    /// - callbacks a primitive runs ([`runs_callbacks`]): a created, moved or
+    ///   removed object's, its container's, or a cancelled action's target's (any of
+    ///   which may be another object).
     ///
     /// Such code may run on this thread with this object as owner, so it may run any
     /// of this file's trees by name, create an object, or read any of its data.
     fn runs_shared_code(&self, i: &sims_formats::behavior::Instruction) -> bool {
         (i.opcode >= 0x100 && !PRIVATE_TREES.contains(&i.opcode))
             || i.opcode == RUN_FUNCTIONAL_TREE
-            || i.opcode == CREATE_OBJECT
+            || runs_callbacks(i)
             || !self.names_run(i, &self.original_strings).is_empty()
             || self
                 .direct_named_callees(i)
@@ -1239,7 +1251,7 @@ impl Model {
 
     /// The trees of this file instruction `i` may run by name in the original (the tree
     /// each name finds here, or every tree for a name not known here), by function, or
-    /// as callbacks of an object it creates.
+    /// or as callbacks a primitive runs ([`runs_callbacks`]).
     fn direct_named_callees(&self, i: &sims_formats::behavior::Instruction) -> Vec<u16> {
         let mut out = Vec::new();
         for name in self.names_run(i, &self.original_strings) {
@@ -1250,10 +1262,10 @@ impl Model {
             }
         }
         out.extend(self.functional_callees(i));
-        if i.opcode == CREATE_OBJECT
+        if runs_callbacks(i)
             && let Some(c) = &self.original_callbacks
         {
-            // The new object may be one of this file's definitions: its callbacks run.
+            // The object whose callbacks run may be one of this file's definitions.
             out.extend(c.by_tree.keys().copied());
         }
         out
@@ -1699,7 +1711,7 @@ fn fwav_sounds(iff: &Iff) -> BTreeMap<u16, String> {
 ///   `BMP_` 2002): each resource of that key in resource order (live chunks; every
 ///   chunk of the tag in file order when the resource map does not parse).
 fn resource_chunks(iff: &Iff) -> BTreeMap<([u8; 4], u16), Vec<Vec<u8>>> {
-    const LAST_CHUNK: [&[u8; 4]; 4] = [b"BCON", b"FCNS", b"TTAB", b"SLOT"];
+    const LAST_CHUNK: [&[u8; 4]; 5] = [b"BCON", b"FCNS", b"TTAB", b"SLOT", b"FWAV"];
     const EVERY_CHUNK: [&[u8; 4]; 1] = [b"STR#"];
     const RESOURCE_ORDER: [&[u8; 4]; 8] = [
         b"CTSS", b"CATS", b"\0CST", b"TTAs", b"GLOB", b"TPRP", b"OBJD", b"OBJf",
@@ -1743,6 +1755,17 @@ fn resource_chunks(iff: &Iff) -> BTreeMap<([u8; 4], u16), Vec<Vec<u8>>> {
         }
     }
     out
+}
+
+/// Whether instruction `i` may run object callbacks in the VM ([`CALLBACK_PRIMITIVES`]).
+/// Dialog does when it builds a temporary person for a portrait (`sims-vm`
+/// `dialog_portrait`, whose `init` runs): kinds 0 to 4 (operand 5) with icon mode 0
+/// or 2 (operand 7 bits 1 to 3).
+fn runs_callbacks(i: &sims_formats::behavior::Instruction) -> bool {
+    if i.opcode == DIALOG {
+        return i.operands[5] <= 4 && matches!((i.operands[7] >> 1) & 7, 0 | 2);
+    }
+    CALLBACK_PRIMITIVES.contains(&i.opcode)
 }
 
 /// The portrait bitmap ID the VM loads (`sims-vm` `program.rs` `PORTRAIT_BITMAP`).

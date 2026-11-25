@@ -860,30 +860,50 @@ fn reads_of_definitions_and_callbacks_need_the_same_tables() {
 }
 
 #[test]
-fn creating_an_object_runs_its_callbacks() {
+fn primitives_that_run_callbacks_need_the_same_tables() {
     // Create Object Instance runs the new object's `init` (and more), whether or not it
-    // creates from a record: it may create this object.
-    let source = r#"object "Fable Bellows" {
-    guid: 0x7E00_013A;
-    @id(4200) main { temp[0] = 1; }
-    @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 2; }
-    @id(4301) @frame(locals: 0) tree spawn "Spawn" {
-        raw { op 0x002a (0x3a, 0x01, 0x00, 0x7e, 0, 0, 0, 0); }
+    // creates from a record: it may create this object. Remove Object Instance runs the
+    // removed object's Leaving callback, Drop and Grab its container's Placed callback,
+    // Push Interaction and Idle For Input a cancelled action's target's Cancelled
+    // callback, and a Dialog with a portrait its temporary person's `init`; any of them
+    // may be this object.
+    for (n, op) in [
+        "0x002a (0x3a, 0x01, 0x00, 0x7e, 0, 0, 0, 0)",
+        "0x0012 (0, 0, 0, 0, 0, 0, 0, 0)",
+        "0x0005 (0, 0, 0, 0, 0, 0, 0, 0)",
+        "0x0004 (0, 0, 0, 0, 0, 0, 0, 0)",
+        "0x000d (0, 0, 0, 0, 0, 0, 0, 0)",
+        "0x0011 (0, 0, 0, 0, 0, 0, 0, 0)",
+        "0x0024 (0, 0, 0, 0, 0, 0, 0, 0)",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let source = format!(
+            r#"object "Fable Bellows" {{
+    guid: 0x7E00_{:04X};
+    @id(4200) main {{ temp[0] = 1; }}
+    @id(4300) @frame(locals: 0) tree pump "Pump" {{ temp[0] = 2; }}
+    @id(4301) @frame(locals: 0) tree caller "Caller" {{
+        raw {{ op {op}; }}
+    }}
+}}"#,
+            0x013A + 0x20 * n
+        );
+        let iff = compile(&source);
+        let (init, main) = init_and_main(&iff);
+        // Callback 18 runs `Pump`, which the lift writes as a plain tree.
+        let mut entries = vec![(0, 0); 19];
+        entries[0] = (0, init);
+        entries[1] = (0, main);
+        entries[18] = (0, 4300);
+        let report = report(&with_callbacks(&iff, &entries));
+        assert!(
+            matches!(check_of(&report, 4301), TreeCheck::Inconclusive(why) if why.contains("may run object callbacks")),
+            "{op}: {:?}",
+            report.trees
+        );
     }
-}"#;
-    let iff = compile(source);
-    let (init, main) = init_and_main(&iff);
-    // Callback 18 runs `Pump`, which the lift writes as a plain tree.
-    let mut entries = vec![(0, 0); 19];
-    entries[0] = (0, init);
-    entries[1] = (0, main);
-    entries[18] = (0, 4300);
-    let report = report(&with_callbacks(&iff, &entries));
-    assert!(
-        matches!(check_of(&report, 4301), TreeCheck::Inconclusive(why) if why.contains("creates an object")),
-        "{:?}",
-        report.trees
-    );
 }
 
 #[test]
@@ -1240,8 +1260,9 @@ fn a_global_call_waits_on_every_private_tree() {
 
 #[test]
 fn catalog_strings_and_the_portrait_are_owner_data() {
-    // The VM loads `CATS` presence and `BMP_` 2002 with the object; a global tree
-    // running with it as owner may see either. The lift writes neither.
+    // The VM loads `CATS` and `\0CST` presence, `BMP_` 2002 and `FWAV` event names with
+    // the object; a global tree running with it as owner may see any of them. The lift
+    // writes none of these chunks as given here.
     let source = r#"object "Fable Bellows" {
     guid: 0x7E00_0144;
     @id(4301) @frame(locals: 0) tree caller "Caller" {
@@ -1250,7 +1271,12 @@ fn catalog_strings_and_the_portrait_are_owner_data() {
 }"#;
     let iff = compile(source);
     assert!(proven(check_of(&report(&iff), 4301)));
-    for (tag, id) in [(*b"CATS", 300), (*b"BMP_", 2002)] {
+    for (tag, id) in [
+        (*b"CATS", 300),
+        (*b"\0CST", 301),
+        (*b"BMP_", 2002),
+        (*b"FWAV", 5),
+    ] {
         let extra = ChunkData {
             tag,
             id,

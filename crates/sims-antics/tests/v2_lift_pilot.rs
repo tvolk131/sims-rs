@@ -323,7 +323,7 @@ fn trees_showing_text_prove_through_lifted_strings() {
     strings 301 "Dialog prim string set" { ask = "Go on? $Local:0", head = "Sign \"A\"" }
     strings 431 "Action labels" { a = "Read", b = "Wave" }
     @id(4300) tree confirm {
-        dialog(kind: yes_no, message: ask, title: head)?;
+        dialog(kind: yes_no, message: ask, title: head, icon_mode: 1)?;
     }
     @id(4301) tree label {
         action_label(table: 431, index: 2);
