@@ -566,3 +566,768 @@ fn methods_match_the_call_forms() {
     }"),
     );
 }
+
+/// IFF bytes of a synthetic `.air` object whose Init tree is `body`.
+fn air_iff(body: &str) -> Vec<u8> {
+    let manifest = "[object]\nname = \"Kind Probe\"\nguid = 0x7F50_0002\ninit = \"Init\"\n";
+    let src = format!("tree 4096 \"Init\" {{ {body} return true; }}");
+    sims_antics::compile_object_from_sources(manifest, &[("k.antics", &src)])
+        .unwrap_or_else(|e| panic!("must compile: {e}\n{src}"))
+        .iff_bytes
+}
+
+#[test]
+fn functional_kind_names_follow_the_engine_table() {
+    // Run Functional Tree / Find Best Object function numbers (sims-vm
+    // `run_functional_tree.rs` `callback`, `find_best_object.rs` `wanted`).
+    let kinds = [
+        ("prep", 0),
+        ("cook", 1),
+        ("surface", 2),
+        ("dispose", 3),
+        ("eat", 4),
+        ("pickup_from_slot", 5),
+        ("wash_dish", 6),
+        ("eating_surface", 7),
+        ("sit", 8),
+        ("stand", 9),
+        ("serving_surface", 10),
+        ("clean", 11),
+        ("gardening", 12),
+        ("wash_hands", 13),
+        ("repair", 14),
+    ];
+    for (name, n) in kinds {
+        assert!(
+            air_iff(&format!("run_functional_tree({name});"))
+                == air_iff(&format!("run_functional_tree({n});")),
+            "run_functional_tree({name}) is not function {n}"
+        );
+        if !matches!(name, "eat" | "pickup_from_slot" | "stand") {
+            assert!(
+                air_iff(&format!("find_best_object({name});"))
+                    == air_iff(&format!("find_best_object({n});")),
+                "find_best_object({name}) is not function {n}"
+            );
+        }
+    }
+    assert!(air_iff("find_best_object(category4);") == air_iff("find_best_object(15);"));
+
+    // The names an off-by-one table used are gone, with a pointer to the new name.
+    for (old, new) in [
+        ("serve", "gardening"),
+        ("rest", "repair"),
+        ("pick_up", "eating_surface"),
+    ] {
+        expect_err(
+            &obj(&format!(
+                "    main {{ let Some(_o) = find_best_object({old}) else {{ return; }}; loop {{ sleep(1); }} }}"
+            )),
+            &format!(
+                "unknown functional kind '{old}': the function this name used to give is '{new}'"
+            ),
+        );
+    }
+    // v2 refuses a search the engine never answers.
+    expect_err(
+        &obj(
+            "    main { let Some(_o) = find_best_object(stand) else { return; }; loop { sleep(1); } }",
+        ),
+        "find_best_object(stand) always fails",
+    );
+    // A v2 `functional gardening` is OBJf entry 16, found by function 12, scored by word 64.
+    let garden = r#"object "Garden Bed" {
+    guid: 0x7F50_0003;
+    functional gardening {
+        score: 7,
+        run(sim) {
+            return;
+        }
+    }
+    main { loop { sleep(1); } }
+}
+"#;
+    let (air, _, _) = build(garden);
+    assert!(
+        air.contains("my.data[64] := 7;"),
+        "score word 64 missing:\n{air}"
+    );
+    let finder = obj(
+        "    main { let Some(_o) = find_best_object(gardening) else { return; }; loop { sleep(1); } }",
+    );
+    let (air, _, _) = build(&finder);
+    assert!(air.contains("find_best_object(gardening"), "{air}");
+}
+
+#[test]
+fn local_extern_globals_merge_with_std() {
+    let body = |externs: &str| {
+        format!(
+            "object \"Syntax Probe\" {{
+    guid: 0x7F50_0001;
+    state n: i16;
+{externs}    interaction \"Use\" {{
+        run(sim) {{
+            globals::standard_entry()?;
+            globals::robot_hum(2)?;
+            if !globals::am_i_a_child() {{
+                self.n = 1;
+            }}
+            globals::standard_exit(3)?;
+        }}
+    }}
+}}
+"
+        )
+    };
+    let copied = "extern mod globals {
+    #[id(272)] fn standard_entry() -> Result;
+    #[id(273)] fn standard_exit(delay: i16) -> Result;
+    #[id(363)] fn am_i_a_child() -> bool;
+    #[id(4000)] fn robot_hum(level: i16) -> Result;
+}
+
+";
+    let expected = format!("{copied}{}", body(""));
+    // A top-level local block and an object-member block both add to std's.
+    let local = "extern mod globals {
+    #[id(4000)] fn robot_hum(level: i16) -> Result;
+    #[id(272)] fn standard_entry() -> Result;
+}
+
+";
+    assert_same(
+        "top-level block merges",
+        &format!("use std::globals::*;\n\n{local}{}", body("")),
+        &expected,
+    );
+    assert_same(
+        "object block merges",
+        &format!(
+            "use std::globals::*;\n\n{}",
+            body(
+                "    extern mod globals {\n        #[id(4000)] fn robot_hum(level: i16) -> Result;\n    }\n"
+            )
+        ),
+        &expected,
+    );
+    // The same tree under a second name is fine when it is called the same way.
+    assert_same(
+        "alias of one tree",
+        &format!(
+            "use std::globals::*;\n\n{}",
+            body(
+                "    extern mod globals {\n        #[id(4000)] fn robot_hum(level: i16) -> Result;\n        #[id(272)] fn enter() -> Result;\n    }\n"
+            )
+        ),
+        &expected,
+    );
+    // Genuine conflicts are refused, naming both declarations.
+    expect_err(
+        &format!(
+            "use std::globals::*;\n\n{}",
+            body(
+                "    extern mod globals {\n        #[id(4000)] fn robot_hum(level: i16) -> Result;\n        #[id(274)] fn standard_entry() -> Result;\n    }\n"
+            )
+        ),
+        "extern mod 'globals' declares fn 'standard_entry' twice, differently: `#[id(274)] fn standard_entry() -> Result`",
+    );
+    expect_err(
+        &format!(
+            "use std::globals::*;\n\nextern mod globals {{\n    #[id(4000)] fn robot_hum(level: i16) -> Result;\n    #[id(273)] fn leave() -> Result;\n}}\n\n{}",
+            body("")
+        ),
+        "extern mod 'globals' calls tree 273 two ways",
+    );
+}
+
+#[test]
+fn run_functional_on_stack_obj_keeps_a_found_cursor() {
+    // The callee runs in its own frame, so `stack_obj.run_functional(..)` leaves the tree's
+    // `stack_obj` alone: no entry restore may replace the object Find Best Object found.
+    let src = |call: &str| {
+        format!(
+            "object \"Syntax Probe\" {{
+    guid: 0x7F50_0001;
+    state n: i16;
+
+    #[bhav(id = 4100, label = \"clean one\")]
+    fn clean_one() -> bool {{
+        stack_obj = 0;
+        raw {{ if !find_best_object(clean, flags: 0) {{ return false; }} }}
+        {call}
+        stack_obj.data[25] = 50;
+        if self.n > 0 {{
+            return true;
+        }}
+        false
+    }}
+}}
+"
+        )
+    };
+    let (air, _, _) = build(&src("stack_obj.run_functional(clean);"));
+    assert!(!air.contains("__saved_stack_obj"), "{air}");
+    assert_same(
+        "statement",
+        &src("stack_obj.run_functional(clean);"),
+        &src("raw { run_functional_tree(clean); }"),
+    );
+    // (The raw form prints on one line; the trees are the same.)
+    assert!(
+        build(&src(
+            "if !stack_obj.run_functional(clean) { return false; }"
+        ))
+        .1 == build(&src(
+            "raw { if !run_functional_tree(clean) { return false; } }"
+        ))
+        .1,
+        "condition: IFF bytes differ"
+    );
+}
+
+#[test]
+fn me_reads_like_the_sim_handle_in_inherit_trees() {
+    // In a `context = inherit` tree, `me` is whichever object runs it: its typed fields and
+    // methods lower to the same `my.` cells as the Sim handle's.
+    let src = |body: &str| {
+        format!(
+            "object \"Syntax Probe\" {{
+    guid: 0x7F50_0001;
+    state n: i16;
+    sound ding = preset(\"ui_click\", wav: \"probe_ding\");
+
+    #[bhav(id = 4100, label = \"me probe\", context = inherit)]
+    fn me_probe() -> bool {{
+{body}
+        true
+    }}
+}}
+"
+        )
+    };
+    let (air, _, _) = build(&src("        if me.job_level == 0 { return false; }
+        if me.skill.body > 300 { return false; }
+        me.motive.mood = me.priority;
+        temp[0] = me.id;
+        temp[1] = me.personality.nice;
+        me.play_sound(ding);
+        me.refresh(2);"));
+    for want in [
+        "if my.person[57] == 0 {",
+        "if my.person.body > 300 {",
+        "my.motive.mood := my.person.priority;",
+        "temp[0] := my.id;",
+        "temp[1] := my.person[2];",
+        "play_sound(1, false);",
+        "refresh(target: me, mode: 2);",
+    ] {
+        assert!(air.contains(want), "missing `{want}`:\n{air}");
+    }
+    // `me` still yields to a local of that name.
+    expect_err(
+        &src("        let me = 3;\n        temp[0] = me.job_level;"),
+        "unknown field 'me.job_level' (nothing in scope has it)",
+    );
+}
+
+#[test]
+fn budget_methods_are_bool_expressions() {
+    // `sim.debit_funds(..)` / `sim.credit_funds(..)` test like the call forms: in conditions,
+    // under `!` and `&&`, as values and as tails, with no extra locals or nodes.
+    let pair = |method_form: &str| {
+        let call_form = method_form
+            .replace("sim.debit_funds(", "debit_funds(")
+            .replace("sim.credit_funds(", "credit_funds(");
+        (obj(method_form), obj(&call_form))
+    };
+    for (case, body) in [
+        (
+            "condition",
+            "    interaction \"Use\" {
+        run(sim) {
+            if !sim.credit_funds(self.n, category: 2) {
+                return false;
+            }
+            if sim.debit_funds(5) && self.n > 0 {
+                self.m = 1;
+            }
+            while sim.debit_funds(1) {
+                self.m += 1;
+                sleep(1);
+            }
+        }
+    }",
+        ),
+        (
+            "value",
+            "    interaction \"Use\" {
+        run(sim) {
+            let paid = sim.debit_funds(5);
+            if paid {
+                self.m = 1;
+            }
+        }
+    }",
+        ),
+        (
+            "tail",
+            "    fn pay(sim: Sim) -> bool {
+        sim.credit_funds(5)
+    }
+    interaction \"Use\" {
+        run(sim) {
+            if !pay(sim) {
+                return false;
+            }
+            self.m = 1;
+        }
+    }",
+        ),
+    ] {
+        let (new, old) = pair(body);
+        assert_same(case, &new, &old);
+    }
+    let (air, _, _) = build(&obj("    fn pay(sim: Sim) -> bool {
+        sim.credit_funds(5)
+    }
+    interaction \"Use\" {
+        run(sim) {
+            if !pay(sim) {
+                return false;
+            }
+            self.m = 1;
+        }
+    }"));
+    assert!(!air.contains("let "), "a tail needs no local:\n{air}");
+    expect_err(
+        &obj("    interaction \"Use\" {
+        run(sim) {
+            if self.debit_funds(5) { self.m = 1; }
+        }
+    }"),
+        "'.debit_funds()' is called on the interaction's Sim",
+    );
+}
+
+#[test]
+fn bare_exit_match_arms_are_statements() {
+    let looped = |arms: &str| {
+        obj(&format!(
+            "    main {{
+        loop {{
+            match self.n {{
+{arms}
+            }}
+            sleep(1);
+        }}
+        loop {{ sleep(1); }}
+    }}"
+        ))
+    };
+    assert_same(
+        "break / continue arms",
+        &looped(
+            "                1 => break,\n                2 => continue,\n                _ => self.n += 1,",
+        ),
+        &looped(
+            "                1 => { break; }\n                2 => { continue; }\n                _ => { self.n += 1; }",
+        ),
+    );
+    let returns = |arms: &str| {
+        obj(&format!(
+            "    interaction \"Use\" {{
+        run(sim) {{
+            match self.n {{
+{arms}
+            }}
+            self.m = 1;
+        }}
+    }}"
+        ))
+    };
+    assert_same(
+        "return arms",
+        &returns(
+            "                0 => return false,\n                1 => return,\n                _ => {}",
+        ),
+        &returns(
+            "                0 => { return false; }\n                1 => { return; }\n                _ => {}",
+        ),
+    );
+    // The formatter keeps the bare forms parseable and stable.
+    let src = looped(
+        "                1 => break,\n                2 => continue,\n                _ => self.n += 1,",
+    );
+    let once = v2::format_v2_source(&src).expect("formats");
+    assert_eq!(v2::format_v2_source(&once).expect("formats again"), once);
+    assert_same("formatted", &once, &src);
+}
+
+/// The `.air` of a synthetic object whose `msg` string is `message`, around `members`.
+fn air_with_message(message: &str, members: &str) -> String {
+    let src = format!(
+        r#"object "Text Words" {{
+    guid: 0x7F40_0A20;
+    strings 301 "Notes" {{ title = "T", msg = "{message}" }}
+{members}
+}}
+"#
+    );
+    build(&src).0
+}
+
+/// `$Me` writes a name into the text that later passes may read as a token, so it may read any
+/// frame word: the unread entry save still drops when every other word keeps its local (the
+/// save's own word holds no source local). Explicit tokens keep the strict rule: one that may
+/// read the save's own word, or a word a named local would move to, keeps the save.
+#[test]
+fn me_text_drops_an_entry_save_that_moves_no_named_local() {
+    // The save, by name or (under `#[slot]` placement) by word.
+    let saves =
+        |air: &str| air.contains("let __self_obj = stack_obj;") || air.contains("] := stack_obj;");
+    // `n` is pinned below the save, so dropping the save moves no named local.
+    let pinned = r#"    #[bhav]
+    fn a(sim: Sim) {
+        #[slot(0)] let n: i16;
+        random_into(n, 4)?;
+        if !set_to_next(guid, 0x7F40_0A21, dest: stack_obj) {
+            return false;
+        }
+        stack_obj.attr[0] = n;
+        dialog(kind: ok, title: title, message: msg);
+    }"#;
+    for message in ["Hello $Me", "$Me rolled $Local:0"] {
+        let air = air_with_message(message, pinned);
+        assert!(!saves(&air), "{message}:\n{air}");
+    }
+    // `$Local:1` is the save's own word.
+    let air = air_with_message("$Me saw $Local:1", pinned);
+    assert!(saves(&air), "{air}");
+    // A name without `$` can still complete a token the source starts right before the `$Me`
+    // (the name `1` makes `$Local:1`, and `$Local:0` then writes the digits `$TimeLocal:`
+    // reads).
+    for message in ["Saw $Local:$Me", "$TimeLocal:$Me$Local:0", "$Loc$Me"] {
+        let air = air_with_message(message, pinned);
+        assert!(saves(&air), "{message}:\n{air}");
+    }
+    // `n` declared after the save would move down a word.
+    let moving = r#"    #[bhav]
+    fn a(sim: Sim) {
+        if !set_to_next(guid, 0x7F40_0A21, dest: stack_obj) {
+            return false;
+        }
+        let n = sim.person[3];
+        stack_obj.attr[0] = n;
+        dialog(kind: ok, title: title, message: msg);
+    }"#;
+    let air = air_with_message("Hello $Me", moving);
+    assert!(saves(&air), "{air}");
+    // `.air` keeps `param[0]` around an `idle` in the word after the named locals, which
+    // dropping the save would move.
+    let scratch = r#"    #[bhav(args = 1)]
+    fn a(sim: Sim) {
+        if !set_to_next(guid, 0x7F40_0A21, dest: stack_obj) {
+            return false;
+        }
+        stack_obj.attr[0] = param[0];
+        sleep(1);
+        dialog(kind: ok, title: title, message: msg);
+    }"#;
+    let air = air_with_message("Hello $Me", scratch);
+    assert!(saves(&air), "{air}");
+    // Without the `param[0]` read there is no scratch word.
+    let air = air_with_message("Hello $Me", &scratch.replace("param[0]", "1"));
+    assert!(!saves(&air), "{air}");
+    // A string unbounded besides `$Me` keeps the save.
+    let air = air_with_message("Hello $Object", pinned);
+    assert!(saves(&air), "{air}");
+}
+
+/// A bool helper whose tail is a constant, returned through `return leave();` in a tree whose
+/// raw block keeps the layout (so the helper is inlined for its tail condition), keeps its
+/// constant test: the test sets the last result, which ending an active action records
+/// (`release_use`), and the call before it may have left the other one.
+#[test]
+fn constant_helper_tails_keep_their_test_after_raw_code() {
+    for (tail, test) in [("false", "if 1 == 0 {"), ("true", "if 1 == 1 {")] {
+        let src = format!(
+            r#"use std::globals::*;
+
+object "Tail Probe" {{
+    guid: 0x7F40_0A30;
+    fn leave() -> bool {{
+        globals::standard_exit(50)?;
+        {tail}
+    }}
+    #[bhav(id = 4100)]
+    fn t(sim: Sim) -> bool {{
+        loop {{
+            raw {{ if !find_best_object(8, flags: 0) {{ break; }} }}
+            if sim.person[62] == 3 {{
+                return leave();
+            }}
+            sim.person[62] += 1;
+        }}
+        leave()
+    }}
+}}
+"#
+        );
+        let air = build(&src).0;
+        let t = &air[air.find("tree 4100").expect("tree 4100")..];
+        assert_eq!(t.matches(test).count(), 2, "{air}");
+    }
+}
+
+/// A lint `allow` on its own line above an item's attributes covers the item, as it does
+/// directly above the item; and `frame_headroom` suggests a `#[bhav] fn`.
+#[test]
+fn lint_allow_above_attributes_covers_the_item() {
+    use sims_antics::v2::lint::lint_v2_source;
+    let many_nodes: String = (0..205).map(|_| "        sim.person[3] += 1;\n").collect();
+    let source = |allow: &str| {
+        format!(
+            "object \"Lint Probe\" {{\n    guid: 0x7F40_0A31;\n{allow}    #[bhav(label = \"Big\")]\n    fn big(sim: Sim) {{\n{many_nodes}    }}\n}}\n"
+        )
+    };
+    let headroom = |src: &str| {
+        lint_v2_source(src, "probe.antics")
+            .unwrap_or_else(|e| panic!("lint failed: {e}"))
+            .into_iter()
+            .filter(|d| d.rule == "frame_headroom")
+            .collect::<Vec<_>>()
+    };
+    let found = headroom(&source(""));
+    assert_eq!(found.len(), 1, "{found:#?}");
+    let help = found[0].help.as_deref().unwrap_or_default();
+    assert!(
+        help.contains("`#[bhav] fn`") && !help.contains("`tree`"),
+        "{help}"
+    );
+    let found = headroom(&source("    // antics-lint: allow(frame_headroom)\n"));
+    assert!(found.is_empty(), "{found:#?}");
+}
+
+/// Round 1 review regressions: a loop-local `me`, `me` in an object's own tree, a `bcon me`
+/// table, an arm assigning a binding named `break`, and the untyped `category4` search.
+#[test]
+fn review_round_1_name_regressions() {
+    // A loop-local `me` is a fresh cursor like any other name.
+    let looped = |name: &str| {
+        build(&format!(
+            r#"object "Loop Probe" {{
+    guid: 0x7F40_0A40;
+    #[bhav]
+    fn run(sim: Sim) {{
+        for item in lot.objects() {{
+            let {name}: ObjectId = sim.id;
+            temp[0] = {name}.room;
+            temp[1] = item.data[11];
+        }}
+    }}
+}}
+"#
+        ))
+    };
+    assert_eq!(looped("me"), looped("other"));
+    // In an object's own tree `me` is the object, which has no Sim fields.
+    expect_err(
+        "object \"Init Probe\" {\n    guid: 0x7F40_0A41;\n    init { temp[0] = me.job_level; }\n}\n",
+        "unknown field 'me.job_level'",
+    );
+    // A `bcon me` table keeps its name there.
+    let air = build(
+        "extern bcon me { #[addr(16521)] probe; }\nobject \"Init Probe\" {\n    guid: 0x7F40_0A41;\n    init { temp[0] = me.probe; }\n}\n",
+    )
+    .0;
+    assert!(air.contains("temp[0] := bcon[16521];"), "{air}");
+    // `break` followed by an assignment is the binding, not the exit.
+    let air = build(&obj(
+        "    #[bhav]\n    fn a() {\n        let break: i16 = 0;\n        match self.n {\n            _ => break += 1,\n        }\n        temp[0] = break;\n    }",
+    ))
+    .0;
+    assert!(air.contains("+= 1"), "{air}");
+    // The untyped search takes `category4` (function 15), as raw `.air` does.
+    let air = build(&obj(
+        "    #[bhav]\n    fn a(sim: Sim) {\n        let Some(_o) = find_best_object(category4) else { return; };\n    }",
+    ))
+    .0;
+    assert!(air.contains("find_best_object(category4)"), "{air}");
+}
+
+/// Extern merges across modules are refused when both sides name module types (they resolve in
+/// different scopes), and every alias of a tree is checked: neither depends on import order.
+#[test]
+fn extern_merges_do_not_depend_on_import_order() {
+    let compile = |modules: &[(&str, &str)], src: &str| {
+        let mut cfg = PackResolverConfig::default();
+        for (name, body) in modules {
+            cfg.virtual_modules
+                .insert((*name).to_owned(), (*body).to_owned());
+        }
+        v2::expand_v2_source_to_objects("case.antics", src, &cfg).map(|o| o[0].air_source.clone())
+    };
+    let a = "pub enum Mode { A = 10 }\npub extern mod bridge { #[id(4000)] fn act(mode: Mode) -> Result; }\n";
+    let b = "pub enum Mode { B = 20 }\npub extern mod bridge { #[id(4000)] fn act(mode: Mode) -> Result; }\n";
+    let ping = "pub extern mod bridge { #[id(4001)] fn ping() -> Result; }\n";
+    let object =
+        "object \"Bridge Probe\" {\n    guid: 0x7F40_0A42;\n    init { bridge::ping()?; }\n}\n";
+    for (first, second) in [("a", "b"), ("b", "a")] {
+        let src = format!(
+            "use crate::{first}::bridge;\nuse crate::{second}::bridge;\n{}",
+            object.replace("ping()", "act(1)")
+        );
+        let err = compile(&[("crate::a", a), ("crate::b", b)], &src).expect_err("two Mode types");
+        assert!(
+            err.to_string()
+                .contains("both name types of their own module"),
+            "{err}"
+        );
+    }
+    let mut airs = Vec::new();
+    for (first, second) in [("a", "p"), ("p", "a")] {
+        let src = format!("use crate::{first}::bridge;\nuse crate::{second}::bridge;\n{object}");
+        airs.push(
+            compile(&[("crate::a", a), ("crate::p", ping)], &src)
+                .unwrap_or_else(|e| panic!("{first} then {second}: {e}")),
+        );
+    }
+    assert_eq!(airs[0], airs[1]);
+    // Tree 4000 under `left(i16)` and `right()`: `middle(i16)` conflicts with `right` in
+    // either order.
+    let dep = "pub extern mod bridge { #[id(4000)] fn middle(mode: i16) -> Result; }\n";
+    for local in [
+        "extern mod bridge {\n    #[id(4000)] fn left(mode: i16) -> Result;\n    #[id(4000)] fn right() -> bool;\n}\n",
+        "extern mod bridge {\n    #[id(4000)] fn right() -> bool;\n    #[id(4000)] fn left(mode: i16) -> Result;\n}\n",
+    ] {
+        let src = format!(
+            "use crate::dep::bridge;\n{local}{}",
+            object.replace("bridge::ping()?;", "if bridge::right() { temp[0] = 7; }")
+        );
+        let err = compile(&[("crate::dep", dep)], &src).expect_err("tree 4000 called two ways");
+        assert!(
+            err.to_string().contains("calls tree 4000 two ways"),
+            "{err}"
+        );
+    }
+}
+
+/// Round 2 review regressions: `stack_obj.run_functional` with arguments keeps the found
+/// cursor, a short arm's `return` binding, and the typed search's score check for every
+/// scored kind.
+#[test]
+fn review_round_2_regressions() {
+    let tree = |air: &str, name: &str| {
+        let at = air.find(&format!("\"{name}\"")).expect("tree");
+        let rest = &air[at..];
+        rest[..rest.find("\n}\n").expect("tree end")].to_owned()
+    };
+    let air = build(&obj(r#"    #[bhav]
+    fn a(sim: Sim) -> bool {
+        raw { if !find_best_object(15) { return false; } }
+        if !stack_obj.run_functional(4, 7) { return false; }
+        stack_obj.data[25] = 1;
+        return true;
+    }
+    #[bhav]
+    fn b(sim: Sim, other: ObjectId) -> bool {
+        raw { if !find_best_object(15) { return false; } }
+        if !stack_obj.run_functional(4, other.data[3]) { return false; }
+        stack_obj.data[25] = 1;
+        return true;
+    }
+    #[bhav]
+    fn c(sim: Sim) -> bool {
+        raw { if !find_best_object(15) { return false; } }
+        if !stack_obj.run_functional(4, set_to_next(guid, 0x7F40_0A53, dest: stack_obj)) {
+            return false;
+        }
+        return true;
+    }"#))
+    .0;
+    // A literal argument leaves the cursor alone.
+    let a = tree(&air, "a");
+    assert!(!a.contains("stack_obj :="), "{a}");
+    // Argument code that moves the cursor: the found one is saved first and selected again.
+    let b = tree(&air, "b");
+    let saved = b.find("let __rf_obj_1 = stack_obj;").expect("cursor saved");
+    let moved = b.find("stack_obj := param[0];").expect("argument read");
+    let call = b.find("run_functional_tree(4)").expect("call");
+    let reselect = b
+        .find("stack_obj := __rf_obj_1;")
+        .expect("cursor selected again");
+    assert!(saved < moved && moved < reselect && reselect < call, "{b}");
+    assert!(!b[call..].contains("stack_obj :="), "{b}");
+    // A primitive argument that steps the cursor: the receiver is still the found one.
+    let c = tree(&air, "c");
+    let saved = c.find("let __rf_obj").expect("cursor saved");
+    let step = c.find("set_to_next(").expect("argument step");
+    let reselect = c
+        .find("stack_obj := __rf_obj")
+        .expect("cursor selected again");
+    let call = c.find("run_functional_tree(4)").expect("call");
+    assert!(saved < step && step < reselect && reselect < call, "{c}");
+    // A binding named `return` assigned in a short arm, and `return <name>` of a binding whose
+    // name is an assignment word.
+    let air = build(&obj(
+        "    #[bhav]\n    fn a(return: ObjectId, flag_set: bool) -> bool {\n        match self.n {\n            0 => return.person[3] += 1,\n            1 => return flag_set,\n            _ => {}\n        }\n        return true;\n    }",
+    ))
+    .0;
+    assert!(air.contains("+= 1"), "{air}");
+    // The typed search's fallback checks the kind's own score word (gardening: data word 64).
+    let air = build(
+        r#"object "Garden Bed" {
+    guid: 0x7F40_0A51;
+    functional gardening { score: 0, run(sim) { return; } }
+    interaction "Tend" {
+        run(sim) {
+            let Some(bed) = find_best_object::<Self>(gardening) else { return; };
+            bed.data[2] = 1;
+        }
+    }
+}
+"#,
+    )
+    .0;
+    // Only a zero score is skipped, as the primitive skips it (a negative one still counts).
+    assert!(air.contains("if stack.data[64] != 0 {"), "{air}");
+}
+
+/// Round 2 extern merge regressions: exact duplicates still check every alias, built-in types
+/// merge across modules, and an object's block cannot take a module's typed declarations.
+#[test]
+fn extern_merge_round_2_regressions() {
+    let compile = |modules: &[(&str, &str)], src: &str| {
+        let mut cfg = PackResolverConfig::default();
+        for (name, body) in modules {
+            cfg.virtual_modules
+                .insert((*name).to_owned(), (*body).to_owned());
+        }
+        v2::expand_v2_source_to_objects("case.antics", src, &cfg)
+            .map(|o| o[0].air_source.clone())
+            .map_err(|e| e.to_string())
+    };
+    let object =
+        "object \"Bridge Probe\" {\n    guid: 0x7F40_0A52;\n    init { bridge::common(1)?; }\n}\n";
+    let a = "pub extern mod bridge {\n    #[id(4000)] fn common(n: i16) -> Result;\n    #[id(4000)] fn alias() -> bool;\n}\n";
+    let b = "pub extern mod bridge { #[id(4000)] fn common(n: i16) -> Result; }\n";
+    for (first, second) in [("a", "b"), ("b", "a")] {
+        let src = format!("use crate::{first}::bridge;\nuse crate::{second}::bridge;\n{object}");
+        let err = compile(&[("crate::a", a), ("crate::b", b)], &src).expect_err("two ABIs");
+        assert!(err.contains("calls tree 4000 two ways"), "{err}");
+    }
+    let take = "pub extern mod bridge { #[id(4000)] fn take(h: Height) -> Result; }\n";
+    let put = "pub extern mod bridge { #[id(4001)] fn put(p: Placement) -> Result; }\n";
+    let src = format!(
+        "use crate::t::bridge;\nuse crate::p::bridge;\n{}",
+        object.replace("bridge::common(1)?;", "bridge::ping_none();")
+    );
+    let err = compile(&[("crate::t", take), ("crate::p", put)], &src)
+        .expect_err("ping_none is not declared");
+    assert!(!err.contains("both name types"), "{err}");
+    let typed = "pub enum Mode { Shared = 10 }\npub extern mod bridge { #[id(4000)] fn send(mode: Mode) -> Result; }\n";
+    let src = "use crate::typed::bridge;\nuse crate::typed::Mode as ImportedMode;\nobject \"Bridge Probe\" {\n    guid: 0x7F40_0A52;\n    enum Mode { Local = 20 }\n    extern mod bridge { #[id(4001)] fn ping() -> Result; }\n    init { bridge::send(ImportedMode::Shared)?; }\n}\n";
+    let err = compile(&[("crate::typed", typed)], src).expect_err("typed module block");
+    assert!(err.contains("names a type of its module"), "{err}");
+}

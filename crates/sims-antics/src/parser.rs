@@ -8,6 +8,98 @@ use crate::ast::{
 use crate::error::{Error, Result, Span};
 use crate::lexer::{Token, TokenKind, tokenize};
 
+/// One function of the OBJf table, the numbering that Run Functional Tree and Find Best Object
+/// for Function share (sims-vm `run_functional_tree.rs` `callback`, `find_best_object.rs`
+/// `wanted`). The callback is the OBJf entry; its order is the OBJD fallback's
+/// (`program.rs` `DEFINITION_CALLBACKS`: entry 16 is OBJD word 6, the gardening tree).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FunctionKind {
+    /// The name `.air` and v2 `functional` / `find_best_object` / `run_functional` use.
+    pub name: &'static str,
+    /// The function number in the primitive's operand.
+    pub function: u16,
+    /// The OBJf callback (entry) the function runs.
+    pub callback: usize,
+    /// How Find Best Object for Function scores it.
+    pub search: FunctionSearch,
+}
+
+/// How Find Best Object for Function scores a function's objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FunctionSearch {
+    /// Never searched: Find Best Object gives false for this function.
+    None,
+    /// Scored by this object data word.
+    Score(usize),
+    /// Searched with a fixed score of 50 (only by a person whose data word 65 is at most 1).
+    Fixed,
+}
+
+/// The OBJf functions by number (sims-vm `run_functional_tree.rs` and `find_best_object.rs`).
+pub(crate) const FUNCTION_KINDS: [FunctionKind; 15] = {
+    use FunctionSearch::{Fixed, None as Never, Score};
+    const fn k(
+        name: &'static str,
+        function: u16,
+        callback: usize,
+        search: FunctionSearch,
+    ) -> FunctionKind {
+        FunctionKind {
+            name,
+            function,
+            callback,
+            search,
+        }
+    }
+    [
+        k("prep", 0, 0x12, Score(31)),
+        k("cook", 1, 0x13, Score(32)),
+        k("surface", 2, 0x14, Score(33)),
+        k("dispose", 3, 0x15, Score(36)),
+        k("eat", 4, 0x16, Never),
+        k("pickup_from_slot", 5, 0x17, Never),
+        k("wash_dish", 6, 0x18, Score(37)),
+        k("eating_surface", 7, 0x19, Score(38)),
+        k("sit", 8, 0x1a, Fixed),
+        k("stand", 9, 0x1b, Never),
+        k("serving_surface", 10, 0x0e, Score(61)),
+        k("clean", 11, 0x1c, Score(39)),
+        k("gardening", 12, 0x10, Score(64)),
+        k("wash_hands", 13, 0x11, Score(65)),
+        k("repair", 14, 0x1d, Score(15)),
+    ]
+};
+
+/// Find Best Object's category function (no callback; scored by data word 59).
+const CATEGORY_FUNCTION: u16 = 15;
+
+/// The OBJf function named `name`.
+pub(crate) fn function_kind(name: &str) -> Option<&'static FunctionKind> {
+    FUNCTION_KINDS.iter().find(|k| k.name == name)
+}
+
+/// The error for a name that is not an OBJf function, with the replacement for names that an
+/// earlier, off-by-one table used.
+pub(crate) fn unknown_function_kind(name: &str) -> String {
+    let renamed = match name {
+        "serve" => Some("gardening"),
+        "rest" => Some("repair"),
+        "pick_up" => Some("eating_surface"),
+        _ => None,
+    };
+    let names: Vec<&str> = FUNCTION_KINDS.iter().map(|k| k.name).collect();
+    match renamed {
+        Some(new) => format!(
+            "unknown functional kind '{name}': the function this name used to give is '{new}' (expected one of {})",
+            names.join(", ")
+        ),
+        None => format!(
+            "unknown functional kind '{name}' (expected one of {})",
+            names.join(", ")
+        ),
+    }
+}
+
 /// Maximum structural nesting depth for blocks and control flow in `.antics`.
 const MAX_NESTING_DEPTH: usize = 64;
 
@@ -1007,21 +1099,13 @@ impl Parser {
                 let name = s.clone();
                 let span = self.span();
                 self.bump();
-                match name.as_str() {
-                    "prep" => Ok(0),
-                    "cook" => Ok(1),
-                    "surface" => Ok(2),
-                    "dispose" => Ok(3),
-                    "eat" => Ok(6),
-                    "pick_up" => Ok(7),
-                    "sit" => Ok(8),
-                    "clean" => Ok(10),
-                    "repair" => Ok(11),
-                    "serve" => Ok(12),
-                    "rest" => Ok(14),
-                    "category4" => Ok(15),
-                    other => Err(Error::at(span, format!("unknown function name '{other}'"))),
+                if name == "category4" {
+                    return Ok(CATEGORY_FUNCTION);
                 }
+                if let Some(kind) = function_kind(&name) {
+                    return Ok(kind.function);
+                }
+                Err(Error::at(span, unknown_function_kind(&name)))
             }
             other => Err(Error::at(
                 self.span(),

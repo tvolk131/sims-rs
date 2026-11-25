@@ -58,6 +58,7 @@ impl<'a> TreeLowerer<'a> {
             sleep_span: None,
             stmt_marks: Vec::new(),
             inherited_entry_save: false,
+            inherit_tree: false,
             raw_reserved: Vec::new(),
         }
     }
@@ -105,12 +106,18 @@ impl<'a> TreeLowerer<'a> {
             || body_reads_global_34
             || bottom_reads_unwritten
             || self.pin_span.is_some();
-        let text_reads = if formats_text && (bottom_frame || main_rules) {
-            mir::TableLocals::Unknown
+        let (text_reads, text_reads_besides_me) = if formats_text && (bottom_frame || main_rules) {
+            (mir::TableLocals::Unknown, mir::TableLocals::Unknown)
         } else if formats_text {
-            self.env.text_reads.clone()
+            (
+                self.env.text_reads.clone(),
+                self.env.text_reads_besides_me.clone(),
+            )
         } else {
-            mir::TableLocals::Known(BTreeSet::new())
+            (
+                mir::TableLocals::Known(BTreeSet::new()),
+                mir::TableLocals::Known(BTreeSet::new()),
+            )
         };
         if let Some((span, name)) = &self.dup_decl
             && mir::reads_a_word(&text_reads)
@@ -128,6 +135,7 @@ impl<'a> TreeLowerer<'a> {
             main_rules,
             fixed_frame: self.frame_locals.is_some() || self.frame_format.is_some(),
             text_reads,
+            text_reads_besides_me,
             keep_layout: self.keep_layout,
             has_self_obj_local: self.has_self_obj_local,
             pinned: self.pin_span.is_some(),
@@ -324,6 +332,20 @@ impl<'a> TreeLowerer<'a> {
 
     pub(super) fn is_frame_me(&self, name: &str) -> bool {
         name == "me" && self.lookup_var(name).is_none()
+    }
+
+    /// The running object's handle for its own cells and fields: the Sim handle, or the frame's
+    /// `me` where it may be a Sim (in an interaction the Sim is `me`; in a `context = inherit`
+    /// tree `me` is whichever object runs it). Both lower to `my.` cells. In an object's own
+    /// tree `me` is the object, which has no Sim fields: only its raw cells
+    /// ([`Self::is_frame_me`]) apply there, and a `bcon me` table keeps its name.
+    pub(super) fn is_my_ident(&self, name: &str) -> bool {
+        self.is_sim_ident(name)
+            || (self.is_frame_me(name)
+                && (self.inherit_tree || matches!(self.tree_ctx, TreeContext::SimOnObject { .. }))
+                && !self
+                    .env
+                    .is_bcon_table_name(&self.owner_module, name, self.in_object_scope))
     }
 
     pub(super) fn is_self_ident(&self, name: &str) -> bool {

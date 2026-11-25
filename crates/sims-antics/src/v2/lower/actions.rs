@@ -80,7 +80,10 @@ impl<'a> TreeLowerer<'a> {
         let is_fixed =
             |air: &str| air.parse::<i16>().is_ok() || air.starts_with("bcon.") || air == "my.id";
         let positional = args[1..].iter().filter(|a| a.name.is_none()).count();
-        let staged_target = if positional == 0 || is_fixed(&target_air) {
+        // The live cursor as receiver stays in place unless argument code moves it (below).
+        let receiver_is_cursor = target_air == "stack_obj";
+        let args_at = self.em.mark();
+        let mut staged_target = if positional == 0 || is_fixed(&target_air) || receiver_is_cursor {
             target_air
         } else {
             let staged = self.fresh("rf_obj");
@@ -149,15 +152,31 @@ impl<'a> TreeLowerer<'a> {
                 }
             }
         }
+        // Argument code may move the cursor (reading another object's cells puts back the
+        // entry object, and a primitive such as `set_to_next` steps it), so when there is any,
+        // save the cursor before it and select it again for the call (which leaves the caller's
+        // frame's cursor as it was).
+        let mut cursor_saved = false;
+        if receiver_is_cursor && !self.em.since(args_at).is_empty() {
+            let args_text = self.em.split_off(args_at);
+            let staged = self.fresh("rf_obj");
+            self.emit_let(&staged, "stack_obj");
+            self.em.append(&args_text);
+            staged_target = staged;
+            cursor_saved = true;
+        }
         for (i, (val, _, _)) in staged_args.iter().enumerate() {
             self.line(format!("temp[{i}] := {val};"));
         }
-        let saved_stack_obj = if staged_target != "stack_obj" {
+        let saved_stack_obj = if cursor_saved {
+            self.stack_op(mir::StackObjOp::Set(&staged_target));
+            StackRestore::Unmoved
+        } else if staged_target != "stack_obj" {
             let saved = self.save_stack_obj_for_move();
             self.stack_op(mir::StackObjOp::Set(&staged_target));
-            saved
+            StackRestore::Moved(saved)
         } else {
-            None
+            StackRestore::Unmoved
         };
         let prim = if change_icon {
             format!("run_functional_tree({kind_name}, change_icon: true)")
@@ -197,7 +216,7 @@ impl<'a> TreeLowerer<'a> {
         } else {
             self.line(format!("{prim};"));
         }
-        self.emit_restore_stack_obj(saved_stack_obj.as_deref());
+        self.emit_stack_restore(&saved_stack_obj);
         Ok(())
     }
 
@@ -211,7 +230,7 @@ impl<'a> TreeLowerer<'a> {
         binding_name: &str,
         ty_ann: Option<&V2Type>,
         else_body: &[V2Stmt],
-    ) -> Result<(ValueType, Option<String>)> {
+    ) -> Result<(ValueType, StackRestore)> {
         if type_args.len() > 1 {
             return Err(Error::at(
                 span,
@@ -291,7 +310,7 @@ impl<'a> TreeLowerer<'a> {
 
         self.line(format!("if !{prim} {{"));
         self.em.indent();
-        self.emit_restore_stack_obj(saved_stack_obj.as_deref());
+        self.emit_stack_restore(&saved_stack_obj);
         self.push_scope(ScopeFrame::block());
         let r = self.lower_stmts(else_body);
         let p = self.pop_scope_and_run_cleanups();
@@ -472,7 +491,7 @@ impl<'a> TreeLowerer<'a> {
             V2Expr::Ident(_, n) if self.is_self_ident(n) => {
                 Ok(matches!(self.tree_ctx, TreeContext::SimOnObject { .. }))
             }
-            V2Expr::Ident(_, n) if self.is_sim_ident(n) => Ok(false),
+            V2Expr::Ident(_, n) if self.is_my_ident(n) => Ok(false),
             other => Err(Error::at(
                 other.span(),
                 format!("{prim} target must be 'self', 'sim', 'stack_obj', or a literal bool"),
@@ -494,6 +513,33 @@ impl<'a> TreeLowerer<'a> {
             format!("stop_all_sounds({use_stack})"),
             self.sound_targets_self(bound.get("target").copied()),
         ))
+    }
+
+    /// `sim.debit_funds(n)` / `sim.credit_funds(n)`: the Sim's household budget, the same
+    /// primitive as the call form (a statement, a condition, or a bool value).
+    pub(super) fn format_budget_method(
+        &mut self,
+        receiver: &V2Expr,
+        method: &str,
+        type_args: &[V2Type],
+        args: &[CallArg],
+        span: Span,
+    ) -> Result<String> {
+        if !type_args.is_empty() {
+            return Err(Error::at(
+                span,
+                format!("'.{method}()' does not accept type arguments"),
+            ));
+        }
+        if !matches!(receiver, V2Expr::Ident(_, n) if self.is_sim_ident(n)) {
+            return Err(Error::at(
+                receiver.span(),
+                format!(
+                    "'.{method}()' is called on the interaction's Sim (its household's budget)"
+                ),
+            ));
+        }
+        self.format_alter_budget(args, span, false, method == "credit_funds")
     }
 
     pub(super) fn format_alter_budget(
@@ -547,7 +593,21 @@ impl<'a> TreeLowerer<'a> {
                 "find_best_object() expects a functional kind identifier (e.g. prep, cook)",
             ));
         };
-        let _ = functional_kind_info(kind_name, *kspan)?;
+        // `category4` (function 15) searches category-4 objects by a fixed score and has no
+        // callback, so only the untyped search takes it.
+        if !(kind_name == "category4" && type_args.is_empty()) {
+            functional_kind_info(kind_name, *kspan)?;
+        }
+        if crate::parser::function_kind(kind_name)
+            .is_some_and(|k| k.search == crate::parser::FunctionSearch::None)
+        {
+            return Err(Error::at(
+                *kspan,
+                format!(
+                    "find_best_object({kind_name}) always fails: Find Best Object never searches for '{kind_name}'"
+                ),
+            ));
+        }
         let typed_schema = if type_args.is_empty() {
             None
         } else if type_args.len() == 1 {

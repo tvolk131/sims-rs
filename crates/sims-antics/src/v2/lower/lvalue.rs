@@ -23,7 +23,7 @@ impl<'a> TreeLowerer<'a> {
             },
             _ => return Ok(()),
         };
-        if self.is_sim_ident(name)
+        if self.is_my_ident(name)
             || self.is_self_ident(name)
             || self.object_handle_air(name).is_some()
         {
@@ -125,7 +125,7 @@ impl<'a> TreeLowerer<'a> {
                             "'sim' is not available in init/main (object lifecycle context)",
                         ));
                     }
-                    if self.is_sim_ident(rname) {
+                    if self.is_my_ident(rname) {
                         return match group.as_str() {
                             "motive" => {
                                 let _ = motive_by_name(field).ok_or_else(|| {
@@ -244,7 +244,7 @@ impl<'a> TreeLowerer<'a> {
                             )),
                         };
                     }
-                    if self.is_sim_ident(bname) {
+                    if self.is_my_ident(bname) {
                         return match field.as_str() {
                             "hand" => Ok(LValue::Direct {
                                 air: "my.slot[0]".to_owned(),
@@ -362,9 +362,21 @@ impl<'a> TreeLowerer<'a> {
                         });
                     }
                 }
+                let path = match base.as_ref() {
+                    V2Expr::Ident(_, b) => format!("'{b}.{field}'"),
+                    V2Expr::Field {
+                        base: root,
+                        field: group,
+                        ..
+                    } => match root.as_ref() {
+                        V2Expr::Ident(_, r) => format!("'{r}.{group}.{field}'"),
+                        _ => format!("'.{field}'"),
+                    },
+                    _ => format!("'.{field}'"),
+                };
                 Err(Error::at(
                     *span,
-                    "expression is not a valid assignment target",
+                    format!("unknown field {path} (nothing in scope has it)"),
                 ))
             }
             V2Expr::Index { span, base, index } => {
@@ -432,7 +444,7 @@ impl<'a> TreeLowerer<'a> {
                             ty: ValueType::I16,
                         });
                     }
-                    if self.is_sim_ident(rname) && field == "skill" {
+                    if self.is_my_ident(rname) && field == "skill" {
                         let sk = self.resolve_skill_expr(index)?;
                         return Ok(LValue::Direct {
                             air: format!("my.person[{sk}]"),

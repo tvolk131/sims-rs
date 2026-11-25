@@ -783,7 +783,7 @@ impl<'a> TreeLowerer<'a> {
                     let bang = if negated { "!" } else { "" };
                     self.line(format!("if {bang}{prim} {{"));
                     self.em.indent();
-                    self.emit_restore_stack_obj(saved_stack_obj.as_deref());
+                    self.emit_stack_restore(&saved_stack_obj);
                     self.push_scope(ScopeFrame::block());
                     let r1 = self.lower_stmts(then_body);
                     let p1 = self.pop_scope_and_run_cleanups();
@@ -792,7 +792,7 @@ impl<'a> TreeLowerer<'a> {
                     self.line("} else {".to_owned());
                     self.em.indent();
                     let restore_at = self.em.mark();
-                    self.emit_restore_stack_obj(saved_stack_obj.as_deref());
+                    self.emit_stack_restore(&saved_stack_obj);
                     let restored = self.em.mark() != restore_at;
                     self.push_scope(ScopeFrame::block());
                     let r2 = self.lower_stmts(else_body);
@@ -1402,7 +1402,7 @@ impl<'a> TreeLowerer<'a> {
             )?;
             let air_name = self.fresh(&format!("v_{name}"));
             self.line(format!("let {air_name} = temp[0];"));
-            self.emit_restore_stack_obj(saved_stack_obj.as_deref());
+            self.emit_stack_restore(&saved_stack_obj);
             self.bind_var(
                 name.to_owned(),
                 Binding::Local {
@@ -1467,10 +1467,17 @@ impl<'a> TreeLowerer<'a> {
             let found_var = self.fresh(&format!("v_{name}"));
             let raw_var = self.fresh("fbo_raw");
             let cand_var = self.fresh("fbo_cand");
+            // The fallback skips a candidate whose score word (the one Find Best Object reads
+            // for the kind) is 0, as the primitive does; any other score is eligible.
             let score_field = match plan.kind_name.as_str() {
-                "prep" => Some("stack.prep_score"),
-                "cook" => Some("stack.cook_score"),
-                _ => None,
+                "prep" => Some("stack.prep_score".to_owned()),
+                "cook" => Some("stack.cook_score".to_owned()),
+                kind => match crate::parser::function_kind(kind).map(|k| k.search) {
+                    Some(crate::parser::FunctionSearch::Score(word)) => {
+                        Some(format!("stack.data[{word}]"))
+                    }
+                    _ => None,
+                },
             };
             let guard_summary = schema
                 .functionals
@@ -1527,8 +1534,8 @@ impl<'a> TreeLowerer<'a> {
                     self.em.indent();
                     extra_blocks += 1;
                 }
-                if let (Some(sf), Some(bvar)) = (score_field, &best_var) {
-                    self.line(format!("if {sf} > 0 {{"));
+                if let (Some(sf), Some(bvar)) = (score_field.as_deref(), &best_var) {
+                    self.line(format!("if {sf} != 0 {{"));
                     self.em.indent();
                     self.line(format!("if {found_var} == 0 {{"));
                     self.em.indent();
@@ -1959,22 +1966,7 @@ impl<'a> TreeLowerer<'a> {
                 // `sim.debit_funds(n)` / `sim.credit_funds(n)`: the Sim's household budget (the
                 // lot's family; the same primitive as `debit_funds(n)`).
                 "debit_funds" | "credit_funds" => {
-                    if !type_args.is_empty() {
-                        return Err(Error::at(
-                            *span,
-                            format!("'.{method}()' does not accept type arguments"),
-                        ));
-                    }
-                    if !matches!(receiver.as_ref(), V2Expr::Ident(_, n) if self.is_sim_ident(n)) {
-                        return Err(Error::at(
-                            receiver.span(),
-                            format!(
-                                "'.{method}()' is called on the interaction's Sim (its household's budget)"
-                            ),
-                        ));
-                    }
-                    let s =
-                        self.format_alter_budget(args, *span, false, method == "credit_funds")?;
+                    let s = self.format_budget_method(receiver, method, type_args, args, *span)?;
                     self.line(format!("{s};"));
                     Ok(())
                 }

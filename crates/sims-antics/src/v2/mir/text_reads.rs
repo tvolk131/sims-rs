@@ -36,6 +36,29 @@ pub(crate) fn strings_read<'a>(texts: impl IntoIterator<Item = &'a str>) -> Tabl
     all
 }
 
+/// [`strings_read`] apart from what a `$Me` name may name. `$Me` writes the running object's
+/// name into the text before every other pass, which then read it as text: a name holding a
+/// token (`$Local:N`) may read any word, and that is what this fact leaves out (each `$Me`
+/// counts as a space). A name without `$` can still complete a token the source starts right
+/// before it (`$Local:$Me` with the name `0` reads word 0, `$Loc$Me` with `al:0` too), so a
+/// `$Me` right after a letter, digit, `_`, `-`, `:` or `$` leaves the fact unknown.
+pub(crate) fn strings_read_besides_me<'a>(texts: impl IntoIterator<Item = &'a str>) -> TableLocals {
+    let mut neutral = Vec::new();
+    for text in texts {
+        let completes_a_token = text.match_indices("$Me").any(|(at, _)| {
+            text[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ':' | '$'))
+        });
+        if completes_a_token {
+            return TableLocals::Unknown;
+        }
+        neutral.push(text.replace("$Me", " "));
+    }
+    strings_read(neutral.iter().map(String::as_str))
+}
+
 /// Whether text that reads `reads` may read any frame word at all.
 pub(crate) fn reads_a_word(reads: &TableLocals) -> bool {
     !matches!(reads, TableLocals::Known(set) if set.is_empty())

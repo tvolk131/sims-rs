@@ -414,7 +414,7 @@ impl<'a> TreeLowerer<'a> {
     /// `self` / Sim handles are never treated as tables.
     pub(super) fn is_bcon_table_ref(&self, name: &str) -> bool {
         !self.is_self_ident(name)
-            && !self.is_sim_ident(name)
+            && !self.is_my_ident(name)
             && self
                 .env
                 .is_bcon_table_name(&self.owner_module, name, self.in_object_scope)

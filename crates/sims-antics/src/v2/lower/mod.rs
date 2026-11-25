@@ -303,6 +303,8 @@ struct ObjectEnv<'a> {
     /// ([`mir::text_reads`](mod@crate::v2::mir)): every tree is finished with the object's final
     /// fact (`lower_object` lowers again when a later tree's inline dialog literal adds to it).
     text_reads: mir::TableLocals,
+    /// `text_reads` apart from what a `$Me` name may name ([`mir::strings_read_besides_me`]).
+    text_reads_besides_me: mir::TableLocals,
     /// Some tree of the object may read global 34 ([`mir::may_read_global_34`]), so every tree
     /// is finished with main's rules: a call carries the scratch pointer into the callee and
     /// back, so an Expression one tree keeps or drops can change what another tree reads.
@@ -558,7 +560,18 @@ struct PreparedFunctional {
     prim: String,
     sig: Option<ResolvedFunctionalSig>,
     kind_name: String,
-    saved_stack_obj: Option<String>,
+    saved_stack_obj: StackRestore,
+}
+
+/// What `stack_obj` needs after a `run_functional` call. The callee runs in its own frame, so the
+/// call itself never changes the caller's `stack_obj`; only moving it to the receiver does.
+#[derive(Clone)]
+enum StackRestore {
+    /// The receiver was `stack_obj` itself: nothing moved, nothing to restore (an entry restore
+    /// here would throw away a cursor the tree set, e.g. by Find Best Object).
+    Unmoved,
+    /// `stack_obj` was moved to the receiver: restore the saved value (or the entry object).
+    Moved(Option<String>),
 }
 
 #[derive(Clone)]
@@ -703,6 +716,9 @@ struct TreeLowerer<'a> {
     /// the object pass's `__saved_stack_obj`, `finish` declares `__self_obj` (the entry stack
     /// object) first when the body reads it.
     inherited_entry_save: bool,
+    /// The tree is `#[context(inherit)]`: its `me` may be a Sim in either pass, so it reads the
+    /// Sim's typed fields like the Sim handle ([`TreeLowerer::is_my_ident`]).
+    inherit_tree: bool,
     /// The compiler's entry-object locals that a raw block of the tree declares, with the
     /// block's span: an error when the tree's lowering declares the same name (`finish`).
     raw_reserved: Vec<(&'static str, Span)>,

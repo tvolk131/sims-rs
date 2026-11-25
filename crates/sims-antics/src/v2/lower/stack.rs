@@ -50,6 +50,13 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// Restores `stack_obj` after a `run_functional` call (see [`StackRestore`]).
+    pub(super) fn emit_stack_restore(&mut self, restore: &StackRestore) {
+        if let StackRestore::Moved(saved) = restore {
+            self.emit_restore_stack_obj(saved.as_deref());
+        }
+    }
+
     pub(super) fn emit_entry_stack_restore(&mut self) {
         if self.has_self_obj_local {
             self.stack_op(mir::StackObjOp::Set(mir::SELF_OBJ));
@@ -144,7 +151,11 @@ impl<'a> TreeLowerer<'a> {
     /// they stand outside the body, so a shadowing binding (`let sim = o;`) would be checked as
     /// the outer one.
     pub(super) fn cursor_fresh_name(&self, name: &str, cursor: &str) -> bool {
-        name != cursor && name != "self" && name != "stack_obj" && self.lookup_var(name).is_none()
+        name != cursor
+            && name != "self"
+            && name != "stack_obj"
+            && name != "me"
+            && self.lookup_var(name).is_none()
     }
 
     /// Whether `base.<field>` / `base.<group>[i]` names a cell the cursor loop may touch: the
@@ -152,7 +163,7 @@ impl<'a> TreeLowerer<'a> {
     /// own tree (`my.`).
     pub(super) fn cursor_cell_root_ok(&self, root: &str, cursor: &str) -> bool {
         root == cursor
-            || self.is_sim_ident(root)
+            || self.is_my_ident(root)
             || (self.is_self_ident(root) && matches!(self.tree_ctx, TreeContext::ObjectSelf))
     }
 

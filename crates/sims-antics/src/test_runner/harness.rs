@@ -6,7 +6,7 @@
 //! `sims_content::Index` (as in-memory files), `sims_content::Catalog::build`, and
 //! `sims_vm::load_library`: the same registration and loading the game's install goes
 //! through. Every case then gets a fresh world, built like the `open-pack` behavioural
-//! suite's (`tests/open_pack_behavioral.rs`): a flat 64-by-64 lot with one indoor room,
+//! suite's (`tests/integration/open_pack_behavioral.rs`): a flat 64-by-64 lot with one indoor room,
 //! the Sim (if any) as object 1, and the subject made by the VM's own factory
 //! (`Interpreter::create`, which runs its Init).
 

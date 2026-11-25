@@ -272,7 +272,7 @@ impl<'a> TreeLowerer<'a> {
                     };
                 }
                 if self.is_self_ident(name)
-                    || self.is_sim_ident(name)
+                    || self.is_my_ident(name)
                     || (name == "sim" && matches!(self.tree_ctx, TreeContext::ObjectSelf))
                 {
                     return Ok(None);
@@ -497,7 +497,7 @@ impl<'a> TreeLowerer<'a> {
                     return None;
                 }
                 if self.is_self_ident(name)
-                    || self.is_sim_ident(name)
+                    || self.is_my_ident(name)
                     || (name == "sim" && matches!(self.tree_ctx, TreeContext::ObjectSelf))
                 {
                     None
@@ -570,7 +570,7 @@ impl<'a> TreeLowerer<'a> {
                     };
                 }
                 if self.is_self_ident(name)
-                    || self.is_sim_ident(name)
+                    || self.is_my_ident(name)
                     || (name == "sim" && matches!(self.tree_ctx, TreeContext::ObjectSelf))
                 {
                     return Err(Error::at(

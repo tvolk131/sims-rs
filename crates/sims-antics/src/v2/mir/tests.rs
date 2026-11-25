@@ -110,6 +110,7 @@ fn pipeline_applies_frame_facts() {
         main_rules: false,
         fixed_frame: false,
         text_reads: TableLocals::Known(BTreeSet::new()),
+        text_reads_besides_me: TableLocals::Known(BTreeSet::new()),
         keep_layout: true,
         has_self_obj_local: true,
         pinned: false,
@@ -126,11 +127,35 @@ fn pipeline_applies_frame_facts() {
         finish_body(body.to_owned(), &facts),
         "    const K = 3;\n    my.attr[0] := K;\n    return true;\n"
     );
-    // Text that may read any frame word by number (`$Local:N`) sees the shift: the save stays.
+    // Text that may read any frame word only through a `$Me` name: with no named local to move,
+    // the save still goes (its own word holds no source local).
     let facts = FrameFacts {
         text_reads: TableLocals::Unknown,
         raw_consts: &no_consts,
         raw_declared: &no_names,
+        ..facts
+    };
+    assert_eq!(
+        finish_body(body.to_owned(), &facts),
+        "    my.attr[0] := K;\n    return true;\n"
+    );
+    // A named local after the save would move down a word that text may read: the save stays.
+    let moving =
+        "    let __self_obj = stack_obj;\n    let x = 1;\n    my.attr[0] := x;\n    return true;\n";
+    assert_eq!(finish_body(moving.to_owned(), &facts), moving);
+    // Text that may read the save's own word by number (`$Local:0`) keeps the save.
+    let mut word_0 = BTreeSet::new();
+    word_0.insert(0);
+    let facts = FrameFacts {
+        text_reads: TableLocals::Known(word_0.clone()),
+        text_reads_besides_me: TableLocals::Known(word_0),
+        ..facts
+    };
+    assert_eq!(finish_body(body.to_owned(), &facts), body);
+    // Text unbounded besides any `$Me` (or a frame whose layout is observable) keeps it too.
+    let facts = FrameFacts {
+        text_reads: TableLocals::Unknown,
+        text_reads_besides_me: TableLocals::Unknown,
         ..facts
     };
     assert_eq!(finish_body(body.to_owned(), &facts), body);

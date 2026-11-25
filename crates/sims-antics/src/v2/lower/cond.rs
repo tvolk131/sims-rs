@@ -38,12 +38,12 @@ impl<'a> TreeLowerer<'a> {
                 // `stack_obj.<field>` is the stack object's own cell (no switch).
                 V2Expr::Ident(_, bname) => {
                     (self.is_self_ident(bname) && self.self_stack_target() == "stack_obj")
-                        || self.is_sim_ident(bname)
+                        || self.is_my_ident(bname)
                         || self.is_bcon_table_ref(bname)
                         || bname == "stack_obj"
                 }
                 V2Expr::Field { base: root, .. } => {
-                    matches!(root.as_ref(), V2Expr::Ident(_, rname) if self.is_sim_ident(rname))
+                    matches!(root.as_ref(), V2Expr::Ident(_, rname) if self.is_my_ident(rname))
                 }
                 _ => false,
             },
@@ -469,6 +469,15 @@ impl<'a> TreeLowerer<'a> {
                 method,
                 type_args,
                 args,
+            } if matches!(method.as_str(), "debit_funds" | "credit_funds") => Ok(Some(
+                self.format_budget_method(receiver, method, type_args, args, *span)?,
+            )),
+            V2Expr::MethodCall {
+                span,
+                receiver,
+                method,
+                type_args,
+                args,
             } if matches!(method.as_str(), "contains" | "intersects" | "is_empty") => {
                 if !type_args.is_empty() {
                     return Err(Error::at(
@@ -561,6 +570,16 @@ impl<'a> TreeLowerer<'a> {
             } if method == "is_type" && type_args.is_empty() => Ok(Some(format!(
                 "!{}",
                 self.format_is_type(receiver, args, *span)?
+            ))),
+            V2Expr::MethodCall {
+                span,
+                receiver,
+                method,
+                type_args,
+                args,
+            } if matches!(method.as_str(), "debit_funds" | "credit_funds") => Ok(Some(format!(
+                "!{}",
+                self.format_budget_method(receiver, method, type_args, args, *span)?
             ))),
             V2Expr::MethodCall {
                 span,
@@ -1053,7 +1072,7 @@ impl<'a> TreeLowerer<'a> {
         self.line(format!("if {test} {{"));
         self.em.indent();
         if let Some(saved) = &restore {
-            self.emit_restore_stack_obj(saved.as_deref());
+            self.emit_stack_restore(saved);
         }
         edge(self, true)?;
         self.em.dedent();
@@ -1065,7 +1084,7 @@ impl<'a> TreeLowerer<'a> {
             self.em.indent();
             let arm_at = self.em.mark();
             if let Some(saved) = &restore {
-                self.emit_restore_stack_obj(saved.as_deref());
+                self.emit_stack_restore(saved);
             }
             edge(self, false)?;
             self.em.dedent();
@@ -1076,7 +1095,7 @@ impl<'a> TreeLowerer<'a> {
             return Ok(());
         }
         if let Some(saved) = &restore {
-            self.emit_restore_stack_obj(saved.as_deref());
+            self.emit_stack_restore(saved);
         }
         edge(self, false)?;
         Ok(())
@@ -1153,11 +1172,11 @@ impl<'a> TreeLowerer<'a> {
                     let bang = if negated { "!" } else { "" };
                     self.line(format!("if {bang}{prim} {{"));
                     self.em.indent();
-                    self.emit_restore_stack_obj(saved_stack_obj.as_deref());
+                    self.emit_stack_restore(&saved_stack_obj);
                     self.line("return true;".to_owned());
                     self.em.dedent();
                     self.line("}".to_owned());
-                    self.emit_restore_stack_obj(saved_stack_obj.as_deref());
+                    self.emit_stack_restore(&saved_stack_obj);
                     self.line("return false;".to_owned());
                     return Ok(());
                 }
