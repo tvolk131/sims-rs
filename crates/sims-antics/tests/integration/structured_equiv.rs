@@ -32,6 +32,7 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
         return;
     }
 
+    let _install_sweep = crate::common::install_sweep_lock();
     // Strictly in memory: the same install catalog `sims-antics lift` uses resolves global
     // (`Global.iff`), private (this IFF), and semi-global (`GLOB` link) callee arities,
     // matching `sims_vm::Interpreter::behavior_from_owner`.
