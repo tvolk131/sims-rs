@@ -472,7 +472,7 @@ impl<'a> TreeLowerer<'a> {
             V2Expr::Ident(_, n) if self.is_self_ident(n) => {
                 Ok(matches!(self.tree_ctx, TreeContext::SimOnObject { .. }))
             }
-            V2Expr::Ident(_, n) if self.is_sim_ident(n) => Ok(false),
+            V2Expr::Ident(_, n) if self.is_my_ident(n) => Ok(false),
             other => Err(Error::at(
                 other.span(),
                 format!("{prim} target must be 'self', 'sim', 'stack_obj', or a literal bool"),

@@ -38,12 +38,12 @@ impl<'a> TreeLowerer<'a> {
                 // `stack_obj.<field>` is the stack object's own cell (no switch).
                 V2Expr::Ident(_, bname) => {
                     (self.is_self_ident(bname) && self.self_stack_target() == "stack_obj")
-                        || self.is_sim_ident(bname)
+                        || self.is_my_ident(bname)
                         || self.is_bcon_table_ref(bname)
                         || bname == "stack_obj"
                 }
                 V2Expr::Field { base: root, .. } => {
-                    matches!(root.as_ref(), V2Expr::Ident(_, rname) if self.is_sim_ident(rname))
+                    matches!(root.as_ref(), V2Expr::Ident(_, rname) if self.is_my_ident(rname))
                 }
                 _ => false,
             },

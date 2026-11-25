@@ -765,3 +765,48 @@ fn run_functional_on_stack_obj_keeps_a_found_cursor() {
         "condition: IFF bytes differ"
     );
 }
+
+#[test]
+fn me_reads_like_the_sim_handle_in_inherit_trees() {
+    // In a `context = inherit` tree, `me` is whichever object runs it: its typed fields and
+    // methods lower to the same `my.` cells as the Sim handle's.
+    let src = |body: &str| {
+        format!(
+            "object \"Syntax Probe\" {{
+    guid: 0x7F50_0001;
+    state n: i16;
+    sound ding = preset(\"ui_click\", wav: \"probe_ding\");
+
+    #[bhav(id = 4100, label = \"me probe\", context = inherit)]
+    fn me_probe() -> bool {{
+{body}
+        true
+    }}
+}}
+"
+        )
+    };
+    let (air, _, _) = build(&src("        if me.job_level == 0 { return false; }
+        if me.skill.body > 300 { return false; }
+        me.motive.mood = me.priority;
+        temp[0] = me.id;
+        temp[1] = me.personality.nice;
+        me.play_sound(ding);
+        me.refresh(2);"));
+    for want in [
+        "if my.person[57] == 0 {",
+        "if my.person.body > 300 {",
+        "my.motive.mood := my.person.priority;",
+        "temp[0] := my.id;",
+        "temp[1] := my.person[2];",
+        "play_sound(1, false);",
+        "refresh(target: me, mode: 2);",
+    ] {
+        assert!(air.contains(want), "missing `{want}`:\n{air}");
+    }
+    // `me` still yields to a local of that name.
+    expect_err(
+        &src("        let me = 3;\n        temp[0] = me.job_level;"),
+        "unknown field 'me.job_level' (nothing in scope has it)",
+    );
+}

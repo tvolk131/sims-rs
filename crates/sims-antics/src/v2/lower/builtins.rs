@@ -770,10 +770,11 @@ impl<'a> TreeLowerer<'a> {
                         "stack_obj".to_owned()
                     }
                     (V2Expr::Ident(_, n), TreeContext::SimOnObject { .. })
-                        if self.is_sim_ident(n) =>
+                        if self.is_my_ident(n) =>
                     {
                         "me".to_owned()
                     }
+                    (V2Expr::Ident(_, n), _) if self.is_frame_me(n) => "me".to_owned(),
                     (V2Expr::Ident(_, n), _) if n == "stack_obj" => "stack_obj".to_owned(),
                     (other, _) => self.eval_builtin_int(other, &what, 0, 1)?.to_string(),
                 },

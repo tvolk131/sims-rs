@@ -161,7 +161,7 @@ impl<'a> TreeLowerer<'a> {
                         };
                         return prop_air == canon_target;
                     }
-                    if self.is_sim_ident(bname) {
+                    if self.is_my_ident(bname) {
                         let sim_air = match field.as_str() {
                             "id" => "my.data[11]".to_owned(),
                             "priority" => "my.person[33]".to_owned(),
@@ -190,7 +190,7 @@ impl<'a> TreeLowerer<'a> {
                     ..
                 } = base.as_ref()
                     && let V2Expr::Ident(_, rname) = root.as_ref()
-                    && self.is_sim_ident(rname)
+                    && self.is_my_ident(rname)
                 {
                     let sim_air = match group.as_str() {
                         "motive" => canonical_air_cell(&format!("my.motive.{field}")),
@@ -534,7 +534,7 @@ impl<'a> TreeLowerer<'a> {
                 }
                 // Handle read-only properties like `sim.id`, `sim.priority`, `self.id`, `self.room`
                 if let V2Expr::Ident(bspan, bname) = base.as_ref() {
-                    if self.is_sim_ident(bname) {
+                    if self.is_my_ident(bname) {
                         return match field.as_str() {
                             "id" => Ok(("my.id".to_owned(), ValueType::ObjectId)),
                             "priority" => Ok(("my.person.priority".to_owned(), ValueType::I16)),

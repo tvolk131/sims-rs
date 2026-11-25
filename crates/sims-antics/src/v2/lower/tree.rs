@@ -326,6 +326,13 @@ impl<'a> TreeLowerer<'a> {
         name == "me" && self.lookup_var(name).is_none()
     }
 
+    /// The running object's handle for its own cells and fields: the Sim handle, or the frame's
+    /// `me` (in an interaction the Sim is `me`; in a `context = inherit` tree `me` is whichever
+    /// object runs it). Both lower to `my.` cells.
+    pub(super) fn is_my_ident(&self, name: &str) -> bool {
+        self.is_sim_ident(name) || self.is_frame_me(name)
+    }
+
     pub(super) fn is_self_ident(&self, name: &str) -> bool {
         if matches!(self.lookup_var(name), Some(Binding::SelfHandle)) {
             return true;

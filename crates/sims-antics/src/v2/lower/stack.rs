@@ -159,7 +159,7 @@ impl<'a> TreeLowerer<'a> {
     /// own tree (`my.`).
     pub(super) fn cursor_cell_root_ok(&self, root: &str, cursor: &str) -> bool {
         root == cursor
-            || self.is_sim_ident(root)
+            || self.is_my_ident(root)
             || (self.is_self_ident(root) && matches!(self.tree_ctx, TreeContext::ObjectSelf))
     }
 
