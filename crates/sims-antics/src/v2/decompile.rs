@@ -440,7 +440,9 @@ struct Model {
     /// The sound event each original FWAV names, as the VM reads it (last chunk wins).
     original_sounds: BTreeMap<u16, String>,
     /// Behaviour-relevant non-code chunks of the original, as the VM reads them.
-    original_resources: BTreeMap<([u8; 4], u16), Vec<u8>>,
+    original_resources: BTreeMap<([u8; 4], u16), Vec<Vec<u8>>>,
+    /// The original's object definitions, as the VM reads them.
+    original_definitions: Option<Vec<(u16, u16, Vec<u8>)>>,
     /// The original's string tables, as the VM reads their text.
     original_strings: BTreeMap<([u8; 4], u16), StringTexts>,
     /// How the original finds a tree by name.
@@ -857,6 +859,7 @@ impl Model {
             ctx_original,
             original_sounds,
             original_resources: resource_chunks(iff),
+            original_definitions: definition_data(iff),
             original_strings: string_texts(iff),
             original_lookup: NameLookup::of(iff),
             original_callbacks: callback_slots(iff),
@@ -905,6 +908,7 @@ impl Model {
             ctx,
             sounds: fwav_sounds(&iff),
             resources: resource_chunks(&iff),
+            definitions: definition_data(&iff),
             strings: string_texts(&iff),
             lookup: NameLookup::of(&iff),
             callbacks: callback_slots(&iff),
@@ -981,9 +985,10 @@ impl Model {
     /// - the rebuilt object links another semi-global file, which any of its trees may
     ///   reach (semi-global calls and constants, and global trees, which run with this
     ///   object as their owner);
-    /// - it reads this file's definitions or callback tables, creates an object (whose
-    ///   callbacks run), or runs a non-private tree of this file, and the rebuilt object
-    ///   differs there.
+    /// - the rebuilt file drops this file's non-private trees or constant tables, which
+    ///   its trees reach when it is another object's global or semi-global file;
+    /// - it reads this file's definitions or callback tables, or creates an object (whose
+    ///   callbacks run), and the rebuilt object differs there.
     fn object_gap(&self, t: &TreeModel, recompiled: &RecompiledFile) -> Option<String> {
         let b = recompiled.trees.get(&t.id)?;
         if b.label != t.original.label {
@@ -999,21 +1004,35 @@ impl Model {
                     .to_owned(),
             );
         }
+        let foreign = |of: &BTreeMap<([u8; 4], u16), Vec<Vec<u8>>>| {
+            of.iter()
+                .filter(|(key, _)| foreign_code(key))
+                .map(|(key, data)| (*key, data.clone()))
+                .collect::<Vec<_>>()
+        };
+        let dropped = foreign(&self.original_resources);
+        if dropped != foreign(&recompiled.resources) {
+            let names: Vec<String> = dropped
+                .iter()
+                .map(|((tag, id), _)| format!("{} {id}", String::from_utf8_lossy(tag)))
+                .collect();
+            return Some(format!(
+                "the rebuilt file does not keep this file's non-private code ({}), which its \
+                 trees reach by number or by name when it is another object's global or \
+                 semi-global file",
+                names.join(", ")
+            ));
+        }
         let callbacks = || match (&self.original_callbacks, &recompiled.callbacks) {
             (Some(a), Some(b)) => Some(a.tables == b.tables),
             _ => None,
-        };
-        let definitions = |of: &BTreeMap<([u8; 4], u16), Vec<u8>>| {
-            of.iter()
-                .filter(|((tag, _), _)| tag == b"OBJD")
-                .map(|(key, data)| (*key, data.clone()))
-                .collect::<Vec<_>>()
         };
         for i in &t.original.instructions {
             if i.opcode == EXPRESSION {
                 let scopes = [i.operands[6], i.operands[7]];
                 if scopes.contains(&DEFINITION_WORDS_SCOPE)
-                    && definitions(&self.original_resources) != definitions(&recompiled.resources)
+                    && (self.original_definitions.is_none()
+                        || self.original_definitions != recompiled.definitions)
                 {
                     return Some(
                         "reads an object definition's words, which the rebuilt object's \
@@ -1035,16 +1054,6 @@ impl Model {
                      differently"
                         .to_owned(),
                 );
-            }
-            // Opcodes below 256 are primitives.
-            let direct = (i.opcode >= 256).then_some(i.opcode);
-            if let Some(id) = direct.into_iter().chain(self.named_callees(i)).find(|id| {
-                !PRIVATE_TREES.contains(id) && self.original_lookup.names.contains_key(id)
-            }) {
-                return Some(format!(
-                    "runs this file's tree {id}, which the lift does not write (only private \
-                     trees are)"
-                ));
             }
             let names = self.names_run(i, &self.original_strings);
             if names != self.names_run(i, &recompiled.strings) {
@@ -1238,12 +1247,6 @@ impl Model {
     }
 
     fn resources_not_reproduced(&self, recompiled: &RecompiledFile) -> Vec<String> {
-        let trees = self
-            .original_lookup
-            .names
-            .keys()
-            .filter(|id| !PRIVATE_TREES.contains(id))
-            .map(|id| format!("BHAV {id}"));
         self.original_resources
             .iter()
             .filter(|(key, data)| recompiled.resources.get(key) != Some(*data))
@@ -1255,7 +1258,6 @@ impl Model {
                 }
                 format!("{} {id}", String::from_utf8_lossy(tag))
             })
-            .chain(trees)
             .collect()
     }
 
@@ -1622,24 +1624,64 @@ fn fwav_sounds(iff: &Iff) -> BTreeMap<u16, String> {
     out
 }
 
-/// Non-code chunks a tree can read through a primitive, keyed by tag and ID (last
-/// chunk of a key wins).
-fn resource_chunks(iff: &Iff) -> BTreeMap<([u8; 4], u16), Vec<u8>> {
-    const TAGS: [&[u8; 4]; 10] = [
+/// The resources a tree can read through a primitive, keyed by tag and ID, as the VM
+/// reads them: each resource of that key in resource order (live chunks; every chunk
+/// of the tag in file order when the resource map does not parse). Also the trees and
+/// constants the lift never writes ([`foreign_code`]).
+fn resource_chunks(iff: &Iff) -> BTreeMap<([u8; 4], u16), Vec<Vec<u8>>> {
+    const TAGS: [&[u8; 4]; 11] = [
         b"STR#", b"CTSS", b"TTAB", b"TTAs", b"SLOT", b"FCNS", b"GLOB", b"TPRP", b"OBJD", b"OBJf",
+        b"BCON",
     ];
-    let mut out = BTreeMap::new();
-    for c in iff.chunks.iter().filter(|c| TAGS.contains(&&c.tag)) {
-        out.insert((c.tag, c.id), iff.data(c).to_vec());
+    let mut out: BTreeMap<([u8; 4], u16), Vec<Vec<u8>>> = BTreeMap::new();
+    for tag in TAGS {
+        let chunks = iff
+            .resource_order(tag)
+            .unwrap_or_else(|_| iff.chunks.iter().filter(|c| &c.tag == tag).collect());
+        for c in chunks {
+            if tag == b"BCON" && PRIVATE_BCONS.contains(&c.id) {
+                // Written by the lift and checked as the trees' constants.
+                continue;
+            }
+            out.entry((c.tag, c.id))
+                .or_default()
+                .push(iff.data(c).to_vec());
+        }
+    }
+    // The VM loads the last BHAV chunk of each ID, deleted or not.
+    for c in vm_kept_bhavs(iff).chunks {
+        if !PRIVATE_TREES.contains(&c.id) {
+            out.insert((c.tag, c.id), vec![iff.data(c).to_vec()]);
+        }
     }
     out
+}
+
+/// Whether a resource key is code the lift never writes: a tree outside the private
+/// range, or a constant table outside the private ones. This file's trees reach them
+/// when it is another object's global or semi-global file.
+fn foreign_code(key: &([u8; 4], u16)) -> bool {
+    &key.0 == b"BHAV" || &key.0 == b"BCON"
+}
+
+/// Every object definition as the VM reads it, in resource order (None when the
+/// resource map does not parse).
+fn definition_data(iff: &Iff) -> Option<Vec<(u16, u16, Vec<u8>)>> {
+    Some(
+        iff.resource_order(b"OBJD")
+            .ok()?
+            .into_iter()
+            .map(|c| (c.id, c.flags, iff.data(c).to_vec()))
+            .collect(),
+    )
 }
 
 struct RecompiledFile {
     trees: BTreeMap<u16, BhavChunk>,
     ctx: LiveContext,
     sounds: BTreeMap<u16, String>,
-    resources: BTreeMap<([u8; 4], u16), Vec<u8>>,
+    resources: BTreeMap<([u8; 4], u16), Vec<Vec<u8>>>,
+    definitions: Option<Vec<(u16, u16, Vec<u8>)>>,
     strings: BTreeMap<([u8; 4], u16), StringTexts>,
     attributes: Option<u16>,
     lookup: NameLookup,

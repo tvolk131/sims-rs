@@ -86,11 +86,17 @@ The code check compares a tree's frame and code. It does not compare the object 
   - a definition the lift drops.
 - **Run Functional Tree** runs the callback its function names, on the stack object. The action every definition has there must agree, and is a callee of the caller.
 - **Create Object Instance** runs the new object's callbacks (`init`, then a turn of `main`), with or without its from-record flag. The new object may be this one, so every callback table must agree, and every callback tree is a callee.
-- **Definition and callback reads.** An Expression reading scope 21 (the stack object's definition words) or scope 35 (whether its callback table names a tree) needs this file's definitions, or its callback tables, to agree.
+- **Definition and callback reads.** An Expression reading scope 21 (the stack object's definition words) or scope 35 (whether its callback table names a tree) needs this file's definitions (the live ones, in resource order, byte for byte), or its callback tables, to agree.
 - **The semi-global link.** Semi-global calls and constants go through `GLOB`, and so does every global tree a tree calls, since it runs with this object as its owner. When the rebuilt object's link differs (an empty name links nothing), no tree of the object is proven.
-- **Non-private trees of this file.** The lift writes only private trees. A tree that runs one of this file's other trees (directly, by name or by function, for example when lifting the global file) is inconclusive.
+- **Non-private code of this file.** The lift writes only private trees (4096–8191) and private constant tables (4096–4159). A file holding other trees or constant tables (for example the global file, or a file other objects link as their semi-global) is a file whose trees reach them by number, by a name another file supplies, or through constant addresses. When the rebuilt file does not keep them, no tree of the object is proven.
 
-What stays outside the per-tree checks is listed per object. The lift's existing note names every resource chunk the rebuilt object does not reproduce byte for byte: it now includes `OBJf` tables and non-private BHAVs. The trees that read those resources through a primitive, or through another object, are checked as code only. That covers primitives that read the stack object's definition or interaction table (routing, interactions, Test Object Type, ...) and trees of other objects that read this one.
+**File roles.** The checks hold whichever role the lifted file plays for a running tree: the object's own file, another object's semi-global file, or the global file.
+
+**What the per-object note covers.** The lift's existing note lists the resources the rebuilt object does not reproduce, as the VM reads them (live resources in resource order; for trees, the last chunk of each ID). The list covers:
+- `STR#`, `CTSS`, `TTAB`, `TTAs`, `SLOT`, `FCNS`, `GLOB`, `TPRP`, `OBJD` and `OBJf`;
+- non-private BHAVs and BCONs.
+
+Some of these also have the per-tree checks above (`STR#` text and names, `OBJD`/`OBJf` callbacks and Expression reads, `GLOB`, non-private code). For those, the note is informational: a tree that depends on them in a way the checks see is already inconclusive. The rest are read only inside primitives (routing slots, interaction tables, Test Object Type, ...) or by trees of other objects reading this one, and the tree verdicts treat those reads as the same in both files. Chunk types outside the list (graphics and other assets) are neither listed nor compared: primitives that read them are treated as reading the same data in both files. The CLI's wording ("trees that read them are checked as code only") is in `src/bin/sims-antics.rs`, outside this track.
 
 These gaps are settled: no other spelling of the tree closes them, so the tree is not lowered for them. A caller of an unproven tree stays unproven as before.
 

@@ -727,10 +727,11 @@ fn definitions_sharing_a_chunk_id_share_its_callbacks() {
     let mut second = iff.data(objd).to_vec();
     second[0x0a..0x0c].copy_from_slice(&4300u16.to_le_bytes());
     second[0x1c..0x20].copy_from_slice(&0x7E00_0137u32.to_le_bytes());
+    // The flags' high byte is part of a resource's key, so both definitions are live.
     let second = ChunkData {
         tag: *b"OBJD",
         id: objd.id,
-        flags: 0,
+        flags: objd.flags | 0x0100,
         label: "second".to_owned(),
         data: second,
     };
@@ -742,6 +743,10 @@ fn definitions_sharing_a_chunk_id_share_its_callbacks() {
             }
         },
         vec![second],
+    );
+    assert_eq!(
+        original.resource_order(b"OBJD").expect("resources").len(),
+        2
     );
     // The rebuilt object gives each definition its own ID, so the first runs 4200.
     let report = report(&original);
@@ -924,9 +929,10 @@ fn an_objf_table_overrides_the_definition_words() {
 }
 
 #[test]
-fn a_non_private_tree_of_this_file_is_a_callee_the_lift_drops() {
+fn non_private_code_the_lift_drops_leaves_no_tree_proven() {
     // Lifting the global file itself: tree 4301 calls this file's global tree 256,
-    // which the lift does not write.
+    // which the lift does not write. Any tree may also reach it by a name another file
+    // supplies, so none is proven.
     let source = r#"object "Fable Bellows" {
     guid: 0x7E00_013C;
     @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 2; }
@@ -943,18 +949,41 @@ fn a_non_private_tree_of_this_file_is_a_callee_the_lift_drops() {
         label: "Global pump".to_owned(),
         data: iff.data(pump).to_vec(),
     };
-    let report = report(&rebuild(&iff, |_| {}, vec![global]));
+    let trees = report(&rebuild(&iff, |_| {}, vec![global]));
     assert!(
-        report
+        trees
             .resources_not_reproduced
             .contains(&"BHAV 256".to_owned()),
         "{:?}",
-        report.resources_not_reproduced
+        trees.resources_not_reproduced
+    );
+    for id in [4300, 4301] {
+        assert!(
+            matches!(check_of(&trees, id), TreeCheck::Inconclusive(why) if why.contains("BHAV 256")),
+            "{id}: {:?}",
+            trees.trees
+        );
+    }
+    // A global constant table (256) this file holds as the global file.
+    let table = ChunkData {
+        tag: *b"BCON",
+        id: 256,
+        flags: 0,
+        label: "Global constants".to_owned(),
+        data: vec![1, 0, 77, 0],
+    };
+    let constants = report(&rebuild(&iff, |_| {}, vec![table]));
+    assert!(
+        constants
+            .resources_not_reproduced
+            .contains(&"BCON 256".to_owned()),
+        "{:?}",
+        constants.resources_not_reproduced
     );
     assert!(
-        matches!(check_of(&report, 4301), TreeCheck::Inconclusive(why) if why.contains("tree 256")),
+        matches!(check_of(&constants, 4300), TreeCheck::Inconclusive(why) if why.contains("BCON 256")),
         "{:?}",
-        report.trees
+        constants.trees
     );
 }
 
@@ -970,4 +999,42 @@ fn a_name_entry_zero_looks_nothing_up() {
 }"#;
     let report = report(&relabel(&compile(source), 4200, "Tick"));
     assert!(proven(check_of(&report, 4301)), "{:?}", report.trees);
+}
+
+#[test]
+fn a_deleted_definition_does_not_stand_in_for_the_live_one() {
+    // The VM reads the live OBJD: a deleted copy with the rebuilt bytes after it does not
+    // make a changed definition word look reproduced.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_013E;
+    @id(4200) main { temp[0] = 1; }
+    @id(4301) @frame(locals: 0) tree words "Words" {
+        raw { op 0x0002 (0, 0, 47, 0, 0, 5, 8, 21); }
+    }
+}"#;
+    let iff = compile(source);
+    let objd = iff.chunks.iter().find(|c| &c.tag == b"OBJD").expect("OBJD");
+    let at = 4 + 47 * 2;
+    let stale = ChunkData {
+        tag: *b"OBJD",
+        id: objd.id,
+        flags: objd.flags | sims_formats::iff::DELETED,
+        label: objd.label.clone(),
+        data: iff.data(objd).to_vec(),
+    };
+    let original = rebuild(
+        &iff,
+        |c| {
+            if &c.tag == b"OBJD" {
+                c.data[at..at + 2].copy_from_slice(&123u16.to_le_bytes());
+            }
+        },
+        vec![stale],
+    );
+    let report = report(&original);
+    assert!(
+        matches!(check_of(&report, 4301), TreeCheck::Inconclusive(why) if why.contains("definition's words")),
+        "{:?}",
+        report.trees
+    );
 }
