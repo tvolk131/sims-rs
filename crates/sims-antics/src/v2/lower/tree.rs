@@ -264,6 +264,12 @@ impl<'a> TreeLowerer<'a> {
     /// Whether `name` is read-only in `stmts`: assigned, borrowed `&mut`, or handed to an
     /// unshadowed builtin that writes a named local.
     pub(super) fn stmts_write_ident(&self, stmts: &[V2Stmt], name: &str) -> Result<bool> {
+        let active = self.active_local_writing_builtins()?;
+        Ok(stmts_mutate_or_borrow_ident_in(stmts, name, &active))
+    }
+
+    /// [`LOCAL_WRITING_BUILTINS`] less the names a user tree or helper shadows here.
+    pub(super) fn active_local_writing_builtins(&self) -> Result<Vec<&'static str>> {
         let mut active = Vec::new();
         for b in LOCAL_WRITING_BUILTINS {
             let callee = V2Expr::Ident(Span::default(), (*b).to_owned());
@@ -271,7 +277,7 @@ impl<'a> TreeLowerer<'a> {
                 active.push(*b);
             }
         }
-        Ok(stmts_mutate_or_borrow_ident_in(stmts, name, &active))
+        Ok(active)
     }
 
     pub(super) fn bind_var(&mut self, name: String, binding: Binding) {

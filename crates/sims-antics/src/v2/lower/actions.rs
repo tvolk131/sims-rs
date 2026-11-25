@@ -171,6 +171,8 @@ impl<'a> TreeLowerer<'a> {
             cursor_saved = true;
             if self.explicit_stack_obj && args.iter().any(|a| self.arg_moves_cursor(&a.value)) {
                 args_cursor = self.save_stack_obj_for_move();
+                // The cursor at exit is observable (item 5): this restore is the source's.
+                self.sets_stack_obj = true;
             }
         }
         for (i, (val, _, _)) in staged_args.iter().enumerate() {
@@ -873,8 +875,8 @@ impl<'a> TreeLowerer<'a> {
                         if air
                             .strip_prefix("temp[")
                             .and_then(|r| r.strip_suffix(']'))
-                            .and_then(|n| n.trim().parse::<u32>().ok())
-                            .is_some_and(|n| n > 7) =>
+                            .and_then(|n| n.trim().parse::<i32>().ok())
+                            .is_some_and(|n| !(0..=7).contains(&n)) =>
                     {
                         Err(refuse(format!(
                             "set_to_next(dest: {air}): there are 8 temps, 'temp[0]' to 'temp[7]'"

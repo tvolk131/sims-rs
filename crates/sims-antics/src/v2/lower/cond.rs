@@ -34,7 +34,14 @@ impl<'a> TreeLowerer<'a> {
                     false
                 }
             }
-            V2Expr::Field { base, .. } => match base.as_ref() {
+            V2Expr::Field { base, field, .. } => match base.as_ref() {
+                // A definition cell is read in place only on the stack object.
+                V2Expr::Ident(_, bname)
+                    if definition_field(field).is_some()
+                        && !self.handle_has_state(bname, field) =>
+                {
+                    self.definition_cell_in_place(bname)
+                }
                 // `stack_obj.<field>` is the stack object's own cell (no switch).
                 V2Expr::Ident(_, bname) => {
                     (self.is_self_ident(bname) && self.self_stack_target() == "stack_obj")
@@ -55,6 +62,11 @@ impl<'a> TreeLowerer<'a> {
                     V2Expr::Ident(_, bname) => {
                         matches!(bname.as_str(), "temp" | "global")
                             || (bname == "param" && self.lookup_var("param").is_none())
+                    }
+                    V2Expr::Field {
+                        base: root, field, ..
+                    } if field == "has_function" => {
+                        matches!(root.as_ref(), V2Expr::Ident(_, r) if self.definition_cell_in_place(r))
                     }
                     V2Expr::Field {
                         base: root, field, ..

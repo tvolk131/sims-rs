@@ -1802,3 +1802,96 @@ fn pr_i3_review_round_1_regressions() {
         "there are 8 temps",
     );
 }
+
+#[test]
+fn pr_i3_review_round_2_regressions() {
+    let body = |src: &str| {
+        let air = build(&obj(src)).0;
+        tree_body(&air, "a").to_owned()
+    };
+    let has = |body: &str, want: &str| assert!(body.contains(want), "{want}:\n{body}");
+    // A definition read that switches the cursor is not a pure operand: the other side is read
+    // before the switch.
+    let b = body(
+        "    #[bhav] fn a(o: ObjectId) -> bool {
+        stack_obj = o;
+        stack_obj.object_type == self.object_type
+    }",
+    );
+    has(
+        &b,
+        "stack_obj := param[0];\n    let __cmp_l_0 = scope(21, 9);\n    stack_obj := my.id;",
+    );
+    // The found cursor a functional's argument left is restored even at the exit.
+    let b = body("    #[bhav] fn a() { stack_obj.run_functional(4, find_best_object(cook)); }");
+    has(
+        &b,
+        "run_functional_tree(4);\n    stack_obj := __pre_stack_obj_2;\n    return true;",
+    );
+    // A helper argument that assigns `stack_obj` moves the cursor too.
+    let b = body(
+        "    fn select(o: ObjectId) -> i16 { stack_obj = o; 0 }
+    #[bhav] fn a(o: ObjectId) {
+        set_to_next(person);
+        stack_obj.run_functional(4, select(o));
+        self.n = stack_obj.attr[0];
+    }",
+    );
+    has(
+        &b,
+        "run_functional_tree(4);\n    stack_obj := __pre_stack_obj_4;\n    my.attr[0] := stack.attr[0];",
+    );
+    // Helpers named like the builtins are called as helpers.
+    let b = body(
+        "    fn find_best_object(x: i16) -> i16 { x + 1 }
+    #[bhav] fn a(x: i16) { self.n = find_best_object(x); }",
+    );
+    has(&b, "__ret_find_best_object_0 += 1;");
+    let b = body(
+        "    fn set_to_next(dest: i16) { self.n = dest; }
+    fn write(const c: i16) { set_to_next(dest: c); }
+    #[bhav] fn a() { write(4); }",
+    );
+    has(&b, "my.attr[0] := 4;");
+    // A cursor loop's binding removes itself through `stack_obj`.
+    let b = body(
+        "    #[bhav] fn a() {
+        for o in lot.objects() {
+            if !o.remove() { return; }
+            o.remove(no_yield: true);
+        }
+    }",
+    );
+    has(
+        &b,
+        "while set_to_next(all, dest: stack_obj) {\n        if !remove_object(stack_obj) {",
+    );
+    has(&b, "remove_object(stack_obj, flags: 1);");
+    // A definition read on `self` keeps the loop off the cursor.
+    let b = body(
+        "    #[bhav] fn a() {
+        for o in lot.objects() {
+            if self.object_type == 3 { temp[0] = o.object_type; }
+        }
+    }",
+    );
+    has(
+        &b,
+        "while set_to_next(all, dest: __v_o_0) {\n        stack_obj := my.id;",
+    );
+    // A discarded branch's `stack_obj = o;` keeps nothing at the exit.
+    let b = body(
+        "    #[bhav] fn a(o: ObjectId) {
+        if false { stack_obj = o; }
+        self.n = o.attr[0];
+    }",
+    );
+    assert!(!b.contains("__saved_stack_obj"), "{b}");
+    // `me` in an object's own tree is the object.
+    let b = body("    #[bhav] fn a() { self.n = me.object_type; }");
+    has(&b, "stack_obj := my.id;\n    my.attr[0] := scope(21, 9);");
+    expect_err(
+        &obj("    #[bhav] fn a() { set_to_next(person, dest: temp[-1]); }"),
+        "there are 8 temps",
+    );
+}

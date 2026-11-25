@@ -957,6 +957,11 @@ impl ExplicitStackOps {
                 }
                 _ => None,
             };
+            if self.assignments
+                && matches!(stmt, V2Stmt::Assign { target: V2Expr::Ident(_, n), .. } if n == "stack_obj")
+            {
+                return true;
+            }
             if let Some(args) = let_some_search {
                 return args.iter().any(|a| self.in_expr(&a.value, env, owner, local))
                     || super::specialize::stmt_bodies(stmt)

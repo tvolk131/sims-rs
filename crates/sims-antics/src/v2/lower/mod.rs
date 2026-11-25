@@ -796,4 +796,6 @@ const PIN_SLOT: &str = "@pin@";
 #[derive(Default)]
 struct ExplicitStackOps {
     visited: BTreeSet<(String, String, bool)>,
+    /// Also count a `stack_obj = x;` statement (in a helper body).
+    assignments: bool,
 }

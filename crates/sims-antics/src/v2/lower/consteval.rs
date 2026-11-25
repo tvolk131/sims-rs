@@ -459,6 +459,7 @@ impl<'a> TreeLowerer<'a> {
         let out_len = self.em.mark();
         let indent = self.em.depth();
         let used_saved = self.used_saved_stack_obj;
+        let sets_stack_obj = self.sets_stack_obj;
         let (event_local, sleep_span) = (self.event_local, self.sleep_span);
         let expansions = self.inline_expansions;
         let next_id = self.next_id;
@@ -470,6 +471,7 @@ impl<'a> TreeLowerer<'a> {
         self.em.truncate(out_len);
         self.em.set_depth(indent);
         self.used_saved_stack_obj = used_saved;
+        self.sets_stack_obj = sets_stack_obj;
         (self.event_local, self.sleep_span) = (event_local, sleep_span);
         self.inline_expansions = expansions;
         self.next_id = next_id;

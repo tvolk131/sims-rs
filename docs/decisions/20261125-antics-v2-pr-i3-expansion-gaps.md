@@ -45,6 +45,7 @@ the false exit.
   - `self` in a Sim tree that steps the cursor (`destroy_self()` selects it there).
 - **Options:** `flags:`, `no_yield:` and `skip_resets:`, shared with `destroy_self()`.
 - **Where it works:** as a statement, a condition (`if !x.remove() { .. }`) and a bool value.
+  A `for o in ..` loop whose body removes `o` keeps `o` the cursor.
 
 ### 2. `find_best_object(kind)` as a condition (`lower/cond.rs`, `lower/ast_facts.rs`)
 
@@ -59,7 +60,8 @@ A tree that uses it counts as one that steps its own cursor (`ExplicitStackOps`)
 tree's `self` stays the object the tree started on.
 
 The same holds in a `stack_obj.run_functional(..)` argument: the functional runs on the receiver,
-and the found object is selected again after it. A helper `fn find_best_object` still wins over
+and the found object (or the object a helper argument assigned to `stack_obj`) is selected again
+after it, also right before the exit. A helper `fn find_best_object` still wins over
 the search, as it does in value position.
 
 `let Some(x) = find_best_object(..)` already restores the cursor itself and is unchanged. The
@@ -79,11 +81,12 @@ destination is the stack object.
   - `temp[N]`.
 - **Refused destinations:**
   - an immutable parameter (the error names its `param[N]` word);
-  - `temp[8]` and up (the VM bounds-checks the destination: a Sim has 8 temps);
+  - a temp outside `temp[0]` to `temp[7]` (the VM bounds-checks the destination);
   - a typed handle (the next object need not be of its type);
   - a bool, an enum, or any field.
 - **A write:** the destination counts as a written local (`LOCAL_WRITING_BUILTINS`), so a
-  helper's by-value parameter used as one is copied, not aliased to the caller's local.
+  helper's by-value parameter used as one is copied, not aliased to the caller's local. A
+  helper named `set_to_next` shadows the builtin there too.
 - **The stack object:** stepping another cell leaves it alone (`set_to_next_steps_stack_obj`).
   Such a call is no cursor move, so a Sim tree keeps no entry save for it.
 - **Already supported, now tested:**
@@ -108,6 +111,10 @@ Each is verified in `sims-vm` `memory.rs`. All are read-only. A write is an erro
   - a state of the same name wins over the engine field;
   - a store to another object's cell copies a definition-cell value first, as it does a
     `stack.` cell (`reads_stack_obj`), since the store selects the other object;
+  - `me` in an object's own tree is the object, as `self` is;
+  - a read that switches the cursor is no plain operand, so a compare reads its other side
+    first, and a cursor loop whose body reads one off another object does not use `stack_obj`
+    as its cursor;
   - a Sim handle (`sim`, or `me` in a Sim tree) is refused. It is read through `my.`, so a
     tree that never moves the cursor keeps no save to put it back with.
 - **`job_field(F)`** reads the temps as they are where it is read. It is a plain operand, so
@@ -128,7 +135,8 @@ The stack object at exit is observable:
 - every Expression node sets the scratch pointer.
 
 A tree whose source assigns `stack_obj` (`FrameFacts::keeps_exit_stack_obj`) keeps every
-`stack_obj` store that only the exit makes dead.
+`stack_obj` store that only the exit makes dead. An assignment in code a constant condition
+discards does not count.
 
 The compiler's own bookkeeping restores still drop when dead. Keeping them too would change
 open-pack trees whose early returns pass a restore nothing reads. So the rule follows the source:
@@ -153,6 +161,11 @@ The name must name one number everywhere, and no `let` / `local` may reuse it. T
 - **`self` after a search.** A conditional `find_best_object` keeps `self` the tree's own
   object (item 2), so the `stack_obj_clobber_after_self` lint (Track 7) correctly leaves it
   alone.
+- **Pre-existing, not changed here:**
+  - in a tree that does not step its own cursor, a foreign read after `stack_obj = o;` puts back
+    the entry object, not `o`;
+  - a compound store such as `temp[0] = 1 + stack_obj.attr[0]` writes `temp[0]` before the
+    stack-object read that can fault. A definition read behaves the same.
 - **Out of scope.** Two pilot asks remain:
   - `remove_object` mode 2 (object 0, which no object is);
   - Maxis's pad bytes on Remove Object.

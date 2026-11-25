@@ -781,8 +781,7 @@ impl<'a> TreeLowerer<'a> {
                             | "dialog"
                             | "route_to"
                             | "snap"
-                            | "find_best_object"
-                    ) || (fname == "create_object"
+                    ) || (matches!(fname.as_str(), "create_object" | "find_best_object")
                         && !self.user_callable_named(callee, *span)?)
                     {
                         let tmp = self.fresh("call");
@@ -945,6 +944,16 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// Whether a definition cell (`scope(21, ..)`, `scope(35, ..)`) of `handle` is read in place,
+    /// with no cursor switch (see [`Self::read_stack_object_cell`]).
+    pub(super) fn definition_cell_in_place(&self, handle: &str) -> bool {
+        handle == "stack_obj"
+            || (self.is_self_ident(handle)
+                && !self.inherit_tree
+                && matches!(self.tree_ctx, TreeContext::SimOnObject { .. })
+                && self.self_stack_target() == "stack_obj")
+    }
+
     /// Reads `cell`, a cell of the stack object (`scope(21, ..)`, `scope(35, ..)`), for the object
     /// `handle` names: in place when that is the stack object, else with the stack object moved
     /// to it and put back. `None` when `handle` is no object handle. A Sim handle (`sim`, `me`
@@ -983,6 +992,12 @@ impl<'a> TreeLowerer<'a> {
                     target => foreign(target, ty),
                 },
             }
+        } else if self.is_frame_me(handle)
+            && !self.is_my_ident(handle)
+            && matches!(self.tree_ctx, TreeContext::ObjectSelf)
+        {
+            // In an object's own tree `me` is the running object, as `self` is.
+            foreign("my.id", ty)
         } else if self.is_my_ident(handle) || self.is_frame_me(handle) {
             return Err(Error::at(
                 span,
