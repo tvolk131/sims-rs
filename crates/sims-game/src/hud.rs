@@ -777,13 +777,8 @@ impl Hud {
 
     /// Loads the residential Buy Mode catalog on first use and returns it.
     pub fn ensure_buy_catalog(&mut self, assets: &Assets) -> &BuyCatalog {
-        let rating_labels = self.rating_labels.clone();
-        let sell_labels = self.sell_labels.clone();
-        self.buy_catalog.get_or_insert_with(|| {
-            BuyCatalog::load(assets.index(), assets.catalog())
-                .with_rating_labels(rating_labels)
-                .with_sell_labels(sell_labels)
-        })
+        self.buy_catalog
+            .get_or_insert_with(|| load_buy_catalog(assets, &self.rating_labels, &self.sell_labels))
     }
 
     /// The residential Buy Mode catalog, once loaded.
@@ -845,12 +840,8 @@ impl Hud {
         let lot_id = world.globals.get(10).copied().unwrap_or(0);
         let zone = sims_ui::buy::BuyZone::for_lot(lot_id, lot_zoning);
         self.buy_state.set_zone(zone);
-        let rating_labels = self.rating_labels.clone();
-        let sell_labels = self.sell_labels.clone();
         let catalog = self.buy_catalog.get_or_insert_with(|| {
-            BuyCatalog::load(assets.index(), assets.catalog())
-                .with_rating_labels(rating_labels)
-                .with_sell_labels(sell_labels)
+            load_buy_catalog(assets, &self.rating_labels, &self.sell_labels)
         });
         let funds = sims_vm::available_funds(world);
         let layout = buy::layout_with_sell(size, catalog, &self.buy_state, &self.art, funds, sell);
@@ -2242,13 +2233,7 @@ impl Hud {
             self.kinds.learn(world, assets.index(), assets.catalog());
         }
         if self.controls.expanded && self.controls.panel == Some(UiPanel::Gifts) {
-            let rating_labels = self.rating_labels.clone();
-            let sell_labels = self.sell_labels.clone();
-            self.buy_catalog.get_or_insert_with(|| {
-                BuyCatalog::load(assets.index(), assets.catalog())
-                    .with_rating_labels(rating_labels)
-                    .with_sell_labels(sell_labels)
-            });
+            self.ensure_buy_catalog(assets);
         }
         // The pause button shows global 17, which the game's pause sets.
         let snapshot = self.for_panel(household, world);
@@ -3317,6 +3302,18 @@ impl Hud {
         }
         release
     }
+}
+
+/// The residential Buy Mode catalog with its popup rating and sell prompt
+/// labels, loaded on first use.
+fn load_buy_catalog(
+    assets: &Assets,
+    rating_labels: &RatingLabels,
+    sell_labels: &SellLabels,
+) -> BuyCatalog {
+    BuyCatalog::load(assets.index(), assets.catalog())
+        .with_rating_labels(rating_labels.clone())
+        .with_sell_labels(sell_labels.clone())
 }
 
 /// The actions whose icons were pressed while they show: a second press
