@@ -821,10 +821,17 @@ object "Pr I4" {{
                 "if drop_onto(src: 1, dst: param[0]) {",
                 "reach(mode: 1, moves: true, param: 1);",
                 "reach(mode: 0, moves: false);",
-                "make_new_character(skin: __v_skin_0, age: __v_age_1, sex: __v_sex_2, species: 1)",
+                "make_new_character(skin: __v_skin_",
+                ", species: 1)",
             ] {
                 assert!(t.contains(want), "missing `{want}` in:\n{t}");
             }
+            // Make New Character moves the cursor, so the tree puts `self` back for its write.
+            expect_seq(
+                "make_new_character",
+                t,
+                &["stack_obj := __self_obj;", "stack.attr[0] := 2;"],
+            );
         }
 
         #[test]
@@ -1061,9 +1068,18 @@ object "Pr I4 Tail" {
                 "",
                 "temp[0] = min(temp[1], self.n); temp[4] = max(sim.age, global[3]);",
             );
-            assert!(!t.contains("__arg_"), "{t}");
-            assert!(t.contains("if temp[1] < stack.attr[0] {"), "{t}");
             assert!(t.contains("if my.person[58] > global[3] {"), "{t}");
+            // Nothing proves a Sim tree's entry cursor names a live object, so `self.n` is
+            // read once, up front.
+            expect_seq(
+                "zero_copy",
+                &t,
+                &[
+                    "let __arg_b_0 = stack.attr[0];",
+                    "let __ret_min_1;",
+                    "if temp[1] < __arg_b_0 {",
+                ],
+            );
         }
 
         #[test]
@@ -1330,6 +1346,131 @@ object "Pr I4 Tail" {
                 ),
                 "make_new_character(skin:) must name an i16 local",
             );
+        }
+    }
+
+    /// Regressions from the second review round.
+    mod review_round_2 {
+        use super::*;
+
+        fn object(members: &str) -> String {
+            format!("object \"Pr I4 R2\" {{\n    guid: 0x7F40_0264;\n{members}\n}}\n")
+        }
+
+        fn air_of(name: &str, members: &str, label: &str) -> String {
+            tree(&expand(name, &object(members)), label).to_owned()
+        }
+
+        /// An object may run a functional, so its person reads are staged and never dropped.
+        #[test]
+        fn functional_person_reads_may_fault() {
+            let t = air_of(
+                "functional_fault.antics",
+                "    fn ignore(x: i16) -> i16 { 7 }\n    functional cook {\n        score: 50,\n        \
+                 run(sim) {\n            temp[0] = 1 + sim.age;\n            \
+                 temp[1] = ignore(sim.age);\n        }\n    }",
+                "Functional_Cook",
+            );
+            assert!(!t.contains("temp[0] := 1;"), "{t}");
+            assert_eq!(t.matches("my.person[58]").count(), 2, "{t}");
+        }
+
+        /// A Sim tree's entry cursor is not proven live: an unused cursor argument is still
+        /// read.
+        #[test]
+        fn cursor_arguments_are_read_eagerly() {
+            let t = air_of(
+                "cursor_arg.antics",
+                "    state n: i16;\n    fn ignore(x: i16) -> i16 { 7 }\n    \
+                 #[bhav] fn t(sim: Sim) { temp[1] = ignore(self.n); }",
+                "t",
+            );
+            assert!(t.contains("= stack.attr[0];"), "{t}");
+        }
+
+        /// A `&mut` to a temp-indexed cell names the cell chosen at the call, even when the
+        /// helper rewrites the index temp.
+        #[test]
+        fn temp_indexed_borrows_keep_their_cell() {
+            let t = air_of(
+                "borrow.antics",
+                "    fn overwrite(word: &mut i16) {\n        temp[0] = 1;\n        *word = 42;\n    }\n    \
+                 #[bhav] fn t(sim: Sim) {\n        overwrite(&mut self.sprite_flags[temp[0]]);\n        \
+                 overwrite(&mut sim.person[temp[0]]);\n    }",
+                "t",
+            );
+            for scope in ["27", "30"] {
+                expect_seq(
+                    "borrow",
+                    &t,
+                    &[
+                        "temp[0] := 1;",
+                        "temp[0] := __ref_idx_word_0;",
+                        &format!("scope({scope}, 0) := 42;"),
+                    ],
+                );
+            }
+        }
+
+        /// Raw cursor writes count in `repeat`, animation event loops, an inlined condition
+        /// helper and a `run_functional` argument.
+        #[test]
+        fn raw_cursor_writes_count_in_every_loop_and_ahead_of_arms() {
+            let body = "temp[0] = p.attr[0];\n            temp[1] = stack_obj.attr[0];\n            \
+                        raw { stack_obj := param[1]; }";
+            for (name, members) in [
+                (
+                    "repeat",
+                    format!(
+                        "    #[bhav] fn t(p: ObjectId, o: ObjectId) {{ repeat 2 {{ {body} }} }}"
+                    ),
+                ),
+                (
+                    "animate",
+                    format!(
+                        "    #[bhav] fn t(sim: Sim, p: ObjectId, o: ObjectId) {{\n        \
+                         animate(clip: 8, table: 0, events: 2) |event| {{ {body} }}\n    }}"
+                    ),
+                ),
+                (
+                    "condition",
+                    "    fn mv() -> bool { raw { stack_obj := param[1]; } temp[7] == 1 }\n    \
+                     #[bhav] fn t(p: ObjectId, o: ObjectId) {\n        \
+                     if mv() { temp[0] = p.attr[0]; temp[1] = stack_obj.attr[0]; }\n    }"
+                        .to_owned(),
+                ),
+            ] {
+                let t = air_of(&format!("{name}.antics"), &members, "t");
+                assert!(t.contains("__pre_stack_obj"), "{name}:\n{t}");
+                assert!(
+                    !t.contains("__saved_stack_obj") && !t.contains("__self_obj"),
+                    "{name}:\n{t}"
+                );
+            }
+            let t = air_of(
+                "rf_arg.antics",
+                "    fn change() -> i16 { raw { stack_obj := param[0]; } 5 }\n    \
+                 #[bhav] fn t(o: ObjectId) {\n        stack_obj.run_functional(cook, change());\n        \
+                 temp[7] = stack_obj.attr[0];\n    }",
+                "t",
+            );
+            let call = t.find("run_functional_tree(cook);").expect("call");
+            assert!(t[call..].contains("stack_obj := __pre_stack_obj"), "{t}");
+        }
+
+        /// Make New Character leaves the new neighbor in the cursor, which a later foreign
+        /// read puts back.
+        #[test]
+        fn make_new_character_moves_the_cursor() {
+            let t = air_of(
+                "make_cursor.antics",
+                "    #[bhav] fn t(p: ObjectId) {\n        let skin = 0;\n        let age = 0;\n        \
+                 let sex = 0;\n        \
+                 if make_new_character(skin: skin, age: age, sex: sex, species: 0) {\n            \
+                 temp[0] = p.attr[0];\n            temp[1] = stack_obj.neighbor.age;\n        }\n    }",
+                "t",
+            );
+            assert!(t.contains("__pre_stack_obj"), "{t}");
         }
     }
 }

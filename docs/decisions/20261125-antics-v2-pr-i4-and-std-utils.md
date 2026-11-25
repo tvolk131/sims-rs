@@ -106,12 +106,14 @@ any plain cell in place when both of these hold:
   from `sims-vm` `memory.rs`. Reads that qualify:
   - `temp[0..8]`, a parameter below the tree's argument count, `global[0..32]` (older saves
     keep 32);
-  - a declared `my`/`self` attribute, and data words below 64 (the smallest object), except
+  - a declared `my` attribute, and `my` data words below 64 (the smallest object), except
     word 25, whose read wakes the object;
   - the runner's person words below 80 and motives below 16, only in a Sim tree, where the
-    runner is a Sim (not an inherit tree, whose runner may be an object);
-  - a `self` read through the cursor, only in a Sim tree where nothing has moved the cursor
-    (no `stack_obj` assignment, no explicit stepping, no raw block that may write it).
+    runner is a Sim. Inherit trees and functionals (action and guard) do not qualify: an
+    object may run them.
+
+  A read through the cursor (`self` in a Sim tree) is never forwarded: nothing proves the
+  entry cursor names a live object of this kind.
 
   Because the read cannot fault, moving it into the body, repeating it, or dropping it is
   unobservable.
@@ -119,7 +121,7 @@ any plain cell in place when both of these hold:
   the cell nor the cursor changes while it runs.
 
 Temps, parameters and own attributes keep their existing rules. A stack-object or foreign read
-is still copied up front. `min(temp[1], self.n)` from `std::math` now costs no local.
+is still copied up front. `max(sim.age, global[3])` from `std::math` now costs no local.
 
 **Scoped `keep_layout`** (`lower/raw.rs` `raw_block_is_layout_free`, `layout_free_raw_lines`).
 A raw block no longer pins the tree's layout when it is built only from text the lowering itself
@@ -176,8 +178,12 @@ put back the entry object after the read, not `o`.
 - In such a tree, foreign reads, `emit_on_self`, distance, `run_functional` and lvalue moves
   save and restore the current cursor (`__pre_stack_obj_N`).
 - A raw block that may write the cursor has the same effect from that point in lowering order.
-  A loop whose body holds one sets it before the body, since the next iteration runs the code
-  before the block again. A raw block after a loop does not change the loop (PR H's `for ..
+  A loop (`while`, `for`, `repeat`, an animation's event loop) whose body holds one sets it
+  before the body, since the next iteration runs the code before the block again. So does an
+  inlined condition helper holding one, whose arms are captured before the helper is lowered,
+  and a `run_functional` argument holding one counts as moving the cursor.
+- Make New Character counts as a cursor move: on success it leaves the new neighbor in the
+  stack object. A raw block after a loop does not change the loop (PR H's `for ..
   else` shape is kept).
 - PR D's `self` rule is unchanged, and so is the explicit-tree classification.
 - `for` loops still restore the entry object on exit (PR H's rule, pinned by its tests).
@@ -198,6 +204,14 @@ put back the entry object after the read, not `o`.
   the object's count faults after the first write lands).
 - A temp-indexed destination (`scope(27|30|31, k)`) is always staged: its index may alias a
   cell the right side reads.
+- A `&mut` to a temp-indexed cell copies the index at the call and sets it into `temp[0]`
+  before each use (as a run-time sprite index already was), so a helper that rewrites the
+  index temp still writes the borrowed cell.
+- The in-place shape `temp[4] := 1; temp[4] += stack.attr[0];` is still emitted for a `self`
+  read in a Sim tree that never moves the cursor. It relies on PR D's contract that a Sim
+  tree is entered with the stack object on an object of this kind. That shape predates this
+  PR and is open-pack's, and a caller that breaks the contract already reads the wrong
+  attributes.
 - A Sim tree that never moves the cursor keeps `temp[4] := 1; temp[4] += stack.attr[0];`, which
   is the open-pack shape, so the pack is unchanged.
 
@@ -236,6 +250,10 @@ first. An operand read through a cell indexed by `temp[0]` (`scope(27|30|31, 0)`
     - the lift corpus effect of `from_raw` constant folding is unchecked.
 - Not done:
   - checking a raw `call N` to a Sim tree from an inherit tree;
+  - a functional calling a Sim tree (directly, or through one that reaches a Sim-only inherit
+    tree) when an object runs the functional. The language types a functional's runner as its
+    `sim` binding, and Sim trees called from functionals predate this PR. Closing the gap
+    needs a functional-runner type rather than one more inherit fact;
   - a short-circuit condition with a constant leaf (`temp[0] == 1 && false`) can still leave the
     previous node's result as the tree's last result. That predates this PR and is left for a
     follow-up;

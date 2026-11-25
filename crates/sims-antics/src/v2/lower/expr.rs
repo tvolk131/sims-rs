@@ -172,11 +172,11 @@ impl<'a> TreeLowerer<'a> {
         let Some(i) = rest.strip_suffix(']').and_then(|n| n.parse::<usize>().ok()) else {
             return false;
         };
-        let sim_runner =
-            matches!(self.tree_ctx, TreeContext::SimOnObject { .. }) && !self.inherit_tree;
-        let cursor_is_self = matches!(self.tree_ctx, TreeContext::SimOnObject { .. })
+        // An inherit tree's or a functional's runner may be an object.
+        let sim_runner = matches!(self.tree_ctx, TreeContext::SimOnObject { .. })
             && !self.inherit_tree
-            && !(self.explicit_stack_obj || self.cursor_may_be_moved());
+            && !self.object_reachable;
+        let cursor_is_self = sim_runner && !(self.explicit_stack_obj || self.cursor_may_be_moved());
         let own = |prefix: &str| prefix == self.self_prefix() && (prefix == "my" || cursor_is_self);
         let declared_attr = self.env.states.values().any(|s| s.attr_index == i);
         match head {

@@ -419,6 +419,7 @@ impl<'a> TreeLowerer<'a> {
         event: Option<&str>,
         body: &[V2Stmt],
     ) -> Result<()> {
+        self.note_loop_raw_cursor(None, body);
         if let Some(name) = event
             && self.stmts_write_ident(body, name)?
         {

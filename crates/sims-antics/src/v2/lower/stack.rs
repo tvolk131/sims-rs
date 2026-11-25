@@ -40,6 +40,7 @@ impl<'a> TreeLowerer<'a> {
     pub(super) fn arg_moves_cursor(&self, expr: &V2Expr) -> bool {
         ExplicitStackOps {
             assignments: true,
+            raw_writes: true,
             ..Default::default()
         }
         .in_expr(expr, self.env, &self.owner_module, self.in_object_scope)
@@ -52,7 +53,8 @@ impl<'a> TreeLowerer<'a> {
     }
 
     /// Sets [`Self::raw_moves_cursor`] before a loop whose body (or condition) has a raw block
-    /// that may write the cursor: the next iteration runs earlier code after it.
+    /// that may write the cursor: the next iteration runs earlier code after it. Also used for
+    /// code lowered ahead of the condition that runs first (inline branch arms).
     pub(super) fn note_loop_raw_cursor(&mut self, cond: Option<&V2Expr>, body: &[V2Stmt]) {
         let mut ops = ExplicitStackOps {
             raw_writes: true,

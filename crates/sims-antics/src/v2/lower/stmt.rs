@@ -357,6 +357,7 @@ impl<'a> TreeLowerer<'a> {
                 cancel_on_abort,
                 body,
             } => {
+                self.note_loop_raw_cursor(None, body);
                 if *cancel_on_abort && matches!(self.tree_ctx, TreeContext::ObjectSelf) {
                     return Err(Error::at(
                         *span,

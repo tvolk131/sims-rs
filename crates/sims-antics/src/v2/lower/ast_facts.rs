@@ -1059,7 +1059,9 @@ impl ExplicitStackOps {
                         .filter_map(|p| p.default.as_ref())
                         .any(|expr| self.in_expr(expr, env, &module, is_local)))
         } else {
+            // Make New Character puts the new neighbor in the stack object on success.
             name == "find_best_object"
+                || name == "make_new_character"
                 || (name == "set_to_next" && set_to_next_steps_stack_obj(args))
                 || (name == "create_object" && has_create_dest(args))
         }

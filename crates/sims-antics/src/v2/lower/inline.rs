@@ -102,6 +102,8 @@ impl<'a> TreeLowerer<'a> {
         } else if self.safe_cell_air(air)
             // Resolving data word 25 wakes its object, so that read must happen as written.
             && !canonical_air_cell(air).ends_with(".data[25]")
+            // Nothing proves a Sim tree's entry cursor names a live object of this kind.
+            && !canonical_air_cell(air).starts_with("stack.")
         {
             HelperCell::Pure
         } else {
@@ -447,6 +449,49 @@ impl<'a> TreeLowerer<'a> {
                     self.emit_let(&snap, idx);
                     *setup = format!("temp[0] := {snap};");
                 }
+                // A temp-indexed cell (`scope(27|30|31, k)`) reads its index from `temp[k]` at
+                // each use. Copy the index now and set it into `temp[0]` before each use, the
+                // way a run-time sprite index is.
+                let temp_indexed = |air: &str| {
+                    let (scope, k) = air
+                        .strip_prefix("scope(")?
+                        .strip_suffix(')')?
+                        .split_once(", ")?;
+                    let k = k.parse::<u8>().ok().filter(|k| *k < 8)?;
+                    matches!(scope, "27" | "30" | "31").then(|| (scope.to_owned(), k))
+                };
+                let (cell_air, foreign_setup) = match &lval {
+                    LValue::Direct { air, .. } => (air.clone(), None),
+                    LValue::ForeignCell { cell, setup, .. } => {
+                        (cell.clone(), Some(setup.is_some()))
+                    }
+                    LValue::ForeignAttr { .. } => (String::new(), None),
+                };
+                if foreign_setup != Some(true)
+                    && let Some((scope, k)) = temp_indexed(&cell_air)
+                {
+                    let snap = self.fresh(&format!("ref_idx_{}", param.name));
+                    self.emit_let(&snap, &format!("temp[{k}]"));
+                    let setup = Some(format!("temp[0] := {snap};"));
+                    let cell = format!("scope({scope}, 0)");
+                    match &mut lval {
+                        LValue::ForeignCell {
+                            cell: c, setup: s, ..
+                        } => {
+                            *c = cell;
+                            *s = setup;
+                        }
+                        LValue::Direct { ty, .. } => {
+                            lval = LValue::ForeignCell {
+                                obj_air: "stack_obj".to_owned(),
+                                cell,
+                                setup,
+                                ty: ty.clone(),
+                            };
+                        }
+                        LValue::ForeignAttr { .. } => {}
+                    }
+                }
                 Binding::MutRef { target: lval }
             }
             V2Type::Sim => {
@@ -661,6 +706,9 @@ impl<'a> TreeLowerer<'a> {
 
         // Check a trial emission for raw code, pinned slots and calls that depend on the
         // layout of adjacent nodes. These need the ordinary single-copy branch lowering.
+        // The arms are captured before the condition's helper is lowered: a raw cursor write
+        // in the helper must already count for them.
+        self.note_loop_raw_cursor(Some(cond), &[]);
         let prefix = self.em.take_text();
         let mut trial = self.clone();
         self.em.set_text(prefix);
