@@ -594,3 +594,87 @@ fn casts_and_raw_conversions_stay_sound() {
         ),
     );
 }
+
+#[test]
+fn constant_casts_follow_the_value_rules() {
+    // An `extern mod` named like the type owns `T::from_raw` in every position.
+    for (name, body) in [
+        (
+            "owned_cond.antics",
+            "if Height::from_raw(1) == Height::Floor { temp[0] = 9; }",
+        ),
+        ("owned_let.antics", "let h = Height::from_raw(1);"),
+    ] {
+        expect_err(
+            name,
+            &sim_tree(
+                "extern mod Height { #[id(280)] fn other() -> Result; }",
+                body,
+            ),
+            "extern mod 'Height' has no fn 'from_raw'",
+        );
+    }
+    expect_err(
+        "closed_index.antics",
+        &sim_tree(
+            "enum Closed { Only = 0 }",
+            "temp[Closed::from_raw(1) as i16] = 7;",
+        ),
+        "'Closed' is a closed enum",
+    );
+    expect_err(
+        "wide_operand.antics",
+        &sim_tree("", "generic_call(routine: 32768 as i16);"),
+        "integer 32768 out of i16 range",
+    );
+    expect_err(
+        "runtime_operand.antics",
+        &sim_tree("", "refresh(target: temp[0] as i16, mode: 0);"),
+        "refresh target must be a compile-time constant",
+    );
+    expect_err(
+        "foreign_raw.antics",
+        &sim_tree(
+            "use std::engine::*;",
+            "refresh(target: Direction::from_raw(RefreshMode::RecountRoom) as i16, mode: 0);",
+        ),
+        "'Direction::from_raw' expects an i16, found 'RefreshMode'",
+    );
+    let source = r#"use std::engine::Direction;
+object "Typed Std" {
+    guid: 0x7F40_0250;
+    state n: i16;
+    param enabled: bool = true;
+    #[bhav] fn t(sim: Sim) {
+        refresh(target: Direction::from_raw(Direction::NorthEast) as i16, mode: 0);
+        drop_onto(src: Direction::from_raw(-32768) as i16, dst: 2);
+        temp[0] = (!false) as i16;
+        refresh(target: (!false) as i16, mode: 0);
+        temp[1] = enabled as i16;
+        refresh(target: enabled as i16, mode: 0);
+        self.n = (temp[0] + temp[1]) as i16;
+    }
+}
+"#;
+    let air = expand("const_operands.antics", source);
+    expect_lines(
+        "const_operands",
+        &air,
+        &[
+            "refresh(target: 1, mode: 0);",
+            "drop_onto(src: -32768, dst: 2);",
+            "temp[0] := 1;",
+            "temp[1] := 1;",
+            "stack.attr[0] := temp[0];",
+            "stack.attr[0] += temp[1];",
+        ],
+    );
+    // The cast costs no node: the same bytes as the uncast sum.
+    let sum = |cast: &str| {
+        iff(
+            "sum.antics",
+            &sim_tree("", &format!("self.n = (temp[0] + temp[1]){cast};")),
+        )
+    };
+    assert_eq!(sum(" as i16"), sum(""));
+}

@@ -32,14 +32,36 @@ impl<'a> TreeLowerer<'a> {
             }
             // A `std::engine` variant or `std::flags` constant is its number.
             _ if let Some(v) = self.try_eval_engine_const(expr)? => i64::from(v),
-            // `c as i16` is the constant `c` (`-32768 as i16` too).
+            // `c as i16` is the constant `c` (`-32768 as i16` too). A literal or `T::from_raw`
+            // keeps its own error (out of range, a closed enum); any other operand is not a
+            // constant.
             V2Expr::Unary {
                 op: V2UnaryOp::AsI16,
                 inner,
                 ..
-            } if self.eval_const_i16(expr).is_err() => {
-                return self.eval_builtin_int(inner, what, lo, hi);
-            }
+            } => match self.eval_const_i16(expr) {
+                Ok(v) => i64::from(v),
+                Err(e)
+                    if matches!(
+                        inner.as_ref(),
+                        V2Expr::Int(..)
+                            | V2Expr::Unary {
+                                op: V2UnaryOp::Neg | V2UnaryOp::AsI16,
+                                ..
+                            }
+                            | V2Expr::Call { .. }
+                            | V2Expr::Path(..)
+                    ) =>
+                {
+                    return Err(e);
+                }
+                Err(_) => {
+                    return Err(Error::at(
+                        expr.span(),
+                        format!("{what} must be a compile-time constant"),
+                    ));
+                }
+            },
             _ => match self.literal_compare_operand(expr) {
                 Some((_, v)) => i64::from(v),
                 None => i64::from(self.eval_const_i16(expr).map_err(|_| {

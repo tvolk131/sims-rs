@@ -190,13 +190,19 @@ impl<'a> TreeLowerer<'a> {
                     return self.emit_lvalue_assign(&lval, *op, &bit.to_string());
                 }
                 // Compact in-place compound arithmetic lowering when target is Direct, alias-free,
-                // side-effect-free, and cannot trap partway through!
+                // side-effect-free, and cannot trap partway through! An `as i16` around the
+                // arithmetic adds no node.
+                let (arith, cast_at) = peel_as_i16(value);
                 if *op == V2AssignOp::Set
                     && let LValue::Direct { ref air, .. } = lval
-                    && is_compound_arith_or_neg(value)
-                    && self.can_lower_arith_in_place(air, value, false)
+                    && is_compound_arith_or_neg(arith)
+                    && self.can_lower_arith_in_place(air, arith, false)
                 {
-                    let val_ty = self.lower_arith_into_dest(value, air, false)?;
+                    let mut val_ty = self.lower_arith_into_dest(arith, air, false)?;
+                    if let Some(at) = cast_at {
+                        self.check_as_i16_source(at, &val_ty)?;
+                        val_ty = ValueType::I16;
+                    }
                     if !types_compatible_for_assign(&target_ty, &val_ty) {
                         return Err(Error::at(
                             *span,
@@ -2148,4 +2154,19 @@ fn air_writes_cell(air: &str, cell: &str) -> bool {
         let is_dest = air[..at].trim_end().ends_with("dest:");
         before_ok && (WRITES.contains(&op) || is_dest)
     })
+}
+
+/// `e as i16 as i16 ..` → `e` and the span of the outermost cast, if there is one.
+fn peel_as_i16(mut expr: &V2Expr) -> (&V2Expr, Option<Span>) {
+    let mut at = None;
+    while let V2Expr::Unary {
+        span,
+        op: V2UnaryOp::AsI16,
+        inner,
+    } = expr
+    {
+        at.get_or_insert(*span);
+        expr = inner;
+    }
+    (expr, at)
 }

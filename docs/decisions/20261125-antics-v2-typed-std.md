@@ -50,9 +50,10 @@ name (`parse_v2_std_file`).
 ## Decision 2: zero-cost conversions
 
 - **`expr as i16`** is a postfix unary (`V2UnaryOp::AsI16`).
-  - It accepts `i16`, enums, bitflags and constant `bool`s. A runtime `bool` is refused, because a
-    bool word may hold any nonzero value; write `if b { 1 } else { 0 }`.
-  - A chain `x as i16 as i16` is one node.
+  - It accepts `i16`, enums, bitflags and constant `bool`s (literals, bool params, constant
+    bindings, and `!`, `&&`, `||` of those, with both operands constant). A runtime `bool` is
+    refused, because a bool word may hold any nonzero value; write `if b { 1 } else { 0 }`.
+  - A chain `x as i16 as i16` is one node, and `(a + b) as i16` stores in place like `a + b`.
   - It rejects object handles, so `stack_obj as i16` is an error.
   - Const evaluation folds it.
   - Only `i16` is accepted as a target: `as u8` is a parse error.
@@ -63,8 +64,9 @@ name (`parse_v2_std_file`).
 
 Neither adds a node, and a comparison reads either one in place, as it reads the value it converts.
 A constant primitive operand takes a cast of a constant: `-32768 as i16`, `Direction::from_raw(1) as i16`.
-A declared callable at the same path wins over `T::from_raw`, for example an `extern mod Height`
-with a `from_raw` fn.
+Constant evaluation applies the same `from_raw` rules as value lowering (a closed enum is refused,
+and the argument is an `i16` or a `T`). An `extern mod` named like the type owns the whole
+`T::from_raw` path in every position, so its fn is called, or the call fails as that module's.
 
 ## Decision 3: engine words are lenient; engine enums are open
 
@@ -142,6 +144,9 @@ Reads of `my.data[11]`, `stack.data[11]`, `my.data[29]` and `stack.data[29]` now
 - The optimiser knows `stack_obj := my.id` as a value, so `stack_obj = sim.data[11]` is now
   optimised exactly like `stack_obj = sim.id`.
 - `sim.id`, `self.id`, `sim.room` and `self.room` keep their `.air` spellings.
+- This is the one deliberate byte change: an existing source that reads a numbered id or room word
+  may now build fewer nodes, exactly as its named spelling always did. The open pack has no such
+  read and stays byte-identical.
 
 Tests compare the `.iff` bytes of named and numbered sources.
 
@@ -173,7 +178,9 @@ Changes to the existing entries:
 
 One compatibility edge: a file that has both `use std::globals::*;` and a local
 `extern mod globals` declaring one of the 45 new trees with another ABI is now refused, because
-the merge sees one tree called two ways. No file in the repository does this. The lift already puts
+the merge sees one tree called two ways. This is the existing rule for the 17 original trees
+(`v2_rust_syntax` tests it); this change only widens it to the new ones. No file in the repository
+does this. The lift already puts
 such trees in `more_globals`, and `duplicate_std_global` points at the local declaration. The fix
 is to rename the local block.
 

@@ -679,6 +679,9 @@ impl<'a> TreeLowerer<'a> {
                 }
                 // `e as i16`: the operand of `e` itself, retyped (no `.air` nodes).
                 V2UnaryOp::AsI16 => {
+                    if let Some(b) = self.try_eval_cast_bool(inner) {
+                        return Ok((i16::from(b).to_string(), ValueType::I16));
+                    }
                     let (air, ty) = self.lower_value_expr(inner)?;
                     self.check_as_i16_source(*span, &ty)?;
                     // A bool word may hold any nonzero value (a visitor's person word 32 is
@@ -1152,8 +1155,13 @@ impl<'a> TreeLowerer<'a> {
         if method != "from_raw" {
             return None;
         }
-        // A declared callable of that path (an `extern mod` named like the type) wins.
-        if matches!(self.resolve_callable(callee, callee.span()), Ok(Some(_))) {
+        // An `extern mod` named like the type owns the path, in every position: the call
+        // then resolves (or fails) as that module's fn.
+        if self
+            .env
+            .lookup_extern_mod(&self.owner_module, tname, self.in_object_scope)
+            .is_some()
+        {
             return None;
         }
         match self
@@ -1180,7 +1188,21 @@ impl<'a> TreeLowerer<'a> {
         type_args: &[V2Type],
         args: &[CallArg],
     ) -> Result<(String, ValueType)> {
-        let name = self.env.display_value_type(&target);
+        self.check_from_raw_call(span, &target, type_args, args)?;
+        let (air, ty) = self.lower_value_expr(&args[0].value)?;
+        self.check_from_raw_arg(&args[0].value, &target, &ty)?;
+        Ok((air, target))
+    }
+
+    /// The shape rules of `T::from_raw(..)`, shared by value lowering and constant evaluation.
+    pub(super) fn check_from_raw_call(
+        &self,
+        span: Span,
+        target: &ValueType,
+        type_args: &[V2Type],
+        args: &[CallArg],
+    ) -> Result<()> {
+        let name = self.env.display_value_type(target);
         if !type_args.is_empty() || args.len() != 1 || args[0].name.is_some() {
             return Err(Error::at(
                 span,
@@ -1189,7 +1211,7 @@ impl<'a> TreeLowerer<'a> {
         }
         // A user enum is closed: a `match` lists its variants with no `_`, so a word with no
         // variant must not reach one.
-        if let ValueType::Enum(key) = &target
+        if let ValueType::Enum(key) = target
             && !is_engine_enum_key(key)
         {
             return Err(Error::at(
@@ -1199,17 +1221,27 @@ impl<'a> TreeLowerer<'a> {
                 ),
             ));
         }
-        let (air, ty) = self.lower_value_expr(&args[0].value)?;
-        if ty != ValueType::I16 && ty != target {
+        Ok(())
+    }
+
+    /// `T::from_raw(e)` takes an `i16` or a `T`.
+    pub(super) fn check_from_raw_arg(
+        &self,
+        arg: &V2Expr,
+        target: &ValueType,
+        ty: &ValueType,
+    ) -> Result<()> {
+        if *ty != ValueType::I16 && ty != target {
             return Err(Error::at(
-                args[0].value.span(),
+                arg.span(),
                 format!(
-                    "'{name}::from_raw' expects an i16, found '{}' (use 'as i16' first)",
-                    self.env.display_value_type(&ty)
+                    "'{}::from_raw' expects an i16, found '{}' (use 'as i16' first)",
+                    self.env.display_value_type(target),
+                    self.env.display_value_type(ty)
                 ),
             ));
         }
-        Ok((air, target))
+        Ok(())
     }
 
     /// `e as i16` accepts integers, bools, enums and bitflags; object handles already

@@ -586,6 +586,30 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// The constant bool that `b as i16` converts: a literal, a constant binding, a bool param,
+    /// and `!`, `&&` and `||` of those. Unlike a condition, both operands of `&&` and `||` must
+    /// be constant, so an unresolved name is never folded away.
+    pub(super) fn try_eval_cast_bool(&self, expr: &V2Expr) -> Option<bool> {
+        match expr {
+            V2Expr::Unary {
+                op: V2UnaryOp::Not,
+                inner,
+                ..
+            } => self.try_eval_cast_bool(inner).map(|b| !b),
+            V2Expr::Binary {
+                lhs,
+                op: op @ (V2BinOp::And | V2BinOp::Or),
+                rhs,
+                ..
+            } => {
+                let (l, r) = (self.try_eval_cast_bool(lhs)?, self.try_eval_cast_bool(rhs)?);
+                Some(if *op == V2BinOp::And { l && r } else { l || r })
+            }
+            V2Expr::Bool(..) | V2Expr::Ident(..) => self.try_eval_const_bool_inner(expr, true),
+            _ => None,
+        }
+    }
+
     pub(super) fn eval_const_bool_required(&self, expr: &V2Expr, span: Span) -> Result<bool> {
         self.try_const_bool_arg(expr).ok_or_else(|| {
             Error::at(
@@ -604,6 +628,15 @@ impl<'a> TreeLowerer<'a> {
                 op: V2UnaryOp::Neg,
                 inner,
             } => {
+                // `-32768` is a literal, though `32768` alone is out of range.
+                if let V2Expr::Int(_, v) = inner.as_ref() {
+                    return v
+                        .checked_neg()
+                        .and_then(|x| i16::try_from(x).ok())
+                        .ok_or_else(|| {
+                            Error::at(*span, format!("negated integer -{v} out of i16 range"))
+                        });
+                }
                 let inner_v = self.eval_const_i16(inner)?;
                 inner_v
                     .checked_neg()
@@ -621,19 +654,28 @@ impl<'a> TreeLowerer<'a> {
                 if let Some(v) = self.try_eval_any_const_enum(inner)? {
                     return Ok(v);
                 }
+                if let Some(b) = self.try_eval_cast_bool(inner) {
+                    return Ok(i16::from(b));
+                }
                 match inner.as_ref() {
-                    V2Expr::Bool(_, b) => Ok(i16::from(*b)),
-                    // `T::from_raw(c) as i16` is `c`.
+                    // `T::from_raw(c) as i16` is `c`, under the rules of the value path.
                     V2Expr::Call {
+                        span,
                         callee,
                         type_args,
                         args,
-                        ..
-                    } if type_args.is_empty()
-                        && matches!(args.as_slice(), [a] if a.name.is_none())
-                        && self.raw_conversion_target(callee).is_some() =>
-                    {
-                        self.eval_const_i16(&args[0].value)
+                    } if let Some(target) = self.raw_conversion_target(callee) => {
+                        self.check_from_raw_call(*span, &target, type_args, args)?;
+                        let arg = &args[0].value;
+                        if let Some((key, mask, _)) = self.try_eval_any_const_bitflag(arg)? {
+                            self.check_from_raw_arg(arg, &target, &ValueType::Bitflags(key))?;
+                            return Ok(mask);
+                        }
+                        if let Some((key, v)) = self.try_eval_keyed_const_enum(arg)? {
+                            self.check_from_raw_arg(arg, &target, &ValueType::Enum(key))?;
+                            return Ok(v);
+                        }
+                        self.eval_const_i16(arg)
                     }
                     _ => self.eval_const_i16(inner),
                 }
