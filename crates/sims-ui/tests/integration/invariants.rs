@@ -1,7 +1,7 @@
 //! Resize-continuity, radio-group mutual exclusion, Buy strip height, and
 //! real-install Build Mode catalog asset-sanity invariant tests.
 
-mod common;
+use crate::common;
 
 use sims_content::{Catalog, Index, Install};
 use sims_ui::art::Art;

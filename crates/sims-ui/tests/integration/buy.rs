@@ -1,7 +1,7 @@
 //! Asset-backed Buy Mode catalog & popup chrome tests against a real Complete
 //! Collection install (`SIMS_INSTALL`).
 
-mod common;
+use crate::common;
 
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_content::{Catalog, Index, Install};

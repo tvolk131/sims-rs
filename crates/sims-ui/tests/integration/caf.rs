@@ -1,7 +1,7 @@
 //! Unit and live-install tests for the Create-a-Family (`cWinEditFamily`) and
 //! Create-a-Sim (`cWinEditPerson`) UI screens.
 
-mod common;
+use crate::common;
 
 use sims_content::Install;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};

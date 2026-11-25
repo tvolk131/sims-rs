@@ -1,7 +1,7 @@
 //! Asset-backed tests for the Options control panel (`cWinOptions`).
 //! Needs the game: set `SIMS_INSTALL` to the install folder.
 
-mod common;
+use crate::common;
 
 use sims_content::Install;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};

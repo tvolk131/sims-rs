@@ -1,7 +1,7 @@
 //! A dialog drawn from a real script's strings. Needs the game: set
 //! `SIMS_INSTALL` to the install folder.
 
-mod common;
+use crate::common;
 
 use sha2::{Digest, Sha256};
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
