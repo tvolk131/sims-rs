@@ -979,6 +979,7 @@ fn lower_object_with(
         strings,
         string_names,
         dialog_strings,
+        inherit_calls: RefCell::default(),
         text_reads,
         text_reads_besides_me,
         reads_global_34,
@@ -1113,6 +1114,10 @@ fn lower_object_with(
         ctx.explicit_stack_obj = init_blocks
             .iter()
             .any(|b| stack_ops.in_stmts(&b.stmts, &env, &b.owner_module, true));
+        let mut stack_ops = ExplicitStackOps::for_tree();
+        ctx.reassigns_stack_obj = init_blocks
+            .iter()
+            .any(|b| stack_ops.in_stmts(&b.stmts, &env, &b.owner_module, true));
         // Set functional score data words first (e.g., `my.prep_score := ...`).
         for func in &functionals {
             if let Some(score_expr) = &func.decl.score {
@@ -1216,6 +1221,9 @@ fn lower_object_with(
         ctx.explicit_stack_obj = main_block.as_ref().is_some_and(|b| {
             ExplicitStackOps::default().in_stmts(&b.stmts, &env, &b.owner_module, true)
         });
+        ctx.reassigns_stack_obj = main_block.as_ref().is_some_and(|b| {
+            ExplicitStackOps::for_tree().in_stmts(&b.stmts, &env, &b.owner_module, true)
+        });
         if let Some(blk) = &main_block {
             ctx.with_owner_module(&blk.owner_module, |c| {
                 c.push_scope(ScopeFrame::block());
@@ -1265,6 +1273,10 @@ fn lower_object_with(
         ctx.explicit_stack_obj = blocks
             .iter()
             .any(|b| stack_ops.in_stmts(&b.stmts, &env, &b.owner_module, true));
+        let mut stack_ops = ExplicitStackOps::for_tree();
+        ctx.reassigns_stack_obj = blocks
+            .iter()
+            .any(|b| stack_ops.in_stmts(&b.stmts, &env, &b.owner_module, true));
         for blk in blocks {
             ctx.with_owner_module(&blk.owner_module, |c| {
                 c.push_scope(ScopeFrame::block());
@@ -1306,7 +1318,7 @@ fn lower_object_with(
                 gid,
                 &label,
                 guard,
-                &func.decl.params,
+                Some(&func.decl.params),
             )?;
             Some(gid)
         } else {
@@ -1347,6 +1359,9 @@ fn lower_object_with(
             &func.owner_module,
             needs_self_save,
         );
+        ctx.object_reachable = true;
+        ctx.reassigns_stack_obj =
+            ExplicitStackOps::for_tree().in_stmts(&func.decl.body, &env, &func.owner_module, true);
         ctx.begin_body(ExplicitStackOps::default().in_stmts(
             &func.decl.body,
             &env,
@@ -1498,7 +1513,7 @@ fn lower_object_with(
                 gid,
                 &glabel,
                 guard,
-                &[],
+                None,
             )?;
             Some(gid)
         } else {
@@ -1520,6 +1535,12 @@ fn lower_object_with(
             },
             &inter.owner_module,
             needs_self_save,
+        );
+        ctx.reassigns_stack_obj = ExplicitStackOps::for_tree().in_stmts(
+            &effective_run_body,
+            &env,
+            &inter.owner_module,
+            true,
         );
         ctx.begin_body(ExplicitStackOps::default().in_stmts(
             &effective_run_body,
@@ -1571,6 +1592,7 @@ fn lower_object_with(
     for t in &tree_members {
         emit_standalone_tree(&mut trees_air, &env, t)?;
     }
+    check_inherit_calls(&env.inherit_calls.borrow())?;
 
     // 8g. Assemble final `.air` output: header + BCON 4096 + STR# tables (including auto-interned 301) + trees.
     let mut air = String::new();

@@ -47,6 +47,152 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// Returns `true` iff reading `expr` may fault at runtime (`sims-vm` `memory.rs`): a read
+    /// through the stack object, a foreign handle, a neighbor or a definition, `self` through a
+    /// cursor the tree may move, an index outside what every such object has, or a person word
+    /// of a runner that may not be a Sim. Locals, temps, constants and the cells
+    /// [`Self::safe_cell_air`] accepts never fault.
+    pub(super) fn expr_may_fault_read(&self, expr: &V2Expr) -> bool {
+        if self.expr_may_trap_arith(expr) {
+            return true;
+        }
+        match expr {
+            V2Expr::Int(..)
+            | V2Expr::Bool(..)
+            | V2Expr::Str(..)
+            | V2Expr::Path(..)
+            | V2Expr::Ident(..) => false,
+            V2Expr::Binary { lhs, rhs, .. } => {
+                self.expr_may_fault_read(lhs) || self.expr_may_fault_read(rhs)
+            }
+            V2Expr::Unary { inner, .. } => self.expr_may_fault_read(inner),
+            V2Expr::Tuple(_, elems) => elems.iter().any(|e| self.expr_may_fault_read(e)),
+            V2Expr::Field { .. } | V2Expr::Index { .. } => {
+                if matches!(self.bcon_field_ref(expr), Some(Ok((_, Some(_))))) {
+                    return false;
+                }
+                !self
+                    .known_cell_air(expr)
+                    .is_some_and(|air| self.safe_cell_air(&air))
+            }
+            _ => true,
+        }
+    }
+
+    /// The `.air` cell a plain field or constant-index read names, when it is one of the running
+    /// object's, the Sim's, a temp, a parameter or a global (`None` for anything else).
+    fn known_cell_air(&self, expr: &V2Expr) -> Option<String> {
+        match expr {
+            V2Expr::Field { base, field, .. } => match base.as_ref() {
+                V2Expr::Ident(_, b) if self.is_self_ident(b) => {
+                    let p = self.self_prefix();
+                    if let Some(st) = self.env.states.get(field) {
+                        return Some(format!("{p}.attr[{}]", st.attr_index));
+                    }
+                    let w = match field.as_str() {
+                        "graphic" => 0,
+                        "prep_score" => 31,
+                        "cook_score" => 32,
+                        "in_use" => 25,
+                        "id" => 11,
+                        "room" => 29,
+                        other => object_data_word(other)?.index,
+                    };
+                    Some(format!("{p}.data[{w}]"))
+                }
+                V2Expr::Ident(_, b) if self.is_my_ident(b) => Some(match field.as_str() {
+                    "id" => "my.data[11]".to_owned(),
+                    "priority" => "my.person[33]".to_owned(),
+                    "room" => "my.data[29]".to_owned(),
+                    "age" => "my.person[58]".to_owned(),
+                    "visitor_kind" => "my.person[32]".to_owned(),
+                    other => match (sim_person_word(other), object_data_word(other)) {
+                        (Some(w), _) => format!("my.person[{}]", w.index),
+                        (None, Some(w)) => format!("my.data[{}]", w.index),
+                        (None, None) => return None,
+                    },
+                }),
+                V2Expr::Field {
+                    base: root,
+                    field: group,
+                    ..
+                } if matches!(root.as_ref(), V2Expr::Ident(_, r) if self.is_my_ident(r))
+                    && matches!(group.as_str(), "motive" | "skill") =>
+                {
+                    let air = canonical_air_cell(&format!("my.{group}.{field}"));
+                    (air != format!("my.{group}.{field}")).then_some(air)
+                }
+                _ => None,
+            },
+            V2Expr::Index { base, index, .. } => {
+                let i = self.eval_const_i16(index).ok()?;
+                match base.as_ref() {
+                    V2Expr::Ident(_, b)
+                        if matches!(b.as_str(), "temp" | "global" | "param")
+                            && self.lookup_var(b).is_none() =>
+                    {
+                        Some(format!("{b}[{i}]"))
+                    }
+                    V2Expr::Field {
+                        base: root, field, ..
+                    } if matches!(field.as_str(), "attr" | "data" | "person") => {
+                        let V2Expr::Ident(_, r) = root.as_ref() else {
+                            return None;
+                        };
+                        let p = if self.is_self_ident(r) {
+                            self.self_prefix()
+                        } else if self.is_my_ident(r) {
+                            "my"
+                        } else {
+                            return None;
+                        };
+                        Some(format!("{p}.{field}[{i}]"))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether reading the `.air` cell `air` can never fault (`sims-vm` `memory.rs`):
+    /// - `temp[0..8]`, `param[i]` within the frame's arguments, `global[0..32]` (older saves
+    ///   keep 32);
+    /// - the running object's attributes it declares, and its data words below 64 (the
+    ///   smallest object record); through `stack.` only in a Sim tree that never moves the
+    ///   cursor, where `stack` is that object;
+    /// - the runner's data words below 64;
+    /// - the Sim's person words below 80 (older saves keep 80) and motives, only in a Sim tree,
+    ///   whose runner is a Sim.
+    pub(super) fn safe_cell_air(&self, air: &str) -> bool {
+        let air = canonical_air_cell(air);
+        let Some((head, rest)) = air.split_once('[') else {
+            return false;
+        };
+        let Some(i) = rest.strip_suffix(']').and_then(|n| n.parse::<usize>().ok()) else {
+            return false;
+        };
+        // An inherit tree's or a functional's runner may be an object.
+        let sim_runner = matches!(self.tree_ctx, TreeContext::SimOnObject { .. })
+            && !self.inherit_tree
+            && !self.object_reachable;
+        let cursor_is_self = sim_runner && !(self.explicit_stack_obj || self.cursor_may_be_moved());
+        let own = |prefix: &str| prefix == self.self_prefix() && (prefix == "my" || cursor_is_self);
+        let declared_attr = self.env.states.values().any(|s| s.attr_index == i);
+        match head {
+            "temp" => i < 8,
+            "param" => i < self.frame_args,
+            "global" => i < 32,
+            "my.attr" => own("my") && declared_attr,
+            "stack.attr" => own("stack") && declared_attr,
+            "my.data" => i < 64,
+            "stack.data" => own("stack") && i < 64,
+            "my.person" => sim_runner && i < 80,
+            "my.motive" => sim_runner && i < 16,
+            _ => false,
+        }
+    }
+
     /// Returns `true` iff `expr` can be lowered directly in-place into `dst_air` without aliasing,
     /// partial writes on trap, observable VM write side effects, or premature motive/skill clamping!
     pub(super) fn can_lower_arith_in_place(
@@ -63,6 +209,9 @@ impl<'a> TreeLowerer<'a> {
             || canon_dst.starts_with("my.data[")
             || canon_dst.starts_with("stack.data[")
             || canon_dst.starts_with("global[")
+            // A temp-indexed or other scope cell: its word is not known here, so it may alias
+            // an operand or be a word with write side effects.
+            || canon_dst.starts_with("scope(")
         {
             return false;
         }
@@ -70,6 +219,23 @@ impl<'a> TreeLowerer<'a> {
             return false;
         }
         let (base, ops) = flatten_arith_chain(expr);
+        // In place, `dst := base; dst op= rhs; ...` has already written `dst` when a later operand
+        // read faults (an invalid stack object, say), leaving the observable cell half-updated.
+        if !is_fresh_local {
+            let neg_inner = match base {
+                V2Expr::Unary {
+                    op: V2UnaryOp::Neg,
+                    inner,
+                    ..
+                } => Some(inner.as_ref()),
+                _ => None,
+            };
+            if neg_inner.is_some_and(|e| self.expr_may_fault_read(e))
+                || ops.iter().any(|(_, rhs)| self.expr_may_fault_read(rhs))
+            {
+                return false;
+            }
+        }
         if ops.is_empty() {
             if let V2Expr::Unary {
                 op: V2UnaryOp::Neg,
@@ -588,6 +754,27 @@ impl<'a> TreeLowerer<'a> {
                         }
                     }
                 }
+                // `h.neighbor.<name>`: the neighborhood record the handle names, read through
+                // the stack object.
+                if let V2Expr::Field {
+                    base: root,
+                    field: middle,
+                    ..
+                } = base.as_ref()
+                    && middle == "neighbor"
+                    && let V2Expr::Ident(_, rname) = root.as_ref()
+                    && !self.handle_has_state(rname, "neighbor")
+                {
+                    let Some((cell, ty)) = neighbor_cell(field) else {
+                        return Err(Error::at(
+                            *span,
+                            format!(
+                                "unknown neighbor field '{field}' (expected person_on_lot, in_selected_family, age, friend_count, family_house, family_friend_count, a named person word (family, gender_kind, job_type, fame, ...), field[i], or person[i])"
+                            ),
+                        ));
+                    };
+                    return self.read_neighbor_cell(rname, *span, &cell, ty);
+                }
                 if let V2Expr::Ident(_, bname) = base.as_ref()
                     && let Some(word) = definition_field(field)
                     && !self.handle_has_state(bname, field)
@@ -630,6 +817,35 @@ impl<'a> TreeLowerer<'a> {
                         ),
                     )),
                 }
+            }
+            // `h.neighbor.field[i]` and `h.neighbor.person[i]`.
+            V2Expr::Index { span, base, index }
+                if matches!(base.as_ref(), V2Expr::Field { base: mid, field, .. }
+                    if neighbor_indexed_scope(field).is_some()
+                        && matches!(mid.as_ref(), V2Expr::Field { base: root, field: m, .. }
+                            if m == "neighbor"
+                                && matches!(root.as_ref(), V2Expr::Ident(_, r) if !self.handle_has_state(r, "neighbor")))) =>
+            {
+                let V2Expr::Field {
+                    base: mid, field, ..
+                } = base.as_ref()
+                else {
+                    unreachable!("matched above");
+                };
+                let V2Expr::Field { base: root, .. } = mid.as_ref() else {
+                    unreachable!("matched above");
+                };
+                let V2Expr::Ident(_, rname) = root.as_ref() else {
+                    unreachable!("matched above");
+                };
+                let (scope, hi) = neighbor_indexed_scope(field).expect("matched above");
+                let i = self.eval_builtin_int(index, &format!("neighbor.{field} index"), 0, hi)?;
+                self.read_neighbor_cell(
+                    rname,
+                    *span,
+                    &format!("scope({scope}, {i})"),
+                    ValueType::I16,
+                )
             }
             V2Expr::Index { span, base, index }
                 if matches!(base.as_ref(), V2Expr::Ident(_, n) if n == "local")
@@ -939,7 +1155,7 @@ impl<'a> TreeLowerer<'a> {
         let field = self.eval_builtin_int(&field_arg.value, "job_data field", 0, 32767)?;
         // The career's staging writes `temp[0]` first: a level that reads it (job data reads
         // both temps) is copied before.
-        if level.contains("temp[0]") || level.contains("scope(33,") {
+        if reads_temp0(&level) {
             level = self.snapshot_operand(level, "job_level");
         }
         self.line(format!("temp[0] := {career};"));
@@ -1041,6 +1257,26 @@ impl<'a> TreeLowerer<'a> {
             return Ok(None);
         };
         self.read_lvalue(&lval).map(Some)
+    }
+
+    /// A neighbor cell (`scope(24, ..)`, `scope(32, ..)`), read through the stack object like a
+    /// definition cell.
+    fn read_neighbor_cell(
+        &mut self,
+        handle: &str,
+        span: Span,
+        cell: &str,
+        ty: ValueType,
+    ) -> Result<(String, ValueType)> {
+        self.read_stack_object_cell(handle, span, cell, ty)?
+            .ok_or_else(|| {
+                Error::at(
+                    span,
+                    format!(
+                        "'{handle}.neighbor' needs an object handle holding a neighbor ('stack_obj' after 'set_to_next(neighbor)', or an object variable)"
+                    ),
+                )
+            })
     }
 
     pub(super) fn lower_job_operand(&mut self, key: &str, arg: &CallArg) -> Result<String> {

@@ -264,3 +264,153 @@ pub(super) fn validate_raw_air_stmts(
     }
     Ok(())
 }
+
+/// Whether a raw block leaves the tree's node layout free for the backend optimizer
+/// (`TreeLowerer::keep_layout` stays off for it). The block must be built only from text the
+/// lowering itself emits, touching no frame word and reading no instruction bytes beyond its own:
+///
+/// - calls are `call N(temps)` (the temps pass-through ABI: the callee reads no literal words, so
+///   none from the next instruction, and has its own frame);
+/// - the only primitives are ones that read neither the caller's frame words nor bytes past their
+///   own operands (`find_best_object`, `run_functional_tree`, `play_sound`; checked in `sims-vm`);
+/// - every other word is control flow (`if`, `else`, `while`, `break`, `continue`, `return`) or a
+///   temp, parameter, global, own, Sim or stack-object cell, or a primitive's named argument: no
+///   `local[N]` or named local (so no frame word, and no name the optimizer could rename or
+///   coalesce), no `let`/`local`/`const` declaration, no string, no node label or `->` graph,
+///   no `scope(..)`/`expr(..)`/`pad` spelling.
+///
+/// Such a block's text is one the lowering could have produced, so whatever the optimizer
+/// proves of lowered text holds for it. Anything else keeps the whole tree's layout.
+pub(super) fn raw_block_is_layout_free(code: &str) -> bool {
+    use crate::lexer::TokenKind as T;
+    const WORDS: &[&str] = &[
+        "if",
+        "else",
+        "while",
+        "break",
+        "continue",
+        "return",
+        "true",
+        "false",
+        "error",
+        "temp",
+        "param",
+        "global",
+        "my",
+        "stack",
+        "attr",
+        "data",
+        "person",
+        "stack_obj",
+        "flag_set",
+        "flag_clear",
+        "flag_test",
+    ];
+    const PRIMS: &[&str] = &["find_best_object", "run_functional_tree", "play_sound"];
+    // The line printer strips only `//` comments.
+    if code.contains("/*") || code.contains('#') {
+        return false;
+    }
+    let Ok(tokens) = crate::lexer::tokenize(code) else {
+        return false;
+    };
+    let kind = |i: usize| tokens.get(i).map(|t| &t.kind);
+    let mut depth = 0i32;
+    let mut i = 0;
+    while let Some(k) = kind(i) {
+        match k {
+            T::Eof => break,
+            T::Label(_) | T::Arrow | T::Str(_) => return false,
+            T::LParen => depth += 1,
+            T::RParen => depth -= 1,
+            T::Colon if depth == 0 => return false,
+            T::Ident(w) if w == "call" => {
+                let temps_call = matches!(kind(i + 1), Some(T::Int(_)))
+                    && kind(i + 2) == Some(&T::LParen)
+                    && matches!(kind(i + 3), Some(T::Ident(t)) if t == "temps")
+                    && kind(i + 4) == Some(&T::RParen);
+                if !temps_call {
+                    return false;
+                }
+                i += 5;
+                continue;
+            }
+            T::Ident(w) => {
+                let ok = if kind(i + 1) == Some(&T::LParen) {
+                    PRIMS.contains(&w.as_str())
+                } else if depth > 0 && kind(i + 1) == Some(&T::Colon) {
+                    // A primitive's named argument (`flags: 0`).
+                    true
+                } else {
+                    WORDS.contains(&w.as_str())
+                };
+                if !ok {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    depth == 0
+}
+
+/// A layout-free raw block ([`raw_block_is_layout_free`]) as the lowering prints its own code:
+/// one statement per line, `{` ending its line, `}` alone (or `} else {`), comments dropped, so
+/// the backend passes parse it like lowered text. The block has no strings, so every `{`, `}`
+/// and `;` is punctuation.
+pub(super) fn layout_free_raw_lines(code: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let flush = |cur: &mut String, lines: &mut Vec<String>| {
+        let t = cur.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !t.is_empty() {
+            lines.push(t);
+        }
+        cur.clear();
+    };
+    for raw_line in code.lines() {
+        let line = raw_line.split("//").next().unwrap_or("");
+        for c in line.chars() {
+            match c {
+                '{' | ';' => {
+                    cur.push(c);
+                    flush(&mut cur, &mut lines);
+                }
+                '}' => {
+                    flush(&mut cur, &mut lines);
+                    lines.push("}".to_owned());
+                }
+                _ => cur.push(c),
+            }
+        }
+        cur.push(' ');
+    }
+    flush(&mut cur, &mut lines);
+    let mut joined: Vec<String> = Vec::with_capacity(lines.len());
+    for l in lines {
+        if l.starts_with("else")
+            && let Some(prev) = joined.last_mut()
+            && prev == "}"
+        {
+            *prev = format!("}} {l}");
+        } else {
+            joined.push(l);
+        }
+    }
+    // Nested lines indent like lowered code (the backend passes ignore indentation).
+    let mut depth = 0usize;
+    joined
+        .into_iter()
+        .map(|l| {
+            if l.starts_with('}') {
+                depth = depth.saturating_sub(1);
+            }
+            let out = format!("{}{l}", "    ".repeat(depth));
+            if l.ends_with('{') {
+                depth += 1;
+            }
+            out
+        })
+        .collect()
+}

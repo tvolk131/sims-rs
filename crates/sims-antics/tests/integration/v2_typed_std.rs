@@ -189,10 +189,11 @@ fn typed_engine_fields_lower_to_their_words() {
         &air,
         &[
             "stack.data[1] := 4;",
-            "stack.attr[0] := stack.data[27];",
-            "stack.attr[0] += stack.data[28];",
-            "stack.attr[0] := stack.data[41];",
-            "stack.attr[0] += stack.data[59];",
+            // The tree moves the cursor, so `self` arithmetic is staged (PR I-4).
+            "let __arith_0 = stack.data[27];",
+            "__arith_0 += stack.data[28];",
+            "__arith_0 := stack.data[41];",
+            "__arith_0 += stack.data[59];",
             "if stack.data[40] flag_test 11 {",
             "stack.data[43] flag_clear 4;",
             "stack.data[13] flag_set 6;",

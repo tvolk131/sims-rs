@@ -67,6 +67,16 @@ impl<'a> TreeLowerer<'a> {
                         || self.is_bcon_table_ref(bname)
                         || bname == "stack_obj"
                 }
+                // A neighbor cell reads through the stack object, like a definition cell.
+                V2Expr::Field {
+                    base: root,
+                    field: middle,
+                    ..
+                } if middle == "neighbor" => {
+                    neighbor_cell(field).is_some()
+                        && matches!(root.as_ref(), V2Expr::Ident(_, r)
+                            if !self.handle_has_state(r, "neighbor") && self.definition_cell_in_place(r))
+                }
                 V2Expr::Field { base: root, .. } => {
                     matches!(root.as_ref(), V2Expr::Ident(_, rname) if self.is_my_ident(rname))
                 }
@@ -85,6 +95,15 @@ impl<'a> TreeLowerer<'a> {
                         base: root, field, ..
                     } if field == "has_function" => {
                         matches!(root.as_ref(), V2Expr::Ident(_, r) if self.definition_cell_in_place(r))
+                    }
+                    V2Expr::Field {
+                        base: mid, field, ..
+                    } if neighbor_indexed_scope(field).is_some()
+                        && matches!(mid.as_ref(), V2Expr::Field { field: m, .. } if m == "neighbor") =>
+                    {
+                        matches!(mid.as_ref(), V2Expr::Field { base: root, .. }
+                            if matches!(root.as_ref(), V2Expr::Ident(_, r)
+                                if !self.handle_has_state(r, "neighbor") && self.definition_cell_in_place(r)))
                     }
                     V2Expr::Field {
                         base: root, field, ..
@@ -1154,9 +1173,97 @@ impl<'a> TreeLowerer<'a> {
             self.emit_bool_into_local(expr, &local)?;
             (format!("{local} != 0"), None)
         };
+        self.emit_test_edges(&test, restore.as_ref(), terminal, edge)
+    }
+
+    /// A helper's `return <cond>;` routing the caller's branch
+    /// ([`Self::emit_inline_bool_edges`]): when a constant condition's arm exits the tree with a
+    /// result (`return true;` / `return false;`, as `return h();` gives), a test node still
+    /// leaves the condition as the last result, as a non-constant condition's test does and as
+    /// a called tree's return would, not the result of the node before it. Ending an active
+    /// action records that result (`release_use`).
+    ///
+    /// The node is left out when the node before already left the value
+    /// ([`Self::last_node_result`]), and for any other arm: its own nodes, or the caller's code
+    /// after the call, decide the last result (as they do after a call node). A raw block's
+    /// layout keeps the test in every case. The test is `if 1 == 1 { <arm> }` for `true` and
+    /// `if 1 == 0 { } <arm>` for `false`, so only the taken arm is emitted.
+    pub(super) fn emit_inline_return_edges(
+        &mut self,
+        expr: &V2Expr,
+        terminal: bool,
+        arms: (&str, &str),
+        edge: &mut dyn FnMut(&mut Self, bool) -> Result<()>,
+    ) -> Result<()> {
+        let value = match self.try_eval_const_bool(expr) {
+            Some(value) => Some(value),
+            None => match self.try_fold_literal_cond(expr) {
+                Some(value) => {
+                    self.check_folded_cond(expr)?;
+                    Some(value)
+                }
+                None => None,
+            },
+        };
+        let Some(value) = value else {
+            return self.emit_inline_bool_edges(expr, terminal, edge);
+        };
+        let taken = if value { arms.0 } else { arms.1 };
+        let exits_with_result = taken
+            .lines()
+            .next()
+            .is_some_and(|l| matches!(l.trim(), "return true;" | "return false;"));
+        if !exits_with_result || self.last_node_result() == Some(value) {
+            return edge(self, value);
+        }
+        if value {
+            self.line("if 1 == 1 {".to_owned());
+            self.em.indent();
+            edge(self, true)?;
+            self.em.dedent();
+            self.line("}".to_owned());
+        } else {
+            self.line("if 1 == 0 {".to_owned());
+            self.line("}".to_owned());
+            edge(self, false)?;
+        }
+        Ok(())
+    }
+
+    /// The last result the node just emitted leaves on the straight-line path to the next
+    /// line, when the text shows it: `true` after a cell assignment (Expression's assignments
+    /// return true); the branch's polarity first thing in an `if <test> {` arm (a node branches on
+    /// its result). `None` when unknown.
+    fn last_node_result(&self) -> Option<bool> {
+        let line = self
+            .em
+            .text()
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())?
+            .trim();
+        if is_cell_assignment(line) {
+            return Some(true);
+        }
+        let test = line.strip_prefix("if ")?.strip_suffix(" {")?;
+        if test.contains("&&") || test.contains("||") {
+            return None;
+        }
+        Some(!test.starts_with('!'))
+    }
+
+    /// `if <test> { <true edge> } <false edge>` (or an `else` arm when not `terminal`); each
+    /// edge first restores the stack object to `restore` when given.
+    fn emit_test_edges(
+        &mut self,
+        test: &str,
+        restore: Option<&StackRestore>,
+        terminal: bool,
+        edge: &mut dyn FnMut(&mut Self, bool) -> Result<()>,
+    ) -> Result<()> {
         self.line(format!("if {test} {{"));
         self.em.indent();
-        if let Some(saved) = &restore {
+        if let Some(saved) = restore {
             self.emit_stack_restore(saved);
         }
         edge(self, true)?;
@@ -1168,7 +1275,7 @@ impl<'a> TreeLowerer<'a> {
             self.line("} else {".to_owned());
             self.em.indent();
             let arm_at = self.em.mark();
-            if let Some(saved) = &restore {
+            if let Some(saved) = restore {
                 self.emit_stack_restore(saved);
             }
             edge(self, false)?;
@@ -1179,7 +1286,7 @@ impl<'a> TreeLowerer<'a> {
             self.line("}".to_owned());
             return Ok(());
         }
-        if let Some(saved) = &restore {
+        if let Some(saved) = restore {
             self.emit_stack_restore(saved);
         }
         edge(self, false)?;
@@ -1293,4 +1400,37 @@ impl<'a> TreeLowerer<'a> {
             }
         }
     }
+}
+
+/// Whether an `.air` line is an assignment (an Expression node, which returns true) to a cell
+/// other than a named local: `stack.attr[0] := 1;`, `my.motive.fun += x;`, `temp[2] := 0;`. The
+/// optimizer may drop a local's store and a `stack_obj` move, so neither counts.
+fn is_cell_assignment(line: &str) -> bool {
+    let line = line.trim();
+    let Some(body) = line.strip_suffix(';') else {
+        return false;
+    };
+    let ops = [
+        " := ",
+        " += ",
+        " -= ",
+        " *= ",
+        " /= ",
+        " %= ",
+        " &= ",
+        " |= ",
+        " ^= ",
+        " flag_set ",
+        " flag_clear ",
+    ];
+    let Some(at) = ops.iter().filter_map(|op| body.find(op)).min() else {
+        return false;
+    };
+    let lhs = &body[..at];
+    let first = lhs.split(['.', '[', '(']).next().unwrap_or("");
+    !matches!(
+        first,
+        "let" | "if" | "while" | "return" | "break" | "continue" | "stack_obj" | "local"
+    ) && !lhs.contains(' ')
+        && (lhs.contains('.') || lhs.contains('[') || lhs.starts_with("scope("))
 }

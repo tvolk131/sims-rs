@@ -40,13 +40,36 @@ impl<'a> TreeLowerer<'a> {
     pub(super) fn arg_moves_cursor(&self, expr: &V2Expr) -> bool {
         ExplicitStackOps {
             assignments: true,
+            raw_writes: true,
             ..Default::default()
         }
         .in_expr(expr, self.env, &self.owner_module, self.in_object_scope)
     }
 
+    /// Whether the cursor may rest on another object than the entry object here
+    /// ([`Self::reassigns_stack_obj`], [`Self::raw_moves_cursor`]).
+    pub(super) fn cursor_may_be_moved(&self) -> bool {
+        self.reassigns_stack_obj || self.raw_moves_cursor
+    }
+
+    /// Sets [`Self::raw_moves_cursor`] before a loop whose body (or condition) has a raw block
+    /// that may write the cursor: the next iteration runs earlier code after it. Also used for
+    /// code lowered ahead of the condition that runs first (inline branch arms).
+    pub(super) fn note_loop_raw_cursor(&mut self, cond: Option<&V2Expr>, body: &[V2Stmt]) {
+        let mut ops = ExplicitStackOps {
+            raw_writes: true,
+            ..Default::default()
+        };
+        let (env, owner, local) = (self.env, self.owner_module.clone(), self.in_object_scope);
+        if cond.is_some_and(|c| ops.in_expr(c, env, &owner, local))
+            || ops.in_stmts(body, env, &owner, local)
+        {
+            self.raw_moves_cursor = true;
+        }
+    }
+
     pub(super) fn save_stack_obj_for_move(&mut self) -> Option<String> {
-        self.explicit_stack_obj.then(|| {
+        (self.explicit_stack_obj || self.cursor_may_be_moved()).then(|| {
             let saved = self.fresh("pre_stack_obj");
             self.stack_op(mir::StackObjOp::Save(&saved));
             saved
@@ -187,6 +210,17 @@ impl<'a> TreeLowerer<'a> {
     pub(super) fn cursor_place_ok(&self, place: &V2Expr, cursor: &str) -> bool {
         match place {
             V2Expr::Field { field, .. } if field == "sprite_flags" => false,
+            // A neighbor cell reads the stack object, so only the cursor's own is in place.
+            V2Expr::Field { base, .. } if is_neighbor_place(base) => {
+                matches!(base.as_ref(), V2Expr::Field { base: root, .. }
+                    if matches!(root.as_ref(), V2Expr::Ident(_, r) if r == cursor))
+            }
+            V2Expr::Index { base, index, .. } if matches!(base.as_ref(), V2Expr::Field { base: mid, .. } if is_neighbor_place(mid)) => {
+                matches!(base.as_ref(), V2Expr::Field { base: mid, .. }
+                    if matches!(mid.as_ref(), V2Expr::Field { base: root, .. }
+                        if matches!(root.as_ref(), V2Expr::Ident(_, r) if r == cursor)))
+                    && self.cursor_expr_ok(index, cursor)
+            }
             // A definition cell reads the stack object, so only the cursor's own is in place.
             V2Expr::Field { base, field, .. }
                 if definition_field(field).is_some()
@@ -271,4 +305,10 @@ impl<'a> TreeLowerer<'a> {
             _ => false,
         }
     }
+}
+
+/// Whether `e` is `h.neighbor` (the base of a neighbor cell).
+fn is_neighbor_place(e: &V2Expr) -> bool {
+    matches!(e, V2Expr::Field { base, field, .. }
+        if field == "neighbor" && matches!(base.as_ref(), V2Expr::Ident(..)))
 }

@@ -63,7 +63,9 @@ use self::object::*;
 use self::prim_table::*;
 use self::raw::*;
 use self::schema::*;
-use self::tree::{definition_field, object_data_word, sim_person_word};
+use self::tree::{
+    definition_field, neighbor_cell, neighbor_indexed_scope, object_data_word, sim_person_word,
+};
 use self::trees::*;
 
 const MAX_INLINE_DEPTH: usize = 16;
@@ -221,6 +223,68 @@ enum CallContext {
     Extern,
 }
 
+/// What lowering saw of calls that involve `#[context(inherit)]` trees, keyed by the callee's
+/// display name (`tree 'x'`). An inherit tree may call a Sim tree by name with `me` as the Sim:
+/// the callee then runs on the inherit tree's runner and stack object, which is the Sim's
+/// context only when the inherit tree itself runs on a Sim. So such a tree, and every inherit
+/// or Sim tree that calls it, must not be called from an object's own tree or from a
+/// functional, which an object may run ([`check_inherit_calls`]).
+#[derive(Default)]
+struct InheritCallFacts {
+    /// Inherit trees that call a Sim tree by name, with that call's span.
+    calls_sim: BTreeMap<String, Span>,
+    /// Calls to an inherit or Sim tree: the calling standalone inherit or Sim tree (if the
+    /// caller is one), whether an object may be the caller's runner, the callee, whether the
+    /// callee is an inherit tree, and the call's span.
+    edges: Vec<(Option<String>, bool, String, bool, Span)>,
+}
+
+/// Refuses a call from an object's own tree or a functional to an inherit tree that runs a Sim
+/// tree on its runner (directly, or through other inherit and Sim trees), or to a Sim tree that
+/// reaches one.
+fn check_inherit_calls(facts: &InheritCallFacts) -> Result<()> {
+    let mut sim_only: BTreeMap<&str, Span> = facts
+        .calls_sim
+        .iter()
+        .map(|(k, s)| (k.as_str(), *s))
+        .collect();
+    loop {
+        let mut grew = false;
+        for (caller, _, callee, _, span) in &facts.edges {
+            if let Some(caller) = caller
+                && sim_only.contains_key(callee.as_str())
+                && !sim_only.contains_key(caller.as_str())
+            {
+                sim_only.insert(caller, *span);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    for (_, from_object, callee, callee_inherit, span) in &facts.edges {
+        if *from_object && sim_only.contains_key(callee.as_str()) {
+            return Err(Error::at(
+                *span,
+                if *callee_inherit {
+                    format!(
+                        "{callee} is 'context = inherit' but runs a Sim tree on its runner, so it \
+                         can only be called from interactions, Sim trees, or other inherit trees \
+                         (an object can run a functional)"
+                    )
+                } else {
+                    format!(
+                        "{callee} reaches a 'context = inherit' tree that runs a Sim tree on its \
+                         runner, so a functional (which an object can run) cannot call it"
+                    )
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Fully resolved call signature of an `extern mod` fn or a sibling standalone `#[bhav] fn`.
 #[derive(Debug, Clone)]
 struct CallableSig {
@@ -299,6 +363,9 @@ struct ObjectEnv<'a> {
     strings: BTreeMap<u16, StringsDecl>,
     string_names: BTreeMap<String, u16>,
     dialog_strings: RefCell<DialogStringTable>,
+    /// Calls among the object's trees that decide which `#[context(inherit)]` trees an
+    /// object-context tree may not call ([`InheritCallFacts`]).
+    inherit_calls: RefCell<InheritCallFacts>,
     /// The frame words any string of the object may make the formatter read
     /// ([`mir::text_reads`](mod@crate::v2::mir)): every tree is finished with the object's final
     /// fact (`lower_object` lowers again when a later tree's inline dialog literal adds to it).
@@ -354,6 +421,11 @@ enum PrimArg {
     /// local, a parameter, a cell); otherwise the VM writes the number into it, so a writable
     /// direct `i16` cell (a local, `temp[i]`, an attribute, a `&mut` parameter's cell).
     RelValue,
+    /// A slot number the VM reads from the operand or from a parameter: a constant `i16`, or a
+    /// tree parameter (a parameter variable or `param[N]`, spelled `param[N]`).
+    SlotOrParam,
+    /// A tree parameter the VM reads (a parameter variable or `param[N]`), spelled by its index.
+    ParamIndex,
 }
 
 /// A v2 builtin that lowers one-to-one onto a named-argument `.air` primitive.
@@ -429,21 +501,46 @@ impl ValueType {
     }
 }
 
-/// Whether an `.air` operand reads the temps: a `temp[i]` cell, or job data (`scope(33, F)`,
-/// which reads the career and level in `temp[0]` and `temp[1]`). Staging that writes temps
-/// copies such an operand first.
+/// Whether an `.air` operand reads the temps: a `temp[i]` cell, job data (`scope(33, F)`,
+/// which reads the career and level in `temp[0]` and `temp[1]`), or a temp-indexed cell
+/// (`scope(27, k)`, `scope(30, k)`, `scope(31, k)`, which read the index in `temp[k]`).
+/// Staging that writes temps copies such an operand first.
 fn reads_temps(air: &str) -> bool {
-    air.contains("temp[") || air.contains("scope(33,")
+    air.contains("temp[")
+        || ["scope(27,", "scope(30,", "scope(31,", "scope(33,"]
+            .iter()
+            .any(|s| air.contains(s))
+}
+
+/// Whether an `.air` operand reads `temp[0]`: the cell itself, job data (which reads the career
+/// there), or a cell indexed by it (`scope(27, 0)`, `scope(30, 0)`, `scope(31, 0)`). Staging
+/// that writes only `temp[0]` copies such an operand first.
+fn reads_temp0(air: &str) -> bool {
+    air.contains("temp[0]")
+        || air.contains("scope(33,")
+        || ["scope(27, 0)", "scope(30, 0)", "scope(31, 0)"]
+            .iter()
+            .any(|s| air.contains(s))
 }
 
 /// Whether a single operand reads a cell of the current stack object: `stack_obj` itself, a
-/// `stack.` cell, or its definition (`scope(21, ..)`, `scope(35, ..)`; `sims-vm` `memory.rs`).
+/// `stack.` cell, its definition (`scope(21, ..)`, `scope(35, ..)`), its sprite flags or
+/// temp-indexed person data (`scope(27, ..)`, `scope(31, ..)`), or the neighbor record it names
+/// (`scope(24, ..)`, `scope(32, ..)`; `sims-vm` `memory.rs`).
 /// Code that moves the cursor before reading such an operand copies it first.
 fn reads_stack_obj(air: &str) -> bool {
     air == "stack_obj"
         || air.starts_with("stack.")
-        || air.starts_with("scope(21,")
-        || air.starts_with("scope(35,")
+        || [
+            "scope(21,",
+            "scope(24,",
+            "scope(27,",
+            "scope(31,",
+            "scope(32,",
+            "scope(35,",
+        ]
+        .iter()
+        .any(|s| air.starts_with(s))
 }
 
 /// Whether bitflags `key` is an engine bit-field word: a `std::flags` type or `self.flags`'s
@@ -662,6 +759,9 @@ enum HelperCell {
     Temp(i16),
     Param(i16),
     OwnAttr(i16),
+    /// Any other object, global or Sim cell: forwarded only into a helper whose body writes
+    /// nothing but its own locals and calls nothing, so no cell (and no cursor) changes.
+    Pure,
 }
 
 /// One lowering of a source declaration: the source call sites of the inlined helpers around
@@ -683,6 +783,16 @@ struct TreeLowerer<'a> {
     /// This tree explicitly uses the frame's stack object as a persistent cursor. Temporary
     /// moves must restore its pre-operation value, which may differ from the entry object.
     explicit_stack_obj: bool,
+    /// The tree assigns `stack_obj` (directly, through a helper, or as `&mut stack_obj`), or
+    /// steps it explicitly: the cursor may rest on another object than the entry object, so a
+    /// builtin that moves it saves and restores it rather than putting back the entry object.
+    reassigns_stack_obj: bool,
+    /// A raw block lowered so far, or one in a loop being lowered, may write the cursor: like
+    /// [`Self::reassigns_stack_obj`] from that point on. Set in lowering order, so a raw block
+    /// after a loop does not change how the loop lowers.
+    raw_moves_cursor: bool,
+    /// Resolving a held place ([`Self::resolve_borrowed_lvalue`]).
+    borrowing_place: bool,
     /// The source assigns `stack_obj` itself (`stack_obj = x;`), so the stack object the tree
     /// leaves at exit is the source's: no store of it is dropped as dead at the exit
     /// (`mir::FrameFacts::keeps_exit_stack_obj`).
@@ -780,6 +890,12 @@ struct TreeLowerer<'a> {
     /// The tree is `#[context(inherit)]`: its `me` may be a Sim in either pass, so it reads the
     /// Sim's typed fields like the Sim handle ([`TreeLowerer::is_my_ident`]).
     inherit_tree: bool,
+    /// The standalone tree being lowered (`tree 'x'`), for [`InheritCallFacts`].
+    tree_display: Option<String>,
+    /// A functional's action or guard: lowered as a Sim tree, but `run_functional` and Find
+    /// Best Object run it on whichever object asks, so an object may be its runner
+    /// ([`InheritCallFacts`]).
+    object_reachable: bool,
     /// The compiler's entry-object locals that a raw block of the tree declares, with the
     /// block's span: an error when the tree's lowering declares the same name (`finish`).
     raw_reserved: Vec<(&'static str, Span)>,
@@ -838,4 +954,6 @@ struct ExplicitStackOps {
     visited: BTreeSet<(String, String, bool)>,
     /// Also count a `stack_obj = x;` statement (in a helper body).
     assignments: bool,
+    /// Also count a raw block that may write the cursor.
+    raw_writes: bool,
 }

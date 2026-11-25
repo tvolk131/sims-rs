@@ -354,7 +354,7 @@ fn self_is_switched_to_before_the_first_cursor_move() {
         if temp[0] == 0 { return true; }
         if self.data[10000] == 1 { return true; }
         set_to_next(all, dest: stack_obj);
-        raw { temp[2] := 7; }
+        raw { const K = 7; temp[2] := K; }
     }"#,
     );
     let air = expand("self_switch.antics", &src);
@@ -919,7 +919,7 @@ fn a_raw_layout_tree_that_may_read_global_34_keeps_its_entry_save() {
         r#"    #[bhav]
     fn a(sim: Sim) {
         let n: i16;
-        raw { temp[2] := global[34]; }
+        raw { const K = 2; temp[K] := global[34]; }
         set_to_next(all, dest: stack_obj);
         random_into(n, Limits.draw)?;
         temp[3] = n;

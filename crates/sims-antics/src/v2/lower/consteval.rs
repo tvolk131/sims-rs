@@ -54,6 +54,19 @@ impl<'a> TreeLowerer<'a> {
                 }
                 Ok(None)
             }
+            // `T::from_raw(c)` of a constant `c` is a constant `T` (`c` under the rules of
+            // `T::from_raw(c) as i16`), so it binds a helper's `T` parameter as `T::Variant` does.
+            V2Expr::Call { span, callee, .. }
+                if self.raw_conversion_target(callee)
+                    == Some(ValueType::Enum(expected_key.to_owned())) =>
+            {
+                let cast = V2Expr::Unary {
+                    span: *span,
+                    op: V2UnaryOp::AsI16,
+                    inner: Box::new(expr.clone()),
+                };
+                Ok(self.eval_const_i16(&cast).ok())
+            }
             _ => Ok(None),
         }
     }

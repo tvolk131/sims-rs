@@ -69,7 +69,7 @@ impl<'a> TreeLowerer<'a> {
         let mut args = args;
         match sig.context {
             CallContext::SimOnObject => {
-                if !matches!(self.tree_ctx, TreeContext::SimOnObject { .. }) {
+                if !self.inherit_tree && !matches!(self.tree_ctx, TreeContext::SimOnObject { .. }) {
                     return Err(Error::at(
                         span,
                         format!(
@@ -78,18 +78,48 @@ impl<'a> TreeLowerer<'a> {
                         ),
                     ));
                 }
+                // In an inherit tree the Sim is the runner, `me`, in both passes.
                 let first_is_sim = args.first().is_some_and(|a| {
                     a.name.is_none()
-                        && matches!(&a.value, V2Expr::Ident(_, n) if self.is_sim_ident(n))
+                        && matches!(&a.value, V2Expr::Ident(_, n) if if self.inherit_tree {
+                            self.is_frame_me(n)
+                        } else {
+                            self.is_sim_ident(n)
+                        })
                 });
                 if !first_is_sim {
                     return Err(Error::at(
                         span,
-                        format!(
-                            "{} expects the Sim handle as its first argument",
-                            sig.display
-                        ),
+                        if self.inherit_tree {
+                            format!(
+                                "{} expects 'me' (the inherit tree's runner) as its first argument",
+                                sig.display
+                            )
+                        } else {
+                            format!(
+                                "{} expects the Sim handle as its first argument",
+                                sig.display
+                            )
+                        },
                     ));
+                }
+                // Discarded code emits no call.
+                if self.checking_discarded == 0 {
+                    let mut facts = self.env.inherit_calls.borrow_mut();
+                    if self.inherit_tree {
+                        if let Some(caller) = &self.tree_display {
+                            facts.calls_sim.entry(caller.clone()).or_insert(span);
+                        }
+                    } else {
+                        // A Sim tree reaching a Sim-only inherit tree passes the restriction on.
+                        facts.edges.push((
+                            self.tree_display.clone(),
+                            self.object_reachable,
+                            sig.display.clone(),
+                            false,
+                            span,
+                        ));
+                    }
                 }
                 args = &args[1..];
             }
@@ -102,7 +132,21 @@ impl<'a> TreeLowerer<'a> {
                     ),
                 ));
             }
-            CallContext::ObjectSelf | CallContext::Inherit | CallContext::Extern => {}
+            CallContext::Inherit if self.checking_discarded == 0 => {
+                let named =
+                    self.inherit_tree || matches!(self.tree_ctx, TreeContext::SimOnObject { .. });
+                let caller = named.then(|| self.tree_display.clone()).flatten();
+                let from_object = self.object_reachable
+                    || (!self.inherit_tree && matches!(self.tree_ctx, TreeContext::ObjectSelf));
+                self.env.inherit_calls.borrow_mut().edges.push((
+                    caller,
+                    from_object,
+                    sig.display.clone(),
+                    true,
+                    span,
+                ));
+            }
+            CallContext::Inherit | CallContext::ObjectSelf | CallContext::Extern => {}
         }
 
         // Match arguments to parameters (positional first, then by name).

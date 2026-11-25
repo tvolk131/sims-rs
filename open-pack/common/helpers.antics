@@ -1,6 +1,12 @@
-// Shared clean-room behavioral helpers for `open-pack/`.
+// Shared clean-room behavioral helpers for `open-pack/`. The motive and repair loops delegate to
+// the built-in `std::motives`.
 
-/// Cancel-safe single-motive restoration loop with per-cycle counter updates.
+use std::motives::repair_by_progress as std_repair_by_progress;
+use std::motives::restore_motive_tracked as std_restore_motive_tracked;
+use std::motives::restore_two_motives_tracked as std_restore_two_motives_tracked;
+
+/// Cancel-safe single-motive restoration loop with per-cycle counter updates
+/// (`std::motives::restore_motive_tracked`).
 pub fn restore_motive_tracked(
     sim: Sim,
     motive: Motive,
@@ -10,17 +16,19 @@ pub fn restore_motive_tracked(
     ticks: i16 = 2,
     cap: i16 = 100,
 ) {
-    repeat cycles cancel_on_abort {
-        sleep(ticks);
-        sim.motive[motive] += step;
-        *completed += 1;
-        if sim.motive[motive] >= cap {
-            break;
-        }
-    }
+    std_restore_motive_tracked(
+        sim,
+        motive,
+        cycles: cycles,
+        step: step,
+        completed: completed,
+        ticks: ticks,
+        cap: cap,
+    );
 }
 
-/// Cancel-safe single-motive restoration loop returning the number of completed cycles.
+/// Cancel-safe single-motive restoration loop returning the number of completed cycles
+/// (`std::motives::restore_motive_loop`, inlined the same way).
 pub fn restore_motive_loop(
     sim: Sim,
     motive: Motive,
@@ -30,7 +38,7 @@ pub fn restore_motive_loop(
     cap: i16 = 100,
 ) -> i16 {
     let mut completed: i16 = 0;
-    restore_motive_tracked(
+    std_restore_motive_tracked(
         sim,
         motive,
         cycles: cycles,
@@ -42,7 +50,8 @@ pub fn restore_motive_loop(
     completed
 }
 
-/// Cancel-safe dual-motive restoration loop with per-cycle counter updates.
+/// Cancel-safe dual-motive restoration loop with per-cycle counter updates
+/// (`std::motives::restore_two_motives_tracked`).
 pub fn restore_two_motives_tracked(
     sim: Sim,
     primary: Motive,
@@ -54,18 +63,21 @@ pub fn restore_two_motives_tracked(
     ticks: i16 = 2,
     primary_cap: i16 = 100,
 ) {
-    repeat cycles cancel_on_abort {
-        sleep(ticks);
-        sim.motive[primary] += primary_step;
-        sim.motive[secondary] += secondary_step;
-        *completed += 1;
-        if sim.motive[primary] >= primary_cap {
-            break;
-        }
-    }
+    std_restore_two_motives_tracked(
+        sim,
+        primary,
+        primary_step,
+        secondary,
+        secondary_step,
+        cycles: cycles,
+        completed: completed,
+        ticks: ticks,
+        primary_cap: primary_cap,
+    );
 }
 
-/// Cancel-safe dual-motive restoration loop returning the number of completed cycles.
+/// Cancel-safe dual-motive restoration loop returning the number of completed cycles
+/// (`std::motives::restore_two_motives_loop`, inlined the same way).
 pub fn restore_two_motives_loop(
     sim: Sim,
     primary: Motive,
@@ -77,7 +89,7 @@ pub fn restore_two_motives_loop(
     primary_cap: i16 = 100,
 ) -> i16 {
     let mut completed: i16 = 0;
-    restore_two_motives_tracked(
+    std_restore_two_motives_tracked(
         sim,
         primary,
         primary_step,
@@ -108,7 +120,7 @@ pub fn record_fixture_wear(wear: &mut i16, broken: &mut bool, threshold: i16) ->
     return false;
 }
 
-/// Cancel-safe Mechanical-skill-scaled repair loop.
+/// Cancel-safe Mechanical-skill-scaled repair loop (`std::motives::repair_by_progress`).
 /// Returns `true` if repair progress reached `goal` (not canceled early).
 pub fn repair_by_progress(
     sim: Sim,
@@ -118,16 +130,14 @@ pub fn repair_by_progress(
     cycles_out: &mut i16,
     ticks: i16 = 2,
 ) -> bool {
-    let step = sim.skill.mechanical / mechanic_divisor + base_step;
-    let mut progress: i16 = 0;
-    let mut cycles: i16 = 0;
-    while progress < goal cancel_on_abort {
-        sleep(ticks);
-        progress += step;
-        cycles += 1;
-    }
-    *cycles_out = cycles;
-    progress >= goal
+    std_repair_by_progress(
+        sim,
+        goal: goal,
+        base_step: base_step,
+        mechanic_divisor: mechanic_divisor,
+        cycles_out: cycles_out,
+        ticks: ticks,
+    )
 }
 
 /// Cancel-safe fixed-cycle work loop (e.g. plunging/unclogging).

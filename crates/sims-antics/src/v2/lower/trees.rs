@@ -152,7 +152,10 @@ pub(super) fn lower_standalone_tree(
     };
     let mut ctx = TreeLowerer::new(env, tree_ctx, &t.owner_module, needs_self_save);
     ctx.inherit_tree = t.decl.inherit_context;
+    ctx.tree_display = Some(format!("tree '{}'", d.ident));
     let explicit = ExplicitStackOps::default().in_stmts(&d.body, env, &t.owner_module, true);
+    ctx.reassigns_stack_obj =
+        ExplicitStackOps::for_tree().in_stmts(&d.body, env, &t.owner_module, true);
     if checking_inherited_sim {
         ctx.track_stack_obj(explicit);
         ctx.inherited_entry_save = true;
@@ -344,8 +347,12 @@ pub(super) fn emit_guard_tree(
     tree_id: u16,
     label: &str,
     guard: &GuardDecl,
-    func_params: &[crate::v2::ast::FnParam],
+    // `Some(params)` for a functional's guard, which an object may run; `None` for an
+    // interaction's.
+    functional: Option<&[crate::v2::ast::FnParam]>,
 ) -> Result<()> {
+    let object_reachable = functional.is_some();
+    let func_params = functional.unwrap_or(&[]);
     let needs_self_save = match &guard.kind {
         GuardBody::Expr(e) => {
             expr_may_clobber_stack_obj(e, env, owner_module, true, Some(&guard.sim_binding), 0)
@@ -362,7 +369,14 @@ pub(super) fn emit_guard_tree(
         owner_module,
         needs_self_save,
     );
+    ctx.object_reachable = object_reachable;
     let mut stack_ops = ExplicitStackOps::default();
+    ctx.reassigns_stack_obj = match &guard.kind {
+        GuardBody::Expr(e) => ExplicitStackOps::for_tree().in_expr(e, env, owner_module, true),
+        GuardBody::Block(stmts) => {
+            ExplicitStackOps::for_tree().in_stmts(stmts, env, owner_module, true)
+        }
+    };
     ctx.begin_body(match &guard.kind {
         GuardBody::Expr(e) => stack_ops.in_expr(e, env, owner_module, true),
         GuardBody::Block(stmts) => stack_ops.in_stmts(stmts, env, owner_module, true),
