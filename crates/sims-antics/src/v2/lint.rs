@@ -387,6 +387,11 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             stmt_flows: false,
             body: 0,
             unbuilt: false,
+            in_template: false,
+            const_names: const_bindings(tokens)
+                .into_iter()
+                .flat_map(|b| b.names.into_iter().map(|(_, n)| n))
+                .collect(),
             wide: wide_strings(tokens),
             diags: Vec::new(),
         };
@@ -1498,10 +1503,12 @@ const NON_YIELDING_METHODS: &[&str] = &[
 /// `.air` primitives a v2 builtin spells with the same operands, with that spelling.
 ///
 /// Primitives whose v2 spelling takes different operands are left out, since a raw block
-/// holding them is often the only way to say it: `play_sound` (v2 names a declared
-/// `sound`), `stop_all_sounds` and `push_interaction` (v2 picks the target from the
-/// tree's context), `test_object_type` as a statement, `set_to_next` outside a loop, and
-/// `stack_obj :=` (not every source has a v2 spelling).
+/// holding them is often the only way to say it: an unpadded `play_sound` (v2 names a
+/// declared `sound`), `stop_all_sounds` and `push_interaction`
+/// (v2 picks the target from the tree's context), `test_object_type` as a statement,
+/// `set_to_next` outside a loop, and `stack_obj :=` (not every source has a v2 spelling).
+/// `play_sound` with `pad(..)` bytes, `clear_motive_changes` and `reach` are judged operand by
+/// operand in `FileLinter::raw_native_form`.
 const RAW_BUILTINS: &[(&str, &str)] = &[
     ("action_string", "action_label(...)"),
     ("refresh", "refresh(target: .., mode: ..)"),
@@ -1613,6 +1620,13 @@ struct FileLinter<'a> {
     /// files may inline too, or a template's member, built only into the objects that
     /// extend it. Its rewrites could not be checked, so none is proposed.
     unbuilt: bool,
+    /// The code being linted is a template's member: a bare call in it may resolve to a
+    /// member of an object in another file that extends the template.
+    in_template: bool,
+    /// Every name a `const` binds anywhere in the file (file, member, block and `const`
+    /// parameters). Parsing substitutes a block constant for its name, so a spelling rooted
+    /// at one would read the constant.
+    const_names: BTreeSet<String>,
     /// Per line, each string literal's column and how many more bytes than characters it
     /// holds: the lexer counts a string's characters, everything else by bytes.
     wide: BTreeMap<usize, Vec<(usize, usize)>>,
@@ -1649,7 +1663,8 @@ struct TreeCx {
 
 /// The bare names a call in `file` may resolve to a user function or tree by, which then
 /// takes the call over a builtin of the same name: the file's own functions and trees, the
-/// names it imports (by alias when it has one), and every template's members (an object may
+/// names it imports (by alias when it has one, and a `std` module's `pub fn`s for its glob; see
+/// [`std_glob_fns`]), and every template's members (an object may
 /// extend a template of another file). `None` when a glob import other than `std::*` may bring
 /// in any name, or an object extends a template the linted files do not declare (its members
 /// are unknown). Another file's private methods are not visible here.
@@ -1668,6 +1683,7 @@ fn file_callables(file: &V2File, symbols: &Symbols) -> Option<BTreeSet<String>> 
                 if u.module_path.first().map(String::as_str) != Some("std") {
                     return None;
                 }
+                out.extend(std_glob_fns(&u.module_path).iter().cloned());
             } else {
                 out.insert(item.alias.clone().unwrap_or_else(|| item.name.clone()));
             }
@@ -1700,15 +1716,19 @@ fn file_callables(file: &V2File, symbols: &Symbols) -> Option<BTreeSet<String>> 
 }
 
 /// The bare names a call in `file` surely resolves to a user function or tree by: its own
-/// functions and trees, and the names it imports by name (by alias when it has one).
+/// functions and trees, the names it imports by name (by alias when it has one), and the
+/// `pub fn`s a `use std::<module>::*;` brings in.
 fn file_sure_callables(file: &V2File) -> BTreeSet<String> {
-    let mut out: BTreeSet<String> = file
-        .uses
-        .iter()
-        .flat_map(|u| &u.items)
-        .filter(|item| item.name != "*")
-        .map(|item| item.alias.clone().unwrap_or_else(|| item.name.clone()))
-        .collect();
+    let mut out = BTreeSet::new();
+    for u in &file.uses {
+        for item in &u.items {
+            if item.name == "*" {
+                out.extend(std_glob_fns(&u.module_path).iter().cloned());
+            } else {
+                out.insert(item.alias.clone().unwrap_or_else(|| item.name.clone()));
+            }
+        }
+    }
     for item in &file.items {
         let members = match item {
             V2Item::Fn(f) => {
@@ -1844,12 +1864,20 @@ fn air_literal(v: &str) -> Option<i64> {
     if digits.is_empty() || digits.starts_with(['_', '-', '+']) {
         return None;
     }
+    // As the `.air` lexer reads them: digits (and `_` separators) only, so no sign after
+    // `0x` or a leading `+`, which Rust's parsers would accept.
+    let body = |text: &str, radix: u32| {
+        text.starts_with(|c: char| c.is_digit(radix))
+            && text.chars().all(|c| c == '_' || c.is_digit(radix))
+    };
     let n = match digits
         .strip_prefix("0x")
         .or_else(|| digits.strip_prefix("0X"))
     {
-        Some(hex) => i64::from_str_radix(&hex.replace('_', ""), 16).ok()?,
-        None => digits.replace('_', "").parse().ok()?,
+        Some(hex) if body(hex, 16) => i64::from_str_radix(&hex.replace('_', ""), 16).ok()?,
+        Some(_) => return None,
+        None if body(digits, 10) => digits.replace('_', "").parse().ok()?,
+        None => return None,
     };
     if neg { n.checked_neg() } else { Some(n) }
 }
@@ -1865,17 +1893,7 @@ fn native_operands(word: &str, args: &str) -> bool {
     if matches!(word, "notify_idle" | "breakpoint") {
         return inner.is_empty();
     }
-    let literal = |v: &str| -> Option<i64> {
-        let (neg, digits) = v.strip_prefix('-').map_or((false, v), |d| (true, d));
-        let n = match digits
-            .strip_prefix("0x")
-            .or_else(|| digits.strip_prefix("0X"))
-        {
-            Some(hex) => i64::from_str_radix(&hex.replace('_', ""), 16).ok()?,
-            None => digits.replace('_', "").parse().ok()?,
-        };
-        if neg { n.checked_neg() } else { Some(n) }
-    };
+    let literal = air_literal;
     !inner.is_empty()
         && inner.split(',').all(|arg| {
             let Some((key, value)) = arg.split_once(':') else {
@@ -1896,6 +1914,33 @@ fn native_operands(word: &str, args: &str) -> bool {
                 _ => false,
             }
         })
+}
+
+/// `.air` text with its whitespace removed, or `None` when whitespace separates two word
+/// characters (`1 2`, `scope(1 2, 0)`: two tokens, which removing the space would read as
+/// one) or follows a `-` (`- 2`, which the `.air` lexer does not read as `-2`).
+fn compact_air(text: &str) -> Option<String> {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::new();
+    let mut gap = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            gap = true;
+            continue;
+        }
+        // `- 2` is not `-2`: the `.air` lexer reads a sign only next to its digits.
+        if gap
+            && out
+                .chars()
+                .last()
+                .is_some_and(|p| p == '-' || (word(c) && word(p)))
+        {
+            return None;
+        }
+        gap = false;
+        out.push(c);
+    }
+    Some(out)
 }
 
 /// What a v2 builtin accepts for one named operand.
@@ -2346,10 +2391,12 @@ impl FileLinter<'_> {
     }
 
     fn lint_members(&mut self, members: &[ObjectMember], template: bool) {
-        let unbuilt = self.unbuilt;
+        let (unbuilt, in_template) = (self.unbuilt, self.in_template);
         self.unbuilt |= template;
+        self.in_template |= template;
         self.lint_members_inner(members, template);
         self.unbuilt = unbuilt;
+        self.in_template = in_template;
     }
 
     fn lint_members_inner(&mut self, members: &[ObjectMember], template: bool) {
@@ -4040,36 +4087,54 @@ impl FileLinter<'_> {
         Span::new(line, at - self.line_starts[line - 1] + 1)
     }
 
+    /// Whether a bare call to builtin `name` in the body being linted surely means the builtin:
+    /// no user function the file can call takes the name, and the body is not a template's
+    /// member (an object in another file that extends the template may declare one).
+    fn call_free(&self, name: &str) -> bool {
+        !self.in_template && !self.user_fn(name)
+    }
+
     fn raw_builtin(&mut self, span: Span, code: &str) {
-        // One `.air` statement per entry.
-        let lines: Vec<&str> = code
+        let code: Vec<&str> = code
             .lines()
-            .flat_map(|l| {
+            .map(|l| {
                 let l = l.split("//").next().unwrap_or("");
-                l.split('#').next().unwrap_or("").split(';')
+                l.split('#').next().unwrap_or("")
             })
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
             .collect();
-        if lines.is_empty() {
+        // One `.air` statement per entry: only `;` ends one, never a line break.
+        let code = code.join("\n");
+        let mut lines: Vec<&str> = code.split(';').map(str::trim).collect();
+        // The block must end its last statement and hold no empty one: `.air` reads adjacent
+        // raw blocks as one stream, so `raw { f() } raw { pad(3: 0x05); }` is one padded
+        // primitive, and the leading `;` of `raw { f() } raw { ; g(); }` ends `f()`.
+        if lines.pop() != Some("") || lines.is_empty() || lines.iter().any(|l| l.is_empty()) {
             return;
         }
         let mut spellings = Vec::new();
         for l in &lines {
-            if l.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .any(|w| w == "pad")
+            let word: String = l
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            // Only the two primitives v2 gives `padN:` bytes may carry a `pad`.
+            let padded = matches!(word.as_str(), "play_sound" | "clear_motive_changes");
+            if (!padded
+                && l.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .any(|w| w == "pad"))
                 || l.contains("->")
                 || l.contains('{')
                 || l.contains('}')
             {
                 return;
             }
-            let word: String = l
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
             let v2 = match RAW_BUILTINS.iter().find(|(air, _)| *air == word) {
-                Some((_, v2)) if native_operands(&word, l[word.len()..].trim()) => (*v2).to_owned(),
+                Some((_, v2))
+                    if native_operands(&word, l[word.len()..].trim())
+                        && self.call_free(v2.split('(').next().unwrap_or(v2)) =>
+                {
+                    (*v2).to_owned()
+                }
                 Some(_) => return,
                 None => match self.raw_native_form(&word, l) {
                     Some(v2) => v2,
@@ -4099,6 +4164,25 @@ impl FileLinter<'_> {
     /// - `temp[K] := scope(21, 9 | 11)` or `scope(33, F)`: the stack object's `object_type` /
     ///   `sub_index`, and `job_field(F)`.
     ///
+    /// And PR I-4's (#469), each lowering to the statement's own `.air` text:
+    /// - `play_sound(N [, false | true | stack_obj [: bool]]) pad(i: 0xNN, ..)` with a
+    ///   literal FWAV id, as `play_sound(N, false | stack_obj, padI: 0xNN)` (an explicit target,
+    ///   so the spelling does not depend on the tree's context); not `flags:`, not a pad of
+    ///   bytes 0, 1 or 4, which the call spells, and not without a pad (wave 1 leaves that raw,
+    ///   since v2 would rather name a declared `sound`);
+    /// - `clear_motive_changes() [pad(i: 0xNN, ..)]`, as `clear_motive_changes(padI: 0xNN)`;
+    /// - `reach(mode: M, moves: B [, param: P])`: mode 1 as `slot: param[P]` (P below the
+    ///   tree's compiled argument count; `.air` defaults P to 0), any other mode only with P 0;
+    /// - `temp[K] := scope(S, N)` and `scope(S, N) := X` (X a literal, `temp[J]` or a
+    ///   `param[J]` as above) for the cells #469 spells: `advert.delta[N]` (12, N 0..16),
+    ///   `stack_obj.sprite_flags[temp[N]]` (27), `me.person[temp[N]]` (30) and
+    ///   `stack_obj.person[temp[N]]` (31) with N 0..=7; and the read-only neighbor cells
+    ///   `stack_obj.neighbor.<field>` / `.field[N]` (24, N 0..=9) and
+    ///   `stack_obj.neighbor.person[N]` (32, N 0..=255).
+    ///
+    /// `make_new_character` is not spelled: v2 reads skin, age and sex from named `i16` locals,
+    /// and a raw block names only frame words, which a v2 local need not land on.
+    ///
     /// Raw code cannot name a v2 local, and `has_function[N]` (`scope(35, N)`) is a `bool`
     /// no `temp` takes, so neither is a store here. Nothing is spelled when the body rebinds
     /// the name the spelling uses (`temp`, `param`, `me`, `stack_obj`), or a user function
@@ -4113,8 +4197,14 @@ impl FileLinter<'_> {
             |v: &str, lo: i64, hi: i64| air_literal(v).is_some_and(|n| (lo..=hi).contains(&n));
         // A builtin, or a name the body has not rebound.
         let free = |name: &str| {
-            !self.bound.contains(name) && !self.sim_bindings.contains(name) && !self.user_fn(name)
+            !self.bound.contains(name)
+                && !self.sim_bindings.contains(name)
+                && !self.const_names.contains(name)
+                && !self.user_fn(name)
         };
+        // A builtin's call name: in a template's member, an extending object's member of
+        // that name would take the call.
+        let free_call = |name: &str| free(name) && !self.in_template;
         let index = |cell: &str, base: &str| -> Option<i64> {
             let inner = cell
                 .strip_prefix(base)?
@@ -4137,7 +4227,7 @@ impl FileLinter<'_> {
                 })
         };
         match word {
-            "remove_object" if free("remove_object") => {
+            "remove_object" if free_call("remove_object") => {
                 let args = args()?;
                 let (target, opts) = args.split_first()?;
                 // `.air` reads `me` / `self` / `0` as the frame's object, as v2's `me` is.
@@ -4165,7 +4255,7 @@ impl FileLinter<'_> {
                     format!("remove_object({target}, flags: {flags})")
                 })
             }
-            "find_best_object" if free("find_best_object") => {
+            "find_best_object" if free_call("find_best_object") => {
                 let args = args()?;
                 let (kind, opts) = args.split_first()?;
                 let searched = |k: &crate::parser::FunctionKind| {
@@ -4189,7 +4279,7 @@ impl FileLinter<'_> {
                 (ok && self.object_me)
                     .then(|| "`find_best_object(..)` as an `if` / `while` test".to_owned())
             }
-            "set_to_next" if free("set_to_next") => {
+            "set_to_next" if free_call("set_to_next") => {
                 const MODES: &[&str] = &[
                     "all",
                     "person",
@@ -4224,21 +4314,176 @@ impl FileLinter<'_> {
                     });
                 (ok && dest).then(|| "set_to_next(.., dest: ..)".to_owned())
             }
-            "remove_object" | "find_best_object" | "set_to_next" => None,
-            _ => {
-                let (dst, src) = l.split_once(":=")?;
-                if !temp(dst.trim()) {
+            "play_sound" | "clear_motive_changes" if free_call(word) => {
+                // `name(args)`, then an optional `pad(i: 0xNN, ..)`.
+                let close = rest.find(')')?;
+                let inner = rest.strip_prefix('(')?[..close - 1].trim();
+                let after = rest[close + 1..].trim();
+                let mut pads: Vec<(u8, u8)> = Vec::new();
+                if !after.is_empty() {
+                    let bytes = after
+                        .strip_prefix("pad")?
+                        .trim_start()
+                        .strip_prefix('(')?
+                        .strip_suffix(')')?;
+                    for b in bytes.split(',') {
+                        let (i, v) = b.split_once(':')?;
+                        let i = u8::try_from(air_literal(i.trim())?).ok()?;
+                        let v = u8::try_from(air_literal(v.trim())?).ok()?;
+                        pads.push((i, v));
+                    }
+                }
+                // The call's own operands, as the `.air` encoder lays them out.
+                let (opcode, base, spelled, target) = if word == "clear_motive_changes" {
+                    if !inner.is_empty() {
+                        return None;
+                    }
+                    (29, [0, 0, 0, 1, 0, 0, 0, 0], &[][..], None)
+                } else {
+                    // Wave 1 leaves an unpadded sound raw: v2 would rather name a declared
+                    // sound.
+                    if pads.is_empty() {
+                        return None;
+                    }
+                    let mut args = inner.split(',').map(compact_air);
+                    let sound = u16::try_from(air_literal(&args.next()??)?).ok()?;
+                    let on_stack = match args.next().map(|a| a.unwrap_or_default()).as_deref() {
+                        None | Some("false" | "stack_obj:false") => false,
+                        Some("true" | "stack_obj" | "stack_obj:true") => true,
+                        Some(_) => return None,
+                    };
+                    if args.next().is_some() {
+                        return None;
+                    }
+                    let [s0, s1] = sound.to_le_bytes();
+                    let flags = if on_stack { 2 } else { 0 };
+                    let target = match (on_stack, free("stack_obj")) {
+                        (false, _) => "false",
+                        (true, true) => "stack_obj",
+                        (true, false) => "true",
+                    };
+                    (
+                        23,
+                        [s0, s1, 0, 0, flags, 0, 0, 0],
+                        &[0u8, 1, 4][..],
+                        Some(target),
+                    )
+                };
+                // v2 refuses a pad of a byte the call spells; the encoder refuses the rest
+                // (order, repeats, a byte that already holds the value, a byte the VM reads).
+                if pads.iter().any(|(i, _)| spelled.contains(i))
+                    || (!pads.is_empty()
+                        && crate::verify::apply_operand_pad(
+                            opcode,
+                            base,
+                            &crate::ast::OperandPad::Bytes(pads.clone()),
+                        )
+                        .is_err())
+                {
                     return None;
                 }
-                let src: String = src.chars().filter(|c| !c.is_whitespace()).collect();
-                let inner = src.strip_prefix("scope(")?.strip_suffix(')')?;
-                let (scope, n) = inner.split_once(',')?;
-                let n = air_literal(n)?;
-                match (air_literal(scope)?, n) {
-                    (21, 9) if free("stack_obj") => Some("stack_obj.object_type".to_owned()),
-                    (21, 11) if free("stack_obj") => Some("stack_obj.sub_index".to_owned()),
-                    (33, 0..=32767) if free("job_field") => Some(format!("job_field({n})")),
-                    _ => None,
+                let pad = if pads.is_empty() { "" } else { "padN: 0xNN" };
+                Some(match target {
+                    None => format!("clear_motive_changes({pad})"),
+                    Some(target) => format!("play_sound(.., {target}, {pad})"),
+                })
+            }
+            "reach" if free_call("reach") => {
+                let (mut mode, mut moves, mut slot) = (None, None, None);
+                for a in args()? {
+                    let (k, v) = a.split_once(':')?;
+                    let v = v.trim();
+                    let cell = match k.trim() {
+                        "mode" => &mut mode,
+                        "moves" => &mut moves,
+                        "param" | "slot_param" => &mut slot,
+                        _ => return None,
+                    };
+                    if cell.replace(v).is_some() {
+                        return None;
+                    }
+                }
+                // `.air` defaults the mode to 0.
+                let mode = match mode {
+                    None => 0,
+                    Some(m) => air_literal(m).filter(|m| (-32768..=32767).contains(m))?,
+                };
+                if !moves.is_none_or(|b| matches!(b, "true" | "false")) {
+                    return None;
+                }
+                // `.air` reads `param: param[P]` or `param: P`.
+                let p = match slot {
+                    None => 0,
+                    Some(v) => match index(v, "param") {
+                        Some(p) => p,
+                        None => air_literal(v)?,
+                    },
+                };
+                if mode == 1 {
+                    param(&format!("param[{p}]"))
+                        .then(|| "reach(mode: 1, moves: .., slot: param[..])".to_owned())
+                } else {
+                    (p == 0).then(|| "reach(mode: .., moves: ..)".to_owned())
+                }
+            }
+            "remove_object"
+            | "find_best_object"
+            | "set_to_next"
+            | "play_sound"
+            | "clear_motive_changes"
+            | "reach" => None,
+            _ => {
+                let (dst, src) = l.split_once(":=")?;
+                let (dst, src) = (compact_air(dst)?, compact_air(src)?);
+                let scope_cell = |cell: &str| -> Option<(i64, i64)> {
+                    let inner = cell.strip_prefix("scope(")?.strip_suffix(')')?;
+                    let (scope, n) = inner.split_once(',')?;
+                    Some((air_literal(scope)?, air_literal(n)?))
+                };
+                // A cell #469 spells, readable and writable alike.
+                let cell = |scope: i64, n: i64| -> Option<String> {
+                    let temp_n = (0..=7).contains(&n) && free("temp");
+                    match scope {
+                        12 if (0..16).contains(&n) && free("advert") => {
+                            Some(format!("advert.delta[{n}]"))
+                        }
+                        27 if temp_n && free("stack_obj") => {
+                            Some("stack_obj.sprite_flags[temp[..]]".to_owned())
+                        }
+                        30 if temp_n && free("me") && !self.me_bcon => {
+                            Some("me.person[temp[..]]".to_owned())
+                        }
+                        31 if temp_n && free("stack_obj") => {
+                            Some("stack_obj.person[temp[..]]".to_owned())
+                        }
+                        _ => None,
+                    }
+                };
+                if temp(&dst) {
+                    let (scope, n) = scope_cell(&src)?;
+                    match (scope, n) {
+                        (21, 9) if free("stack_obj") => Some("stack_obj.object_type".to_owned()),
+                        (21, 11) if free("stack_obj") => Some("stack_obj.sub_index".to_owned()),
+                        (33, 0..=32767) if free_call("job_field") => {
+                            Some(format!("job_field({n})"))
+                        }
+                        (24, 0..=9) if free("stack_obj") => Some(match n {
+                            2 => "stack_obj.neighbor.age".to_owned(),
+                            5 => "stack_obj.neighbor.friend_count".to_owned(),
+                            6 => "stack_obj.neighbor.family_house".to_owned(),
+                            9 => "stack_obj.neighbor.family_friend_count".to_owned(),
+                            _ => format!("stack_obj.neighbor.field[{n}]"),
+                        }),
+                        (32, 0..=255) if free("stack_obj") => {
+                            Some(format!("stack_obj.neighbor.person[{n}]"))
+                        }
+                        _ => cell(scope, n),
+                    }
+                } else {
+                    let (scope, n) = scope_cell(&dst)?;
+                    (temp(&src) || param(&src) || in_range(&src, -32768, 32767))
+                        .then(|| cell(scope, n))
+                        .flatten()
                 }
             }
         }
@@ -4921,6 +5166,39 @@ fn has_comment(text: &str) -> bool {
 /// The types `std::flags` and `std::engine` declare: (module, type) -> each value or bit
 /// and its name.
 type StdEngineTypes = BTreeMap<(&'static str, String), Vec<(i64, String)>>;
+
+/// The `pub fn`s `use <path>::*;` brings in when `path` is a built-in `std::<module>` (the
+/// loader's embedded `std` sources: `std::math::min`, `std::motives::restore_motive_loop`,
+/// `std::budget::try_charge`, ...); empty for any other path.
+fn std_glob_fns(path: &[String]) -> &'static [String] {
+    static FNS: std::sync::OnceLock<BTreeMap<&'static str, Vec<String>>> =
+        std::sync::OnceLock::new();
+    let fns = FNS.get_or_init(|| {
+        let mut out = BTreeMap::new();
+        for module in crate::v2::loader::STD_MODULES {
+            let Some(src) = crate::v2::loader::std_module_source(&[module.to_owned()]) else {
+                continue;
+            };
+            let Ok(file) = crate::v2::parser::parse_v2_std_file(src) else {
+                continue;
+            };
+            let names = file
+                .items
+                .into_iter()
+                .filter_map(|item| match item {
+                    V2Item::Fn(f) if f.is_pub => Some(f.name),
+                    _ => None,
+                })
+                .collect();
+            out.insert(module, names);
+        }
+        out
+    });
+    match path {
+        [std, module] if std == "std" => fns.get(module.as_str()).map_or(&[], Vec::as_slice),
+        _ => &[],
+    }
+}
 
 /// [`StdEngineTypes`], read from the `std` sources.
 fn std_engine_types() -> &'static StdEngineTypes {
@@ -6171,6 +6449,7 @@ const ENUM_WORDS: &[&str] = &["facing", "gender_kind"];
 const SIM_WORDS: &[TypedField] = &[
     typed("person", 65, "gender_kind", true, false),
     typed("person", 77, "date_partner", true, false),
+    typed("person", 81, "fame", true, false),
 ];
 
 /// The cells `stack_obj` and handles name (`lower/tree.rs` `handle_field_cell`), besides
@@ -6188,6 +6467,7 @@ const HANDLE_WORDS: &[TypedField] = &[
     typed("person", 61, "family", true, false),
     typed("person", 65, "kind", true, false),
     typed("person", 77, "date_partner", true, false),
+    typed("person", 81, "fame", true, false),
 ];
 
 fn stmt_span(s: &V2Stmt) -> Span {
