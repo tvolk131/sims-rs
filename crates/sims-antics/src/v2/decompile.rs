@@ -50,12 +50,21 @@ const RUN_TREE_BY_NAME: u16 = 28;
 const TREE_NAMES_TABLE: u16 = 303;
 /// Primitives that look a tree up by a fixed name (the other `sims-vm`
 /// `Program::named_tree` callers): Create Object Instance runs `init visitor`, Go To
-/// Routing Slot asks or waits by name and runs `Route failure feedback`, and Reach runs
-/// `CT - Grab`/`CT - Put`. Which object's file is searched first varies, so the names
-/// are checked in this file whichever it is.
-const FIXED_NAME_LOOKUPS: [(u16, &[&str]); 3] = [
+/// Relative Position and Go To Routing Slot (one routing state machine) ask or wait by
+/// name and run `Route failure feedback`, and Reach runs `CT - Grab`/`CT - Put`. Which
+/// object's file is searched first varies, so the names are checked in this file
+/// whichever it is.
+const FIXED_NAME_LOOKUPS: [(u16, &[&str]); 4] = [
     // Only with `FROM_RECORD` (byte 5 bit 2): see `fixed_names`.
     (42, &["init visitor"]),
+    (
+        27,
+        &[
+            "route ask to move animation",
+            "route waiting animation",
+            "Route failure feedback",
+        ],
+    ),
     (
         45,
         &[
@@ -71,8 +80,11 @@ const CREATE_OBJECT: u16 = 42;
 const CREATE_FROM_RECORD: u8 = 0x04;
 /// Run Functional Tree: the stack object runs the callback a function names.
 const RUN_FUNCTIONAL_TREE: u16 = 20;
-/// The first semi-global tree ID: calls at or above it go through the `GLOB` link.
-const FIRST_SEMI_GLOBAL_TREE: u16 = 8192;
+/// Expression, and the operand scopes through which it reads an object definition's
+/// words (21) and whether its callback table names a tree (35) (`sims-vm` `memory.rs`).
+const EXPRESSION: u16 = 2;
+const DEFINITION_WORDS_SCOPE: u8 = 21;
+const CALLBACK_SCOPE: u8 = 35;
 /// When an OBJD has no OBJf table, the VM reads its callbacks from these OBJD byte
 /// offsets, in callback order (`sims-vm` `program.rs` `DEFINITION_CALLBACKS`).
 const DEFINITION_CALLBACKS: [usize; 30] = [
@@ -435,9 +447,6 @@ struct Model {
     original_lookup: NameLookup,
     /// Where the original's object definitions register each tree as a callback.
     original_callbacks: Option<Callbacks>,
-    /// Whether the original defines an object, so that its trees run as that object
-    /// and Run Tree By Name reads its names from this file.
-    defines_object: bool,
     library_arities: BTreeMap<u16, usize>,
 }
 
@@ -851,7 +860,6 @@ impl Model {
             original_strings: string_texts(iff),
             original_lookup: NameLookup::of(iff),
             original_callbacks: callback_slots(iff),
-            defines_object: iff.chunks.iter().any(|c| &c.tag == b"OBJD"),
             library_arities: options.library_arities.clone(),
         })
     }
@@ -969,7 +977,13 @@ impl Model {
     ///   Run Tree By Name may see;
     /// - it runs a tree by name, and the rebuilt file's tree labels differ;
     /// - it is the object's `init`/`main`, and the rebuilt object's entry runs another
-    ///   tree (a plain tree written for it gets a compiler-made block).
+    ///   tree (a plain tree written for it gets a compiler-made block);
+    /// - the rebuilt object links another semi-global file, which any of its trees may
+    ///   reach (semi-global calls and constants, and global trees, which run with this
+    ///   object as their owner);
+    /// - it reads this file's definitions or callback tables, creates an object (whose
+    ///   callbacks run), or runs a non-private tree of this file, and the rebuilt object
+    ///   differs there.
     fn object_gap(&self, t: &TreeModel, recompiled: &RecompiledFile) -> Option<String> {
         let b = recompiled.trees.get(&t.id)?;
         if b.label != t.original.label {
@@ -978,7 +992,60 @@ impl Model {
                 b.label, t.original.label
             ));
         }
+        if self.original_lookup.glob != recompiled.lookup.glob {
+            return Some(
+                "the rebuilt object links another semi-global file, which its trees reach \
+                 through semi-global calls and constants and the global trees they call"
+                    .to_owned(),
+            );
+        }
+        let callbacks = || match (&self.original_callbacks, &recompiled.callbacks) {
+            (Some(a), Some(b)) => Some(a.tables == b.tables),
+            _ => None,
+        };
+        let definitions = |of: &BTreeMap<([u8; 4], u16), Vec<u8>>| {
+            of.iter()
+                .filter(|((tag, _), _)| tag == b"OBJD")
+                .map(|(key, data)| (*key, data.clone()))
+                .collect::<Vec<_>>()
+        };
         for i in &t.original.instructions {
+            if i.opcode == EXPRESSION {
+                let scopes = [i.operands[6], i.operands[7]];
+                if scopes.contains(&DEFINITION_WORDS_SCOPE)
+                    && definitions(&self.original_resources) != definitions(&recompiled.resources)
+                {
+                    return Some(
+                        "reads an object definition's words, which the rebuilt object's \
+                         definitions give differently"
+                            .to_owned(),
+                    );
+                }
+                if scopes.contains(&CALLBACK_SCOPE) && callbacks() != Some(true) {
+                    return Some(
+                        "reads an object's callback table, which the rebuilt object gives \
+                         differently"
+                            .to_owned(),
+                    );
+                }
+            }
+            if i.opcode == CREATE_OBJECT && callbacks() != Some(true) {
+                return Some(
+                    "creates an object, whose callbacks the rebuilt object's tables give \
+                     differently"
+                        .to_owned(),
+                );
+            }
+            // Opcodes below 256 are primitives.
+            let direct = (i.opcode >= 256).then_some(i.opcode);
+            if let Some(id) = direct.into_iter().chain(self.named_callees(i)).find(|id| {
+                !PRIVATE_TREES.contains(id) && self.original_lookup.names.contains_key(id)
+            }) {
+                return Some(format!(
+                    "runs this file's tree {id}, which the lift does not write (only private \
+                     trees are)"
+                ));
+            }
             let names = self.names_run(i, &self.original_strings);
             if names != self.names_run(i, &recompiled.strings) {
                 return Some(
@@ -1014,19 +1081,6 @@ impl Model {
                     ));
                 }
             }
-        }
-        if self.original_lookup.glob != recompiled.lookup.glob
-            && t.original.instructions.iter().any(|i| {
-                i.opcode >= FIRST_SEMI_GLOBAL_TREE
-                    || self
-                        .functional_callees(i)
-                        .any(|id| id >= FIRST_SEMI_GLOBAL_TREE)
-            })
-        {
-            return Some(
-                "calls a semi-global tree, and the rebuilt object links another semi-global file"
-                    .to_owned(),
-            );
         }
         let slots = |c: &Option<Callbacks>| {
             c.as_ref()
@@ -1068,6 +1122,10 @@ impl Model {
             // The VM refuses another table before it looks anything up.
             return Vec::new();
         }
+        if i.operands[4] == 0 {
+            // Entry 0 names nothing, in either table.
+            return Vec::new();
+        }
         let entry = match strings.get(&(*b"STR#", TREE_NAMES_TABLE)) {
             // No table: the VM looks nothing up.
             None => Some(None),
@@ -1080,10 +1138,9 @@ impl Model {
             ),
             Some(Err(_)) => None,
         };
-        if i.operands[2] & 1 != 0 || !self.defines_object {
-            // The global file's table, or the table of whichever object runs this
-            // (semi-global) code. This file may be the global file, so its own entry must
-            // not change either.
+        if i.operands[2] & 1 != 0 {
+            // The global file's table. This file may be the global file, so its own entry
+            // must not change either.
             return vec![TreeName::Unknown, TreeName::Entry(entry)];
         }
         match entry {
@@ -1107,8 +1164,9 @@ impl Model {
             .filter(|&id| id != 0)
     }
 
-    /// The trees of this file instruction `i` may run by name in the original: the tree
-    /// each name finds here, or every tree for a name not known here.
+    /// The trees of this file instruction `i` may run by name in the original (the tree
+    /// each name finds here, or every tree for a name not known here), by function, or
+    /// as callbacks of an object it creates.
     fn named_callees(&self, i: &sims_formats::behavior::Instruction) -> Vec<u16> {
         let mut out = Vec::new();
         for name in self.names_run(i, &self.original_strings) {
@@ -1119,6 +1177,12 @@ impl Model {
             }
         }
         out.extend(self.functional_callees(i));
+        if i.opcode == CREATE_OBJECT
+            && let Some(c) = &self.original_callbacks
+        {
+            // The new object may be one of this file's definitions: its callbacks run.
+            out.extend(c.by_tree.keys().copied());
+        }
         out
     }
 
@@ -1174,6 +1238,12 @@ impl Model {
     }
 
     fn resources_not_reproduced(&self, recompiled: &RecompiledFile) -> Vec<String> {
+        let trees = self
+            .original_lookup
+            .names
+            .keys()
+            .filter(|id| !PRIVATE_TREES.contains(id))
+            .map(|id| format!("BHAV {id}"));
         self.original_resources
             .iter()
             .filter(|(key, data)| recompiled.resources.get(key) != Some(*data))
@@ -1185,6 +1255,7 @@ impl Model {
                 }
                 format!("{} {id}", String::from_utf8_lossy(tag))
             })
+            .chain(trees)
             .collect()
     }
 
@@ -1366,8 +1437,9 @@ struct NameLookup {
     /// Every tree's label as the VM loads it: the last BHAV chunk of each ID, deleted
     /// ones included.
     names: BTreeMap<u16, Vec<u8>>,
-    /// The first `GLOB` chunk: the semi-global file the catalog links.
-    glob: Option<Vec<u8>>,
+    /// The first `GLOB` chunk: the semi-global file the catalog links (none for an
+    /// empty name), or its bytes when it does not parse.
+    glob: std::result::Result<Option<String>, Vec<u8>>,
 }
 
 impl NameLookup {
@@ -1378,7 +1450,11 @@ impl NameLookup {
                 .into_iter()
                 .map(|c| (c.id, iff.label_bytes(c).to_vec()))
                 .collect(),
-            glob: iff.all(b"GLOB").next().map(|c| iff.data(c).to_vec()),
+            glob: match iff.all(b"GLOB").next() {
+                None => Ok(None),
+                Some(c) => sims_formats::execution::global_link(iff.data(c))
+                    .map_err(|_| iff.data(c).to_vec()),
+            },
         }
     }
 
@@ -1549,8 +1625,8 @@ fn fwav_sounds(iff: &Iff) -> BTreeMap<u16, String> {
 /// Non-code chunks a tree can read through a primitive, keyed by tag and ID (last
 /// chunk of a key wins).
 fn resource_chunks(iff: &Iff) -> BTreeMap<([u8; 4], u16), Vec<u8>> {
-    const TAGS: [&[u8; 4]; 9] = [
-        b"STR#", b"CTSS", b"TTAB", b"TTAs", b"SLOT", b"FCNS", b"GLOB", b"TPRP", b"OBJD",
+    const TAGS: [&[u8; 4]; 10] = [
+        b"STR#", b"CTSS", b"TTAB", b"TTAs", b"SLOT", b"FCNS", b"GLOB", b"TPRP", b"OBJD", b"OBJf",
     ];
     let mut out = BTreeMap::new();
     for c in iff.chunks.iter().filter(|c| TAGS.contains(&&c.tag)) {

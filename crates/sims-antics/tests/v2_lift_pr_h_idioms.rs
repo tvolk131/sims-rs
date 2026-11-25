@@ -442,7 +442,8 @@ fn rebuilt(report: &sims_antics::v2::DecompileV2Report) -> Iff {
 fn a_tree_run_by_name_is_proven_only_with_the_tree_it_runs() {
     // `Pump` reads a string table the lift cannot reproduce (its chunk is marked
     // deleted), so it is not proven; neither is a caller that runs it by name, nor
-    // primitives that look up a fixed name (Go To Routing Slot, Reach) finding it.
+    // primitives that look up a fixed name (Go To Relative Position, Go To Routing
+    // Slot, Reach) finding it.
     let source = r#"object "Fable Bellows" {
     guid: 0x7E00_0130;
     strings 300 "Lines" {
@@ -469,6 +470,9 @@ fn a_tree_run_by_name_is_proven_only_with_the_tree_it_runs() {
     @id(4305) @frame(locals: 0) tree reach "Reach" {
         raw { op 0x002f (0, 0, 0, 0, 0, 0, 0, 0); }
     }
+    @id(4306) @frame(locals: 0) tree relative "Relative" {
+        raw { op 0x001b (0, 0, 0, 0, 0, 0, 0, 0); }
+    }
 }"#;
     let original = rebuild(
         &compile(source),
@@ -483,7 +487,7 @@ fn a_tree_run_by_name_is_proven_only_with_the_tree_it_runs() {
     for id in [4300, 4302, 4304] {
         assert!(!proven(check_of(&report, id)), "{:?}", report.trees);
     }
-    for id in [4301, 4303, 4305] {
+    for id in [4301, 4303, 4305, 4306] {
         assert!(
             matches!(check_of(&report, id), TreeCheck::Inconclusive(why) if why.contains("not proven")),
             "{id}: {:?}",
@@ -674,30 +678,39 @@ fn a_functional_call_is_proven_only_with_the_callback_it_runs() {
 }
 
 #[test]
-fn a_semi_global_call_needs_the_same_link() {
+fn a_semi_global_link_is_kept_or_no_tree_is_proven() {
+    // Semi-global calls and constants resolve through `GLOB`, and so do the global trees
+    // a tree calls (they run with this object as their owner): with another link, no
+    // tree of the object is proven, whatever it calls.
     let source = r#"object "Fable Bellows" {
     guid: 0x7E00_0135;
     @id(4301) @frame(locals: 0) tree caller "Caller" {
         raw { op 0x2000 (0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff); }
     }
+    @id(4302) @frame(locals: 0) tree plain "Plain" { temp[0] = 1; }
 }"#;
-    let glob = ChunkData {
+    let glob = |data: &[u8]| ChunkData {
         tag: *b"GLOB",
         id: 128,
         flags: 0,
         label: String::new(),
-        data: b"FableGlobals\0".to_vec(),
+        data: data.to_vec(),
     };
-    let original = rebuild(&compile(source), |_| {}, vec![glob]);
-    let report = report(&original);
+    let original = rebuild(&compile(source), |_| {}, vec![glob(b"FableGlobals\0")]);
+    let linked = report(&original);
     // The lift writes no `GLOB`, so 8192 resolves nowhere in the rebuilt object.
     let link = |iff: &Iff| iff.all(b"GLOB").next().map(|c| iff.data(c).to_vec());
-    assert_ne!(link(&rebuilt(&report)), link(&original));
-    assert!(
-        matches!(check_of(&report, 4301), TreeCheck::Inconclusive(why) if why.contains("semi-global")),
-        "{:?}",
-        report.trees
-    );
+    assert_ne!(link(&rebuilt(&linked)), link(&original));
+    for id in [4301, 4302] {
+        assert!(
+            matches!(check_of(&linked, id), TreeCheck::Inconclusive(why) if why.contains("semi-global")),
+            "{id}: {:?}",
+            linked.trees
+        );
+    }
+    // An empty name links nothing, like no `GLOB` at all.
+    let empty = report(&rebuild(&compile(source), |_| {}, vec![glob(b"\0")]));
+    assert!(proven(check_of(&empty, 4302)), "{:?}", empty.trees);
 }
 
 #[test]
@@ -763,4 +776,198 @@ fn a_global_table_name_keeps_this_files_entry() {
         "{:?}",
         report.trees
     );
+}
+
+#[test]
+fn reads_of_definitions_and_callbacks_need_the_same_tables() {
+    // Expression scope 21 reads the stack object's definition words, scope 35 whether
+    // its callback table names a tree; the stack object may be this object.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_0139;
+    @id(4200) main { temp[0] = 1; }
+    @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 2; }
+    @id(4301) @frame(locals: 0) tree words "Words" {
+        raw { op 0x0002 (0, 0, 2, 0, 0, 5, 8, 21); }
+    }
+    @id(4302) @frame(locals: 0) tree slots "Slots" {
+        raw { op 0x0002 (0, 0, 18, 0, 0, 5, 8, 35); }
+    }
+}"#;
+    let iff = compile(source);
+    let (init, main) = init_and_main(&iff);
+    // Callback 18 runs `Pump`, which the lift writes as a plain tree.
+    let mut entries = vec![(0, 0); 19];
+    entries[0] = (0, init);
+    entries[1] = (0, main);
+    entries[18] = (0, 4300);
+    let slots = report(&with_callbacks(&iff, &entries));
+    assert!(
+        matches!(check_of(&slots, 4302), TreeCheck::Inconclusive(why) if why.contains("callback table")),
+        "{:?}",
+        slots.trees
+    );
+    // A definition word the lift does not keep (a callback word an OBJf overrides).
+    let objd = iff
+        .chunks
+        .iter()
+        .find(|c| &c.tag == b"OBJD")
+        .expect("OBJD")
+        .id;
+    let original = rebuild(
+        &with_callbacks(&iff, &[(0, init), (0, main)]),
+        |c| {
+            if &c.tag == b"OBJD" && c.id == objd {
+                c.data[0x5e..0x60].copy_from_slice(&4300u16.to_le_bytes());
+            }
+        },
+        Vec::new(),
+    );
+    let report = report(&original);
+    assert!(
+        report
+            .resources_not_reproduced
+            .iter()
+            .any(|r| r.starts_with("OBJD")),
+        "{:?}",
+        report.resources_not_reproduced
+    );
+    assert!(
+        matches!(check_of(&report, 4301), TreeCheck::Inconclusive(why) if why.contains("definition's words")),
+        "{:?}",
+        report.trees
+    );
+}
+
+#[test]
+fn creating_an_object_runs_its_callbacks() {
+    // Create Object Instance runs the new object's `init` (and more), whether or not it
+    // creates from a record: it may create this object.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_013A;
+    @id(4200) main { temp[0] = 1; }
+    @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 2; }
+    @id(4301) @frame(locals: 0) tree spawn "Spawn" {
+        raw { op 0x002a (0x3a, 0x01, 0x00, 0x7e, 0, 0, 0, 0); }
+    }
+}"#;
+    let iff = compile(source);
+    let (init, main) = init_and_main(&iff);
+    // Callback 18 runs `Pump`, which the lift writes as a plain tree.
+    let mut entries = vec![(0, 0); 19];
+    entries[0] = (0, init);
+    entries[1] = (0, main);
+    entries[18] = (0, 4300);
+    let report = report(&with_callbacks(&iff, &entries));
+    assert!(
+        matches!(check_of(&report, 4301), TreeCheck::Inconclusive(why) if why.contains("creates an object")),
+        "{:?}",
+        report.trees
+    );
+}
+
+#[test]
+fn an_objf_table_overrides_the_definition_words() {
+    // The VM reads callbacks from OBJf when there is one: `Pump` is `main` here though
+    // the OBJD words still name 4200.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_013B;
+    @id(4200) main { temp[0] = 1; }
+    @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 2; }
+}"#;
+    let iff = compile(source);
+    let (init, main) = init_and_main(&iff);
+    assert_eq!(main, 4200);
+    let objd = iff
+        .chunks
+        .iter()
+        .find(|c| &c.tag == b"OBJD")
+        .expect("OBJD")
+        .id;
+    let table = objf_table(&[(0, init), (0, 4300)]);
+    let original = if iff.get(b"OBJf", objd).is_some() {
+        rebuild(
+            &iff,
+            |c| {
+                if &c.tag == b"OBJf" && c.id == objd {
+                    c.data = table.clone();
+                }
+            },
+            Vec::new(),
+        )
+    } else {
+        let objf = ChunkData {
+            tag: *b"OBJf",
+            id: objd,
+            flags: 0,
+            label: String::new(),
+            data: table,
+        };
+        rebuild(&iff, |_| {}, vec![objf])
+    };
+    let objd_data = |f: &Iff| {
+        f.data(f.chunks.iter().find(|c| &c.tag == b"OBJD").unwrap())
+            .to_vec()
+    };
+    assert_eq!(objd_data(&original), objd_data(&iff));
+    let report = report(&original);
+    for id in [4200, 4300] {
+        if proven(check_of(&report, id)) {
+            assert_eq!(
+                init_and_main(&rebuilt(&report)).1,
+                4300,
+                "{id}: {:?}",
+                report.trees
+            );
+        }
+    }
+    assert!(!proven(check_of(&report, 4300)), "{:?}", report.trees);
+}
+
+#[test]
+fn a_non_private_tree_of_this_file_is_a_callee_the_lift_drops() {
+    // Lifting the global file itself: tree 4301 calls this file's global tree 256,
+    // which the lift does not write.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_013C;
+    @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 2; }
+    @id(4301) @frame(locals: 0) tree caller "Caller" {
+        raw { op 0x0100 (0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff); }
+    }
+}"#;
+    let iff = compile(source);
+    let pump = iff.all(b"BHAV").find(|c| c.id == 4300).expect("pump");
+    let global = ChunkData {
+        tag: *b"BHAV",
+        id: 256,
+        flags: 0,
+        label: "Global pump".to_owned(),
+        data: iff.data(pump).to_vec(),
+    };
+    let report = report(&rebuild(&iff, |_| {}, vec![global]));
+    assert!(
+        report
+            .resources_not_reproduced
+            .contains(&"BHAV 256".to_owned()),
+        "{:?}",
+        report.resources_not_reproduced
+    );
+    assert!(
+        matches!(check_of(&report, 4301), TreeCheck::Inconclusive(why) if why.contains("tree 256")),
+        "{:?}",
+        report.trees
+    );
+}
+
+#[test]
+fn a_name_entry_zero_looks_nothing_up() {
+    // Entry 0 names no tree in either table, so a changed label is not seen.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_013D;
+    @id(4200) main { temp[0] = 1; }
+    @id(4301) @frame(locals: 0) tree caller "Caller" {
+        raw { run_tree_by_name(table: 303, index: 0, mode: 0, global: true); }
+    }
+}"#;
+    let report = report(&relabel(&compile(source), 4200, "Tick"));
+    assert!(proven(check_of(&report, 4301)), "{:?}", report.trees);
 }

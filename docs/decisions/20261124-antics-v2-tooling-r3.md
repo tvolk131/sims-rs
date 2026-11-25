@@ -60,7 +60,7 @@ Every idiom stays behind the decompiler's existing proof loop. A tree whose reco
 
 ### Object-level checks the code check does not make
 
-The code check compares a tree's frame and code. It does not compare four things the game reads, so the lift now checks them itself:
+The code check compares a tree's frame and code. It does not compare the object data the game reads around them, so the lift now checks that data itself:
 
 - **The revision** (saved objects are matched against it). A mismatch leaves the tree unproven (`header_gap`), and `@frame` fixes it.
 - **The label** (Run Tree By Name finds a tree by it). A rebuilt tree labelled differently is reported inconclusive (`Model::object_gap`).
@@ -68,12 +68,12 @@ The code check compares a tree's frame and code. It does not compare four things
   - A label the compiler cannot store (a control character, a character outside Windows-1252, more than 63 bytes) is cleaned and cut to fit. The lift goes on and that tree is reported inconclusive.
 - **The trees a primitive finds by name.**
   - Run Tree By Name reads its name from `STR#` 303. The lift now writes that table; before, it dropped it.
-  - Create Object Instance (with its from-record flag), Go To Routing Slot and Reach look up fixed names (`init visitor`, `route ask to move animation`, `route waiting animation`, `Route failure feedback`, `CT - Grab`, `CT - Put`).
+  - Create Object Instance (with its from-record flag), Go To Relative Position and Go To Routing Slot (which share one routing state machine), and Reach look up fixed names (`init visitor`, `route ask to move animation`, `route waiting animation`, `Route failure feedback`, `CT - Grab`, `CT - Put`).
   - The labels are the VM's: the last BHAV chunk of each ID, deleted ones included.
   - The VM searches the owner's file, its semi-global file and the global file by exact name, then all three again ignoring case. Which file is the owner varies, so a name is checked in this file whichever it is:
     - the exact pass in this file must agree;
     - when it finds nothing, the `GLOB` link and the case-ignoring pass must agree too.
-  - A name not known here (from the global file's table) needs the whole label map and `GLOB` link to agree. This file may itself be the global file, so its own `STR#` 303 entry must not change either.
+  - A name not known here (from the global file's table) needs the whole label map and `GLOB` link to agree. This file may itself be the global file, so its own `STR#` 303 entry must not change either. Entry 0 names nothing in either table.
   - A tree a name finds is a callee: a caller is proven only with it (every tree of the file, for a name not known here).
 - **The object's callbacks.** For every object definition (by GUID), the trees its callback slots run, the VM's way, conditions included:
   - the `OBJf` table when there is one, else the definition's own words;
@@ -85,7 +85,12 @@ The code check compares a tree's frame and code. It does not compare four things
   - an `OBJf` override;
   - a definition the lift drops.
 - **Run Functional Tree** runs the callback its function names, on the stack object. The action every definition has there must agree, and is a callee of the caller.
-- **The semi-global link.** A call to a tree 8192 and up (directly or as a functional callback) goes through `GLOB`. When the rebuilt object's link differs, the caller is inconclusive.
+- **Create Object Instance** runs the new object's callbacks (`init`, then a turn of `main`), with or without its from-record flag. The new object may be this one, so every callback table must agree, and every callback tree is a callee.
+- **Definition and callback reads.** An Expression reading scope 21 (the stack object's definition words) or scope 35 (whether its callback table names a tree) needs this file's definitions, or its callback tables, to agree.
+- **The semi-global link.** Semi-global calls and constants go through `GLOB`, and so does every global tree a tree calls, since it runs with this object as its owner. When the rebuilt object's link differs (an empty name links nothing), no tree of the object is proven.
+- **Non-private trees of this file.** The lift writes only private trees. A tree that runs one of this file's other trees (directly, by name or by function, for example when lifting the global file) is inconclusive.
+
+What stays outside the per-tree checks is listed per object. The lift's existing note names every resource chunk the rebuilt object does not reproduce byte for byte: it now includes `OBJf` tables and non-private BHAVs. The trees that read those resources through a primitive, or through another object, are checked as code only. That covers primitives that read the stack object's definition or interaction table (routing, interactions, Test Object Type, ...) and trees of other objects that read this one.
 
 These gaps are settled: no other spelling of the tree closes them, so the tree is not lowered for them. A caller of an unproven tree stays unproven as before.
 
@@ -94,7 +99,7 @@ They also close soundness gaps on main, which reported these trees proven:
 - every lifecycle block (named after its kind, `Main`/`Init`);
 - every plain-tree `init`/`main` (whose entry ran a generated stub);
 - every Run Tree By Name (whose rebuilt object had no names table);
-- every caller of a semi-global tree: v2 cannot write `GLOB`, so the lifted object has no semi-global file;
+- every tree of an object with a semi-global file: v2 cannot write `GLOB`, so the lifted object has none;
 - every callback the lifted object does not register: v2 writes `init`/`main` (and a catalog variant's), `load`/`reset`/`cleanup` and a fixed set of `functional` kinds, each with a compiler-chosen label. The lift writes none of the other OBJD callback words, no `functional`, and no definition it cannot write as a variant.
 
 v2 has no way to label a lifecycle block, so a block labelled e.g. `main loop` cannot be proven. A label on blocks would be a compiler change (Track 8).
@@ -136,8 +141,8 @@ Not lifted: the rare raw `sleep` statements.
 
 | | main (b3758a7c) | this change |
 |---|---|---|
-| proven (identical + equivalent) | 2699 (367 + 2332)* | 1806 (252 + 1554) |
-| inconclusive / omitted / DIFFERENT | 22 / 1 / **0** | 915 / 1 / **0** |
+| proven (identical + equivalent) | 2699 (367 + 2332)* | 1555 (218 + 1337) |
+| inconclusive / omitted / DIFFERENT | 22 / 1 / **0** | 1166 / 1 / **0** |
 | idiomatic trees | 870 | 891 |
 | raw statements inside idiomatic trees | 1119 | 768 (−31%) |
 | raw trees | 1851 | 1830 |
@@ -146,14 +151,16 @@ Not lifted: the rare raw `sleep` statements.
 
 \* Main's count is not sound. It does not check labels, callbacks, tree names or the semi-global link (see *Object-level checks*).
 
-The 915 inconclusive trees, by the first reason reported:
+The 1166 inconclusive trees, by the first reason reported:
 
-- 449 callbacks the lifted object does not register (see above);
+- 371 callbacks the lifted object does not register (see above);
+- 354 trees of the 36 objects with a semi-global file (the lift writes no `GLOB`);
+- 219 trees that call an unproven tree, directly, by name, by function or by creating an object;
 - 103 lifecycle trees whose label a block cannot keep;
-- 69 callers of semi-global trees (the lift writes no `GLOB`);
-- 88 trees looking a tree up by name that may resolve differently: 43 by a known name, 45 by a name not known here (mostly the global file's table);
+- 53 trees that create an object while the callback tables differ;
+- 23 trees looking a tree up by a name not known here (mostly the global file's table);
 - 18 Run Functional Tree callers whose callback differs;
-- 184 trees that call an unproven tree, directly, by name or by function;
+- 15 readers of definition words and 6 of callback tables that differ;
 - 4 trees that read a `STR#` table the lift does not reproduce.
 
 Writing `STR#` 303 recovered 187 by-name trees and callers that the checks alone would also have left unproven.
@@ -174,7 +181,7 @@ Writing `STR#` 303 recovered 187 by-name trees and callers that the checks alone
 - A block call stays `raw` (see Decision 3.1).
 - 103 base-game lifecycle trees carry labels other than the compiler's block names (`main loop`, ...). They and their by-name callers stay inconclusive until v2 can label a block (Track 8 follow-up, e.g. `main "main loop" { }`).
 - Run Tree By Name from the global file's names table is checked conservatively. Resolving it would need the global file's `STR#` 303 in the lift options.
-- **Callbacks** (500 base-game trees, 6 open-pack trees) need follow-ups:
+- **Callbacks and the semi-global link** (most of the 1166 base-game trees, all 6 open-pack trees) need follow-ups:
   - lift `functional`, `load`/`reset`/`cleanup` and multi-tile definitions (Track 9);
   - a v2 way to fill any OBJD callback word with a labelled tree, and to write the `GLOB` link (Track 8).
 - `@slot(N) let x: T;` is exempt from `uninitialized_local_read` as a whole. A pinned slot exists so raw code or text can use it by number, and lint does not model raw writes by slot number.
