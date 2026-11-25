@@ -87,7 +87,7 @@ fn opening_userdata2_imports_its_patch_families_as_the_first_neighborhood_has_th
     let first = root.join("UserData");
     let directory = root.join("UserData2");
 
-    let mut index = Index::build(&install).unwrap();
+    let mut index = crate::common::installed_index(&install);
     index.add_characters(&directory.join("Characters")).unwrap();
     let catalog = Catalog::build(&index).unwrap();
     let registry = registry(&index, &catalog);

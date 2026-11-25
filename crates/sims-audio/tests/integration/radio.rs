@@ -8,8 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 fn install() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    path.is_dir().then_some(path)
+    crate::common::install("the install's radio and TV")
 }
 
 fn make_wav(rate: u32, channels: u16, frames: usize, sample: i16) -> Vec<u8> {
@@ -256,7 +255,7 @@ fn complete_collection_live_install_discovers_and_streams_radio_and_tv() {
     let Some(root) = install() else {
         return;
     };
-    let files = SoundFiles::scan(&root).expect("scan sound files");
+    let files = crate::common::sound_files(&root);
     let catalog = RadioCatalog::from_sound_files(&files);
 
     // Every built-in stereo station in Complete Collection should have tracks.

@@ -1,12 +1,10 @@
-use sims_audio::files::SoundFiles;
 use sims_audio::music::{ALL_EXPANSIONS, ModeCatalog, ModeMusicPlayer, MusicMode};
 use sims_audio::player::{RATE, VOLUME_STEPS};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 fn install() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    path.is_dir().then_some(path)
+    crate::common::install("the install's music")
 }
 
 /// Builds a tiny 16-bit PCM RIFF WAVE file holding a constant amplitude or
@@ -281,7 +279,7 @@ fn low_output_rate_and_expansion_return_from_family_bin() {
 #[test]
 fn install_catalog_discovers_all_mode_directories_us_and_non_us() {
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
+    let files = crate::common::sound_files(&root);
 
     let us = ModeCatalog::from_sound_files(&files, true, ALL_EXPANSIONS);
     assert_eq!(us.tracks(MusicMode::Buy).len(), 4);
@@ -305,7 +303,7 @@ fn install_catalog_discovers_all_mode_directories_us_and_non_us() {
 #[test]
 fn install_streams_nhood_buy_build_and_load_with_volume_and_transitions() {
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
+    let files = crate::common::sound_files(&root);
     let catalog = ModeCatalog::from_sound_files(&files, true, ALL_EXPANSIONS);
 
     let mut player_a = ModeMusicPlayer::new(catalog.clone(), files.clone(), 99);

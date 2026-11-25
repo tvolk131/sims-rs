@@ -9,19 +9,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 fn install() -> Option<PathBuf> {
-    match std::env::var_os("SIMS_INSTALL") {
-        Some(path) => Some(PathBuf::from(path)),
-        None => {
-            eprintln!("SIMS_INSTALL is not set; skipping the install sound tables");
-            None
-        }
-    }
+    crate::common::install("the install sound tables")
 }
 
 #[test]
 fn shadowed_copies_of_the_tables_are_identical() {
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
+    let files = crate::common::sound_files(&root);
     let mut compared = 0;
     for shadow in &files.shadowed {
         if !["hit", "hsm", "hot", "fsc"].contains(&shadow.extension().as_str()) {
@@ -42,8 +36,8 @@ fn shadowed_copies_of_the_tables_are_identical() {
 #[test]
 fn every_sound_module_parses_and_its_references_resolve() {
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
-    let modules = Module::load_all(&files).unwrap();
+    let files = crate::common::sound_files(&root);
+    let modules = crate::common::modules(&root);
     let names: Vec<&str> = modules.iter().map(|m| m.name.as_str()).collect();
     assert_eq!(names.len(), 27, "{names:?}");
 
@@ -243,7 +237,7 @@ const AMBIENT: [&str; 4] = [
 #[test]
 fn every_ambient_score_parses_and_its_samples_resolve() {
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
+    let files = crate::common::sound_files(&root);
     let mut summary = Vec::new();
     for entry in files.iter().filter(|e| e.extension() == "fsc") {
         let score =
@@ -329,8 +323,8 @@ fn trace(modules: &[Module], files: &SoundFiles, event: &str) -> String {
 #[test]
 fn a_phone_ring_and_a_footstep_lead_to_their_samples() {
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
-    let modules = Module::load_all(&files).unwrap();
+    let files = crate::common::sound_files(&root);
+    let modules = crate::common::modules(&root);
     assert_eq!(
         trace(&modules, &files, "Phone_ring"),
         "sounddata\\simsgeneratedhitsource kind 1 track 3479 entry 0x100 at 0x10 \

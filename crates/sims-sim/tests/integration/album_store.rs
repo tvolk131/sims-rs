@@ -1,5 +1,6 @@
 //! Integration tests for `sims_sim::album_store::PhotoAlbumStore`.
 
+use crate::common::TempDb;
 use redb::ReadableDatabase;
 use sha2::{Digest, Sha256};
 use sims_formats::neighborhood::Family;
@@ -10,29 +11,6 @@ use sims_sim::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-
-struct TempDb(PathBuf);
-
-impl TempDb {
-    fn new(label: &str) -> Self {
-        let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "sims-sim-album-{label}-{}-{n}.redb",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        Self(path)
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
 
 fn dummy_family(number: i32) -> Family {
     Family {

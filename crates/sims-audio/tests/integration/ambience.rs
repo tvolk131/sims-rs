@@ -734,17 +734,12 @@ fn mixer_attenuates_by_zoom_indoor_outdoor_and_volume_steps() {
 #[test]
 fn catalog_indexes_complete_collection_zones_and_streams_real_xa() {
     use sims_audio::ambience::{AmbienceCatalog, AmbienceMixer, AmbienceZone, TimeOfDay};
-    use sims_audio::files::SoundFiles;
-    use std::path::PathBuf;
 
-    let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+    let Some(root) = crate::common::install("the install's ambience") else {
         return;
     };
-    if !root.is_dir() {
-        return;
-    }
 
-    let files = SoundFiles::scan(&root).expect("scan SoundFiles");
+    let files = crate::common::sound_files(&root);
     let catalog = AmbienceCatalog::from_sound_files(&files);
     assert!(catalog.total_tracks() > 0);
 

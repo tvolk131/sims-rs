@@ -7,7 +7,7 @@ use sims_audio::voices::{
 use std::path::PathBuf;
 
 fn sims_install() -> Option<PathBuf> {
-    std::env::var_os("SIMS_INSTALL").map(PathBuf::from)
+    crate::common::install("the install's voices")
 }
 
 #[test]

@@ -2,6 +2,7 @@
 //! corrupt-save recovery, shared-DB `NeighborhoodStore::autosaves()`, and
 //! background worker thread commits.
 
+use crate::common::TempDb;
 use redb::{ReadableDatabase, ReadableTable};
 use sims_sim::{
     AUTOSAVE_FORMAT, AutosavePolicy, AutosaveStore, DEFAULT_MAX_AUTOSAVES, NeighborhoodStore,
@@ -9,31 +10,7 @@ use sims_sim::{
     World,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-
-static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-
-struct TempDb(PathBuf);
-
-impl TempDb {
-    fn new(label: &str) -> Self {
-        let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "sims-sim-autosave-{label}-{}-{n}.redb",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        Self(path)
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
 
 fn assert_send_sync<T: Send + Sync>() {}
 fn assert_send<T: Send>() {}

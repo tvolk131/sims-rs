@@ -1,6 +1,4 @@
-mod common;
-
-use common::{Tree, far};
+use crate::common::{Tree, far};
 use sims_content::{Expansions, Index, Install, Mount};
 
 fn base_game(tree: &Tree) {

@@ -1,6 +1,4 @@
-mod common;
-
-use common::{Tree, far};
+use crate::common::{Tree, far};
 use sims_content::Install;
 use sims_content::ui_graphics::{TABLES, US_ENGLISH, UiGraphics};
 

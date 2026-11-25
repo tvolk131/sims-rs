@@ -1,7 +1,8 @@
 //! Unit and `SIMS_INSTALL` integration tests for `NeighborhoodStore`.
 
+use crate::common::{self, TempDb, TempDir};
 use redb::ReadableDatabase;
-use sims_content::{Catalog, Index, Install};
+use sims_content::{Catalog, Install};
 use sims_formats::neighborhood::Family;
 use sims_sim::characters::{Character, Characters};
 use sims_sim::migration::{
@@ -18,29 +19,6 @@ use sims_sim::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-
-struct TempDb(PathBuf);
-
-impl TempDb {
-    fn new(label: &str) -> Self {
-        let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "sims-sim-nh-{label}-{}-{n}.redb",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        Self(path)
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
 
 fn install() -> Option<PathBuf> {
     match std::env::var_os("SIMS_INSTALL") {
@@ -799,11 +777,11 @@ fn import_userdata_and_userdata2_without_modifying_install_and_match_catalog() {
 
     // Inline character mount reproduces the exact same Catalog GUID order as disk.
     let install = Install::detect(&root).unwrap();
-    let mut disk_index = Index::build(&install).unwrap();
+    let mut disk_index = common::installed_index(&install);
     disk_index.add_characters(&ud1.join("Characters")).unwrap();
     let disk_catalog = Catalog::build(&disk_index).unwrap();
 
-    let mut redb_index = Index::build(&install).unwrap();
+    let mut redb_index = common::installed_index(&install);
     let chars = store.load_character_files("UserData").unwrap();
     redb_index.add_character_files(&chars).unwrap();
     let redb_catalog = Catalog::build(&redb_index).unwrap();
@@ -938,8 +916,8 @@ fn add_character_files_matches_disk_for_subdirs_far_and_win1252_names() {
     let Some(root) = install() else {
         return;
     };
-    let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("sims-sim-char-parity-{}-{n}", std::process::id()));
+    let temp = TempDir::new("char-parity");
+    let dir = temp.0.clone();
     let sub = dir.join("SubDir");
     std::fs::create_dir_all(&sub).unwrap();
 
@@ -985,7 +963,7 @@ fn add_character_files_matches_disk_for_subdirs_far_and_win1252_names() {
     std::fs::write(shadow_dir.join("inner.iff"), &bytes_b).unwrap();
 
     let install = Install::detect(&root).unwrap();
-    let mut disk_index = Index::build(&install).unwrap();
+    let mut disk_index = common::installed_index(&install);
     disk_index.add_characters(&dir).unwrap();
     let disk_catalog = Catalog::build(&disk_index).unwrap();
 
@@ -996,7 +974,7 @@ fn add_character_files_matches_disk_for_subdirs_far_and_win1252_names() {
     files.insert("pack.far".to_owned(), far.clone());
     files.insert("archived.iff/".to_owned(), Vec::new());
     files.insert("archived.iff/inner.iff".to_owned(), bytes_b);
-    let mut inline_index = Index::build(&install).unwrap();
+    let mut inline_index = common::installed_index(&install);
     inline_index.add_character_files(&files).unwrap();
     let inline_catalog = Catalog::build(&inline_index).unwrap();
 
@@ -1008,9 +986,9 @@ fn add_character_files_matches_disk_for_subdirs_far_and_win1252_names() {
     // present, so `pack.far/archived.iff` remains shadowed.
     std::fs::remove_file(shadow_dir.join("inner.iff")).unwrap();
     files.remove("archived.iff/inner.iff");
-    let mut disk_after = Index::build(&install).unwrap();
+    let mut disk_after = common::installed_index(&install);
     disk_after.add_characters(&dir).unwrap();
-    let mut inline_after = Index::build(&install).unwrap();
+    let mut inline_after = common::installed_index(&install);
     inline_after.add_character_files(&files).unwrap();
     let disk_guids_after: Vec<u32> = Catalog::build(&disk_after)
         .unwrap()
