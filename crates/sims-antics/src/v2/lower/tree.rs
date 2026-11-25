@@ -599,6 +599,19 @@ const SIM_PERSON_FIELDS: &[(&str, u8)] = &[
     ("family", 61),
 ];
 
+/// Read-only words of an object's definition, read through the stack object (`sims-vm`
+/// `memory.rs` scope 21, the stack object's definition as words; the word meanings are the
+/// engine's, `factory.rs` `word`): `object_type` is word 9 (2 for a person) and `sub_index`
+/// word 11, a tile's place in its group (high byte, signed, its first offset; low byte its
+/// second; -1 the group's catalog master).
+pub(super) fn definition_field(name: &str) -> Option<u8> {
+    match name {
+        "object_type" => Some(9),
+        "sub_index" => Some(11),
+        _ => None,
+    }
+}
+
 /// The object-data word of a named object field (`broken` → 15).
 pub(super) fn object_data_field(name: &str) -> Option<u8> {
     OBJECT_DATA_FIELDS

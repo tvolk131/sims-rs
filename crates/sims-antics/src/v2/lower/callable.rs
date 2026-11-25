@@ -205,14 +205,14 @@ impl<'a> TreeLowerer<'a> {
             // A runtime (`extern bcon`) read can fault on a missing chunk: read it now, in source
             // order, so a fault cannot follow a partial temp staging or an out-of-order read.
             let may_fault = air.starts_with("bcon[");
-            operands[i] =
-                if const_val.is_none() && (air.contains("temp[") || later_impure || may_fault) {
-                    let snap = self.fresh("arg");
-                    self.emit_let(&snap, &air);
-                    (snap, None)
-                } else {
-                    (air, const_val)
-                };
+            operands[i] = if const_val.is_none() && (reads_temps(&air) || later_impure || may_fault)
+            {
+                let snap = self.fresh("arg");
+                self.emit_let(&snap, &air);
+                (snap, None)
+            } else {
+                (air, const_val)
+            };
         }
 
         let positional: Vec<usize> = (0..n)

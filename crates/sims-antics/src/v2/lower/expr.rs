@@ -578,8 +578,48 @@ impl<'a> TreeLowerer<'a> {
                         }
                     }
                 }
+                if let V2Expr::Ident(_, bname) = base.as_ref()
+                    && let Some(word) = definition_field(field)
+                    && !self.handle_has_state(bname, field)
+                    && let Some(read) = self.read_stack_object_cell(
+                        bname,
+                        *span,
+                        &format!("scope(21, {word})"),
+                        ValueType::I16,
+                    )?
+                {
+                    return Ok(read);
+                }
                 let lval = self.resolve_lvalue(expr)?;
                 self.read_lvalue(&lval)
+            }
+            // `x.has_function[N]`: whether the stack object's definition names a tree for
+            // function N (`sims-vm` `memory.rs` scope 35), read through the stack object.
+            V2Expr::Index { span, base, index }
+                if matches!(base.as_ref(), V2Expr::Field { base: root, field, .. }
+                    if field == "has_function" && matches!(root.as_ref(), V2Expr::Ident(..))) =>
+            {
+                let V2Expr::Field { base: root, .. } = base.as_ref() else {
+                    unreachable!("matched above");
+                };
+                let V2Expr::Ident(_, rname) = root.as_ref() else {
+                    unreachable!("matched above");
+                };
+                let n = self.eval_builtin_int(index, "has_function index", 0, 255)?;
+                match self.read_stack_object_cell(
+                    rname,
+                    *span,
+                    &format!("scope(35, {n})"),
+                    ValueType::Bool,
+                )? {
+                    Some(read) => Ok(read),
+                    None => Err(Error::at(
+                        *span,
+                        format!(
+                            "'{rname}.has_function[..]' needs an object handle ('self', 'stack_obj', or an object variable)"
+                        ),
+                    )),
+                }
             }
             V2Expr::Index { span, base, index }
                 if matches!(base.as_ref(), V2Expr::Ident(_, n) if n == "local")
@@ -700,6 +740,22 @@ impl<'a> TreeLowerer<'a> {
                         self.line(format!("let {tmp} = 0;"));
                         self.line(format!("random({tmp}, {range_air});"));
                         return Ok((tmp, ValueType::I16));
+                    }
+                    // `job_field(F)`: field F of the job `temp[0]` (career) and `temp[1]` (level)
+                    // name as they are where it is read (`sims-vm` `memory.rs` scope 33), as a
+                    // plain operand a compare or store reads in place.
+                    if fname == "job_field"
+                        && self
+                            .env
+                            .lookup_fn(&self.owner_module, fname, self.in_object_scope)
+                            .is_none()
+                    {
+                        let bound = self.bind_builtin_args("job_field", args, &["field"], &[])?;
+                        let field = bound.get("field").ok_or_else(|| {
+                            Error::at(*span, "job_field(field) requires a field number")
+                        })?;
+                        let f = self.eval_builtin_int(&field.value, "job_field field", 0, 32767)?;
+                        return Ok((format!("scope(33, {f})"), ValueType::I16));
                     }
                     if fname == "job_data"
                         && self
@@ -852,7 +908,9 @@ impl<'a> TreeLowerer<'a> {
         let b = self.lower_job_operand(second_key, second)?;
         let (career, mut level) = if level_first { (b, a) } else { (a, b) };
         let field = self.eval_builtin_int(&field_arg.value, "job_data field", 0, 32767)?;
-        if level.contains("temp[0]") {
+        // The career's staging writes `temp[0]` first: a level that reads it (job data reads
+        // both temps) is copied before.
+        if level.contains("temp[0]") || level.contains("scope(33,") {
             level = self.snapshot_operand(level, "job_level");
         }
         self.line(format!("temp[0] := {career};"));
@@ -860,6 +918,84 @@ impl<'a> TreeLowerer<'a> {
         let tmp = self.fresh("job");
         self.line(format!("let {tmp} = scope(33, {field});"));
         Ok((tmp, ValueType::I16))
+    }
+
+    /// Whether `handle.<field>` names a state of the object `handle` is (which then wins over an
+    /// engine field of the same name).
+    pub(super) fn handle_has_state(&self, handle: &str, field: &str) -> bool {
+        if self.is_self_ident(handle) {
+            return self.env.states.contains_key(field);
+        }
+        match self.lookup_var(handle) {
+            Some(
+                Binding::Local {
+                    ty: ValueType::ObjectRef(key),
+                    ..
+                }
+                | Binding::BhavParam {
+                    ty: ValueType::ObjectRef(key),
+                    ..
+                },
+            ) => self
+                .env
+                .object_schemas
+                .get(key)
+                .is_some_and(|s| s.states.contains_key(field)),
+            _ => false,
+        }
+    }
+
+    /// Reads `cell`, a cell of the stack object (`scope(21, ..)`, `scope(35, ..)`), for the object
+    /// `handle` names: in place when that is the stack object, else with the stack object moved
+    /// to it and put back. `None` when `handle` is no object handle. A Sim handle (`sim`, `me`
+    /// in a Sim tree) is refused: it is `my.`, not reached through the stack object, so a tree
+    /// that never moves the cursor keeps no entry save to put it back with.
+    pub(super) fn read_stack_object_cell(
+        &mut self,
+        handle: &str,
+        span: Span,
+        cell: &str,
+        ty: ValueType,
+    ) -> Result<Option<(String, ValueType)>> {
+        let direct = |ty| LValue::Direct {
+            air: cell.to_owned(),
+            ty,
+        };
+        let foreign = |obj_air: &str, ty| LValue::ForeignCell {
+            obj_air: obj_air.to_owned(),
+            cell: cell.to_owned(),
+            setup: None,
+            ty,
+        };
+        let lval = if handle == "stack_obj" {
+            direct(ty)
+        } else if self.is_self_ident(handle) {
+            if self.inherit_tree {
+                return Err(Error::at(
+                    span,
+                    "a 'context = inherit' tree runs on whichever object calls it; read the field through 'stack_obj'",
+                ));
+            }
+            match self.tree_ctx {
+                TreeContext::ObjectSelf => foreign("my.id", ty),
+                TreeContext::SimOnObject { .. } => match self.self_stack_target() {
+                    "stack_obj" => direct(ty),
+                    target => foreign(target, ty),
+                },
+            }
+        } else if self.is_my_ident(handle) || self.is_frame_me(handle) {
+            return Err(Error::at(
+                span,
+                format!(
+                    "'{handle}' is read through 'my.', not the stack object: select it first ('stack_obj = {handle};') and read the field on 'stack_obj'"
+                ),
+            ));
+        } else if let Some((obj_air, _)) = self.object_handle_air(handle) {
+            foreign(&obj_air, ty)
+        } else {
+            return Ok(None);
+        };
+        self.read_lvalue(&lval).map(Some)
     }
 
     pub(super) fn lower_job_operand(&mut self, key: &str, arg: &CallArg) -> Result<String> {

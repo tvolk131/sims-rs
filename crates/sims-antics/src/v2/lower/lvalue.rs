@@ -111,6 +111,17 @@ impl<'a> TreeLowerer<'a> {
                         "BCON constants are read-only (cannot assign to a BCON table entry)",
                     ));
                 }
+                if let V2Expr::Ident(_, bname) = base.as_ref()
+                    && let Some(word) = definition_field(field)
+                    && !self.handle_has_state(bname, field)
+                {
+                    return Err(Error::at(
+                        *span,
+                        format!(
+                            "'{bname}.{field}' is read-only (word {word} of the object's definition)"
+                        ),
+                    ));
+                }
                 // `sim.motive.energy`, `sim.skill.cooking`, `self.<state>`, `self.graphic`, etc.
                 if let V2Expr::Field {
                     base: root,
@@ -377,6 +388,12 @@ impl<'a> TreeLowerer<'a> {
                 Err(Error::at(
                     *span,
                     format!("unknown field {path} (nothing in scope has it)"),
+                ))
+            }
+            V2Expr::Index { span, base, .. } if matches!(base.as_ref(), V2Expr::Field { field, .. } if field == "has_function") => {
+                Err(Error::at(
+                    *span,
+                    "'has_function[N]' is read-only (whether the object's definition names a tree for function N)",
                 ))
             }
             V2Expr::Index { span, base, index } => {
@@ -678,7 +695,8 @@ impl<'a> TreeLowerer<'a> {
                 ..
             } => {
                 let switches = obj_air != "stack_obj";
-                let clobbers_temp0 = setup.is_some() && rhs_air.contains("temp[0]");
+                let clobbers_temp0 = setup.is_some()
+                    && (rhs_air.contains("temp[0]") || rhs_air.contains("scope(33,"));
                 let effective_rhs = if (switches
                     && (rhs_air.starts_with("stack.") || rhs_air == "stack_obj"))
                     || clobbers_temp0

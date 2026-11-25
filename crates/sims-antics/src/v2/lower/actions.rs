@@ -109,7 +109,9 @@ impl<'a> TreeLowerer<'a> {
                 // The last argument is followed only by the temp copies, so it stays in place
                 // unless it reads a temp those copies overwrite.
                 let last = seen_positional == positional;
-                let staged = if is_fixed(&val) || (last && !val.starts_with("temp[")) {
+                let staged = if is_fixed(&val)
+                    || (last && !val.starts_with("temp[") && !reads_temps(&val))
+                {
                     val
                 } else {
                     let staged = self.fresh("rf_arg");

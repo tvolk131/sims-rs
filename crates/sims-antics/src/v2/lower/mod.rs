@@ -63,7 +63,7 @@ use self::object::*;
 use self::prim_table::*;
 use self::raw::*;
 use self::schema::*;
-use self::tree::{object_data_field, sim_person_field};
+use self::tree::{definition_field, object_data_field, sim_person_field};
 use self::trees::*;
 
 const MAX_INLINE_DEPTH: usize = 16;
@@ -427,6 +427,13 @@ impl ValueType {
     fn is_object_handle(&self) -> bool {
         matches!(self, Self::ObjectId | Self::ObjectRef(_))
     }
+}
+
+/// Whether an `.air` operand reads the temps: a `temp[i]` cell, or job data (`scope(33, F)`,
+/// which reads the career and level in `temp[0]` and `temp[1]`). Staging that writes temps
+/// copies such an operand first.
+fn reads_temps(air: &str) -> bool {
+    air.contains("temp[") || air.contains("scope(33,")
 }
 
 fn types_compatible_for_assign(target: &ValueType, value: &ValueType) -> bool {
