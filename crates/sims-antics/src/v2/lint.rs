@@ -1297,6 +1297,7 @@ fn print_expr(e: &V2Expr) -> Option<String> {
             let op = match op {
                 V2UnaryOp::Not => "!",
                 V2UnaryOp::Neg => "-",
+                V2UnaryOp::AsI16 => return Some(format!("{} as i16", child(inner)?)),
             };
             format!("{op}{}", child(inner)?)
         }

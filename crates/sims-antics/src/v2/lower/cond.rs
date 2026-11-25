@@ -22,6 +22,23 @@ impl<'a> TreeLowerer<'a> {
                 inner,
                 ..
             } => matches!(inner.as_ref(), V2Expr::Int(_, _)),
+            // The conversions add no node: `x as i16` and `T::from_raw(x)` are `x`'s operand.
+            V2Expr::Unary {
+                op: V2UnaryOp::AsI16,
+                inner,
+                ..
+            } => self.is_pure_single_operand(inner),
+            V2Expr::Call {
+                callee,
+                type_args,
+                args,
+                ..
+            } if type_args.is_empty()
+                && matches!(args.as_slice(), [a] if a.name.is_none())
+                && self.raw_conversion_target(callee).is_some() =>
+            {
+                self.is_pure_single_operand(&args[0].value)
+            }
             V2Expr::Deref { inner, .. } => {
                 if let V2Expr::Ident(_, pname) = inner.as_ref() {
                     matches!(
@@ -167,14 +184,19 @@ impl<'a> TreeLowerer<'a> {
         span: Span,
     ) -> Result<(String, String)> {
         let (l, l_ty) = self.lower_value_expr(lhs)?;
+        // An engine word also takes a raw bit number (`w flag_test 3`), compared below exactly
+        // as an `i16` word is; an `i16` word takes a single flag constant of any bitflags type
+        // (`world.expansions flag_test Expansions::Pets`).
         if op == V2BinOp::FlagTest
-            && let ValueType::Bitflags(ref key) = l_ty
+            && let Some(key) = flag_op_key(&l_ty)
+            && let const_bit = self.try_eval_const_bitflag(rhs, key)?
+            && (const_bit.is_some() || is_strict_flags(&l_ty))
         {
-            let Some((_, Some(bit))) = self.try_eval_const_bitflag(rhs, key)? else {
+            let Some((_, Some(bit))) = const_bit else {
                 return Err(Error::at(
                     rhs.span(),
                     format!(
-                        "'flag_test' on bitflags '{}' requires a single flag constant (use '.contains(...)' for masks)",
+                        "'flag_test' on '{}' requires a single flag constant (use '.contains(...)' for masks)",
                         self.env.display_value_type(&l_ty)
                     ),
                 ));
@@ -206,9 +228,17 @@ impl<'a> TreeLowerer<'a> {
                 }
             }
             V2BinOp::Lt | V2BinOp::Le | V2BinOp::Gt | V2BinOp::Ge => {
-                if !matches!(l_ty, ValueType::I16 | ValueType::ObjectId)
-                    || !matches!(r_ty, ValueType::I16 | ValueType::ObjectId)
-                {
+                // An engine word compares as the `i16` it is.
+                let ordered = |t: &ValueType| {
+                    matches!(t, ValueType::I16 | ValueType::ObjectId) || is_engine_flags(t)
+                };
+                // Two typed words compare only when they are one type (as `==` requires).
+                let same_kind = !matches!(
+                    (&l_ty, &r_ty),
+                    (ValueType::Bitflags(_), ValueType::Bitflags(_))
+                ) || types_compatible_for_assign(&l_ty, &r_ty)
+                    || types_compatible_for_assign(&r_ty, &l_ty);
+                if !ordered(&l_ty) || !ordered(&r_ty) || !same_kind {
                     return Err(Error::at(
                         span,
                         format!(
@@ -219,7 +249,10 @@ impl<'a> TreeLowerer<'a> {
                     ));
                 }
             }
-            V2BinOp::FlagTest if l_ty != ValueType::I16 || r_ty != ValueType::I16 => {
+            V2BinOp::FlagTest
+                if !(l_ty == ValueType::I16 || is_engine_flags(&l_ty))
+                    || r_ty != ValueType::I16 =>
+            {
                 return Err(Error::at(
                     span,
                     format!(

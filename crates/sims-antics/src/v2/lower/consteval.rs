@@ -58,6 +58,48 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// Resolves a compile-time constant of any enum (`Enum::Variant` or `Binding::ConstEnum`).
+    pub(super) fn try_eval_any_const_enum(&self, expr: &V2Expr) -> Result<Option<i16>> {
+        Ok(self.try_eval_keyed_const_enum(expr)?.map(|(_, v)| v))
+    }
+
+    /// A constant of an engine type (a `std::engine` variant or a `std::flags` mask), which a
+    /// primitive's numeric operand takes as its number.
+    pub(super) fn try_eval_engine_const(&self, expr: &V2Expr) -> Result<Option<i16>> {
+        if let Some((key, mask, _)) = self.try_eval_any_const_bitflag(expr)? {
+            return Ok(is_engine_flags_key(&key).then_some(mask));
+        }
+        Ok(self
+            .try_eval_keyed_const_enum(expr)?
+            .and_then(|(key, v)| is_engine_enum_key(&key).then_some(v)))
+    }
+
+    /// [`Self::try_eval_any_const_enum`] with the enum's key.
+    fn try_eval_keyed_const_enum(&self, expr: &V2Expr) -> Result<Option<(String, i16)>> {
+        match expr {
+            V2Expr::Path(span, segs) if segs.len() == 2 => {
+                let Some(e) =
+                    self.env
+                        .lookup_enum(&self.owner_module, &segs[0], self.in_object_scope)
+                else {
+                    return Ok(None);
+                };
+                let &val = e.variants.get(&segs[1]).ok_or_else(|| {
+                    Error::at(
+                        *span,
+                        format!("enum '{}' has no variant '{}'", e.display_name, segs[1]),
+                    )
+                })?;
+                Ok(Some((e.canonical_key.clone(), val)))
+            }
+            V2Expr::Ident(_, name) => match self.lookup_var(name) {
+                Some(Binding::ConstEnum { key, value }) => Ok(Some((key.clone(), *value))),
+                _ => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
     /// Resolves a compile-time `Bitflags` constant expression (single flag, `None`, or `|`/`&`/`^` of constants),
     /// returning `(mask, single_bit_1_based)` when constant!
     pub(super) fn try_eval_const_bitflag(
@@ -126,6 +168,12 @@ impl<'a> TreeLowerer<'a> {
                 rhs,
                 ..
             } => {
+                // Any bitflags type: both sides must still be the same type.
+                if expected_key == ANY_BITFLAGS {
+                    return Ok(self
+                        .try_eval_any_const_bitflag(expr)?
+                        .map(|(_, mask, bit)| (mask, bit)));
+                }
                 let Some((lmask, _)) = self.try_eval_const_bitflag(lhs, expected_key)? else {
                     return Ok(None);
                 };
@@ -538,6 +586,30 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// The constant bool that `b as i16` converts: a literal, a constant binding, a bool param,
+    /// and `!`, `&&` and `||` of those. Unlike a condition, both operands of `&&` and `||` must
+    /// be constant, so an unresolved name is never folded away.
+    pub(super) fn try_eval_cast_bool(&self, expr: &V2Expr) -> Option<bool> {
+        match expr {
+            V2Expr::Unary {
+                op: V2UnaryOp::Not,
+                inner,
+                ..
+            } => self.try_eval_cast_bool(inner).map(|b| !b),
+            V2Expr::Binary {
+                lhs,
+                op: op @ (V2BinOp::And | V2BinOp::Or),
+                rhs,
+                ..
+            } => {
+                let (l, r) = (self.try_eval_cast_bool(lhs)?, self.try_eval_cast_bool(rhs)?);
+                Some(if *op == V2BinOp::And { l && r } else { l || r })
+            }
+            V2Expr::Bool(..) | V2Expr::Ident(..) => self.try_eval_const_bool_inner(expr, true),
+            _ => None,
+        }
+    }
+
     pub(super) fn eval_const_bool_required(&self, expr: &V2Expr, span: Span) -> Result<bool> {
         self.try_const_bool_arg(expr).ok_or_else(|| {
             Error::at(
@@ -556,10 +628,57 @@ impl<'a> TreeLowerer<'a> {
                 op: V2UnaryOp::Neg,
                 inner,
             } => {
+                // `-32768` is a literal, though `32768` alone is out of range.
+                if let V2Expr::Int(_, v) = inner.as_ref() {
+                    return v
+                        .checked_neg()
+                        .and_then(|x| i16::try_from(x).ok())
+                        .ok_or_else(|| {
+                            Error::at(*span, format!("negated integer -{v} out of i16 range"))
+                        });
+                }
                 let inner_v = self.eval_const_i16(inner)?;
                 inner_v
                     .checked_neg()
                     .ok_or_else(|| Error::at(*span, "i16 negation overflow"))
+            }
+            // `Enum::Variant as i16`, `Flags::A | Flags::B as i16`, or an i16 constant.
+            V2Expr::Unary {
+                op: V2UnaryOp::AsI16,
+                inner,
+                ..
+            } => {
+                if let Some((_, mask, _)) = self.try_eval_any_const_bitflag(inner)? {
+                    return Ok(mask);
+                }
+                if let Some(v) = self.try_eval_any_const_enum(inner)? {
+                    return Ok(v);
+                }
+                if let Some(b) = self.try_eval_cast_bool(inner) {
+                    return Ok(i16::from(b));
+                }
+                match inner.as_ref() {
+                    // `T::from_raw(c) as i16` is `c`, under the rules of the value path.
+                    V2Expr::Call {
+                        span,
+                        callee,
+                        type_args,
+                        args,
+                    } if let Some(target) = self.raw_conversion_target(callee) => {
+                        self.check_from_raw_call(*span, &target, type_args, args)?;
+                        let arg = &args[0].value;
+                        if let Some((key, mask, _)) = self.try_eval_any_const_bitflag(arg)? {
+                            self.check_from_raw_arg(arg, &target, &ValueType::Bitflags(key))?;
+                            return Ok(mask);
+                        }
+                        if let Some((key, v)) = self.try_eval_keyed_const_enum(arg)? {
+                            self.check_from_raw_arg(arg, &target, &ValueType::Enum(key))?;
+                            return Ok(v);
+                        }
+                        self.eval_const_i16(arg)
+                    }
+                    _ => self.eval_const_i16(inner),
+                }
             }
             V2Expr::Ident(span, name) => {
                 if let Some(binding) = self.lookup_var(name) {

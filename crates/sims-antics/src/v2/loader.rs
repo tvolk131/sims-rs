@@ -9,7 +9,7 @@ use crate::v2::ast::{
     AbiParamSlot, BitflagsDecl, ConstDecl, EnumDecl, ExternBconDecl, ExternFnDecl, ExternModDecl,
     FnDecl, ObjectDecl, ReturnAbi, TemplateDecl, V2File, V2Item, V2Type, object_type_ident,
 };
-use crate::v2::parser::parse_v2_file;
+use crate::v2::parser::{parse_v2_file, parse_v2_std_file};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -612,10 +612,15 @@ pub(crate) fn merge_extern_mods(
     Ok((base_owner.to_owned(), merged))
 }
 
+/// The built-in module that declares the prelude types (`Height`, `Placement`).
+pub(crate) const STD_PRELUDE_MODULE: &str = "std::flags";
+
 /// The source of a built-in `std::<module>` (`use std::globals::*;`), if there is one.
-fn std_module_source(segs: &[String]) -> Option<String> {
+pub(crate) fn std_module_source(segs: &[String]) -> Option<&'static str> {
     match segs {
-        [m] if m == "globals" => Some(include_str!("std/globals.antics").to_owned()),
+        [m] if m == "globals" => Some(include_str!("std/globals.antics")),
+        [m] if m == "flags" => Some(include_str!("std/flags.antics")),
+        [m] if m == "engine" => Some(include_str!("std/engine.antics")),
         _ => None,
     }
 }
@@ -780,6 +785,9 @@ impl<'a> ModuleLoader<'a> {
                     glob_items = target
                         .pub_names()
                         .into_iter()
+                        // `std::flags` declares the prelude types (`Height`, `Placement`),
+                        // which every module already sees under their built-in names.
+                        .filter(|n| !crate::v2::ast::is_reserved_type_name(n))
                         // A name already bound here (a local item or an earlier import)
                         // shadows the glob's.
                         .filter(|n| {
@@ -806,6 +814,13 @@ impl<'a> ModuleLoader<'a> {
             };
             for item in use_items {
                 let local_name = item.alias.as_ref().unwrap_or(&item.name);
+                // `use std::flags::Height;` names the prelude type itself: nothing to bind.
+                if target_key == STD_PRELUDE_MODULE
+                    && item.alias.is_none()
+                    && crate::v2::ast::is_std_prelude_type_name(local_name)
+                {
+                    continue;
+                }
                 if crate::v2::ast::is_reserved_type_name(local_name) {
                     return Err(Error::at(
                         item.span,
@@ -1023,10 +1038,12 @@ impl<'a> ModuleLoader<'a> {
             let Some(src) = std_module_source(mod_segs) else {
                 return Err(Error::at(
                     span,
-                    format!("unknown built-in module '{canonical_key}' (expected 'std::globals')"),
+                    format!(
+                        "unknown built-in module '{canonical_key}' (expected 'std::globals', 'std::flags' or 'std::engine')"
+                    ),
                 ));
             };
-            let parsed = parse_v2_file(&src).map_err(|e| e.with_context(&canonical_key))?;
+            let parsed = parse_v2_std_file(src).map_err(|e| e.with_context(&canonical_key))?;
             self.resolve_parsed_module(canonical_key.clone(), &parsed, false)?;
             return Ok(canonical_key);
         }

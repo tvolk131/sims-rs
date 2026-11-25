@@ -42,42 +42,54 @@ impl DialogStringTable {
     }
 }
 
-pub(super) fn builtin_bitflags() -> BTreeMap<String, ResolvedBitflags> {
-    let mut map = BTreeMap::new();
-    map.insert(
-        "builtin::Height".to_owned(),
-        ResolvedBitflags {
-            canonical_key: "builtin::Height".to_owned(),
-            display_name: "Height".to_owned(),
-            flags: BTreeMap::from([
-                ("Floor".to_owned(), 1),
-                ("LowTable".to_owned(), 2),
-                ("Table".to_owned(), 3),
-                ("Counter".to_owned(), 4),
-                ("NonStandard".to_owned(), 5),
-                ("InHand".to_owned(), 6),
-                ("Sitting".to_owned(), 7),
-                ("EndTable".to_owned(), 8),
-            ]),
-        },
-    );
-    map.insert(
-        "builtin::Placement".to_owned(),
-        ResolvedBitflags {
-            canonical_key: "builtin::Placement".to_owned(),
-            display_name: "Placement".to_owned(),
-            flags: BTreeMap::from([
-                ("Floor".to_owned(), 1),
-                ("Terrain".to_owned(), 2),
-                ("Water".to_owned(), 3),
-                ("Sloped".to_owned(), 9),
-                ("Air".to_owned(), 10),
-                ("Pool".to_owned(), 12),
-                ("WaterOnly".to_owned(), 14),
-            ]),
-        },
-    );
-    map
+/// `Height` (object data word 4), a prelude type declared in `std::flags`.
+pub(super) const HEIGHT_KEY: &str = "bitflags::std::flags::Height";
+/// `Placement`, a prelude type declared in `std::flags`.
+pub(super) const PLACEMENT_KEY: &str = "bitflags::std::flags::Placement";
+
+/// The enums and bitflags of the built-in `std::flags` and `std::engine` modules, keyed as an
+/// import of them keys them (`bitflags::std::flags::Height`). Every object resolves them, so
+/// typed engine fields name the same type whether or not the source imports it.
+pub(super) struct StdTypes {
+    pub(super) enums: BTreeMap<String, ResolvedEnum>,
+    pub(super) bitflags: BTreeMap<String, ResolvedBitflags>,
+}
+
+pub(super) fn std_types() -> Result<&'static StdTypes> {
+    static TYPES: std::sync::OnceLock<std::result::Result<StdTypes, String>> =
+        std::sync::OnceLock::new();
+    TYPES
+        .get_or_init(|| {
+            let mut types = StdTypes {
+                enums: BTreeMap::new(),
+                bitflags: BTreeMap::new(),
+            };
+            for m in ["flags", "engine"] {
+                let module = format!("std::{m}");
+                let src = crate::v2::loader::std_module_source(&[m.to_owned()])
+                    .ok_or_else(|| format!("missing built-in module '{module}'"))?;
+                let file = crate::v2::parser::parse_v2_std_file(src)
+                    .map_err(|e| format!("built-in module '{module}': {e}"))?;
+                for item in &file.items {
+                    match item {
+                        V2Item::Enum(d) => {
+                            let key = format!("enum::{module}::{}", d.name);
+                            types.enums.insert(key.clone(), resolve_enum_decl(key, d));
+                        }
+                        V2Item::Bitflags(d) => {
+                            let key = format!("bitflags::{module}::{}", d.name);
+                            types
+                                .bitflags
+                                .insert(key.clone(), resolve_bitflags_decl(key, d));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(types)
+        })
+        .as_ref()
+        .map_err(|e| Error::new(e.clone()))
 }
 
 pub(super) fn bit_to_mask(bit: u8) -> i16 {
@@ -172,10 +184,8 @@ impl<'a> ObjectEnv<'a> {
             }
         }
         match name {
-            "Height" => return Some(ResolvedNamedType::Bitflags("builtin::Height".to_owned())),
-            "Placement" => {
-                return Some(ResolvedNamedType::Bitflags("builtin::Placement".to_owned()));
-            }
+            "Height" => return Some(ResolvedNamedType::Bitflags(HEIGHT_KEY.to_owned())),
+            "Placement" => return Some(ResolvedNamedType::Bitflags(PLACEMENT_KEY.to_owned())),
             "Self" => return Some(ResolvedNamedType::Object(self.self_object_key.clone())),
             _ => {}
         }

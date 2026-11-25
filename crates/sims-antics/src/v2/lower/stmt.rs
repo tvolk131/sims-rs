@@ -170,14 +170,19 @@ impl<'a> TreeLowerer<'a> {
                 let lval = self.resolve_lvalue(target)?;
                 let target_ty = lval.value_type().clone();
                 // Handle bitflags `flag_set` / `flag_clear` explicitly (1-based bit index!).
+                // An engine word also takes a raw bit number (`w flag_set 3`), lowered below
+                // exactly as for an `i16` cell.
+                // An `i16` target takes a single flag constant of any bitflags type.
                 if matches!(op, V2AssignOp::FlagSet | V2AssignOp::FlagClear)
-                    && let ValueType::Bitflags(ref key) = target_ty
+                    && let Some(key) = flag_op_key(&target_ty)
+                    && let const_bit = self.try_eval_const_bitflag(value, key)?
+                    && (const_bit.is_some() || is_strict_flags(&target_ty))
                 {
-                    let Some((_, Some(bit))) = self.try_eval_const_bitflag(value, key)? else {
+                    let Some((_, Some(bit))) = const_bit else {
                         return Err(Error::at(
                             value.span(),
                             format!(
-                                "'flag_set'/'flag_clear' on bitflags '{}' requires a single flag constant (use '.set(...)' / '.clear(...)' for masks)",
+                                "'flag_set'/'flag_clear' on '{}' requires a single flag constant (use '.set(...)' / '.clear(...)' for masks)",
                                 self.env.display_value_type(&target_ty)
                             ),
                         ));
@@ -185,13 +190,19 @@ impl<'a> TreeLowerer<'a> {
                     return self.emit_lvalue_assign(&lval, *op, &bit.to_string());
                 }
                 // Compact in-place compound arithmetic lowering when target is Direct, alias-free,
-                // side-effect-free, and cannot trap partway through!
+                // side-effect-free, and cannot trap partway through! An `as i16` around the
+                // arithmetic adds no node.
+                let (arith, cast_at) = peel_as_i16(value);
                 if *op == V2AssignOp::Set
                     && let LValue::Direct { ref air, .. } = lval
-                    && is_compound_arith_or_neg(value)
-                    && self.can_lower_arith_in_place(air, value, false)
+                    && is_compound_arith_or_neg(arith)
+                    && self.can_lower_arith_in_place(air, arith, false)
                 {
-                    let val_ty = self.lower_arith_into_dest(value, air, false)?;
+                    let mut val_ty = self.lower_arith_into_dest(arith, air, false)?;
+                    if let Some(at) = cast_at {
+                        self.check_as_i16_source(at, &val_ty)?;
+                        val_ty = ValueType::I16;
+                    }
                     if !types_compatible_for_assign(&target_ty, &val_ty) {
                         return Err(Error::at(
                             *span,
@@ -214,6 +225,19 @@ impl<'a> TreeLowerer<'a> {
                     Some(r) => r,
                     None => self.lower_value_expr(value)?,
                 };
+                // Past the constant path, a flag operation takes a raw bit number: a runtime
+                // bitflags value is a mask, not a bit.
+                if matches!(op, V2AssignOp::FlagSet | V2AssignOp::FlagClear)
+                    && !matches!(val_ty, ValueType::I16 | ValueType::ObjectId)
+                {
+                    return Err(Error::at(
+                        value.span(),
+                        format!(
+                            "'flag_set'/'flag_clear' takes a single flag constant or an i16 bit number, found '{}'",
+                            self.env.display_value_type(&val_ty)
+                        ),
+                    ));
+                }
                 if *op != V2AssignOp::Set {
                     match &target_ty {
                         ValueType::Bool => {
@@ -231,6 +255,9 @@ impl<'a> TreeLowerer<'a> {
                                 ),
                             ));
                         }
+                        // An engine word takes any compound assignment from a raw word.
+                        ValueType::Bitflags(_)
+                            if is_engine_flags(&target_ty) && val_ty == ValueType::I16 => {}
                         ValueType::Bitflags(_) => {
                             if !matches!(
                                 op,
@@ -2127,4 +2154,19 @@ fn air_writes_cell(air: &str, cell: &str) -> bool {
         let is_dest = air[..at].trim_end().ends_with("dest:");
         before_ok && (WRITES.contains(&op) || is_dest)
     })
+}
+
+/// `e as i16 as i16 ..` → `e` and the span of the outermost cast, if there is one.
+fn peel_as_i16(mut expr: &V2Expr) -> (&V2Expr, Option<Span>) {
+    let mut at = None;
+    while let V2Expr::Unary {
+        span,
+        op: V2UnaryOp::AsI16,
+        inner,
+    } = expr
+    {
+        at.get_or_insert(*span);
+        expr = inner;
+    }
+    (expr, at)
 }

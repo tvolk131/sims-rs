@@ -299,6 +299,16 @@ impl<'a> TreeLowerer<'a> {
             && wildcard.is_none()
             && let Some(e) = self.env.all_enums.get(key)
         {
+            // An engine word may hold a value no variant names.
+            if is_engine_enum_key(key) {
+                return Err(Error::at(
+                    span,
+                    format!(
+                        "a match on engine enum '{}' needs a '_' arm (the engine word may hold a value with no variant)",
+                        e.display_name
+                    ),
+                ));
+            }
             for (vname, &vval) in &e.variants {
                 if !seen_vals.contains(&vval) {
                     return Err(Error::at(
