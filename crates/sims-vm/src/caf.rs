@@ -2304,6 +2304,10 @@ fn encode_expi(family_id: u16, member_ids: &[u16], language: u8) -> Vec<u8> {
 /// `CTSS + 2000` (localized copy), `BMP_` (`newimage` 2004), `NBRS #1`, and
 /// optionally `FINV #2` (`include_finv = true` matches `Alice_7.FAM` chunk-for-chunk;
 /// `include_finv = false` also passes `sims_content::family_import::import`).
+///
+/// It writes no `FAMh`, as for a family that has none, such as one made in
+/// Create-a-Family. [`export_stored_family_fam`] exports a stored family
+/// with the `FAMh` its neighborhood's save would write.
 pub fn export_family_fam(
     stored: &StoredNeighborhood,
     character_files: &BTreeMap<String, Vec<u8>>,
@@ -2311,6 +2315,64 @@ pub fn export_family_fam(
     family_name: &str,
     language: u8,
     include_finv: bool,
+) -> Result<Vec<u8>, CafError> {
+    export_family_fam_with_history(
+        stored,
+        character_files,
+        family_id,
+        family_name,
+        language,
+        include_finv,
+        None,
+    )
+}
+
+/// Exports family `family_id` of neighborhood `neighborhood_id` in `store`
+/// as [`export_family_fam`] does, with the family's `FAMh` when its save
+/// inputs hold one. The neighborhood, its character files and its save
+/// inputs are read from one snapshot of the store.
+///
+/// The Family Bin export writes the family through the same routine as the
+/// `Neighborhood.iff` save (0x410696, called at 0x428a17), which writes the
+/// family's `FAMh` (from its `.FAM` file, else from its record, 0x4107a8)
+/// after `FAMs` and before the export's `CTSS #1000` (0x428a6c). A family
+/// with neither writes none.
+pub fn export_stored_family_fam(
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    family_id: u16,
+    family_name: &str,
+    language: u8,
+    include_finv: bool,
+) -> Result<Vec<u8>, CafError> {
+    let snapshot = store
+        .load_export_snapshot(neighborhood_id)?
+        .ok_or_else(|| CafError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
+    export_family_fam_with_history(
+        &snapshot.neighborhood,
+        &snapshot.character_files,
+        family_id,
+        family_name,
+        language,
+        include_finv,
+        snapshot
+            .save_inputs
+            .histories
+            .get(&family_id)
+            .map(Vec::as_slice),
+    )
+}
+
+/// [`export_family_fam`] writing `history`, if any, as the family's `FAMh`
+/// (ID `family_id`, after `FAMs`).
+pub fn export_family_fam_with_history(
+    stored: &StoredNeighborhood,
+    character_files: &BTreeMap<String, Vec<u8>>,
+    family_id: u16,
+    family_name: &str,
+    language: u8,
+    include_finv: bool,
+    history: Option<&[u8]>,
 ) -> Result<Vec<u8>, CafError> {
     let family = stored
         .families
@@ -2499,6 +2561,17 @@ pub fn export_family_fam(
             label: String::new(),
             data: fams.clone(),
         },
+    ];
+    if let Some(history) = history {
+        chunks.push(ChunkData {
+            tag: *b"FAMh",
+            id: family_id,
+            flags: CHUNK_CONVERTED,
+            label: String::new(),
+            data: history.to_vec(),
+        });
+    }
+    chunks.extend([
         ChunkData {
             tag: *b"CTSS",
             id: 1000,
@@ -2513,7 +2586,7 @@ pub fn export_family_fam(
             label: String::new(),
             data: encode_expi(family_id, &member_ids, language),
         },
-    ];
+    ]);
     chunks.extend(member_chunks);
     chunks.push(ChunkData {
         tag: *b"NBRS",

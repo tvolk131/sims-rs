@@ -386,6 +386,38 @@ fn the_destination_must_take_a_write() {
 }
 
 #[test]
+fn an_object_s_container_slot_and_id_words_are_refused_before_any_mode() {
+    // Storing such a word's own value back succeeds, so it proves nothing
+    // about the next value; mode 4 would list the lamp's instances first.
+    let [g0, g1, g2, g3] = LAMP_GUID.to_le_bytes();
+    for mode in [4, 0] {
+        for word in [11u8, 2, 3] {
+            let mut fx = Fixture::new();
+            let instances = fx.world.instances.clone();
+            assert!(!instances.contains_key(&LAMP_GUID));
+            let data = fx.lamp().data.clone();
+            fx.add(
+                LAMP_FILE,
+                4096,
+                tree(vec![ins(
+                    31,
+                    RETURN_TRUE,
+                    RETURN_FALSE,
+                    [g0, g1, g2, g3, 0x80 | mode, scope::MY_DATA, 0, word],
+                )]),
+            );
+            let result = fx.run();
+            assert_eq!(fx.world.instances, instances, "mode {mode} word {word}");
+            assert!(
+                matches!(trap(result), Trap::Unsupported(_)),
+                "mode {mode} word {word}"
+            );
+            assert_eq!(fx.lamp().data, data);
+        }
+    }
+}
+
+#[test]
 fn modes_over_state_the_lot_lacks_fail_loudly() {
     // Mode 10 is here because the fixture's program has no career list.
     for mode in [10, 13, 127] {

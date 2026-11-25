@@ -16,8 +16,8 @@ use sims_vm::caf::{
     FAMILY_FLAG_CAF_CREATED, FamilySpec, Gender, Personality, PortraitBitmaps, PortraitKind,
     SimSpec, SkinTone, TEMPLATE_PERSON_GUID, allocate_family_id, commit_family,
     commit_family_with_context, compute_zodiac, delete_bin_family, encode_bmp24, encode_fami,
-    encode_fams, export_family_fam, import_family_fam, person_word, synthesize_character_iff,
-    synthesize_neighbor, zodiac_name,
+    encode_fams, export_family_fam, export_stored_family_fam, import_family_fam, person_word,
+    synthesize_character_iff, synthesize_neighbor, zodiac_name,
 };
 use sims_vm::lifecycle::{enter_lot, move_in, save_and_leave_lot};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1517,4 +1517,181 @@ fn a_fam_import_saves_the_files_famh_byte_for_byte() {
     assert!(!inputs.family_names.contains_key(&3));
     assert_eq!(saved_famh(&store, "SyntheticNH", 3), None);
     assert_eq!(saved_famh(&store, "SyntheticNH", 2), Some(history));
+}
+
+/// The tags of `fam`'s chunks with their IDs, in file order.
+fn chunk_order(fam: &[u8]) -> Vec<(String, u16)> {
+    Iff::parse(fam.to_vec())
+        .unwrap()
+        .chunks
+        .iter()
+        .map(|chunk| (String::from_utf8_lossy(&chunk.tag).into_owned(), chunk.id))
+        .collect()
+}
+
+/// A chunk whole: tag, ID, flags, label and payload.
+type WholeChunk = ([u8; 4], u16, u16, String, Vec<u8>);
+
+/// `fam`'s chunks other than FAMh, whole, in file order.
+fn chunks_but_famh(fam: &[u8]) -> Vec<WholeChunk> {
+    let iff = Iff::parse(fam.to_vec()).unwrap();
+    iff.chunks
+        .iter()
+        .filter(|chunk| &chunk.tag != b"FAMh")
+        .map(|chunk| {
+            (
+                chunk.tag,
+                chunk.id,
+                chunk.flags,
+                chunk.label.clone(),
+                iff.data(chunk).to_vec(),
+            )
+        })
+        .collect()
+}
+
+/// The FAMh chunk of `fam`, if any: its ID, flags, label and payload.
+fn famh_chunk(fam: &[u8]) -> Option<(u16, u16, String, Vec<u8>)> {
+    let iff = Iff::parse(fam.to_vec()).unwrap();
+    let chunks: Vec<_> = iff.all(b"FAMh").collect();
+    assert!(chunks.len() <= 1, "at most one FAMh");
+    chunks.first().map(|chunk| {
+        (
+            chunk.id,
+            chunk.flags,
+            chunk.label.clone(),
+            iff.data(chunk).to_vec(),
+        )
+    })
+}
+
+/// A Family Bin export writes the family through the save's routine
+/// (0x410696 at 0x428a17), so a family that brought a FAMh from its `.FAM`
+/// file exports it byte for byte, under its own ID, after FAMs and before
+/// the export's CTSS #1000 (0x428a6c). A family with none exports none.
+#[test]
+fn a_stored_family_exports_the_famh_its_fam_brought_byte_for_byte() {
+    let db = TempDb::new("fam-famh-export");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .save_neighborhood("SyntheticNH", &empty_stored_neighborhood("SyntheticNH"))
+        .unwrap();
+    let ctx = CafContext::synthetic(
+        synthetic_template_iff(),
+        BTreeSet::from([TEMPLATE_PERSON_GUID]),
+        DEFAULT_STARTING_FUNDS,
+    );
+    let mut rng = CrtRng::from_state(2026_1125);
+    let spec = FamilySpec::new("Alice", "", vec![alice_sim_spec(None)]);
+    let created = commit_family_with_context(&ctx, &store, "SyntheticNH", &spec, &mut rng).unwrap();
+    assert_eq!(created.family_id, 1);
+    let stored = store.load_neighborhood("SyntheticNH").unwrap().unwrap();
+    let chars = store.load_character_files("SyntheticNH").unwrap();
+    let plain = export_family_fam(&stored, &chars, 1, "Alice", 1, true).unwrap();
+    let history: Vec<u8> = (0..=255u8).rev().chain([0x7f, 0, 0]).collect();
+    let with_history = with_famh(&plain, 1, &history);
+
+    // Family 2 brings a FAMh; family 3 none.
+    let imported =
+        import_family_fam(&ctx, &store, "SyntheticNH", &with_history, 1, &mut rng).unwrap();
+    assert_eq!(imported.family_id, 2);
+    let imported = import_family_fam(&ctx, &store, "SyntheticNH", &plain, 1, &mut rng).unwrap();
+    assert_eq!(imported.family_id, 3);
+
+    let exported = export_stored_family_fam(&store, "SyntheticNH", 2, "Alice", 1, true).unwrap();
+    assert_eq!(
+        FamilyFile::parse(&exported).unwrap().history.as_deref(),
+        Some(&history[..])
+    );
+    assert_eq!(
+        famh_chunk(&exported),
+        Some((2, 0x10, String::new(), history.clone()))
+    );
+    let order = chunk_order(&exported);
+    assert_eq!(
+        order[..5],
+        [
+            ("FAMI".to_owned(), 2),
+            ("FAMs".to_owned(), 2),
+            ("FAMh".to_owned(), 2),
+            ("CTSS".to_owned(), 1000),
+            ("EXPi".to_owned(), 0),
+        ]
+    );
+    // Apart from the FAMh, the export is the one without the history.
+    let stored = store.load_neighborhood("SyntheticNH").unwrap().unwrap();
+    let chars = store.load_character_files("SyntheticNH").unwrap();
+    let without = export_family_fam(&stored, &chars, 2, "Alice", 1, true).unwrap();
+    assert_eq!(famh_chunk(&without), None);
+    assert_eq!(chunks_but_famh(&exported), chunks_but_famh(&without));
+
+    // Families without one export none: the one made in Create-a-Family
+    // and the one whose file had none.
+    for family in [1, 3] {
+        let fam =
+            export_stored_family_fam(&store, "SyntheticNH", family, "Alice", 1, true).unwrap();
+        assert_eq!(famh_chunk(&fam), None, "family {family}");
+        assert_eq!(FamilyFile::parse(&fam).unwrap().history, None);
+    }
+
+    // Importing the export again gives that family the same FAMh.
+    let reimported =
+        import_family_fam(&ctx, &store, "SyntheticNH", &exported, 1, &mut rng).unwrap();
+    assert_eq!(reimported.family_id, 4);
+    assert_eq!(saved_famh(&store, "SyntheticNH", 4), Some(history.clone()));
+    let again = export_stored_family_fam(&store, "SyntheticNH", 4, "Alice", 1, true).unwrap();
+    assert_eq!(famh_chunk(&again), Some((4, 0x10, String::new(), history)));
+
+    assert!(matches!(
+        export_stored_family_fam(&store, "Missing", 2, "Alice", 1, true),
+        Err(CafError::NeighborhoodNotFound(id)) if id == "Missing"
+    ));
+}
+
+/// The FAMh a `.FAM` brought survives moving the family into a house,
+/// playing and saving the lot: the export afterwards still carries it
+/// byte for byte.
+#[test]
+fn a_moved_in_family_still_exports_its_famh_after_a_lot_save() {
+    let Some(root) = install() else { return };
+    let db = TempDb::new("fam-famh-movein-export");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .import_directory("UserData", &root.join("UserData"), 0xff)
+        .unwrap();
+    let mut rng = CrtRng::from_state(0x5eed_fa4b);
+    let spec = FamilySpec::new("Alice", "", vec![alice_sim_spec(None)]);
+    let created = commit_family(&root, &store, "UserData", &spec, &mut rng).unwrap();
+    let stored = store.load_neighborhood("UserData").unwrap().unwrap();
+    let chars = store.load_character_files("UserData").unwrap();
+    let plain = export_family_fam(&stored, &chars, created.family_id, "Alice", 1, true).unwrap();
+    let history: Vec<u8> = (0..64u8).map(|n| n.wrapping_mul(37)).collect();
+    let with_history = with_famh(&plain, created.family_id, &history);
+
+    let ctx = CafContext::from_install(&root).unwrap();
+    let imported = import_family_fam(&ctx, &store, "UserData", &with_history, 1, &mut rng).unwrap();
+    let family = imported.family_id;
+    move_in(&root, &store, "UserData", family, 4).unwrap();
+    let mut lot4 = enter_lot(&root, &store, "UserData", 4, &[3], Frames::default()).unwrap();
+    for _ in 0..50 {
+        lot4.step().unwrap();
+    }
+    save_and_leave_lot(&root, &store, "UserData", &mut lot4).unwrap();
+
+    assert_eq!(
+        store
+            .load_save_inputs("UserData")
+            .unwrap()
+            .histories
+            .get(&family),
+        Some(&history)
+    );
+    let exported = export_stored_family_fam(&store, "UserData", family, "Alice", 1, true).unwrap();
+    let parsed = FamilyFile::parse(&exported).unwrap();
+    assert_eq!(parsed.history.as_deref(), Some(&history[..]));
+    assert_eq!(parsed.family.house, 4);
+    assert_eq!(
+        famh_chunk(&exported),
+        Some((family, 0x10, String::new(), history))
+    );
 }

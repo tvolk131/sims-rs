@@ -65,12 +65,12 @@ pub use migration::{
 };
 pub use neighborhood_store::{
     CheckedCommitError, DEFAULT_ARCH_VALUE_MULTIPLIER, DEFAULT_LAYOUT_HISTORY_FILL,
-    DEFAULT_LOT_THUMBNAILS_MAX_BYTES, DEFAULT_NEW_FAMILY_START_HOUR, FAMILY_FLAG_BIT_3,
-    FAMILY_FLAG_HAS_CATEGORY_1, FAMILY_FLAG_HAS_CATEGORY_9, FAMILY_FLAG_NEW_MOVE_IN, ImportSummary,
-    LOT_THUMBNAIL_FORMAT, LOT_THUMBNAIL_MIN_FORMAT, LotSnapshot, MAX_LOT_THUMBNAIL_DIM,
-    MAX_LOT_THUMBNAIL_ENCODED_BYTES, MAX_LOT_THUMBNAIL_PIXELS, NEIGHBORHOOD_FORMAT,
-    NeighborhoodStore, StoredLotThumbnail, StoredNeighborhood, ThumbnailSurface565,
-    family_net_worth, lot_total_value,
+    DEFAULT_LOT_THUMBNAILS_MAX_BYTES, DEFAULT_NEW_FAMILY_START_HOUR, ExportSnapshot,
+    FAMILY_FLAG_BIT_3, FAMILY_FLAG_HAS_CATEGORY_1, FAMILY_FLAG_HAS_CATEGORY_9,
+    FAMILY_FLAG_NEW_MOVE_IN, ImportSummary, LOT_THUMBNAIL_FORMAT, LOT_THUMBNAIL_MIN_FORMAT,
+    LotSnapshot, MAX_LOT_THUMBNAIL_DIM, MAX_LOT_THUMBNAIL_ENCODED_BYTES, MAX_LOT_THUMBNAIL_PIXELS,
+    NEIGHBORHOOD_FORMAT, NeighborhoodStore, StoredLotThumbnail, StoredNeighborhood,
+    ThumbnailSurface565, family_net_worth, lot_total_value,
 };
 pub use snapshot::{FORMAT as SNAPSHOT_FORMAT, ReadOnlySnapshots, Snapshots};
 pub use world::{

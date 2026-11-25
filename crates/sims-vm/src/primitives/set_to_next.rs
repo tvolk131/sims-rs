@@ -126,6 +126,12 @@ impl Machine<'_, '_> {
         // included.
         let (destination, writable) = self.resolve(scope, index, true)?;
         let current = self.value(destination)?;
+        // Object data words 2, 3 and 11 take only the value they hold, so
+        // storing it back proves nothing about the next one; mode 4 would
+        // list the instances first. They are refused before any mode runs.
+        if writable {
+            Self::refuse_guarded_data_word(destination)?;
+        }
         if !writable || !self.store(destination, current)? {
             return Err(Trap::native(
                 0x13,

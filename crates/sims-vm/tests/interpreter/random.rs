@@ -111,6 +111,28 @@ fn faults_come_before_the_draw() {
 }
 
 #[test]
+fn a_draw_of_the_value_an_object_word_holds_is_stored() {
+    // My object ID (data word 11) is 22, and the first draw from state 1
+    // is 16838, which is 22 modulo 16816: the store changes nothing and
+    // takes the draw.
+    let mut fx = Fixture::new();
+    assert_eq!(fx.lamp().data[11], 22);
+    let before = fx.lamp().data.clone();
+    assert_eq!(random(&mut fx, 3, 11, 7, 16816), Ok(true));
+    assert_eq!(fx.lamp().data, before);
+    let mut expected = GameRng::from_state(1);
+    expected.next_u32();
+    assert_eq!(fx.world.lot_rng, expected);
+    // Any other draw would change it, and faults before the draw.
+    let mut fx = Fixture::new();
+    assert!(matches!(
+        trap(random(&mut fx, 3, 11, 7, 16817)),
+        Trap::Unsupported(_)
+    ));
+    assert_eq!(fx.world.lot_rng, GameRng::from_state(1));
+}
+
+#[test]
 fn a_range_in_global_34_takes_the_draw() {
     // Global 34 resolves with a word pointer even read-only, which replaces
     // the destination: the draw lands in global 34, not the temp.
