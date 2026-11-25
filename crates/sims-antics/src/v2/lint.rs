@@ -1864,12 +1864,20 @@ fn air_literal(v: &str) -> Option<i64> {
     if digits.is_empty() || digits.starts_with(['_', '-', '+']) {
         return None;
     }
+    // As the `.air` lexer reads them: digits (and `_` separators) only, so no sign after
+    // `0x` or a leading `+`, which Rust's parsers would accept.
+    let body = |text: &str, radix: u32| {
+        text.starts_with(|c: char| c.is_digit(radix))
+            && text.chars().all(|c| c == '_' || c.is_digit(radix))
+    };
     let n = match digits
         .strip_prefix("0x")
         .or_else(|| digits.strip_prefix("0X"))
     {
-        Some(hex) => i64::from_str_radix(&hex.replace('_', ""), 16).ok()?,
-        None => digits.replace('_', "").parse().ok()?,
+        Some(hex) if body(hex, 16) => i64::from_str_radix(&hex.replace('_', ""), 16).ok()?,
+        Some(_) => return None,
+        None if body(digits, 10) => digits.replace('_', "").parse().ok()?,
+        None => return None,
     };
     if neg { n.checked_neg() } else { Some(n) }
 }
@@ -1885,17 +1893,7 @@ fn native_operands(word: &str, args: &str) -> bool {
     if matches!(word, "notify_idle" | "breakpoint") {
         return inner.is_empty();
     }
-    let literal = |v: &str| -> Option<i64> {
-        let (neg, digits) = v.strip_prefix('-').map_or((false, v), |d| (true, d));
-        let n = match digits
-            .strip_prefix("0x")
-            .or_else(|| digits.strip_prefix("0X"))
-        {
-            Some(hex) => i64::from_str_radix(&hex.replace('_', ""), 16).ok()?,
-            None => digits.replace('_', "").parse().ok()?,
-        };
-        if neg { n.checked_neg() } else { Some(n) }
-    };
+    let literal = air_literal;
     !inner.is_empty()
         && inner.split(',').all(|arg| {
             let Some((key, value)) = arg.split_once(':') else {

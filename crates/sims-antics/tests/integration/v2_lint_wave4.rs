@@ -525,3 +525,24 @@ fn reach_defaults_its_mode_to_0() {
         "reach(mode: 0, moves: true);",
     );
 }
+
+// --- review round 3 -------------------------------------------------------------------------
+
+#[test]
+fn literals_read_as_the_air_lexer_reads_them() {
+    for raw in [
+        "clear_motive_changes() pad(5: 0x+2);",
+        "clear_motive_changes() pad(+5: 0x02);",
+        "scope(12, +6) := 1;",
+        "scope(12, 6) := 0x-1;",
+        "refresh(target: 0, mode: 0x+1);",
+    ] {
+        stays_raw(sim_tree, raw);
+    }
+    same_as_raw(
+        sim_tree,
+        "clear_motive_changes() pad(5: 0x0_2);",
+        "clear_motive_changes(padN: 0xNN)",
+        "clear_motive_changes(pad5: 0x02);",
+    );
+}

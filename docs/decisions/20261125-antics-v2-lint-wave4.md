@@ -109,7 +109,10 @@ The usual guards apply, tightened after review:
 - **A parameter in a functional's body.** The lint knows a tree's compiled argument count but
   not a functional's, so `reach(mode: 1)` and a `param[N]` source there get no hint (a false
   negative).
-- **Positional `reach` operands and a trailing comma** get no hint (a false negative).
+- **Positional `reach` operands, a trailing comma, and an empty `reach()`** get no hint (a
+  false negative).
+- **A `/* */` comment in a raw block** keeps the block (a false negative): only `//` and `#`
+  comments are stripped.
 
 ### What the hint promises
 
@@ -170,6 +173,10 @@ GPT-6.2 Sol (high effort), correctness and soundness only.
   separated sign. The tail merge after a replaced block is the accepted behaviour above. Of the
   NOTEs, `reach` without `mode:` is now spelled. Positional operands and functional parameters
   stay false negatives.
+- **R3:** 3 findings. The SHOULD-FIX is fixed with a regression test: an integer literal is now
+  read as the `.air` lexer reads it (no sign after `0x`, no leading `+`), which also tightens
+  wave 1's operand check. The 2 NOTEs (`reach()`, block comments) are false negatives, documented
+  above.
 
 ## Consequences
 
