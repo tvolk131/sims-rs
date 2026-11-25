@@ -39,13 +39,16 @@ Neither change is meant to change behaviour.
   - `sims-render`: the detected install.
   - `sims-people`: `hex`.
 
-  A module that named one of these differently imports it under its old name (for example `use crate::common::install_root as install;`). No test body changed.
+  A module that named one of these differently imports it under its old name (for example `use crate::common::install_root as install;`).
 - **Helpers that differ stay in their modules.** These include install helpers with their own skip message or without the `is_dir` check, and fixtures that load different houses. Merging them would change what a test does when `SIMS_INSTALL` is unset or wrong.
 - **No `OnceLock` fixture is shared.** Each test that opens a house, a `Game` or a shell mutates what it opened: it ticks the world, draws into its assets, or writes saves. An immutable fixture worth sharing would be at most `Install::detect`, which is cheap. Nothing mutable is shared between tests.
 - **Running in one process is safe:**
   - No test sets environment variables or changes the working directory.
   - Temporary directories carry the test's module-specific prefix plus the process id, so no two modules use the same path.
-  - The library's process-wide state is limited to content-keyed caches (the neighborhood render cache, the highlight LUT) and id counters.
+  - The library's process-wide state is limited to content-keyed caches (the neighborhood render cache, the highlight LUT), id counters, and two more items:
+    - `sims-vm`'s CAF commit mutex. It makes family commits from parallel tests wait for each other. Each test uses its own database, so this costs time, not correctness.
+    - The fallback clipboard in `coop`. No integration test reads it back.
+- **One test body changed.** The Save Manager test asserted that one metadata-only listing beats one full decode on wall-clock time. With every module of the crate running in one process, a single sample can be stretched by another test's work. Each path now takes the best of five runs. The correctness assertions are unchanged. No other test body changed.
 - **Test names gain the module.** `cargo test -p sims-game --test goth foo` becomes `cargo test -p sims-game --test integration goth::foo`. Earlier ADRs keep the old paths as history.
 
 ### `game.rs` and `neighborhood.rs`: module directories

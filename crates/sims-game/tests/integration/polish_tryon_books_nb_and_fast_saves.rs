@@ -151,17 +151,34 @@ fn fast_save_manager_listing_beats_full_decode_and_preserves_corruption_checks()
     drop(worker);
 
     let autosaves = shell.store().autosaves();
+    // Each path's time is the best of five runs. This whole binary runs every
+    // integration module's tests in parallel, so a single sample can be stretched
+    // by another test's save or render. The minimum is the least disturbed run.
+    fn best_ms(mut run: impl FnMut()) -> f64 {
+        (0..5)
+            .map(|_| {
+                let t = Instant::now();
+                run();
+                t.elapsed().as_secs_f64() * 1000.0
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
     // Baseline full decode path (`list_saves_validated` with `validate_save_payload`).
-    let t_full = Instant::now();
     let full_entries = autosaves
         .list_saves_validated("UserData", 5, validate_save_payload)
         .expect("full validated listing");
-    let full_ms = t_full.elapsed().as_secs_f64() * 1000.0;
+    let full_ms = best_ms(|| {
+        autosaves
+            .list_saves_validated("UserData", 5, validate_save_payload)
+            .expect("full validated listing");
+    });
 
     // Fast metadata-only Save Manager listing (`build_save_manager_snapshot` -> `list_saves_metadata`).
-    let t_fast = Instant::now();
     let snap = build_save_manager_snapshot(&autosaves, "UserData", 1, 5, "5 Sim Lane", None);
-    let fast_ms = t_fast.elapsed().as_secs_f64() * 1000.0;
+    let fast_ms = best_ms(|| {
+        build_save_manager_snapshot(&autosaves, "UserData", 1, 5, "5 Sim Lane", None);
+    });
 
     // Also measure warm `list_saves_validated(..., validate_save_payload_cached)`.
     let _ = autosaves.list_saves_validated("UserData", 5, validate_save_payload_cached);
