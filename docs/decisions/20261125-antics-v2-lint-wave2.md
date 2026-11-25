@@ -28,6 +28,8 @@ Two more rules were asked for:
 - **`unused_decl`** counts `dest: x` as a read.
   - It now also tells pure writes apart: a local that only `random_into(x, ..)`, `animate(.., local: x)` or `relationship(.., value: x)` writes, and nothing reads, is unused.
   - Before, any mention counted as a read.
+  - A write is only taken as a write where the lint knows it is one. A user tree named like the builtin (`fn random_into(..)`) takes the call, so its arguments are reads. `relationship` writes `value:` only without flag 4: with flags that are not a literal (a `const` name), the local counts as read.
+  - `animate(.., local: x) |e| { .. }` as a statement writes `x` the same way, so a local only that writes is unused.
   - No open-pack or corpus file changes from this.
 - **`param[N]` and `temp[N]`** destinations are not locals. They get no `unused_decl` or `uninitialized_local_read` finding, and the step marks them written, like an assignment.
 
@@ -48,22 +50,22 @@ These statements are now spelled:
 
 | Raw `.air` statement | v2 | Left raw |
 | --- | --- | --- |
-| `remove_object(T)`, `T` = `me` / `self` / `0` / `stack_obj` / `1`, with `flags: 0..255`, `no_yield:`, `skip_resets:` | `remove_object(..)` | target `2`; any other option; out-of-range flags |
+| `remove_object(T)`, `T` = `me` / `self` / `0` / `stack_obj` / `1`, with `flags: 0..255`, `no_yield:`, `skip_resets:` | `remove_object(me)` / `remove_object(stack_obj, flags: N)`, the flags folded into one number | target `2`; any other option; out-of-range flags; `me` in a file whose `me` is a BCON name |
 | `find_best_object(kind)`, a searched function by name or number, with `flags:` (named or positional) | `find_best_object(..)` as an `if` / `while` test | `origin:`; never-searched functions (`stand`, `eat`, ...); `category4` |
-| `set_to_next(mode, dest: X)` / `into: X`, mode 0..12 except `beside` (9), with `guid: <literal>`; `X` = `temp[0..7]`, `param[N]`, or a v2 `i16` / `ObjectId` local | `set_to_next(.., dest: ..)` | `temp[8]` and up; `stack_obj` or no `dest:`; `beside` / `local:`; typed handles, bools, parameters, a raw block's own locals; a GUID by name |
-| `X := scope(21, 9)` / `scope(21, 11)` / `scope(33, F)` into `temp[0..7]` or an `i16` local | `stack_obj.object_type` / `.sub_index` / `job_field(F)` | other definition words; any other expression; `my.attr[..]`, `local[N]` targets |
-| `X := scope(35, N)` into a `bool` local | `stack_obj.has_function[N]` | an `i16` or `temp` target (the read is a `bool`) |
+| `set_to_next(mode, dest: X)` / `into: X`, mode 0..12 except `beside` (9), with `guid: <literal>`; `X` = `temp[0..7]`, or `param[N]` below the tree's compiled argument count | `set_to_next(.., dest: ..)` | `temp[8]` and up; `param[N]` at or past the argument count; `stack_obj` or no `dest:`; `beside` / `local:`; any named destination; a GUID by name |
+| `temp[K] := scope(21, 9)` / `scope(21, 11)` / `scope(33, F)`, `K` in 0..7 | `stack_obj.object_type` / `.sub_index` / `job_field(F)` | other definition words; any other expression; `my.attr[..]`, `local[N]`, named targets; `scope(35, N)` (`has_function` is a `bool`, which no `temp` holds) |
 
 Notes on the table:
 
 - **Not covered.** A store into the stack object, and the scope cells inside tests (`if scope(21, 9) == 2 {`), are outside this rule. Its unit is a whole raw block of statements.
-- **Locals.** The lint knows a local's kind from its `let` (the declared type, or an integer or bool literal initializer). Parameters and `for` bindings count as "other".
+- **No v2 locals.** Raw code names locals only by their compiled names (`__v_x_0`), never by their source names, so a named destination or target is never a v2 local and is left alone.
+- **Shadowing.** A suggestion is made only when its v2 spelling means the same thing in that tree. A local named `temp`, `param`, `me` or `stack_obj`, or a user tree named `remove_object`, `find_best_object`, `set_to_next` or `job_field`, would take the v2 spelling over the builtin, so the raw block stays.
 
 **Corpus:** `corpus-v2-behavioral` has 577 findings in 218 files: 541 are `raw { remove_object(N, flags: F); }` and 36 are `raw { temp[k] := scope(21, 11); }`.
 
 With every suggestion applied, all 218 files still lower:
 
-- **188 files** lower to the same `.air`, after normalizing `me`/`stack_obj` to `0`/`1` and dropping `flags: 0`.
+- **188 files** lower to the same `.air` with each help's spelling applied verbatim, after normalizing `me`/`stack_obj` to `0`/`1` and dropping `flags: 0` in the `.air` text.
 - **The other 30 files** differ only where the optimizer, no longer blocked by the raw block, merges the identical tails of two branches (`remove_object(..); return true;`) into one after the `if`. That pass preserves behaviour.
 
 ## Decision 4: `stale_lint_allow`
@@ -112,6 +114,7 @@ It reports only the first unreachable statement of a block, and notes which stat
 **What it does not report:**
 
 - **Fall-through cases.** An `if` without `else`; a `match` without `_` (a value no arm names falls through); `cond?;` (an `if` with no `else`); loops, `with lock`, `defer` and `animate` (each may go on).
+- **Raw edges.** A body with any raw `->` edge is skipped. `.air` edges may name a node by label (`true: there`) or by number (`true: 2`), which can land anywhere later in the tree.
 - **Raw labels.** No statement is reported when any `raw { }` block from the unreachable statement to the end of the block, nested blocks included, defines an `.air` label (`@name:` outside comments and strings). A jump in another raw block may land there. A raw block without a label is as unreachable as any other statement.
 - **A trailing return.** A lone `return` that ends a block right after an `if` / `match` whose every branch leaves is not reported. It is the trailing return written for the reader, and a direct `return; return x;` is still reported.
 
@@ -132,6 +135,7 @@ It reports only the first unreachable statement of a block, and notes which stat
 - **Track 9 (lift):**
   - Stop writing `allow(unbounded_loop_without_yield)` above a loop whose body is a raw block. The lint does not report it (84 corpus files).
   - Lift `raw { remove_object(..); }` and `raw { temp[k] := scope(21, 11); }` to the v2 spellings.
+- **Review.** Sol round 1 found eight cases, all fixed: raw edges past a `return`, `param[N]` past the argument count, shadowed `temp`/`me` and user trees named like the builtins (both rules), relationship flags by `const`, the `animate` statement's local, and the raw local by source name (dropped). Each has a test in `v2_lint_wave2.rs`.
 - **Not covered yet:**
   - `set_to_next(.., dest: stack_obj)` and plain `set_to_next(mode)` in raw. v2 spells both, but the earlier raw table left `set_to_next` out on purpose, and this wave keeps to the asked forms.
   - The definition cells inside raw tests.

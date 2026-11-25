@@ -171,6 +171,44 @@ fn a_local_only_written_by_a_builtin_is_unused() {
     );
 }
 
+#[test]
+fn a_write_the_lint_cannot_tell_from_a_read_counts_as_read() {
+    // A user tree named `random_into` takes the call: its arguments are plain reads.
+    let source = obj(
+        "    #[bhav(label = \"Roll\")] fn random_into(x: i16, n: i16) { self.level = x + n; }\n    \
+         #[bhav(label = \"Probe\")] fn probe() {\n        self.level = 0;\n        self.mode = Mode::Off;\n        \
+         let roll: i16 = 2;\n        random_into(roll, 5);\n    }",
+    );
+    none(&source, "unused_decl");
+    // `relationship` with named flags may carry flag 4, which reads `value:`.
+    let source = sim_tree(
+        "        let n: i16 = 3;\n        relationship(column: 0, dir: 0, flags: SOME_FLAGS, local: 0, value: n);",
+    )
+    .replace("object \"", "const SOME_FLAGS = 4;\nobject \"");
+    none(&source, "unused_decl");
+    // With literal flags, no flag 4: a pure write.
+    one(
+        &sim_tree(
+            "        let n: i16 = 3;\n        relationship(column: 0, dir: 0, flags: 0, local: 0, value: n);",
+        ),
+        "unused_decl",
+    );
+}
+
+#[test]
+fn an_animate_statement_local_is_only_written() {
+    let source = sim_tree(
+        "        let event: i16 = 0;\n        animate(clip: 1, table: 0, events: 2, local: event) |_e| {\n            sim.person[1] = 1;\n        }",
+    );
+    let d = one(&source, "unused_decl");
+    assert_eq!(d.message, "local `event` is never read");
+    // Read in the event handler: used.
+    let source = sim_tree(
+        "        let event: i16 = 0;\n        animate(clip: 1, table: 0, events: 2, local: event) |_e| {\n            if event == 0 { sim.person[1] = 1; }\n        }",
+    );
+    none(&source, "unused_decl");
+}
+
 // --- BCON entries read by name in raw code ------------------------------------------------
 
 #[test]
@@ -210,19 +248,44 @@ fn no_raw_builtin(body: &str) {
 
 #[test]
 fn raw_remove_object_has_a_builtin() {
-    for stmt in [
-        "remove_object(stack_obj);",
-        "remove_object(1, flags: 2);",
-        "remove_object(0, flags: 0);",
-        "remove_object(me, no_yield: true, skip_resets: false);",
+    for (stmt, v2) in [
+        ("remove_object(stack_obj);", "use remove_object(stack_obj)"),
+        (
+            "remove_object(1, flags: 2);",
+            "use remove_object(stack_obj, flags: 2)",
+        ),
+        ("remove_object(0, flags: 0);", "use remove_object(me)"),
+        ("remove_object(self);", "use remove_object(me)"),
+        (
+            "remove_object(me, no_yield: true, skip_resets: false);",
+            "use remove_object(me, flags: 1)",
+        ),
+        (
+            "remove_object(1, flags: 1, skip_resets: true);",
+            "use remove_object(stack_obj, flags: 3)",
+        ),
     ] {
-        let help = raw_help(&format!("        raw {{ {stmt} }}"));
-        assert_eq!(help, "use remove_object(..)", "{stmt}");
+        assert_eq!(raw_help(&format!("        raw {{ {stmt} }}")), v2, "{stmt}");
     }
     // The v2 spelling compiles where the raw one did.
     let raw = sim_tree("        raw { remove_object(1, flags: 2); }");
     let v2 = sim_tree("        remove_object(stack_obj, flags: 2);");
     assert!(compiles(&raw) && compiles(&v2));
+}
+
+#[test]
+fn raw_remove_object_of_a_shadowed_name_stays_raw() {
+    // A local `me` would take the v2 spelling's target.
+    no_raw_builtin(
+        "        let me: i16 = 0;\n        raw { remove_object(0); }\n        self.level = me;",
+    );
+    // A user function named `remove_object` would take the call.
+    let source = obj(
+        "    #[bhav(label = \"Gone\")] fn remove_object(x: i16) { self.level = x; }\n    \
+         #[bhav(label = \"Probe\")] fn probe(sim: Sim) {\n        self.level = 0;\n        self.mode = Mode::Off;\n        \
+         raw { remove_object(1); }\n    }",
+    );
+    none(&source, "manual_raw_has_builtin");
 }
 
 #[test]
@@ -275,23 +338,57 @@ fn raw_find_best_object_has_a_builtin() {
     }
 }
 
+/// A Sim-context tree with two parameters.
+fn sim_tree_with_args(body: &str) -> String {
+    obj(&format!(
+        "    #[bhav(label = \"Probe\", args = 2)] fn probe(sim: Sim) {{\n        self.level = 0;\n        self.mode = Mode::Off;\n{body}\n    }}"
+    ))
+}
+
 #[test]
 fn raw_set_to_next_dest_has_a_builtin() {
-    for (lets, stmt) in [
-        ("", "set_to_next(person, dest: temp[3]);"),
-        ("", "set_to_next(3, guid: 0x7E00_0101, dest: param[0]);"),
-        ("", "set_to_next(part, into: temp[0]);"),
-        (
-            "let c: ObjectId = 0;\n        ",
-            "set_to_next(all, dest: c);",
-        ),
-        ("let n = 0;\n        ", "set_to_next(neighbor, dest: n);"),
+    for stmt in [
+        "set_to_next(person, dest: temp[3]);",
+        "set_to_next(part, into: temp[0]);",
+        "set_to_next(neighbor, dest: temp[7]);",
     ] {
         let help = raw_help(&format!(
-            "        {lets}raw {{ {stmt} }}\n        self.level = 1;"
+            "        raw {{ {stmt} }}\n        self.level = 1;"
         ));
         assert_eq!(help, "use set_to_next(.., dest: ..)", "{stmt}");
     }
+    // A parameter below the tree's argument count.
+    for stmt in [
+        "set_to_next(3, guid: 0x7E00_0101, dest: param[0]);",
+        "set_to_next(all, dest: param[1]);",
+    ] {
+        let source = sim_tree_with_args(&format!(
+            "        raw {{ {stmt} }}\n        self.level = 1;"
+        ));
+        let d = one(&source, "manual_raw_has_builtin");
+        assert_eq!(
+            d.help.as_deref(),
+            Some("use set_to_next(.., dest: ..)"),
+            "{stmt}"
+        );
+    }
+}
+
+#[test]
+fn raw_set_to_next_into_a_missing_param_or_shadowed_temp_stays_raw() {
+    // The tree has no arguments: `param[0]` has no v2 spelling there.
+    no_raw_builtin("        raw { set_to_next(all, dest: param[0]); }\n        self.level = 1;");
+    // Past the argument count.
+    none(
+        &sim_tree_with_args(
+            "        raw { set_to_next(all, dest: param[2]); }\n        self.level = 1;",
+        ),
+        "manual_raw_has_builtin",
+    );
+    // A local named `temp` would take `temp[3]` in v2.
+    no_raw_builtin(
+        "        let temp: i16 = 0;\n        raw { set_to_next(person, dest: temp[3]); }\n        self.level = temp;",
+    );
 }
 
 #[test]
@@ -305,6 +402,12 @@ fn raw_set_to_next_without_a_v2_spelling_stays_raw() {
         // `beside` takes `local:`.
         ("", "set_to_next(beside, dest: temp[0], local: 1);"),
         ("", "set_to_next(9, dest: temp[0]);"),
+        // A v2 local: raw code cannot name it.
+        (
+            "let c: ObjectId = 0;\n        ",
+            "set_to_next(all, dest: c);",
+        ),
+        ("let n = 0;\n        ", "set_to_next(neighbor, dest: n);"),
         // A typed handle, a bool, a parameter, a raw block's own local.
         (
             "let o: Object = stack_obj;\n        ",
@@ -328,23 +431,13 @@ fn raw_set_to_next_without_a_v2_spelling_stays_raw() {
 
 #[test]
 fn raw_definition_and_job_cells_have_names() {
-    for (lets, stmt, v2) in [
-        ("", "temp[0] := scope(21, 9);", "use stack_obj.object_type"),
-        ("", "temp[7] := scope(21,11);", "use stack_obj.sub_index"),
-        ("", "temp[1] := scope(33, 12);", "use job_field(12)"),
-        (
-            "let t: i16 = 0;\n        ",
-            "t := scope(21, 9);",
-            "use stack_obj.object_type",
-        ),
-        (
-            "let has: bool = false;\n        ",
-            "has := scope(35, 26);",
-            "use stack_obj.has_function[26]",
-        ),
+    for (stmt, v2) in [
+        ("temp[0] := scope(21, 9);", "use stack_obj.object_type"),
+        ("temp[7] := scope(21,11);", "use stack_obj.sub_index"),
+        ("temp[1] := scope(33, 12);", "use job_field(12)"),
     ] {
         let help = raw_help(&format!(
-            "        {lets}raw {{ {stmt} }}\n        self.level = 1;"
+            "        raw {{ {stmt} }}\n        self.level = 1;"
         ));
         assert_eq!(help, v2, "{stmt}");
     }
@@ -353,8 +446,33 @@ fn raw_definition_and_job_cells_have_names() {
         raw_help(
             "        raw {\n            temp[0] := scope(21, 9);\n            remove_object(1);\n        }"
         ),
-        "use stack_obj.object_type, remove_object(..)"
+        "use stack_obj.object_type, remove_object(stack_obj)"
     );
+}
+
+#[test]
+fn raw_job_and_search_forms_under_a_user_function_stay_raw() {
+    // A user tree named like the builtin takes the v2 call.
+    for (helper, stmt) in [
+        (
+            "    #[bhav(label = \"Job\")] #[ret(temp = 0)] fn job_field(n: i16) -> i16 { return n; }\n    ",
+            "temp[1] := scope(33, 12);",
+        ),
+        (
+            "    #[bhav(label = \"Find\")] fn find_best_object(n: i16) -> bool { return n == 1; }\n    ",
+            "find_best_object(cook);",
+        ),
+        (
+            "    #[bhav(label = \"Step\")] fn set_to_next(n: i16) -> bool { return n == 1; }\n    ",
+            "set_to_next(person, dest: temp[3]);",
+        ),
+    ] {
+        let source = obj(&format!(
+            "{helper}#[bhav(label = \"Probe\")] fn probe(sim: Sim) {{\n        self.level = 0;\n        self.mode = Mode::Off;\n        \
+             raw {{ {stmt} }}\n        self.level = 1;\n    }}"
+        ));
+        none(&source, "manual_raw_has_builtin");
+    }
 }
 
 #[test]
@@ -362,6 +480,8 @@ fn raw_definition_cells_without_a_v2_name_stay_raw() {
     for (lets, stmt) in [
         // Definition words with no v2 name.
         ("", "temp[0] := scope(21, 65);"),
+        // `has_function` (scope 35) is a bool and raw code cannot name a v2 local.
+        ("let has: bool = false;\n        ", "has := scope(35, 26);"),
         ("", "temp[0] := scope(21, 9) + 1;"),
         // `has_function` is a bool: not into an `i16`.
         ("", "temp[0] := scope(35, 26);"),
@@ -630,4 +750,20 @@ fn raw_labels_after_a_return_may_be_reached() {
         "        return;\n        raw {\n            # @there: not a label\n            temp[1] := 2;\n        }",
     );
     one(&source, "unreachable_code");
+}
+
+#[test]
+fn raw_edges_may_reach_code_after_a_return() {
+    // A raw edge may name a node by label or by number anywhere later in the tree.
+    for edge in ["true: there", "true: 2", "-> true: @there, false: true"] {
+        let jump = if edge.starts_with("->") {
+            format!("expr(temp[0] == 1) {edge};")
+        } else {
+            format!("expr(temp[0] == 1) -> {edge}, false: true;")
+        };
+        let source = tree(&format!(
+            "        raw {{ {jump} }}\n        return;\n        self.level = 1;"
+        ));
+        none(&source, "unreachable_code");
+    }
 }

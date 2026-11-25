@@ -336,9 +336,9 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             object_me: false,
             me_bcon: symbols.bcon_names.contains("me"),
             bound: BTreeSet::new(),
-            local_kinds: BTreeMap::new(),
             raw_declared: BTreeSet::new(),
             raw_blocks: Vec::new(),
+            raw_edges: false,
             written: BTreeSet::new(),
             assigned: None,
             air_consts: BTreeMap::new(),
@@ -1503,11 +1503,12 @@ struct FileLinter<'a> {
     /// The names the body being linted binds itself (`let`s, `for` bindings, non-Sim
     /// parameters): such a `me`, `self` or Sim name is not the frame's.
     bound: BTreeSet<String>,
-    /// What each `let`, `for` binding and parameter in scope holds (by name).
-    local_kinds: BTreeMap<String, LocalKind>,
     /// The names the body's `raw` blocks declare as `.air` locals (`let` / `local`), which
     /// every raw block of the tree shares.
     raw_declared: BTreeSet<String>,
+    /// A `raw` block of the body has an explicit edge (`->`), which may jump to any later
+    /// statement (a label, or a node by number).
+    raw_edges: bool,
     /// The body's `raw` blocks (span, code), in order, checked together when it ends.
     raw_blocks: Vec<(Span, String)>,
     /// Addresses of the expressions the statement being linted writes (an assignment's
@@ -1530,6 +1531,8 @@ struct AirFrame {
     slots: Vec<String>,
     /// Slots `raw` blocks address by number (`0..raw_slots`).
     raw_slots: usize,
+    /// Its argument count, from the `(args: N, ..)` header.
+    args: Option<usize>,
 }
 
 /// The tree a body belongs to, for the rules that read its compiled frame.
@@ -1665,36 +1668,6 @@ fn air_literal(v: &str) -> Option<i64> {
         None => digits.replace('_', "").parse().ok()?,
     };
     if neg { n.checked_neg() } else { Some(n) }
-}
-
-/// What a `let` of the body being linted holds, for the raw statements v2 can spell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalKind {
-    I16,
-    ObjectId,
-    Bool,
-    Other,
-}
-
-impl LocalKind {
-    fn of(ty: Option<&V2Type>, init: Option<&V2Expr>) -> Self {
-        match (ty, init) {
-            (Some(V2Type::I16), _) => Self::I16,
-            (Some(V2Type::ObjectId), _) => Self::ObjectId,
-            (Some(V2Type::Bool), _) => Self::Bool,
-            (None, Some(V2Expr::Int(..))) => Self::I16,
-            (
-                None,
-                Some(V2Expr::Unary {
-                    op: V2UnaryOp::Neg,
-                    inner,
-                    ..
-                }),
-            ) if matches!(inner.as_ref(), V2Expr::Int(..)) => Self::I16,
-            (None, Some(V2Expr::Bool(..))) => Self::Bool,
-            _ => Self::Other,
-        }
-    }
 }
 
 /// Whether the operands of raw `.air` primitive `word` (`args` is the text after its name)
@@ -2160,17 +2133,13 @@ impl FileLinter<'_> {
 
     /// Records names the body being linted binds itself.
     fn bind<'n>(&mut self, names: impl Iterator<Item = &'n str>) {
-        for n in names {
-            self.bound.insert(n.to_owned());
-            self.local_kinds.insert(n.to_owned(), LocalKind::Other);
-        }
+        self.bound.extend(names.map(str::to_owned));
     }
 
     fn leave_context(&mut self) {
         self.sims.clear();
         self.object_me = false;
         self.bound.clear();
-        self.local_kinds.clear();
     }
 
     fn lint_members(&mut self, members: &[ObjectMember], template: bool) {
@@ -2768,10 +2737,12 @@ impl FileLinter<'_> {
         self.sim_body = cx.sim;
         self.body_has_defer = false;
         self.raw_declared.clear();
+        self.raw_edges = false;
         walk_stmts(body, &mut |s| {
             self.body_has_defer |= matches!(s, V2Stmt::Defer { .. });
             if let V2Stmt::RawAir { code, .. } = s {
                 self.raw_declared.extend(raw_locals(code));
+                self.raw_edges |= air_code_only(code).contains("->");
             }
         });
         self.raw_blocks.clear();
@@ -3083,7 +3054,6 @@ impl FileLinter<'_> {
     fn lint_list(&mut self, list: &[V2Stmt], elif: bool, follows: bool) {
         // Names a statement binds are in scope from the next statement to the list's end.
         let outer = self.bound.clone();
-        let outer_kinds = self.local_kinds.clone();
         self.unreachable_code(list);
         for (i, s) in list.iter().enumerate() {
             if !(elif && i == 0) {
@@ -3116,12 +3086,9 @@ impl FileLinter<'_> {
                     ..
                 } => {
                     let before = self.bound.clone();
-                    let kinds = self.local_kinds.clone();
                     self.bound.insert(binding.clone());
-                    self.local_kinds.insert(binding.clone(), LocalKind::Other);
                     self.lint_list(body, false, true);
                     self.bound = before;
-                    self.local_kinds = kinds;
                     if let Some(else_body) = else_body {
                         self.lint_list(else_body, false, after);
                     }
@@ -3148,16 +3115,9 @@ impl FileLinter<'_> {
             | V2Stmt::LetUninit { name, .. } = s
             {
                 self.bound.insert(name.clone());
-                let kind = match s {
-                    V2Stmt::Let { ty, init, .. } => LocalKind::of(ty.as_ref(), Some(init)),
-                    V2Stmt::LetUninit { ty, .. } => LocalKind::of(Some(ty), None),
-                    _ => LocalKind::Other,
-                };
-                self.local_kinds.insert(name.clone(), kind);
             }
         }
         self.bound = outer;
-        self.local_kinds = outer_kinds;
     }
 
     fn lint_stmt(&mut self, s: &V2Stmt) {
@@ -3881,10 +3841,15 @@ impl FileLinter<'_> {
     /// forms spell with the same operands, or `None`:
     /// - `remove_object(me | stack_obj, flags: N)` (target 2 has no v2 spelling);
     /// - `find_best_object(kind, flags: N)` with no `origin:`, as an `if` / `while` test;
-    /// - `set_to_next(mode, dest: x)` into an `i16` / `ObjectId` local, `param[N]` or
-    ///   `temp[0..7]` (not `beside`, which takes `local:`);
-    /// - `x := scope(21, 9 | 11)`, `scope(35, N)` or `scope(33, F)`: the stack object's
-    ///   `object_type` / `sub_index` / `has_function[N]`, and `job_field(F)`.
+    /// - `set_to_next(mode, dest: X)` into `temp[0..7]`, or `param[N]` below the tree's
+    ///   compiled argument count (not `beside`, which takes `local:`);
+    /// - `temp[K] := scope(21, 9 | 11)` or `scope(33, F)`: the stack object's `object_type` /
+    ///   `sub_index`, and `job_field(F)`.
+    ///
+    /// Raw code cannot name a v2 local, and `has_function[N]` (`scope(35, N)`) is a `bool`
+    /// no `temp` takes, so neither is a store here. Nothing is spelled when the body rebinds
+    /// the name the spelling uses (`temp`, `param`, `me`, `stack_obj`), or a user function
+    /// shadows the builtin.
     fn raw_native_form(&self, word: &str, l: &str) -> Option<String> {
         let rest = l[word.len()..].trim();
         let args = || -> Option<Vec<&str>> {
@@ -3893,6 +3858,8 @@ impl FileLinter<'_> {
         };
         let in_range =
             |v: &str, lo: i64, hi: i64| air_literal(v).is_some_and(|n| (lo..=hi).contains(&n));
+        // A builtin, or a name the body has not rebound.
+        let free = |name: &str| !self.bound.contains(name) && !self.symbols.user_defined(name);
         let index = |cell: &str, base: &str| -> Option<i64> {
             let inner = cell
                 .strip_prefix(base)?
@@ -3901,31 +3868,49 @@ impl FileLinter<'_> {
                 .strip_suffix(']')?;
             air_literal(inner.trim())
         };
-        // A v2 local of this kind, not a raw block's own `.air` local.
-        let local = |name: &str| -> Option<LocalKind> {
-            if self.raw_declared.contains(name) {
-                return None;
-            }
-            self.local_kinds.get(name).copied()
+        let temp =
+            |cell: &str| free("temp") && index(cell, "temp").is_some_and(|n| (0..=7).contains(&n));
+        let args_count = self
+            .tree
+            .as_ref()
+            .and_then(|t| t.frame.as_ref())
+            .and_then(|f| f.args);
+        let param = |cell: &str| {
+            free("param")
+                && index(cell, "param").is_some_and(|n| {
+                    args_count.is_some_and(|args| usize::try_from(n).is_ok_and(|n| n < args))
+                })
         };
         match word {
-            "remove_object" => {
+            "remove_object" if free("remove_object") => {
                 let args = args()?;
                 let (target, opts) = args.split_first()?;
-                if !matches!(*target, "me" | "self" | "stack_obj" | "0" | "1") {
-                    return None;
+                // `.air` reads `me` / `self` / `0` as the frame's object, as v2's `me` is.
+                let target = match *target {
+                    "me" | "self" | "0" if free("me") && !self.me_bcon => "me",
+                    "stack_obj" | "1" if free("stack_obj") => "stack_obj",
+                    _ => return None,
+                };
+                let mut flags = 0i64;
+                for o in opts {
+                    let (k, v) = o.split_once(':')?;
+                    match (k.trim(), v.trim()) {
+                        ("flags", v) => {
+                            flags |= air_literal(v).filter(|n| (0..=255).contains(n))?
+                        }
+                        ("no_yield", "true") => flags |= 1,
+                        ("skip_resets", "true") => flags |= 2,
+                        ("no_yield" | "skip_resets", "false") => {}
+                        _ => return None,
+                    }
                 }
-                let ok = opts.iter().all(|o| match o.split_once(':') {
-                    Some((k, v)) => match k.trim() {
-                        "flags" => in_range(v.trim(), 0, 255),
-                        "no_yield" | "skip_resets" => matches!(v.trim(), "true" | "false"),
-                        _ => false,
-                    },
-                    None => false,
-                });
-                ok.then(|| "remove_object(..)".to_owned())
+                Some(if flags == 0 {
+                    format!("remove_object({target})")
+                } else {
+                    format!("remove_object({target}, flags: {flags})")
+                })
             }
-            "find_best_object" => {
+            "find_best_object" if free("find_best_object") => {
                 let args = args()?;
                 let (kind, opts) = args.split_first()?;
                 let searched = |k: &crate::parser::FunctionKind| {
@@ -3945,7 +3930,7 @@ impl FileLinter<'_> {
                     });
                 ok.then(|| "`find_best_object(..)` as an `if` / `while` test".to_owned())
             }
-            "set_to_next" => {
+            "set_to_next" if free("set_to_next") => {
                 const MODES: &[&str] = &[
                     "all",
                     "person",
@@ -3971,13 +3956,7 @@ impl FileLinter<'_> {
                             "guid" => in_range(v.trim(), 0, 0xFFFF_FFFF),
                             "dest" | "into" if !dest => {
                                 dest = true;
-                                let v = v.trim();
-                                index(v, "temp").is_some_and(|n| (0..=7).contains(&n))
-                                    || index(v, "param").is_some_and(|n| (0..=255).contains(&n))
-                                    || matches!(
-                                        local(v),
-                                        Some(LocalKind::I16 | LocalKind::ObjectId)
-                                    )
+                                temp(v.trim()) || param(v.trim())
                             }
                             _ => false,
                         },
@@ -3986,38 +3965,36 @@ impl FileLinter<'_> {
                     });
                 (ok && dest).then(|| "set_to_next(.., dest: ..)".to_owned())
             }
+            "remove_object" | "find_best_object" | "set_to_next" => None,
             _ => {
                 let (dst, src) = l.split_once(":=")?;
-                let (dst, src) = (dst.trim(), src.trim());
-                let dst_kind = if index(dst, "temp").is_some_and(|n| (0..=7).contains(&n)) {
-                    LocalKind::I16
-                } else if dst.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
-                    local(dst)?
-                } else {
+                if !temp(dst.trim()) {
                     return None;
-                };
+                }
                 let src: String = src.chars().filter(|c| !c.is_whitespace()).collect();
                 let inner = src.strip_prefix("scope(")?.strip_suffix(')')?;
                 let (scope, n) = inner.split_once(',')?;
                 let n = air_literal(n)?;
-                let (v2, kind) = match (scope, n) {
-                    ("21", 9) => ("stack_obj.object_type".to_owned(), LocalKind::I16),
-                    ("21", 11) => ("stack_obj.sub_index".to_owned(), LocalKind::I16),
-                    ("35", 0..=255) => (format!("stack_obj.has_function[{n}]"), LocalKind::Bool),
-                    ("33", 0..=32767) => (format!("job_field({n})"), LocalKind::I16),
-                    _ => return None,
-                };
-                (dst_kind == kind).then_some(v2)
+                match (scope, n) {
+                    ("21", 9) if free("stack_obj") => Some("stack_obj.object_type".to_owned()),
+                    ("21", 11) if free("stack_obj") => Some("stack_obj.sub_index".to_owned()),
+                    ("33", 0..=32767) if free("job_field") => Some(format!("job_field({n})")),
+                    _ => None,
+                }
             }
         }
     }
 
     /// `unreachable_code`: the first statement of `list` after one that always leaves it.
-    /// Not when a `raw { }` block from there on defines an `.air` label (`@n4:`), which a
-    /// jump in another raw block may reach, and not for a lone `return` closing the list
+    /// Not in a body whose raw code has an explicit edge (`-> true: @a` / `there` / `2`):
+    /// it may jump to any later statement. Not when a `raw { }` block from there on defines
+    /// an `.air` label, and not for a lone `return` closing the list
     /// after an `if` / `match` whose every branch leaves (a trailing return written for the
     /// reader).
     fn unreachable_code(&mut self, list: &[V2Stmt]) {
+        if self.raw_edges {
+            return;
+        }
         let Some(i) = list.iter().position(stmt_leaves) else {
             return;
         };
@@ -4114,8 +4091,17 @@ impl FileLinter<'_> {
                 {
                     continue;
                 }
+                // `animate(.., local: x)` only writes `x`.
+                if let V2Stmt::Animate { args, .. } = s
+                    && args
+                        .get(k)
+                        .is_some_and(|a| a.name.as_deref() == Some("local"))
+                    && is_ident(e, name)
+                {
+                    continue;
+                }
                 // `set_to_next(.., dest: x)` reads `x`; `random_into(x, ..)` only writes it.
-                read |= reads_ident(e, name);
+                read |= reads_ident(e, name, &|f| self.symbols.user_defined(f));
             }
         });
         if by_slot {
@@ -4137,7 +4123,9 @@ impl FileLinter<'_> {
         if !read {
             return;
         }
-        if uninit && let Some(at) = first_unassigned_read(rest, name) {
+        if uninit
+            && let Some(at) = first_unassigned_read(rest, name, &|f| self.symbols.user_defined(f))
+        {
             self.emit(
                 UNINITIALIZED_LOCAL_READ,
                 at,
@@ -4275,13 +4263,19 @@ impl FileLinter<'_> {
 
 /// The first read of `name` with no assignment before it on any path (`None` when every
 /// read follows some assignment, or a `&mut name` / `raw` mention ends the search).
-fn first_unassigned_read(list: &[V2Stmt], name: &str) -> Option<Span> {
+fn first_unassigned_read(list: &[V2Stmt], name: &str, user: &dyn Fn(&str) -> bool) -> Option<Span> {
     enum Event {
         Read(Span),
         Write,
     }
     /// A builtin call whose arguments may name a local it writes.
-    fn call_events(callee: &str, args: &[CallArg], name: &str, out: &mut Vec<Event>) {
+    fn call_events(
+        callee: &str,
+        args: &[CallArg],
+        name: &str,
+        user: &dyn Fn(&str) -> bool,
+        out: &mut Vec<Event>,
+    ) {
         let mut writes = false;
         for (k, a) in args.iter().enumerate() {
             if writes_arg(callee, args, k) && is_ident(&a.value, name) {
@@ -4291,14 +4285,14 @@ fn first_unassigned_read(list: &[V2Stmt], name: &str) -> Option<Span> {
                     out.push(Event::Read(a.value.span()));
                 }
             } else {
-                expr_events(&a.value, name, out);
+                expr_events(&a.value, name, user, out);
             }
         }
         if writes {
             out.push(Event::Write);
         }
     }
-    fn expr_events(e: &V2Expr, name: &str, out: &mut Vec<Event>) {
+    fn expr_events(e: &V2Expr, name: &str, user: &dyn Fn(&str) -> bool, out: &mut Vec<Event>) {
         if let V2Expr::MutRef { inner, .. } = e
             && is_ident(inner, name)
         {
@@ -4308,8 +4302,9 @@ fn first_unassigned_read(list: &[V2Stmt], name: &str) -> Option<Span> {
         if let V2Expr::Call { callee, args, .. } = e
             && let V2Expr::Ident(_, f) = callee.as_ref()
             && LOCAL_WRITING_BUILTINS.contains(&f.as_str())
+            && !user(f)
         {
-            call_events(f, args, name, out);
+            call_events(f, args, name, user, out);
             return;
         }
         if is_ident(e, name) {
@@ -4317,10 +4312,10 @@ fn first_unassigned_read(list: &[V2Stmt], name: &str) -> Option<Span> {
             return;
         }
         for c in subexprs(e) {
-            expr_events(c, name, out);
+            expr_events(c, name, user, out);
         }
     }
-    fn stmt_events(list: &[V2Stmt], name: &str, out: &mut Vec<Event>) {
+    fn stmt_events(list: &[V2Stmt], name: &str, user: &dyn Fn(&str) -> bool, out: &mut Vec<Event>) {
         for s in list {
             match s {
                 V2Stmt::Assign {
@@ -4329,7 +4324,7 @@ fn first_unassigned_read(list: &[V2Stmt], name: &str) -> Option<Span> {
                     value,
                     ..
                 } if is_ident(target, name) => {
-                    expr_events(value, name, out);
+                    expr_events(value, name, user, out);
                     out.push(Event::Write);
                 }
                 V2Stmt::RawAir { code, .. }
@@ -4343,7 +4338,7 @@ fn first_unassigned_read(list: &[V2Stmt], name: &str) -> Option<Span> {
                 V2Stmt::Let { name: n, init, .. } | V2Stmt::LetSome { name: n, init, .. }
                     if n == name =>
                 {
-                    expr_events(init, name, out);
+                    expr_events(init, name, user, out);
                     out.push(Event::Write);
                 }
                 V2Stmt::LetUninit { name: n, .. } if n == name => out.push(Event::Write),
@@ -4353,35 +4348,37 @@ fn first_unassigned_read(list: &[V2Stmt], name: &str) -> Option<Span> {
                 V2Stmt::Expr {
                     expr: V2Expr::Call { callee, args, .. },
                     ..
-                } if matches!(callee.as_ref(), V2Expr::Ident(_, f) if f == "relationship") => {
+                } if matches!(callee.as_ref(), V2Expr::Ident(_, f) if f == "relationship")
+                    && !user("relationship") =>
+                {
                     for (k, a) in args.iter().enumerate() {
                         if !(writes_arg("relationship", args, k) && is_ident(&a.value, name)) {
-                            expr_events(&a.value, name, out);
+                            expr_events(&a.value, name, user, out);
                         }
                     }
                 }
                 V2Stmt::Animate {
                     args, event, body, ..
                 } => {
-                    call_events("animate", args, name, out);
+                    call_events("animate", args, name, user, out);
                     // The handler's `|event|` binding shadows the name inside it.
                     if event.as_deref() != Some(name) {
-                        stmt_events(body, name, out);
+                        stmt_events(body, name, user, out);
                     }
                 }
                 other => {
                     for e in stmt_exprs(other) {
-                        expr_events(e, name, out);
+                        expr_events(e, name, user, out);
                     }
                     for b in stmt_blocks(other) {
-                        stmt_events(b, name, out);
+                        stmt_events(b, name, user, out);
                     }
                 }
             }
         }
     }
     let mut events = Vec::new();
-    stmt_events(list, name, &mut events);
+    stmt_events(list, name, user, &mut events);
     match events.first()? {
         Event::Read(at) => Some(*at),
         Event::Write => None,
@@ -4855,26 +4852,37 @@ fn reads_written_arg(callee: &str, args: &[CallArg], k: usize) -> bool {
     callee == "set_to_next" && args[k].name.as_deref() == Some("dest")
 }
 
-/// Whether `e` reads `name`: a mention that is not only an argument a builtin writes
-/// without reading it first (`random_into(x, ..)`, `animate(.., local: x)`).
-fn reads_ident(e: &V2Expr, name: &str) -> bool {
+/// Whether `e` reads `name`: a mention that is not only an argument a builtin (not a user
+/// function of that name: `user`) writes without reading it first (`random_into(x, ..)`,
+/// `relationship(.., value: x)` with literal flags).
+fn reads_ident(e: &V2Expr, name: &str, user: &dyn Fn(&str) -> bool) -> bool {
     if let V2Expr::Call { callee, args, .. } = e
         && let V2Expr::Ident(_, f) = callee.as_ref()
         && LOCAL_WRITING_BUILTINS.contains(&f.as_str())
+        && !user(f)
     {
-        return is_ident(callee, name)
-            || args.iter().enumerate().any(|(k, a)| {
-                if writes_arg(f, args, k) && is_ident(&a.value, name) {
-                    reads_written_arg(f, args, k)
-                } else {
-                    reads_ident(&a.value, name)
-                }
-            });
+        return args.iter().enumerate().any(|(k, a)| {
+            if writes_arg(f, args, k) && is_ident(&a.value, name) {
+                reads_written_arg(f, args, k) || !write_only_known(f, args)
+            } else {
+                reads_ident(&a.value, name, user)
+            }
+        });
     }
     if is_ident(e, name) {
         return true;
     }
-    subexprs(e).into_iter().any(|c| reads_ident(c, name))
+    subexprs(e).into_iter().any(|c| reads_ident(c, name, user))
+}
+
+/// Whether the call's write-only argument surely is one: `relationship` reads its
+/// `value:` local instead when flag 4 is set, which a non-literal `flags:` may hold.
+fn write_only_known(callee: &str, args: &[CallArg]) -> bool {
+    callee != "relationship"
+        || args
+            .iter()
+            .filter(|a| a.name.as_deref() == Some("flags"))
+            .all(|a| matches!(a.value, V2Expr::Int(..)))
 }
 
 /// Whether a statement is a store that lowers to one expression node which cannot
@@ -5120,7 +5128,7 @@ fn local_culprits(frame: &AirFrame) -> Option<String> {
 /// reserve slots too (numeric primitive locals), so the caller keeps a frame only when
 /// the compiled tree has exactly as many locals ([`verified_frames`]).
 fn parse_air_frames(air: &str) -> Vec<AirFrame> {
-    fn header(line: &str) -> Option<(u16, String)> {
+    fn header(line: &str) -> Option<(u16, String, Option<usize>)> {
         let mut parts = line.splitn(3, ' ');
         let word = parts.next()?;
         let id = parts.next()?.parse().ok()?;
@@ -5129,10 +5137,16 @@ fn parse_air_frames(air: &str) -> Vec<AirFrame> {
             return None;
         }
         let label = rest.strip_prefix('"')?;
-        let label = &label[..label.find('"')?];
-        Some((id, label.to_owned()))
+        let end = label.find('"')?;
+        let args = label[end..].split_once("args:").and_then(|(_, r)| {
+            let r = r.trim_start();
+            r[..r.find(|c: char| !c.is_ascii_digit()).unwrap_or(r.len())]
+                .parse()
+                .ok()
+        });
+        Some((id, label[..end].to_owned(), args))
     }
-    fn frame(id: u16, label: String, body: &str) -> Option<AirFrame> {
+    fn frame(id: u16, label: String, args: Option<usize>, body: &str) -> Option<AirFrame> {
         let code = strip_air_comments(body);
         let mut lets = Vec::new();
         let mut explicit: Option<usize> = None;
@@ -5191,21 +5205,22 @@ fn parse_air_frames(air: &str) -> Vec<AirFrame> {
             label,
             slots,
             raw_slots,
+            args,
         })
     }
     let mut out = Vec::new();
-    let mut current: Option<(u16, String, String)> = None;
+    let mut current: Option<(u16, String, Option<usize>, String)> = None;
     for line in air.lines() {
-        if let Some((_, _, body)) = &mut current {
+        if let Some((_, _, _, body)) = &mut current {
             if line == "}" {
-                let (id, label, body) = current.take().expect("open tree");
-                out.extend(frame(id, label, &body));
+                let (id, label, args, body) = current.take().expect("open tree");
+                out.extend(frame(id, label, args, &body));
             } else {
                 body.push_str(line);
                 body.push('\n');
             }
-        } else if let Some((id, label)) = header(line) {
-            current = Some((id, label, String::new()));
+        } else if let Some((id, label, args)) = header(line) {
+            current = Some((id, label, args, String::new()));
         }
     }
     out
