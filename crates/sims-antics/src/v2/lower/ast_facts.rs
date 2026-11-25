@@ -941,6 +941,24 @@ impl ExplicitStackOps {
         local: bool,
     ) -> bool {
         stmts.iter().any(|stmt| {
+            // `let Some(x) = find_best_object(..) else {..}` puts the cursor back itself; only
+            // its arguments can move it. Anywhere else (a condition, a bool value) Find Best
+            // Object leaves the found object in `stack_obj`.
+            let let_some_search = match stmt {
+                V2Stmt::LetSome {
+                    init: V2Expr::Call { callee, args, .. },
+                    ..
+                } if matches!(callee.as_ref(), V2Expr::Ident(_, n) if n == "find_best_object") => {
+                    Some(args)
+                }
+                _ => None,
+            };
+            if let Some(args) = let_some_search {
+                return args.iter().any(|a| self.in_expr(&a.value, env, owner, local))
+                    || super::specialize::stmt_bodies(stmt)
+                        .into_iter()
+                        .any(|body| self.in_stmts(body, env, owner, local));
+            }
             super::specialize::stmt_exprs(stmt)
                 .into_iter()
                 .any(|expr| self.in_expr(expr, env, owner, local))
@@ -990,7 +1008,8 @@ impl ExplicitStackOps {
                         .filter_map(|p| p.default.as_ref())
                         .any(|expr| self.in_expr(expr, env, &module, is_local)))
         } else {
-            name == "set_to_next" || (name == "create_object" && has_create_dest(args))
+            matches!(name, "set_to_next" | "find_best_object")
+                || (name == "create_object" && has_create_dest(args))
         }
     }
 }

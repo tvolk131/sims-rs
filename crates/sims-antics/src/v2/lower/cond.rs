@@ -422,6 +422,15 @@ impl<'a> TreeLowerer<'a> {
                             return Ok(Some(self.format_slot_prim("route_to", args, *span)?));
                         }
                         "snap" => return Ok(Some(self.format_slot_prim("snap", args, *span)?)),
+                        // Find Best Object's own node: true leaves the found object in
+                        // `stack_obj`, false leaves `stack_obj` as it was (`sims-vm`
+                        // `primitives/find_best_object.rs`). The tree keeps its cursor through
+                        // later builtins (`ExplicitStackOps`), like `set_to_next`.
+                        "find_best_object" => {
+                            return Ok(Some(
+                                self.parse_find_best_object(&[], args, *span)?.prim_air,
+                            ));
+                        }
                         _ => {}
                     }
                     if let Some((fn_mod, fn_decl, is_local)) =
@@ -748,6 +757,12 @@ impl<'a> TreeLowerer<'a> {
                     return Ok(());
                 }
                 if !type_args.is_empty() {
+                    if matches!(callee.as_ref(), V2Expr::Ident(_, n) if n == "find_best_object") {
+                        return Err(Error::at(
+                            *span,
+                            "find_best_object::<T>() binds the object it checks against T: use 'let Some(x) = find_best_object::<T>(..) else { .. };' (the untyped search is a condition)",
+                        ));
+                    }
                     return Err(Error::at(
                         *span,
                         "type arguments are only supported on 'create_object::<T>', 'find_best_object::<T>', and 'objects_of::<T>'",
