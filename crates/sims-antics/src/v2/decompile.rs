@@ -6398,7 +6398,7 @@ object "Fable Lamp" {
             &[
                 "return ready_4300();",
                 "return !ready_4300();",
-                "return !(self.data[8] flag_test 6);",
+                "return !(self.flags flag_test 6);",
                 "} else {\n            return ready_4300();",
             ],
         );
@@ -6655,9 +6655,9 @@ object "Fable Lamp" {
         has(
             &lifted,
             &[
-                "sim.data[5] flag_set 3;",
+                "sim.wall_adjacency flag_set 3;",
                 "if temp[0] flag_test 2 {",
-                "self.data[4] flag_clear 1;",
+                "self.allowed_heights flag_clear 1;",
                 "if !(sim.hand == 0) {",
             ],
         );
