@@ -35,7 +35,6 @@ backlog of what is still to mine.
 | --- | --- |
 | sims-app | stays (still to mine: see the mining audit) |
 | sims-content | stays (still to mine) |
-| sims-formats | stays (still to mine; leftovers only) |
 | sims-render | stays (still to mine) |
 | sims-runtime | stays (still to mine) |
 | sims-sim | stays (still to mine) |
@@ -43,6 +42,7 @@ backlog of what is still to mine.
 | sims-fixtures | removed 2026-11-23; at `legacy-final` |
 | sims-kernel | removed 2026-11-23; at `legacy-final` |
 | sims-tools | removed 2026-11-23; at `legacy-final` |
+| sims-formats (leftovers) | removed 2026-11-24; at `legacy-final` |
 
 The remaining crates' `Cargo.toml` files still name the removed crates as
 dependencies. That doesn't matter, because nothing here is built.

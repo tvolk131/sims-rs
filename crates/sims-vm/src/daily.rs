@@ -37,7 +37,7 @@
 use crate::factory::word;
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
-use crate::placement::{floor, pool_byte, segments, stands_on_lot, tile_flags};
+use crate::placement::{stands_on_lot, tile_flags};
 use crate::play::{Recovery, ScriptError};
 use sims_sim::World;
 
@@ -405,9 +405,10 @@ impl Interpreter<'_> {
     ///    without flag 0x20 (0x4452cc), counts for global 22.
     /// 2. The architecture (0x47b006) counts for global 22 when a tile of
     ///    level 1 or 2 inside the lot's size, without flag 0x20, has a
-    ///    floor (0x4330b7) or, on level 1, a pool byte up to 0x10. A tile
-    ///    with walls counts too; working out its walls (0x4795c5) is not
-    ///    ported, so a lot where only walls could count fails loudly.
+    ///    wall (the segments 0x4795c5 hands out, 0x47b08c), a floor
+    ///    (0x4330b7) or, on level 1, a pool byte up to 0x10
+    ///    ([`crate::lifecycle::architecture_value_and_built`], which the
+    ///    load runs too).
     /// 3. Global 23 becomes the lot's size, global 22 1 when either step
     ///    counted and else 0, and global 37 the lot's features, as at a
     ///    load ([`World::update_statistics`]).
@@ -418,21 +419,14 @@ impl Interpreter<'_> {
     /// objects' value. Any other adds to the architecture's when its
     /// catalog master's word 69 is not 0 or 4 (0x445190 to 0x445223).
     /// The objects' value becomes the budget's
-    /// ([`sims_sim::Budget::objects_value`], simulator +0xa0, 0x416118).
-    ///
-    /// **Not ported: the architecture's value** (+0xa4, 0x416126): the
-    /// pass's other subtotal, of the objects that add to the
-    /// architecture's (0x445223), plus what 0x47b006 returns (added at
-    /// 0x416121): half the prices of
-    /// the walls' styles (0x6e5838), the wall patterns' prices (0x4c63cf),
-    /// the floors' prices (0x4a1439, half for a diagonal half floor) and
-    /// the pool's (0x6c5ff8). `sims_ui::house::Values::read` has that sum,
-    /// but the simulation does not store it, so
-    /// [`sims_sim::Budget::architecture_value`] keeps the value the house
-    /// was saved with. The house panel's Furnishings rating reads it, so
-    /// after a day turns it weighs the new objects' value against the
-    /// saved architecture's, and a save written then would hold a stale
-    /// value. This is a known gap, not the original's behaviour.
+    /// ([`sims_sim::Budget::objects_value`], simulator +0xa0, 0x416118),
+    /// and the architecture's, plus what 0x47b006 returns (added at
+    /// 0x416121), the architecture's value
+    /// ([`sims_sim::Budget::architecture_value`], +0xa4, 0x416126): half
+    /// the prices of the walls' styles, the wall patterns', the floors'
+    /// (half for a diagonal half floor) and the pool's. The prices come
+    /// from the lot's install ([`Interpreter::architecture_prices`]); an
+    /// interpreter without them leaves the architecture's value as it was.
     ///
     /// Two flags of the selected family (+0x138: bit 1 when an object of
     /// category 1 stands on the lot, bit 2 when there is one of category
@@ -446,6 +440,7 @@ impl Interpreter<'_> {
         };
         let mut built = false;
         let mut objects_value = 0i32;
+        let mut architecture_value = 0i32;
         for id in world.order.clone() {
             let object = world.objects.get(&id).ok_or_else(|| {
                 fail(id, Trap::Invalid("object on the lot's list is gone".into()))
@@ -476,14 +471,15 @@ impl Interpreter<'_> {
             if on_lot && self.valued(world, id).map_err(|trap| fail(id, trap))? {
                 let value = value(world, &words, id).map_err(|trap| fail(id, trap))?;
                 objects_value = objects_value.wrapping_add(i32::from(value));
+            } else if self
+                .counts_as_architecture(world, id)
+                .map_err(|trap| fail(id, trap))?
+            {
+                let value = value(world, &words, id).map_err(|trap| fail(id, trap))?;
+                architecture_value = architecture_value.wrapping_add(i32::from(value));
             }
-            // Otherwise the object's value goes to the architecture's,
-            // which is not ported (above).
         }
-        world.budget.objects_value = objects_value;
-        if !built {
-            built = architecture_counts(world).map_err(|trap| fail(0, trap))?;
-        }
+        built |= self.store_values(world, objects_value, architecture_value);
         world
             .update_statistics()
             .map_err(|error| fail(0, Trap::Invalid(error.to_string())))?;
@@ -516,6 +512,7 @@ impl Interpreter<'_> {
         };
         let mut built = false;
         let mut objects_value = 0i32;
+        let mut architecture_value = 0i32;
         for id in world.order.clone() {
             let step = (|| -> Result<(), Trap> {
                 let object = world
@@ -547,6 +544,9 @@ impl Interpreter<'_> {
                 if on_lot && self.valued(world, id)? {
                     let v = value(world, &words, id)?;
                     objects_value = objects_value.wrapping_add(i32::from(v));
+                } else if self.counts_as_architecture(world, id)? {
+                    let v = value(world, &words, id)?;
+                    architecture_value = architecture_value.wrapping_add(i32::from(v));
                 }
                 Ok(())
             })();
@@ -554,21 +554,7 @@ impl Interpreter<'_> {
                 record(errors, id, trap);
             }
         }
-        world.budget.objects_value = objects_value;
-        if !built {
-            match architecture_counts(world) {
-                Ok(counts) => built = counts,
-                Err(trap) => {
-                    // The only `Unsupported` branch in `architecture_counts` is
-                    // a lot with walls but no floor or pool, where walls count
-                    // as built in 0x47b006.
-                    if matches!(trap, Trap::Unsupported(_)) {
-                        built = true;
-                    }
-                    record(errors, 0, trap);
-                }
-            }
-        }
+        built |= self.store_values(world, objects_value, architecture_value);
         if let Err(error) = world.update_statistics() {
             record(errors, 0, Trap::Invalid(error.to_string()));
         }
@@ -581,6 +567,44 @@ impl Interpreter<'_> {
 }
 
 impl Interpreter<'_> {
+    /// Stores the values the object pass summed, with the architecture's
+    /// own (0x47b006), as 0x416112 to 0x416126 do, and returns whether the
+    /// architecture counts for global 22.
+    fn store_values(&self, world: &mut World, objects: i32, architecture: i32) -> bool {
+        let default = crate::lifecycle::LotPrices::default();
+        let prices = self.architecture_prices.unwrap_or(&default);
+        let (surfaces, built) = crate::lifecycle::architecture_value_and_built(world, prices);
+        world.budget.objects_value = objects;
+        if self.architecture_prices.is_some() {
+            world.budget.architecture_value = surfaces.wrapping_add(architecture);
+        }
+        built
+    }
+
+    /// Whether object `id`, which the object pass does not count in the
+    /// objects' value, counts in the architecture's: its catalog master's
+    /// word 69 (+0x8a) is not 0 or 4 (0x445190 to 0x4451c5). The master is
+    /// read with no test for null (0x4451a4).
+    fn counts_as_architecture(&self, world: &World, id: u16) -> Result<bool, Trap> {
+        let object = world
+            .objects
+            .get(&id)
+            .ok_or_else(|| Trap::Invalid(format!("object {id} on the lot's list is gone")))?;
+        let definition = crate::interpreter::object_definition(self.catalog, world, object.guid)
+            .ok_or_else(|| Trap::Invalid(format!("object {id} has no definition")))?;
+        let master = self
+            .program
+            .master_definition(definition.resource, definition.chunk)
+            .map_err(Trap::Invalid)?
+            .ok_or_else(|| {
+                Trap::Unsupported(format!(
+                    "object {id} has no catalog master, which 0x4451a4 reads through a null \
+                     pointer"
+                ))
+            })?;
+        Ok(!matches!(master[def::BUILD_KIND], 0 | 4))
+    }
+
     /// Whether object `id` counts in the objects' value (0x4354d5): not
     /// with flag 0x10 in its data word 43; a person (definition word 9 is
     /// 2) does; any other only when its catalog master's word 69 is 0
@@ -662,39 +686,113 @@ pub(crate) fn value(world: &World, words: &[i16], id: u16) -> Result<i16, Trap> 
     Ok(if halved { value / 2 } else { value })
 }
 
-/// Whether the lot's architecture counts for global 22 (0x47b006's flag).
-/// See [`Interpreter::day_statistics`].
-fn architecture_counts(world: &World) -> Result<bool, Trap> {
-    let size = i8::try_from(world.size)
-        .ok()
-        .filter(|&s| s > 0 && i32::from(s) <= 64)
-        .ok_or_else(|| Trap::Invalid(format!("the lot's size is {}", world.size)))?;
-    let mut walls = false;
-    for level in 1..=2 {
-        for b in 0..size {
-            for a in 0..size {
-                walls |= segments(world, a, b, level)? != 0;
-                if tile_flags(world, a, b, level)? & UNCOUNTED != 0 {
-                    continue;
-                }
-                if floor(world, a, b, level)? != 0 {
-                    return Ok(true);
-                }
-                if level == 1 && pool_byte(world, a, b)?.is_some_and(|p| p <= 0x10) {
-                    return Ok(true);
-                }
-            }
+#[cfg(test)]
+mod tests {
+    use super::{BUILT, data, value, word};
+    use crate::boot::{Frames, Lot};
+    use crate::interpreter::{Interpreter, Stream};
+    use crate::placement::stands_on_lot;
+    use sims_sim::load::{FLOORS, WALLS};
+    use std::path::PathBuf;
+
+    /// The lot's pool array (0x47b1a8 reads it on level 1), and a byte
+    /// above 0x10, which neither counts nor is priced.
+    const POOL: u16 = 9;
+    const NO_POOL: u8 = 0xff;
+
+    fn goth() -> Option<Lot> {
+        let root = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
+        let house = root.join("UserData/Houses/House05.iff");
+        Some(Lot::load(&root, &house, &[3], Frames::default()).unwrap())
+    }
+
+    fn priced(lot: &Lot) -> Interpreter<'_> {
+        Interpreter {
+            architecture_prices: Some(&lot.architecture_prices),
+            ..Interpreter::new(&lot.program, &lot.catalog, Stream::Global)
         }
     }
-    // A tile's walls (0x4795c5) come from its own wall cell and its
-    // neighbours' inside the lot's size: with no segment anywhere there,
-    // no tile has a wall.
-    if walls {
-        return Err(Trap::Unsupported(
-            "the day's statistics on a lot with walls but no floor or pool: whether its walls \
-             count for global 22 (0x4795c5 in 0x47b006) is not ported"
-                .into(),
-        ));
+
+    /// The day's statistics work the architecture's value out again
+    /// (0x416121, 0x416126): an object that adds to it changes it by its
+    /// own change, and an interpreter without prices leaves it alone.
+    #[test]
+    fn the_day_turn_works_the_architecture_value_out_again() {
+        let Some(mut lot) = goth() else {
+            return;
+        };
+        let mut world = lot.world.clone();
+        let interpreter = priced(&lot);
+        interpreter.day_statistics(&mut world).unwrap();
+        let before = world.budget.architecture_value;
+        assert_eq!(before, lot.world.budget.architecture_value);
+        let id = world
+            .order
+            .clone()
+            .into_iter()
+            .find(|&id| {
+                let words = *interpreter.words(&world, id).unwrap();
+                // The lead of its group, whose word 41 is the group's.
+                let lead = world.objects[&id]
+                    .multipart
+                    .as_ref()
+                    .is_none_or(|part| part.parent == 0 || part.parent as u16 == id);
+                lead && words[word::TYPE] != super::SKIPPED_TYPE
+                    && !(stands_on_lot(&mut world, id).unwrap()
+                        && interpreter.valued(&world, id).unwrap())
+                    && interpreter.counts_as_architecture(&world, id).unwrap()
+                    && value(&world, &words, id).unwrap() > 0
+            })
+            .expect("the Goth house has an object that adds to the architecture's value");
+        let words = *interpreter.words(&world, id).unwrap();
+        let old = value(&world, &words, id).unwrap();
+        world.objects.get_mut(&id).unwrap().data[data::VALUE] += 100;
+        let new = value(&world, &words, id).unwrap();
+        assert_ne!(old, new);
+        interpreter.day_statistics(&mut world).unwrap();
+        assert_eq!(
+            world.budget.architecture_value,
+            before + i32::from(new) - i32::from(old)
+        );
+
+        lot.world.budget.architecture_value = -1;
+        let unpriced = Interpreter::new(&lot.program, &lot.catalog, Stream::Global);
+        let mut world = lot.world.clone();
+        unpriced.day_statistics(&mut world).unwrap();
+        assert_eq!(world.budget.architecture_value, -1);
     }
-    Ok(false)
+
+    /// A lot whose only architecture is walls counts for global 22
+    /// (0x47b08c tests the segments 0x4795c5 hands out), and is priced at
+    /// half its walls' styles.
+    #[test]
+    fn walls_alone_count_the_lot_as_built() {
+        let Some(lot) = goth() else {
+            return;
+        };
+        let interpreter = priced(&lot);
+        let mut world = lot.world.clone();
+        world.order.clear();
+        for id in FLOORS {
+            if let Some(array) = world.arrays.get_mut(&id) {
+                array.data.fill(0);
+            }
+        }
+        if let Some(array) = world.arrays.get_mut(&POOL) {
+            array.data.fill(NO_POOL);
+        }
+        interpreter.day_statistics(&mut world).unwrap();
+        assert_eq!(world.globals[BUILT], 1);
+        assert!(world.budget.architecture_value > 0);
+        assert_eq!(world.budget.objects_value, 0);
+
+        for id in WALLS {
+            if let Some(array) = world.arrays.get_mut(&id) {
+                array.data.fill(0);
+            }
+        }
+        interpreter.day_statistics(&mut world).unwrap();
+        assert_eq!(world.globals[BUILT], 0);
+        assert_eq!(world.budget.architecture_value, 0);
+    }
 }

@@ -1839,6 +1839,64 @@ mod tests {
         }
     }
 
+    /// What a Sim holds is drawn on the Sim's hand. The person's draw
+    /// projects the hand's vertex ([`View::place_on`], [`View::screen`]).
+    /// The held object goes to the lot renderer as an attach point
+    /// ([`View::lot_point`]), which places it as a moved object
+    /// (`place_moved`, the original's `0x4b9991`): its fine position
+    /// rounded, turned by the camera, projected on its level, and raised
+    /// `2 << zoom` pixels per height unit, one column right. Both land on
+    /// the same pixel, give or take the whole fine position the sprite is
+    /// placed at, at every zoom, rotation and level. Upstairs the hand carries the original's level offset
+    /// (`0x5922d2`) and the sprite the floor's height, which differ by a
+    /// third of a near-zoom pixel.
+    #[test]
+    fn a_held_object_is_placed_on_the_hand_that_holds_it() {
+        let step = sims_sim::head::terrain_height(F32::from_f32(1.0)).to_f32();
+        for zoom in Zoom::ALL {
+            for rotation in 0..4 {
+                let c = camera(zoom, rotation);
+                let view = View::new(&c);
+                for [x, y] in [[37, 5], [360, 376], [1000, 17]] {
+                    let mut animator = Animator::new(0);
+                    animator.position = [x as f32, y as f32, 3.0].map(F32::from_f32);
+                    let root = placement(&animator).unwrap().translation;
+                    // A palm in front of the chest, off to one side, on
+                    // ground two terrain steps up.
+                    for offset in [
+                        Vec3::new(0.0, 0.0, 0.0),
+                        Vec3::new(0.3, 3.4, -0.6),
+                        Vec3::new(-1.1, 2.2, 0.9),
+                    ] {
+                        let hand = root + Vec3::new(0.0, 2.0 * step, 0.0) + offset;
+                        let [lx, ly, lz] = view.lot_point(hand);
+                        for level in [1, 2] {
+                            let (fine, elevation) = view.place_on(hand, level);
+                            let vertex = view.screen(fine, elevation, level);
+                            let rounded = [(lx + 0.5).trunc() as i32, (ly + 0.5).trunc() as i32];
+                            let rise = (lz * (2u32 << zoom.level()) as f32 + 0.5).trunc() as i32;
+                            let [sx, sy] = c.project_fine(c.rotate_fine(rounded), level, 0);
+                            let sprite = [sx + 1, sy - rise];
+                            let miss = [
+                                (vertex[0].floor() as i32 - sprite[0]).abs(),
+                                (vertex[1].floor() as i32 - sprite[1]).abs(),
+                            ];
+                            // The sprite stands at a whole fine position,
+                            // which moves it up to one fine unit on screen.
+                            let shift = zoom.level();
+                            let slack = [(8 << shift) / 16 + 1, (4 << shift) / 16 + 1];
+                            assert!(
+                                miss[0] <= slack[0] && miss[1] <= slack[1],
+                                "{zoom:?} {rotation} level {level} at {offset:?}: hand {vertex:?}, \
+                                 sprite {sprite:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A person upstairs stands where the original's level offset puts
     /// them: 232.33 near-zoom pixels above where they would stand on the
     /// ground floor, straight up, and a sixth of a tile nearer along both

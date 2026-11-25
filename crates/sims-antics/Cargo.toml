@@ -48,5 +48,9 @@ required-features = ["vm-replay"]
 name = "live_equiv_corpus"
 required-features = ["vm-replay"]
 
+[[test]]
+name = "antics_test_runner"
+required-features = ["vm-replay"]
+
 [lints]
 workspace = true

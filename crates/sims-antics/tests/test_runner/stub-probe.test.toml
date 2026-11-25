@@ -1,0 +1,42 @@
+# Stubbed global trees and pushed interactions, on a synthetic fixture object.
+
+[subject]
+antics = "stub-probe.antics"
+
+[[stub]]
+id = 300
+label = "Probe"
+returns = true
+
+[[stub]]
+source = "tree 301 \"Rate\" (args: 1) { if param[0] > 2 { return true; } return false; }"
+
+[sim]
+
+[[test]]
+name = "a true global stub takes the true branch"
+tree = "Ask"
+expect = { result = true, attrs = { hits = 1, misses = 0 } }
+
+[[test]]
+name = "a source stub reads its arguments"
+tree = "Rated"
+given = { attrs = { hits = 3 } }
+expect = { result = true }
+
+[[test]]
+name = "a source stub's false branch"
+tree = 4401
+given = { attrs = { hits = 2 } }
+expect = { result = false }
+
+[[test]]
+name = "the interaction runs through the stub"
+interaction = "Poke"
+expect = { attrs = { hits = 1 } }
+
+[[test]]
+name = "pushing Poke on the Sim"
+tree = "Nudge"
+stack_obj = "sim"
+expect = { result = true, queue = [{ interaction = "Poke", target = "object", priority = 50 }] }

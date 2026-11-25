@@ -686,10 +686,11 @@ fn what_the_day_turn_does_not_port_fails_loudly() {
             "{result:?}"
         );
     };
-    // Walls with no floor: whether they count (0x4795c5) is not ported.
+    // Walls with no floor count the lot as built (0x4795c5, 0x47b08c).
     let mut fx = before_midnight();
     fx.world.arrays.get_mut(&2).unwrap().data[(4 * 64 + 4) * 14] = 1;
-    unsupported(&mut fx, "walls");
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(fx.world.globals[22], 1);
     // Budget days not all kept.
     let mut fx = before_midnight();
     fx.world.budget.days.pop();

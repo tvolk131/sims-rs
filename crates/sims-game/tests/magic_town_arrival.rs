@@ -22,6 +22,7 @@
 use sims_game::Frames;
 use sims_game::Game;
 use sims_game::neighborhood::NeighborhoodShell;
+use sims_vm::travel::TravelTransport;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -160,6 +161,9 @@ fn the_middle_ped_marker_places_an_arriving_family_once() {
     assert_eq!(trip.leader_guid, jumper_guid);
     let party: Vec<u32> = trip.travelers.iter().map(|t| t.guid).collect();
     assert_eq!(party, vec![jumper_guid], "the jumper goes alone");
+    // The Magic Hole's lot picker gives the transport, not Magic Town's
+    // default (the blimp): the arrival places the jumper by it.
+    assert_eq!(trip.transport, TravelTransport::MagicHole);
 
     let game = shell.game_mut().expect("lot 93");
     let travelers: Vec<u16> = {

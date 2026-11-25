@@ -1,0 +1,52 @@
+# Live sims-vm unit tests for the Open Privacy Shower: wear to broken, and repair scaled by
+# the Mechanical skill.
+
+[subject]
+antics = "../objects/open-shower.antics"
+pack = ".."
+# Its Main returns at once (v2's default Main), which faults the game's lot update (error
+# 0x3e9): the interaction cases run with an idle loop in its place, an assumption every case
+# reports. Drop this once the object's Main loops.
+idle_main = true
+
+[sim]
+motives = { hygiene = 0 }
+
+[[test]]
+name = "a clean shower can be used"
+guard = "Take Shower"
+expect = { result = true }
+
+[[test]]
+name = "a broken shower cannot"
+guard = "Take Shower"
+given = { attrs = { broken = 1 } }
+expect = { result = false }
+
+[[test]]
+name = "a shower wears with use"
+interaction = "Take Shower"
+expect = { attrs = { wear = 1, broken = 0, occupied = 0 }, sim = { motives = { hygiene = 100 } }, sounds = ["open_shower_spray"] }
+
+[[test]]
+name = "the third use breaks it"
+interaction = "Take Shower"
+given = { attrs = { wear = 2 } }
+expect = { attrs = { wear = 3, broken = 1 }, sounds = ["open_shower_spray", "open_shower_wrench"] }
+
+[[test]]
+name = "repair is offered only when broken"
+guard = "Repair Shower"
+expect = { result = false }
+
+[[test]]
+name = "an unskilled repair takes five cycles"
+interaction = "Repair Shower"
+given = { attrs = { broken = 1, wear = 3 } }
+expect = { attrs = { broken = 0, wear = 0, last_repair_cycles = 5 }, sim = { skills = { mechanical = 15 } }, sounds = ["open_shower_wrench", "open_shower_fixed"] }
+
+[[test]]
+name = "a skilled mechanic repairs faster"
+interaction = "Repair Shower"
+given = { attrs = { broken = 1 }, sim = { skills = { mechanical = 600 } } }
+expect = { attrs = { broken = 0, last_repair_cycles = 2 }, sim = { skills = { mechanical = 615 } } }

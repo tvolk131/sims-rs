@@ -4,3 +4,5 @@ mod animation;
 mod avatar;
 #[path = "avatar_codecs/avatar_index.rs"]
 mod avatar_index;
+#[path = "avatar_codecs/catalog.rs"]
+mod catalog;

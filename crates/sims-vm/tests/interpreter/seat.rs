@@ -1006,23 +1006,59 @@ fn step_20_goes_on_to_fail_once_its_animator_stops() {
 
 #[test]
 fn a_lost_route_sets_its_contexts_byte_0x78_again() {
-    // 0x45aebb: with byte +0x78 clear, any step but 2 and 3 sets it again
-    // and goes on; written back as step 20 yields.
+    // 0x45aebb: with byte +0x78 clear (the lot forgot its routes,
+    // 0x444805), a lost route sets it again and goes on; written back as
+    // step 20 yields.
     let (mut fx, me) = mid_route(3, 1);
     fx.world.objects.remove(&LAMP);
     let route = fx.world.routing.routes.get_mut(&me).unwrap();
     route.contexts[0].byte_78 = false;
     assert_eq!(turn(&mut fx, me), Ok(sims_vm::Status::Yielded));
     assert!(fx.world.routing.routes[&me].contexts[0].byte_78);
-    // Step 2 with the byte clear is not ported.
+    assert_eq!(fx.world.objects[&me].stack[0].primitive_state, 20);
+}
+
+#[test]
+fn a_forgotten_route_through_a_door_forgets_the_door() {
+    // 0x45aeb8: in step 2 with byte +0x78 clear, the door the route goes
+    // through (+0x68) is forgotten before step 2 runs. Here the person is
+    // already in the slot's room, so step 2 goes back to step 1, plans,
+    // and the walk is under way.
     let (mut fx, me) = mid_route(2, 0);
     let route = fx.world.routing.routes.get_mut(&me).unwrap();
     route.contexts[0].byte_78 = false;
-    let result = turn(&mut fx, me);
-    assert!(
-        matches!(result, Err(ref fault) if format!("{fault}").contains("0x45aea5")),
-        "{result:?}"
-    );
+    route.contexts[0].word_68 = i32::from(LAMP);
+    assert_eq!(turn(&mut fx, me), Ok(sims_vm::Status::Yielded));
+    let context = &fx.world.routing.routes[&me].contexts[0];
+    assert_eq!((context.byte_78, context.word_68), (true, 0));
+    assert_eq!(fx.world.objects[&me].stack[0].primitive_state, 3);
+}
+
+#[test]
+fn a_forgotten_route_under_way_stops_and_plans_again() {
+    // 0x45aeaf: in step 3 with byte +0x78 clear the route goes to step 15
+    // (0x45b3aa), which asks the animator to stop (0x589e2d) with no
+    // sound. One under way (arrival 1) does not, so the run yields in
+    // step 15 and the request is kept; the byte is set again.
+    let (mut fx, me) = mid_route(3, 1);
+    let route = fx.world.routing.routes.get_mut(&me).unwrap();
+    route.contexts[0].byte_78 = false;
+    assert_eq!(turn(&mut fx, me), Ok(sims_vm::Status::Yielded));
+    assert_eq!(fx.world.objects[&me].stack[0].primitive_state, 15);
+    assert!(fx.world.stops_asked.contains(&me));
+    assert!(fx.world.routing.routes[&me].contexts[0].byte_78);
+    // Still under way on the next run: step 15 again.
+    assert_eq!(turn(&mut fx, me), Ok(sims_vm::Status::Yielded));
+    assert_eq!(fx.world.objects[&me].stack[0].primitive_state, 15);
+    // Once the animator may stop (arrival 0), it stops (its segment goes
+    // to -1) and the route starts again from step 1 (0x45b05a), which
+    // plans the walk anew: under way, step 3.
+    let animator = fx.world.animators.get_mut(&me).unwrap();
+    animator.arrival = 0;
+    animator.motion.segment = 5;
+    assert_eq!(turn(&mut fx, me), Ok(sims_vm::Status::Yielded));
+    assert_eq!(fx.world.objects[&me].stack[0].primitive_state, 3);
+    assert_eq!(fx.world.routing.routes[&me].contexts.len(), 1);
 }
 
 /// Another person, whom the route of `mid_route` asked (context +0x80) to

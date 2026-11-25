@@ -559,11 +559,17 @@ impl Interpreter<'_> {
     /// ([`World::update_statistics`]). Then global 19, the mode, becomes
     /// 0.
     ///
+    /// Then the lot forgets what its routes worked out
+    /// ([`Interpreter::forget_routes`], 0x444805): each person's route
+    /// contexts are marked to start again from what they have, and every
+    /// portal's costs become 10001.
+    ///
     /// Not modeled: each room's cached route rectangles are dropped
-    /// (0x467436), and each person is told of the mode (0x444805). In a
-    /// trace of a Goth load neither changes anything compared.
+    /// (0x467436). In a trace of a Goth load that changes nothing
+    /// compared.
     pub fn go_live(&self, world: &mut World) -> Result<(), Fault> {
         world.mark_all_rooms();
+        self.forget_routes(world).map_err(|trap| fault(0, trap))?;
         world
             .update_statistics()
             .map_err(|error| fault(0, Trap::Invalid(error.to_string())))?;

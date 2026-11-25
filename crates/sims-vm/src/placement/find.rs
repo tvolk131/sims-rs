@@ -388,22 +388,6 @@ pub(crate) fn tile_flags(world: &World, a: i8, b: i8, level: i32) -> Result<u8, 
     Ok(flags[cell(a, b)?])
 }
 
-/// A tile's floor (0x4330b7): the word in the level's floor array.
-pub(crate) fn floor(world: &World, a: i8, b: i8, level: i32) -> Result<u16, Trap> {
-    let floors = array(world, FLOORS[level_index(level)?], 2)?;
-    let at = cell(a, b)? * 2;
-    Ok(u16::from_le_bytes([floors[at], floors[at + 1]]))
-}
-
-/// The pool array's byte for a ground tile (0x478f76, 0x47b1ab), or None
-/// for a lot without a pool array.
-pub(crate) fn pool_byte(world: &World, a: i8, b: i8) -> Result<Option<u8>, Trap> {
-    if !world.arrays.contains_key(&POOL) {
-        return Ok(None);
-    }
-    Ok(Some(array(world, POOL, 1)?[cell(a, b)?]))
-}
-
 /// The wall segments a tile has: byte 0 of its wall cell (0x4795c5).
 pub(crate) fn segments(world: &World, a: i8, b: i8, level: i32) -> Result<u8, Trap> {
     let walls = array(world, WALLS[level_index(level)?], WALL_CELL)?;
