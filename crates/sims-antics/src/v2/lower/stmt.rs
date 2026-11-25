@@ -11,11 +11,44 @@ impl<'a> TreeLowerer<'a> {
         Ok(())
     }
 
+    /// A tree's top-level body. In a Sim tree, the leading statements before the first one that
+    /// may move the cursor (`stmts_may_clobber_stack_obj`, which also looks through the helpers
+    /// they call) run with `stack_obj` still the entry object, so `self` needs no switch there.
+    /// Whatever a statement lowers, including a `return`'s cleanups, is emitted inside it, and
+    /// a cleanup still pending after it is lowered from its AST where it is emitted.
+    pub(super) fn lower_tree_body(&mut self, stmts: &[V2Stmt]) -> Result<()> {
+        let sim = match &self.tree_ctx {
+            TreeContext::SimOnObject { sim_name } => Some(sim_name.clone()),
+            TreeContext::ObjectSelf => None,
+        };
+        let mut prefix = sim.is_some();
+        for stmt in stmts {
+            prefix = prefix
+                && !stmts_may_clobber_stack_obj(
+                    std::slice::from_ref(stmt),
+                    self.env,
+                    &self.owner_module,
+                    true,
+                    sim.as_deref(),
+                    0,
+                );
+            self.entry_cursor = prefix;
+            let lowered = self.lower_stmt(stmt);
+            self.entry_cursor = false;
+            lowered?;
+        }
+        Ok(())
+    }
+
     pub(super) fn lower_stmt(&mut self, stmt: &V2Stmt) -> Result<()> {
         if let Some(split) = self.split_inline_specialization(stmt)? {
             return self.lower_stmt(&split);
         }
         self.note_decl(stmt);
+        if self.inline_call_stack.is_empty() {
+            self.stmt_marks
+                .push((self.em.mark(), crate::v2::specialize::stmt_span(stmt)));
+        }
         match stmt {
             V2Stmt::Let {
                 span,

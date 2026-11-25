@@ -52,6 +52,9 @@ impl<'a> TreeLowerer<'a> {
             frame_locals: None,
             event_local: None,
             sleep_span: None,
+            stmt_marks: Vec::new(),
+            inherited_entry_save: false,
+            entry_cursor: false,
         }
     }
 
@@ -68,8 +71,14 @@ impl<'a> TreeLowerer<'a> {
 
     pub(super) fn finish(self) -> Result<String> {
         let formats_text = self.raw_formats_text || mir::body_formats_text(self.em.text());
+        // The frame words the tree's text may read: none unless it formats text.
+        let text_reads = if formats_text {
+            self.env.text_reads.clone()
+        } else {
+            mir::TableLocals::Known(BTreeSet::new())
+        };
         if let Some((span, name)) = &self.dup_decl
-            && formats_text
+            && mir::reads_a_word(&text_reads)
         {
             return Err(Error::at(
                 *span,
@@ -81,7 +90,7 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
         let facts = mir::FrameFacts {
-            formats_text,
+            text_reads,
             keep_layout: self.keep_layout,
             has_self_obj_local: self.has_self_obj_local,
             pinned: self.pin_span.is_some(),
@@ -97,6 +106,11 @@ impl<'a> TreeLowerer<'a> {
         } else {
             body
         };
+        if self.inherited_entry_save && out.lines().any(|l| mir::idents(l).contains(&mir::SELF_OBJ))
+        {
+            let save = mir::StackObjOp::Save(mir::SELF_OBJ).text();
+            out = format!("    {save}\n{out}");
+        }
         if self.pin_span.is_some() {
             // A tree with a pinned `push_interaction` has no raw block (that is an error), so
             // nothing else names an explicit local: the pin takes slot 0, and `.air` allocates

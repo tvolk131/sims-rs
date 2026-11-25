@@ -60,8 +60,12 @@ impl<'a> TreeLowerer<'a> {
     }
 
     /// A Sim tree's `self` is always its entry object, even when the user moves the cursor.
+    /// Before the first statement that may move it, the cursor is that object.
     pub(super) fn self_stack_target(&self) -> &'static str {
-        if self.explicit_stack_obj && matches!(self.tree_ctx, TreeContext::SimOnObject { .. }) {
+        if self.explicit_stack_obj
+            && !self.entry_cursor
+            && matches!(self.tree_ctx, TreeContext::SimOnObject { .. })
+        {
             "__self_obj"
         } else {
             "stack_obj"

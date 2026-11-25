@@ -792,7 +792,51 @@ impl<'a> TreeLowerer<'a> {
 
     /// `job_data(career, level, field)`: scope 33 reads a field of a career level, the career
     /// taken from `temp[0]` and the level from `temp[1]`. Both temps are overwritten.
+    ///
+    /// The value is copied into a fresh local, because the cell reads the temps wherever the
+    /// operand ends up (a later staged argument would overwrite them first).
     pub(super) fn lower_job_data(
+        &mut self,
+        args: &[CallArg],
+        span: Span,
+    ) -> Result<(String, ValueType)> {
+        let (cell, ty) = self.lower_job_data_cell(args, span)?;
+        let tmp = self.fresh("job");
+        self.line(format!("let {tmp} = {cell};"));
+        Ok((tmp, ty))
+    }
+
+    /// The builtin `job_data(..)` call `expr` is (no user callable of that name), as its
+    /// arguments and span.
+    pub(super) fn builtin_job_data_call<'e>(
+        &mut self,
+        expr: &'e V2Expr,
+    ) -> Result<Option<(&'e [CallArg], Span)>> {
+        let V2Expr::Call {
+            span,
+            callee,
+            type_args,
+            args,
+        } = expr
+        else {
+            return Ok(None);
+        };
+        if !type_args.is_empty()
+            || !matches!(callee.as_ref(), V2Expr::Ident(_, f) if f == "job_data")
+            || self.user_callable_named(callee, *span)?
+            || self
+                .env
+                .lookup_fn(&self.owner_module, "job_data", self.in_object_scope)
+                .is_some()
+        {
+            return Ok(None);
+        }
+        Ok(Some((args, *span)))
+    }
+
+    /// [`Self::lower_job_data`] staged, but left as the `scope(33, field)` cell itself: only for
+    /// a consumer that reads it in the very next node, with nothing staged in between.
+    pub(super) fn lower_job_data_cell(
         &mut self,
         args: &[CallArg],
         span: Span,
@@ -830,9 +874,7 @@ impl<'a> TreeLowerer<'a> {
         }
         self.line(format!("temp[0] := {career};"));
         self.line(format!("temp[1] := {level};"));
-        let tmp = self.fresh("job");
-        self.line(format!("let {tmp} = scope(33, {field});"));
-        Ok((tmp, ValueType::I16))
+        Ok((format!("scope(33, {field})"), ValueType::I16))
     }
 
     pub(super) fn lower_job_operand(&mut self, key: &str, arg: &CallArg) -> Result<String> {

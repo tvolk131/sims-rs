@@ -69,9 +69,22 @@ impl Liveness<'_> {
                     }
                     _ => (None, l.as_str()),
                 };
+                // A primitive that stores into a local through an out-operand on both exits
+                // defines it like a plain store (it is not a removable store, so it is never a
+                // dead def). One that stores on only one exit defines nothing on the other, so
+                // as a bare statement it stays a read.
+                let out_def = match def {
+                    None => self.out_write(l).filter(|w| w.2 == WriteExit::Both),
+                    Some(_) => None,
+                };
+                let (def, uses_text): (Option<&str>, &str) = match &out_def {
+                    Some((name, rest, _)) => (Some(name.as_str()), rest.as_str()),
+                    None => (def, uses_text),
+                };
                 self.live_out.insert(std::ptr::from_ref(n), out.clone());
                 if let Some(d) = def
                     && d.starts_with("__")
+                    && out_def.is_none()
                 {
                     self.dead_defs
                         .insert(std::ptr::from_ref(n), !out.contains(d));
@@ -96,30 +109,49 @@ impl Liveness<'_> {
                     None => out.clone(),
                 };
                 for (cond, body) in arms.iter().rev() {
-                    let then_in = self.block(body, out.clone(), brk, cont);
+                    let mut then_in = self.block(body, out.clone(), brk, cont);
                     let after_test: Set = then_in.union(&acc).cloned().collect();
-                    let m = self.mentions(cond);
-                    let mut live_in = after_test.clone();
+                    let (m, kill) = self.cond_effect(cond);
+                    if let Some((name, on_true, on_false)) = &kill {
+                        if *on_true {
+                            then_in.remove(name);
+                        }
+                        if *on_false {
+                            acc.remove(name);
+                        }
+                    }
+                    let mut live_in: Set = then_in.union(&acc).cloned().collect();
                     live_in.extend(m.iter().cloned());
-                    self.record(&m, &live_in);
+                    let around: Set = after_test.union(&live_in).cloned().collect();
+                    self.record(&stored_and(&m, &kill), &around);
                     acc = live_in;
                 }
                 acc
             }
             Stmt::While { cond, body } => {
-                let m = cond
-                    .as_deref()
-                    .map(|c| self.mentions(c))
-                    .unwrap_or_default();
+                let (m, kill) = match cond.as_deref() {
+                    Some(c) => self.cond_effect(c),
+                    None => (Set::new(), None),
+                };
+                // The live set on the condition's false exit (the loop exit).
+                let mut exit_live = out.clone();
+                if let Some((name, _, true)) = &kill {
+                    exit_live.remove(name);
+                }
                 let mut head: Set = m.clone();
                 if cond.is_some() {
-                    head.extend(out.iter().cloned());
+                    head.extend(exit_live.iter().cloned());
                 }
+                let mut around = head.clone();
                 loop {
-                    let body_in = self.block(body, head.clone(), &out, &head);
+                    let mut body_in = self.block(body, head.clone(), &out, &head);
+                    around.extend(body_in.iter().cloned());
+                    if let Some((name, true, _)) = &kill {
+                        body_in.remove(name);
+                    }
                     let mut new_head = body_in;
                     if cond.is_some() {
-                        new_head.extend(out.iter().cloned());
+                        new_head.extend(exit_live.iter().cloned());
                         new_head.extend(m.iter().cloned());
                     }
                     if new_head == head {
@@ -127,11 +159,58 @@ impl Liveness<'_> {
                     }
                     head = new_head;
                 }
-                self.record(&m, &head);
+                around.extend(head.iter().cloned());
+                around.extend(out.iter().cloned());
+                self.record(&stored_and(&m, &kill), &around);
                 head
             }
         }
     }
+}
+
+impl Liveness<'_> {
+    /// When `text` stores into one of the locals through a primitive out-operand
+    /// ([`out_operand_write`]): that local, the text with the operand blanked, and the exits
+    /// that store.
+    fn out_write(&self, text: &str) -> Option<(String, String, WriteExit)> {
+        idents(text)
+            .into_iter()
+            .filter(|t| self.locals.contains(*t))
+            .find_map(|name| {
+                out_operand_write(text, name).map(|(rest, exit)| (name.to_owned(), rest, exit))
+            })
+    }
+
+    /// A branch condition's reads, and the local its primitive stores into, if any, with
+    /// whether the store happens on the condition's true and false exits (a leading `!` swaps
+    /// the primitive's exits). On an exit that does not store, the local keeps its old value,
+    /// so it stays live there exactly when the successor reads it.
+    fn cond_effect(&self, cond: &str) -> (Set, Option<(String, bool, bool)>) {
+        let (negated, inner) = match cond.trim_start().strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, cond),
+        };
+        let Some((name, rest, exit)) = self.out_write(inner) else {
+            return (self.mentions(cond), None);
+        };
+        let (prim_true, prim_false) = (exit != WriteExit::False, exit != WriteExit::True);
+        let (on_true, on_false) = if negated {
+            (prim_false, prim_true)
+        } else {
+            (prim_true, prim_false)
+        };
+        (self.mentions(&rest), Some((name, on_true, on_false)))
+    }
+}
+
+/// A condition's reads plus the local it stores into: every local the condition touches, which
+/// interferes with every local live around it.
+fn stored_and(reads: &Set, kill: &Option<(String, bool, bool)>) -> Set {
+    let mut all = reads.clone();
+    if let Some((name, _, _)) = kill {
+        all.insert(name.clone());
+    }
+    all
 }
 
 /// A local the source names (`let x`, an inlined helper's `let x`, `@slot(N) let x`), as

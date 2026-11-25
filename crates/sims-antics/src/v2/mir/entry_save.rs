@@ -10,16 +10,20 @@ use super::*;
 /// The save is the lowering's own bookkeeping, not part of the program: an unread save is one the
 /// lowering never needed, so it goes even before a node that observes the last result (which
 /// then sees the frame's entry state, as the source says).
-pub(crate) fn drop_unread_entry_save(body: &str, formats_text: bool) -> Option<String> {
+///
+/// Deleting the local moves the frame words of the named locals after it. Text the tree formats
+/// reads frame words by number (`$Local:N`), so `text_unmoved(body, trimmed)` must hold: the
+/// words that text may read keep their locals.
+pub(crate) fn drop_unread_entry_save(
+    body: &str,
+    text_unmoved: &dyn Fn(&str, &str) -> bool,
+) -> Option<String> {
     const SAVE: &str = "let __self_obj = stack_obj;";
     // Deleting the node would shift numeric branch targets (`-> true: 3`), and deleting the
     // local would move the frame words of the named locals after it, which a raw op or a
     // `scope(25, N)` cell may name by number. (`.air` places named locals after every explicit
     // `local[N]`, so those keep their words.)
-    // A tree that formats text (`formats_text`, which the lowering reads from the parse of its
-    // raw blocks) reads frame words by number (`$Local:N`), so it sees the shift.
-    if formats_text
-        || body.contains("/*")
+    if body.contains("/*")
         || has_positional_targets(body)
         || body.lines().any(|l| names_local_slot(&strip_strings(l)))
     {
@@ -76,7 +80,7 @@ pub(crate) fn drop_unread_entry_save(body: &str, formats_text: bool) -> Option<S
             out.push('\n');
         }
     }
-    Some(out)
+    text_unmoved(body, &out).then_some(out)
 }
 
 /// The entry save `let __self_obj = stack_obj;` (or `__saved_stack_obj`), as its name.
@@ -179,13 +183,15 @@ pub(crate) fn forward_save_block(nodes: &mut [Stmt], map: &BTreeMap<String, Stri
 }
 
 /// Drops an entry save nothing else names (see `drop_unread_entry_save`), when no named local
-/// that moves down a frame word is read before it is written.
-pub(crate) fn drop_unread_entry_save_node(nodes: &mut Vec<Stmt>) {
+/// that moves down a frame word is read before it is written. `text_reads` says the tree's text
+/// may read a frame word (`FrameFacts::text_reads`): then a body that formats text keeps the
+/// save here, and the pipeline decides once the frame is final.
+pub(crate) fn drop_unread_entry_save_node(nodes: &mut Vec<Stmt>, text_reads: bool) {
     let Some(name) = entry_save(nodes) else {
         return;
     };
     if !mentions(&nodes[1..], name)
-        && !nodes_format_text(&nodes[1..])
+        && !(text_reads && nodes_format_text(&nodes[1..]))
         && locals_defined_before_reads(&nodes[1..])
     {
         nodes.remove(0);

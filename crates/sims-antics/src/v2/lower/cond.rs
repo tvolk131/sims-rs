@@ -153,7 +153,16 @@ impl<'a> TreeLowerer<'a> {
         rhs: &V2Expr,
         span: Span,
     ) -> Result<(String, String)> {
-        let (l, l_ty) = self.lower_value_expr(lhs)?;
+        // `job_data(..) <op> x` with an `x` that lowers to no setup: the comparison node reads
+        // the career cell right after its staging, so it needs no copy.
+        let job_cell = match self.builtin_job_data_call(lhs)? {
+            Some(call) if self.is_pure_single_operand(rhs) => Some(call),
+            _ => None,
+        };
+        let (l, l_ty) = match job_cell {
+            Some((args, jspan)) => self.lower_job_data_cell(args, jspan)?,
+            None => self.lower_value_expr(lhs)?,
+        };
         if op == V2BinOp::FlagTest
             && let ValueType::Bitflags(ref key) = l_ty
         {

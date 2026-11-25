@@ -44,7 +44,8 @@
 //! - [`frame`]: frame allocation (pinned slot, `@slot(N)` placement, local renaming);
 //! - [`entry_save`](mod@entry_save): the Sim-tree `stack_obj` entry save;
 //! - [`emit`]: the emitter lowering writes a body through;
-//! - [`pipeline`]: the per-tree backend pipeline from a lowered body to final `.air`.
+//! - [`pipeline`]: the per-tree backend pipeline from a lowered body to final `.air`;
+//! - [`text_reads`]: which frame words an object's text may read.
 //!
 //! The optimizer passes over the MIR live in `v2::opt`.
 
@@ -61,6 +62,7 @@ mod pipeline;
 #[cfg(test)]
 mod tests;
 mod text;
+mod text_reads;
 
 pub(crate) use self::body::*;
 pub(crate) use self::effects::*;
@@ -71,3 +73,4 @@ pub(crate) use self::inst::*;
 pub(crate) use self::liveness::*;
 pub(crate) use self::pipeline::*;
 pub(crate) use self::text::*;
+pub(crate) use self::text_reads::*;

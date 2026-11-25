@@ -297,6 +297,10 @@ struct ObjectEnv<'a> {
     strings: BTreeMap<u16, StringsDecl>,
     string_names: BTreeMap<String, u16>,
     dialog_strings: RefCell<DialogStringTable>,
+    /// The frame words any string of the object may make the formatter read
+    /// ([`mir::text_reads`](mod@crate::v2::mir)): every tree is finished with the object's final
+    /// fact (`lower_object` lowers again when a later tree's inline dialog literal adds to it).
+    text_reads: mir::TableLocals,
     local_fns: BTreeMap<String, (String, FnDecl)>,
     /// Object/template-local enums by short name -> canonical key.
     local_enums: BTreeMap<String, String>,
@@ -670,6 +674,18 @@ struct TreeLowerer<'a> {
     /// The first `sleep`/`idle`, which `.air` lowers through `idle()`: it cannot share a tree
     /// with a raw op such as `animate(event_local:)`.
     sleep_span: Option<Span>,
+    /// Where each source statement of the tree itself (not of an inlined helper) starts in the
+    /// emitted text, as `(mark, span)`: the `@context(inherit)` check points its error at the
+    /// statement whose lowering differs between the caller contexts.
+    stmt_marks: Vec<(usize, Span)>,
+    /// The Sim pass of the `@context(inherit)` check, which emits no entry save up front: like
+    /// the object pass's `__saved_stack_obj`, `finish` declares `__self_obj` (the entry stack
+    /// object) first when the body reads it.
+    inherited_entry_save: bool,
+    /// The statement being lowered is one of the tree's leading top-level statements, none of
+    /// which may move the cursor (see `lower_tree_body`): `stack_obj` still holds the entry
+    /// object, so a Sim tree's `self` reads and writes it in place.
+    entry_cursor: bool,
 }
 
 struct FindBestObjectPlan {

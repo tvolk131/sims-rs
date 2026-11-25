@@ -106,7 +106,7 @@ fn pipeline_applies_frame_facts() {
     let mut declared = BTreeSet::new();
     declared.insert("D".to_owned());
     let facts = FrameFacts {
-        formats_text: false,
+        text_reads: TableLocals::Known(BTreeSet::new()),
         keep_layout: true,
         has_self_obj_local: true,
         pinned: false,
@@ -121,9 +121,9 @@ fn pipeline_applies_frame_facts() {
         finish_body(body.to_owned(), &facts),
         "    const K = 3;\n    my.attr[0] := K;\n    return true;\n"
     );
-    // A tree that formats text reads frame words by number: the save stays.
+    // Text that may read any frame word by number (`$Local:N`) sees the shift: the save stays.
     let facts = FrameFacts {
-        formats_text: true,
+        text_reads: TableLocals::Unknown,
         raw_consts: &no_consts,
         raw_declared: &no_names,
         ..facts

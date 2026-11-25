@@ -7,9 +7,10 @@ use super::*;
 
 /// What the backend needs to know about a lowered tree besides its body text.
 pub(crate) struct FrameFacts<'a> {
-    /// The tree formats text (a raw block's, or a dialog or action string in the body), which
-    /// reads frame words by number (`$Local:N`).
-    pub(crate) formats_text: bool,
+    /// The frame words the tree's text may read: what the object's strings read
+    /// ([`text_reads`](mod@super::text_reads)) when the tree formats text (a raw block's, or a
+    /// dialog or action string in the body), and none when it does not.
+    pub(crate) text_reads: TableLocals,
     /// Keep the body's node layout: a raw block, `local[N]` read, or `@slot` in the tree may
     /// depend on it, so only the unread entry save may go.
     pub(crate) keep_layout: bool,
@@ -29,18 +30,31 @@ pub(crate) struct FrameFacts<'a> {
 
 /// Runs the backend passes over one lowered tree body.
 pub(crate) fn finish_body(out: String, facts: &FrameFacts<'_>) -> String {
+    let reads_text = reads_a_word(&facts.text_reads);
+    let unmoved = |before: &str, after: &str| text_words_unmoved(before, after, facts);
     let out = if facts.keep_layout {
         if facts.has_self_obj_local
-            && let Some(trimmed) = drop_unread_entry_save(&out, facts.formats_text)
+            && let Some(trimmed) = drop_unread_entry_save(&out, &unmoved)
         {
             trimmed
         } else {
             out
         }
     } else {
-        let out = crate::v2::opt::optimize_tree_body(&out);
-        if facts.pinned {
+        let out = crate::v2::opt::optimize_tree_body(&out, reads_text);
+        let out = if facts.pinned {
             pin_in_place(&out)
+        } else {
+            out
+        };
+        // The optimizer keeps the entry save of a tree whose text may read a frame word. The
+        // frame's locals are final here, so the save still goes when no word the text reads
+        // changes hands.
+        if facts.has_self_obj_local
+            && reads_text
+            && let Some(trimmed) = drop_unread_entry_save(&out, &unmoved)
+        {
+            trimmed
         } else {
             out
         }
@@ -58,4 +72,30 @@ pub(crate) fn finish_body(out: String, facts: &FrameFacts<'_>) -> String {
     } else {
         out
     }
+}
+
+/// Whether dropping the entry save from `before` (giving `after`) leaves every frame word the
+/// tree's text may read ([`FrameFacts::text_reads`]) holding the same local
+/// ([`frame_occupancy`]). The save's own word changes hands, so text that may read it keeps
+/// the save; so does text that may read any word.
+fn text_words_unmoved(before: &str, after: &str, facts: &FrameFacts<'_>) -> bool {
+    let words = match &facts.text_reads {
+        TableLocals::Unknown => return false,
+        TableLocals::Known(words) if words.is_empty() => return true,
+        TableLocals::Known(words) => words,
+    };
+    let occupancy = |body: &str| {
+        frame_occupancy(
+            body,
+            facts.pinned_locals,
+            facts.raw_declared,
+            facts.has_slots,
+        )
+    };
+    let (Some(was), Some(now)) = (occupancy(before), occupancy(after)) else {
+        return false;
+    };
+    words
+        .iter()
+        .all(|&w| usize::try_from(w).is_ok_and(|w| was.get(&w) == now.get(&w)))
 }

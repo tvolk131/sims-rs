@@ -63,17 +63,30 @@ pub(crate) fn assign_frame_slots(
     pinned: &BTreeMap<String, usize>,
     raw_declared: &BTreeSet<String>,
 ) -> String {
-    let wrapped = format!("tree 4096 \"__slots\" {{\n{body}\n}}\n");
-    let Some(usage) =
-        crate::parser::parse_module(&wrapped)
-            .ok()
-            .and_then(|m| match m.items.first() {
-                Some(crate::ast::Item::Tree(t)) => Some(crate::lower::air_local_usage(&t.body)),
-                _ => None,
-            })
-    else {
+    let Some((_, slots)) = plan_frame_slots(body, pinned, raw_declared) else {
         return body.to_owned();
     };
+    place_locals(body, &slots).unwrap_or_else(|| body.to_owned())
+}
+
+/// The `.air` compiler's local-slot scan of a tree body, or `None` if `.air` cannot parse it.
+fn body_local_usage(body: &str) -> Option<crate::lower::AirLocalUsage> {
+    let wrapped = format!("tree 4096 \"__slots\" {{\n{body}\n}}\n");
+    crate::parser::parse_module(&wrapped)
+        .ok()
+        .and_then(|m| match m.items.first() {
+            Some(crate::ast::Item::Tree(t)) => Some(crate::lower::air_local_usage(&t.body)),
+            _ => None,
+        })
+}
+
+/// The words [`assign_frame_slots`] gives the locals it places, with the body's local usage.
+fn plan_frame_slots(
+    body: &str,
+    pinned: &BTreeMap<String, usize>,
+    raw_declared: &BTreeSet<String>,
+) -> Option<(crate::lower::AirLocalUsage, BTreeMap<String, usize>)> {
+    let usage = body_local_usage(body)?;
     let mut used = usage.explicit.clone();
     let mut slots: BTreeMap<String, usize> = BTreeMap::new();
     for name in &usage.lets {
@@ -94,7 +107,44 @@ pub(crate) fn assign_frame_slots(
             }
         }
     }
-    place_locals(body, &slots).unwrap_or_else(|| body.to_owned())
+    Some((usage, slots))
+}
+
+/// Which local occupies each frame word of the finished tree `body` (before `@slot(N)`
+/// placement, which `has_slots` says runs): an explicit `local[N]` holds itself, a placed local
+/// its [`assign_frame_slots`] word, and every other `let` the word `.air` gives it, after the
+/// highest explicit or placed word and the `min_locals` floor (`push_frame_floor`: the highest
+/// `@slot` word plus one), in declaration order. `None` if `.air` cannot parse the body.
+pub(crate) fn frame_occupancy(
+    body: &str,
+    pinned: &BTreeMap<String, usize>,
+    raw_declared: &BTreeSet<String>,
+    has_slots: bool,
+) -> Option<BTreeMap<usize, String>> {
+    let (usage, slots) = if has_slots {
+        plan_frame_slots(body, pinned, raw_declared)?
+    } else {
+        (body_local_usage(body)?, BTreeMap::new())
+    };
+    let mut words: BTreeMap<usize, String> = usage
+        .explicit
+        .iter()
+        .map(|&w| (w, format!("local[{w}]")))
+        .collect();
+    for (name, &w) in &slots {
+        words.insert(w, name.clone());
+    }
+    let floor = if has_slots {
+        pinned.values().max().map_or(0, |top| top + 1)
+    } else {
+        0
+    };
+    let first = words.keys().last().map_or(0, |w| w + 1).max(floor);
+    let placed = usage.lets.iter().filter(|n| !slots.contains_key(*n));
+    for (word, name) in (first..).zip(placed) {
+        words.insert(word, name.clone());
+    }
+    Some(words)
 }
 
 /// `body` with each local of `slots` written as `local[K]`, found by the `.air` lexer: `let x;`
@@ -398,9 +448,8 @@ pub(crate) enum WriteExit {
 /// cell `name` through an out-operand, returns the text with that operand blanked (for the reads
 /// it still makes) and the exits on which the store happens, as the VM runs them:
 ///
-/// - `random(x, n)` with a literal range stores the draw, then takes the true exit (a range
-///   that resolves to a word pointer, such as global 34, redirects the draw into the range
-///   cell, so any other range is not a write of `x`);
+/// - `random(x, n)` stores the draw, then takes the true exit, unless its range may resolve to a
+///   word pointer ([`range_may_take_draw`]), which redirects the draw into the range cell;
 /// - `animate(.., local: x)` stores an event in the local, then takes the false exit;
 /// - `relationship(.., value: x)` without flag 4 reads the number into the cell and takes the
 ///   true exit; with flag 1 a missing number takes the false exit unwritten, and without it
@@ -425,8 +474,8 @@ pub(crate) fn out_operand_write(text: &str, name: &str) -> Option<(String, Write
     let (at, exit) = match prim {
         "random" => {
             let first = args.first()?;
-            let literal_range = args.get(1).and_then(|r| parse_int(r.trim())).is_some();
-            (first.trim() == name && literal_range).then_some((0, WriteExit::Both))?
+            let range = args.get(1)?.trim();
+            (first.trim() == name && !range_may_take_draw(range)).then_some((0, WriteExit::Both))?
         }
         "animate" => {
             let i = named("local")?;
@@ -460,6 +509,18 @@ pub(crate) fn out_operand_write(text: &str, name: &str) -> Option<(String, Write
     }
     rest.push(')');
     Some((rest, exit))
+}
+
+/// Whether a Random Number range operand (`.air` text) may resolve to a word pointer, which
+/// takes the draw in place of the destination. The VM resolves the range read-only, and the only
+/// cell that then comes back with a word pointer is global 34 (`resolve` in `sims-vm`'s
+/// `memory.rs`). `.air` names a global only as `global[N]` or `scope(6, N)`, so any range not
+/// spelled with `global` or `scope` (a literal, a `const`/`bcon` constant or named constant, a
+/// local, a temp, a parameter, an attribute) leaves the draw in the destination.
+pub(crate) fn range_may_take_draw(range: &str) -> bool {
+    idents(range)
+        .iter()
+        .any(|id| matches!(*id, "global" | "scope"))
 }
 
 pub(crate) fn drop_pins(nodes: &mut Vec<Stmt>) {

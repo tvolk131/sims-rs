@@ -360,7 +360,7 @@ fn check_region(region: &[V2Stmt], binding: &ConstBinding, names: &[String]) -> 
     Ok(())
 }
 
-fn stmt_span(s: &V2Stmt) -> Span {
+pub(super) fn stmt_span(s: &V2Stmt) -> Span {
     match s {
         V2Stmt::Let { span, .. }
         | V2Stmt::LetSome { span, .. }
