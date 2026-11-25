@@ -826,6 +826,17 @@ impl Machine<'_, '_> {
         Ok(())
     }
 
+    /// Refuses object data words 2, 3 and 11 as a destination whatever the
+    /// value, for a primitive that checks its destination by storing the
+    /// word's own value back before it works out (with effects) the value
+    /// it stores, which `store` takes only when it is the same.
+    pub(crate) fn refuse_guarded_data_word(cell: Cell) -> Result<(), Trap> {
+        match cell {
+            Cell::Data(_, i @ (2 | 3 | 11)) => Err(guarded_data_word(i)),
+            _ => Ok(()),
+        }
+    }
+
     /// Stores a word. Returns false for cells with no integer word behind
     /// them: literals and motives.
     pub(crate) fn store(&mut self, cell: Cell, value: i16) -> Result<bool, Trap> {
@@ -936,13 +947,20 @@ impl Machine<'_, '_> {
         let target = match cell {
             Cell::Literal(_) | Cell::Motive(..) => return Ok(false),
             Cell::Advertisement(..) => unreachable!("stored above"),
-            Cell::Data(_, i @ (2 | 3 | 11)) => {
+            Cell::Data(id, i @ (2 | 3 | 11)) => {
                 // Words 2 and 3 are the container and its slot, and 11 the
-                // object's ID; the original updates more than the word
-                // (legacy memory.rs:711).
-                return Err(Trap::Unsupported(format!(
-                    "writing object data word {i} has a native side effect"
-                )));
+                // object's ID. Expression stores into the object's data
+                // block like any other word (0x453ff1 resolves my or the
+                // stack object's word to `object + 0x4a + 2 * index`, and
+                // 0x452e8b stores through it), but the original keeps the
+                // container's slot table and its table of objects by these
+                // words, which a changed value would leave behind. Storing
+                // the value the word already holds changes nothing, as
+                // when an object sets its own ID to itself.
+                if object_mut(world, id)?.data.get(i) == Some(&value) {
+                    return Ok(true);
+                }
+                return Err(guarded_data_word(i));
             }
             Cell::Attribute(id, i) => object_mut(world, id)?.attributes.get_mut(i),
             Cell::Data(id, i) => object_mut(world, id)?.data.get_mut(i),
@@ -1040,4 +1058,11 @@ fn person_data(object: &Object) -> Result<&sims_formats::saved_objects::Person, 
         .person
         .as_ref()
         .ok_or(Trap::native(0x1c, "object is not a person"))
+}
+
+/// The fault for a store that changes object data word 2, 3 or 11.
+fn guarded_data_word(index: usize) -> Trap {
+    Trap::Unsupported(format!(
+        "writing object data word {index} has a native side effect"
+    ))
 }

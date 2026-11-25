@@ -20,7 +20,8 @@ use crate::error::{Error, Result};
 use crate::ir::BhavChunk;
 use crate::lift::{format_bhav_labeled_air_with_arities, lift_bhav};
 use crate::structure_lift::{
-    LiftOptions, StructuredLiftOutcome, lift_bhav_structured_with_arities,
+    LiftOptions, StructuredLiftOutcome, lift_bhav_structured_in_node_order,
+    lift_bhav_structured_with_arities,
 };
 use crate::v2::ast::{is_reserved_type_name, object_type_ident};
 use crate::v2::fmt::format_v2_source;
@@ -119,6 +120,13 @@ pub struct DecompileV2Options {
     /// back to `raw` where needed (default `true`). Without it the output is the most
     /// readable translation, unchecked.
     pub validate: bool,
+    /// Check trees under the behavioral relation (`lift --v2 --behavioral`, the relation of
+    /// `verify-equiv --behavioral`, `docs/decisions/20261123-verifier-behavioral-mode.md`)
+    /// instead of the strict one (default `false`). Node numbers and frame storage are
+    /// then not compared, so a proof holds only for runs that start and end under one
+    /// build. Every other check (headers, sounds, strings, object gaps, unproven callees)
+    /// is unchanged. The source says so in its header.
+    pub behavioral: bool,
 }
 
 impl Default for DecompileV2Options {
@@ -127,6 +135,7 @@ impl Default for DecompileV2Options {
             library_arities: BTreeMap::new(),
             library_names: BTreeMap::new(),
             validate: true,
+            behavioral: false,
         }
     }
 }
@@ -239,9 +248,10 @@ pub fn decompile_iff_to_v2_report(
     }
 
     let mut cache: BTreeMap<(u16, String, String), TreeCheck> = BTreeMap::new();
-    // Every round lowers at least one tree or statement, so this bound is never reached by
+    // Every round lowers at least one tree or statement (or swaps a tree's branch order, at
+    // most once per tree and level), so this bound is never reached by
     // a run that converges; it only guards against a bug turning into a hang.
-    let max_rounds = 8 + model.trees.len() * 4 + model.statement_count() * 2;
+    let max_rounds = 8 + model.trees.len() * 8 + model.statement_count() * 2;
     for _ in 0..max_rounds {
         let generated = model.generate(&plan);
         match model.compile(&generated.text) {
@@ -303,7 +313,9 @@ pub fn decompile_iff_to_v2_report(
                 }
                 if !changed {
                     for &id in &unproven {
-                        changed |= plan.drop_extras(id, &generated) || plan.lower_tree(&model, id);
+                        changed |= plan.drop_extras(id, &generated)
+                            || plan.other_order(&mut model, id)
+                            || plan.lower_tree(&model, id);
                     }
                 }
                 if changed {
@@ -373,11 +385,59 @@ struct TreeModel {
     structured: bool,
     /// Parsed structured body (`None` for a labeled-CFG lift).
     body: Option<Vec<Stmt>>,
+    /// The structured lift with the other branch order (true branch first rather than the
+    /// lower-numbered one), when it differs: [`Plan::other_order`] swaps it in.
+    other_order: Option<Box<OrderedLift>>,
     /// Whether the idiomatic body runs as a Sim acting on this object (`(sim: Sim)`).
     sim_ctx: bool,
     lifecycle: Option<Lifecycle>,
     /// Why the tree cannot be written at all (unsupported header).
     omitted: Option<String>,
+}
+
+/// Swaps `t`'s structured lift for its other branch order, if it has one.
+fn swap_lift(t: &mut TreeModel) {
+    if let Some(other) = t.other_order.as_mut() {
+        std::mem::swap(&mut t.lifted, &mut other.lifted);
+        std::mem::swap(&mut t.body_lines, &mut other.body_lines);
+        std::mem::swap(&mut t.body, &mut other.body);
+    }
+}
+
+/// One structured lift of a tree: its lines, header and closing-brace indices, and
+/// parsed body.
+struct OrderedLift {
+    lifted: Vec<String>,
+    body_lines: (usize, usize),
+    body: Option<Vec<Stmt>>,
+}
+
+/// `text`'s tree as an [`OrderedLift`], or `None` when it holds no tree.
+fn ordered_lift(text: &str) -> Option<OrderedLift> {
+    let lifted: Vec<String> = text.lines().map(str::to_owned).collect();
+    let head = lifted
+        .iter()
+        .position(|l| l.starts_with("tree ") && l.trim_end().ends_with('{'))?;
+    let close = lifted
+        .iter()
+        .rposition(|l| l.trim_end() == "}")
+        .filter(|&i| i > head)
+        .unwrap_or(lifted.len());
+    let body = crate::parser::parse_module(text)
+        .ok()
+        .and_then(|m| {
+            m.items.into_iter().find_map(|item| match item {
+                crate::ast::Item::Tree(t) => Some(t.body),
+                _ => None,
+            })
+        })
+        // Labeled-CFG bodies (`@n0:` labels) are only ever written raw.
+        .filter(|b| !b.iter().any(|s| matches!(s, Stmt::Label { .. })));
+    Some(OrderedLift {
+        lifted,
+        body_lines: (head, close),
+        body,
+    })
 }
 
 /// One catalog variant (`variant "Name" { ... }`).
@@ -439,6 +499,8 @@ struct Model {
     guid_consts: BTreeMap<u32, String>,
     /// Library trees referenced by a structured call, by ID and source identifier.
     extern_calls: BTreeMap<u16, String>,
+    /// Library trees called through `use std::globals::*;`.
+    std_globals: BTreeSet<u16>,
     /// Callable trees with a known arity and a structured inline call.
     literal_calls: BTreeMap<u16, usize>,
     trees: Vec<TreeModel>,
@@ -462,10 +524,13 @@ struct Model {
     /// Where the original's object definitions register each tree as a callback.
     original_callbacks: Option<Callbacks>,
     library_arities: BTreeMap<u16, usize>,
+    /// Trees are checked under the behavioral relation ([`DecompileV2Options::behavioral`]).
+    behavioral: bool,
 }
 
 impl Model {
     fn build(iff: &Iff, options: &DecompileV2Options) -> Result<Self> {
+        let behavioral = options.validate && options.behavioral;
         let objds: Vec<&Chunk> = iff.chunks.iter().filter(|c| &c.tag == b"OBJD").collect();
         let objd_chunk = objds
             .first()
@@ -598,6 +663,7 @@ impl Model {
                 labeled: Vec::new(),
                 structured: false,
                 body: None,
+                other_order: None,
                 sim_ctx: false,
                 lifecycle: lifecycle.get(&c.id).copied(),
                 omitted: None,
@@ -629,47 +695,35 @@ impl Model {
             let labeled =
                 format_bhav_labeled_air_with_arities(&tree.original, opts, Some(&lift_arities));
             tree.labeled = tree_body(&labeled);
-            let text = match lift_bhav_structured_with_arities(
-                &tree.original,
-                opts,
-                Some(&lift_arities),
-            ) {
-                StructuredLiftOutcome::Lifted(text) => {
-                    tree.structured = true;
-                    text
-                }
-                _ => labeled,
-            };
-            tree.lifted = text.lines().map(str::to_owned).collect();
-            let Some(head) = tree
-                .lifted
-                .iter()
-                .position(|l| l.starts_with("tree ") && l.trim_end().ends_with('{'))
-            else {
+            let text =
+                match lift_bhav_structured_in_node_order(&tree.original, opts, Some(&lift_arities))
+                {
+                    StructuredLiftOutcome::Lifted(text) => {
+                        tree.structured = true;
+                        text
+                    }
+                    _ => labeled,
+                };
+            let Some(lift) = ordered_lift(&text) else {
+                tree.lifted = text.lines().map(str::to_owned).collect();
                 tree.omitted = Some("the lifter produced no tree".to_owned());
                 trees.push(tree);
                 continue;
             };
-            let close = tree
-                .lifted
-                .iter()
-                .rposition(|l| l.trim_end() == "}")
-                .filter(|&i| i > head)
-                .unwrap_or(tree.lifted.len());
-            tree.body_lines = (head, close);
-            tree.body = crate::parser::parse_module(&text).ok().and_then(|m| {
-                m.items.into_iter().find_map(|item| match item {
-                    crate::ast::Item::Tree(t) => Some(t.body),
-                    _ => None,
-                })
-            });
-            // Labeled-CFG bodies (`@n0:` labels) are only ever written raw.
-            if tree
-                .body
-                .as_ref()
-                .is_some_and(|b| b.iter().any(|s| matches!(s, Stmt::Label { .. })))
+            tree.lifted = lift.lifted;
+            tree.body_lines = lift.body_lines;
+            tree.body = lift.body;
+            if tree.structured
+                && let StructuredLiftOutcome::Lifted(other) =
+                    lift_bhav_structured_with_arities(&tree.original, opts, Some(&lift_arities))
+                && other != text
             {
-                tree.body = None;
+                tree.other_order = ordered_lift(&other).map(Box::new);
+                // Node numbers are not compared in behavioral mode: the true branch goes
+                // first, as written, which needs no negated conditions.
+                if behavioral {
+                    swap_lift(&mut tree);
+                }
             }
             // A variant runs its init/main tree as the object itself.
             let variant_tree = variants
@@ -732,7 +786,8 @@ impl Model {
             .collect();
 
         // Interactions, as comments.
-        let mut interactions = Vec::new();
+        // Identical tables (one per OBJD, typically) are written once.
+        let mut tables: Vec<(Vec<u16>, Vec<String>)> = Vec::new();
         let tree_ident = |id: u16| -> String {
             trees
                 .iter()
@@ -746,6 +801,7 @@ impl Model {
             let names = iff
                 .get(b"TTAs", c.id)
                 .and_then(|s| StringTable::parse_chunk(iff.data(s), s.flags).ok());
+            let mut lines = Vec::new();
             for (i, it) in table.interactions.iter().enumerate() {
                 let name = names
                     .as_ref()
@@ -759,13 +815,18 @@ impl Model {
                 } else {
                     format!(", guard {}", tree_ident(it.test))
                 };
-                interactions.push(format!(
+                lines.push(format!(
                     "{name}: action {}{guard}, autonomy {}",
                     tree_ident(it.action),
                     it.autonomy
                 ));
             }
+            match tables.iter_mut().find(|(_, l)| *l == lines) {
+                Some((ids, _)) => ids.push(c.id),
+                None => tables.push((vec![c.id], lines)),
+            }
         }
+        let interactions = interaction_comments(tables);
 
         // Sounds: v2 can pin an FWAV's ID and event name when the name is a plain file
         // name (`sound s = fwav(N, wav: "name")`).
@@ -826,9 +887,22 @@ impl Model {
                 global_idents.insert(format!("global_{id}"));
             }
         }
+        // A library tree `std::globals` declares with the arity the bodies call it with is
+        // named from there; the rest stay in a local block.
+        let std_globals: BTreeSet<u16> = extern_calls
+            .iter()
+            .copied()
+            .filter(|id| {
+                std_global(*id)
+                    .is_some_and(|g| g.params == literal_calls.get(id).copied().unwrap_or(0))
+            })
+            .collect();
         let extern_calls = extern_calls
             .into_iter()
             .map(|id| {
+                if let Some(g) = std_global(id).filter(|_| std_globals.contains(&id)) {
+                    return (id, g.name.to_owned());
+                }
                 let (prefix, used) = if id >= 8192 {
                     ("semi_global", &mut semi_global_idents)
                 } else {
@@ -863,6 +937,7 @@ impl Model {
             state_limit,
             guid_consts,
             extern_calls,
+            std_globals,
             literal_calls,
             trees,
             interactions,
@@ -876,7 +951,18 @@ impl Model {
             original_lookup: NameLookup::of(iff),
             original_callbacks: callback_slots(iff),
             library_arities: options.library_arities.clone(),
+            behavioral,
         })
+    }
+
+    /// The local block's name for library trees: a local `globals` would hide
+    /// `std::globals`.
+    fn globals_module(&self) -> &'static str {
+        if self.std_globals.is_empty() {
+            "globals"
+        } else {
+            "more_globals"
+        }
     }
 
     fn statement_count(&self) -> usize {
@@ -889,6 +975,13 @@ impl Model {
 
     fn tree(&self, id: u16) -> Option<&TreeModel> {
         self.trees.iter().find(|t| t.id == id)
+    }
+
+    /// Swaps tree `id`'s structured lift for its other branch order.
+    fn swap_order(&mut self, id: u16) {
+        if let Some(t) = self.trees.iter_mut().find(|t| t.id == id) {
+            swap_lift(t);
+        }
     }
 
     fn compile(&self, text: &str) -> std::result::Result<RecompiledFile, Failure> {
@@ -976,7 +1069,7 @@ impl Model {
             &candidate,
             &recompiled.ctx,
             &EquivOptions::default(),
-            &LiveOptions::default(),
+            &lift_live_options(self.behavioral),
         );
         let check = match result {
             EquivResult::Equivalent { .. } => TreeCheck::Equivalent,
@@ -2434,6 +2527,15 @@ fn direct_local(r: &OperandRef) -> Option<i16> {
     }
 }
 
+/// Whether a body assigns `stack_obj`.
+fn assigns_stack_obj(body: &[Stmt]) -> bool {
+    let mut found = false;
+    walk_stmts(body, &mut |s| {
+        found |= matches!(s, Stmt::Assign { lhs, .. } if is_operand(lhs, 10, 0));
+    });
+    found
+}
+
 fn is_operand(r: &OperandRef, scope: u8, index: i16) -> bool {
     matches!(r, OperandRef::Direct(o) if o.scope == scope && o.index == index)
 }
@@ -2697,6 +2799,90 @@ fn stmt_call(s: &Stmt) -> Option<(u16, bool)> {
     }
 }
 
+/// The interaction comment lines: with more than one distinct table, each starts with a
+/// line naming its TTAB chunk(s).
+fn interaction_comments(tables: Vec<(Vec<u16>, Vec<String>)>) -> Vec<String> {
+    let headed = tables.len() > 1;
+    let mut out = Vec::new();
+    for (ids, lines) in tables {
+        if headed {
+            let ids: Vec<String> = ids.iter().map(u16::to_string).collect();
+            out.push(format!("TTAB {}:", ids.join(", ")));
+        }
+        out.extend(lines);
+    }
+    out
+}
+
+/// The header lines of a source checked under the behavioral relation. They name the
+/// relation only: which trees proved is in the lift's report, not the source.
+const BEHAVIORAL_HEADER: [&str; 4] = [
+    "// Checked in behavioral mode (`--behavioral`): node numbers and frame storage were not",
+    "// compared, so a tree proven equivalent is equivalent only for runs that start and end",
+    "// under one build (docs/decisions/20261123-verifier-behavioral-mode.md). Not every tree",
+    "// is proven; the lift's report lists the ones that are not.",
+];
+
+/// The checker's bounds for `lift`: the defaults, but at most 50,000 pairs of paths with
+/// different outputs (the default is 250,000). Running out leaves a tree unproven, so it
+/// falls back to a lower level, and never proves one. It stops a file of many large trees
+/// that each fail at the first levels from taking minutes. Over the full corpus no tree's
+/// result or written text changed. `behavioral` selects the behavioral relation.
+fn lift_live_options(behavioral: bool) -> LiveOptions {
+    LiveOptions {
+        max_pair_checks: 50_000,
+        behavioral,
+        ..LiveOptions::default()
+    }
+}
+
+/// A tree `std::globals` declares.
+#[derive(Clone, Copy)]
+struct StdGlobal {
+    name: &'static str,
+    params: usize,
+    /// Declared `-> Result` (else `-> bool`).
+    result: bool,
+}
+
+/// The tree `std::globals` declares with this ID.
+fn std_global(id: u16) -> Option<StdGlobal> {
+    static TABLE: std::sync::OnceLock<BTreeMap<u16, StdGlobal>> = std::sync::OnceLock::new();
+    TABLE
+        .get_or_init(|| {
+            include_str!("std/globals.antics")
+                .lines()
+                .filter_map(|line| {
+                    let rest = line.trim().strip_prefix("#[id(")?;
+                    let (id, rest) = rest.split_once(")]")?;
+                    let rest = rest.trim().strip_prefix("fn ")?;
+                    let (name, rest) = rest.split_once('(')?;
+                    let (params, ret) = rest.split_once(')')?;
+                    let params = if params.trim().is_empty() {
+                        0
+                    } else {
+                        params.split(',').count()
+                    };
+                    let result = match ret.trim() {
+                        "-> Result;" => true,
+                        "-> bool;" => false,
+                        _ => return None,
+                    };
+                    Some((
+                        id.parse().ok()?,
+                        StdGlobal {
+                            name,
+                            params,
+                            result,
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .get(&id)
+        .copied()
+}
+
 fn call_params(arity: usize) -> impl Iterator<Item = String> {
     (0..arity).map(|i| format!("arg_{i}: i16"))
 }
@@ -2808,6 +2994,9 @@ struct Plan {
     /// Trees some caller runs in the other context: written `#[context(inherit)]` (an extra
     /// idiom) so that either context may call them.
     inherit: BTreeSet<u16>,
+    /// Tree ID -> the level at which its branch order was last swapped (see
+    /// [`Plan::other_order`]).
+    swapped: BTreeMap<u16, Level>,
 }
 
 impl Plan {
@@ -2873,6 +3062,7 @@ impl Plan {
             strings_off: None,
             plain: BTreeSet::new(),
             inherit,
+            swapped: BTreeMap::new(),
         }
     }
 
@@ -2920,6 +3110,30 @@ impl Plan {
         t.sim_ctx && self.level(t) == Level::Idiomatic && !self.inherits(t)
     }
 
+    /// Tries tree `id`'s other branch order at its current level, once per level: node
+    /// order usually keeps the original's node numbers, but a tree whose paths visit
+    /// nodes out of order can prove only in the other. The extra idioms and the statements
+    /// written raw start over, since the statements are numbered differently.
+    fn other_order(&mut self, model: &mut Model, id: u16) -> bool {
+        let Some(t) = model.tree(id) else {
+            return false;
+        };
+        let level = self.level(t);
+        // In behavioral mode node numbers are not compared, so the order cannot matter.
+        if model.behavioral
+            || t.other_order.is_none()
+            || level == Level::RawLabeled
+            || self.swapped.get(&id) == Some(&level)
+        {
+            return false;
+        }
+        model.swap_order(id);
+        self.swapped.insert(id, level);
+        self.plain.remove(&id);
+        self.raw_stmts.remove(&id);
+        true
+    }
+
     /// Moves tree `id` one style down. `false` when it is already at its last style.
     fn lower_tree(&mut self, model: &Model, id: u16) -> bool {
         let Some(t) = model.tree(id) else {
@@ -2937,6 +3151,7 @@ impl Plan {
                 // Start again as a plain tree, which keeps the header.
                 self.standalone.insert(id);
                 self.raw_stmts.remove(&id);
+                self.swapped.remove(&id);
                 if t.body.is_some() {
                     Level::Idiomatic
                 } else {
@@ -3095,6 +3310,11 @@ impl Model {
         let mut raw_counts = BTreeMap::new();
         let mut extras = BTreeSet::new();
         out.line("// Decompiled by `sims-antics lift --v2`.");
+        if self.behavioral {
+            for line in BEHAVIORAL_HEADER {
+                out.line(line);
+            }
+        }
         if self.extra_objds > 0 {
             out.line(format!(
                 "// The file has {} additional OBJD chunks that v2 cannot write as catalog variants.",
@@ -3108,11 +3328,18 @@ impl Model {
         for &id in self.extern_calls.keys() {
             if id >= 8192 {
                 lib_semis.push(id);
-            } else if id >= 256 {
+            } else if id >= 256 && !self.std_globals.contains(&id) {
                 lib_globals.push(id);
             }
         }
-        for (module, ids) in [("globals", &lib_globals), ("semi_globals", &lib_semis)] {
+        if !self.std_globals.is_empty() {
+            out.line("use std::globals::*;");
+            out.line("");
+        }
+        for (module, ids) in [
+            (self.globals_module(), &lib_globals),
+            ("semi_globals", &lib_semis),
+        ] {
             if ids.is_empty() {
                 continue;
             }
@@ -3245,6 +3472,7 @@ impl Model {
             match as_lifecycle {
                 Some(kind) if !plan.framed.contains(&t.id) => {
                     out.line(format!("#[id({})]", t.id));
+                    write_frame_allow(&mut out, &t.original);
                     out.line(format!("{} {{", kind.keyword()));
                 }
                 Some(kind) => {
@@ -3259,6 +3487,7 @@ impl Model {
                         "#[bhav(id = {}, args = {}, locals = {}, format = {:#06x}, revision = {}{frame_kind})]",
                         t.id, b.args, b.locals, b.format, b.revision,
                     ));
+                    write_frame_allow(&mut out, b);
                     out.line(format!("{} {{", kind.keyword()));
                 }
                 None => {
@@ -3300,6 +3529,7 @@ impl Model {
                         "#[bhav(id = {}{label}, args = {}, locals = {}, format = {:#06x}, revision = {}{kind}{context})]",
                         t.id, b.args, b.locals, b.format, b.revision,
                     ));
+                    write_frame_allow(&mut out, b);
                     out.line(format!("fn {}({}) {{", t.ident, params.join(", ")));
                 }
             }
@@ -3334,6 +3564,7 @@ impl Model {
                         cursor: None,
                         named_locals,
                         extras: std::cell::Cell::new(false),
+                        stack_moves: sim && assigns_stack_obj(body),
                     };
                     if named_locals > 0 && tr.extra() {
                         // `#[slot]` pins each word the builtins address by number; the
@@ -3503,6 +3734,17 @@ fn ladder_tokens(line: &str) -> Option<Vec<std::ops::Range<usize>>> {
     Some(out)
 }
 
+/// Allows `frame_headroom` on a tree whose original already has more nodes or locals than
+/// the lint asks for: a faithful lift keeps the original's size. Written between the
+/// tree's attribute and its header line, which the lint reports.
+fn write_frame_allow(out: &mut Out, original: &BhavChunk) {
+    if original.instructions.len() > crate::v2::lint::FRAME_NODE_WARN
+        || original.locals > crate::v2::lint::FRAME_LOCAL_WARN
+    {
+        out.line("// antics-lint: allow(frame_headroom): the original tree is this size");
+    }
+}
+
 fn write_raw_block(out: &mut Out, lines: &[String]) {
     if lines.is_empty() {
         return;
@@ -3510,10 +3752,36 @@ fn write_raw_block(out: &mut Out, lines: &[String]) {
     out.line("raw {");
     out.indent += 1;
     for l in lines {
-        out.line(l);
+        out.line(explicit_false_exit(l));
     }
     out.indent -= 1;
     out.line("}");
+}
+
+/// The value a body that is just `return true;` or `return false;` returns.
+fn single_return(body: &[Stmt]) -> Option<bool> {
+    match body {
+        [Stmt::Return { target, .. }] => match target {
+            Target::ReturnTrue => Some(true),
+            Target::ReturnFalse => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A bare `call N(..);` line in AIR exits the tree false when the call returns false; it
+/// is written `if !call N(..) { return false; }`, the same node with the exit spelled out
+/// (lint `raw_bare_call_false_exit` asks for it before v2 code).
+fn explicit_false_exit(line: &str) -> Cow<'_, str> {
+    let body = line.trim_start();
+    let indent = &line[..line.len() - body.len()];
+    match body.strip_suffix(';') {
+        Some(call) if call.starts_with("call ") && call.ends_with(')') && !call.contains("->") => {
+            Cow::Owned(format!("{indent}if !{call} {{ return false; }}"))
+        }
+        _ => Cow::Borrowed(line),
+    }
 }
 
 struct Translator<'a> {
@@ -3546,6 +3814,10 @@ struct Translator<'a> {
     named_locals: u16,
     /// Whether an extra idiom was written (see [`Translator::extra`]).
     extras: std::cell::Cell<bool>,
+    /// A Sim tree that assigns `stack_obj`: the stack object's cells are written
+    /// `stack_obj.attr[i]` / `stack_obj.slot[i]` (the same operands), since `self` would
+    /// name another object after the assignment (lint `stack_obj_clobber_after_self`).
+    stack_moves: bool,
 }
 
 impl Translator<'_> {
@@ -3709,6 +3981,20 @@ impl Translator<'_> {
             }
             Stmt::Loop { body, .. } => {
                 self.flush_raw(out);
+                // A breakpoint whose true branch is itself: the original's own trap, which
+                // runs until the VM errors the object out.
+                if let [
+                    Stmt::Primitive {
+                        prim: PrimitiveCall::Breakpoint { .. },
+                        branches: None,
+                        ..
+                    },
+                ] = body.as_slice()
+                {
+                    out.line(
+                        "// antics-lint: allow(unbounded_loop_without_yield): the original's breakpoint loops on itself",
+                    );
+                }
                 let start = out.lines.len();
                 out.line("loop {");
                 out.indent += 1;
@@ -3734,8 +4020,8 @@ impl Translator<'_> {
 
     /// `if a op b { return true; } else { return false; }` as `return a op b;`, and the
     /// other polarity as `return !(a op b);`: each lowers to the same compare node with
-    /// the same exits (so the same last result). Also a primitive test returned whole
-    /// (`return can_afford(..);`), in that polarity only. No tree calls.
+    /// the same exits (so the same last result). Also a primitive test or a tree call
+    /// returned whole (`return can_afford(..);`, `return !f();`), one node either way.
     fn return_compare(
         &mut self,
         id: usize,
@@ -3756,29 +4042,31 @@ impl Translator<'_> {
                     | CompareOp::Eq
                     | CompareOp::Ge
                     | CompareOp::Le
-                    | CompareOp::Ne,
+                    | CompareOp::Ne
+                    | CompareOp::FlagTest,
                 ..
             }
         );
-        if !compare && !matches!(cond, Condition::Primitive { .. }) {
+        // A call returns its result as one node (`if call N { return true; } return false;`),
+        // but a `-> Result` one is no `bool` to return.
+        let call = match cond {
+            Condition::Call {
+                target: CallTarget::Id(callee),
+                ..
+            } => {
+                !std_global(*callee).is_some_and(|g| g.result)
+                    || !self.model.std_globals.contains(callee)
+            }
+            _ => false,
+        };
+        if !compare && !call && !matches!(cond, Condition::Primitive { .. }) {
             return false;
         }
-        let returns = |body: &[Stmt]| match body {
-            [Stmt::Return { target, .. }] => match target {
-                Target::ReturnTrue => Some(true),
-                Target::ReturnFalse => Some(false),
-                _ => None,
-            },
-            _ => None,
-        };
-        let (Some(on_true), Some(on_false)) = (returns(then_body), returns(else_body)) else {
+        let (Some(on_true), Some(on_false)) = (single_return(then_body), single_return(else_body))
+        else {
             return false;
         };
-        if on_true == on_false
-            || (!compare && on_true == negated)
-            || self.forced_raw(id + 1)
-            || self.forced_raw(id + 2)
-        {
+        if on_true == on_false || self.forced_raw(id + 1) || self.forced_raw(id + 2) {
             return false;
         }
         let Some(c) = self.cond(cond) else {
@@ -3788,8 +4076,10 @@ impl Translator<'_> {
         let start = out.lines.len();
         if on_true != negated {
             out.line(format!("return {c};"));
-        } else {
+        } else if compare {
             out.line(format!("return !({c});"));
+        } else {
+            out.line(format!("return !{c};"));
         }
         self.record(id, start, out);
         self.next_id = id + 3;
@@ -3902,6 +4192,9 @@ impl Translator<'_> {
                 ..
             },
         ] = else_body
+            // An `if` that only returns its condition is left to `else { return c; }`.
+            && !(single_return(inner_then).is_some()
+                && single_return(inner_else).is_some_and(|f| Some(!f) == single_return(inner_then)))
             && !self.forced_raw(self.next_id)
             && let Some(c) = self.cond(cond)
         {
@@ -4412,6 +4705,22 @@ impl Translator<'_> {
                 return None;
             }
             format!("sleep({ticks});")
+        } else if let Stmt::Call {
+            target: CallTarget::Id(callee),
+            args,
+            pass_temps,
+            branches: None,
+            ..
+        } = first
+            && let Stmt::Return {
+                target: Target::ReturnTrue,
+                ..
+            } = second
+            && !self.in_handler
+        {
+            // A standalone call exits false on failure, so with `return true;` after it the
+            // tree returns the call's result: the same node as `return f();`.
+            format!("return {};", self.call(*callee, args, *pass_temps)?)
         } else {
             return None;
         };
@@ -4602,12 +4911,8 @@ impl Translator<'_> {
                 ..
             } => {
                 let call = self.call(*id, args, *pass_temps)?;
-                if *pass_temps {
-                    Some(format!("{call};"))
-                } else {
-                    // A standalone AIR call exits false on failure.
-                    Some(format!("if !{call} {{ return false; }}"))
-                }
+                // A standalone AIR call exits false on failure.
+                Some(format!("if !{call} {{ return false; }}"))
             }
             Stmt::Primitive {
                 prim,
@@ -4641,8 +4946,10 @@ impl Translator<'_> {
             let ident = self.model.extern_calls.get(&id)?;
             let module = if id >= 8192 {
                 "semi_globals"
-            } else {
+            } else if self.model.std_globals.contains(&id) {
                 "globals"
+            } else {
+                self.model.globals_module()
             };
             format!("{module}::{ident}")
         };
@@ -4729,8 +5036,20 @@ impl Translator<'_> {
         match p {
             PrimitiveCall::TestObjectType { guid, object } => {
                 let obj = self.rvalue(object)?;
-                let receiver = if self.sim && obj == "stack_obj" {
+                let receiver = if self.sim && obj == "stack_obj" && !self.stack_moves {
                     "self".to_owned()
+                } else if let Some(base) = obj
+                    .strip_suffix(".data[11]")
+                    .filter(|b| *b == "self" || (self.sim && *b == "sim"))
+                {
+                    // Object data word 11 is the object's id; `.is_type` needs it typed as a
+                    // handle, which only the `.id` spelling gives.
+                    format!("{base}.id")
+                } else if let Some(base) = obj
+                    .strip_suffix(".data[2]")
+                    .filter(|b| self.sim && *b == "sim")
+                {
+                    format!("{base}.container")
                 } else {
                     obj
                 };
@@ -5117,7 +5436,12 @@ impl Translator<'_> {
                 Some(format!("self.slot[{}]", o.index))
             }
             16 if self.sim && o.index >= 0 && self.extra() => {
-                Some(format!("self.slot[{}]", o.index))
+                let handle = if self.stack_moves {
+                    "stack_obj"
+                } else {
+                    "self"
+                };
+                Some(format!("{handle}.slot[{}]", o.index))
             }
             3 if self.sim && o.index == 2 && self.extra() => Some("sim.container".to_owned()),
             19 if o.index == 65 && self.person_binding().is_some() => {
@@ -5211,6 +5535,7 @@ impl Translator<'_> {
                     |(name, _)| format!("world.{name}"),
                 ),
             (10, _) if i == 0 => "stack_obj".to_owned(),
+            (1, true) if self.stack_moves && i <= 255 => format!("stack_obj.attr[{i}]"),
             (0, false) | (1, true) if i <= self.model.state_limit => format!("self.attr_{i}"),
             (3, false) => format!("self.data[{i}]"),
             (0, true) if i <= 255 && self.extra() => format!("sim.attr[{i}]"),
@@ -5366,6 +5691,433 @@ mod tests {
             dedent(&["  a", "\u{a0}  b"]),
             vec!["a".to_owned(), " b".to_owned()]
         );
+    }
+
+    /// Lifts the object `source` compiles to: every tree proven, the text compiles again
+    /// and lints clean.
+    fn lift_source(source: &str) -> String {
+        lift_source_with(source, &DecompileV2Options::default())
+    }
+
+    fn compile_source(text: &str) -> Iff {
+        let object = crate::compile_v2_source("lift.antics", text, &PackResolverConfig::default())
+            .unwrap_or_else(|e| panic!("{e}\n{text}"));
+        Iff::parse(object.iff_bytes).expect("parse IFF")
+    }
+
+    /// Lifts `source`'s object with `options`, asserting every tree is proven and the
+    /// result compiles and lints clean.
+    fn lift_source_with(source: &str, options: &DecompileV2Options) -> String {
+        let compile = compile_source;
+        let report = decompile_iff_to_v2_report(&compile(source), options).expect("lift");
+        assert!(report.compiled);
+        assert!(
+            report
+                .trees
+                .iter()
+                .all(|t| matches!(t.check, TreeCheck::Identical | TreeCheck::Equivalent)),
+            "{:?}\n{}",
+            report.trees,
+            report.source
+        );
+        compile(&report.source);
+        let lints = crate::v2::lint_v2_source(&report.source, "lifted.antics").expect("lint");
+        assert!(lints.is_empty(), "{lints:?}\n{}", report.source);
+        report.source
+    }
+
+    fn has(lifted: &str, spellings: &[&str]) {
+        for s in spellings {
+            assert!(lifted.contains(s), "missing {s:?} in:\n{lifted}");
+        }
+    }
+
+    #[test]
+    fn std_globals_are_used_and_the_rest_stay_local() {
+        let lifted = lift_source(
+            r#"use std::globals::*;
+
+extern mod more_globals {
+    #[id(300)] fn other() -> bool;
+}
+
+object "Fable Lamp" {
+    guid: 0x7E00_0130;
+    #[bhav(id = 4300, label = "Use", locals = 0)]
+    fn use_it() {
+        globals::standard_entry()?;
+        if globals::am_i_a_child() {
+            temp[0] = 1;
+        }
+        if more_globals::other() {
+            temp[0] = 2;
+        }
+    }
+}"#,
+        );
+        has(
+            &lifted,
+            &[
+                "use std::globals::*;",
+                "extern mod more_globals {",
+                "#[id(300)] fn global_300() -> bool;",
+                "globals::standard_entry()",
+                "globals::am_i_a_child()",
+                "more_globals::global_300()",
+            ],
+        );
+        assert!(!lifted.contains("extern mod globals"), "{lifted}");
+        assert!(!lifted.contains("#[id(272)]"), "{lifted}");
+    }
+
+    #[test]
+    fn std_globals_need_the_called_arity() {
+        // The bodies call 273 passing temps; std declares it with one argument.
+        let lifted = lift_source(
+            r#"extern mod globals {
+    #[id(273)] fn exit_now() -> bool;
+}
+
+object "Fable Lamp" {
+    guid: 0x7E00_0131;
+    #[bhav(id = 4300, label = "Use", locals = 0)]
+    fn use_it() {
+        if globals::exit_now() {
+            temp[0] = 1;
+        }
+    }
+}"#,
+        );
+        has(&lifted, &["extern mod globals {", "#[id(273)]"]);
+        assert!(!lifted.contains("use std::globals"), "{lifted}");
+    }
+
+    #[test]
+    fn calls_and_flag_tests_are_returned_whole() {
+        let lifted = lift_source(
+            r#"object "Fable Clock" {
+    guid: 0x7E00_0132;
+    #[bhav(id = 4300, label = "Ready", locals = 0)]
+    fn ready() -> bool {
+        return self.data[3] == 1;
+    }
+    #[bhav(id = 4301, label = "Ask", locals = 0)]
+    fn ask() -> bool {
+        return ready();
+    }
+    #[bhav(id = 4302, label = "Ask Not", locals = 0)]
+    fn ask_not() -> bool {
+        return !ready();
+    }
+    #[bhav(id = 4303, label = "Lit", locals = 0)]
+    fn lit() -> bool {
+        return !(self.data[8] flag_test 6);
+    }
+    #[bhav(id = 4304, label = "Either", locals = 0)]
+    fn either() -> bool {
+        if self.data[4] == 0 {
+            return self.data[5] == 2;
+        } else if ready() {
+            return true;
+        } else {
+            return false;
+        }
+    }
+}"#,
+        );
+        has(
+            &lifted,
+            &[
+                "return ready_4300();",
+                "return !ready_4300();",
+                "return !(self.data[8] flag_test 6);",
+                "} else {\n            return ready_4300();",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_standalone_call_keeps_its_false_exit() {
+        let lifted = lift_source(
+            r#"object "Fable Clock" {
+    guid: 0x7E00_0133;
+    #[bhav(id = 4300, label = "Ready", locals = 0)]
+    fn ready() -> bool {
+        return self.data[3] == 1;
+    }
+    #[bhav(id = 4301, label = "Step", locals = 0)]
+    fn step() -> bool {
+        if !ready() {
+            return false;
+        }
+        temp[0] = 1;
+        return true;
+    }
+}"#,
+        );
+        has(
+            &lifted,
+            &["if !ready_4300() {\n            return false;\n        }"],
+        );
+        assert!(!lifted.contains("raw"), "{lifted}");
+    }
+
+    #[test]
+    fn raw_bare_calls_spell_out_the_false_exit() {
+        assert_eq!(
+            explicit_false_exit("    call 4099(temps);"),
+            "    if !call 4099(temps) { return false; }"
+        );
+        assert_eq!(
+            explicit_false_exit("call 4099(1, 2, 3, 4);"),
+            "if !call 4099(1, 2, 3, 4) { return false; }"
+        );
+        for kept in [
+            "call 4099(temps) -> true: @n2, false: error;",
+            "temp[0] := 1;",
+            "if call 4099(temps) {",
+        ] {
+            assert_eq!(explicit_false_exit(kept), kept);
+        }
+    }
+
+    #[test]
+    fn a_sim_tree_that_moves_stack_obj_names_its_cells_by_stack_obj() {
+        let lifted = lift_source(
+            r#"object "Fable Easel" {
+    guid: 0x7E00_0134;
+    state paint: i16;
+    #[bhav(id = 4300, label = "Pick", locals = 0)]
+    fn pick(sim: Sim) {
+        stack_obj = temp[1];
+        stack_obj.attr[0] = 2;
+        sim.motive[1] = 3;
+    }
+}"#,
+        );
+        has(&lifted, &["stack_obj = temp[1];", "stack_obj.attr[0] = 2;"]);
+    }
+
+    #[test]
+    fn node_order_puts_the_lower_branch_first() {
+        let lifted = lift_source(
+            r#"object "Fable Clock" {
+    guid: 0x7E00_0135;
+    #[bhav(id = 4300, label = "Ready", locals = 0)]
+    fn ready() -> bool {
+        return self.data[3] == 1;
+    }
+    #[bhav(id = 4301, label = "Pick", locals = 0)]
+    fn pick() -> bool {
+        if !ready() {
+            temp[0] = 2;
+        } else {
+            temp[0] = 3;
+        }
+        return true;
+    }
+}"#,
+        );
+        has(&lifted, &["if !ready_4300() {\n            temp[0] = 2;"]);
+    }
+
+    #[test]
+    fn a_tree_that_proves_only_in_the_other_branch_order_keeps_it() {
+        // The true branch visits n4, n2, n3: written first, it keeps the primitive at n3;
+        // node order would put it at n4.
+        let lifted = lift_source(
+            r#"object "Fable Clock" {
+    guid: 0x7E00_0137;
+    #[bhav(id = 4300, label = "Pick", locals = 0)]
+    fn pick() {
+        raw {
+            @n0:
+            expr(my.data[3] == 1) -> true: @n4, false: @n1;
+            @n1:
+            expr(temp[0] := 5) -> true: true, false: error;
+            @n2:
+            expr(temp[1] := 2) -> true: @n3, false: error;
+            @n3:
+            play_sound(2) -> true: true, false: error;
+            @n4:
+            expr(temp[0] := 1) -> true: @n2, false: error;
+        }
+    }
+}"#,
+        );
+        has(
+            &lifted,
+            &["if self.data[3] == 1 {\n            temp[0] = 1;"],
+        );
+        assert!(!lifted.contains("@n"), "{lifted}");
+    }
+
+    /// n3 (a yield) is reached from n1 and n2; the structured lift writes it twice, so the
+    /// idiomatic tree yields at another node number than the original.
+    const SHARED_YIELD: &str = r#"object "Fable Clock" {
+    guid: 0x7E00_0137;
+    #[bhav(id = 4300, label = "Pick", locals = 0)]
+    fn pick() {
+        raw {
+            @n0:
+            expr(my.data[3] == 1) -> true: @n2, false: @n1;
+            @n1:
+            expr(my.data[4] == 1) -> true: @n3, false: true;
+            @n2:
+            expr(temp[1] := 2) -> true: @n3, false: error;
+            @n3:
+            sleep(1) -> true: true, false: error;
+        }
+    }
+}"#;
+
+    #[test]
+    fn behavioral_mode_proves_a_renumbered_tree_and_says_so() {
+        let strict = lift_source(SHARED_YIELD);
+        assert!(strict.contains("@n3:"), "{strict}");
+        assert!(!strict.contains("behavioral"), "{strict}");
+
+        let behavioral = lift_source_with(
+            SHARED_YIELD,
+            &DecompileV2Options {
+                behavioral: true,
+                ..DecompileV2Options::default()
+            },
+        );
+        assert!(!behavioral.contains("@n"), "{behavioral}");
+        has(
+            &behavioral,
+            &[
+                &BEHAVIORAL_HEADER.join("\n"),
+                // The true branch first: node order does not matter here.
+                "if self.data[3] == 1 {\n            temp[1] = 2;",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_breakpoint_trap_loop_allows_the_yield_lint() {
+        let lifted = lift_source(
+            r#"object "Fable Tower" {
+    guid: 0x7E00_0138;
+    #[bhav(id = 4300, label = "Trap", locals = 0)]
+    fn trap() {
+        if self.data[3] == 1 {
+            loop {
+                breakpoint(1);
+            }
+        }
+        temp[0] = 2;
+        return true;
+    }
+}"#,
+        );
+        has(
+            &lifted,
+            &[
+                "// antics-lint: allow(unbounded_loop_without_yield): the original's breakpoint loops on itself\n            loop {\n                breakpoint(1);",
+            ],
+        );
+    }
+
+    #[test]
+    fn an_unchecked_lift_never_claims_behavioral_mode() {
+        let report = decompile_iff_to_v2_report(
+            &compile_source(SHARED_YIELD),
+            &DecompileV2Options {
+                validate: false,
+                behavioral: true,
+                ..DecompileV2Options::default()
+            },
+        )
+        .expect("lift");
+        assert!(!report.source.contains("behavioral"), "{}", report.source);
+    }
+
+    #[test]
+    fn identical_interaction_tables_are_written_once() {
+        let line = |s: &str| vec![s.to_owned()];
+        assert_eq!(
+            interaction_comments(vec![(vec![128], line("a"))]),
+            line("a")
+        );
+        assert_eq!(
+            interaction_comments(vec![(vec![128, 129], line("a")), (vec![130], line("b"))]),
+            vec![
+                "TTAB 128, 129:".to_owned(),
+                "a".to_owned(),
+                "TTAB 130:".to_owned(),
+                "b".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn an_oversized_lifecycle_tree_allows_the_frame_lint() {
+        let stores: String = (0..205)
+            .map(|i| format!("        temp[0] = {i};\n"))
+            .collect();
+        for header in [
+            "#[id(4096)]",
+            "#[bhav(id = 4096, args = 0, locals = 0, format = 0x8002, revision = 7)]",
+        ] {
+            let lifted = lift_source(&format!(
+                "object \"Fable Tower\" {{\n    guid: 0x7E00_0136;\n    {header}\n    init {{\n{stores}    }}\n}}"
+            ));
+            has(&lifted, &["// antics-lint: allow(frame_headroom)"]);
+        }
+    }
+
+    #[test]
+    fn a_superseded_lifecycle_pin_does_not_take_a_trees_frame_finding() {
+        // The last pinned `init` names the lifecycle tree; the first pin (4300) is the
+        // oversized fn's, so its finding stays on the fn, not under the init's allow.
+        let stores: String = (0..205)
+            .map(|i| format!("        temp[0] = {i};\n"))
+            .collect();
+        let source = format!(
+            "object \"Fable Tower\" {{\n    guid: 0x7E00_0137;\n    #[bhav(id = 4300)]\n    fn big() {{\n{stores}    }}\n    #[id(4300)]\n    // antics-lint: allow(frame_headroom): test\n    init {{\n        temp[0] = 1;\n    }}\n    #[id(4301)]\n    init {{\n        temp[1] = 1;\n    }}\n}}\n"
+        );
+        let diags = crate::v2::lint::lint_v2_source(&source, "t.antics").expect("lint");
+        let frame: Vec<_> = diags
+            .iter()
+            .filter(|d| d.rule == crate::v2::lint::FRAME_HEADROOM)
+            .collect();
+        let fn_line = source.lines().position(|l| l.contains("fn big()")).unwrap() + 1;
+        assert_eq!(frame.len(), 1, "{diags:?}");
+        assert_eq!(frame[0].line, fn_line, "{diags:?}");
+    }
+
+    #[test]
+    fn a_tree_already_past_the_frame_lint_allows_it() {
+        let allow = |nodes: usize, locals: u16| {
+            let mut t = tree(&vec![(2, 0xfe, 0xfd, [0; 8]); nodes]);
+            t.locals = locals;
+            let mut out = Out {
+                lines: Vec::new(),
+                indent: 0,
+            };
+            write_frame_allow(&mut out, &t);
+            out.lines.len()
+        };
+        assert_eq!(allow(crate::v2::lint::FRAME_NODE_WARN, 0), 0);
+        assert_eq!(allow(crate::v2::lint::FRAME_NODE_WARN + 1, 0), 1);
+        assert_eq!(allow(1, crate::v2::lint::FRAME_LOCAL_WARN), 0);
+        assert_eq!(allow(1, crate::v2::lint::FRAME_LOCAL_WARN + 1), 1);
+    }
+
+    #[test]
+    fn std_global_table_reads_the_std_source() {
+        let entry = std_global(272).expect("standard_entry");
+        assert_eq!(
+            (entry.name, entry.params, entry.result),
+            ("standard_entry", 0, true)
+        );
+        let exit = std_global(273).expect("standard_exit");
+        assert_eq!((exit.params, exit.result), (1, true));
+        let child = std_global(363).expect("am_i_a_child");
+        assert_eq!((child.params, child.result), (0, false));
+        assert!(std_global(4096).is_none());
     }
 
     #[test]

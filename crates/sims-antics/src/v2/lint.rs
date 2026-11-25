@@ -83,6 +83,10 @@ pub const UNBOUNDED_LOOP_WITHOUT_YIELD: &str = "unbounded_loop_without_yield";
 pub const STACK_OBJ_CLOBBER_AFTER_SELF: &str = "stack_obj_clobber_after_self";
 pub const UNUSED_DECL: &str = "unused_decl";
 pub const FRAME_HEADROOM: &str = "frame_headroom";
+/// `frame_headroom` reports a compiled tree with more nodes than this.
+pub(crate) const FRAME_NODE_WARN: usize = 200;
+/// `frame_headroom` reports a compiled tree with more locals than this.
+pub(crate) const FRAME_LOCAL_WARN: u16 = 12;
 pub const WHILE_TRUE: &str = "while_true";
 pub const REDUNDANT_BOOL_RETURN: &str = "redundant_bool_return";
 pub const COLLAPSIBLE_IF_CHAIN: &str = "collapsible_if_chain";
@@ -3081,8 +3085,6 @@ impl FileLinter<'_> {
     /// `frame_headroom`: compiles the file (with its pack, when it has one) and checks
     /// every tree's node and local counts.
     fn frame_headroom(&mut self, ast: &V2File, objects: Option<&[crate::compile::CompiledObject]>) {
-        const NODE_WARN: usize = 200;
-        const LOCAL_WARN: u16 = 12;
         let Some(objects) = objects else {
             return;
         };
@@ -3106,12 +3108,23 @@ impl FileLinter<'_> {
                 by_id: BTreeMap::new(),
                 by_label: BTreeMap::new(),
             };
+            // Like the lowering, the last pinned `init` / `main` block's pin is the one the
+            // lifecycle tree takes; an earlier, superseded pin names no tree of its own.
+            let mut lifecycle_pins: [Option<(u16, Span)>; 2] = [None, None];
             for m in &o.members {
                 let (id, label, span) = match m {
                     ObjectMember::Tree(t) => (t.pinned_id, t.label.as_str(), t.span),
                     ObjectMember::Interaction(i) => (i.pinned_id, i.label.as_str(), i.span),
-                    ObjectMember::Init(b) => (None, "init", b.span),
-                    ObjectMember::Main(b) => (None, "main", b.span),
+                    ObjectMember::Init(b) | ObjectMember::Main(b) => {
+                        let (slot, label) = match m {
+                            ObjectMember::Init(_) => (0, "init"),
+                            _ => (1, "main"),
+                        };
+                        if let Some(id) = b.pinned_id {
+                            lifecycle_pins[slot] = Some((id, b.span));
+                        }
+                        (None, label, b.span)
+                    }
                     _ => continue,
                 };
                 if let Some(id) = id {
@@ -3122,6 +3135,9 @@ impl FileLinter<'_> {
                     .entry(label.to_owned())
                     .and_modify(|s| *s = None)
                     .or_insert(Some(span));
+            }
+            for (id, span) in lifecycle_pins.into_iter().flatten() {
+                spans.by_id.entry(id).or_insert(span);
             }
             sources.push(spans);
         }
@@ -3144,7 +3160,7 @@ impl FileLinter<'_> {
                     .copied()
                     .or_else(|| source.by_label.get(&b.label).copied().flatten())
                     .unwrap_or(source.span);
-                if nodes > NODE_WARN {
+                if nodes > FRAME_NODE_WARN {
                     self.emit(
                         FRAME_HEADROOM,
                         at,
@@ -3162,7 +3178,7 @@ impl FileLinter<'_> {
                         None,
                     );
                 }
-                if b.locals > LOCAL_WARN {
+                if b.locals > FRAME_LOCAL_WARN {
                     let frame = self.frames.as_ref().and_then(|f| {
                         f.get(&obj.name)
                             .or_else(|| f.values().next().filter(|_| single))?
