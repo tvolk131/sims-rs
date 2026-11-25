@@ -2814,11 +2814,13 @@ fn interaction_comments(tables: Vec<(Vec<u16>, Vec<String>)>) -> Vec<String> {
     out
 }
 
-/// The header lines of a source checked under the behavioral relation.
-const BEHAVIORAL_HEADER: [&str; 3] = [
-    "// Verified in behavioral mode (`--behavioral`): node numbers and frame storage are not",
-    "// compared, so each proof holds only for runs that start and end under one build",
-    "// (docs/decisions/20261123-verifier-behavioral-mode.md).",
+/// The header lines of a source checked under the behavioral relation. They name the
+/// relation only: which trees proved is in the lift's report, not the source.
+const BEHAVIORAL_HEADER: [&str; 4] = [
+    "// Checked in behavioral mode (`--behavioral`): node numbers and frame storage were not",
+    "// compared, so a tree proven equivalent is equivalent only for runs that start and end",
+    "// under one build (docs/decisions/20261123-verifier-behavioral-mode.md). Not every tree",
+    "// is proven; the lift's report lists the ones that are not.",
 ];
 
 /// The checker's bounds for `lift`: the defaults, but at most 50,000 pairs of paths with

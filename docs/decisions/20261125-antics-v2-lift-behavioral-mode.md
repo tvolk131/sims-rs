@@ -53,10 +53,15 @@ calls, untracked memory, exits, tracked cells, and whether and how a path faults
   The header reads:
 
   ```
-  // Verified in behavioral mode (`--behavioral`): node numbers and frame storage are not
-  // compared, so each proof holds only for runs that start and end under one build
-  // (docs/decisions/20261123-verifier-behavioral-mode.md).
+  // Checked in behavioral mode (`--behavioral`): node numbers and frame storage were not
+  // compared, so a tree proven equivalent is equivalent only for runs that start and end
+  // under one build (docs/decisions/20261123-verifier-behavioral-mode.md). Not every tree
+  // is proven; the lift's report lists the ones that are not.
   ```
+
+  The header names the relation trees were checked under. It claims no proof: a file can
+  carry it with every tree inconclusive (for example, through an object gap). Which trees
+  proved is in the stderr report.
 
 **What a behavioral lift does not promise.** Behavioral proofs hold for runs that start and
 end under one build. A frame saved by the original build and resumed by the rebuilt one
@@ -100,7 +105,7 @@ unchanged.
 | Idiomatic trees | 8,472 (32.3%) | 25,296 (96.5%) |
 | Raw-fallback trees | 17,733 (67.7%) | 909 (3.5%) |
 | Inline `raw {}` statements | 7,608 | 79,174 |
-| Lines | 978,879 | 1,199,538 |
+| Lines | 978,879 | 1,200,729 |
 | fmt-dirty files | 0 | 0 |
 | Lint findings | 7 | 102 |
 
