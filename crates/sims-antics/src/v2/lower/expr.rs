@@ -546,11 +546,9 @@ impl<'a> TreeLowerer<'a> {
                 if let V2Expr::Ident(bspan, bname) = base.as_ref() {
                     if self.is_my_ident(bname) {
                         return match field.as_str() {
-                            // The words themselves (`sim.data[11]`, `sim.data[29]`), so a
-                            // typed name builds exactly the nodes its number does.
-                            "id" => Ok(("my.data[11]".to_owned(), ValueType::ObjectId)),
+                            "id" => Ok(("my.id".to_owned(), ValueType::ObjectId)),
                             "priority" => Ok(("my.person.priority".to_owned(), ValueType::I16)),
-                            "room" => Ok(("my.data[29]".to_owned(), ValueType::I16)),
+                            "room" => Ok(("my.room".to_owned(), ValueType::I16)),
                             "hand" => Ok(("my.slot[0]".to_owned(), ValueType::ObjectId)),
                             "age" => Ok(("my.person[58]".to_owned(), ValueType::I16)),
                             "visitor_kind" => Ok(("my.person[32]".to_owned(), ValueType::I16)),
@@ -576,17 +574,16 @@ impl<'a> TreeLowerer<'a> {
                             "'sim' is not available in init/main (object lifecycle context)",
                         ));
                     }
-                    // `self.id` and `self.room` read the words themselves (`self.data[11]`,
-                    // `self.data[29]`), so a typed name builds exactly the nodes its number does.
+                    // `self.id` and `self.room` read their words (data 11 and 29) by name.
                     if self.is_self_ident(bname) {
                         match field.as_str() {
                             "id" => {
                                 return self
-                                    .read_lvalue(&self.self_cell("data[11]", ValueType::ObjectId));
+                                    .read_lvalue(&self.self_cell("id", ValueType::ObjectId));
                             }
                             "room" => {
                                 return self
-                                    .read_lvalue(&self.self_cell("data[29]", ValueType::I16));
+                                    .read_lvalue(&self.self_cell("room", ValueType::I16));
                             }
                             _ => {}
                         }

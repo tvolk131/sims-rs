@@ -20,7 +20,7 @@ impl<'a> TreeLowerer<'a> {
             return Err(Error::at(
                 *span,
                 format!(
-                    "'{name}.{field}' is read-only (the engine refuses a script store into this word)"
+                    "cannot assign to '{name}.{field}': it is read-only (the engine refuses a script store into this word)"
                 ),
             ));
         }
@@ -738,7 +738,9 @@ impl<'a> TreeLowerer<'a> {
 
     pub(super) fn read_lvalue(&mut self, lval: &LValue) -> Result<(String, ValueType)> {
         match lval {
-            LValue::Direct { air, ty } => Ok((air.clone(), ty.clone())),
+            // The id and room words read by name (`my.data[11]` is `my.id`), so a number
+            // builds exactly the nodes its name does: `my.id` is a value the optimiser knows.
+            LValue::Direct { air, ty } => Ok((named_word_read(air), ty.clone())),
             LValue::ForeignAttr {
                 obj_air,
                 attr_index,
@@ -772,5 +774,15 @@ impl<'a> TreeLowerer<'a> {
                 Ok((tmp, ty.clone()))
             }
         }
+    }
+}
+
+/// The read spelling of a `my`/`stack` id or room word: `my.data[11]` → `my.id`,
+/// `stack.data[29]` → `stack.room`. The two encode the same operand.
+fn named_word_read(air: &str) -> String {
+    match air.split_once('.') {
+        Some((prefix @ ("my" | "stack"), "data[11]")) => format!("{prefix}.id"),
+        Some((prefix @ ("my" | "stack"), "data[29]")) => format!("{prefix}.room"),
+        _ => air.to_owned(),
     }
 }

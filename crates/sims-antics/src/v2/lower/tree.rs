@@ -407,7 +407,7 @@ impl<'a> TreeLowerer<'a> {
         let cell = |c: &str, ty| Some((c.to_owned(), ty));
         match field {
             "hand" => cell("stack.slot[0]", ValueType::ObjectId),
-            "room" => cell("stack.data[29]", ValueType::I16),
+            "room" => cell("stack.room", ValueType::I16),
             other if object_data_word(other).is_some() => object_data_word(other)
                 .map(|w| (format!("stack.data[{}]", w.index), w.value_type())),
             _ if !maybe_sim => None,

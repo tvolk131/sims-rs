@@ -75,15 +75,10 @@ impl<'a> TreeLowerer<'a> {
         } else {
             None
         };
-        // Operands that later argument code cannot change (literals, BCON entries, my own id:
-        // `my.id` or the word itself, `my.data[11]`, which no script store may change) are used
-        // in place; anything else is staged when argument code follows it.
-        let is_fixed = |air: &str| {
-            air.parse::<i16>().is_ok()
-                || air.starts_with("bcon.")
-                || air == "my.id"
-                || air == "my.data[11]"
-        };
+        // Operands that later argument code cannot change (literals, BCON entries, `my.id`)
+        // are used in place; anything else is staged when argument code follows it.
+        let is_fixed =
+            |air: &str| air.parse::<i16>().is_ok() || air.starts_with("bcon.") || air == "my.id";
         let positional = args[1..].iter().filter(|a| a.name.is_none()).count();
         // The live cursor as receiver stays in place unless argument code moves it (below).
         let receiver_is_cursor = target_air == "stack_obj";

@@ -3,34 +3,136 @@
 // `use std::globals::*;` brings `globals` into scope, so an object calls `globals::standard_entry()?;`
 // instead of copying its own `extern mod globals { .. }` block. The names are our own descriptions of
 // what each tree does; only the tree ids are engine facts.
+//
+// The signatures follow each tree's live code: the parameters it reads, and whether its false exit
+// is a real answer (`-> bool`) or never taken by a caller as an error (`-> bool` too) rather than a
+// failure to propagate (`-> Result`). A parameter that is a 0/1 switch is an `i16` holding 0 or 1.
+// Trees with no listed parameters ignore their header's argument. Many trees leave values in the
+// caller's temps; the comments name the ones a caller reads. Unless a comment says otherwise, a tree
+// that acts on "the stack object" needs the caller to set `stack_obj` first.
+//
+// Each entry stays on one line: the lift reads this file line by line to name the calls it finds.
 
 pub extern mod globals {
     // Object set-up and tear-down.
     #[id(271)] fn init_object() -> Result;
+    // Marks the stack object busy.
     #[id(272)] fn standard_entry() -> Result;
+    // Frees the stack object, locking it out for `delay` ticks.
     #[id(273)] fn standard_exit(delay: i16) -> Result;
     #[id(278)] fn multi_tile_entry() -> Result;
     // Takes its delay as an argument (param 0), like 273, which it runs for each tile; its
-    // second parameter is a word it writes before reading.
+    // second parameter is a word it writes before reading. Writes temp[0].
     #[id(279)] fn multi_tile_exit(delay: i16) -> Result;
+    // Sets the wall-placement rules of each tile of a multi-tile object. Writes temp[0..2].
+    #[id(438)] fn apply_group_wall_rules() -> Result;
+
+    // Graphics and lighting.
+    #[id(256)] fn select_own_graphic(graphic: i16) -> Result;
+    #[id(260)] fn select_stack_graphic(graphic: i16) -> Result;
+    // Every tile of the stack object's group. Writes temp[0].
+    #[id(277)] fn select_group_graphic(graphic: i16) -> Result;
+    #[id(275)] fn light_stack_object(level: i16) -> Result;
+
+    // Check trees.
+    // Keeps the interaction off the pie menu.
+    #[id(265)] fn withhold_from_menu() -> Result;
+    #[id(397)] fn social_choice_option_on() -> bool;
 
     // Waiting.
     #[id(280)] fn idle_ticks(ticks: i16) -> Result;
+    // Waits up to `a` ticks; `b` is 1 to start a queued action while waiting, else 0. True when
+    // interrupted.
     #[id(281)] fn wait_for_notify(a: i16, b: i16) -> bool;
+    // True when at least one whole `period` has passed; temp[0] is then the number of periods.
+    #[id(282)] fn take_elapsed_periods(period: i16) -> bool;
+    // `unused` is never read; `busy_attr` names an attribute of the stack object.
+    #[id(283)] fn wait_turn_near_stack(unused: i16, busy_attr: i16, timeout: i16) -> bool;
+    #[id(366)] fn wait_hours(hours: i16) -> Result;
+    // Writes temp[0..1].
     #[id(370)] fn animated_idle_for(ticks: i16) -> Result;
 
-    // The Sim's body.
-    #[id(295)] fn flip_sim_around() -> Result;
-    #[id(382)] fn ensure_standing() -> Result;
+    // Motive gates.
+    // True when a fun object is worth using now (fun below `max_fun`, other needs fine).
+    #[id(285)] fn wants_fun(max_fun: i16) -> bool;
+    // True to stop a fun object now (fun reached `fun_target`, interrupted, or a need is low).
+    #[id(405)] fn should_stop_fun(fun_target: i16) -> bool;
+    // True when the Sim is willing to use a skill object; false after acting out a refusal.
+    #[id(407)] fn agrees_to_skill_object(min_mood: i16) -> bool;
+    // A disabled gate: always false in this build.
+    #[id(408)] fn fun_object_gate(max_fun: i16) -> bool;
+    // True to stop a skill object now (interrupted, mood at or below `min_mood`, or a need is low).
+    #[id(415)] fn should_stop_skill(min_mood: i16) -> bool;
+    // True to stop repairing now (interrupted, or a need is low).
+    #[id(417)] fn should_stop_repair() -> bool;
 
-    // Questions about the Sim, the object and the lot.
+    // The stack object.
+    #[id(287)] fn stack_object_exists() -> bool;
+    #[id(355)] fn stack_object_is_person() -> bool;
     #[id(288)] fn in_use() -> bool;
+    // Writes temp[0] (the stack object's room).
+    #[id(301)] fn stack_object_outdoors() -> bool;
+    #[id(303)] fn stack_object_needs_cleaning() -> bool;
+    #[id(302)] fn scrub_stack_object(tiles: i16) -> bool;
+    #[id(347)] fn add_dirt(amount: i16) -> Result;
+    // Writes temp[0..1].
+    #[id(351)] fn show_repair_progress(total: i16) -> Result;
+    // Writes temp[0..1].
+    #[id(349)] fn advance_repair(total: i16) -> Result;
+    #[id(350)] fn stack_repaired() -> bool;
+    // Writes temp[0..2].
+    #[id(297)] fn explain_broken_object() -> Result;
+
+    // The Sim's body and clothes.
+    #[id(295)] fn flip_sim_around() -> Result;
+    // False when the Sim cannot stand (no container, or the way up fails).
+    #[id(382)] fn ensure_standing() -> bool;
+    // Always true.
+    #[id(406)] fn drop_held_object() -> bool;
+    #[id(340)] fn change_to_everyday_clothes() -> Result;
+    // `censor` is 1 to censor while changing, else 0 (also for the next two).
+    #[id(377)] fn change_to_swimwear(censor: i16) -> Result;
+    // Writes temp[0..1] (the job type and level).
+    #[id(378)] fn change_to_work_clothes(censor: i16) -> Result;
+    #[id(412)] fn change_to_sleepwear(censor: i16) -> Result;
+
+    // Questions about the Sim and the lot.
     #[id(320)] fn is_downtown_lot() -> bool;
     #[id(321)] fn is_residential_lot() -> bool;
-    #[id(363)] fn am_i_a_child() -> bool;
-    #[id(410)] fn can_join() -> bool;
     #[id(424)] fn is_vacation_lot() -> bool;
+    #[id(363)] fn am_i_a_child() -> bool;
+    #[id(467)] fn sim_is_dog() -> bool;
+    #[id(468)] fn sim_is_cat() -> bool;
+    // True when the Sim is in the selected Sim's group.
+    #[id(446)] fn with_selected_sim() -> bool;
+    // Writes temp[0].
+    #[id(410)] fn can_join() -> bool;
+    #[id(319)] fn uses_robot_voice() -> bool;
 
     // Skills.
-    #[id(286)] fn show_skill_progress(skill: i16) -> bool;
+    // Shows the meter for a skill value (0..1000). False only off a home lot without expansion
+    // bit 6 (`std::flags::Expansions::Pets`). Writes temp[0].
+    #[id(286)] fn show_skill_progress(points: i16) -> bool;
+
+    // Companions and conversations.
+    #[id(332)] fn push_on_companion(interaction: i16) -> bool;
+    // True when the Sim has a companion; temp[0] is then the companion's object id.
+    #[id(333)] fn find_companion() -> bool;
+    // `children` and `adults` are 1 to wake that group, else 0.
+    #[id(399)] fn rouse_stack_room(children: i16, adults: i16) -> Result;
+    // The other Sim is the stack object. Writes temp[0].
+    #[id(400)] fn start_conversation(kind: i16) -> Result;
+    // Writes temp[0..2].
+    #[id(401)] fn conversation_turn(first: i16, second: i16) -> Result;
+    // The other Sim is the stack object. Writes temp[0].
+    #[id(402)] fn join_stack_conversation() -> Result;
+    #[id(403)] fn leave_conversations() -> Result;
+    // `other` is a Sim's object id.
+    #[id(416)] fn score_joining(daily: i16, social: i16, other: i16) -> Result;
+    // Always true. Writes temp[0..1].
+    #[id(404)] fn queue_phone_ring() -> bool;
+
+    // Leaving.
+    // Never false; it may not return, and may remove the Sim.
+    #[id(368)] fn leave_lot() -> Result;
 }
