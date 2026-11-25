@@ -3419,8 +3419,26 @@ impl Parser {
         self.arm_tails.truncate(saved_arm_tails);
         let span = self.span();
         let short = (|| {
-            // `1 => break,` / `_ => return false,`: the exit itself (not a name `break`).
-            let stmt = if let Some(exit) = self.parse_bare_exit()? {
+            // `1 => break,` / `_ => return false,`: the exit itself. A binding of that name
+            // that the arm assigns (`_ => break += 1,`) is followed by its assignment.
+            let next = &self.peek_at(1).kind;
+            let bare_exit = ((self.is_ident("break") || self.is_ident("continue"))
+                && matches!(next, TokenKind::Comma | TokenKind::RBrace))
+                || (self.is_ident("return")
+                    && !matches!(
+                        next,
+                        TokenKind::Assign
+                            | TokenKind::PlusEq
+                            | TokenKind::MinusEq
+                            | TokenKind::StarEq
+                            | TokenKind::SlashEq
+                            | TokenKind::PercentEq
+                            | TokenKind::AmpEq
+                            | TokenKind::PipeEq
+                            | TokenKind::CaretEq
+                    )
+                    && !matches!(next, TokenKind::Ident(w) if w == "flag_set" || w == "flag_clear"));
+            let stmt = if bare_exit && let Some(exit) = self.parse_bare_exit()? {
                 exit
             } else {
                 let lhs = self.parse_expr()?;

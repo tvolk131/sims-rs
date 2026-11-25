@@ -151,7 +151,11 @@ impl<'a> TreeLowerer<'a> {
     /// they stand outside the body, so a shadowing binding (`let sim = o;`) would be checked as
     /// the outer one.
     pub(super) fn cursor_fresh_name(&self, name: &str, cursor: &str) -> bool {
-        name != cursor && name != "self" && name != "stack_obj" && self.lookup_var(name).is_none()
+        name != cursor
+            && name != "self"
+            && name != "stack_obj"
+            && name != "me"
+            && self.lookup_var(name).is_none()
     }
 
     /// Whether `base.<field>` / `base.<group>[i]` names a cell the cursor loop may touch: the

@@ -941,7 +941,7 @@ fn lower_object_with(
             .get(owner.as_str())
             .and_then(|sc| sc.extern_mods.get(name))
         {
-            *decl = crate::v2::loader::merge_extern_mods(
+            (*owner, *decl) = crate::v2::loader::merge_extern_mods(
                 owner,
                 decl,
                 scope_owner,

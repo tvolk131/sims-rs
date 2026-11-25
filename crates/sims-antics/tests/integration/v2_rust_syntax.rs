@@ -1004,6 +1004,13 @@ fn me_text_drops_an_entry_save_that_moves_no_named_local() {
     // `$Local:1` is the save's own word.
     let air = air_with_message("$Me saw $Local:1", pinned);
     assert!(saves(&air), "{air}");
+    // A name without `$` can still complete a token the source starts right before the `$Me`
+    // (the name `1` makes `$Local:1`, and `$Local:0` then writes the digits `$TimeLocal:`
+    // reads).
+    for message in ["Saw $Local:$Me", "$TimeLocal:$Me$Local:0", "$Loc$Me"] {
+        let air = air_with_message(message, pinned);
+        assert!(saves(&air), "{message}:\n{air}");
+    }
     // `n` declared after the save would move down a word.
     let moving = r#"    #[bhav]
     fn a(sim: Sim) {
@@ -1038,11 +1045,12 @@ fn me_text_drops_an_entry_save_that_moves_no_named_local() {
 }
 
 /// A bool helper whose tail is a constant, returned through `return leave();` in a tree whose
-/// raw block keeps the layout (so the helper is inlined for its tail condition), returns the
-/// constant with no test node, as it does without the raw block.
+/// raw block keeps the layout (so the helper is inlined for its tail condition), keeps its
+/// constant test: the test sets the last result, which ending an active action records
+/// (`release_use`), and the call before it may have left the other one.
 #[test]
-fn constant_helper_tails_return_with_no_test_node() {
-    for (tail, ret) in [("false", "return false;"), ("true", "return true;")] {
+fn constant_helper_tails_keep_their_test_after_raw_code() {
+    for (tail, test) in [("false", "if 1 == 0 {"), ("true", "if 1 == 1 {")] {
         let src = format!(
             r#"use std::globals::*;
 
@@ -1068,8 +1076,7 @@ object "Tail Probe" {{
         );
         let air = build(&src).0;
         let t = &air[air.find("tree 4100").expect("tree 4100")..];
-        assert!(!t.contains("1 == 0") && !t.contains("1 == 1"), "{air}");
-        assert_eq!(t.matches(ret).count(), 2, "{air}");
+        assert_eq!(t.matches(test).count(), 2, "{air}");
     }
 }
 
@@ -1100,4 +1107,108 @@ fn lint_allow_above_attributes_covers_the_item() {
     );
     let found = headroom(&source("    // antics-lint: allow(frame_headroom)\n"));
     assert!(found.is_empty(), "{found:#?}");
+}
+
+/// Round 1 review regressions: a loop-local `me`, `me` in an object's own tree, a `bcon me`
+/// table, an arm assigning a binding named `break`, and the untyped `category4` search.
+#[test]
+fn review_round_1_name_regressions() {
+    // A loop-local `me` is a fresh cursor like any other name.
+    let looped = |name: &str| {
+        build(&format!(
+            r#"object "Loop Probe" {{
+    guid: 0x7F40_0A40;
+    #[bhav]
+    fn run(sim: Sim) {{
+        for item in lot.objects() {{
+            let {name}: ObjectId = sim.id;
+            temp[0] = {name}.room;
+            temp[1] = item.data[11];
+        }}
+    }}
+}}
+"#
+        ))
+    };
+    assert_eq!(looped("me"), looped("other"));
+    // In an object's own tree `me` is the object, which has no Sim fields.
+    expect_err(
+        "object \"Init Probe\" {\n    guid: 0x7F40_0A41;\n    init { temp[0] = me.job_level; }\n}\n",
+        "unknown field 'me.job_level'",
+    );
+    // A `bcon me` table keeps its name there.
+    let air = build(
+        "extern bcon me { #[addr(16521)] probe; }\nobject \"Init Probe\" {\n    guid: 0x7F40_0A41;\n    init { temp[0] = me.probe; }\n}\n",
+    )
+    .0;
+    assert!(air.contains("temp[0] := bcon[16521];"), "{air}");
+    // `break` followed by an assignment is the binding, not the exit.
+    let air = build(&obj(
+        "    #[bhav]\n    fn a() {\n        let break: i16 = 0;\n        match self.n {\n            _ => break += 1,\n        }\n        temp[0] = break;\n    }",
+    ))
+    .0;
+    assert!(air.contains("+= 1"), "{air}");
+    // The untyped search takes `category4` (function 15), as raw `.air` does.
+    let air = build(&obj(
+        "    #[bhav]\n    fn a(sim: Sim) {\n        let Some(_o) = find_best_object(category4) else { return; };\n    }",
+    ))
+    .0;
+    assert!(air.contains("find_best_object(category4)"), "{air}");
+}
+
+/// Extern merges across modules are refused when both sides name module types (they resolve in
+/// different scopes), and every alias of a tree is checked: neither depends on import order.
+#[test]
+fn extern_merges_do_not_depend_on_import_order() {
+    let compile = |modules: &[(&str, &str)], src: &str| {
+        let mut cfg = PackResolverConfig::default();
+        for (name, body) in modules {
+            cfg.virtual_modules
+                .insert((*name).to_owned(), (*body).to_owned());
+        }
+        v2::expand_v2_source_to_objects("case.antics", src, &cfg).map(|o| o[0].air_source.clone())
+    };
+    let a = "pub enum Mode { A = 10 }\npub extern mod bridge { #[id(4000)] fn act(mode: Mode) -> Result; }\n";
+    let b = "pub enum Mode { B = 20 }\npub extern mod bridge { #[id(4000)] fn act(mode: Mode) -> Result; }\n";
+    let ping = "pub extern mod bridge { #[id(4001)] fn ping() -> Result; }\n";
+    let object =
+        "object \"Bridge Probe\" {\n    guid: 0x7F40_0A42;\n    init { bridge::ping()?; }\n}\n";
+    for (first, second) in [("a", "b"), ("b", "a")] {
+        let src = format!(
+            "use crate::{first}::bridge;\nuse crate::{second}::bridge;\n{}",
+            object.replace("ping()", "act(1)")
+        );
+        let err = compile(&[("crate::a", a), ("crate::b", b)], &src).expect_err("two Mode types");
+        assert!(
+            err.to_string()
+                .contains("both name types of their own module"),
+            "{err}"
+        );
+    }
+    let mut airs = Vec::new();
+    for (first, second) in [("a", "p"), ("p", "a")] {
+        let src = format!("use crate::{first}::bridge;\nuse crate::{second}::bridge;\n{object}");
+        airs.push(
+            compile(&[("crate::a", a), ("crate::p", ping)], &src)
+                .unwrap_or_else(|e| panic!("{first} then {second}: {e}")),
+        );
+    }
+    assert_eq!(airs[0], airs[1]);
+    // Tree 4000 under `left(i16)` and `right()`: `middle(i16)` conflicts with `right` in
+    // either order.
+    let dep = "pub extern mod bridge { #[id(4000)] fn middle(mode: i16) -> Result; }\n";
+    for local in [
+        "extern mod bridge {\n    #[id(4000)] fn left(mode: i16) -> Result;\n    #[id(4000)] fn right() -> bool;\n}\n",
+        "extern mod bridge {\n    #[id(4000)] fn right() -> bool;\n    #[id(4000)] fn left(mode: i16) -> Result;\n}\n",
+    ] {
+        let src = format!(
+            "use crate::dep::bridge;\n{local}{}",
+            object.replace("bridge::ping()?;", "if bridge::right() { temp[0] = 7; }")
+        );
+        let err = compile(&[("crate::dep", dep)], &src).expect_err("tree 4000 called two ways");
+        assert!(
+            err.to_string().contains("calls tree 4000 two ways"),
+            "{err}"
+        );
+    }
 }

@@ -574,7 +574,11 @@ impl<'a> TreeLowerer<'a> {
                 "find_best_object() expects a functional kind identifier (e.g. prep, cook)",
             ));
         };
-        let _ = functional_kind_info(kind_name, *kspan)?;
+        // `category4` (function 15) searches category-4 objects by a fixed score and has no
+        // callback, so only the untyped search takes it.
+        if !(kind_name == "category4" && type_args.is_empty()) {
+            functional_kind_info(kind_name, *kspan)?;
+        }
         if crate::parser::function_kind(kind_name)
             .is_some_and(|k| k.search == crate::parser::FunctionSearch::None)
         {

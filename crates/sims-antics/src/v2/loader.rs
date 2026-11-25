@@ -525,20 +525,46 @@ fn names_a_module_type(ty: &V2Type) -> bool {
     }
 }
 
-/// Merges two `extern mod` blocks bound to the same name: `base` (owned by `base_owner`, the
-/// binding that keeps its place) and `extra` (owned by `extra_owner`), e.g. a local
-/// `extern mod globals { .. }` and `use std::globals::*;`.
+/// Whether `f` names a type of its module (an enum, an object), which resolves in the scope
+/// that owns its declaration.
+fn names_module_types(f: &ExternFnDecl) -> bool {
+    f.params.iter().any(|p| names_a_module_type(&p.ty))
+        || matches!(&f.ret, ReturnAbi::Value { ty, .. } | ReturnAbi::ResultValue { ty, .. } if names_a_module_type(ty))
+}
+
+/// Merges two `extern mod` blocks bound to the same name, e.g. a local `extern mod globals { .. }`
+/// (owned by `a_owner`) and `use std::globals::*;` (owned by `b_owner`), into one block and the
+/// module that owns it.
 ///
-/// A fn both declare must be the same declaration (id, parameters, return). One tree id under two
-/// names must have one ABI. `extra`'s fns resolve their types in `base_owner`, so a fn of another
-/// module that names a module type (an enum, an object) cannot merge. Errors point at `at`.
+/// The merged block's types resolve in its owner, so only one side may name module types: that
+/// side owns the merge (otherwise the first does), and the merge is refused when both sides of
+/// two modules do. A fn both declare must be the same declaration (id, parameters, return), and
+/// each fn must call its tree the way every fn of the other side for that tree does. The result
+/// does not depend on which side comes first. Errors point at `at`.
 pub(crate) fn merge_extern_mods(
-    base_owner: &str,
-    base: &ExternModDecl,
-    extra_owner: &str,
-    extra: &ExternModDecl,
+    a_owner: &str,
+    a: &ExternModDecl,
+    b_owner: &str,
+    b: &ExternModDecl,
     at: Span,
-) -> Result<ExternModDecl> {
+) -> Result<(String, ExternModDecl)> {
+    let typed_a = a.fns.iter().find(|f| names_module_types(f));
+    let typed_b = b.fns.iter().find(|f| names_module_types(f));
+    let ((base_owner, base), (extra_owner, extra)) = match (typed_a, typed_b) {
+        (Some(fa), Some(fb)) if a_owner != b_owner => {
+            return Err(Error::at(
+                at,
+                format!(
+                    "extern mod '{}' cannot merge {a_owner}'s and {b_owner}'s declarations: both name types of their own module (`{}` and `{}`)",
+                    a.name,
+                    extern_fn_text(fa),
+                    extern_fn_text(fb)
+                ),
+            ));
+        }
+        (None, Some(_)) => ((b_owner, b), (a_owner, a)),
+        _ => ((a_owner, a), (b_owner, b)),
+    };
     let mut merged = base.clone();
     for f in &extra.fns {
         if let Some(b) = base.fns.iter().find(|b| b.name == f.name) {
@@ -562,8 +588,10 @@ pub(crate) fn merge_extern_mods(
                 ),
             ));
         }
-        if let Some(b) = base.fns.iter().find(|b| b.id == f.id)
-            && !same_extern_abi(b, f)
+        if let Some(b) = base
+            .fns
+            .iter()
+            .find(|b| b.id == f.id && !same_extern_abi(b, f))
         {
             return Err(Error::at(
                 at,
@@ -576,22 +604,9 @@ pub(crate) fn merge_extern_mods(
                 ),
             ));
         }
-        if base_owner != extra_owner
-            && (f.params.iter().any(|p| names_a_module_type(&p.ty))
-                || matches!(&f.ret, ReturnAbi::Value { ty, .. } | ReturnAbi::ResultValue { ty, .. } if names_a_module_type(ty)))
-        {
-            return Err(Error::at(
-                at,
-                format!(
-                    "extern mod '{}' cannot merge `{}` from {extra_owner}: it names a type of that module",
-                    base.name,
-                    extern_fn_text(f)
-                ),
-            ));
-        }
         merged.fns.push(f.clone());
     }
-    Ok(merged)
+    Ok((base_owner.to_owned(), merged))
 }
 
 /// The source of a built-in `std::<module>` (`use std::globals::*;`), if there is one.
@@ -863,8 +878,7 @@ impl<'a> ModuleLoader<'a> {
                     if let Some((base_owner, base)) = extern_mods.get(local_name) {
                         let merged =
                             merge_extern_mods(base_owner, base, &target_key, m_decl, item.span)?;
-                        let base_owner = base_owner.clone();
-                        extern_mods.insert(local_name.clone(), (base_owner, merged));
+                        extern_mods.insert(local_name.clone(), merged);
                         continue;
                     }
                     if name_taken {

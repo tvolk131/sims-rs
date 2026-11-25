@@ -58,6 +58,7 @@ impl<'a> TreeLowerer<'a> {
             sleep_span: None,
             stmt_marks: Vec::new(),
             inherited_entry_save: false,
+            inherit_tree: false,
             raw_reserved: Vec::new(),
         }
     }
@@ -334,10 +335,17 @@ impl<'a> TreeLowerer<'a> {
     }
 
     /// The running object's handle for its own cells and fields: the Sim handle, or the frame's
-    /// `me` (in an interaction the Sim is `me`; in a `context = inherit` tree `me` is whichever
-    /// object runs it). Both lower to `my.` cells.
+    /// `me` where it may be a Sim (in an interaction the Sim is `me`; in a `context = inherit`
+    /// tree `me` is whichever object runs it). Both lower to `my.` cells. In an object's own
+    /// tree `me` is the object, which has no Sim fields: only its raw cells
+    /// ([`Self::is_frame_me`]) apply there, and a `bcon me` table keeps its name.
     pub(super) fn is_my_ident(&self, name: &str) -> bool {
-        self.is_sim_ident(name) || self.is_frame_me(name)
+        self.is_sim_ident(name)
+            || (self.is_frame_me(name)
+                && (self.inherit_tree || matches!(self.tree_ctx, TreeContext::SimOnObject { .. }))
+                && !self
+                    .env
+                    .is_bcon_table_name(&self.owner_module, name, self.in_object_scope))
     }
 
     pub(super) fn is_self_ident(&self, name: &str) -> bool {

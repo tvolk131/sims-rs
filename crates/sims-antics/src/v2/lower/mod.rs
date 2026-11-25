@@ -716,6 +716,9 @@ struct TreeLowerer<'a> {
     /// the object pass's `__saved_stack_obj`, `finish` declares `__self_obj` (the entry stack
     /// object) first when the body reads it.
     inherited_entry_save: bool,
+    /// The tree is `#[context(inherit)]`: its `me` may be a Sim in either pass, so it reads the
+    /// Sim's typed fields like the Sim handle ([`TreeLowerer::is_my_ident`]).
+    inherit_tree: bool,
     /// The compiler's entry-object locals that a raw block of the tree declares, with the
     /// block's span: an error when the tree's lowering declares the same name (`finish`).
     raw_reserved: Vec<(&'static str, Span)>,

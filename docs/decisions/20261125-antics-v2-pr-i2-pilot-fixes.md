@@ -57,21 +57,26 @@ Three names stay but now mean the engine's function:
 - `repair` (function 14).
 
 `find_best_object(kind)` is refused for a kind the engine never searches, because it would always
-fail. A `functional` block's `score:` is accepted only for a scored kind.
+fail. The untyped search also takes `category4`, as raw `.air` does. A `functional` block's
+`score:` is accepted only for a scored kind.
 
 ### 2. A local `extern mod` merges with an imported one (`loader.rs` `merge_extern_mods`)
 
 `use std::globals::*;` together with an object's or module's own `extern mod globals { .. }` now
 gives one module holding both sets of functions.
 
-The merge is refused, with an error naming both owners, when:
+A declaration's types (an enum, an object) resolve in the module that owns it. The merged block
+has one owner, so only one side may name module types: that side owns the merge. The merge is
+refused, with an error naming both owners, when:
 
+- both sides, from two modules, name module types (two `Mode`s spelled alike may differ);
 - one name is declared twice with a different signature (parameter types or ABI slots, or
   return);
-- one tree id is reached two ways;
-- the extra declaration names a type of that module.
+- a function calls its tree differently from any function of the other side with that tree id
+  (every alias is checked, not only the first).
 
-The same declaration in both is fine. This applies to object-member `extern mod` blocks
+The same declaration in both is fine. Neither the result nor the refusal depends on import
+order. This applies to object-member `extern mod` blocks
 (merged with the module scope's block) and to glob and explicit imports into a scope that
 already binds the name.
 
@@ -99,8 +104,12 @@ methods the same way the `sim` handle does in a Sim tree. For example:
 const evaluation, callables, builtins and the stack-target checks. Lint runs on the lowered
 result, so lint and lowering agree.
 
-A local named `me` shadows the handle. A field nothing in scope has fails with "unknown field
-'me.f' (nothing in scope has it)".
+The Sim fields apply only where `me` may be a Sim: an inherit tree and a Sim tree. In an
+object's own tree (Init, Main, a plain `#[bhav] fn`), `me` is the object, so only its raw cells
+apply there, as on main. A `bcon me` table keeps its name. A local named `me` shadows the
+handle, and a cursor loop's body may not bind `me` (the loop checks its body against the names as
+they stand outside it). A field nothing in scope has fails with "unknown field 'me.f' (nothing in
+scope has it)".
 
 ### 5. Budget methods are bool expressions
 
@@ -110,8 +119,10 @@ extra local or node.
 
 ### 6. Bare exit arms
 
-A match arm's short form tries `break`, `continue` or `return` before an expression. So
-`1 => break,` lowers as the statement, and `fmt` keeps it.
+A match arm's short form takes `break` or `continue` followed by the arm's end, or `return` not
+followed by an assignment, as the exit. So `1 => break,` lowers as the statement, and `fmt`
+keeps it. A binding named `break` that the arm assigns (`_ => break += 1,`) still parses as the
+assignment.
 
 ### 7. `$Me` text and the entry save (`mir::text_words_unmoved`)
 
@@ -127,6 +138,14 @@ the text's reads `Unknown`, so the save stayed in any tree that formats text.
 tokens. A name holding `$Local:N` therefore reads word N, which can be any word. The objects
 carry a second fact, `text_reads_besides_me` (`mir::strings_read_besides_me`): the strings read
 with each `$Me` replaced by a space.
+
+A name without `$` can still complete a token that the source starts right before the `$Me`:
+- `$Local:$Me` with the name `0` reads word 0;
+- `$Loc$Me` with the name `al:0` reads word 0 too;
+- in `$TimeLocal:$Me$Local:0`, the name's digits and local 0's value become the hour token's
+  number.
+
+So a `$Me` right after a letter, digit, `_`, `-`, `:` or `$` leaves this fact `Unknown`.
 
 When the reads are `Unknown` only because of `$Me`:
 
@@ -144,9 +163,10 @@ The save stays when:
 
 #### The accepted gap
 
-A Sim or catalog name that itself contains a `$Local:N` naming the save's own word shows the entry
-object's id when the save is kept. When the save is dropped, it shows the token itself or an
-earlier frame's leftovers. No source local lives in that word, so no source value is shown wrong.
+A Sim or catalog name that itself contains `$` can form a token naming the save's own word (a name
+holding `$Local:1`, or ending in `$Local:` before source digits). With the save kept, that token
+shows the entry object's id. With the save dropped, it shows the token itself or an earlier
+frame's leftovers. No source local lives in that word, so no source value is shown wrong.
 
 #### Idle scratch counts only when allocated
 
@@ -156,9 +176,13 @@ idles (`AirLocalUsage::uses_idle_scratch`). Before this, the word was assumed fo
 
 ### 8. Cleanups
 
-- A bool helper with a constant tail, returned through `return h();` in a tree whose raw block
-  keeps the layout, gave the test node `if 1 == 0 { return true; } return false;`. It now
-  returns the constant directly, as the inline-branch path (no raw block) already did.
+- Not changed: a bool helper with a constant tail, returned through `return h();` in a tree whose
+  raw block keeps the layout, gives the test node `if 1 == 0 { return true; } return false;`.
+  That node sets the last result, and when the return ends an active action, `release_use`
+  records the last result in the action's flag. The call before the node may have left the other
+  result. So the node stays, and a test pins it.
+  - The inline-branch path (no raw block) already returns the constant without the node. Whether
+    that path changes the recorded result is a separate question, flagged to the coordinator.
 - A lint `allow` comment on its own line above an item's attributes (`#[bhav(..)]`) covers the
   attributes and the item's line, as it does directly above the item. Before this, it covered
   only the attribute line, and a finding on the `fn` line was still reported.
