@@ -16,9 +16,12 @@
 //!
 //! When the house changes under the routes, the lot forgets what they
 //! worked out ([`Interpreter::forget_routes`], 0x444805): the game going
-//! to live mode does so (0x416534), and the lot's move by an offset
-//! (0x444991, not ported). A route a person resumes after that starts
-//! again from what it has (`primitives/go_to_slot.rs`, 0x45aea5).
+//! to live mode does so (0x416534), and so does the lot's move by an
+//! offset (0x444991), which only the developer cheat `offset_world`
+//! reaches (0x4a557e → message 0x106 → 0x47be21). The port has no such
+//! move; a port of it must forget the routes first, as 0x444991 does. A
+//! route a person resumes after that starts again from what it has
+//! (`primitives/go_to_slot.rs`, 0x45aea5).
 
 mod planner;
 pub(crate) mod portals;
