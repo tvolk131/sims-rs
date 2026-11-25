@@ -408,3 +408,29 @@ fn for_loop_cursors_are_not_builtin_locals() {
     let behavioral = lift(source, true);
     has(tree(&behavioral, 4300), &["temp[1] = self.slot[3];"]);
 }
+
+#[test]
+fn a_raw_self_loop_keeps_its_comment_without_an_allow() {
+    // Lint does not look inside a raw body, so an allow over one would be stale.
+    let source = r#"object "Fable Kiln" {
+    guid: 0x7E00_015C;
+    #[bhav(id = 4300, locals = 0)]
+    fn trap() {
+        if temp[0] == 1 {
+            temp[1] = 1;
+            return true;
+        }
+        loop {
+            raw {
+                breakpoint(invalid_scope: 0xffff, index: -1) pad 0xff;
+            }
+        }
+    }
+}"#;
+    // `lift` checks the text lints clean. Strict mode keeps the whole tree raw.
+    let lifted = lift(source, true);
+    let trap = tree(&lifted, 4300);
+    assert!(trap.contains("loops on itself\n"), "{trap}");
+    assert!(trap.contains("loop {\n"), "{trap}");
+    lacks(trap, &["allow(unbounded_loop_without_yield)"]);
+}

@@ -4825,7 +4825,7 @@ impl Translator<'_> {
                 self.flush_raw(out);
                 // A primitive whose true branch is itself: the original's own loop (a
                 // breakpoint trap, for one), which runs until the VM errors the object out.
-                if let [
+                let allow = if let [
                     Stmt::Primitive {
                         prim,
                         branches: None,
@@ -4838,7 +4838,10 @@ impl Translator<'_> {
                     } else {
                         "// antics-lint: allow(unbounded_loop_without_yield): the original's node loops on itself"
                     });
-                }
+                    Some(out.lines.len() - 1)
+                } else {
+                    None
+                };
                 let start = out.lines.len();
                 out.line("loop {");
                 out.indent += 1;
@@ -4848,6 +4851,18 @@ impl Translator<'_> {
                 self.flush_raw(out);
                 out.indent -= 1;
                 out.line("}");
+                // Lint does not look inside a raw body, so an allow over one suppresses
+                // nothing (`stale_lint_allow`): it stays a plain comment, on the same line
+                // (statement ranges count lines).
+                if let Some(at) = allow
+                    && out.lines[at + 1..].iter().any(|l| l.trim() == "raw {")
+                {
+                    out.lines[at] = out.lines[at].replacen(
+                        "antics-lint: allow(unbounded_loop_without_yield): the",
+                        "The",
+                        1,
+                    );
+                }
                 self.record(id, start, out);
             }
             _ => match self.simple(s) {

@@ -162,6 +162,15 @@ Two more cases count as wave 2:
 - **Unblamed failures.** A failure blamed on no tree drops wave 2 in every tree
   (`drop_all_wave2`) before every tree's extras.
 
+## Decision 6: no `allow` over a raw loop body
+
+- A primitive whose true branch is itself is written `loop { .. }` under
+  `// antics-lint: allow(unbounded_loop_without_yield): ..`.
+- When that primitive is written raw, lint does not look inside the body. The allow then
+  suppresses nothing, and lint `stale_lint_allow` (#467) reports it.
+- So a loop with a raw body keeps the comment's text without the allow, on the same line.
+  Statement ranges count lines, so no line moves.
+
 ## Round order
 
 Two fallback chains change.
@@ -203,9 +212,10 @@ Two fallback chains change.
 
 ## Results (full corpus, same install)
 
-- **Before** is `main` (d7ae63738); **after** is this change.
+- **Before** is `main` (b4bbe414e, after #467 and #468); **after** is this change merged
+  with it.
 - Both cover 1,192 candidate entries in each mode: 1,191 objects lifted and 0 timeouts.
-- Lint is counted with the after build on both outputs.
+- Lint is counted with the after build on both outputs, with #467's rules.
 - In the table, `if !..return error` counts `if !<test> { return error; }` statements, and
   `?` counts `?;` lines.
 
@@ -219,15 +229,17 @@ Two fallback chains change.
 | `raw {}` blocks (inline and whole-tree) | 19,887 | 19,534 | 22,721 | 13,167 |
 | `if !..return error` | 1,313 | 583 | 33,497 | 5,905 |
 | `?` | 199 | 2,028 | 1,218 | 31,286 |
-| Lines | 971,842 | 965,811 | 1,137,208 | 953,299 |
+| Lines | 969,526 | 963,495 | 1,134,892 | 950,983 |
 | fmt-dirty files | 0 | 0 | 0 | 0 |
-| Lint findings | 12 | 10 | 100 | 52 |
+| Lint findings | 36 | 12 | 761 | 117 |
+| `manual_raw_has_builtin` | 24 | 2 | 577 | 64 |
+| `stale_lint_allow` | 0 | 0 | 84 | 1 |
 | `frame_headroom` | 3 | 3 | 70 | 46 |
 | `negated_comparison` | 9 | 7 | 27 | 3 |
 | `collapsible_if_chain` | 0 | 0 | 3 | 3 |
 | `untyped_engine_field` | 0 | 0 | 0 | 0 |
-| Wall time, 10 workers | 108 s | 103 s | 70 s | 70 s |
-| Slowest object | 52 s | 35 s | 26 s | 11 s |
+| Wall time, 10 workers | 85 s | 84 s | 66 s | 66 s |
+| Slowest object | 23 s | 24 s | 19 s | 10 s |
 
 - **Verdicts.** Every count is unchanged. Per file, no tree loses a proof.
 - **Idiomatic trees.** No file has fewer idiomatic trees in either mode.
@@ -242,8 +254,8 @@ Two fallback chains change.
 - **Remaining `if !..return error` in behavioral mode.** About 1,800 test a call. These sit
   inside an animation event handler or a raw block, or their tree dropped the new spellings
   or its extras. The rest test a comparison, not a call.
-- **Time.** The host's load average was between 10 and 150 during these runs, and above
-  60 for the strict after run.
+- **The `stale_lint_allow` left** is over `loop { destroy_self(); }`, which `main` has too.
+- **Time.** The host's load average was between 15 and 75 during these runs.
 
 ## Follow-ups
 
