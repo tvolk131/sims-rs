@@ -1818,9 +1818,11 @@ fn pr_i3_review_round_2_regressions() {
         stack_obj.object_type == self.object_type
     }",
     );
+    // The switch to `my.id` puts back `o`, the cursor the tree assigned (PR I-4), not the entry
+    // object.
     has(
         &b,
-        "stack_obj := param[0];\n    let __cmp_l_0 = scope(21, 9);\n    stack_obj := my.id;",
+        "stack_obj := param[0];\n    let __cmp_l_0 = scope(21, 9);\n    let __pre_stack_obj_2 = stack_obj;\n    stack_obj := my.id;\n    let __fdata_1 = scope(21, 9);\n    stack_obj := __pre_stack_obj_2;",
     );
     // The found cursor a functional's argument left is restored even at the exit.
     let b = body("    #[bhav] fn a() { stack_obj.run_functional(4, find_best_object(cook)); }");

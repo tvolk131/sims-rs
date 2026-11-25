@@ -46,7 +46,7 @@ impl<'a> TreeLowerer<'a> {
     }
 
     pub(super) fn save_stack_obj_for_move(&mut self) -> Option<String> {
-        self.explicit_stack_obj.then(|| {
+        (self.explicit_stack_obj || self.reassigns_stack_obj).then(|| {
             let saved = self.fresh("pre_stack_obj");
             self.stack_op(mir::StackObjOp::Save(&saved));
             saved

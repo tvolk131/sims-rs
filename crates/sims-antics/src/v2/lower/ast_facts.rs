@@ -937,6 +937,17 @@ pub(super) fn expr_may_clobber_stack_obj(
 }
 
 impl ExplicitStackOps {
+    /// Whether a tree body may leave the cursor resting on another object than the entry object:
+    /// it steps it explicitly (as [`Self::default`] counts) or assigns `stack_obj` (directly,
+    /// through a helper, or as `&mut stack_obj`). After `stack_obj = o;` a builtin that moves the
+    /// cursor must put back `o`, not the entry object.
+    pub(super) fn for_tree() -> Self {
+        Self {
+            assignments: true,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn in_stmts(
         &mut self,
         stmts: &[V2Stmt],

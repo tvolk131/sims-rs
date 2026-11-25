@@ -21,6 +21,7 @@ impl<'a> TreeLowerer<'a> {
             in_object_scope: true,
             has_self_obj_local,
             explicit_stack_obj: false,
+            reassigns_stack_obj: false,
             sets_stack_obj: false,
             used_saved_stack_obj: false,
             value_return: None,

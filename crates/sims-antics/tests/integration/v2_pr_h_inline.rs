@@ -65,6 +65,13 @@ fn assert_inlined(helpers: &str, args: &str, with_helper: &str, hand_inline: &st
     assert_eq!(nodes(actual), nodes(&expected.behaviors[&PROBE]));
 }
 
+/// The probe tree's `.air` for `with_helper` is `air` exactly, with no inline scaffolding.
+fn assert_air(helpers: &str, with_helper: &str, air: &str) {
+    let got = expand(&source(helpers, "", with_helper));
+    assert_no_scaffolding(&got);
+    assert_eq!(got, air);
+}
+
 #[test]
 fn void_return_breaks_out_of_the_helper() {
     assert_inlined(
@@ -118,34 +125,46 @@ fn negated_if_and_try_use_their_own_exit_polarities() {
         temp[1] = 3;
         return true;
     }"#;
-    for (call, exit) in [
-        ("if !ready() { return false; }", "return false;"),
-        ("ready()?;", "return error;"),
-    ] {
-        assert_inlined(
-            helper,
-            "",
-            &format!("{call} self.n = 2; return true;"),
-            &format!("if temp[0] == 0 {{ {exit} }} temp[1] = 3; self.n = 2; return true;"),
-            0,
-        );
-    }
+    // An error exit records no result, so it needs no test of its own.
+    assert_inlined(
+        helper,
+        "",
+        "ready()?; self.n = 2; return true;",
+        "if temp[0] == 0 { return error; } temp[1] = 3; self.n = 2; return true;",
+        0,
+    );
+    // The false exit gets a `1 == 0` test: the node before it (`temp[0] == 0`, taken) left
+    // `true` as the last result, and a called tree would have left `false` (PR I-4).
+    assert_air(
+        helper,
+        "if !ready() { return false; } self.n = 2; return true;",
+        "tree 4300 \"Probe\" {\n    if temp[0] == 0 {\n        if 1 == 0 {\n        }\n        return false;\n    }\n    temp[1] := 3;\n    my.attr[0] := 2;\n    return true;\n}",
+    );
 }
 
 #[test]
 fn bool_tail_return_goes_straight_to_the_tree_exits() {
-    assert_inlined(
+    // The tail condition's own tests route to the exits; the early constant `false` gets a
+    // `1 == 0` test, since the taken `temp[0] == 0` left `true` as the last result (PR I-4).
+    assert_air(
         r#"fn ready() -> bool {
             if temp[0] == 0 { return false; }
             return temp[1] > 7 && temp[2] != 4;
         }"#,
+        "return ready();",
+        "tree 4300 \"Probe\" {\n    if temp[0] == 0 {\n        if 1 == 0 {\n        }\n        return false;\n    }\n    if temp[1] > 7 {\n        if temp[2] != 4 {\n            return true;\n        }\n        return false;\n    }\n    return false;\n}",
+    );
+    // A constant that matches the last result needs no test: here the taken `temp[0] != 0`
+    // already left `true`.
+    assert_inlined(
+        r#"fn ready() -> bool {
+            if temp[0] != 0 { return true; }
+            return temp[1] > 7;
+        }"#,
         "",
         "return ready();",
-        r#"if temp[0] == 0 { return false; }
-        if temp[1] > 7 {
-            if temp[2] != 4 { return true; }
-            return false;
-        }
+        r#"if temp[0] != 0 { return true; }
+        if temp[1] > 7 { return true; }
         return false;"#,
         0,
     );
@@ -425,14 +444,11 @@ fn result_helper_error_remains_the_tree_error_exit() {
             if temp[1] > 0 { return false; }
             return true;
         }"#;
-    assert_inlined(
+    // Each constant exit gets a test that leaves its value as the last result (PR I-4).
+    assert_air(
         helper,
-        "",
         "return check();",
-        r#"if temp[0] > 0 { return error; }
-        if temp[1] > 0 { return false; }
-        return true;"#,
-        0,
+        "tree 4300 \"Probe\" {\n    if temp[0] > 0 {\n        return error;\n    }\n    if temp[1] > 0 {\n        if 1 == 0 {\n        }\n        return false;\n    }\n    if 1 == 1 {\n        return true;\n    }\n}",
     );
     assert_inlined(
         helper,

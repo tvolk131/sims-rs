@@ -1177,17 +1177,17 @@ impl<'a> TreeLowerer<'a> {
     }
 
     /// A helper's `return <cond>;` routing the caller's branch
-    /// ([`Self::emit_inline_bool_edges`]): a constant condition still emits a test node, so the
-    /// arm sees the condition as the last result (as a non-constant condition's test leaves it,
-    /// and as a called tree's return would), not the result of the primitive before it. Ending
-    /// an active action records that result (`release_use`), and primitives such as
-    /// `gosub_found_action` read it.
+    /// ([`Self::emit_inline_bool_edges`]): when a constant condition's arm exits the tree with a
+    /// result (`return true;` / `return false;`, as `return h();` gives), a test node still
+    /// leaves the condition as the last result, as a non-constant condition's test does and as
+    /// a called tree's return would, not the result of the node before it. Ending an active
+    /// action records that result (`release_use`).
     ///
-    /// The node is left out where nothing can see the difference: when the taken arm (`arms`
-    /// gives each edge's `.air`) starts with a cell assignment, which sets the last result
-    /// before anything reads it; or when the condition is `true` and the node before is a cell
-    /// assignment, which already left `true` (Expression's assignments return true). Local
-    /// assignments do not count, since the optimizer may drop them.
+    /// The node is left out when the node before already left the value
+    /// ([`Self::last_node_result`]), and for any other arm: its own nodes, or the caller's code
+    /// after the call, decide the last result (as they do after a call node). A raw block's
+    /// layout keeps the test in every case. The test is `if 1 == 1 { <arm> }` for `true` and
+    /// `if 1 == 0 { } <arm>` for `false`, so only the taken arm is emitted.
     pub(super) fn emit_inline_return_edges(
         &mut self,
         expr: &V2Expr,
@@ -1209,20 +1209,47 @@ impl<'a> TreeLowerer<'a> {
             return self.emit_inline_bool_edges(expr, terminal, edge);
         };
         let taken = if value { arms.0 } else { arms.1 };
-        let arm_resets = taken.lines().next().is_some_and(is_cell_assignment);
-        let already_true = value
-            && self
-                .em
-                .text()
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .is_some_and(is_cell_assignment);
-        if arm_resets || already_true {
+        let exits_with_result = taken
+            .lines()
+            .next()
+            .is_some_and(|l| matches!(l.trim(), "return true;" | "return false;"));
+        if !exits_with_result || self.last_node_result() == Some(value) {
             return edge(self, value);
         }
-        let test = if value { "1 == 1" } else { "1 == 0" };
-        self.emit_test_edges(test, None, terminal, edge)
+        if value {
+            self.line("if 1 == 1 {".to_owned());
+            self.em.indent();
+            edge(self, true)?;
+            self.em.dedent();
+            self.line("}".to_owned());
+        } else {
+            self.line("if 1 == 0 {".to_owned());
+            self.line("}".to_owned());
+            edge(self, false)?;
+        }
+        Ok(())
+    }
+
+    /// The last result the node just emitted leaves on the straight-line path to the next
+    /// line, when the text shows it: `true` after a cell assignment (Expression's assignments
+    /// return true); the branch's polarity first thing in an `if <test> {` arm (a node branches on
+    /// its result). `None` when unknown.
+    fn last_node_result(&self) -> Option<bool> {
+        let line = self
+            .em
+            .text()
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())?
+            .trim();
+        if is_cell_assignment(line) {
+            return Some(true);
+        }
+        let test = line.strip_prefix("if ")?.strip_suffix(" {")?;
+        if test.contains("&&") || test.contains("||") {
+            return None;
+        }
+        Some(!test.starts_with('!'))
     }
 
     /// `if <test> { <true edge> } <false edge>` (or an `else` arm when not `terminal`); each

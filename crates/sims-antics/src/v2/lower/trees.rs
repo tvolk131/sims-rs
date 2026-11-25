@@ -153,6 +153,8 @@ pub(super) fn lower_standalone_tree(
     let mut ctx = TreeLowerer::new(env, tree_ctx, &t.owner_module, needs_self_save);
     ctx.inherit_tree = t.decl.inherit_context;
     let explicit = ExplicitStackOps::default().in_stmts(&d.body, env, &t.owner_module, true);
+    ctx.reassigns_stack_obj =
+        ExplicitStackOps::for_tree().in_stmts(&d.body, env, &t.owner_module, true);
     if checking_inherited_sim {
         ctx.track_stack_obj(explicit);
         ctx.inherited_entry_save = true;
@@ -363,6 +365,12 @@ pub(super) fn emit_guard_tree(
         needs_self_save,
     );
     let mut stack_ops = ExplicitStackOps::default();
+    ctx.reassigns_stack_obj = match &guard.kind {
+        GuardBody::Expr(e) => ExplicitStackOps::for_tree().in_expr(e, env, owner_module, true),
+        GuardBody::Block(stmts) => {
+            ExplicitStackOps::for_tree().in_stmts(stmts, env, owner_module, true)
+        }
+    };
     ctx.begin_body(match &guard.kind {
         GuardBody::Expr(e) => stack_ops.in_expr(e, env, owner_module, true),
         GuardBody::Block(stmts) => stack_ops.in_stmts(stmts, env, owner_module, true),

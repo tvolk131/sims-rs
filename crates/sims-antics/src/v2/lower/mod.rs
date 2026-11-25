@@ -704,6 +704,10 @@ struct TreeLowerer<'a> {
     /// This tree explicitly uses the frame's stack object as a persistent cursor. Temporary
     /// moves must restore its pre-operation value, which may differ from the entry object.
     explicit_stack_obj: bool,
+    /// The tree assigns `stack_obj` (directly, through a helper, or as `&mut stack_obj`), or
+    /// steps it explicitly: the cursor may rest on another object than the entry object, so a
+    /// builtin that moves it saves and restores it rather than putting back the entry object.
+    reassigns_stack_obj: bool,
     /// The source assigns `stack_obj` itself (`stack_obj = x;`), so the stack object the tree
     /// leaves at exit is the source's: no store of it is dropped as dead at the exit
     /// (`mir::FrameFacts::keeps_exit_stack_obj`).

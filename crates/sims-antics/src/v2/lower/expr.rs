@@ -47,6 +47,64 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// Returns `true` iff reading `expr` may fault at runtime: any read through another object
+    /// than `self` or the Sim (the stack object, a foreign handle, a neighbor) faults when that
+    /// object is gone. Locals, temps, globals, parameters, constants and `self`/`my` cells never do.
+    /// `self_ok` also trusts `self` read through a cursor that may have moved: the caller writes
+    /// through that same cursor first, so a gone object faults before anything is written.
+    pub(super) fn expr_may_fault_read(&self, expr: &V2Expr, self_ok: bool) -> bool {
+        if self.expr_may_trap_arith(expr) {
+            return true;
+        }
+        let safe_self = |name: &str| {
+            self.is_self_ident(name)
+                && (self_ok
+                    || self.self_prefix() == "my"
+                    || !(self.explicit_stack_obj || self.reassigns_stack_obj))
+        };
+        match expr {
+            V2Expr::Int(..)
+            | V2Expr::Bool(..)
+            | V2Expr::Str(..)
+            | V2Expr::Path(..)
+            | V2Expr::Ident(..) => false,
+            V2Expr::Binary { lhs, rhs, .. } => {
+                self.expr_may_fault_read(lhs, self_ok) || self.expr_may_fault_read(rhs, self_ok)
+            }
+            V2Expr::Unary { inner, .. } => self.expr_may_fault_read(inner, self_ok),
+            V2Expr::Tuple(_, elems) => elems.iter().any(|e| self.expr_may_fault_read(e, self_ok)),
+            V2Expr::Field { base, .. } => match base.as_ref() {
+                V2Expr::Ident(_, b) => {
+                    !(self.is_bcon_table_ref(b) || safe_self(b) || self.is_my_ident(b))
+                }
+                V2Expr::Field {
+                    base: root, field, ..
+                } => {
+                    !(matches!(root.as_ref(), V2Expr::Ident(_, r) if self.is_my_ident(r))
+                        && matches!(field.as_str(), "motive" | "skill"))
+                }
+                _ => true,
+            },
+            V2Expr::Index { base, index, .. } => {
+                if self.expr_may_fault_read(index, self_ok) {
+                    return true;
+                }
+                match base.as_ref() {
+                    V2Expr::Ident(_, b) => !matches!(b.as_str(), "temp" | "global"),
+                    V2Expr::Field {
+                        base: root, field, ..
+                    } => {
+                        !(matches!(root.as_ref(), V2Expr::Ident(_, r)
+                            if safe_self(r) || self.is_my_ident(r))
+                            && matches!(field.as_str(), "attr" | "data"))
+                    }
+                    _ => true,
+                }
+            }
+            _ => true,
+        }
+    }
+
     /// Returns `true` iff `expr` can be lowered directly in-place into `dst_air` without aliasing,
     /// partial writes on trap, observable VM write side effects, or premature motive/skill clamping!
     pub(super) fn can_lower_arith_in_place(
@@ -70,6 +128,26 @@ impl<'a> TreeLowerer<'a> {
             return false;
         }
         let (base, ops) = flatten_arith_chain(expr);
+        // In place, `dst := base; dst op= rhs; ...` has already written `dst` when a later operand
+        // read faults (an invalid stack object, say), leaving the observable cell half-updated.
+        if !is_fresh_local {
+            let self_ok = canon_dst.starts_with(&format!("{}.", self.self_prefix()));
+            let neg_inner = match base {
+                V2Expr::Unary {
+                    op: V2UnaryOp::Neg,
+                    inner,
+                    ..
+                } => Some(inner.as_ref()),
+                _ => None,
+            };
+            if neg_inner.is_some_and(|e| self.expr_may_fault_read(e, self_ok))
+                || ops
+                    .iter()
+                    .any(|(_, rhs)| self.expr_may_fault_read(rhs, self_ok))
+            {
+                return false;
+            }
+        }
         if ops.is_empty() {
             if let V2Expr::Unary {
                 op: V2UnaryOp::Neg,
