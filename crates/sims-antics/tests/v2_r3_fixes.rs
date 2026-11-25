@@ -383,48 +383,20 @@ fn push_interaction_reads_a_slot_handle_in_place() {
     assert!(err.message.contains("implied by an object handle"), "{err}");
 }
 
-/// `job_data(..) == k` reads the career cell in the comparison node itself; a comparison whose
-/// other side lowers to setup keeps the copy.
+/// `job_data(..) == k` keeps main's copy into a local: dropping it would remove a frame word,
+/// and a tree's frame size is observable (Create Object passes `temp[0]` to a new object's
+/// `main` only when that frame has a word for it).
 #[test]
-fn job_data_compares_without_a_copy() {
+fn job_data_comparisons_keep_their_copy() {
     let src = obj(
         "Plain",
         r#"    tree a (sim: Sim) {
         return job_data(sim.person[60], sim.person[61], 22) == 1;
-    }
-    tree b (sim: Sim) {
-        return job_data(sim.person[60], sim.person[61], 22) == job_data(1, 2, 3);
     }"#,
     );
     let air = expand("job_cmp.antics", &src);
     let a = tree(&air, "a");
-    assert!(a.contains("if scope(33, 22) == 1 {"), "{a}");
-    assert!(!a.contains("__job"), "{a}");
-    let b = tree(&air, "b");
-    assert!(b.contains("let __job_0 = scope(33, 22);"), "{b}");
-}
-
-/// Dropping a `job_data` comparison's copy removes a node, an Expression and a local. A raw
-/// label may be reached from raw code that counts on them, so a tree whose raw blocks define a
-/// label keeps the copy.
-#[test]
-fn a_raw_label_keeps_the_job_data_copy() {
-    let src = obj(
-        "Plain",
-        r#"    tree a (sim: Sim) {
-        raw { @again: temp[3] := 1; }
-        if job_data(1, 1, 0) == 1 {
-            temp[4] = 1;
-        }
-        if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
-            return false;
-        }
-        raw { random(temp[2], 1) -> true: @again, false: false; }
-    }"#,
-    );
-    let air = expand("raw_back_edge.antics", &src);
-    let a = tree(&air, "a");
-    assert!(!a.contains("if scope(33, 0) == 1"), "the copy stays:\n{a}");
+    assert!(a.contains("let __job_0 = scope(33, 22);"), "{a}");
 }
 
 /// `.air` keeps `param[0]` in the word after the named locals around an `idle` when a tree uses
@@ -445,21 +417,6 @@ fn dialog_entry_save_stays_when_text_may_read_the_idle_scratch_word() {
     assert!(!tree(&air, "a").contains(SAVE), "{air}");
 }
 
-/// The VM resolves a comparison's right operand first, so `job_data(..) <op> x` reads the cell
-/// in place only when `x` cannot fault; a temp keeps the copy (the career lookup faults first).
-#[test]
-fn job_data_compares_in_place_only_against_a_constant() {
-    let src = obj(
-        "Plain",
-        r#"    tree a (sim: Sim) {
-        return job_data(9999, 1, 22) == temp[99];
-    }"#,
-    );
-    let air = expand("job_temp.antics", &src);
-    let a = tree(&air, "a");
-    assert!(a.contains("let __job"), "{a}");
-}
-
 /// An out-operand that writes on only one exit leaves the old value on the other: the loop
 /// exits when `animate` returns true, which does not write `ev`, so its initial 7 must stay.
 #[test]
@@ -478,28 +435,6 @@ fn an_out_operand_keeps_the_old_value_on_the_exit_it_does_not_write() {
     let air = expand("out_keep.antics", &src);
     let a = tree(&air, "a");
     assert!(a.contains("= 7;"), "the initial store stays:\n{a}");
-}
-
-/// A branch to a node by number counts the removed node, so a named primitive with one keeps
-/// the copy too. (The `mir` body parser does not read positional targets either, so the residue
-/// check also keeps it.)
-#[test]
-fn a_positional_raw_branch_keeps_the_job_data_copy() {
-    let src = obj(
-        "Plain",
-        r#"    tree a (sim: Sim) {
-        if job_data(1, 1, 0) == 1 {
-            temp[4] = 1;
-        }
-        if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
-            return false;
-        }
-        raw { random(temp[2], 1) -> true: 1, false: false; }
-    }"#,
-    );
-    let air = expand("raw_positional.antics", &src);
-    let a = tree(&air, "a");
-    assert!(!a.contains("if scope(33, 0) == 1"), "the copy stays:\n{a}");
 }
 
 /// A padded raw action string formats text like a plain one, so a string that may read a
@@ -540,35 +475,11 @@ fn frame_locals_sets_no_allocation_floor() {
     assert!(a.contains("local[0] := stack_obj;"), "{a}");
 }
 
-/// A raw block of the tree may branch to a label an inlined helper's raw block emits, so a
-/// helper's label also keeps the copy.
-#[test]
-fn a_helper_raw_label_keeps_the_job_data_copy() {
-    let src = obj(
-        "Plain",
-        r#"    fn checkpoint() {
-        raw { @again: temp[3] := 1; }
-    }
-    tree a (sim: Sim) {
-        checkpoint();
-        if job_data(1, 1, 0) == 1 {
-            temp[4] = 1;
-        }
-        if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
-            return false;
-        }
-        raw { random(temp[2], 1) -> true: @again, false: false; }
-    }"#,
-    );
-    let air = expand("raw_helper_label.antics", &src);
-    let a = tree(&air, "a");
-    assert!(!a.contains("if scope(33, 0) == 1"), "the copy stays:\n{a}");
-}
-
 /// The inherit check reads the entry object from `.air` tokens, so a comment naming it is not a
-/// read; a raw block may not declare a local, constant or label of that name.
+/// read. A raw block may not declare a local, constant or label of a name its tree's lowering
+/// declares too, and may declare one otherwise.
 #[test]
-fn inherit_check_ignores_comments_and_raw_blocks_cannot_declare_the_entry_object() {
+fn inherit_check_ignores_comments_and_raw_blocks_declare_no_compiler_local() {
     let quiet = |raw: &str| {
         obj(
             "Plain",
@@ -585,7 +496,6 @@ fn inherit_check_ignores_comments_and_raw_blocks_cannot_declare_the_entry_object
         "raw { let __self_obj = 1; temp[0] := __self_obj; }",
         "raw { const __self_obj = 7; temp[0] := __self_obj; }",
         "raw { @__self_obj: temp[0] := 1; }",
-        "raw { let __saved_stack_obj = 1; temp[0] := __saved_stack_obj; }",
     ] {
         let err = compile_v2_source(
             "inherit_reserved.antics",
@@ -598,6 +508,20 @@ fn inherit_check_ignores_comments_and_raw_blocks_cannot_declare_the_entry_object
             "{raw}: {err}"
         );
     }
+    // A tree whose lowering declares no such local may declare one, as on main.
+    expand(
+        "inherit_saved_name.antics",
+        &quiet("raw { let __saved_stack_obj = 1; temp[0] := __saved_stack_obj; }"),
+    );
+    let plain = obj(
+        "Plain",
+        "    tree probe {\n        raw { const __self_obj = 17; temp[3] := __self_obj; }\n    }",
+    );
+    let air = expand("raw_const_self.antics", &plain);
+    assert!(
+        tree(&air, "probe").contains("const __self_obj = 17;"),
+        "{air}"
+    );
 }
 
 /// Two helpers' out-operand locals that happen to share a spelling are distinct source locals:
@@ -630,51 +554,6 @@ fn same_spelled_out_operand_locals_of_different_helpers_do_not_share() {
     assert_eq!(a.matches("let __inline_v_event_").count(), 2, "{a}");
     let b = tree(&air, "b");
     assert_eq!(b.matches("let __inline_v_event_").count(), 1, "{b}");
-}
-
-/// A raw label can reach the tree from routes the source does not show as a call: a parameter
-/// default that calls a helper, and a helper named like the `animate` statement. The emitted
-/// `.air` decides, so both keep the `job_data` copy.
-#[test]
-fn raw_labels_from_defaults_and_statement_named_helpers_keep_the_job_data_copy() {
-    let tail = r#"
-        if job_data(1, 1, 0) == 1 {
-            temp[4] = 1;
-        }
-        if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
-            return false;
-        }
-        raw { random(temp[2], 1) -> true: @again, false: false; }
-    }"#;
-    let default = format!(
-        r#"    fn checkpoint() -> bool {{
-        raw {{ @again: temp[3] := 1; }}
-        return temp[0] == 0;
-    }}
-    fn use_default(x: i16 = if checkpoint() {{ 1 }} else {{ 2 }}) {{
-        temp[0] = x;
-    }}
-    tree a (sim: Sim) {{
-        use_default();{tail}"#
-    );
-    let animate = format!(
-        r#"    fn animate() {{
-        raw {{ @again: temp[3] := 1; }}
-    }}
-    tree a (sim: Sim) {{
-        animate();{tail}"#
-    );
-    for (name, members) in [
-        ("raw_default.antics", default),
-        ("raw_animate.antics", animate),
-    ] {
-        let air = expand(name, &obj("Plain", &members));
-        let a = tree(&air, "a");
-        assert!(
-            !a.contains("if scope(33, 0) == 1"),
-            "{name}: the copy stays:\n{a}"
-        );
-    }
 }
 
 /// `let Some(x)` bindings of different helpers are distinct declarations, and copies of one
@@ -723,29 +602,9 @@ fn out_operand_groups_follow_declarations_through_let_some_and_specialization() 
 }
 
 /// Every Expression node sets the scratch pointer that a later read of global 34 depends on, so
-/// a tree that may read global 34 keeps the `job_data` copy, and keeps its dialog entry save, as
-/// on main.
+/// a tree that may read global 34 keeps its dialog entry save, as on main.
 #[test]
-fn a_tree_that_may_read_global_34_keeps_its_expressions() {
-    let src = obj(
-        "Plain",
-        r#"    tree a (sim: Sim) {
-        if job_data(1, 1, 0) == 1 {
-            temp[2] = global[34];
-        }
-        return false;
-    }"#,
-    );
-    let air = expand("global34_job.antics", &src);
-    let a = tree(&air, "a");
-    assert!(!a.contains("if scope(33, 0) == 1"), "the copy stays:\n{a}");
-    // Another global leaves the comparison in place.
-    let air = expand(
-        "global5_job.antics",
-        &src.replace("global[34]", "global[5]"),
-    );
-    let a = tree(&air, "a");
-    assert!(a.contains("if scope(33, 0) == 1"), "in place:\n{a}");
+fn a_tree_that_may_read_global_34_keeps_its_entry_save() {
     let src = obj(
         "Plain",
         r#"    tree a (sim: Sim) {
@@ -853,28 +712,6 @@ fn a_raw_op_with_a_named_opcode_may_read_global_34() {
     );
 }
 
-/// Dropping the `job_data` copy's local moves the named locals after it, so a tree whose text
-/// may read a frame word keeps the copy.
-#[test]
-fn text_that_reads_frame_words_keeps_the_job_data_copy() {
-    let src = obj(
-        "Number $Local:2",
-        r#"    tree a (sim: Sim) {
-        if job_data(1, 1, 0) == 1 {
-            sim.person[4] = 1;
-        }
-        let n = sim.person[3];
-        stack_obj.attr[1] = n;
-        dialog(kind: ok, title: title, message: msg, icon_mode: 1);
-        set_to_next(all, dest: stack_obj);
-        stack_obj.attr[1] = self.value;
-    }"#,
-    );
-    let air = expand("text_prefix.antics", &src);
-    let a = tree(&air, "a");
-    assert!(!a.contains("if scope(33, 0) == 1"), "the copy stays:\n{a}");
-}
-
 /// A raw block may declare a qualified constant whose first part is spelled like the entry
 /// object: it declares neither the entry object nor a read of it.
 #[test]
@@ -888,28 +725,6 @@ fn a_qualified_raw_constant_is_not_the_entry_object() {
 "#;
     let air = expand("raw_qualified.antics", src);
     assert!(!tree(&air, "a").contains("= stack_obj"), "{air}");
-}
-
-/// A `job_data` comparison without its copy still reads its arguments in source order: the
-/// level before the career.
-#[test]
-fn a_job_data_comparison_reads_its_arguments_in_order() {
-    let src = obj(
-        "Plain",
-        r#"    tree c (sim: Sim) {
-        if job_data(level: temp[8], career: self.data[25], field: 0) == 1 {
-            return false;
-        }
-        set_to_next(all, dest: stack_obj);
-    }"#,
-    );
-    let air = expand("job_order.antics", &src);
-    let c = tree(&air, "c");
-    let (temp, data) = (
-        c.find("temp[8]").unwrap(),
-        c.find("stack.data[25]").unwrap(),
-    );
-    assert!(temp < data, "the level is read first:\n{c}");
 }
 
 /// The raw-layout path keeps the entry save of a tree that may read global 34.
@@ -975,24 +790,4 @@ fn text_that_reads_a_moved_word_keeps_the_push_interaction_copy() {
     let air = expand("pin_plain.antics", &obj("Plain", members));
     let a = tree(&air, "a");
     assert!(a.contains("local[0] := stack_obj;"), "pinned:\n{a}");
-}
-
-/// Dropping the `job_data` copy's local moves the named locals after it down a word, so a tree
-/// that reads a local before writing it (what an earlier frame left in its word) keeps the copy.
-#[test]
-fn a_local_read_before_its_write_keeps_the_job_data_copy() {
-    let src = r#"object "Round Three" {
-    guid: 0x7F40_0900;
-    tree probe {
-        if job_data(1, 1, 0) == 1 {
-            temp[3] = 21;
-        }
-        let residue: i16;
-        temp[4] = residue;
-    }
-}
-"#;
-    let air = expand("job_residue.antics", src);
-    let a = tree(&air, "probe");
-    assert!(!a.contains("if scope(33, 0) == 1"), "the copy stays:\n{a}");
 }

@@ -27,7 +27,8 @@ The Round 3 pilots (13 objects, Batches 1–4 plus Fridges) found these lowering
   - a Sim tree staged `self.*` reads through a `__pre_stack_obj` local even before its first
     cursor move (Batch 1 Stoves 4110 R3-6; kept, see section 5);
   - `push_interaction(object: <@slot let>)` was refused (CashRegisters 4098 gap 3);
-  - `job_data(..) == k` went through a fresh `__job` local (Dressers 4117 bug 3).
+  - `job_data(..) == k` went through a fresh `__job` local (Dressers 4117 bug 3; kept, see
+    section 5).
 
 ## Decision
 
@@ -129,8 +130,11 @@ declaration order, so generated names no longer matter.
 
 - The Sim pass declares its implicit entry object (`__self_obj`) when the body reads it, as the
   object pass declares `__saved_stack_obj`. A read is an `.air` token naming it, so a comment, a
-  field after a dot and the tree a raw `call x` or `subroutine(x)` names do not count. A raw block may read `__self_obj` or `__saved_stack_obj` but may not declare a local,
-  constant or label of either name (`check_raw_reserved_names`). A source constant named
+  field after a dot and the tree a raw `call x` or `subroutine(x)` names do not count. A raw
+  block may read `__self_obj` or `__saved_stack_obj`. It may not declare a local, constant or
+  label of either name in a tree whose lowering declares that name too
+  (`raw_reserved_declarations`, checked in `finish`). Elsewhere, as on main, it may. A source
+  constant named
   `__self_obj` is a constant to the raw blocks that read it, not the entry object, and so is a
   qualified constant such as `__self_obj.tuning`, which a raw block may declare.
 - A tree whose two lowerings differ still fails. The error points at the first source statement of
@@ -183,26 +187,20 @@ declaration order, so generated names no longer matter.
   with flag 0x02, so the VM reads the handle from its own pinned word. There is no copy into word 0
   and no pin, so it can share a tree with other `@slot` lets. An explicit flag 0x02 is refused, as
   for any handle.
-- **`job_data` comparisons (`lower/cond.rs`, `lower/expr.rs`).** `job_data(..) <op> k` reads the
-  `scope(33, field)` cell directly in the comparison node when `k` is a compile-time constant.
-  - The VM resolves the right operand first. So an operand that can fault, such as a temp or an
-    attribute, would fault where the copy faulted on the career lookup.
-  - Any other right side is still copied to a local.
-  - Dropping the copy removes a node, an Expression and a local that main emits, so it is an
-    in-place rewrite (`in_place_applied`). The tree's finished `.air` is checked after lowering,
-    and the object is lowered again with every copy (`ObjectEnv::in_place_off`) when any of
-    these holds:
-    - raw code defines a label or branches to a node by number. Lowering emits neither, so the
-      check reads the finished `.air` (`raw_facts`), which covers raw code from every route: the
-      tree's own blocks, helpers it calls, parameter defaults, and helpers named like
-      statements. A number counts the removed node, and a label may be reached from raw code
-      that counts on it;
-    - the `.air` may read global 34 (section 1), whose value depends on the scratch pointer the
-      removed Expression set;
-    - the tree's text may read a frame word, or a local may be read before it is written
-      (`may_read_residue`): the named locals after the removed local move down a word, so
-      either would read a different word. The body parser does not read raw positional targets,
-      so a body with one counts as a residue read too.
+- **`job_data` comparisons: not changed (Dressers 4117 bug 3).** `job_data(..) <op> k` still
+  copies the career cell into a `__job` local. Reading the cell in the comparison was tried and
+  dropped. It removes a frame word, and a frame's size is observable: Create Object with flag
+  0x10 passes `temp[0]` to the new object's `main` only when that frame has a word for it, so a
+  `main` that loses its only word faults there. It also removed an Expression and a node, which
+  needed fallbacks for raw labels, positional targets, global 34, text and residue reads. The 13
+  pilots are EQUIVALENT without it.
+- **The fault state of dropped stores.** Main's dead-store elimination and its entry-save drop
+  already remove Expressions before a node that may fault: a store a later plain write kills, and
+  the unread save of a tree that formats no text. The last result and scratch pointer such a
+  fault leaves then differ from the unoptimized tree's. This branch applies the same rules to
+  more trees, namely a store an out-operand kills (above), the save of a text tree that reads no
+  moved word (section 1) and a pin enabled by a BCON range (above). It adds no rule of its own
+  that removes an Expression.
 
 ## Verification
 
@@ -217,9 +215,8 @@ declaration order, so generated names no longer matter.
 - **Tests.**
   - `tests/v2_r3_fixes.rs` (synthetic) covers each fix and its negative cases: kept saves (including
     the `idle` scratch word), a later literal reaching earlier trees, read-first helper locals, an
-    out-operand's unwritten exit, the `job_data` copy's fallbacks (raw labels and positional
-    targets from every route, global 34, text, residue reads), a faulting `job_data` comparand,
-    and the pinned slot under text.
+    out-operand's unwritten exit, the kept `self` switch and `job_data` copy, raw blocks' own
+    entry-object names, and the pinned slot under text.
   - The `opt.rs` unit tests cover the pipeline's text veto.
 
 ## What would reopen this

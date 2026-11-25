@@ -46,7 +46,6 @@ impl<'a> TreeLowerer<'a> {
             pinned_locals: BTreeMap::new(),
             local_origins: BTreeMap::new(),
             stmt_span: None,
-            in_place_applied: false,
             seen_decls: BTreeSet::new(),
             inline_call_sites: Vec::new(),
             dup_decl: None,
@@ -57,6 +56,7 @@ impl<'a> TreeLowerer<'a> {
             sleep_span: None,
             stmt_marks: Vec::new(),
             inherited_entry_save: false,
+            raw_reserved: Vec::new(),
         }
     }
 
@@ -117,40 +117,40 @@ impl<'a> TreeLowerer<'a> {
         } else {
             body
         };
-        // The body reads the entry object when an `.air` token names it (a comment does not; a
-        // raw block may read it but not declare its own, `check_raw_reserved_names`). A source
-        // constant of that name, which a raw block reads as a constant, is not the entry object.
+        // The body reads the entry object when an `.air` token names it (a comment does not). A
+        // source constant of that name, which a raw block reads as a constant, is not the entry
+        // object.
+        let mut declares_self_obj = self.has_self_obj_local;
         if self.inherited_entry_save
             && !self.raw_consts.contains_key(mir::SELF_OBJ)
             && names_token(&out, mir::SELF_OBJ)
         {
             let save = mir::StackObjOp::Save(mir::SELF_OBJ).text();
             out = format!("    {save}\n{out}");
+            declares_self_obj = true;
+        }
+        // A raw block may declare an entry-object local of its own only where lowering declares
+        // none of that name.
+        for (name, span) in &self.raw_reserved {
+            let declared = match *name {
+                mir::SELF_OBJ => declares_self_obj,
+                _ => self.used_saved_stack_obj,
+            };
+            if declared {
+                return Err(Error::at(
+                    *span,
+                    format!(
+                        "'{name}' is the compiler's entry object in this tree: a raw block may \
+                         read it but not declare its own"
+                    ),
+                ));
+            }
         }
         if self.pin_span.is_some() {
             // A tree with a pinned `push_interaction` has no raw block (that is an error), so
             // nothing else names an explicit local: the pin takes slot 0, and `.air` allocates
             // the named locals after it.
             out = replace_outside_strings(&out, PIN_SLOT, "0");
-        }
-        // An in-place rewrite (a `job_data` comparison without its copy) removes a node, an
-        // Expression and a local that main emits. Lowering emits no label and no branch by node
-        // number, so one in the body comes from raw code (the tree's or an inlined helper's),
-        // and a number counts the removed node. A later read of global 34 could see a scratch pointer no
-        // Expression has set yet. The named locals after the removed local move down a word, so
-        // text that may read a frame word, or a local read before it is written (which reads
-        // what an earlier frame left in its word), could see another value. (A body that does
-        // not parse counts as having raw control flow.)
-        if self.in_place_applied {
-            let raw = raw_facts::raw_facts(&out, None);
-            if raw.defines_label
-                || raw.positional_target
-                || mir::may_read_global_34(&out)
-                || mir::reads_a_word(&facts.text_reads)
-                || mir::may_read_residue(&out)
-            {
-                self.env.in_place_unsound.set(true);
-            }
         }
         Ok(mir::finish_body(out, &facts))
     }

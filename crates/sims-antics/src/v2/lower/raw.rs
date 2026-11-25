@@ -133,23 +133,15 @@ pub(super) fn raw_air_stmts_clobber_stack_obj(stmts: &[crate::ast::Stmt]) -> boo
     })
 }
 
-/// A raw block may read the compiler's entry-object locals (`__self_obj`, `__saved_stack_obj`)
-/// but not declare a local, a constant or a label of that name: lowering decides from the names
-/// a tree's `.air` reads whether it needs the entry save.
-pub(super) fn check_raw_reserved_names(code: &str, span: Span) -> Result<()> {
+/// The compiler's entry-object locals (`__self_obj`, `__saved_stack_obj`) that a raw block
+/// declares as a local, a constant or a label. A raw block may read them, and may declare them
+/// in a tree whose lowering does not declare them itself (`TreeLowerer::finish` checks that).
+pub(super) fn raw_reserved_declarations(code: &str) -> Vec<&'static str> {
     use crate::lexer::TokenKind as T;
     const RESERVED: [&str; 2] = [mir::SELF_OBJ, mir::SAVED_STACK_OBJ];
-    let reject = |name: &str| {
-        Err(Error::at(
-            span,
-            format!(
-                "'{name}' is the compiler's entry object: a raw block may read it but not \
-                 declare its own"
-            ),
-        ))
-    };
+    let mut found = Vec::new();
     let Ok(tokens) = crate::lexer::tokenize(code) else {
-        return Ok(());
+        return found;
     };
     for (i, pair) in tokens.windows(2).enumerate() {
         // `const __self_obj.tuning = ..` declares a qualified constant, not the entry object.
@@ -157,9 +149,9 @@ pub(super) fn check_raw_reserved_names(code: &str, span: Span) -> Result<()> {
         if let (T::Ident(kw), T::Ident(name)) = (&pair[0].kind, &pair[1].kind)
             && matches!(kw.as_str(), "let" | "local" | "const")
             && !qualified
-            && RESERVED.contains(&name.as_str())
+            && let Some(reserved) = RESERVED.iter().find(|r| **r == name.as_str())
         {
-            return reject(name);
+            found.push(*reserved);
         }
     }
     let wrapped = format!("tree 4096 \"__raw_names\" {{\n{code}\n}}\n");
@@ -168,11 +160,9 @@ pub(super) fn check_raw_reserved_names(code: &str, span: Span) -> Result<()> {
     {
         let mut labels = BTreeSet::new();
         collect_raw_air_labels(&tree.body, &mut labels);
-        if let Some(name) = RESERVED.iter().find(|n| labels.contains(**n)) {
-            return reject(name);
-        }
+        found.extend(RESERVED.iter().filter(|n| labels.contains(**n)));
     }
-    Ok(())
+    found
 }
 
 pub(super) fn collect_raw_air_labels<'a>(

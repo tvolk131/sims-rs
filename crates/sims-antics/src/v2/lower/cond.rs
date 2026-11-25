@@ -153,23 +153,7 @@ impl<'a> TreeLowerer<'a> {
         rhs: &V2Expr,
         span: Span,
     ) -> Result<(String, String)> {
-        // `job_data(..) <op> k` with a constant `k`: the comparison node reads the career cell
-        // right after its staging, so it needs no copy. The VM resolves the right operand
-        // first, so `k` must be one that cannot fault (a temp or attribute can), or the
-        // comparison would fault where the copy faulted on the career lookup.
-        // Dropping the copy is an in-place rewrite, which `finish` checks (it removes a node, an
-        // Expression and a local).
-        let job_cell = match self.builtin_job_data_call(lhs)? {
-            Some(call) if self.eval_const_i16(rhs).is_ok() && !self.env.in_place_off => Some(call),
-            _ => None,
-        };
-        let (l, l_ty) = match job_cell {
-            Some((args, jspan)) => {
-                self.in_place_applied = true;
-                self.lower_job_data_cell(args, jspan)?
-            }
-            None => self.lower_value_expr(lhs)?,
-        };
+        let (l, l_ty) = self.lower_value_expr(lhs)?;
         if op == V2BinOp::FlagTest
             && let ValueType::Bitflags(ref key) = l_ty
         {

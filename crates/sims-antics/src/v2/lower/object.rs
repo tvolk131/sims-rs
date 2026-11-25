@@ -7,7 +7,7 @@ pub(super) fn lower_object(
     resolved: &ResolvedModule,
     obj: &ObjectDecl,
 ) -> Result<ExpandedV2Object> {
-    lower_object_with(resolved, obj, None, false)
+    lower_object_with(resolved, obj, None)
 }
 
 /// The frame words the object's strings may make the formatter read (see
@@ -33,13 +33,11 @@ fn object_text_reads(
 }
 
 /// [`lower_object`], finishing every tree with `text_reads` as the object's text fact when it is
-/// given, and otherwise with the fact the strings known before any tree is lowered give; with
-/// `in_place_off`, no tree gets an in-place rewrite (a `job_data` comparison without its copy).
+/// given, and otherwise with the fact the strings known before any tree is lowered give.
 fn lower_object_with(
     resolved: &ResolvedModule,
     obj: &ObjectDecl,
     text_reads: Option<mir::TableLocals>,
-    in_place_off: bool,
 ) -> Result<ExpandedV2Object> {
     // 1. Resolve optional `from Template`.
     let template_opt: Option<(String, TemplateDecl)> = match &obj.from_template {
@@ -921,8 +919,6 @@ fn lower_object_with(
         string_names,
         dialog_strings,
         text_reads,
-        in_place_off,
-        in_place_unsound: std::cell::Cell::new(false),
         local_fns,
         local_enums,
         local_bitflags,
@@ -1555,12 +1551,10 @@ fn lower_object_with(
 
     // Every tree was finished with `env.text_reads`. A tree's inline dialog literal can add a
     // token that an earlier tree's text may then read, so lower the object again with the
-    // final fact when it differs (the second lowering interns the same strings). Likewise
-    // when a tree's in-place rewrite turned out unsound: lower again without it.
+    // final fact when it differs (the second lowering interns the same strings).
     let final_reads = object_text_reads(&env.strings, &env.dialog_strings.borrow(), &catalog);
-    let in_place_off = env.in_place_off || env.in_place_unsound.get();
-    if final_reads != env.text_reads || in_place_off != env.in_place_off {
-        return lower_object_with(resolved, obj, Some(final_reads), in_place_off);
+    if final_reads != env.text_reads {
+        return lower_object_with(resolved, obj, Some(final_reads));
     }
 
     // Emit STR# tables in deterministic ID order, merging any auto-interned STR# 301 dialog strings.

@@ -1057,7 +1057,9 @@ impl<'a> TreeLowerer<'a> {
                         "'raw { ... }' is not allowed inside a 'defer' block",
                     ));
                 }
-                check_raw_reserved_names(code, *span)?;
+                for name in raw_reserved_declarations(code) {
+                    self.raw_reserved.push((name, *span));
+                }
                 let prelude = self.collect_raw_consts(code, *span)?;
                 let facts = super::raw_facts::raw_facts(code, Some(&prelude));
                 if self.checking_discarded == 0 && facts.formats_text {

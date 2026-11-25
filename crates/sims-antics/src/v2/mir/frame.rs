@@ -291,19 +291,6 @@ pub(crate) fn check_pins(nodes: &[Stmt], copied: &mut BTreeSet<String>, ok: &mut
     }
 }
 
-/// Whether some named local of `body` may be read before it is written, and so reads what an
-/// earlier frame left in its word. A body that does not parse may.
-pub(crate) fn may_read_residue(body: &str) -> bool {
-    let Some(nodes) = parse_body(body) else {
-        return true;
-    };
-    let mut lets = Vec::new();
-    collect_lets(&nodes, &mut lets);
-    !lets
-        .iter()
-        .all(|name| defined_before_reads(&nodes, name, &mut false))
-}
-
 /// Whether every read of `name` in `nodes` comes after a write of it on every path (`defined`
 /// says it is written on entry). A local read before any write reads whatever its frame word
 /// held, so moving it to another word would change the value read. Writes are plain stores and
