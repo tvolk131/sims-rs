@@ -632,6 +632,9 @@ impl<'a> TreeLowerer<'a> {
         op: V2AssignOp,
         rhs_air: &str,
     ) -> Result<()> {
+        if matches!(lval, LValue::Direct { air, .. } if air == "stack_obj") {
+            self.sets_stack_obj = true;
+        }
         let op_str = match op {
             V2AssignOp::Set => ":=",
             V2AssignOp::Add => "+=",

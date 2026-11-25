@@ -626,6 +626,10 @@ struct TreeLowerer<'a> {
     /// This tree explicitly uses the frame's stack object as a persistent cursor. Temporary
     /// moves must restore its pre-operation value, which may differ from the entry object.
     explicit_stack_obj: bool,
+    /// The source assigns `stack_obj` itself (`stack_obj = x;`), so the stack object the tree
+    /// leaves at exit is the source's: no store of it is dropped as dead at the exit
+    /// (`mir::FrameFacts::keeps_exit_stack_obj`).
+    sets_stack_obj: bool,
     /// Set to `true` when an `ObjectSelf` lifecycle tree (`init`/`main`/`load`/`reset`/`cleanup`)
     /// touches `stack_obj` for a foreign object access, so `finish()` preserves the incoming
     /// `stack_obj` (e.g. the cancelling Sim in `cleanup` / OBJf 4) into `__saved_stack_obj`.
