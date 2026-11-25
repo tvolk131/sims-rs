@@ -50,8 +50,18 @@ impl<'a> TreeLowerer<'a> {
         if let Some(split) = self.split_inline_specialization(stmt)? {
             return self.lower_stmt(&split);
         }
+        // A binding allocated after its statement's nested bodies (`let Some`'s `else`) keeps its
+        // own statement as its declaration origin, so the span is restored on the way out.
+        let outer = self
+            .stmt_span
+            .replace(crate::v2::specialize::stmt_span(stmt));
+        let lowered = self.lower_stmt_at(stmt);
+        self.stmt_span = outer;
+        lowered
+    }
+
+    fn lower_stmt_at(&mut self, stmt: &V2Stmt) -> Result<()> {
         self.note_decl(stmt);
-        self.stmt_span = Some(crate::v2::specialize::stmt_span(stmt));
         if self.inline_call_stack.is_empty() {
             self.stmt_marks
                 .push((self.em.mark(), crate::v2::specialize::stmt_span(stmt)));

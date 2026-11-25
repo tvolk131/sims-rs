@@ -75,7 +75,11 @@ impl<'a> TreeLowerer<'a> {
     pub(super) fn finish(self) -> Result<String> {
         let formats_text = self.raw_formats_text || mir::body_formats_text(self.em.text());
         // The frame words the tree's text may read: none unless it formats text.
-        let text_reads = if formats_text {
+        // A tree that may read global 34 keeps main's rule (every text tree reads): dropping
+        // the entry save removes an Expression, whose scratch-pointer write that read depends on.
+        let text_reads = if formats_text && may_read_global_34(self.em.text()) {
+            mir::TableLocals::Unknown
+        } else if formats_text {
             self.env.text_reads.clone()
         } else {
             mir::TableLocals::Known(BTreeSet::new())
@@ -112,8 +116,12 @@ impl<'a> TreeLowerer<'a> {
             body
         };
         // The body reads the entry object when an `.air` token names it (a comment does not; a
-        // raw block may read it but not declare its own, `check_raw_reserved_names`).
-        if self.inherited_entry_save && names_token(&out, mir::SELF_OBJ) {
+        // raw block may read it but not declare its own, `check_raw_reserved_names`). A source
+        // constant of that name, which a raw block reads as a constant, is not the entry object.
+        if self.inherited_entry_save
+            && !self.raw_consts.contains_key(mir::SELF_OBJ)
+            && names_token(&out, mir::SELF_OBJ)
+        {
             let save = mir::StackObjOp::Save(mir::SELF_OBJ).text();
             out = format!("    {save}\n{out}");
         }
@@ -128,7 +136,9 @@ impl<'a> TreeLowerer<'a> {
         // `self` prefix after a cursor move. (A body that does not parse counts as one.)
         if self.entry_cursor_applied {
             let raw = raw_facts::raw_facts(&out, None);
-            if raw.defines_label || raw.positional_target {
+            // The prefix also removes the Expression that staged a `self` read, so a later read
+            // of global 34 could see a scratch pointer no Expression has set yet.
+            if raw.defines_label || raw.positional_target || may_read_global_34(&out) {
                 self.env.entry_cursor_unsound.set(true);
             }
         }
@@ -461,6 +471,27 @@ impl<'a> TreeLowerer<'a> {
         }
         Ok(air_name)
     }
+}
+
+/// Whether `body` may read global 34, whose value depends on the scratch pointer every
+/// Expression sets (`sims-vm` `primitives/expression.rs`): a `global[..]` operand, a
+/// `scope(6, ..)` or `scope(<non-literal>, ..)` cell, or a raw `op` whose bytes may name it.
+/// A body that does not lex counts as reading it.
+fn may_read_global_34(body: &str) -> bool {
+    use crate::lexer::TokenKind as T;
+    let Ok(tokens) = crate::lexer::tokenize(body) else {
+        return true;
+    };
+    let kind = |i: usize| tokens.get(i).map(|t| &t.kind);
+    tokens.iter().enumerate().any(|(i, t)| match &t.kind {
+        T::Ident(id) if id == "global" => true,
+        T::Ident(id) if id == "scope" => {
+            matches!(kind(i + 1), Some(T::LParen))
+                && !matches!(kind(i + 2), Some(T::Int(n)) if *n != 6)
+        }
+        T::Ident(id) if id == "op" => matches!(kind(i + 1), Some(T::Int(_))),
+        _ => false,
+    })
 }
 
 /// Whether an `.air` identifier token of `body` is `name` (comments and strings are not tokens).

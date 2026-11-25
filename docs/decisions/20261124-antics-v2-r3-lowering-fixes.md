@@ -72,6 +72,11 @@ if it does not:
   word that would move.
 - **`Unknown`**: the save stays.
 
+A text tree whose `.air` may read global 34 takes `Unknown`, which is main's rule. Such a read is
+a `global[..]` operand, a `scope(6, ..)` cell, or a raw `op`. Every Expression node, the save
+included, sets the object's scratch pointer, and a read of global 34 depends on it (`sims-vm`
+`primitives/expression.rs`).
+
 The rule is a permission, not an obligation. As on main, dead-store elimination drops an unread
 save whose next node ignores the last result. It does this whatever the text reads, because the
 save is a compiler temporary, not a source local. Under the `$Local:N` contract (PR H) only
@@ -118,7 +123,8 @@ declaration order, so generated names no longer matter.
 - The Sim pass declares its implicit entry object (`__self_obj`) when the body reads it, as the
   object pass declares `__saved_stack_obj`. A read is an `.air` token naming it, so a comment does
   not count. A raw block may read `__self_obj` or `__saved_stack_obj` but may not declare a local,
-  constant or label of either name (`check_raw_reserved_names`).
+  constant or label of either name (`check_raw_reserved_names`). A source constant named
+  `__self_obj` is a constant to the raw blocks that read it, not the entry object.
 - A tree whose two lowerings differ still fails. The error points at the first source statement of
   the tree whose lowering differs (`differing_statement`, via the statement marks `TreeLowerer`
   records), such as a targetless `play_sound`.
@@ -134,7 +140,9 @@ declaration order, so generated names no longer matter.
     declaration, and never the cross-helper merge.
     - Lowering records each inlined local's declaration (`local_origins`: the helper and the
       innermost statement being lowered). That covers `let`, `let Some`, `for` and every other
-      binding, so another helper's local of the same spelling is not a copy.
+      binding, so another helper's local of the same spelling is not a copy. The statement is
+      restored when a nested body ends, so a `let Some` binding, which is allocated after its
+      `else` body, still has the `let Some` as its declaration.
     - When any copy of a declaration is written through an out-operand, all its copies count as
       written. A specialization that drops the write from one copy keeps them one group.
     Bookcases 4107 shows why: Maxis keeps a helper's `event` and `pick` in separate words, and
@@ -149,6 +157,12 @@ declaration order, so generated names no longer matter.
     every route: the tree's own blocks, helpers it calls, parameter defaults, and helpers named like
     statements. When a tree that used the prefix has such code, the object is lowered again with no
     prefix in any tree (`ObjectEnv::entry_cursor_off`), as for the text fact.
+  - The prefix also drops the Expression that staged a `self` read. So the same fallback applies
+    when the finished `.air` may read global 34 (as in section 1), whose value depends on the
+    scratch pointer that Expression set.
+  - The scratch pointer a tree leaves for its callees and callers is part of its lowered shape,
+    which `verify-equiv` observes at every call and exit. It is not a rule of the source: main's
+    entry-save drop in non-text trees already ignores it.
   - A raw block in an inlined helper or under a cleanup may branch only to its own labels. That
     check now covers raw `loop` bodies too.
   - A padded raw primitive (`… pad 0xNN`) counts as the primitive it wraps, both for moving the

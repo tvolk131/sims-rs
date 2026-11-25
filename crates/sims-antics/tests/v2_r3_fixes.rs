@@ -94,9 +94,12 @@ fn dialog_entry_save_drops_when_no_text_reads_a_moved_word() {
     }"#;
     let air = expand("save_pinned.antics", &obj("Was $Local:1", pinned));
     assert!(!tree(&air, "a").contains(SAVE), "{air}");
-    // The save is the highest word (declared at the move, after `n`): dropping it moves nothing.
+    // The save is the highest word (after the pinned `n`), and the text reads only the word
+    // below it: dropping it moves nothing. (`random_into` is not an Expression, so ordinary
+    // dead-store elimination does not drop the save first.)
     let highest = r#"    tree a (sim: Sim) {
-        let n = sim.person[3];
+        @slot(0) let n: i16;
+        random_into(n, 4)?;
         if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
             return false;
         }
@@ -143,6 +146,21 @@ fn random_into_a_constant_range_defines_its_destination() {
     }
     const LIMIT = 6;"#;
     let air = expand("random_range.antics", &obj("Plain", members));
+    assert!(!tree(&air, "a").contains(SAVE), "{air}");
+    // A BCON range stays a `bcon[..]` cell in `.air`. (The raw statement keeps ordinary
+    // dead-store elimination from dropping the save before the analysis sees it.)
+    let members = r#"    tree a (sim: Sim) {
+        let n: i16;
+        raw { temp[7] := 0; }
+        stack_obj = 0;
+        if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
+            return false;
+        }
+        random_into(n, Limits.draw)?;
+        stack_obj.attr[0] = n;
+    }
+    bcon 4097 "Limits" { draw = 6 }"#;
+    let air = expand("random_bcon.antics", &obj("Plain", members));
     assert!(!tree(&air, "a").contains(SAVE), "{air}");
 }
 
@@ -473,10 +491,13 @@ fn an_out_operand_keeps_the_old_value_on_the_exit_it_does_not_write() {
         "Plain",
         r#"    tree a (sim: Sim) {
         let ev: i16 = 7;
+        temp[0] = 1;
         while !animate(clip: 0, table: 0, local: ev) {}
         sim.person[3] = ev;
     }"#,
     );
+    // `temp[0] = 1` is a plain Expression after the store, so dead-store elimination drops
+    // the store if liveness calls it dead.
     let air = expand("out_keep.antics", &src);
     let a = tree(&air, "a");
     assert!(a.contains("= 7;"), "the initial store stays:\n{a}");
@@ -745,4 +766,85 @@ fn out_operand_groups_follow_declarations_through_let_some_and_specialization() 
     assert_eq!(a.matches("let __inline_v_value_").count(), 2, "{a}");
     let split = tree(&air, "split_mode");
     assert_eq!(split.matches("let __inline_v_value_").count(), 1, "{split}");
+}
+
+/// Every Expression node sets the scratch pointer that a later read of global 34 depends on, so
+/// a tree that may read global 34 keeps the Expression that stages a `self` read, and keeps its
+/// dialog entry save, as on main.
+#[test]
+fn a_tree_that_may_read_global_34_keeps_its_expressions() {
+    let src = obj(
+        "Plain",
+        r#"    tree a (sim: Sim) {
+        if self.value == global[34] {
+            return true;
+        }
+        set_to_next(all, dest: stack_obj);
+        return false;
+    }"#,
+    );
+    let air = expand("global34_self.antics", &src);
+    let a = tree(&air, "a");
+    assert!(
+        a.contains("let __pre_stack_obj"),
+        "the self read is staged:\n{a}"
+    );
+    let src = obj(
+        "Plain",
+        r#"    tree a (sim: Sim) {
+        raw { @entry: if 0 == global[34] { return true; } }
+        set_to_next(all, dest: stack_obj);
+        dialog(kind: ok, title: title, message: msg);
+        return false;
+    }"#,
+    );
+    let air = expand("global34_save.antics", &src);
+    assert!(tree(&air, "a").contains(SAVE), "{air}");
+}
+
+/// A source constant spelled like the entry object is a constant to the raw block that reads
+/// it, so an inherited tree needs no entry save for it.
+#[test]
+fn a_source_constant_named_like_the_entry_object_is_not_the_entry_object() {
+    let src = r#"object "Round Three" {
+    guid: 0x7F40_0900;
+    const __self_obj = 7;
+    @context(inherit) tree a {
+        raw { temp[0] := __self_obj; }
+    }
+}
+"#;
+    let air = expand("inherit_const.antics", src);
+    let a = tree(&air, "a");
+    assert!(!a.contains("= stack_obj"), "{a}");
+}
+
+/// A `let Some` binding is allocated after its `else` body is lowered; its declaration is still
+/// the `let Some`, so two copies of a helper whose constant argument picks different arms share
+/// the binding's word.
+#[test]
+fn a_let_some_binding_keeps_its_declaration_after_the_else_body() {
+    let src = r#"object "Round Three" {
+    guid: 0x7F40_0900;
+    fn pick(target: ObjectId, mode: bool) {
+        let Some(value) = target.run_functional::<i16>(prep) else {
+            if mode {
+                temp[2] = 1;
+                return;
+            } else {
+                temp[2] = 2;
+                return;
+            }
+        };
+        random_into(value, 4)?;
+        temp[3] = value;
+    }
+    @frame(locals: 3) tree a {
+        pick(stack_obj, true);
+        pick(stack_obj, false);
+    }
+}
+"#;
+    let air = expand("let_some_origin.antics", src);
+    assert!(tree(&air, "a").contains("(locals: 3)"), "{air}");
 }
