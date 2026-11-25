@@ -619,28 +619,88 @@ pub(crate) fn count_frame_locals(body: &str) -> usize {
 
 /// Whether `body` may read global 34, whose value depends on the scratch pointer every
 /// Expression sets (`sims-vm` `primitives/expression.rs`): a `global[34]` operand or one whose
-/// index is not a literal, a `scope(6, ..)` or `scope(<non-literal>, ..)` cell, or a raw `op`
-/// that may be an Expression or a UI Effect naming it ([`raw_op_may_read_global_34`]).
+/// index is not a known number, a `scope(6, ..)` or `scope(<not a known number>, ..)` cell, or
+/// a raw `op` that may be an Expression or a UI Effect naming it ([`raw_op_may_read_global_34`]).
 /// A body that does not lex counts as reading it.
-pub(crate) fn may_read_global_34(body: &str) -> bool {
+///
+/// An index may be a constant: one of `consts` (the raw blocks' source constants, which the
+/// tree declares at its top) or a `const NAME = N;` in the body. It is the number it names when
+/// every declaration of the name gives the same number and no `let` / `local` reuses the name;
+/// otherwise it may be anything.
+pub(crate) fn may_read_global_34(body: &str, consts: &BTreeMap<String, String>) -> bool {
     use crate::lexer::TokenKind as T;
     let Ok(tokens) = crate::lexer::tokenize(body) else {
         return true;
     };
     let kind = |i: usize| tokens.get(i).map(|t| &t.kind);
+    let known = const_numbers(&tokens, consts);
+    // The number an index token names, if it is a literal or a known constant.
+    let number = |k: Option<&T>| match k {
+        Some(T::Int(n)) => Some(*n),
+        Some(T::Ident(name)) => known.get(name).copied().flatten(),
+        _ => None,
+    };
     tokens.iter().enumerate().any(|(i, t)| match &t.kind {
         T::Ident(id) if id == "global" => {
             matches!(kind(i + 1), Some(T::LBracket))
-                && !(matches!(kind(i + 2), Some(T::Int(n)) if *n != 34)
+                && !(number(kind(i + 2)).is_some_and(|n| n != 34)
                     && matches!(kind(i + 3), Some(T::RBracket)))
         }
         T::Ident(id) if id == "scope" => {
             matches!(kind(i + 1), Some(T::LParen))
-                && !matches!(kind(i + 2), Some(T::Int(n)) if *n != 6)
+                && !(number(kind(i + 2)).is_some_and(|n| n != 6)
+                    && matches!(kind(i + 3), Some(T::Comma)))
         }
         T::Ident(id) if id == "op" => raw_op_may_read_global_34(&tokens[i + 1..]),
         _ => false,
     })
+}
+
+/// The number each constant names: `Some(n)` when every declaration of the name (in `consts`, or
+/// a `const NAME = N;` in `tokens`) gives the literal `n` and no `let` / `local` declares it, and
+/// `None` when they disagree or one is not a literal.
+fn const_numbers(
+    tokens: &[crate::lexer::Token],
+    consts: &BTreeMap<String, String>,
+) -> BTreeMap<String, Option<i64>> {
+    use crate::lexer::TokenKind as T;
+    let mut known: BTreeMap<String, Option<i64>> = BTreeMap::new();
+    let mut note = |name: &str, value: Option<i64>| {
+        known
+            .entry(name.to_owned())
+            .and_modify(|v| {
+                if *v != value {
+                    *v = None;
+                }
+            })
+            .or_insert(value);
+    };
+    for (name, value) in consts {
+        let literal = crate::lexer::tokenize(value).ok().and_then(|t| {
+            match t.iter().map(|t| &t.kind).collect::<Vec<_>>().as_slice() {
+                [T::Int(n)] | [T::Int(n), T::Eof] => Some(*n),
+                _ => None,
+            }
+        });
+        note(name, literal);
+    }
+    let kind = |i: usize| tokens.get(i).map(|t| &t.kind);
+    for (i, t) in tokens.iter().enumerate() {
+        match (&t.kind, kind(i + 1)) {
+            (T::Ident(kw), Some(T::Ident(name))) if kw == "const" => {
+                let literal = match (kind(i + 2), kind(i + 3), kind(i + 4)) {
+                    (Some(T::Assign), Some(T::Int(n)), Some(T::Semicolon)) => Some(*n),
+                    _ => None,
+                };
+                note(name, literal);
+            }
+            (T::Ident(kw), Some(T::Ident(name))) if kw == "let" || kw == "local" => {
+                note(name, None);
+            }
+            _ => {}
+        }
+    }
+    known
 }
 
 /// Whether a raw `op` (`tokens` follow the keyword) may read global 34 in the way that depends

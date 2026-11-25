@@ -75,7 +75,7 @@ fn finish_frame(out: String, facts: &FrameFacts<'_>) -> String {
     // Expressions, whose scratch-pointer writes that read depends on, so the tree neither
     // keeps nor drops one where main would not. So does every tree of its object, since a call
     // carries the scratch pointer between trees, and a tree that pins (`FrameFacts::main_rules`).
-    let main_rules = facts.main_rules || may_read_global_34(&out);
+    let main_rules = facts.main_rules || may_read_global_34(&out, facts.raw_consts);
     let ranges = DrawRanges::for_tree(main_rules);
     if facts.keep_layout {
         if facts.has_self_obj_local

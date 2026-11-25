@@ -92,7 +92,7 @@ impl<'a> TreeLowerer<'a> {
             || self.inherited_entry_save)
             && self.frame_args == 0;
         let body = replace_outside_strings(self.em.text(), PIN_SLOT, "0");
-        let body_reads_global_34 = mir::may_read_global_34(&body);
+        let body_reads_global_34 = mir::may_read_global_34(&body, &self.raw_consts);
         if body_reads_global_34 {
             self.env.saw_global_34.set(true);
         }

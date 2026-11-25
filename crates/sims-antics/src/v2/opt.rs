@@ -34,7 +34,8 @@ use super::mir::*;
 /// primitive. `origins` names the declaration each inlined helper local copies
 /// (`mir::FrameFacts::local_origins`). `decl_groups` lets out-operand locals share words only
 /// with copies of their own declaration; without it they coalesce as on main. `main_rules`
-/// keeps main's rules (`mir::FrameFacts::main_rules`), as a body that may read global 34 does.
+/// keeps main's rules (`mir::FrameFacts::main_rules`); the caller sets it for a body that may
+/// read global 34 too.
 /// `keep_exit_stack_obj` keeps every `stack_obj` store that only the exit makes dead
 /// (`mir::FrameFacts::keeps_exit_stack_obj`).
 pub(crate) fn optimize_tree_body(
@@ -51,8 +52,9 @@ pub(crate) fn optimize_tree_body(
     let before = nodes.clone();
     // A tree that may read global 34 keeps main's rules (`out_defs` off, literal draw ranges):
     // the read depends on the scratch pointer an Expression sets, so the tree keeps or drops
-    // an Expression exactly where main does.
-    let out_defs = !(main_rules || may_read_global_34(body));
+    // an Expression exactly where main does. The caller folds the body's own possible read into
+    // `main_rules` (`mir::may_read_global_34`, which knows the tree's constants).
+    let out_defs = !main_rules;
     let ranges = DrawRanges::for_tree(!out_defs);
     for _ in 0..8 {
         let snapshot = nodes.clone();
