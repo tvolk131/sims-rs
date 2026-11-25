@@ -1,14 +1,25 @@
-//! Synthetic install trees and archives for tests. No game data.
+//! Synthetic install trees and archives for tests, and the real install's
+//! index built once per run. No game data.
 #![allow(dead_code)]
 
+use sims_content::{Index, Install};
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Numbers temporary trees. Every module's tests now run in one process,
+/// so the process ID no longer keeps their paths apart; this names folders
+/// and holds no test state.
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 /// A temporary directory removed on drop.
 pub struct Tree(pub PathBuf);
 
 impl Tree {
     pub fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("sims-content-{name}-{}", std::process::id()));
+        let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("sims-content-{name}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         Self(path)
@@ -75,4 +86,19 @@ pub fn objd(guid: u32) -> Vec<u8> {
     bytes[..4].copy_from_slice(&138u32.to_le_bytes());
     bytes[28..32].copy_from_slice(&guid.to_le_bytes());
     bytes
+}
+
+/// `Index::build(install)` for the install `SIMS_INSTALL` names, built
+/// once per run and cloned for each caller, who may then mount characters
+/// on its copy. The tests change only their own temporary folders, never
+/// the install, so every build would be the same.
+pub fn installed_index(install: &Install) -> Index {
+    static INDEX: OnceLock<(PathBuf, Index)> = OnceLock::new();
+    let (root, index) =
+        INDEX.get_or_init(|| (install.root.clone(), Index::build(install).unwrap()));
+    assert_eq!(
+        root, &install.root,
+        "installed_index serves one install per run"
+    );
+    index.clone()
 }

@@ -7,6 +7,7 @@
 mod album_store;
 mod animator;
 mod autosave;
+mod common;
 mod load;
 mod motives;
 mod neighborhood_save;

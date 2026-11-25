@@ -5,6 +5,7 @@
 //! `<module>::<test>` (`cargo test -p sims-audio --test integration <module>::`).
 
 mod ambience;
+mod common;
 mod decoders;
 mod install;
 mod install_player;

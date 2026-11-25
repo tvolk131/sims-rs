@@ -461,7 +461,7 @@ fn installed_buy_catalog_reads_cleanly() {
         return;
     };
     let install = Install::detect(std::path::Path::new(&root)).unwrap();
-    let index = Index::build(&install).unwrap();
+    let index = crate::common::installed_index(&install);
     let catalog = Catalog::build(&index).unwrap();
     let buy = catalog.buy_entries(&index, 1).unwrap();
     assert!(buy.diagnostics.is_empty(), "{:?}", buy.diagnostics);

@@ -27,6 +27,7 @@
 //! Everything is synthetic: made-up families, names and GUIDs. No wall
 //! clock reaches a trace.
 
+use crate::common::{TempDb, TempDir};
 use sims_core::{CrtRng, GameRng};
 use sims_formats::neighborhood::{Family, Inventory, InventoryItem, Neighbor, Relationship};
 use sims_formats::saved_objects::{Frame, Slot};
@@ -36,8 +37,6 @@ use sims_sim::{IndicatorQueues, NeighborhoodStore, Object, Snapshots, StoredNeig
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// SplitMix64 (Steele, Lea and Flood), as the legacy fuzzer used.
 struct Rng(u64);
@@ -87,29 +86,6 @@ impl Rng {
     fn bytes(&mut self, max: usize) -> Vec<u8> {
         let n = self.below(max as u64 + 1) as usize;
         (0..n).map(|_| self.next() as u8).collect()
-    }
-}
-
-static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
-
-/// A file path in the temporary directory, removed on drop.
-struct TempPath(PathBuf);
-
-impl TempPath {
-    fn new(label: &str) -> Self {
-        let n = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("sims-sim-fuzz-{label}-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(&path);
-        Self(path)
-    }
-}
-
-impl Drop for TempPath {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -524,7 +500,7 @@ fn check_world_run(
 
 #[test]
 fn world_snapshots_and_forks_replay_the_reference() {
-    let file = TempPath::new("snapshots");
+    let file = TempDb::new("fuzz-snapshots");
     let snapshots = Snapshots::open(&file.0).unwrap();
     for seed in 0..48u64 {
         let mut rng = Rng(seed);
@@ -872,7 +848,7 @@ fn model_renumber(inputs: &mut SaveInputs, from: u16, to: u16) {
 }
 
 fn check_store_run(ops: &[StoreOp]) -> Result<(), String> {
-    let file = TempPath::new("store");
+    let file = TempDb::new("fuzz-store");
     let mut store = NeighborhoodStore::open(&file.0).map_err(|e| e.to_string())?;
     let mut models: [Model; 2] = Default::default();
     let mut instances = BTreeSet::new();
@@ -1087,7 +1063,7 @@ fn compare(store: &NeighborhoodStore, name: &str, model: &Model) -> Result<(), S
         }
     }
     if let Some(record) = &model.record {
-        let directory = TempPath::new("iff");
+        let directory = TempDir::new("fuzz-iff");
         std::fs::create_dir_all(&directory.0).map_err(|e| e.to_string())?;
         let saved = store
             .save_neighborhood_iff(name, &directory.0)

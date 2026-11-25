@@ -508,7 +508,7 @@ fn imports_and_writes_the_complete_collections_userdata2_patches() {
         .collect();
     let install = Install::detect(&root).unwrap();
     let wardrobe = ImportWardrobe::load(&install).unwrap();
-    let mut index = Index::build(&install).unwrap();
+    let mut index = crate::common::installed_index(&install);
     index.add_characters(&directory.join("Characters")).unwrap();
     let catalog = Catalog::build(&index).unwrap();
     let character_mount = index
@@ -696,7 +696,7 @@ fn imports_and_writes_the_complete_collections_userdata2_patches() {
         .collect();
     assert_eq!(unmapped, BTreeSet::from([13, 14, 15, 17, 20, 21, 22, 23]));
 
-    let mut index = Index::build(&install).unwrap();
+    let mut index = crate::common::installed_index(&install);
     index.add_characters(&output.0.join("Characters")).unwrap();
     let catalog = Catalog::build(&index).unwrap();
     for (guid, number) in written {

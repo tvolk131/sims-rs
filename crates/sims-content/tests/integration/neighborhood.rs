@@ -329,7 +329,7 @@ fn the_old_town_homes_load_through_their_guid_tables() {
     let root = std::path::Path::new(&root);
     let install = Install::detect(root).unwrap();
     let neighborhood = Neighborhood::open(&root.join("UserData")).unwrap();
-    let mut index = Index::build(&install).unwrap();
+    let mut index = crate::common::installed_index(&install);
     index
         .add_characters(&neighborhood.characters().unwrap().unwrap())
         .unwrap();
