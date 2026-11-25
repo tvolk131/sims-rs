@@ -200,7 +200,8 @@ fn print_usage() {
          sims-antics lift --v2 <file.iff|archive.far> [--entry <name.iff>] [--install <dir>] [--globals ...] [--semiglobal ...] [--no-catalog]   (decompiles an object to checked .antics v2)\n  \
          sims-antics build <pack_dir> --out <dir>\n  \
          sims-antics fmt [--check] [--stdout] <file.antics|dir...>   (canonical .antics v2 layout; --check exits 1 if any file would change)\n  \
-         sims-antics lint [--deny-warnings] [--json] <file.antics|dir...>   (.antics v2 lints; exits 1 on an error, or on any finding with --deny-warnings)\n\
+         sims-antics lint [--deny-warnings] [--json] <file.antics|dir...>   (.antics v2 lints; exits 1 on an error, or on any finding with --deny-warnings)\n  \
+         sims-antics test <file.test.toml|dir...>   (live sims-vm unit tests, needs the vm-replay feature; exits 1 on any failure)\n\
          lift arities: inside an install, global and semi-global callee arities come from its catalog;\n  \
          --globals/--semiglobal replace one range; --no-catalog disables catalog lookup (private arities\n  \
          from the file only). Equivalent is relative to the arities shown in the `// arity sources:` header.\n  \
@@ -2082,6 +2083,7 @@ fn run() -> Result<(), CliError> {
         "lift" => cmd_lift(&args),
         "fmt" => cmd_fmt(&args),
         "lint" => cmd_lint(&args),
+        "test" => cmd_test(&args),
         "verify-equiv" => match cmd_verify_equiv(&args) {
             Err(CliError::Message(msg)) => {
                 eprintln!("error: {msg}");
@@ -2455,6 +2457,96 @@ fn cmd_fmt(args: &[OsString]) -> Result<(), CliError> {
     out.flush()?;
     if check && unformatted > 0 {
         eprintln!("{unformatted} file(s) need formatting");
+        return Err(CliError::Exit(1));
+    }
+    Ok(())
+}
+
+/// `sims-antics test <path...>`: runs `*.test.toml` unit tests on a live `sims-vm` lot.
+fn cmd_test(args: &[OsString]) -> Result<(), CliError> {
+    use sims_antics::test_runner::{TestFile, can_run, collect_test_files, run_test_file};
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut end_of_flags = false;
+    for arg in &args[1..] {
+        if !end_of_flags && let Some(s) = arg.to_str() {
+            match s {
+                "--" => {
+                    end_of_flags = true;
+                    continue;
+                }
+                "-h" | "--help" => {
+                    print_usage();
+                    return Ok(());
+                }
+                other if other.starts_with('-') => {
+                    return Err(format!("unknown flag '{other}'").into());
+                }
+                _ => {}
+            }
+        }
+        paths.push(PathBuf::from(arg));
+    }
+    if paths.is_empty() {
+        return Err("test requires at least one <file.test.toml|dir>"
+            .to_owned()
+            .into());
+    }
+    if !can_run() {
+        return Err(
+            "`sims-antics test` needs sims-vm: build sims-antics with the `vm-replay` \
+                    feature (on by default)"
+                .to_owned()
+                .into(),
+        );
+    }
+    let mut files = Vec::new();
+    for p in &paths {
+        let found = collect_test_files(p).map_err(|e| e.to_string())?;
+        if found.is_empty() {
+            return Err(format!("no *.test.toml files under {}", sanitize_path_display(p)).into());
+        }
+        files.extend(found);
+    }
+    let mut out = OutWriter::stdout();
+    let (mut passed, mut failed, mut broken) = (0usize, 0usize, 0usize);
+    for file in &files {
+        let shown = sanitize_path_display(file);
+        let report = TestFile::read(file).and_then(|t| run_test_file(&t, file));
+        let report = match report {
+            Ok(r) => r,
+            Err(e) => {
+                broken += 1;
+                out.writeln_str(&format!(
+                    "ERROR {shown}: {}",
+                    sanitize_single_line(&e.to_string())
+                ))?;
+                continue;
+            }
+        };
+        for case in &report.cases {
+            let name = sanitize_single_line(&case.name);
+            for a in &case.assumptions {
+                out.writeln_str(&format!("ASSUME {shown}: {}", sanitize_single_line(a)))?;
+            }
+            if case.passed() {
+                passed += 1;
+                out.writeln_str(&format!("PASS {shown}: {name}"))?;
+            } else {
+                failed += 1;
+                out.writeln_str(&format!("FAIL {shown}: {name}"))?;
+                for f in &case.failures {
+                    out.writeln_str(&format!("    {}", sanitize_single_line(f)))?;
+                }
+            }
+        }
+    }
+    let mut summary = format!("{passed} passed, {failed} failed");
+    if broken > 0 {
+        summary.push_str(&format!(", {broken} file(s) could not run"));
+    }
+    out.writeln_str(&summary)?;
+    out.flush()?;
+    if failed > 0 || broken > 0 {
         return Err(CliError::Exit(1));
     }
     Ok(())
