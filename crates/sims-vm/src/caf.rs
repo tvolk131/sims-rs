@@ -56,6 +56,7 @@ use sims_formats::iff::{ChunkData, Iff, write as write_iff};
 use sims_formats::neighborhood::{Family, Inventory, InventoryItem, Neighbor, Relationship};
 use sims_formats::strings::{Format, StringTable, decode};
 use sims_formats::tuning::Constants;
+use sims_sim::neighborhood_save::SaveInputs;
 use sims_sim::neighborhood_store::{
     CheckedCommitError, FAMILY_FLAG_BIT_3, NeighborhoodStore, StoredNeighborhood,
 };
@@ -1731,23 +1732,41 @@ fn checked_save_neighborhood(
 /// against concurrent `import_directory`, `delete_neighborhood`, lot saves, or
 /// crashes: on conflict, zero character files and zero neighborhood rows are
 /// written.
+///
+/// `move_in` is a family moving in from a `.FAM` file, with the file's FAMh:
+/// the same transaction records it in the save inputs
+/// ([`SaveInputs::move_in_family`]), as the import hands the file to the
+/// family (+0x140, 0x4291e6) and the save copies its FAMh from it
+/// (0x4107a8).
 fn persist_household_atomic(
     store: &NeighborhoodStore,
     neighborhood_id: &str,
     origin_neighborhood: &StoredNeighborhood,
     final_stored: &StoredNeighborhood,
     created_members: &[CreatedSim],
+    move_in: Option<(u16, Option<Vec<u8>>)>,
 ) -> Result<u64, CafError> {
     let files = created_members
         .iter()
         .map(|member| (member.file_name.as_str(), member.iff_bytes.as_slice()));
-    match store.save_characters_and_neighborhood_checked(
-        neighborhood_id,
-        origin_neighborhood.instance_id,
-        origin_neighborhood.revision,
-        files,
-        final_stored,
-    )? {
+    let committed = match move_in {
+        Some((family, history)) => store.save_characters_neighborhood_and_save_inputs_checked(
+            neighborhood_id,
+            origin_neighborhood.instance_id,
+            origin_neighborhood.revision,
+            files,
+            final_stored,
+            |inputs: &mut SaveInputs| inputs.move_in_family(family, history),
+        )?,
+        None => store.save_characters_and_neighborhood_checked(
+            neighborhood_id,
+            origin_neighborhood.instance_id,
+            origin_neighborhood.revision,
+            files,
+            final_stored,
+        )?,
+    };
+    match committed {
         Ok((_, committed_revision)) => Ok(committed_revision),
         Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
             Err(CafError::NeighborhoodMismatch {
@@ -1875,6 +1894,7 @@ fn commit_family_with_context_hook(
         &origin_neighborhood,
         &stored,
         &created_members,
+        None,
     )?;
 
     Ok(CreatedHousehold {
@@ -2845,12 +2865,15 @@ pub fn import_family_fam(
     stored.families.insert(family_id, family.clone());
     stored.set_family_surname(family_id, &family_name);
 
+    // The file's FAMh, under the ID the family takes (0x4291e6, 0x4107a8).
+    let history = parsed.history;
     let committed_revision = persist_household_atomic(
         store,
         neighborhood_id,
         &origin_neighborhood,
         &stored,
         &created_members,
+        Some((family_id, history)),
     )?;
 
     Ok(CreatedHousehold {

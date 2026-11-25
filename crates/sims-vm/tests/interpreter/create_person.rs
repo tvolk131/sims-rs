@@ -733,3 +733,102 @@ fn a_cancellation_callback_may_not_remove_the_person_with_the_refresh_pending() 
         "{fault}"
     );
 }
+
+#[test]
+fn an_init_visitor_tree_that_makes_another_visitor_faults_at_the_creation_depth_limit() {
+    // The tree runs after the factory, inside the same Create New Object
+    // Instance, so it runs one creation deeper too: a visitor whose tree
+    // makes another visitor from its own record faults once creations
+    // nest MAX_CREATION_DEPTH deep, on the test thread's default stack.
+    let (mut fx, file, record) = visitors();
+    fx.add(
+        file,
+        INIT_VISITOR,
+        tree(vec![
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, record, 1),
+            ins(
+                CREATE,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, 0, 0, 0, 6, FROM_RECORD, 0, 0],
+            ),
+        ]),
+    );
+    let before = ids(&fx).len();
+    let fault = create(&mut fx, 0, 6, FROM_RECORD, record)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("nested creations"), "{fault}");
+    assert_eq!(
+        ids(&fx).len() - before,
+        usize::from(sims_vm::MAX_CREATION_DEPTH)
+    );
+}
+
+#[test]
+fn a_person_refused_at_the_creation_depth_limit_is_refused_before_its_skeleton_is_looked_up() {
+    // The skeleton lookup can load `.ndx` catalogs and draw from the C
+    // runtime stream, so the depth guard comes first: with no skeleton for
+    // the type, a run below the limit faults on the lookup and a run at
+    // the limit on the depth, with nothing changed.
+    let without_skeleton = || {
+        let (mut fx, _, _) = visitors();
+        fx.program.people.skeletons.remove(&WIDGET);
+        fx
+    };
+    let at = |fx: &mut Fixture, depth: u16| {
+        let mut interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter.creation_depth = depth;
+        interpreter
+            .create_person(&mut fx.world, WIDGET)
+            .unwrap_err()
+            .to_string()
+    };
+    let below = at(&mut without_skeleton(), 0);
+    assert!(!below.contains("nested creations"), "{below}");
+    let mut fx = without_skeleton();
+    let objects = ids(&fx);
+    let rng = format!("{:?}", fx.world.crt_rng);
+    let fault = at(&mut fx, sims_vm::MAX_CREATION_DEPTH);
+    assert!(fault.contains("nested creations"), "{fault}");
+    assert_eq!(ids(&fx), objects);
+    assert_eq!(format!("{:?}", fx.world.crt_rng), rng);
+}
+
+#[test]
+fn a_pet_refused_by_its_skeletons_name_is_refused_at_the_creation_depth_limit_too() {
+    // With neither pet expansion installed, a type whose loaded body row 0
+    // is empty but whose skeleton is "kat" is refused after the lookup
+    // (0x440dd5): Create New Object Instance takes its false
+    // branch. At the limit it still does, rather than faulting.
+    for depth in [0, sims_vm::MAX_CREATION_DEPTH] {
+        let (mut fx, file, record) = visitors();
+        fx.program.expansions = 0;
+        fx.program.people.skeletons.get_mut(&WIDGET).unwrap().name = "kat".into();
+        // Body row 0, loaded, is empty, so the early check names nothing.
+        fx.words(file)[19] = 200;
+        let library = fx.program.libraries.get_mut(&file).unwrap();
+        library
+            .loaded_strings
+            .insert(200, Some(vec![String::new()]));
+        let before = ids(&fx);
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![ins(
+                CREATE,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, 0, 0, 0, 6, FROM_RECORD, 0, 0],
+            )]),
+        );
+        let mut interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter.creation_depth = depth;
+        assert_eq!(
+            interpreter.run_tree(&mut fx.world, LAMP, 4096, record, &[], 1000),
+            Ok(false),
+            "depth {depth}"
+        );
+        assert_eq!(ids(&fx), before);
+    }
+}

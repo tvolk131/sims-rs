@@ -120,6 +120,11 @@ pub struct Interpreter<'a> {
     /// the making the original appends a person to the person vector is
     /// not read, so a walk of the vector meanwhile is refused.
     pub(crate) making_person: Option<u16>,
+    /// How many creations this run is nested in: factories running a new
+    /// object's Init or first turn, and the scripts a creation runs after
+    /// its factory returns ([`crate::factory::MAX_CREATION_DEPTH`]). 0 for
+    /// a run no creation started.
+    pub creation_depth: u16,
     /// The pie menu's listing, while it checks an action (the original's
     /// three pointers at 0x6e5130, 0x6e50fc and 0x6e50f8 are set), through
     /// every tree the check runs, nested ones included: the action being
@@ -245,6 +250,7 @@ impl<'a> Interpreter<'a> {
             ui_effects: None,
             masks_rebuilt: None,
             making_person: None,
+            creation_depth: 0,
             menu: None,
             running_at_once: None,
             letting_go: None,
@@ -417,6 +423,7 @@ impl<'a> Interpreter<'a> {
             base,
             synchronous,
             making_person: self.making_person,
+            creation_depth: self.creation_depth,
             menu: self.menu,
             running_at_once: self.running_at_once,
             letting_go: self.letting_go,
@@ -562,6 +569,8 @@ pub(crate) struct Machine<'a, 'w> {
     pub checking: bool,
     /// See [`Interpreter::making_person`].
     pub making_person: Option<u16>,
+    /// See [`Interpreter::creation_depth`].
+    pub creation_depth: u16,
     /// See [`Interpreter::menu`].
     pub menu: Option<&'a RefCell<crate::orders::Checking>>,
     /// See [`Interpreter::running_at_once`].
@@ -627,6 +636,7 @@ impl<'a> Machine<'a, '_> {
             ui_effects: self.ui_effects,
             masks_rebuilt: self.masks_rebuilt,
             making_person: self.making_person,
+            creation_depth: self.creation_depth,
             menu: self.menu,
             running_at_once: self.running_at_once,
             letting_go: self.letting_go,

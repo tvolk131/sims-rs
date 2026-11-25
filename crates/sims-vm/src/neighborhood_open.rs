@@ -19,7 +19,8 @@
 //!
 //! **Not ported:**
 //! - the save of `Neighborhood.iff` (0x4252cc), so the opened neighborhood
-//!   is returned in memory, for [`crate::boot::Lot::load_in`];
+//!   is returned in memory, for [`crate::boot::Lot::load_in`], with the
+//!   save inputs that save would write ([`Opened::save_inputs`]);
 //! - the portraits (BMP_ 2002 to 2007, 0x4e8c5d).
 
 mod pools;
@@ -36,6 +37,7 @@ use sims_core::CrtRng;
 use sims_formats::family_file::FamilyFile;
 use sims_formats::iff::{Iff, write};
 use sims_formats::iff_write::{ChunkWrite, write_chunk_with_residue};
+use sims_sim::neighborhood_save::SaveInputs;
 use sims_sim::neighbors::registry;
 use sims_sim::patch_import::{self, Context, Patch, open, pending};
 use std::io::Write;
@@ -63,6 +65,17 @@ pub struct Opened {
     /// why. The original does not check the deletion (0x429a87), so this
     /// does not fail the open.
     pub patch_left: Vec<(PathBuf, String)>,
+    /// What the save after the import (0x4252cc) writes beyond the
+    /// neighborhood ([`sims_sim::neighborhood_store::StoredNeighborhood::save_neighborhood_iff`]):
+    /// the inputs `Neighborhood.iff` held, with the import's changes
+    /// ([`patch_import::Opened::update_save_inputs`]). Each imported
+    /// family takes its file's FAMh (0x4291e6, 0x4107a8), or none if the
+    /// file has none, and the renumbered family 4000 keeps its own. A
+    /// family a pool moves off a reserved ID keeps its own under its new
+    /// ID ([`OpenedPools::renumbered`]), so the pool family made at the
+    /// reserved ID has none. Entries of families the opened neighborhood
+    /// lacks are dropped.
+    pub save_inputs: SaveInputs,
 }
 
 /// Opens the neighborhood at `directory` of the install at `root`, as the
@@ -90,7 +103,11 @@ pub fn open_neighborhood(
     crt: &mut CrtRng,
 ) -> Result<(Neighborhood, Opened), BootError> {
     let install = Install::detect(root)?;
-    let mut neighborhood = Neighborhood::open(directory)?;
+    let (mut neighborhood, file) = Neighborhood::open_with_file(directory)?;
+    // From the same read of `Neighborhood.iff` as the neighborhood, as the
+    // store's import keeps them.
+    let mut save_inputs = SaveInputs::from_file(&file)?;
+    save_inputs.retain_families(|family| neighborhood.families.contains_key(&family));
     let mut index = Index::build(&install)?;
     let characters = neighborhood.characters()?;
     if let Some(characters) = &characters {
@@ -153,6 +170,7 @@ pub fn open_neighborhood(
         });
     }
     let patch = open(&mut neighborhood, &patches, &context, new_guid)?;
+    patch.update_save_inputs(&mut save_inputs);
     let mut pool_crt = *crt;
     let skeletons = if pools.people.is_empty() {
         pools::Skeletons::default()
@@ -195,6 +213,9 @@ pub fn open_neighborhood(
     // Last, once every file is written, so a failure above leaves the
     // copy's `Patch` folder as it was.
     let patch_left = use_up_imported(&used_up, &canonical_output);
+    carry_save_inputs(&mut save_inputs, &filled.report.renumbered, |family| {
+        neighborhood.families.contains_key(&family)
+    });
     neighborhood.directory = output.to_path_buf();
     *crt = pool_crt;
     Ok((
@@ -203,8 +224,23 @@ pub fn open_neighborhood(
             patch_left,
             patch,
             pools: filled.report,
+            save_inputs,
         },
     ))
+}
+
+/// Carries `inputs` through the pools: each family moved off a reserved
+/// ID takes its entries to its new ID, in order, so the pool family made
+/// at the reserved ID has none; then only the families `kept` are left.
+fn carry_save_inputs(
+    inputs: &mut SaveInputs,
+    renumbered: &[(u16, u16)],
+    kept: impl FnMut(u16) -> bool,
+) {
+    for &(from, to) in renumbered {
+        inputs.renumber_family(from, to);
+    }
+    inputs.retain_families(kept);
 }
 
 fn write_imports(
@@ -422,6 +458,35 @@ fn pool_skeletons(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn a_household_moved_off_a_reserved_id_keeps_its_save_inputs() {
+        // Family 2000 had a FAMh and a name as read when the Townie
+        // wrapper moved it to 4002 and made the Townies at 2000.
+        let mut inputs = SaveInputs::default();
+        inputs.histories.insert(2000, vec![1, 2, 3]);
+        inputs.family_names.insert(2000, "Strays ".to_owned());
+        inputs.uninitialized.family_names.insert(2000, 7);
+        inputs.histories.insert(5, vec![5]);
+        inputs.histories.insert(9, vec![9]);
+        let families = [5, 2000, 4002];
+        carry_save_inputs(&mut inputs, &[(2000, 4002)], |family| {
+            families.contains(&family)
+        });
+        assert_eq!(
+            inputs.histories,
+            BTreeMap::from([(5, vec![5]), (4002, vec![1, 2, 3])])
+        );
+        assert_eq!(
+            inputs.family_names,
+            BTreeMap::from([(4002, "Strays ".to_owned())])
+        );
+        assert_eq!(
+            inputs.uninitialized.family_names,
+            BTreeMap::from([(4002, 7)])
+        );
+    }
 
     #[test]
     fn only_a_separate_matching_copy_is_used_up() {

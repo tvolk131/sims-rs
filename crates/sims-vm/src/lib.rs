@@ -106,7 +106,7 @@ pub use coop::{
     player_mode_to_panel_mode,
 };
 pub use error::Error;
-pub use factory::TURN_BUDGET;
+pub use factory::{MAX_CREATION_DEPTH, TURN_BUDGET};
 pub use fault::{Fault, Location, Trap};
 pub use frame::PanelMode;
 pub use interpreter::{Asked, Interpreter, MAX_STACK, Status, Stream};

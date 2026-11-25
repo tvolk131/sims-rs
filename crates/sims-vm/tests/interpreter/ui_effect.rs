@@ -8028,3 +8028,96 @@ fn round_29_ui_effect_events_catalog_bones_and_three_passes() {
         );
     }
 }
+
+/// Shows the portrait of [`visitors`]' off-lot person (a UI Effect, or a
+/// Dialog when `dialog`) on an interpreter `depth` creations deep, where
+/// the temporary person's Placed callback makes a sleeper (a type whose
+/// Main sleeps).
+fn a_portrait_whose_put_makes_a_sleeper(dialog: bool, depth: u16) -> Result<bool, String> {
+    const SLEEPER: u32 = 0x5555;
+    const SLEEP: u16 = 256;
+    let (mut fx, file, record) = visitors();
+    let sleepers = fx.add_type(SLEEPER, 4, 4096, 4097);
+    fx.add(GLOBAL, SLEEP, sleeper());
+    fx.add(
+        sleepers,
+        4096,
+        tree(vec![assign(
+            scope::MY_ATTRIBUTES,
+            0,
+            scope::LITERAL,
+            7,
+            RETURN_TRUE,
+        )]),
+    );
+    fx.add(
+        sleepers,
+        4097,
+        tree(vec![ins(SLEEP, 0, ERROR, [20, 0, 0, 0, 0, 0, 0, 0])]),
+    );
+    let [g0, g1, g2, g3] = SLEEPER.to_le_bytes();
+    fx.add(
+        file,
+        4200,
+        tree(vec![ins(
+            42,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [g0, g1, g2, g3, 6, 0, 0, 0],
+        )]),
+    );
+    let library = fx.program.libraries.get_mut(&file).unwrap();
+    for table in library.callbacks.values_mut() {
+        table.resize(
+            27,
+            sims_formats::execution::ObjectFunction {
+                condition: 0,
+                action: 0,
+            },
+        );
+        table[9].action = 4200; // function::PLACED
+    }
+    let [lo, hi] = record.to_le_bytes();
+    let (show, stack_object) = if dialog {
+        (
+            ins(
+                36,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, 0, 0, 0, 0, 0, 0, 1 | (2 << 1)],
+            ),
+            record,
+        )
+    } else {
+        (
+            ins(
+                UI_EFFECT,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [1, scope::LITERAL, lo, hi, 1, 0, 0, 0],
+            ),
+            0,
+        )
+    };
+    fx.add(LAMP_FILE, 4096, tree(vec![show]));
+    let mut interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.view_centre = Some([2, 2]);
+    interpreter.creation_depth = depth;
+    interpreter
+        .run_tree(&mut fx.world, LAMP, 4096, stack_object, &[], 1000)
+        .map_err(|fault| fault.to_string())
+}
+
+#[test]
+fn a_portraits_temporary_person_is_put_one_creation_deeper() {
+    // The put, its callbacks and the removal run after the person factory
+    // returned, one creation deeper (like Create New Object Instance's
+    // tail): one level short of the limit, the factory still makes the
+    // person, and the object its Placed callback makes is refused.
+    for dialog in [false, true] {
+        assert_eq!(a_portrait_whose_put_makes_a_sleeper(dialog, 0), Ok(true));
+        let fault = a_portrait_whose_put_makes_a_sleeper(dialog, sims_vm::MAX_CREATION_DEPTH - 1)
+            .unwrap_err();
+        assert!(fault.contains("nested creations"), "{fault}");
+    }
+}
