@@ -601,3 +601,540 @@ expect = { attrs = { out = 1 }, funds = 30 }
         }
     }
 }
+
+/// PR I-4: scopes, primitive options, inherit-tree calls, read-only helper parameters, scoped
+/// layout, and three lowering fixes.
+mod pr_i4 {
+    use sims_antics::{PackResolverConfig, compile_v2_source};
+
+    fn expand(name: &str, src: &str) -> String {
+        let cfg = PackResolverConfig::default();
+        compile_v2_source(name, src, &cfg).unwrap_or_else(|e| panic!("{name} must compile: {e}"));
+        sims_antics::v2::expand_v2_source_to_objects(name, src, &cfg)
+            .unwrap_or_else(|e| panic!("{name} must expand: {e}"))
+            .into_iter()
+            .next()
+            .expect("one object")
+            .air_source
+    }
+
+    fn expect_err(name: &str, src: &str, needle: &str) {
+        let cfg = PackResolverConfig::default();
+        let err = compile_v2_source(name, src, &cfg).expect_err(&format!("{name} must fail"));
+        assert!(
+            err.message.contains(needle),
+            "{name}: expected '{needle}' in: {err}"
+        );
+    }
+
+    /// The `.air` body of the tree labelled `label`.
+    fn tree<'a>(air: &'a str, label: &str) -> &'a str {
+        let start = air
+            .find(&format!("\"{label}\""))
+            .unwrap_or_else(|| panic!("tree {label}:\n{air}"));
+        let end = air[start..].find("\n}\n").map_or(air.len(), |e| start + e);
+        &air[start..end]
+    }
+
+    /// `body`'s `.air` lines, in order, appear in `text` one after another (blank-insensitive).
+    fn expect_seq(name: &str, text: &str, lines: &[&str]) {
+        let got: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let found = got.windows(lines.len()).any(|w| w == lines);
+        assert!(found, "{name}: missing\n{}\nin:\n{text}", lines.join("\n"));
+    }
+
+    /// One object with Sim tree `t(sim: Sim)` running `body`, after `uses` and `extra` members.
+    fn sim_tree(uses: &str, extra: &str, body: &str) -> String {
+        format!(
+            r#"{uses}
+object "Pr I4" {{
+    guid: 0x7F40_0262;
+    state n: i16;
+{extra}
+    #[bhav] fn t(sim: Sim) {{ {body} }}
+}}
+"#
+        )
+    }
+
+    fn t_air(name: &str, uses: &str, extra: &str, body: &str) -> String {
+        let air = expand(name, &sim_tree(uses, extra, body));
+        tree(&air, "t").to_owned()
+    }
+
+    mod scopes {
+        use super::*;
+
+        #[test]
+        fn temp_indexed_cells_read_their_temp_with_no_setup() {
+            let t = t_air(
+                "temp_indexed.antics",
+                "",
+                "",
+                "temp[1] = stack_obj.sprite_flags[temp[3]]; \
+                 stack_obj.sprite_flags[temp[2]] = 1; \
+                 temp[4] = sim.person[temp[5]]; \
+                 sim.person[temp[6]] = 2; \
+                 temp[7] = stack_obj.person[temp[1]];",
+            );
+            for want in [
+                "temp[1] := scope(27, 3);",
+                "scope(27, 2) := 1;",
+                "temp[4] := scope(30, 5);",
+                "scope(30, 6) := 2;",
+                "temp[7] := scope(31, 1);",
+            ] {
+                assert!(t.contains(want), "missing `{want}` in:\n{t}");
+            }
+            // A constant index still goes through temp[0] (scope 27 with setup).
+            let t = t_air(
+                "sprite_const.antics",
+                "",
+                "",
+                "temp[1] = stack_obj.sprite_flags[4];",
+            );
+            expect_seq(
+                "sprite_const",
+                &t,
+                &["temp[0] := 4;", "temp[1] := scope(27, 0);"],
+            );
+        }
+
+        #[test]
+        fn neighbor_cells_are_scopes_24_and_32() {
+            let t = t_air(
+                "neighbor.antics",
+                "",
+                "",
+                "temp[0] = stack_obj.neighbor.age; \
+                 temp[1] = stack_obj.neighbor.field[3]; \
+                 temp[2] = stack_obj.neighbor.person[10]; \
+                 temp[3] = stack_obj.neighbor.fame; \
+                 temp[4] = sim.fame;",
+            );
+            for want in [
+                "temp[0] := scope(24, 2);",
+                "temp[1] := scope(24, 3);",
+                "temp[2] := scope(32, 10);",
+                "temp[3] := scope(32, 81);",
+                "temp[4] := my.person[81];",
+            ] {
+                assert!(t.contains(want), "missing `{want}` in:\n{t}");
+            }
+        }
+
+        #[test]
+        fn neighbor_cells_refuse_writes_bad_fields_and_indices() {
+            expect_err(
+                "neighbor_write.antics",
+                &sim_tree("", "", "stack_obj.neighbor.age = 1;"),
+                "a neighbor cell is read-only",
+            );
+            expect_err(
+                "neighbor_index.antics",
+                &sim_tree("", "", "temp[0] = stack_obj.neighbor.field[10];"),
+                "neighbor.field index 10 out of range 0..=9",
+            );
+            expect_err(
+                "neighbor_field.antics",
+                &sim_tree("", "", "temp[0] = stack_obj.neighbor.bogus;"),
+                "unknown neighbor field 'bogus'",
+            );
+        }
+
+        #[test]
+        fn advert_delta_is_scope_12() {
+            let t = t_air("advert.antics", "", "", "advert.delta[2] = 5;");
+            assert!(t.contains("scope(12, 2) := 5;"), "{t}");
+        }
+    }
+
+    mod prim_options {
+        use super::*;
+
+        #[test]
+        fn pad_bytes_follow_the_primitive() {
+            let t = t_air(
+                "pads.antics",
+                "",
+                "",
+                "play_sound(3, pad3: 0x01); play_sound(4, pad7: 0xff, pad6: 0xff); \
+                 clear_motive_changes(pad2: 0x05);",
+            );
+            for want in [
+                "play_sound(3, stack_obj) pad(3: 0x01);",
+                "play_sound(4, stack_obj) pad(6: 0xff, 7: 0xff);",
+                "clear_motive_changes() pad(2: 0x05);",
+            ] {
+                assert!(t.contains(want), "missing `{want}` in:\n{t}");
+            }
+        }
+
+        #[test]
+        fn pad_bytes_refuse_spelled_and_repeated_bytes() {
+            for (name, body, needle) in [
+                (
+                    "pad_spelled",
+                    "play_sound(3, pad0: 1);",
+                    "operand byte 0 is spelled by the call's arguments, not 'pad0'",
+                ),
+                (
+                    "pad_twice",
+                    "play_sound(3, pad3: 1, pad3: 2);",
+                    "'pad3' is given twice",
+                ),
+                (
+                    "clear_args",
+                    "clear_motive_changes(3);",
+                    "takes no arguments besides 'padN: 0xNN' bytes",
+                ),
+            ] {
+                expect_err(name, &sim_tree("", "", body), needle);
+            }
+        }
+
+        #[test]
+        fn reach_make_new_character_and_drop_onto_parameters() {
+            let src = r#"object "Pr I4 Prims" {
+    guid: 0x7F40_0263;
+    state n: i16;
+    #[bhav] fn t(sim: Sim, a: i16, b: i16) {
+        drop_onto(src: 0, dst: b);
+        if drop_onto(src: 1, dst: param[0]) { self.n = 1; }
+        reach(mode: 1, moves: true, slot: b);
+        reach(mode: 0, moves: false);
+        let skin: i16 = 4;
+        let age: i16 = 3;
+        let sex: i16 = a;
+        if !make_new_character(skin: skin, age: age, sex: sex, species: 1) { self.n = 2; }
+    }
+}
+"#;
+            let air = expand("prims.antics", src);
+            let t = tree(&air, "t");
+            for want in [
+                "drop_onto(src: 0, dst: param[1]);",
+                "if drop_onto(src: 1, dst: param[0]) {",
+                "reach(mode: 1, moves: true, param: 1);",
+                "reach(mode: 0, moves: false);",
+                "make_new_character(skin: __v_skin_0, age: __v_age_1, sex: __v_sex_2, species: 1)",
+            ] {
+                assert!(t.contains(want), "missing `{want}` in:\n{t}");
+            }
+        }
+
+        #[test]
+        fn reach_and_make_new_character_check_their_arguments() {
+            for (name, body, needle) in [
+                (
+                    "reach_no_slot",
+                    "reach(mode: 1);",
+                    "reach(mode: 1) reads the slot from a parameter; name it with 'slot:'",
+                ),
+                (
+                    "reach_slot_mode0",
+                    "reach(mode: 0, slot: 1);",
+                    "reach reads 'slot:' only in mode 1",
+                ),
+                (
+                    "mnc_species",
+                    "let s: i16 = 1; make_new_character(skin: s, age: s, sex: s, species: 3);",
+                    "species 3 out of range 0..=2",
+                ),
+            ] {
+                expect_err(name, &sim_tree("", "", body), needle);
+            }
+        }
+    }
+
+    mod fixes {
+        use super::*;
+
+        /// An inline helper whose constant tail exits with a result tests a constant first, so
+        /// the exit's last result is that tail's, not the call before it.
+        #[test]
+        fn a_constant_inline_tail_records_its_own_result() {
+            let src = r#"use std::globals::*;
+
+object "Pr I4 Tail" {
+    guid: 0x7F40_0264;
+    fn leave() -> bool {
+        globals::standard_exit(50)?;
+        false
+    }
+    #[bhav(id = 4100)]
+    fn t(sim: Sim) -> bool {
+        if sim.person[62] == 3 {
+            return leave();
+        }
+        sim.person[62] += 1;
+        leave()
+    }
+}
+"#;
+            let air = expand("tail.antics", src);
+            let t = tree(&air, "t");
+            assert_eq!(t.matches("if 1 == 0 {").count(), 2, "{t}");
+            expect_seq("tail", t, &["if 1 == 0 {", "}", "return false;"]);
+        }
+
+        /// A foreign read after `stack_obj = o` in a tree that is not explicit puts back `o`,
+        /// not the entry object.
+        #[test]
+        fn a_foreign_read_restores_the_assigned_cursor() {
+            let src = r#"object "Pr I4 Cursor" {
+    guid: 0x7F40_0265;
+    #[bhav] fn t(sim: Sim, o: ObjectId, p: ObjectId) {
+        stack_obj = o;
+        temp[0] = p.attr[3];
+        temp[1] = stack_obj.attr[1];
+    }
+}
+"#;
+            let air = expand("cursor.antics", src);
+            expect_seq(
+                "cursor",
+                tree(&air, "t"),
+                &[
+                    "stack_obj := param[0];",
+                    "let __pre_stack_obj_1 = stack_obj;",
+                    "stack_obj := param[1];",
+                    "let __fattr_0 = stack.attr[3];",
+                    "stack_obj := __pre_stack_obj_1;",
+                    "temp[0] := __fattr_0;",
+                    "temp[1] := stack.attr[1];",
+                ],
+            );
+        }
+
+        /// In-place arithmetic into an observable cell goes through a local when a later operand
+        /// read may fault, so a fault leaves the cell as it was.
+        #[test]
+        fn arithmetic_stages_before_a_faulting_read() {
+            let t = t_air(
+                "partial.antics",
+                "",
+                "",
+                "temp[0] = 1 + stack_obj.attr[0]; temp[2] = 1 + stack_obj.object_type; \
+                 temp[6] = -stack_obj.object_type; temp[5] = temp[5] - sim.motive.hunger; \
+                 temp[7] = 3 * temp[1]; temp[4] = 1 + self.n;",
+            );
+            for seq in [
+                &[
+                    "__arith_0 := 1;",
+                    "__arith_0 += scope(21, 9);",
+                    "temp[2] := __arith_0;",
+                ][..],
+                &[
+                    "__arith_0 := 0;",
+                    "__arith_0 -= scope(21, 9);",
+                    "temp[6] := __arith_0;",
+                ],
+                // Reads that cannot fault stay in place.
+                &["temp[5] -= my.motive.hunger;"],
+                &["temp[7] := 3;", "temp[7] *= temp[1];"],
+                // `self` in a tree that never moves the cursor is the entry object.
+                &["temp[4] := 1;", "temp[4] += stack.attr[0];"],
+            ] {
+                expect_seq("partial", &t, seq);
+            }
+            assert!(!t.contains("temp[2] := 1;"), "{t}");
+            // Once the tree moves the cursor, `self` may name another object.
+            let t = t_air(
+                "partial_moved.antics",
+                "",
+                "",
+                "stack_obj = temp[1]; temp[3] = 1 + self.n;",
+            );
+            expect_seq(
+                "partial_moved",
+                &t,
+                &["__arith_0 += stack.attr[0];", "temp[3] := __arith_0;"],
+            );
+            // Writing `self` through the cursor faults first on a gone object.
+            let t = t_air(
+                "partial_self.antics",
+                "",
+                "",
+                "stack_obj = temp[1]; self.n = 1 + self.graphic;",
+            );
+            expect_seq(
+                "partial_self",
+                &t,
+                &["stack.attr[0] := 1;", "stack.attr[0] += stack.data[0];"],
+            );
+        }
+    }
+
+    mod inherit_calls {
+        use super::*;
+
+        fn object(main: &str, inherit_body: &str) -> String {
+            format!(
+                r#"object "Pr I4 Inherit" {{
+    guid: 0x7F40_0266;
+    state n: i16;
+    {main}
+    #[bhav(id = 4200, args = 1, locals = 1)]
+    fn open_door(sim: Sim, event: i16) {{ self.n = event; }}
+    #[bhav(id = 4201)]
+    fn plain(sim: Sim) {{ self.n = 3; }}
+    #[bhav(id = 4202, context = inherit, locals = 1)]
+    fn sing() {{ {inherit_body} }}
+    #[bhav(id = 4203, context = inherit)]
+    fn sing_outer() {{ sing(); }}
+    #[bhav(id = 4204)]
+    fn from_sim(sim: Sim) {{ sing_outer(); }}
+}}
+"#
+            )
+        }
+
+        #[test]
+        fn an_inherit_tree_calls_a_sim_tree_with_me() {
+            let air = expand(
+                "inherit_call.antics",
+                &object("", "let ev = temp[1]; open_door(me, ev)?; plain(me);"),
+            );
+            let sing = tree(&air, "sing");
+            assert!(sing.contains("if !call 4200(temps) {"), "{sing}");
+            assert!(sing.contains("call 4201(temps)"), "{sing}");
+            // Spelled with raw code, the tree is the same.
+            let raw = expand(
+                "inherit_raw.antics",
+                &object(
+                    "",
+                    "raw { temp[0] := temp[1]; \
+                     if !call 4200(temps) { return error; } } plain(me);",
+                ),
+            );
+            let canon = |t: &str| t.split_whitespace().collect::<String>();
+            assert_eq!(canon(sing), canon(tree(&raw, "sing")), "{air}\n{raw}");
+        }
+
+        #[test]
+        fn the_sim_must_be_me() {
+            expect_err(
+                "inherit_stack.antics",
+                &object("", "plain(stack_obj);"),
+                "tree 'plain' expects 'me' (the inherit tree's runner) as its first argument",
+            );
+        }
+
+        #[test]
+        fn object_trees_may_not_call_them() {
+            for (name, main) in [
+                ("init_direct", "init { sing(); }"),
+                ("init_through", "init { sing_outer(); }"),
+            ] {
+                expect_err(
+                    name,
+                    &object(main, "plain(me);"),
+                    "is 'context = inherit' but runs a Sim tree on its runner",
+                );
+            }
+            // An inherit tree that names no Sim tree stays callable from anywhere.
+            expand(
+                "init_free.antics",
+                &object("init { sing_outer(); }", "temp[0] = 1;"),
+            );
+        }
+    }
+
+    mod read_only_params {
+        use super::*;
+
+        #[test]
+        fn pure_helpers_read_stable_cells_in_place() {
+            let t = t_air(
+                "zero_copy.antics",
+                "use std::math::*;",
+                "",
+                "temp[0] = min(temp[1], self.n); temp[4] = max(sim.age, global[3]);",
+            );
+            assert!(!t.contains("__arg_"), "{t}");
+            assert!(t.contains("if temp[1] < stack.attr[0] {"), "{t}");
+            assert!(t.contains("if my.person[58] > global[3] {"), "{t}");
+        }
+
+        #[test]
+        fn faulting_or_changing_cells_are_still_copied() {
+            // A stack object read may fault, so it is read once, up front.
+            let t = t_air(
+                "copy_stack.antics",
+                "use std::math::*;",
+                "",
+                "temp[2] = min(stack_obj.attr[1], 4);",
+            );
+            expect_seq("copy_stack", &t, &["let __arg_a_0 = stack.attr[1];"]);
+            // A helper that writes the cell's object gets a copy.
+            let t = t_air(
+                "copy_write.antics",
+                "",
+                "fn bump(x: i16) -> i16 { self.n += 1; x + self.n }",
+                "temp[0] = bump(sim.age);",
+            );
+            assert!(t.contains("__arg_x"), "{t}");
+        }
+    }
+
+    mod raw_layout {
+        use super::*;
+
+        fn layout(raw: &str) -> String {
+            let air = expand(
+                "raw_layout.antics",
+                &sim_tree("", "", &format!("let unused = 5; {raw}")),
+            );
+            tree(&air, "t").to_owned()
+        }
+
+        /// The optimizer treats such a block like the structured code it spells: the trees
+        /// come out the same.
+        #[test]
+        fn a_lowering_shaped_raw_block_leaves_the_tree_to_the_optimizer() {
+            let canon = |t: &str| t.split_whitespace().collect::<String>();
+            let extra = "    #[bhav(id = 4200)] fn p(sim: Sim) { }";
+            for (raw, structured) in [
+                (
+                    "raw { if !call 4200(temps) { // a comment\n return error; } }",
+                    "p(sim)?;",
+                ),
+                ("raw { temp[0] := 1; }", "temp[0] = 1;"),
+                (
+                    "raw { if temp[0] == 1 { temp[1] := 2; } else { temp[1] := 3; } }",
+                    "if temp[0] == 1 { temp[1] = 2; } else { temp[1] = 3; }",
+                ),
+            ] {
+                let body = |b: &str| {
+                    let air = expand(
+                        "raw_layout.antics",
+                        &sim_tree("", extra, &format!("let unused = 5; temp[7] = unused; {b}")),
+                    );
+                    tree(&air, "t").to_owned()
+                };
+                let (r, s) = (body(raw), body(structured));
+                assert_eq!(canon(&r), canon(&s), "{raw}:\n{r}\n{s}");
+            }
+            assert!(!layout("raw { temp[0] := 1; }").contains(" = 5;"));
+        }
+
+        #[test]
+        fn other_raw_blocks_keep_the_layout() {
+            for raw in [
+                "raw { const K = 1; temp[0] := K; }",
+                "raw { local[0] := 1; }",
+                "raw { call 4200(1, 2); }",
+                "raw { temp[0] := scope(21, 9); }",
+                "raw { if expr(temp[0] := 1) { } }",
+            ] {
+                let t = layout(raw);
+                assert!(t.contains(" = 5;"), "{raw}:\n{t}");
+            }
+        }
+    }
+}

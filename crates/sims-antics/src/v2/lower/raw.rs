@@ -307,6 +307,9 @@ pub(super) fn raw_block_is_layout_free(code: &str) -> bool {
         "flag_test",
     ];
     const PRIMS: &[&str] = &["find_best_object", "run_functional_tree", "play_sound"];
+    if code.contains("/*") {
+        return false;
+    }
     let Ok(tokens) = crate::lexer::tokenize(code) else {
         return false;
     };
@@ -349,4 +352,64 @@ pub(super) fn raw_block_is_layout_free(code: &str) -> bool {
         i += 1;
     }
     depth == 0
+}
+
+/// A layout-free raw block ([`raw_block_is_layout_free`]) as the lowering prints its own code:
+/// one statement per line, `{` ending its line, `}` alone (or `} else {`), comments dropped, so
+/// the backend passes parse it like lowered text. The block has no strings, so every `{`, `}`
+/// and `;` is punctuation.
+pub(super) fn layout_free_raw_lines(code: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let flush = |cur: &mut String, lines: &mut Vec<String>| {
+        let t = cur.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !t.is_empty() {
+            lines.push(t);
+        }
+        cur.clear();
+    };
+    for raw_line in code.lines() {
+        let line = raw_line.split("//").next().unwrap_or("");
+        for c in line.chars() {
+            match c {
+                '{' | ';' => {
+                    cur.push(c);
+                    flush(&mut cur, &mut lines);
+                }
+                '}' => {
+                    flush(&mut cur, &mut lines);
+                    lines.push("}".to_owned());
+                }
+                _ => cur.push(c),
+            }
+        }
+        cur.push(' ');
+    }
+    flush(&mut cur, &mut lines);
+    let mut joined: Vec<String> = Vec::with_capacity(lines.len());
+    for l in lines {
+        if l.starts_with("else")
+            && let Some(prev) = joined.last_mut()
+            && prev == "}"
+        {
+            *prev = format!("}} {l}");
+        } else {
+            joined.push(l);
+        }
+    }
+    // Nested lines indent like lowered code (the backend passes ignore indentation).
+    let mut depth = 0usize;
+    joined
+        .into_iter()
+        .map(|l| {
+            if l.starts_with('}') {
+                depth = depth.saturating_sub(1);
+            }
+            let out = format!("{}{l}", "    ".repeat(depth));
+            if l.ends_with('{') {
+                depth += 1;
+            }
+            out
+        })
+        .collect()
 }

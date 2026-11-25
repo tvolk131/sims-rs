@@ -1074,10 +1074,11 @@ impl<'a> TreeLowerer<'a> {
             V2Stmt::Expr { span: _, expr } => self.lower_expr_stmt(expr),
             V2Stmt::RawAir { span, code } => {
                 self.raw_blocks += 1;
+                let layout_free = raw_block_is_layout_free(code);
                 // Discarded code emits nothing, so only emitted raw blocks count.
                 if self.checking_discarded == 0 {
                     self.raw_span.get_or_insert(*span);
-                    if !raw_block_is_layout_free(code) {
+                    if !layout_free {
                         self.keep_layout = true;
                     }
                     if self.pin_span.is_some() {
@@ -1139,10 +1140,16 @@ impl<'a> TreeLowerer<'a> {
                         )
                     })?;
                 }
-                for raw_line in code.lines() {
-                    let trimmed = raw_line.trim();
-                    if !trimmed.is_empty() {
-                        self.line(trimmed.to_owned());
+                if layout_free {
+                    for line in layout_free_raw_lines(code) {
+                        self.line(line);
+                    }
+                } else {
+                    for raw_line in code.lines() {
+                        let trimmed = raw_line.trim();
+                        if !trimmed.is_empty() {
+                            self.line(trimmed.to_owned());
+                        }
                     }
                 }
                 Ok(())
