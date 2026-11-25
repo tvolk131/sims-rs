@@ -323,7 +323,7 @@ fn trees_showing_text_prove_through_lifted_strings() {
     strings 301 "Dialog prim string set" { ask = "Go on? $Local:0", head = "Sign \"A\"" }
     strings 431 "Action labels" { a = "Read", b = "Wave" }
     @id(4300) tree confirm {
-        dialog(kind: yes_no, message: ask, title: head)?;
+        dialog(kind: yes_no, message: ask, title: head, icon_mode: 1)?;
     }
     @id(4301) tree label {
         action_label(table: 431, index: 2);
@@ -634,7 +634,8 @@ fn lifts_location_local_and_generic_calls() {
         "if find_location(mode: 3, flags: 1, local: slot_1) {",
         "generic_call(41);",
         "find_location(mode: 1, flags: 0);",
-        "find_location(mode: 1, flags: 1, local: 1);",
+        // `@slot` keeps slot 1 where the primitive reads it.
+        "find_location(mode: 1, flags: 1, local: slot_1);",
         "temp[4] = 2;",
     ] {
         assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
@@ -676,7 +677,10 @@ fn lifts_relationship_locals_and_keeps_other_value_operands_raw() {
     ] {
         assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
     }
-    assert_eq!(lifted.matches("raw {").count(), 2, "{lifted}");
+    // Only the non-local values stay raw: `@slot` pins the named locals without a raw
+    // block.
+    assert_eq!(lifted.matches("raw {").count(), 1, "{lifted}");
+    assert!(lifted.contains("@slot(1) let slot_1: i16;"), "{lifted}");
 }
 
 #[test]

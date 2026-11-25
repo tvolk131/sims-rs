@@ -591,6 +591,28 @@ fn uninitialized_local_read_before_assignment_is_flagged() {
 }
 
 #[test]
+fn a_slot_pinned_local_is_neither_unread_nor_uninitialized() {
+    // `@slot(N)` pins the frame word for code that addresses it by number, which may
+    // fill or read it: no `uninitialized_local_read`, no `unused_decl`.
+    for body in [
+        "        @slot(2) let x: i16;\n        self.level = x;\n        x = 3;\n        self.level += x;",
+        "        @slot(2) let y: i16 = 1;\n        self.level = 2;",
+    ] {
+        let source = tree(body);
+        none(&source, "uninitialized_local_read");
+        none(&source, "unused_decl");
+        assert!(lint(&source).is_empty(), "{body}: {:?}", lint(&source));
+    }
+    // An unpinned one still is.
+    one(
+        &tree(
+            "        let x: i16;\n        self.level = x;\n        x = 3;\n        self.level += x;",
+        ),
+        "uninitialized_local_read",
+    );
+}
+
+#[test]
 fn builtins_that_write_a_local_assign_it() {
     // `animate(local:)` and `random_into(x, n)` write their target: no read-before-assign,
     // and the target is not unused.
@@ -932,7 +954,7 @@ fn a_sim_tree_reading_param_in_raw_without_frame_args_is_flagged() {
 
 #[test]
 fn a_const_written_as_its_value_in_raw_is_used() {
-    // `raw` does not resolve const names, so the value stands in for the name.
+    // The value written in place of the name is a use too.
     none(
         &obj(
             "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { attr[7] := 1; }\n    }",
@@ -949,25 +971,52 @@ fn a_const_written_as_its_value_in_raw_is_used() {
 }
 
 #[test]
-fn a_const_named_only_in_raw_is_not_used() {
-    // The build rejects the name in `raw`: say so instead of counting it as a use.
-    let d = one(
+fn a_const_named_in_raw_is_used() {
+    // Lowering declares a v2 `const` a raw block names as an `.air` constant.
+    let source = obj(
+        "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { temp[0] := LEVEL_SLOT; }\n    }",
+    );
+    none(&source, "unused_decl");
+    assert!(lint(&source).is_empty(), "{:?}", lint(&source));
+    // A block's own `.air` constant of the same name is not the v2 one.
+    one(
         &obj(
-            "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { temp[0] := LEVEL_SLOT; }\n    }",
+            "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { const LEVEL_SLOT = 3; temp[0] := LEVEL_SLOT; }\n    }",
         ),
         "unused_decl",
     );
-    assert!(d.message.contains("only named inside `raw"), "{d:?}");
-    assert!(
-        d.note
-            .as_deref()
-            .unwrap()
-            .contains("does not resolve `const`"),
-        "{d:?}"
+    // `const[K]` reads `K`, and `const K.e = ..` declares no `K`: a bare `K` there is a use.
+    for raw in [
+        "raw { temp[0] := const[LEVEL_SLOT]; }",
+        "raw { const LEVEL_SLOT.e = 2; temp[0] := LEVEL_SLOT; }",
+    ] {
+        none(
+            &obj(&format!(
+                "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {{\n        self.mode = Mode::Off;\n        self.level = 0;\n        {raw}\n    }}"
+            )),
+            "unused_decl",
+        );
+    }
+    // `K.e` after the block's own `const K.e` is not the v2 `K`; a `.const` field declares
+    // nothing.
+    one(
+        &obj(
+            "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { const LEVEL_SLOT.e = 2; temp[0] := LEVEL_SLOT.e; }\n    }",
+        ),
+        "unused_decl",
     );
-    assert_eq!(
-        d.help.as_deref(),
-        Some("write its value, 7, in the `raw` body")
+    none(
+        &obj(
+            "    const LEVEL_SLOT = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { const Tune.const = LEVEL_SLOT; temp[0] := Tune.const; }\n    }",
+        ),
+        "unused_decl",
+    );
+    // A field after `.` is not the constant.
+    one(
+        &obj(
+            "    const room = 7;\n    tree probe \"Probe\" {\n        self.mode = Mode::Off;\n        self.level = 0;\n        raw { temp[0] := my.room; }\n    }",
+        ),
+        "unused_decl",
     );
 }
 
