@@ -729,8 +729,15 @@ fn only_a_raw_expression_naming_global_34_reads_it() {
         &src("op 2 (0, 0, 34, 0, 0, 3, 14, 6);"),
     );
     assert!(tree(&air, "a").contains("= 7;"), "{air}");
+    // Bytes separated by spaces encode the same instruction.
+    let air = expand(
+        "raw_global34_spaced.antics",
+        &src("op 2 (0 0 34 0 0 3 14 6);"),
+    );
+    assert!(tree(&air, "a").contains("= 7;"), "{air}");
     for raw in [
         "op 2 (0, 0, 5, 0, 0, 3, 14, 6);",
+        "op 2 (0 0 5 0 0 3 14 6);",
         "op 4 (0, 0, 0, 0, 0, 0, 0, 0);",
     ] {
         let air = expand("raw_other_op.antics", &src(raw));

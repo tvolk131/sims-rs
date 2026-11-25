@@ -653,13 +653,16 @@ fn raw_op_may_read_global_34(tokens: &[crate::lexer::Token]) -> bool {
     match tokens.first().map(|t| &t.kind) {
         Some(T::Ident(_)) => true,
         Some(T::Int(2)) => {
+            // The operand list: `(b0, .., b7)`, its bytes separated by commas or by spaces.
+            if !matches!(tokens.get(1).map(|t| &t.kind), Some(T::LParen)) {
+                return true;
+            }
             let mut bytes = Vec::new();
-            for (n, t) in tokens.iter().skip(1).enumerate() {
-                match (&t.kind, n % 2) {
-                    (T::LParen, _) if n == 0 => {}
-                    (T::Int(b), 1) => bytes.push(*b),
-                    (T::Comma, 0) if n > 0 => {}
-                    (T::RParen, _) => break,
+            for t in &tokens[2..] {
+                match &t.kind {
+                    T::Int(b) => bytes.push(*b),
+                    T::Comma => {}
+                    T::RParen => break,
                     _ => return true,
                 }
             }

@@ -89,8 +89,9 @@ tree turns out to read it). Trees outside the object are not examined: the game'
 - such a read is a `global[34]` operand, a `global[..]` whose index is not a literal, a
   `scope(6, ..)` cell, or a raw `op` that may be an Expression naming it: opcode 2 with right
   scope byte 7 = 6 and right index bytes 2..4 = 34, or an opcode or operand byte that is not a
-  literal. Only Expression reads global 34 that way, so another literal opcode reads none (one
-  from 256 up calls a tree, which the object rule covers for the object's own trees);
+  literal (its bytes separated by commas or spaces). Only Expression reads global 34 that way,
+  so another literal opcode reads none (one from 256 up calls a tree, which the object rule
+  covers for the object's own trees);
 - a text tree takes `Unknown`, which is main's rule;
 - out-operands are not definitions there (section 5), so they make no store dead;
 - a `random` defines its destination only with a literal range (`DrawRanges::Literal`, main's
@@ -233,6 +234,18 @@ declaration order, so generated names no longer matter.
   object any of whose trees may read global 34, and a pinning tree, are the exceptions to
   applying them more widely: there the branch keeps and drops exactly what main does (section 1
   and the pinned slot above).
+- **The last result after a dropped entry save.** The save is an Expression, so it leaves the
+  last result true, and a node that reads the incoming last result sees that on main: Find Best
+  Action (`gosub_found_action`) records it in the person's previous action, idle and routing
+  primitives branch on it, and a call's callee may read it at its first node. Main's entry-save
+  drop (`entry_save.rs`) already drops an unread save before such a node in a tree that formats
+  no text, on purpose: the save is the lowering's bookkeeping, and the node then sees the
+  frame's entry state, as the source says and as the original game's trees (which have no save)
+  do. This branch applies that rule to text trees whose text reads no moved word (section 1),
+  which is the R3-1 fix itself: each of the six saves the Chess R2, Piano R2 and Fridges R5
+  sources lose comes before a call. A tree of an
+  object that may read global 34, a pinning tree, and a text tree that may be a bottom frame
+  keep main's rules and so keep the save where main does.
 - **Bottom frames.** Create Object with flag 0x10 (or 0x02) writes word 0 of the new object's
   bottom frame, and faults when the frame has none. So in a tree that may run as one, which
   local lives in which word is observable: a local read before it is written reads the
