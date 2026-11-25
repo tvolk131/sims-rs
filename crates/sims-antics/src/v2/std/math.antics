@@ -1,0 +1,62 @@
+// Built-in `std::math`: small `i16` helpers, inlined at each call site like any `pub fn`.
+//
+// The VM's expression primitive computes in 32 bits and stores the low 16 bits
+// (`crates/sims-vm` `primitives/expression.rs`), so negation and arithmetic wrap like Rust's
+// `wrapping_*` operations and never trap.
+//
+// Costs below are for `temp[0] = f(temp[1], ..)`, counting the store into `temp[0]`. An argument
+// the helper cannot read in place (a Sim tree's `stack.attr`, say) adds one copy node.
+
+/// The smaller of `a` and `b`. Four nodes: a compare, a store on each branch, the store out.
+pub fn min(a: i16, b: i16) -> i16 {
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+/// The larger of `a` and `b`. Four nodes, as `min`.
+pub fn max(a: i16, b: i16) -> i16 {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+/// `x` limited to `lo..=hi`. Six nodes: two compares, three branch stores, the store out.
+///
+/// Where Rust's `clamp` panics on `lo > hi`, this tests `lo` first: an `x` below `lo` gives `lo`,
+/// and any other `x` gives `hi`.
+pub fn clamp(x: i16, lo: i16, hi: i16) -> i16 {
+    if x < lo {
+        lo
+    } else if x > hi {
+        hi
+    } else {
+        x
+    }
+}
+
+/// The absolute value of `x`. Four nodes: a copy, a compare, a multiply by -1, the store out
+/// (`-x` would cost a fifth, as `0 - x`).
+///
+/// `abs(-32768)` is `-32768`: `-32768 * -1` is 32768 in 32 bits, and its low 16 bits are -32768
+/// again, as Rust's `i16::wrapping_abs` gives.
+pub fn abs(x: i16) -> i16 {
+    let mut r = x;
+    if r < 0 {
+        r *= -1;
+    }
+    r
+}
+
+/// `true` with probability `p` percent: one draw from 0 to 99 below `p`. `p <= 0` is never true
+/// and `p >= 100` always is. Two nodes as a condition: the draw (into a local nothing reads
+/// before it) and the compare.
+pub fn chance_percent(p: i16) -> bool {
+    let r: i16;
+    random_into(r, 100);
+    r < p
+}
