@@ -1,0 +1,14 @@
+// Built-in `std::budget`: household money helpers, inlined at each call site.
+
+use std::engine::BudgetCategory;
+
+/// Spends `price` from `sim`'s household in `category` if the household can afford it, and
+/// returns whether it did. One Alter Budget node: the primitive tests the funds before it
+/// spends, takes its false branch when they fall short (spending nothing), and spends otherwise
+/// (`crates/sims-vm` `primitives/budget.rs`), so it is `can_afford` then `debit_funds` without
+/// a second test.
+///
+/// `category` is a compile-time operand. A number is written `BudgetCategory::from_raw(n)`.
+pub fn try_charge(sim: Sim, price: i16, category: BudgetCategory) -> bool {
+    sim.debit_funds(price, category: category)
+}

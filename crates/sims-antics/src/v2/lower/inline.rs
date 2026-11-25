@@ -76,6 +76,9 @@ impl<'a> TreeLowerer<'a> {
     /// stable cell. Unknown effects (including primitives, calls, raw code, and indirect
     /// writes) force a snapshot. A Sim tree's `stack.attr` can address a different object
     /// even before the helper is entered, so only declared attributes on `my` qualify.
+    /// Any other cell (an object's, the Sim's, a global) is forwarded only when reading it can
+    /// neither fault nor wake an object ([`Self::safe_cell_air`]), so moving, repeating or
+    /// dropping the read changes nothing, and the helper is pure ([`HelperCell::Pure`]).
     pub(super) fn can_forward_helper_cell(
         &self,
         air: &str,
@@ -96,6 +99,13 @@ impl<'a> TreeLowerer<'a> {
             && self.env.states.values().any(|s| s.attr_index == i as usize)
         {
             HelperCell::OwnAttr(i)
+        } else if self.safe_cell_air(air)
+            // Resolving data word 25 wakes its object, so that read must happen as written.
+            && !canonical_air_cell(air).ends_with(".data[25]")
+            // Nothing proves a Sim tree's entry cursor names a live object of this kind.
+            && !canonical_air_cell(air).starts_with("stack.")
+        {
+            HelperCell::Pure
         } else {
             return false;
         };
@@ -376,7 +386,7 @@ impl<'a> TreeLowerer<'a> {
                 let mut lval = match arg_expr {
                     V2Expr::MutRef { inner: place, .. } => {
                         self.reject_read_only_sim_slot(place)?;
-                        self.resolve_lvalue(place)?
+                        self.resolve_borrowed_lvalue(place)?
                     }
                     V2Expr::Ident(_, pname) => match self.lookup_var(pname).cloned() {
                         Some(Binding::MutRef { target }) => target,
@@ -653,6 +663,9 @@ impl<'a> TreeLowerer<'a> {
 
         // Check a trial emission for raw code, pinned slots and calls that depend on the
         // layout of adjacent nodes. These need the ordinary single-copy branch lowering.
+        // The arms are captured before the condition's helper is lowered: a raw cursor write
+        // in the helper must already count for them.
+        self.note_loop_raw_cursor(Some(cond), &[]);
         let prefix = self.em.take_text();
         let mut trial = self.clone();
         self.em.set_text(prefix);
@@ -660,6 +673,12 @@ impl<'a> TreeLowerer<'a> {
         let mut declarations = Vec::new();
         let then_air = trial.capture_inline_arm(then_body, &mut declarations)?;
         let else_air = trial.capture_inline_arm(else_body, &mut declarations)?;
+        // Raw code keeps the single-copy lowering: copying it to each return site could push a
+        // tree past the node limit its author counted with one copy.
+        if trial.raw_blocks != self.raw_blocks {
+            *self.env.dialog_strings.borrow_mut() = strings;
+            return Ok(false);
+        }
         let (on_true, on_false) = if negated {
             (else_air, then_air)
         } else {

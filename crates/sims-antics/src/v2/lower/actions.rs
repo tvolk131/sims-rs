@@ -463,6 +463,63 @@ impl<'a> TreeLowerer<'a> {
     /// `stack_obj`, or a literal `bool` (`true` = the stack object, as in `.air`); by default the
     /// object. Flag 0x02 is the target's, so `flags:` may not set it.
     pub(super) fn format_play_sound(&self, args: &[CallArg], span: Span) -> Result<(String, bool)> {
+        // Bytes 0-1 hold the sound and byte 4 the flags (`flags:`).
+        let (args, pad) = self.split_pad_args("play_sound", args, &[0, 1, 4])?;
+        let (prim, on_self) = self.format_play_sound_call(&args, span)?;
+        Ok((format!("{prim}{pad}"), on_self))
+    }
+
+    /// `padN: 0xNN` named arguments (N in 0..=7): operand bytes the VM never reads, kept so a
+    /// primitive lifted from a shipped tree encodes byte for byte. Returns the other arguments
+    /// and the `.air` ` pad(i: 0xNN, ...)` suffix ("" without pads); `.air` then refuses a pad
+    /// that touches a byte the primitive reads, or one that changes nothing; `spelled` names the
+    /// bytes the call's own arguments encode, refused here with a v2 span.
+    pub(super) fn split_pad_args(
+        &self,
+        prim: &str,
+        args: &[CallArg],
+        spelled: &[u8],
+    ) -> Result<(Vec<CallArg>, String)> {
+        let mut rest = Vec::new();
+        let mut pads: Vec<(u8, u8)> = Vec::new();
+        for a in args {
+            let Some(index) = a
+                .name
+                .as_deref()
+                .and_then(|n| n.strip_prefix("pad"))
+                .filter(|d| d.len() == 1)
+                .and_then(|d| d.parse::<u8>().ok())
+                .filter(|i| *i < 8)
+            else {
+                rest.push(a.clone());
+                continue;
+            };
+            if spelled.contains(&index) {
+                return Err(Error::at(
+                    a.span,
+                    format!(
+                        "{prim}: operand byte {index} is spelled by the call's arguments, not 'pad{index}'"
+                    ),
+                ));
+            }
+            if pads.iter().any(|(i, _)| *i == index) {
+                return Err(Error::at(
+                    a.span,
+                    format!("{prim}: 'pad{index}' is given twice"),
+                ));
+            }
+            let value = self.eval_builtin_int(&a.value, &format!("{prim} pad{index}"), 0, 255)?;
+            pads.push((index, value as u8));
+        }
+        if pads.is_empty() {
+            return Ok((rest, String::new()));
+        }
+        pads.sort_unstable();
+        let bytes: Vec<String> = pads.iter().map(|(i, v)| format!("{i}: {v:#04x}")).collect();
+        Ok((rest, format!(" pad({})", bytes.join(", "))))
+    }
+
+    fn format_play_sound_call(&self, args: &[CallArg], span: Span) -> Result<(String, bool)> {
         let bound = self.bind_builtin_args("play_sound", args, &["sound", "target"], &["flags"])?;
         let Some(sound) = bound.get("sound") else {
             return Err(Error::at(

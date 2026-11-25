@@ -136,7 +136,32 @@ pub(super) const PRIM_BUILTINS: &[PrimBuiltin] = &[
     PrimBuiltin {
         v2: "drop_onto",
         air: "drop_onto",
-        keys: &[("src", "src", I16), ("dst", "dst", I16)],
+        keys: &[
+            ("src", "src", PrimArg::SlotOrParam),
+            ("dst", "dst", PrimArg::SlotOrParam),
+        ],
+    },
+    // Reach (opcode 47): mode 1 reaches for the slot whose number is in parameter `slot:`.
+    PrimBuiltin {
+        v2: "reach",
+        air: "reach",
+        keys: &[
+            ("mode", "mode", I16),
+            ("moves", "moves", PrimArg::Bool),
+            ("slot", "param", PrimArg::ParamIndex),
+        ],
+    },
+    // Make New Character (opcode 19): skin, age, and sex are read from locals; `species` picks
+    // the template (0 person, 1 dog, 2 cat).
+    PrimBuiltin {
+        v2: "make_new_character",
+        air: "make_new_character",
+        keys: &[
+            ("skin", "skin", PrimArg::Local),
+            ("age", "age", PrimArg::Local),
+            ("sex", "sex", PrimArg::Local),
+            ("species", "species", PrimArg::Int(0, 2)),
+        ],
     },
     // `find_location(local:)` reads the target position from the local.
     PrimBuiltin {

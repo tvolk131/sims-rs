@@ -7829,7 +7829,7 @@ fn readability_builtins_animate_frame_and_raw_lower_exactly() {
         "scope(28, 3) := -5;\n    scope(29, 5) := 1;",
         "my.person[40] := 3;",
         // A raw block that only writes attributes and calls a BHAV keeps no dead self save.
-        "tree 4201 \"Raw Safe\" {\n    my.attr[0] := 1; call 256(temps);\n    stack.attr[0] := 1;",
+        "tree 4201 \"Raw Safe\" {\n    my.attr[0] := 1;\n    call 256(temps);\n    stack.attr[0] := 1;",
         // A raw block leaves `stack_obj` where it put it (no restore), so nothing reads the
         // entry save and it is never emitted.
         "tree 4202 \"Raw Clobber\" {\n    set_to_next(all);\n    stack.attr[0] := 1;",
@@ -9107,7 +9107,8 @@ object "Pr E Layout" {
     #[bhav(id = 4411, label = "With Raw")]
     fn with_raw() {
         let unused = 5;
-        raw { my.attr[0] := 1; }
+        // A raw constant keeps the layout (a call-only raw block would not).
+        raw { const ONE = 1; my.attr[0] := ONE; }
     }
 
     #[bhav(id = 4412, label = "Caller")]

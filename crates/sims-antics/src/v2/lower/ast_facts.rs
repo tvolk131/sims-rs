@@ -448,6 +448,9 @@ pub(super) fn stmts_preserve_helper_cell(
         V2Stmt::Let { init, .. } => expr_ok(init),
         V2Stmt::Assign { target, value, .. } => {
             let disjoint = match target {
+                // A pure helper writes only its own locals, never the cursor.
+                V2Expr::Ident(_, name) if cell == HelperCell::Pure => name != "stack_obj",
+                _ if cell == HelperCell::Pure => false,
                 // Bare identifiers in helper scope name local bindings or `stack_obj`.
                 V2Expr::Ident(..) => true,
                 V2Expr::Field { base, field, .. } => match cell {
@@ -937,6 +940,17 @@ pub(super) fn expr_may_clobber_stack_obj(
 }
 
 impl ExplicitStackOps {
+    /// Whether a tree body may leave the cursor resting on another object than the entry object:
+    /// it steps it explicitly (as [`Self::default`] counts) or assigns `stack_obj` (directly,
+    /// through a helper, or as `&mut stack_obj`). After `stack_obj = o;` a builtin that moves the
+    /// cursor must put back `o`, not the entry object.
+    pub(super) fn for_tree() -> Self {
+        Self {
+            assignments: true,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn in_stmts(
         &mut self,
         stmts: &[V2Stmt],
@@ -973,6 +987,13 @@ impl ExplicitStackOps {
                     let body = if *taken { then_body } else { else_body };
                     return self.in_stmts(body, env, owner, local);
                 }
+            }
+            // A raw block that may write the cursor leaves it there.
+            if self.raw_writes
+                && let V2Stmt::RawAir { code, .. } = stmt
+                && super::raw::raw_air_may_clobber_stack_obj(code)
+            {
+                return true;
             }
             if let Some(args) = let_some_search {
                 return args.iter().any(|a| self.in_expr(&a.value, env, owner, local))
@@ -1038,7 +1059,13 @@ impl ExplicitStackOps {
                         .filter_map(|p| p.default.as_ref())
                         .any(|expr| self.in_expr(expr, env, &module, is_local)))
         } else {
+            // Make New Character puts the new neighbor in the stack object on success. Find Best
+            // Interaction selects the object it found for `gosub_found_action`; it counts only
+            // as a reassignment, which keeps its pick across foreign reads without making the
+            // tree explicit.
             name == "find_best_object"
+                || (self.assignments && name == "find_best_interaction")
+                || name == "make_new_character"
                 || (name == "set_to_next" && set_to_next_steps_stack_obj(args))
                 || (name == "create_object" && has_create_dest(args))
         }

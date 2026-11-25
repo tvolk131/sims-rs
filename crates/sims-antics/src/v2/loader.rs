@@ -615,12 +615,19 @@ pub(crate) fn merge_extern_mods(
 /// The built-in module that declares the prelude types (`Height`, `Placement`).
 pub(crate) const STD_PRELUDE_MODULE: &str = "std::flags";
 
+/// The built-in `std` modules, in the order an unknown-module error lists them.
+pub(crate) const STD_MODULES: [&str; 6] =
+    ["globals", "flags", "engine", "math", "motives", "budget"];
+
 /// The source of a built-in `std::<module>` (`use std::globals::*;`), if there is one.
 pub(crate) fn std_module_source(segs: &[String]) -> Option<&'static str> {
     match segs {
         [m] if m == "globals" => Some(include_str!("std/globals.antics")),
         [m] if m == "flags" => Some(include_str!("std/flags.antics")),
         [m] if m == "engine" => Some(include_str!("std/engine.antics")),
+        [m] if m == "math" => Some(include_str!("std/math.antics")),
+        [m] if m == "motives" => Some(include_str!("std/motives.antics")),
+        [m] if m == "budget" => Some(include_str!("std/budget.antics")),
         _ => None,
     }
 }
@@ -1039,7 +1046,8 @@ impl<'a> ModuleLoader<'a> {
                 return Err(Error::at(
                     span,
                     format!(
-                        "unknown built-in module '{canonical_key}' (expected 'std::globals', 'std::flags' or 'std::engine')"
+                        "unknown built-in module '{canonical_key}' (expected one of {})",
+                        STD_MODULES.map(|m| format!("'std::{m}'")).join(", ")
                     ),
                 ));
             };

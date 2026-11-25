@@ -2113,8 +2113,6 @@ fn indexed_cells_without_a_drop_in_name_are_not_flagged() {
         "        self.level = global[2] + self.data[3] + self.attr[0];",
         // Already typed.
         "        self.level = world.hour + self.room;",
-        // Bitflags-typed names: an `i16` use of the cell does not type-check as them.
-        "        self.level = self.data[8] + self.data[4] + self.data[42];",
         // A read-only name is not assigned.
         "        self.data[29] = 1;",
         // An `ObjectId` name is not arithmetic.
@@ -2387,7 +2385,9 @@ fn compiles(source: &str) -> bool {
 fn a_functional_guard_sees_the_functional_parameters() {
     let source = "object \"Probe\" { guid: 1; functional prep(me: ObjectId) { guard(sim) => me.data[2] == 0, run(sim) {} } }\n";
     assert!(compiles(source));
-    none(source, "untyped_engine_field");
+    // `me` is the parameter, a handle: its cell 2 is the handle's `container`.
+    let d = one(source, "untyped_engine_field");
+    assert_eq!(d.suggestion.as_deref(), Some("me.container"), "{d:?}");
 }
 
 #[test]

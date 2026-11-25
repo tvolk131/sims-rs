@@ -1,0 +1,116 @@
+// Built-in `std::motives`: cancel-safe motive restoration and repair loops, inlined at each
+// call site. Each loop sleeps `ticks` per cycle and stops early when the interaction is
+// cancelled (`cancel_on_abort`).
+
+/// Cancel-safe single-motive restoration loop with per-cycle counter updates.
+pub fn restore_motive_tracked(
+    sim: Sim,
+    motive: Motive,
+    cycles: i16,
+    step: i16,
+    completed: &mut i16,
+    ticks: i16 = 2,
+    cap: i16 = 100,
+) {
+    repeat cycles cancel_on_abort {
+        sleep(ticks);
+        sim.motive[motive] += step;
+        *completed += 1;
+        if sim.motive[motive] >= cap {
+            break;
+        }
+    }
+}
+
+/// Cancel-safe single-motive restoration loop returning the number of completed cycles.
+pub fn restore_motive_loop(
+    sim: Sim,
+    motive: Motive,
+    cycles: i16,
+    step: i16,
+    ticks: i16 = 2,
+    cap: i16 = 100,
+) -> i16 {
+    let mut completed: i16 = 0;
+    restore_motive_tracked(
+        sim,
+        motive,
+        cycles: cycles,
+        step: step,
+        completed: &mut completed,
+        ticks: ticks,
+        cap: cap,
+    );
+    completed
+}
+
+/// Cancel-safe dual-motive restoration loop with per-cycle counter updates.
+pub fn restore_two_motives_tracked(
+    sim: Sim,
+    primary: Motive,
+    primary_step: i16,
+    secondary: Motive,
+    secondary_step: i16,
+    cycles: i16,
+    completed: &mut i16,
+    ticks: i16 = 2,
+    primary_cap: i16 = 100,
+) {
+    repeat cycles cancel_on_abort {
+        sleep(ticks);
+        sim.motive[primary] += primary_step;
+        sim.motive[secondary] += secondary_step;
+        *completed += 1;
+        if sim.motive[primary] >= primary_cap {
+            break;
+        }
+    }
+}
+
+/// Cancel-safe dual-motive restoration loop returning the number of completed cycles.
+pub fn restore_two_motives_loop(
+    sim: Sim,
+    primary: Motive,
+    primary_step: i16,
+    secondary: Motive,
+    secondary_step: i16,
+    cycles: i16,
+    ticks: i16 = 2,
+    primary_cap: i16 = 100,
+) -> i16 {
+    let mut completed: i16 = 0;
+    restore_two_motives_tracked(
+        sim,
+        primary,
+        primary_step,
+        secondary,
+        secondary_step,
+        cycles: cycles,
+        completed: &mut completed,
+        ticks: ticks,
+        primary_cap: primary_cap,
+    );
+    completed
+}
+
+/// Cancel-safe Mechanical-skill-scaled repair loop.
+/// Returns `true` if repair progress reached `goal` (not canceled early).
+pub fn repair_by_progress(
+    sim: Sim,
+    goal: i16,
+    base_step: i16,
+    mechanic_divisor: i16,
+    cycles_out: &mut i16,
+    ticks: i16 = 2,
+) -> bool {
+    let step = sim.skill.mechanical / mechanic_divisor + base_step;
+    let mut progress: i16 = 0;
+    let mut cycles: i16 = 0;
+    while progress < goal cancel_on_abort {
+        sleep(ticks);
+        progress += step;
+        cycles += 1;
+    }
+    *cycles_out = cycles;
+    progress >= goal
+}
