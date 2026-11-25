@@ -546,9 +546,9 @@ fn a_deleted_last_chunk_names_its_tree() {
         .rev()
         .find(|c| &c.tag == b"BHAV" && c.id == 4300)
         .map(|c| c.label.clone());
-    if label.as_deref() != Some("Gone") {
-        assert!(!proven(check_of(&report, 4301)), "{:?}", report.trees);
-    }
+    // The lift keeps the VM's chunk, so the name finds nothing in either file.
+    assert_eq!(label.as_deref(), Some("Gone"));
+    assert!(proven(check_of(&report, 4301)), "{:?}", report.trees);
 }
 
 /// The trees an object's `init` and `main` callbacks run, the VM's way: its OBJf
@@ -567,6 +567,56 @@ fn init_and_main(iff: &Iff) -> (u16, u16) {
     (word(0x56), word(0x0a))
 }
 
+/// An OBJf table with `entries` (condition, action).
+fn objf_table(entries: &[(u16, u16)]) -> Vec<u8> {
+    let mut table = Vec::new();
+    table.extend(0u32.to_le_bytes());
+    table.extend(0u32.to_le_bytes());
+    table.extend(b"fJBO");
+    table.extend((entries.len() as u32).to_le_bytes());
+    for &(condition, action) in entries {
+        table.extend(condition.to_le_bytes());
+        table.extend(action.to_le_bytes());
+    }
+    table
+}
+
+/// `iff` with its OBJD's callback table replaced by `entries` (OBJf and OBJD words).
+fn with_callbacks(iff: &Iff, entries: &[(u16, u16)]) -> Iff {
+    let objd = iff
+        .chunks
+        .iter()
+        .find(|c| &c.tag == b"OBJD")
+        .expect("OBJD")
+        .id;
+    let had_table = iff.get(b"OBJf", objd).is_some();
+    let extra = if had_table {
+        Vec::new()
+    } else {
+        vec![ChunkData {
+            tag: *b"OBJf",
+            id: objd,
+            flags: 0,
+            label: String::new(),
+            data: objf_table(entries),
+        }]
+    };
+    rebuild(
+        iff,
+        |c| {
+            if &c.tag == b"OBJf" && c.id == objd {
+                c.data = objf_table(entries);
+            }
+            if &c.tag == b"OBJD" && c.id == objd {
+                let word = |n: usize| entries.get(n).map_or(0, |&(_, a)| a).to_le_bytes();
+                c.data[0x56..0x58].copy_from_slice(&word(0));
+                c.data[0x0a..0x0c].copy_from_slice(&word(1));
+            }
+        },
+        extra,
+    )
+}
+
 #[test]
 fn a_callback_tree_is_proven_only_where_the_rebuilt_object_runs_it() {
     let source = r#"object "Fable Bellows" {
@@ -576,49 +626,141 @@ fn a_callback_tree_is_proven_only_where_the_rebuilt_object_runs_it() {
 }"#;
     let iff = compile(source);
     // One tree as both `init` and `main`.
-    let shared = rebuild(
-        &iff,
-        |c| {
-            if &c.tag == b"OBJD" {
-                c.data[0x56..0x58].copy_from_slice(&4200u16.to_le_bytes());
-            }
-        },
-        Vec::new(),
-    );
+    let shared = with_callbacks(&iff, &[(0, 4200), (0, 4200)]);
+    assert_eq!(init_and_main(&shared), (4200, 4200));
     let lifted = report(&shared);
     if proven(check_of(&lifted, 4200)) {
         assert_eq!(init_and_main(&rebuilt(&lifted)), (4200, 4200));
     }
-    // An OBJf table naming `Pump` as `main` overrides the OBJD's words.
-    let objd = iff.chunks.iter().find(|c| &c.tag == b"OBJD").expect("OBJD");
-    let mut table = Vec::new();
-    for word in [0u32, 0] {
-        table.extend(word.to_le_bytes());
-    }
-    table.extend(b"fJBO");
-    table.extend(2u32.to_le_bytes());
-    for (condition, action) in [(0u16, 0u16), (0, 4300)] {
-        table.extend(condition.to_le_bytes());
-        table.extend(action.to_le_bytes());
-    }
-    let objf = ChunkData {
-        tag: *b"OBJf",
-        id: objd.id,
-        flags: 0,
-        label: String::new(),
-        data: table,
-    };
-    let overridden = rebuild(&iff, |_| {}, vec![objf]);
+    // `Pump` as `main`.
+    let overridden = with_callbacks(&iff, &[(0, 4096), (0, 4300)]);
     assert_eq!(init_and_main(&overridden).1, 4300);
-    let report = report(&overridden);
+    let lifted = report(&overridden);
     for id in [4200, 4300] {
-        if proven(check_of(&report, id)) {
+        if proven(check_of(&lifted, id)) {
             assert_eq!(
-                init_and_main(&rebuilt(&report)).1,
+                init_and_main(&rebuilt(&lifted)).1,
                 4300,
                 "{id}: {:?}",
-                report.trees
+                lifted.trees
             );
         }
     }
+}
+
+#[test]
+fn a_functional_call_is_proven_only_with_the_callback_it_runs() {
+    // Function 0 runs the stack object's callback 18 (`functional prep`'s action). The
+    // lift writes the callback trees as plain trees, so the rebuilt object registers
+    // none: the action and the call are not proven.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_0134;
+    functional prep -> i16 {
+        score: 10,
+        guard(sim) => true,
+        run(sim) { return 3; }
+    }
+    @id(4301) @frame(locals: 0) tree caller "Caller" {
+        raw { op 0x0014 (0, 0, 0, 0, 0, 0, 0, 0); }
+    }
+}"#;
+    let report = report(&compile(source));
+    assert!(
+        matches!(check_of(&report, 4301), TreeCheck::Inconclusive(why) if why.contains("callback")),
+        "{:?}\n{}",
+        report.trees,
+        report.source
+    );
+}
+
+#[test]
+fn a_semi_global_call_needs_the_same_link() {
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_0135;
+    @id(4301) @frame(locals: 0) tree caller "Caller" {
+        raw { op 0x2000 (0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff); }
+    }
+}"#;
+    let glob = ChunkData {
+        tag: *b"GLOB",
+        id: 128,
+        flags: 0,
+        label: String::new(),
+        data: b"FableGlobals\0".to_vec(),
+    };
+    let original = rebuild(&compile(source), |_| {}, vec![glob]);
+    let report = report(&original);
+    // The lift writes no `GLOB`, so 8192 resolves nowhere in the rebuilt object.
+    let link = |iff: &Iff| iff.all(b"GLOB").next().map(|c| iff.data(c).to_vec());
+    assert_ne!(link(&rebuilt(&report)), link(&original));
+    assert!(
+        matches!(check_of(&report, 4301), TreeCheck::Inconclusive(why) if why.contains("semi-global")),
+        "{:?}",
+        report.trees
+    );
+}
+
+#[test]
+fn definitions_sharing_a_chunk_id_share_its_callbacks() {
+    // The VM keeps one callback table per OBJD chunk ID (the last one's), so neither
+    // definition runs 4200 as `main` here.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_0136;
+    @id(4200) main { temp[0] = 1; }
+    @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 2; }
+}"#;
+    let iff = compile(source);
+    let objd = iff.chunks.iter().find(|c| &c.tag == b"OBJD").expect("OBJD");
+    let mut second = iff.data(objd).to_vec();
+    second[0x0a..0x0c].copy_from_slice(&4300u16.to_le_bytes());
+    second[0x1c..0x20].copy_from_slice(&0x7E00_0137u32.to_le_bytes());
+    let second = ChunkData {
+        tag: *b"OBJD",
+        id: objd.id,
+        flags: 0,
+        label: "second".to_owned(),
+        data: second,
+    };
+    let original = rebuild(
+        &iff,
+        |c| {
+            if &c.tag == b"OBJf" {
+                c.tag = *b"XOBf";
+            }
+        },
+        vec![second],
+    );
+    // The rebuilt object gives each definition its own ID, so the first runs 4200.
+    let report = report(&original);
+    assert!(
+        matches!(check_of(&report, 4200), TreeCheck::Inconclusive(why) if why.contains("callback")),
+        "{:?}",
+        report.trees
+    );
+}
+
+#[test]
+fn a_global_table_name_keeps_this_files_entry() {
+    // A name from the global file's table is not known here, but this file may be the
+    // global file: its own entry must not change.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_0138;
+    strings 303 "Tree names" {
+        pump = "Pump",
+    }
+    @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 7; }
+    @id(4301) @frame(locals: 0) tree caller "Caller" {
+        raw { run_tree_by_name(table: 303, index: 1, mode: 0, global: true); }
+    }
+}"#;
+    // The lift writes `STR#` 303 only for this file's own names, so it drops it here.
+    let original = compile(source);
+    let report = report(&original);
+    let table = |iff: &Iff| iff.get(b"STR#", 303).map(|c| iff.data(c).to_vec());
+    assert_ne!(table(&rebuilt(&report)), table(&original));
+    assert!(
+        matches!(check_of(&report, 4301), TreeCheck::Inconclusive(why) if why.contains("names table")),
+        "{:?}",
+        report.trees
+    );
 }
