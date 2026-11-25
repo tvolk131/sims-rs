@@ -7,6 +7,40 @@ pub(super) fn lower_object(
     resolved: &ResolvedModule,
     obj: &ObjectDecl,
 ) -> Result<ExpandedV2Object> {
+    lower_object_with(resolved, obj, None, false)
+}
+
+/// The frame words the object's strings may make the formatter read (see
+/// [`mir::strings_read`]): its `strings` tables, its `STR#` 301 dialog table (declared entries and
+/// interned inline literals), and its catalog strings (each `CTSS`: a name and a description).
+fn object_text_reads(
+    strings: &BTreeMap<u16, StringsDecl>,
+    dialog_strings: &DialogStringTable,
+    catalog: &[&str],
+) -> mir::TableLocals {
+    mir::strings_read(
+        strings
+            .values()
+            .flat_map(|t| t.entries.iter().map(|(_, _, text)| text.as_str()))
+            .chain(
+                dialog_strings
+                    .entries
+                    .iter()
+                    .map(|(_, _, text)| text.as_str()),
+            )
+            .chain(catalog.iter().copied()),
+    )
+}
+
+/// [`lower_object`], finishing every tree with `text_reads` as the object's text fact when it is
+/// given, and otherwise with the fact the strings known before any tree is lowered give, and
+/// with `reads_global_34` as the object's global-34 fact (`ObjectEnv::reads_global_34`).
+fn lower_object_with(
+    resolved: &ResolvedModule,
+    obj: &ObjectDecl,
+    text_reads: Option<mir::TableLocals>,
+    reads_global_34: bool,
+) -> Result<ExpandedV2Object> {
     // 1. Resolve optional `from Template`.
     let template_opt: Option<(String, TemplateDecl)> = match &obj.from_template {
         Some((tpl_name, tspan)) => {
@@ -863,6 +897,16 @@ pub(super) fn lower_object(
     let bcon_tables = resolve_bcon_tables(&bcon_decls, &i16_param_order, &local_extern_bcons)?;
 
     let dialog_strings = RefCell::new(DialogStringTable::from_existing(strings.get(&301)));
+    let catalog: Vec<&str> = [obj.name.as_str(), description.as_str()]
+        .into_iter()
+        .chain(variant_decls.iter().flat_map(|v| {
+            [v.name.as_str()]
+                .into_iter()
+                .chain(v.description.as_deref())
+        }))
+        .collect();
+    let text_reads = text_reads
+        .unwrap_or_else(|| object_text_reads(&strings, &dialog_strings.borrow(), &catalog));
     let env = ObjectEnv {
         resolved,
         name: obj.name.clone(),
@@ -876,6 +920,9 @@ pub(super) fn lower_object(
         strings,
         string_names,
         dialog_strings,
+        text_reads,
+        reads_global_34,
+        saw_global_34: Cell::new(false),
         local_fns,
         local_enums,
         local_bitflags,
@@ -1503,6 +1550,21 @@ pub(super) fn lower_object(
             t.id,
             escape_str(&t.label),
             vals.join(", ")
+        );
+    }
+
+    // Every tree was finished with `env.text_reads`. A tree's inline dialog literal can add a
+    // token that an earlier tree's text may then read, so lower the object again with the
+    // final fact when it differs (the second lowering interns the same strings).
+    // Likewise when a tree may read global 34 and the trees were finished without that fact.
+    let final_reads = object_text_reads(&env.strings, &env.dialog_strings.borrow(), &catalog);
+    let saw_global_34 = env.saw_global_34.get() && !env.reads_global_34;
+    if final_reads != env.text_reads || saw_global_34 {
+        return lower_object_with(
+            resolved,
+            obj,
+            Some(final_reads),
+            env.reads_global_34 || saw_global_34,
         );
     }
 

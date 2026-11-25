@@ -98,6 +98,7 @@ fn instructions_have_a_typed_view() {
 #[test]
 fn pipeline_applies_frame_facts() {
     let no_slots = BTreeMap::new();
+    let no_origins = BTreeMap::new();
     let no_consts = BTreeMap::new();
     let no_names = BTreeSet::new();
     let mut consts = BTreeMap::new();
@@ -106,7 +107,9 @@ fn pipeline_applies_frame_facts() {
     let mut declared = BTreeSet::new();
     declared.insert("D".to_owned());
     let facts = FrameFacts {
-        formats_text: false,
+        main_rules: false,
+        fixed_frame: false,
+        text_reads: TableLocals::Known(BTreeSet::new()),
         keep_layout: true,
         has_self_obj_local: true,
         pinned: false,
@@ -114,6 +117,8 @@ fn pipeline_applies_frame_facts() {
         raw_declared: &declared,
         has_slots: false,
         pinned_locals: &no_slots,
+        local_origins: &no_origins,
+        min_locals: 0,
     };
     // Layout kept: only the unread entry save goes; undeclared raw constants are prepended.
     let body = "    let __self_obj = stack_obj;\n    my.attr[0] := K;\n    return true;\n";
@@ -121,9 +126,9 @@ fn pipeline_applies_frame_facts() {
         finish_body(body.to_owned(), &facts),
         "    const K = 3;\n    my.attr[0] := K;\n    return true;\n"
     );
-    // A tree that formats text reads frame words by number: the save stays.
+    // Text that may read any frame word by number (`$Local:N`) sees the shift: the save stays.
     let facts = FrameFacts {
-        formats_text: true,
+        text_reads: TableLocals::Unknown,
         raw_consts: &no_consts,
         raw_declared: &no_names,
         ..facts

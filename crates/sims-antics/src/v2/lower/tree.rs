@@ -44,14 +44,20 @@ impl<'a> TreeLowerer<'a> {
             raw_formats_text: false,
             slot_span: None,
             pinned_locals: BTreeMap::new(),
+            local_origins: BTreeMap::new(),
+            stmt_span: None,
             seen_decls: BTreeSet::new(),
             inline_call_sites: Vec::new(),
             dup_decl: None,
             keep_layout: false,
             param_words_used: 0,
             frame_locals: None,
+            frame_format: None,
             event_local: None,
             sleep_span: None,
+            stmt_marks: Vec::new(),
+            inherited_entry_save: false,
+            raw_reserved: Vec::new(),
         }
     }
 
@@ -68,8 +74,45 @@ impl<'a> TreeLowerer<'a> {
 
     pub(super) fn finish(self) -> Result<String> {
         let formats_text = self.raw_formats_text || mir::body_formats_text(self.em.text());
+        // The frame words the tree's text may read: none unless it formats text.
+        // A tree of an object any of whose trees may read global 34 keeps main's rule (every
+        // text tree reads): dropping the entry save removes an Expression, whose scratch-pointer
+        // write that read depends on, and a call carries the pointer between trees. (The pinned
+        // slot's placeholder is not `.air` yet; it becomes word 0 below.)
+        // So does a tree that may run as an object's bottom frame (an object-self tree with no
+        // arguments, as an object's or a variant's `main` is, or the inherit check's Sim pass
+        // over one): Create Object with flag 0x10 or 0x02 writes that frame's word 0, so which
+        // local lives there is observable.
+        // A tree with a pinned `push_interaction` slot takes main's rules too, so it pins exactly
+        // where main does (`mir::finish_body`).
+        let bottom_frame = (matches!(self.tree_ctx, TreeContext::ObjectSelf)
+            || self.inherited_entry_save)
+            && self.frame_args == 0;
+        let body = replace_outside_strings(self.em.text(), PIN_SLOT, "0");
+        let body_reads_global_34 = mir::may_read_global_34(&body);
+        if body_reads_global_34 {
+            self.env.saw_global_34.set(true);
+        }
+        // A bottom frame with a local that may be read before it is written takes main's rules
+        // as well: dropping a store, or the local it initializes, shifts which local lives in
+        // word 0, and that read sees what Create Object wrote there.
+        let bottom_reads_unwritten = bottom_frame
+            && !mir::parse_body(&body).is_some_and(|nodes| {
+                mir::locals_defined_before_reads(&nodes, mir::DrawRanges::Literal)
+            });
+        let main_rules = self.env.reads_global_34
+            || body_reads_global_34
+            || bottom_reads_unwritten
+            || self.pin_span.is_some();
+        let text_reads = if formats_text && (bottom_frame || main_rules) {
+            mir::TableLocals::Unknown
+        } else if formats_text {
+            self.env.text_reads.clone()
+        } else {
+            mir::TableLocals::Known(BTreeSet::new())
+        };
         if let Some((span, name)) = &self.dup_decl
-            && formats_text
+            && mir::reads_a_word(&text_reads)
         {
             return Err(Error::at(
                 *span,
@@ -81,7 +124,9 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
         let facts = mir::FrameFacts {
-            formats_text,
+            main_rules,
+            fixed_frame: self.frame_locals.is_some() || self.frame_format.is_some(),
+            text_reads,
             keep_layout: self.keep_layout,
             has_self_obj_local: self.has_self_obj_local,
             pinned: self.pin_span.is_some(),
@@ -89,6 +134,8 @@ impl<'a> TreeLowerer<'a> {
             raw_declared: &self.raw_declared,
             has_slots: self.slot_span.is_some(),
             pinned_locals: &self.pinned_locals,
+            local_origins: &self.local_origins,
+            min_locals: self.frame_floor().unwrap_or(0),
         };
         let body = self.em.into_text();
         let mut out = if self.used_saved_stack_obj {
@@ -97,6 +144,39 @@ impl<'a> TreeLowerer<'a> {
         } else {
             body
         };
+        // The body reads the entry object when an `.air` token names it (a comment does not). A
+        // source constant of that name, which a raw block reads as a constant, is not the entry
+        // object, and neither is a raw block's own local or label of that name. The inherit
+        // check's Sim lowering emits no entry save of its own (`track_stack_obj`), only this one.
+        let declares_self_obj = self.has_self_obj_local && !self.inherited_entry_save;
+        if self.inherited_entry_save
+            && !self.raw_consts.contains_key(mir::SELF_OBJ)
+            && !self
+                .raw_reserved
+                .iter()
+                .any(|(name, _)| *name == mir::SELF_OBJ)
+            && names_token(&out, mir::SELF_OBJ)
+        {
+            let save = mir::StackObjOp::Save(mir::SELF_OBJ).text();
+            out = format!("    {save}\n{out}");
+        }
+        // A raw block may declare an entry-object local of its own only where lowering declares
+        // none of that name.
+        for (name, span) in &self.raw_reserved {
+            let declared = match *name {
+                mir::SELF_OBJ => declares_self_obj,
+                _ => self.used_saved_stack_obj,
+            };
+            if declared {
+                return Err(Error::at(
+                    *span,
+                    format!(
+                        "'{name}' is the compiler's entry object in this tree: a raw block may \
+                         read it but not declare its own"
+                    ),
+                ));
+            }
+        }
         if self.pin_span.is_some() {
             // A tree with a pinned `push_interaction` has no raw block (that is an error), so
             // nothing else names an explicit local: the pin takes slot 0, and `.air` allocates
@@ -110,16 +190,28 @@ impl<'a> TreeLowerer<'a> {
     /// the frame, as on a standalone `tree`.
     pub(super) fn set_lifecycle_frame(&mut self, frame: &TreeFrame) {
         self.frame_locals = frame.locals;
+        self.frame_format = frame.format;
         self.frame_args = frame.args.map_or(0, usize::from);
     }
 
     /// Adds `min_locals: N` to a tree header when an `@slot(N - 1)` word must be in the frame:
     /// the tree may never name it again (an uninitialized slot a raw primitive or text reads by
     /// number), and `.air` sizes the frame by the words the body names.
+    /// The header's `@frame(locals: K)` sets the frame size in its place, with no floor
+    /// (`write_framed_tree`).
     pub(super) fn push_frame_floor(&self, header: &mut Vec<String>) {
-        if let Some(top) = self.pinned_locals.values().max() {
-            header.push(format!("min_locals: {}", top + 1));
+        if let Some(floor) = self.frame_floor() {
+            header.push(format!("min_locals: {floor}"));
         }
+    }
+
+    /// The `min_locals` floor [`Self::push_frame_floor`] puts in the header: the highest
+    /// `@slot` word plus one, unless the tree has `@frame(locals: K)`.
+    pub(super) fn frame_floor(&self) -> Option<usize> {
+        if self.frame_locals.is_some() {
+            return None;
+        }
+        self.pinned_locals.values().max().map(|top| top + 1)
     }
 
     pub(super) fn fresh(&mut self, prefix: &str) -> String {
@@ -130,7 +222,16 @@ impl<'a> TreeLowerer<'a> {
         } else {
             ""
         };
-        format!("__{scope}{prefix}_{id}")
+        let name = format!("__{scope}{prefix}_{id}");
+        // An inlined helper's source local: copies of one declaration (the same helper and
+        // statement) get the same origin.
+        if !scope.is_empty()
+            && let (Some(helper), Some(at)) = (self.inline_call_stack.last(), self.stmt_span)
+        {
+            let origin = format!("{helper}::{prefix}@{}:{}", at.line, at.column);
+            self.local_origins.insert(name.clone(), origin);
+        }
+        name
     }
 
     pub(super) fn line(&mut self, text: String) {
@@ -412,4 +513,37 @@ impl<'a> TreeLowerer<'a> {
         }
         Ok(air_name)
     }
+}
+
+/// Whether an `.air` identifier token of `body` is `name` (comments and strings are not tokens,
+/// and neither is a part of a qualified constant's name such as `name.tuning`, since a local has
+/// no fields, nor the tree a `call name` runs). A body that does not lex counts as naming it.
+fn names_token(body: &str, name: &str) -> bool {
+    use crate::lexer::TokenKind as T;
+    crate::lexer::tokenize(body).map_or(true, |tokens| {
+        let dot = |i: Option<usize>| {
+            i.and_then(|i| tokens.get(i))
+                .is_some_and(|t| matches!(t.kind, T::Dot))
+        };
+        let ident = |i: Option<usize>, word: &str| {
+            i.and_then(|i| tokens.get(i))
+                .is_some_and(|t| matches!(&t.kind, T::Ident(k) if k == word))
+        };
+        // The tree `call x`, `subroutine x` or `subroutine(x ..)` names.
+        let after_call = |i: usize| {
+            ident(i.checked_sub(1), "call")
+                || ident(i.checked_sub(1), "subroutine")
+                || (i
+                    .checked_sub(1)
+                    .and_then(|i| tokens.get(i))
+                    .is_some_and(|t| matches!(t.kind, T::LParen))
+                    && ident(i.checked_sub(2), "subroutine"))
+        };
+        tokens.iter().enumerate().any(|(i, t)| {
+            matches!(&t.kind, T::Ident(n) if n == name)
+                && !dot(i.checked_sub(1))
+                && !dot(Some(i + 1))
+                && !after_call(i)
+        })
+    })
 }

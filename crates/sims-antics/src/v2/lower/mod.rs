@@ -24,7 +24,7 @@ use crate::v2::loader::{ModuleScope, ResolvedModule};
 use crate::v2::parser::snake_case_ident;
 use crate::v2::specialize;
 use crate::v2::{mir, raw_facts};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::rc::Rc;
@@ -297,6 +297,17 @@ struct ObjectEnv<'a> {
     strings: BTreeMap<u16, StringsDecl>,
     string_names: BTreeMap<String, u16>,
     dialog_strings: RefCell<DialogStringTable>,
+    /// The frame words any string of the object may make the formatter read
+    /// ([`mir::text_reads`](mod@crate::v2::mir)): every tree is finished with the object's final
+    /// fact (`lower_object` lowers again when a later tree's inline dialog literal adds to it).
+    text_reads: mir::TableLocals,
+    /// Some tree of the object may read global 34 ([`mir::may_read_global_34`]), so every tree
+    /// is finished with main's rules: a call carries the scratch pointer into the callee and
+    /// back, so an Expression one tree keeps or drops can change what another tree reads.
+    /// `lower_object` lowers again when a finished tree sets `saw_global_34`.
+    reads_global_34: bool,
+    /// A finished tree's body may read global 34.
+    saw_global_34: Cell<bool>,
     local_fns: BTreeMap<String, (String, FnDecl)>,
     /// Object/template-local enums by short name -> canonical key.
     local_enums: BTreeMap<String, String>,
@@ -647,6 +658,12 @@ struct TreeLowerer<'a> {
     /// The `.air` names of the tree's `@slot(N) let` locals and their word numbers: the only
     /// names `opt::assign_frame_slots` pins (a raw block's own `__slot..` name is not one).
     pinned_locals: BTreeMap<String, usize>,
+    /// Each inlined helper's local and the declaration it copies (the helper and the `let`'s
+    /// position): copies of one declaration are one source local, whatever their spelling shares
+    /// with another helper's.
+    local_origins: BTreeMap<String, String>,
+    /// The innermost statement being lowered (the origin of the locals it declares).
+    stmt_span: Option<Span>,
     /// Declarations lowered so far, by lowering instance (the inline-helper instances and the
     /// defer instance around them) and source span. Lowering one source declaration twice in
     /// the same instance means it was copied (a const binding's region), and each copy has its
@@ -665,11 +682,25 @@ struct TreeLowerer<'a> {
     param_words_used: usize,
     /// The tree's `@frame(locals: K)`, which `animate(event_local:)` must stay outside.
     frame_locals: Option<u16>,
+    /// The tree's `@frame(format: F)`, whose format may bound the frame (`0x8000`/`0x8001` hold
+    /// four locals).
+    frame_format: Option<u16>,
     /// The first `animate(event_local: N)`, as `(span, N)`.
     event_local: Option<(Span, u8)>,
     /// The first `sleep`/`idle`, which `.air` lowers through `idle()`: it cannot share a tree
     /// with a raw op such as `animate(event_local:)`.
     sleep_span: Option<Span>,
+    /// Where each source statement of the tree itself (not of an inlined helper) starts in the
+    /// emitted text, as `(mark, span)`: the `@context(inherit)` check points its error at the
+    /// statement whose lowering differs between the caller contexts.
+    stmt_marks: Vec<(usize, Span)>,
+    /// The Sim pass of the `@context(inherit)` check, which emits no entry save up front: like
+    /// the object pass's `__saved_stack_obj`, `finish` declares `__self_obj` (the entry stack
+    /// object) first when the body reads it.
+    inherited_entry_save: bool,
+    /// The compiler's entry-object locals that a raw block of the tree declares, with the
+    /// block's span: an error when the tree's lowering declares the same name (`finish`).
+    raw_reserved: Vec<(&'static str, Span)>,
 }
 
 struct FindBestObjectPlan {

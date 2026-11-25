@@ -610,11 +610,35 @@ impl<'a> TreeLowerer<'a> {
         if let Some(missing) = required.iter().find(|k| !named.contains_key(**k)) {
             return Err(Error::at(span, format!("{fname}() requires '{missing}:'")));
         }
+        // `push_interaction(object: <@slot(N) handle>)`: the handle already lives in frame word
+        // N, which `@slot` fixes, so the VM reads it from there (flag 0x02) with no copy.
+        let slot_object = match named.get("object") {
+            Some(CallArg {
+                value: V2Expr::Ident(_, name),
+                ..
+            }) if fname == "push_interaction" => match self.lookup_var(name) {
+                Some(Binding::Local { air_name, ty }) if ty.is_object_handle() => {
+                    slot_word(air_name)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if slot_object.is_some()
+            && let Some(f) = named.get("flags")
+            && self.eval_builtin_int(&f.value, "push_interaction flags", 0, 255)? & 0x02 != 0
+        {
+            return Err(Error::at(
+                f.span,
+                "push_interaction flags 0x02 is implied by an object handle; leave it out",
+            ));
+        }
         // `push_interaction(object: <handle>)`: the VM reads the object from a local slot
         // (flag 0x02), so the handle is copied into the tree's pinned slot first.
         let pinned_object = match named.get("object") {
             Some(a)
                 if fname == "push_interaction"
+                    && slot_object.is_none()
                     && self
                         .eval_builtin_int(&a.value, "push_interaction object", 0, 255)
                         .is_err() =>
@@ -668,7 +692,11 @@ impl<'a> TreeLowerer<'a> {
                     ),
                 ],
                 (if named.contains_key("icon") { 0x01 } else { 0 })
-                    | (if pinned_object { 0x02 } else { 0 }),
+                    | (if pinned_object || slot_object.is_some() {
+                        0x02
+                    } else {
+                        0
+                    }),
             ),
             "special_effect" => (
                 &[(
@@ -698,6 +726,12 @@ impl<'a> TreeLowerer<'a> {
             let what = format!("{fname} {key}");
             if key == "object" && pinned_object {
                 parts.push(format!("{air_key}: {PIN_SLOT}"));
+                continue;
+            }
+            if key == "object"
+                && let Some(n) = slot_object
+            {
+                parts.push(format!("{air_key}: {n}"));
                 continue;
             }
             let text = match kind {
@@ -823,4 +857,11 @@ impl<'a> TreeLowerer<'a> {
         }
         Ok(())
     }
+}
+
+/// The frame word an `@slot(N) let` local's `.air` name (`__slot<N>_...`) fixes.
+fn slot_word(air_name: &str) -> Option<u8> {
+    let rest = air_name.strip_prefix("__slot")?;
+    let (n, _) = rest.split_once('_')?;
+    n.parse().ok()
 }
