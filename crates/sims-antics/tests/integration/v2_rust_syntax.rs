@@ -566,3 +566,86 @@ fn methods_match_the_call_forms() {
     }"),
     );
 }
+
+/// IFF bytes of a synthetic `.air` object whose Init tree is `body`.
+fn air_iff(body: &str) -> Vec<u8> {
+    let manifest = "[object]\nname = \"Kind Probe\"\nguid = 0x7F50_0002\ninit = \"Init\"\n";
+    let src = format!("tree 4096 \"Init\" {{ {body} return true; }}");
+    sims_antics::compile_object_from_sources(manifest, &[("k.antics", &src)])
+        .unwrap_or_else(|e| panic!("must compile: {e}\n{src}"))
+        .iff_bytes
+}
+
+#[test]
+fn functional_kind_names_follow_the_engine_table() {
+    // Run Functional Tree / Find Best Object function numbers (sims-vm
+    // `run_functional_tree.rs` `callback`, `find_best_object.rs` `wanted`).
+    let kinds = [
+        ("prep", 0),
+        ("cook", 1),
+        ("surface", 2),
+        ("dispose", 3),
+        ("eat", 4),
+        ("pickup_from_slot", 5),
+        ("wash_dish", 6),
+        ("eating_surface", 7),
+        ("sit", 8),
+        ("stand", 9),
+        ("serving_surface", 10),
+        ("clean", 11),
+        ("gardening", 12),
+        ("wash_hands", 13),
+        ("repair", 14),
+    ];
+    for (name, n) in kinds {
+        assert!(
+            air_iff(&format!("run_functional_tree({name});"))
+                == air_iff(&format!("run_functional_tree({n});")),
+            "run_functional_tree({name}) is not function {n}"
+        );
+        if !matches!(name, "eat" | "pickup_from_slot" | "stand") {
+            assert!(
+                air_iff(&format!("find_best_object({name});"))
+                    == air_iff(&format!("find_best_object({n});")),
+                "find_best_object({name}) is not function {n}"
+            );
+        }
+    }
+    assert!(air_iff("find_best_object(category4);") == air_iff("find_best_object(15);"));
+
+    // The names an off-by-one table used are gone, with a pointer to the new name.
+    for (old, new) in [
+        ("serve", "gardening"),
+        ("rest", "repair"),
+        ("pick_up", "eating_surface"),
+    ] {
+        expect_err(
+            &obj(&format!(
+                "    main {{ let Some(_o) = find_best_object({old}) else {{ return; }}; loop {{ sleep(1); }} }}"
+            )),
+            &format!("unknown functional kind '{old}': the function this name used to give is '{new}'"),
+        );
+    }
+    // v2 refuses a search the engine never answers.
+    expect_err(
+        &obj("    main { let Some(_o) = find_best_object(stand) else { return; }; loop { sleep(1); } }"),
+        "find_best_object(stand) always fails",
+    );
+    // A v2 `functional gardening` is OBJf entry 16, found by function 12, scored by word 64.
+    let garden = r#"object "Garden Bed" {
+    guid: 0x7F50_0003;
+    functional gardening {
+        score: 7,
+        run(sim) {
+            return;
+        }
+    }
+    main { loop { sleep(1); } }
+}
+"#;
+    let (air, _, _) = build(garden);
+    assert!(air.contains("my.data[64] := 7;"), "score word 64 missing:\n{air}");
+    let finder = obj("    main { let Some(_o) = find_best_object(gardening) else { return; }; loop { sleep(1); } }");
+    let (air, _, _) = build(&finder);
+    assert!(air.contains("find_best_object(gardening"), "{air}");
+}

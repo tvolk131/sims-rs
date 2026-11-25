@@ -548,6 +548,16 @@ impl<'a> TreeLowerer<'a> {
             ));
         };
         let _ = functional_kind_info(kind_name, *kspan)?;
+        if crate::parser::function_kind(kind_name)
+            .is_some_and(|k| k.search == crate::parser::FunctionSearch::None)
+        {
+            return Err(Error::at(
+                *kspan,
+                format!(
+                    "find_best_object({kind_name}) always fails: Find Best Object never searches for '{kind_name}'"
+                ),
+            ));
+        }
         let typed_schema = if type_args.is_empty() {
             None
         } else if type_args.len() == 1 {

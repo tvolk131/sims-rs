@@ -2,6 +2,7 @@
 //! functional guards and state initialisers.
 
 use super::*;
+use crate::parser::{FunctionSearch, function_kind, unknown_function_kind};
 
 /// Allocates state attribute slots shared by object lowering and imported object schemas.
 ///
@@ -579,23 +580,10 @@ pub(super) fn resolve_state_init_air(
 
 /// Maps a v2 functional kind name to `(OBJf callback index, optional score object data word)`.
 pub(super) fn functional_kind_info(kind: &str, span: Span) -> Result<(usize, Option<usize>)> {
-    match kind {
-        "prep" => Ok((18, Some(31))),
-        "cook" => Ok((19, Some(32))),
-        "surface" => Ok((20, Some(33))),
-        "dispose" => Ok((21, Some(36))),
-        "eat" => Ok((24, Some(37))),
-        "pick_up" => Ok((25, Some(38))),
-        "sit" => Ok((26, None)),
-        "clean" => Ok((14, Some(61))),
-        "repair" => Ok((28, Some(39))),
-        "serve" => Ok((16, Some(64))),
-        "rest" => Ok((29, Some(15))),
-        other => Err(Error::at(
-            span,
-            format!(
-                "unknown functional kind '{other}' (expected prep, cook, surface, dispose, eat, pick_up, sit, clean, repair, serve, or rest)"
-            ),
-        )),
-    }
+    let info = function_kind(kind).ok_or_else(|| Error::at(span, unknown_function_kind(kind)))?;
+    let score = match info.search {
+        FunctionSearch::Score(word) => Some(word),
+        FunctionSearch::None | FunctionSearch::Fixed => None,
+    };
+    Ok((info.callback, score))
 }

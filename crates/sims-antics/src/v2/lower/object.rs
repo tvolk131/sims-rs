@@ -1083,7 +1083,7 @@ fn lower_object_with(
                     return Err(Error::at(
                         func.decl.span,
                         format!(
-                            "functional '{}' uses a fixed score in Sims 1 and cannot set a score data word",
+                            "functional '{}' has no score data word (Find Best Object uses a fixed score or never searches for it)",
                             func.decl.kind
                         ),
                     ));
