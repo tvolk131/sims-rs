@@ -1331,3 +1331,410 @@ fn extern_merge_round_2_regressions() {
     let err = compile(&[("crate::typed", typed)], src).expect_err("typed module block");
     assert!(err.contains("names a type of its module"), "{err}");
 }
+
+/// The `.air` body of tree `label` in `air` (from its header line to the closing brace).
+fn tree_body<'a>(air: &'a str, label: &str) -> &'a str {
+    let header = format!(" \"{label}\"");
+    let start = air
+        .lines()
+        .scan(0, |at, line| {
+            let here = *at;
+            *at += line.len() + 1;
+            Some((here, line))
+        })
+        .find(|(_, line)| line.contains(&header) && line.ends_with('{'))
+        .map(|(at, _)| at)
+        .unwrap_or_else(|| panic!("no tree '{label}':\n{air}"));
+    let end = air[start..]
+        .find("\n}")
+        .map_or(air.len(), |e| start + e + 2);
+    &air[start..end]
+}
+
+/// PR I-3: `remove_object(target)` / `target.remove()` is Remove Object Instance itself, with
+/// the target's mode (0 me, 1 the stack object) and no other node or local.
+#[test]
+fn remove_object_names_me_or_the_stack_object() {
+    assert_same(
+        "call and method forms",
+        &obj("    #[bhav]
+    fn a() -> bool {
+        remove_object(stack_obj, no_yield: true);
+        if !remove_object(me) {
+            return false;
+        }
+        remove_object(stack_obj, skip_resets: true, flags: 4)
+    }"),
+        &obj("    #[bhav]
+    fn a() -> bool {
+        stack_obj.remove(no_yield: true);
+        if !me.remove() {
+            return false;
+        }
+        stack_obj.remove(flags: 6)
+    }"),
+    );
+    let air = build(&obj("    #[bhav]
+    fn a() -> bool {
+        remove_object(stack_obj, no_yield: true);
+        if !remove_object(me) {
+            return false;
+        }
+        remove_object(stack_obj, skip_resets: true, flags: 4)
+    }"))
+    .0;
+    let body = tree_body(&air, "a");
+    assert!(
+        body.contains("    remove_object(stack_obj, flags: 1);\n    if !remove_object(me) {"),
+        "{body}"
+    );
+    assert!(
+        body.contains("if remove_object(stack_obj, flags: 6) {"),
+        "{body}"
+    );
+    assert!(!body.contains("let "), "no local:\n{body}");
+    // `self` is the running object in its own trees and the stack object in a Sim tree, as for
+    // `destroy_self()`.
+    assert_same(
+        "self.remove() is destroy_self()",
+        &obj("    #[bhav]
+    fn a() { self.remove(no_yield: true); }
+    interaction \"Use\" {
+        run(sim) { remove_object(self); }
+    }"),
+        &obj("    #[bhav]
+    fn a() { destroy_self(no_yield: true); }
+    interaction \"Use\" {
+        run(sim) { destroy_self(); }
+    }"),
+    );
+    // A loop's stack-object binding is the stack object.
+    let air = build(&obj("    #[bhav]
+    fn a() {
+        while set_to_next(person) {
+            remove_object(stack_obj);
+        }
+    }"))
+    .0;
+    assert!(air.contains("remove_object(stack_obj);"), "{air}");
+
+    expect_err(
+        &obj("    #[bhav] fn a(o: ObjectId) { remove_object(o); }"),
+        "select another object first ('stack_obj = x;') and remove 'stack_obj'",
+    );
+    expect_err(
+        &obj("    #[bhav(context = inherit)] fn a() { self.remove(); }"),
+        "'context = inherit' tree runs on whichever object calls it",
+    );
+    expect_err(
+        &obj("    interaction \"Use\" { run(sim) { set_to_next(all); remove_object(self); } }"),
+        "this Sim tree moves 'stack_obj', so 'self' is no longer the stack object",
+    );
+    expect_err(
+        &obj("    #[bhav] fn a() { remove_object(flags: 1); }"),
+        "takes its target first",
+    );
+    expect_err(
+        &obj("    #[bhav] fn a() { remove_object(stack_obj, 1); }"),
+        "remove_object() only takes named options",
+    );
+    expect_err(
+        &obj("    #[bhav] fn a() { stack_obj.remove(flags: 256); }"),
+        "remove flags 256 out of range 0..=255",
+    );
+    expect_err(
+        &obj("    #[bhav] fn a() { remove_object(stack_obj, now: true); }"),
+        "unknown remove_object option 'now'",
+    );
+}
+
+/// PR I-3: untyped `find_best_object(kind)` is a condition: Find Best Object's own node, which
+/// leaves the found object in `stack_obj` on its true exit, with no local. The tree then keeps
+/// its cursor through later builtins, as for `set_to_next`.
+#[test]
+fn find_best_object_is_a_condition() {
+    let air = build(&obj("    #[bhav]
+    fn a() -> bool {
+        if find_best_object(cook) {
+            stack_obj.attr[0] = 1;
+            return true;
+        }
+        if !find_best_object(cook, flags: 4) {
+            return false;
+        }
+        stack_obj.attr[1] = 2;
+        true
+    }"))
+    .0;
+    let body = tree_body(&air, "a");
+    assert!(
+        body.contains("    if find_best_object(cook) {\n        stack.attr[0] := 1;"),
+        "{body}"
+    );
+    assert!(
+        body.contains("    if !find_best_object(cook, flags: 4) {\n        return false;"),
+        "{body}"
+    );
+    assert!(!body.contains("let "), "no local:\n{body}");
+    // In a Sim tree `self` stays the object the tree started on after the search.
+    let air = build(&obj("    interaction \"Use\" {
+        run(sim) {
+            if find_best_object(cook) {
+                stack_obj.attr[0] = 1;
+                self.n = 2;
+            }
+        }
+    }"))
+    .0;
+    let body = tree_body(&air, "Use");
+    assert!(body.contains("let __self_obj = stack_obj;"), "{body}");
+    assert!(
+        body.contains("stack.attr[0] := 1;\n        stack_obj := __self_obj;"),
+        "{body}"
+    );
+    // `let Some(x) = find_best_object(..)` still puts the cursor back itself, so it does not
+    // make `stack_obj` the tree's own cursor: no `__pre_stack_obj` save around a later move.
+    let air = build(&obj("    #[bhav]
+    fn a(o: ObjectId) -> bool {
+        let Some(x) = find_best_object(cook) else { return false; };
+        self.n = o.attr[0];
+        true
+    }"))
+    .0;
+    assert!(!air.contains("__pre_stack_obj"), "{air}");
+    expect_err(
+        &obj(
+            "    #[bhav] fn a() -> bool { if find_best_object::<Self>(cook) { return true; } false }",
+        ),
+        "find_best_object::<T>() binds the object it checks against T",
+    );
+}
+
+/// PR I-3: `set_to_next(.., dest: x)` steps a local, `param[N]` or `temp[N]` (read as the
+/// cursor and written with the next one); stepping one leaves `stack_obj` alone, so a Sim tree
+/// keeps no entry save for it.
+#[test]
+fn set_to_next_steps_a_named_cell() {
+    let air = build(&obj("    #[bhav(args = 2)]
+    fn a() -> bool {
+        let anchor = stack_obj;
+        let c: ObjectId = 0;
+        if !set_to_next(beside, dest: c, local: anchor) {
+            return false;
+        }
+        if set_to_next(part, dest: param[1]) {
+            temp[0] = 1;
+        }
+        set_to_next(neighbor, dest: temp[2]);
+        if set_to_next(person, guid: 0x1234) {
+            return true;
+        }
+        stack_obj = c;
+        true
+    }"))
+    .0;
+    let body = tree_body(&air, "a");
+    for want in [
+        "let __v_anchor_0 = stack_obj;",
+        "if !set_to_next(9, dest: __v_c_1, local: __v_anchor_0) {",
+        "if set_to_next(3, dest: param[1]) {",
+        "set_to_next(5, dest: temp[2]);",
+        "if set_to_next(1, guid: 0x00001234) {",
+    ] {
+        assert!(body.contains(want), "{want}:\n{body}");
+    }
+    // A Sim tree stepping a local keeps no `__self_obj`; stepping `stack_obj` does.
+    let sim = |dest: &str| {
+        build(&obj(&format!(
+            "    interaction \"Use\" {{
+        run(sim) {{
+            let c: ObjectId = 0;
+            while set_to_next(person, dest: {dest}) {{
+                self.n += 1;
+            }}
+        }}
+    }}"
+        )))
+        .0
+    };
+    let air = sim("c");
+    assert!(
+        air.contains("while set_to_next(1, dest: __v_c_0) {\n        stack.attr[0] += 1;"),
+        "{air}"
+    );
+    assert!(!air.contains("__self_obj"), "{air}");
+    assert!(sim("stack_obj").contains("let __self_obj = stack_obj;"));
+
+    expect_err(
+        &obj("    #[bhav] fn a(x: i16) { set_to_next(person, dest: x); }"),
+        "parameter 'x' is immutable; step its word with 'dest: param[0]'",
+    );
+    expect_err(
+        &obj(
+            "    #[bhav] fn a() -> bool { let Some(o) = create_object::<Self>() else { return false; }; set_to_next(person, dest: o) }",
+        ),
+        "is a typed object handle",
+    );
+    expect_err(
+        &obj("    #[bhav] fn a() { let b = true; set_to_next(person, dest: b); }"),
+        "needs an i16 or ObjectId local",
+    );
+    expect_err(
+        &obj("    #[bhav] fn a() { set_to_next(person, dest: self.n); }"),
+        "set_to_next(dest:) steps 'stack_obj', a local, 'param[N]', or 'temp[N]'",
+    );
+}
+
+/// PR I-3: an object's definition words 9 and 11 (`object_type`, `sub_index`), whether its
+/// definition has a function (`has_function[N]`), and job data under the current temps
+/// (`job_field(F)`) read the engine cells in place: on the stack object, with no local.
+#[test]
+fn definition_fields_and_job_fields_read_in_place() {
+    let air = build(&obj("    #[bhav]
+    fn a() -> bool {
+        if stack_obj.object_type == 2 {
+            return true;
+        }
+        while stack_obj.sub_index != 257 {
+            set_to_next(part);
+        }
+        temp[0] = 3;
+        temp[1] = 2;
+        if job_field(3) < me.person[10] {
+            return false;
+        }
+        self.n = job_field(1);
+        stack_obj.has_function[26]
+    }"))
+    .0;
+    let body = tree_body(&air, "a");
+    for want in [
+        "if scope(21, 9) == 2 {",
+        "while scope(21, 11) != 257 {",
+        "if scope(33, 3) < my.person[10] {",
+        "my.attr[0] := scope(33, 1);",
+        "if scope(35, 26) != 0 {",
+    ] {
+        assert!(body.contains(want), "{want}:\n{body}");
+    }
+    assert!(!body.contains("let "), "no local:\n{body}");
+    // In a Sim tree `self` is the stack object; an object handle moves it there and back.
+    let air = build(&obj("    interaction \"Use\" {
+        run(sim) {
+            if self.sub_index == -1 {
+                self.n = 1;
+            }
+        }
+    }
+    #[bhav]
+    fn b(o: ObjectId) {
+        self.n = o.object_type;
+    }"))
+    .0;
+    assert!(
+        tree_body(&air, "Use").contains("if scope(21, 11) == -1 {"),
+        "{air}"
+    );
+    assert!(
+        tree_body(&air, "b").contains("stack_obj := param[0];\n    my.attr[0] := scope(21, 9);"),
+        "{air}"
+    );
+    // A state of the same name wins.
+    let air = build(&obj(
+        "    state sub_index: i16;\n    #[bhav] fn a() { self.n = self.sub_index; }",
+    ))
+    .0;
+    assert!(!tree_body(&air, "a").contains("scope(21"), "{air}");
+    // Job data's level is copied before the career's staging when it reads the temps.
+    let air = build(&obj("    #[bhav]
+    fn a() { self.n = job_data(3, job_field(2), 5); }"))
+    .0;
+    assert!(
+        tree_body(&air, "a").contains(
+            "let __job_level_0 = scope(33, 2);\n    temp[0] := 3;\n    temp[1] := __job_level_0;"
+        ),
+        "{air}"
+    );
+    // A call's staged arguments copy job data first.
+    let air = build(&obj("    #[bhav]
+    fn a() { b(1, job_field(4)); }
+    #[bhav]
+    fn b(x: i16, y: i16) {}"))
+    .0;
+    let a = tree_body(&air, "a");
+    assert!(a.contains("= scope(33, 4);"), "{a}");
+    assert!(!a.contains("temp[1] := scope(33"), "{a}");
+
+    expect_err(
+        &obj("    #[bhav] fn a() { stack_obj.object_type = 3; }"),
+        "'stack_obj.object_type' is read-only (word 9 of the object's definition)",
+    );
+    expect_err(
+        &obj("    #[bhav] fn a(o: ObjectId) { o.has_function[2] = true; }"),
+        "'has_function[N]' is read-only",
+    );
+    expect_err(
+        &obj("    interaction \"Use\" { run(sim) { self.n = sim.object_type; } }"),
+        "unknown Sim property 'sim.object_type'",
+    );
+    expect_err(
+        &obj("    #[bhav] fn a() { self.n = job_field(); }"),
+        "job_field(field) requires a field number",
+    );
+}
+
+/// PR I-3: a tree whose source assigns `stack_obj` keeps a restore it ends with (the popped
+/// frame's stack object is observable); the compiler's own exit restores still go.
+#[test]
+fn a_source_restore_before_the_exit_stays() {
+    let air = build(&obj("    #[bhav(context = inherit)]
+    fn a() {
+        #[slot(0)]
+        let saved = stack_obj;
+        stack_obj = me.id;
+        temp[0] = stack_obj.attr[1];
+        stack_obj = saved;
+    }
+    #[bhav]
+    fn b(o: ObjectId) {
+        self.n = o.attr[0];
+    }"))
+    .0;
+    assert!(
+        tree_body(&air, "a").contains("    stack_obj := local[0];\n    return true;"),
+        "{air}"
+    );
+    let b = tree_body(&air, "b");
+    assert!(b.contains("stack_obj := param[0];"), "{b}");
+    assert!(
+        !b.contains("stack_obj := __saved_stack_obj;\n    return true;"),
+        "{b}"
+    );
+}
+
+/// PR I-3: a raw `global[NAME]` whose constant is not 34 cannot read global 34, so the tree
+/// is not held to main's rules for it (here: the unread Sim entry save drops).
+#[test]
+fn a_constant_global_index_other_than_34_reads_no_global_34() {
+    let src = |slot: i16| {
+        format!(
+            r#"const SLOT = {slot};
+object "Global Probe" {{
+    guid: 0x7F50_0003;
+    state n: i16;
+    #[bhav]
+    fn a(sim: Sim) {{
+        let n: i16;
+        raw {{ temp[2] := global[SLOT]; }}
+        set_to_next(all, dest: stack_obj);
+        random_into(n, Limits.draw)?;
+        temp[3] = n;
+    }}
+    bcon 4097 "Limits" {{ draw = 6 }}
+}}
+"#
+        )
+    };
+    assert!(!build(&src(5)).0.contains("__self_obj"));
+    assert!(build(&src(34)).0.contains("let __self_obj = stack_obj;"));
+}
