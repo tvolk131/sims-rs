@@ -386,8 +386,7 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             stmt: None,
             stmt_flows: false,
             body: 0,
-            helper: None,
-            called: called_names(tokens),
+            unbuilt: false,
             wide: wide_strings(tokens),
             diags: Vec::new(),
         };
@@ -434,7 +433,7 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             });
         }
         if let Some(original) = compiled.as_deref() {
-            let (stand, untried) = verified(input, original, pending);
+            let (stand, untried) = verified(input, original, pending, &diags);
             diags.extend(stand);
             let seen: Vec<LintDiagnostic> = diags.iter().chain(&untried).cloned().collect();
             diags.extend(stale_allows(&directives, &seen, &input.name));
@@ -1610,10 +1609,10 @@ struct FileLinter<'a> {
     stmt_flows: bool,
     /// How many bodies have been linted: the current body's number.
     body: usize,
-    /// The plain (inlined) `fn` being linted: its rewrites build only where it is called.
-    helper: Option<String>,
-    /// Names called somewhere in the file (`name(`).
-    called: BTreeSet<String>,
+    /// The code being linted is not built as itself: a plain (inlined) `fn`, which other
+    /// files may inline too, or a template's member, built only into the objects that
+    /// extend it. Its rewrites could not be checked, so none is proposed.
+    unbuilt: bool,
     /// Per line, each string literal's column and how many more bytes than characters it
     /// holds: the lexer counts a string's characters, everything else by bytes.
     wide: BTreeMap<usize, Vec<(usize, usize)>>,
@@ -2312,9 +2311,9 @@ impl FileLinter<'_> {
                 .filter(|p| p.ty != V2Type::Sim)
                 .map(|p| p.name.as_str()),
         );
-        self.helper = Some(f.name.clone());
+        let unbuilt = std::mem::replace(&mut self.unbuilt, true);
         self.lint_body(&f.body, BodyCx { sim });
-        self.helper = None;
+        self.unbuilt = unbuilt;
         self.leave_context();
     }
 
@@ -2347,6 +2346,13 @@ impl FileLinter<'_> {
     }
 
     fn lint_members(&mut self, members: &[ObjectMember], template: bool) {
+        let unbuilt = self.unbuilt;
+        self.unbuilt |= template;
+        self.lint_members_inner(members, template);
+        self.unbuilt = unbuilt;
+    }
+
+    fn lint_members_inner(&mut self, members: &[ObjectMember], template: bool) {
         for m in members {
             match m {
                 ObjectMember::Fn(f) => self.lint_fn(f),
@@ -4595,6 +4601,7 @@ fn verified(
     input: &LintInput,
     original: &[crate::compile::CompiledObject],
     pending: Vec<Pending>,
+    reported: &[LintDiagnostic],
 ) -> (Vec<LintDiagnostic>, Vec<LintDiagnostic>) {
     if pending.is_empty() {
         return (Vec::new(), Vec::new());
@@ -4683,8 +4690,10 @@ fn verified(
     }
     // The lift applies every `untyped_engine_field` suggestion at once, so those must also build
     // together: two typed words of one statement may not compare (`flags2 == buy_flags`).
-    // Each half joins only if it builds with everything kept so far; what the budget does not
-    // reach is dropped.
+    // The static table's suggestions (`self.id`, ...) are always applied, as the lift applies
+    // them. Each half joins only if it builds with everything kept so far; what the budget does
+    // not reach is dropped.
+    let statics = lift_fixes(&input.source, reported);
     stands.sort_unstable();
     let (fields, mut kept): (Vec<usize>, Vec<usize>) = stands
         .into_iter()
@@ -4694,7 +4703,7 @@ fn verified(
     let mut first = true;
     while let Some(part) = todo.pop() {
         // One passing group already built them all together.
-        let tested = first && groups_built_whole(&part, &accepted_groups);
+        let tested = first && statics.is_empty() && groups_built_whole(&part, &accepted_groups);
         first = false;
         if tested {
             joint.extend(part);
@@ -4708,7 +4717,11 @@ fn verified(
             continue;
         }
         joint_budget -= 1;
-        let all = joint.iter().chain(&part).map(|&i| &pending[i]);
+        let all = joint
+            .iter()
+            .chain(&part)
+            .map(|&i| &pending[i])
+            .chain(&statics);
         if apply_fixes(&input.source, all).is_some_and(|s| builds_same(&s)) {
             joint.extend(part);
         } else if part.len() > 1 {
@@ -4722,26 +4735,6 @@ fn verified(
     untried.sort_unstable();
     let diags = |list: Vec<usize>| list.into_iter().map(|i| pending[i].diag.clone()).collect();
     (diags(kept), diags(untried))
-}
-
-/// Each name the tokens call (`name(`, not after `fn`).
-fn called_names(tokens: &[crate::v2::lexer::Token]) -> BTreeSet<String> {
-    tokens
-        .iter()
-        .enumerate()
-        .filter_map(
-            |(i, t)| match (&t.kind, tokens.get(i + 1).map(|n| &n.kind)) {
-                (TokenKind::Ident(name), Some(TokenKind::LParen))
-                    if !i
-                        .checked_sub(1)
-                        .is_some_and(|p| tokens[p].kind == TokenKind::Ident("fn".to_owned())) =>
-                {
-                    Some(name.clone())
-                }
-                _ => None,
-            },
-        )
-        .collect()
 }
 
 /// Per line, each string literal's column and how many more bytes than characters it
@@ -4759,6 +4752,37 @@ fn wide_strings(tokens: &[crate::v2::lexer::Token]) -> BTreeMap<usize, Vec<(usiz
         }
     }
     out
+}
+
+/// The `untyped_engine_field` suggestions of `reported` as the lift applies them: from the
+/// column (read as a byte offset) to the first `]` of the line.
+fn lift_fixes(source: &str, reported: &[LintDiagnostic]) -> Vec<Pending> {
+    let starts: Vec<usize> = std::iter::once(0)
+        .chain(source.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    reported
+        .iter()
+        .filter(|d| d.rule == UNTYPED_ENGINE_FIELD)
+        .filter_map(|d| {
+            let line = *starts.get(d.line.checked_sub(1)?)?;
+            let start = line + d.column.checked_sub(1)?;
+            let rest = source.get(start..)?;
+            let rest = &rest[..rest.find('\n').unwrap_or(rest.len())];
+            let end = start + rest.find(']')? + 1;
+            Some(Pending {
+                diag: d.clone(),
+                fixes: vec![Fix {
+                    start,
+                    end,
+                    text: d.suggestion.clone()?,
+                }],
+                import: None,
+                stmt: None,
+                body: 0,
+                flows: false,
+            })
+        })
+        .collect()
 }
 
 /// Whether `part` lies inside one group that built whole.
@@ -5014,13 +5038,7 @@ impl FileLinter<'_> {
         {
             return;
         }
-        // A plain `fn` builds only where it is inlined: one this file never calls is not
-        // built, so its rewrite could not be checked.
-        if self
-            .helper
-            .as_ref()
-            .is_some_and(|h| !self.called.contains(h))
-        {
+        if self.unbuilt {
             return;
         }
         let severity = rule(rule_name).map_or(Severity::Warning, |r| r.severity);

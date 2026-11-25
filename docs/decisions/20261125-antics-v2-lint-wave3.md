@@ -67,12 +67,17 @@ How the builds run:
   When the whole set fails, its halves join one at a time, each only if it builds with what was
   kept so far. What fails, or what the budget does not reach, is dropped. A set that one group
   already built whole needs no more builds.
+  - The static table's suggestions (`self.id`, ...) are part of every joint build, because the
+    lift applies them too. `self.data[11] == stack_obj.data[40]` keeps `self.id` and drops
+    `stack_obj.flags2`, which does not compare with an `ObjectId`.
 - **Budget.** A file gets at most 48 builds, plus 16 to build its kept `untyped_engine_field`
   findings together. On the corpus, the most any file needed was 3, plus one joint build (68
   files). A finding the budget leaves untried is not reported, but it still counts as a finding for
   `stale_lint_allow`, so an `allow` of it is not called stale.
-- **What a build cannot check.** A plain `fn` is built only where it is inlined. A rewrite in one
-  that no tree of the file calls is not proposed.
+- **What a build cannot check.** Some code is not built as itself, so nothing is proposed in it:
+  - **A plain `fn`** is built only where it is inlined. That may be in another file, whose own
+    states can change what a typed name means there.
+  - **A template's members** are built only into the objects that extend it.
 - **Edits that lose text.** A rewrite whose replaced text holds a comment is not proposed.
 - **Source offsets.** The lexer counts a string literal's characters and everything else by bytes.
   Rewrite offsets therefore add each wide string's extra bytes, and an offset inside a character is
@@ -177,7 +182,7 @@ For `refresh`, target `0` / `RefreshTarget::Me` is the frame's `me`. The suggest
 
 - `self` in an object's own tree;
 - the Sim's name in a Sim's body;
-- `me` in an inline helper, which runs in its caller's frame.
+- `me` where neither holds.
 
 Target `1` / `StackObject` is `stack_obj`.
 

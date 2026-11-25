@@ -703,17 +703,12 @@ fn refresh_takes_me_or_the_stack_object_as_receiver() {
         "refresh(target: 1, mode: 0)",
         "stack_obj.refresh(0)",
     );
-    // An inline helper runs in its caller's frame: `me` is the target.
+    // An inline helper is not built as itself (see `no_rewrite_in_code_built_elsewhere`).
     let source = obj(
         "",
         "    fn helper() {\n        refresh(target: 0, mode: 2);\n    }\n    #[bhav(label = \"Probe\")] fn probe() {\n        helper();\n    }",
     );
-    rewrites(
-        &source,
-        "prefer_method_syntax",
-        "refresh(target: 0, mode: 2)",
-        "me.refresh(2)",
-    );
+    none(&source, "prefer_method_syntax");
 }
 
 #[test]
@@ -838,26 +833,40 @@ fn a_typed_handles_state_is_no_engine_flag_word() {
 }
 
 #[test]
-fn a_helper_no_tree_calls_is_not_rewritten() {
-    // Unused, the helper is not built: a rewrite there is unchecked.
+fn no_rewrite_in_code_built_elsewhere() {
+    // A plain `fn` is built only where it is inlined, perhaps in another file, and a
+    // template only into the objects that extend it: a rewrite there is unchecked.
     let helper = "    fn helper() {\n        temp[0] = stack_obj.data[41];\n    }\n";
-    let unused = obj(
+    for probe in ["temp[1] = 1;", "helper();"] {
+        let source = obj(
+            "",
+            &format!(
+                "{helper}    #[bhav(label = \"Probe\")] fn probe() {{\n        {probe}\n    }}"
+            ),
+        );
+        none(&source, "untyped_engine_field");
+    }
+    let source = format!(
+        "{PREAMBLE}pub fn helper() {{\n    temp[0] = stack_obj.data[41];\n}}\nobject \"Synth Probe\" {{\n    guid: 0x7E00_0300;\n    price: 1;\n    #[bhav(label = \"Probe\")] fn probe() {{\n        helper();\n    }}\n}}\n"
+    );
+    iff(&source);
+    none(&source, "untyped_engine_field");
+    let source = "template Base {\n    #[bhav(label = \"Probe\")] fn probe() {\n        temp[0] = stack_obj.data[41];\n    }\n}\nobject \"Synth Probe\" from Base {\n    guid: 0x7E00_0300;\n    price: 1;\n}\n";
+    iff(source);
+    none(source, "untyped_engine_field");
+}
+
+#[test]
+fn new_field_names_build_beside_the_static_ones() {
+    // `self.id` comes from the static table; `stack_obj.flags2` beside it does not compare
+    // with an `ObjectId`, and the lift applies both.
+    let source = tree(
         "",
-        &format!(
-            "{helper}    #[bhav(label = \"Probe\")] fn probe() {{\n        temp[1] = 1;\n    }}"
-        ),
+        "        if self.data[11] == stack_obj.data[40] {\n            temp[0] = 1;\n        }",
     );
-    none(&unused, "untyped_engine_field");
-    let used = obj(
-        "",
-        &format!("{helper}    #[bhav(label = \"Probe\")] fn probe() {{\n        helper();\n    }}"),
-    );
-    rewrites(
-        &used,
-        "untyped_engine_field",
-        "stack_obj.data[41]",
-        "stack_obj.value",
-    );
+    let found = of(&source, "untyped_engine_field");
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert_eq!(found[0].suggestion.as_deref(), Some("self.id"));
 }
 
 #[test]
