@@ -24,7 +24,8 @@
 //! - `sims-antics build <pack_dir> --out <dir>`
 //! - `sims-antics fmt [--check] [--stdout] <path...>` (canonical `.antics` v2 layout)
 //! - `sims-antics lint [--deny-warnings] [--json] <path...>` (`.antics` v2 lints)
-//! - `sims-antics lift --v2 <file.iff|archive.far> [--entry <name.iff>] [--install <dir>]` (decompile to `.antics` v2)
+//! - `sims-antics lift --v2 <file.iff|archive.far> [--entry <name.iff>] [--install <dir>] [--behavioral]` (decompile to `.antics` v2;
+//!   `--behavioral` checks trees without node numbers and frame storage, like `verify-equiv --behavioral`)
 
 use sims_antics::arity_catalog::{
     AritySource, FileArities, FileIdentity, GLOBAL_TREES, KeptBhavs, ResolvedArities,
@@ -197,7 +198,7 @@ fn print_usage() {
               --ignore-fault-scratch-pointer that nothing reads the scratch-pointer state it leaves: each is\n    \
               printed as an ASSUME line; an INCONCLUSIVE run names the trees it is EQUIVALENT modulo)\n  \
          sims-antics lift <file.iff|archive.far> [--entry <name.iff>] [--tree <id>] [--list] [--filter <substr>] [--raw] [--relax-padding] [--no-comments] [--verify-equiv] [--globals <Global.iff|archive.far[!member.iff]>] [--semiglobal <file.iff|archive.far!member.iff>] [--no-catalog]   (lifts to .air Antics IR)\n  \
-         sims-antics lift --v2 <file.iff|archive.far> [--entry <name.iff>] [--install <dir>] [--globals ...] [--semiglobal ...] [--no-catalog]   (decompiles an object to checked .antics v2)\n  \
+         sims-antics lift --v2 <file.iff|archive.far> [--entry <name.iff>] [--install <dir>] [--globals ...] [--semiglobal ...] [--no-catalog] [--behavioral]   (decompiles an object to checked .antics v2;\n              --behavioral checks each tree like verify-equiv --behavioral: node numbers and frame storage are not compared,\n              so proofs hold only for runs that start and end under one build; the source header says so)\n  \
          sims-antics build <pack_dir> --out <dir>\n  \
          sims-antics fmt [--check] [--stdout] <file.antics|dir...>   (canonical .antics v2 layout; --check exits 1 if any file would change)\n  \
          sims-antics lint [--deny-warnings] [--json] <file.antics|dir...>   (.antics v2 lints; exits 1 on an error, or on any finding with --deny-warnings)\n  \
@@ -1015,6 +1016,7 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
     let mut no_comments = false;
     let mut verify_equiv = false;
     let mut v2 = false;
+    let mut behavioral = false;
     let mut arity_opts = ArityOptions::default();
     let mut end_of_flags = false;
 
@@ -1101,6 +1103,11 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
                         i += 1;
                         continue;
                     }
+                    "--behavioral" => {
+                        behavioral = true;
+                        i += 1;
+                        continue;
+                    }
                     "--install" => {
                         if arity_opts.install.is_some() {
                             return Err("duplicate --install flag".to_owned().into());
@@ -1164,6 +1171,13 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
     {
         return Err(
             "--v2 cannot be combined with --list, --tree, --filter, --raw, --relax-padding, --no-comments, or --verify-equiv (it checks every tree itself)"
+                .to_owned()
+                .into(),
+        );
+    }
+    if behavioral && !v2 {
+        return Err(
+            "--behavioral requires --v2 (use verify-equiv --behavioral to check .air lifts)"
                 .to_owned()
                 .into(),
         );
@@ -1315,6 +1329,7 @@ fn cmd_lift(args: &[OsString]) -> Result<(), CliError> {
             &iff,
             resolved.as_ref(),
             &arity_opts,
+            behavioral,
             &source_label,
             &mut out,
         );
@@ -2238,6 +2253,7 @@ fn lift_v2(
     iff: &Iff,
     resolved: Option<&FileArities>,
     arity_opts: &ArityOptions,
+    behavioral: bool,
     source_label: &str,
     out: &mut OutWriter<impl Write>,
 ) -> Result<(), CliError> {
@@ -2255,6 +2271,7 @@ fn lift_v2(
     let options = DecompileV2Options {
         library_arities,
         library_names: lift_v2_library_names(arity_opts, resolved),
+        behavioral,
         ..DecompileV2Options::default()
     };
     let report = decompile_iff_to_v2_report(iff, &options)
@@ -2278,8 +2295,13 @@ fn lift_v2(
         }
     }
     eprintln!(
-        "decompiled {} tree(s) from {source_label}: {} identical, {} equivalent, {} inconclusive, {} omitted, {} different; {idiomatic} idiomatic ({raw_statements} raw statement(s)), {} raw; {} init/main tree(s) written as plain trees",
+        "decompiled {} tree(s) from {source_label}{}: {} identical, {} equivalent, {} inconclusive, {} omitted, {} different; {idiomatic} idiomatic ({raw_statements} raw statement(s)), {} raw; {} init/main tree(s) written as plain trees",
         report.trees.len(),
+        if behavioral {
+            " (behavioral, node numbers and frame storage not compared)"
+        } else {
+            ""
+        },
         counts[0],
         counts[1],
         counts[2],

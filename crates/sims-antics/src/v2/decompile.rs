@@ -120,6 +120,13 @@ pub struct DecompileV2Options {
     /// back to `raw` where needed (default `true`). Without it the output is the most
     /// readable translation, unchecked.
     pub validate: bool,
+    /// Check trees under the behavioral relation (`lift --v2 --behavioral`, the relation of
+    /// `verify-equiv --behavioral`, `docs/decisions/20261123-verifier-behavioral-mode.md`)
+    /// instead of the strict one (default `false`). Node numbers and frame storage are
+    /// then not compared, so a proof holds only for runs that start and end under one
+    /// build. Every other check (headers, sounds, strings, object gaps, unproven callees)
+    /// is unchanged. The source says so in its header.
+    pub behavioral: bool,
 }
 
 impl Default for DecompileV2Options {
@@ -128,6 +135,7 @@ impl Default for DecompileV2Options {
             library_arities: BTreeMap::new(),
             library_names: BTreeMap::new(),
             validate: true,
+            behavioral: false,
         }
     }
 }
@@ -387,6 +395,15 @@ struct TreeModel {
     omitted: Option<String>,
 }
 
+/// Swaps `t`'s structured lift for its other branch order, if it has one.
+fn swap_lift(t: &mut TreeModel) {
+    if let Some(other) = t.other_order.as_mut() {
+        std::mem::swap(&mut t.lifted, &mut other.lifted);
+        std::mem::swap(&mut t.body_lines, &mut other.body_lines);
+        std::mem::swap(&mut t.body, &mut other.body);
+    }
+}
+
 /// One structured lift of a tree: its lines, header and closing-brace indices, and
 /// parsed body.
 struct OrderedLift {
@@ -507,10 +524,13 @@ struct Model {
     /// Where the original's object definitions register each tree as a callback.
     original_callbacks: Option<Callbacks>,
     library_arities: BTreeMap<u16, usize>,
+    /// Trees are checked under the behavioral relation ([`DecompileV2Options::behavioral`]).
+    behavioral: bool,
 }
 
 impl Model {
     fn build(iff: &Iff, options: &DecompileV2Options) -> Result<Self> {
+        let behavioral = options.validate && options.behavioral;
         let objds: Vec<&Chunk> = iff.chunks.iter().filter(|c| &c.tag == b"OBJD").collect();
         let objd_chunk = objds
             .first()
@@ -699,6 +719,11 @@ impl Model {
                 && other != text
             {
                 tree.other_order = ordered_lift(&other).map(Box::new);
+                // Node numbers are not compared in behavioral mode: the true branch goes
+                // first, as written, which needs no negated conditions.
+                if behavioral {
+                    swap_lift(&mut tree);
+                }
             }
             // A variant runs its init/main tree as the object itself.
             let variant_tree = variants
@@ -926,6 +951,7 @@ impl Model {
             original_lookup: NameLookup::of(iff),
             original_callbacks: callback_slots(iff),
             library_arities: options.library_arities.clone(),
+            behavioral,
         })
     }
 
@@ -953,12 +979,8 @@ impl Model {
 
     /// Swaps tree `id`'s structured lift for its other branch order.
     fn swap_order(&mut self, id: u16) {
-        if let Some(t) = self.trees.iter_mut().find(|t| t.id == id)
-            && let Some(other) = t.other_order.as_mut()
-        {
-            std::mem::swap(&mut t.lifted, &mut other.lifted);
-            std::mem::swap(&mut t.body_lines, &mut other.body_lines);
-            std::mem::swap(&mut t.body, &mut other.body);
+        if let Some(t) = self.trees.iter_mut().find(|t| t.id == id) {
+            swap_lift(t);
         }
     }
 
@@ -1047,7 +1069,7 @@ impl Model {
             &candidate,
             &recompiled.ctx,
             &EquivOptions::default(),
-            &lift_live_options(),
+            &lift_live_options(self.behavioral),
         );
         let check = match result {
             EquivResult::Equivalent { .. } => TreeCheck::Equivalent,
@@ -2792,14 +2814,24 @@ fn interaction_comments(tables: Vec<(Vec<u16>, Vec<String>)>) -> Vec<String> {
     out
 }
 
+/// The header lines of a source checked under the behavioral relation. They name the
+/// relation only: which trees proved is in the lift's report, not the source.
+const BEHAVIORAL_HEADER: [&str; 4] = [
+    "// Checked in behavioral mode (`--behavioral`): node numbers and frame storage were not",
+    "// compared, so a tree proven equivalent is equivalent only for runs that start and end",
+    "// under one build (docs/decisions/20261123-verifier-behavioral-mode.md). Not every tree",
+    "// is proven; the lift's report lists the ones that are not.",
+];
+
 /// The checker's bounds for `lift`: the defaults, but at most 50,000 pairs of paths with
 /// different outputs (the default is 250,000). Running out leaves a tree unproven, so it
 /// falls back to a lower level, and never proves one. It stops a file of many large trees
 /// that each fail at the first levels from taking minutes. Over the full corpus no tree's
-/// result or written text changed.
-fn lift_live_options() -> LiveOptions {
+/// result or written text changed. `behavioral` selects the behavioral relation.
+fn lift_live_options(behavioral: bool) -> LiveOptions {
     LiveOptions {
         max_pair_checks: 50_000,
+        behavioral,
         ..LiveOptions::default()
     }
 }
@@ -3078,7 +3110,6 @@ impl Plan {
         t.sim_ctx && self.level(t) == Level::Idiomatic && !self.inherits(t)
     }
 
-    /// Moves tree `id` one style down. `false` when it is already at its last style.
     /// Tries tree `id`'s other branch order at its current level, once per level: node
     /// order usually keeps the original's node numbers, but a tree whose paths visit
     /// nodes out of order can prove only in the other. The extra idioms and the statements
@@ -3088,7 +3119,9 @@ impl Plan {
             return false;
         };
         let level = self.level(t);
-        if t.other_order.is_none()
+        // In behavioral mode node numbers are not compared, so the order cannot matter.
+        if model.behavioral
+            || t.other_order.is_none()
             || level == Level::RawLabeled
             || self.swapped.get(&id) == Some(&level)
         {
@@ -3101,6 +3134,7 @@ impl Plan {
         true
     }
 
+    /// Moves tree `id` one style down. `false` when it is already at its last style.
     fn lower_tree(&mut self, model: &Model, id: u16) -> bool {
         let Some(t) = model.tree(id) else {
             return false;
@@ -3276,6 +3310,11 @@ impl Model {
         let mut raw_counts = BTreeMap::new();
         let mut extras = BTreeSet::new();
         out.line("// Decompiled by `sims-antics lift --v2`.");
+        if self.behavioral {
+            for line in BEHAVIORAL_HEADER {
+                out.line(line);
+            }
+        }
         if self.extra_objds > 0 {
             out.line(format!(
                 "// The file has {} additional OBJD chunks that v2 cannot write as catalog variants.",
@@ -3942,6 +3981,20 @@ impl Translator<'_> {
             }
             Stmt::Loop { body, .. } => {
                 self.flush_raw(out);
+                // A breakpoint whose true branch is itself: the original's own trap, which
+                // runs until the VM errors the object out.
+                if let [
+                    Stmt::Primitive {
+                        prim: PrimitiveCall::Breakpoint { .. },
+                        branches: None,
+                        ..
+                    },
+                ] = body.as_slice()
+                {
+                    out.line(
+                        "// antics-lint: allow(unbounded_loop_without_yield): the original's breakpoint loops on itself",
+                    );
+                }
                 let start = out.lines.len();
                 out.line("loop {");
                 out.indent += 1;
@@ -5643,14 +5696,20 @@ mod tests {
     /// Lifts the object `source` compiles to: every tree proven, the text compiles again
     /// and lints clean.
     fn lift_source(source: &str) -> String {
-        let compile = |text: &str| {
-            let object =
-                crate::compile_v2_source("lift.antics", text, &PackResolverConfig::default())
-                    .unwrap_or_else(|e| panic!("{e}\n{text}"));
-            Iff::parse(object.iff_bytes).expect("parse IFF")
-        };
-        let report = decompile_iff_to_v2_report(&compile(source), &DecompileV2Options::default())
-            .expect("lift");
+        lift_source_with(source, &DecompileV2Options::default())
+    }
+
+    fn compile_source(text: &str) -> Iff {
+        let object = crate::compile_v2_source("lift.antics", text, &PackResolverConfig::default())
+            .unwrap_or_else(|e| panic!("{e}\n{text}"));
+        Iff::parse(object.iff_bytes).expect("parse IFF")
+    }
+
+    /// Lifts `source`'s object with `options`, asserting every tree is proven and the
+    /// result compiles and lints clean.
+    fn lift_source_with(source: &str, options: &DecompileV2Options) -> String {
+        let compile = compile_source;
+        let report = decompile_iff_to_v2_report(&compile(source), options).expect("lift");
         assert!(report.compiled);
         assert!(
             report
@@ -5891,6 +5950,88 @@ object "Fable Lamp" {
             &["if self.data[3] == 1 {\n            temp[0] = 1;"],
         );
         assert!(!lifted.contains("@n"), "{lifted}");
+    }
+
+    /// n3 (a yield) is reached from n1 and n2; the structured lift writes it twice, so the
+    /// idiomatic tree yields at another node number than the original.
+    const SHARED_YIELD: &str = r#"object "Fable Clock" {
+    guid: 0x7E00_0137;
+    #[bhav(id = 4300, label = "Pick", locals = 0)]
+    fn pick() {
+        raw {
+            @n0:
+            expr(my.data[3] == 1) -> true: @n2, false: @n1;
+            @n1:
+            expr(my.data[4] == 1) -> true: @n3, false: true;
+            @n2:
+            expr(temp[1] := 2) -> true: @n3, false: error;
+            @n3:
+            sleep(1) -> true: true, false: error;
+        }
+    }
+}"#;
+
+    #[test]
+    fn behavioral_mode_proves_a_renumbered_tree_and_says_so() {
+        let strict = lift_source(SHARED_YIELD);
+        assert!(strict.contains("@n3:"), "{strict}");
+        assert!(!strict.contains("behavioral"), "{strict}");
+
+        let behavioral = lift_source_with(
+            SHARED_YIELD,
+            &DecompileV2Options {
+                behavioral: true,
+                ..DecompileV2Options::default()
+            },
+        );
+        assert!(!behavioral.contains("@n"), "{behavioral}");
+        has(
+            &behavioral,
+            &[
+                &BEHAVIORAL_HEADER.join("\n"),
+                // The true branch first: node order does not matter here.
+                "if self.data[3] == 1 {\n            temp[1] = 2;",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_breakpoint_trap_loop_allows_the_yield_lint() {
+        let lifted = lift_source(
+            r#"object "Fable Tower" {
+    guid: 0x7E00_0138;
+    #[bhav(id = 4300, label = "Trap", locals = 0)]
+    fn trap() {
+        if self.data[3] == 1 {
+            loop {
+                breakpoint(1);
+            }
+        }
+        temp[0] = 2;
+        return true;
+    }
+}"#,
+        );
+        has(
+            &lifted,
+            &[
+                "// antics-lint: allow(unbounded_loop_without_yield): the original's breakpoint loops on itself\n            loop {\n                breakpoint(1);",
+            ],
+        );
+    }
+
+    #[test]
+    fn an_unchecked_lift_never_claims_behavioral_mode() {
+        let report = decompile_iff_to_v2_report(
+            &compile_source(SHARED_YIELD),
+            &DecompileV2Options {
+                validate: false,
+                behavioral: true,
+                ..DecompileV2Options::default()
+            },
+        )
+        .expect("lift");
+        assert!(!report.source.contains("behavioral"), "{}", report.source);
     }
 
     #[test]
