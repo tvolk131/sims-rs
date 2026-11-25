@@ -927,8 +927,12 @@ fn bare_exit_match_arms_are_statements() {
     };
     assert_same(
         "break / continue arms",
-        &looped("                1 => break,\n                2 => continue,\n                _ => self.n += 1,"),
-        &looped("                1 => { break; }\n                2 => { continue; }\n                _ => { self.n += 1; }"),
+        &looped(
+            "                1 => break,\n                2 => continue,\n                _ => self.n += 1,",
+        ),
+        &looped(
+            "                1 => { break; }\n                2 => { continue; }\n                _ => { self.n += 1; }",
+        ),
     );
     let returns = |arms: &str| {
         obj(&format!(
@@ -944,12 +948,91 @@ fn bare_exit_match_arms_are_statements() {
     };
     assert_same(
         "return arms",
-        &returns("                0 => return false,\n                1 => return,\n                _ => {}"),
-        &returns("                0 => { return false; }\n                1 => { return; }\n                _ => {}"),
+        &returns(
+            "                0 => return false,\n                1 => return,\n                _ => {}",
+        ),
+        &returns(
+            "                0 => { return false; }\n                1 => { return; }\n                _ => {}",
+        ),
     );
     // The formatter keeps the bare forms parseable and stable.
-    let src = looped("                1 => break,\n                2 => continue,\n                _ => self.n += 1,");
+    let src = looped(
+        "                1 => break,\n                2 => continue,\n                _ => self.n += 1,",
+    );
     let once = v2::format_v2_source(&src).expect("formats");
     assert_eq!(v2::format_v2_source(&once).expect("formats again"), once);
     assert_same("formatted", &once, &src);
+}
+
+/// The `.air` of a synthetic object whose `msg` string is `message`, around `members`.
+fn air_with_message(message: &str, members: &str) -> String {
+    let src = format!(
+        r#"object "Text Words" {{
+    guid: 0x7F40_0A20;
+    strings 301 "Notes" {{ title = "T", msg = "{message}" }}
+{members}
+}}
+"#
+    );
+    build(&src).0
+}
+
+/// `$Me` writes a name into the text that later passes may read as a token, so it may read any
+/// frame word: the unread entry save still drops when every other word keeps its local (the
+/// save's own word holds no source local). Explicit tokens keep the strict rule: one that may
+/// read the save's own word, or a word a named local would move to, keeps the save.
+#[test]
+fn me_text_drops_an_entry_save_that_moves_no_named_local() {
+    // The save, by name or (under `#[slot]` placement) by word.
+    let saves =
+        |air: &str| air.contains("let __self_obj = stack_obj;") || air.contains("] := stack_obj;");
+    // `n` is pinned below the save, so dropping the save moves no named local.
+    let pinned = r#"    #[bhav]
+    fn a(sim: Sim) {
+        #[slot(0)] let n: i16;
+        random_into(n, 4)?;
+        if !set_to_next(guid, 0x7F40_0A21, dest: stack_obj) {
+            return false;
+        }
+        stack_obj.attr[0] = n;
+        dialog(kind: ok, title: title, message: msg);
+    }"#;
+    for message in ["Hello $Me", "$Me rolled $Local:0"] {
+        let air = air_with_message(message, pinned);
+        assert!(!saves(&air), "{message}:\n{air}");
+    }
+    // `$Local:1` is the save's own word.
+    let air = air_with_message("$Me saw $Local:1", pinned);
+    assert!(saves(&air), "{air}");
+    // `n` declared after the save would move down a word.
+    let moving = r#"    #[bhav]
+    fn a(sim: Sim) {
+        if !set_to_next(guid, 0x7F40_0A21, dest: stack_obj) {
+            return false;
+        }
+        let n = sim.person[3];
+        stack_obj.attr[0] = n;
+        dialog(kind: ok, title: title, message: msg);
+    }"#;
+    let air = air_with_message("Hello $Me", moving);
+    assert!(saves(&air), "{air}");
+    // `.air` keeps `param[0]` around an `idle` in the word after the named locals, which
+    // dropping the save would move.
+    let scratch = r#"    #[bhav(args = 1)]
+    fn a(sim: Sim) {
+        if !set_to_next(guid, 0x7F40_0A21, dest: stack_obj) {
+            return false;
+        }
+        stack_obj.attr[0] = param[0];
+        sleep(1);
+        dialog(kind: ok, title: title, message: msg);
+    }"#;
+    let air = air_with_message("Hello $Me", scratch);
+    assert!(saves(&air), "{air}");
+    // Without the `param[0]` read there is no scratch word.
+    let air = air_with_message("Hello $Me", &scratch.replace("param[0]", "1"));
+    assert!(!saves(&air), "{air}");
+    // A string unbounded besides `$Me` keeps the save.
+    let air = air_with_message("Hello $Object", pinned);
+    assert!(saves(&air), "{air}");
 }

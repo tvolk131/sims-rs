@@ -303,6 +303,8 @@ struct ObjectEnv<'a> {
     /// ([`mir::text_reads`](mod@crate::v2::mir)): every tree is finished with the object's final
     /// fact (`lower_object` lowers again when a later tree's inline dialog literal adds to it).
     text_reads: mir::TableLocals,
+    /// `text_reads` apart from what a `$Me` name may name ([`mir::strings_read_besides_me`]).
+    text_reads_besides_me: mir::TableLocals,
     /// Some tree of the object may read global 34 ([`mir::may_read_global_34`]), so every tree
     /// is finished with main's rules: a call carries the scratch pointer into the callee and
     /// back, so an Expression one tree keeps or drops can change what another tree reads.

@@ -36,6 +36,14 @@ pub(crate) fn strings_read<'a>(texts: impl IntoIterator<Item = &'a str>) -> Tabl
     all
 }
 
+/// [`strings_read`] with each `$Me` token's pass taken to read nothing. `$Me` writes the running
+/// object's name into the text, which later passes read as tokens, so a name holding `$Local:N`
+/// reads word N: this is what the text reads besides what a name may name.
+pub(crate) fn strings_read_besides_me<'a>(texts: impl IntoIterator<Item = &'a str>) -> TableLocals {
+    let neutral: Vec<String> = texts.into_iter().map(|t| t.replace("$Me", " ")).collect();
+    strings_read(neutral.iter().map(String::as_str))
+}
+
 /// Whether text that reads `reads` may read any frame word at all.
 pub(crate) fn reads_a_word(reads: &TableLocals) -> bool {
     !matches!(reads, TableLocals::Known(set) if set.is_empty())

@@ -234,6 +234,9 @@ pub(crate) struct AirLocalUsage {
     pub(crate) explicit: BTreeSet<usize>,
     pub(crate) lets: Vec<String>,
     pub(crate) has_raw_ops: bool,
+    /// The tree uses both `param[0]` and `idle()`, so `.air` keeps `param[0]` in the word after
+    /// the named locals around each `idle`.
+    pub(crate) uses_idle_scratch: bool,
 }
 
 /// [`AirLocalUsage`] of a parsed tree body.
@@ -243,6 +246,7 @@ pub(crate) fn air_local_usage(stmts: &[Stmt]) -> AirLocalUsage {
         explicit: usage.explicit_locals,
         lets: usage.let_decls.into_iter().map(|(_, name)| name).collect(),
         has_raw_ops: usage.has_raw_ops,
+        uses_idle_scratch: usage.uses_idle && usage.uses_param0,
     }
 }
 

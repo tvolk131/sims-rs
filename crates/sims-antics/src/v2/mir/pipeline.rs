@@ -18,6 +18,10 @@ pub(crate) struct FrameFacts<'a> {
     /// ([`text_reads`](mod@super::text_reads)) when the tree formats text (a raw block's, or a
     /// dialog or action string in the body), and none when it does not.
     pub(crate) text_reads: TableLocals,
+    /// [`FrameFacts::text_reads`] apart from what a `$Me` name may name
+    /// ([`strings_read_besides_me`]); `Unknown` too when the layout itself is observable (a
+    /// bottom frame, or main's rules).
+    pub(crate) text_reads_besides_me: TableLocals,
     /// Keep the body's node layout: a raw block, `local[N]` read, or `#[slot]` in the tree may
     /// depend on it, so only the unread entry save may go.
     pub(crate) keep_layout: bool,
@@ -121,12 +125,19 @@ fn finish_frame(out: String, facts: &FrameFacts<'_>) -> String {
 /// Whether dropping the entry save from `before` (giving `after`) leaves every frame word the
 /// tree's text may read ([`FrameFacts::text_reads`]) holding the same local
 /// ([`frame_occupancy`]). The save's own word changes hands, so text that may read it keeps
-/// the save; so does text that may read any word.
+/// the save.
+///
+/// Text whose reads are unbounded only through `$Me` ([`FrameFacts::text_reads_besides_me`]
+/// known) may read any word through a name holding a token, so every word must keep its local
+/// then too, except the save's own: the save goes when no other occupant moves. (A name naming
+/// that word would show the entry object's number with the save and the token itself or an
+/// earlier frame's leftovers without it: an accepted gap, as no source local lives there.)
 fn text_words_unmoved(before: &str, after: &str, facts: &FrameFacts<'_>) -> bool {
-    let words = match &facts.text_reads {
-        TableLocals::Unknown => return false,
-        TableLocals::Known(words) if words.is_empty() => return true,
-        TableLocals::Known(words) => words,
+    let (words, names_any_word) = match (&facts.text_reads, &facts.text_reads_besides_me) {
+        (TableLocals::Known(words), _) if words.is_empty() => return true,
+        (TableLocals::Known(words), _) => (words, false),
+        (TableLocals::Unknown, TableLocals::Known(words)) => (words, true),
+        (TableLocals::Unknown, TableLocals::Unknown) => return false,
     };
     let occupancy = |body: &str| {
         frame_occupancy(
@@ -140,7 +151,16 @@ fn text_words_unmoved(before: &str, after: &str, facts: &FrameFacts<'_>) -> bool
     let (Some(was), Some(now)) = (occupancy(before), occupancy(after)) else {
         return false;
     };
-    words
+    let explicit_unmoved = words
         .iter()
-        .all(|&w| usize::try_from(w).is_ok_and(|w| was.get(&w) == now.get(&w)))
+        .all(|&w| usize::try_from(w).is_ok_and(|w| was.get(&w) == now.get(&w)));
+    let besides_save = |frame: &BTreeMap<usize, String>, w: usize| {
+        frame.get(&w).filter(|n| n.as_str() != SELF_OBJ).cloned()
+    };
+    explicit_unmoved
+        && (!names_any_word
+            || was
+                .keys()
+                .chain(now.keys())
+                .all(|&w| besides_save(&was, w) == besides_save(&now, w)))
 }

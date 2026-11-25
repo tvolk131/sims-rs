@@ -105,12 +105,18 @@ impl<'a> TreeLowerer<'a> {
             || body_reads_global_34
             || bottom_reads_unwritten
             || self.pin_span.is_some();
-        let text_reads = if formats_text && (bottom_frame || main_rules) {
-            mir::TableLocals::Unknown
+        let (text_reads, text_reads_besides_me) = if formats_text && (bottom_frame || main_rules) {
+            (mir::TableLocals::Unknown, mir::TableLocals::Unknown)
         } else if formats_text {
-            self.env.text_reads.clone()
+            (
+                self.env.text_reads.clone(),
+                self.env.text_reads_besides_me.clone(),
+            )
         } else {
-            mir::TableLocals::Known(BTreeSet::new())
+            (
+                mir::TableLocals::Known(BTreeSet::new()),
+                mir::TableLocals::Known(BTreeSet::new()),
+            )
         };
         if let Some((span, name)) = &self.dup_decl
             && mir::reads_a_word(&text_reads)
@@ -128,6 +134,7 @@ impl<'a> TreeLowerer<'a> {
             main_rules,
             fixed_frame: self.frame_locals.is_some() || self.frame_format.is_some(),
             text_reads,
+            text_reads_besides_me,
             keep_layout: self.keep_layout,
             has_self_obj_local: self.has_self_obj_local,
             pinned: self.pin_span.is_some(),

@@ -118,9 +118,9 @@ fn plan_frame_slots(
 /// remaining `let` takes the word `.air` gives it, after the highest named word and the
 /// header's `min_locals` floor (0 when the header has none), in declaration order. A placed
 /// local the body never names past its `let x;` is gone from the placed body and holds no
-/// word. The word right after the named locals holds [`IDLE_SCRATCH`]: `.air` saves `param[0]`
-/// there around an `idle` when the tree uses both (a fact the slot scan does not report, so the
-/// word is always counted as taken). `None` if `.air` cannot parse the body.
+/// word. The word right after the named locals holds [`IDLE_SCRATCH`] when `.air` saves
+/// `param[0]` there around an `idle`: when the tree uses both (the same scan `.air`'s allocation
+/// makes). `None` if `.air` cannot parse the body.
 pub(crate) fn frame_occupancy(
     body: &str,
     pinned: &BTreeMap<String, usize>,
@@ -151,7 +151,9 @@ pub(crate) fn frame_occupancy(
         words.insert(word, name.clone());
         end = word + 1;
     }
-    words.insert(end, IDLE_SCRATCH.to_owned());
+    if usage.uses_idle_scratch {
+        words.insert(end, IDLE_SCRATCH.to_owned());
+    }
     Some(words)
 }
 

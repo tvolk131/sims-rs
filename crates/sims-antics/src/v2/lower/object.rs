@@ -12,33 +12,38 @@ pub(super) fn lower_object(
 
 /// The frame words the object's strings may make the formatter read (see
 /// [`mir::strings_read`]): its `strings` tables, its `STR#` 301 dialog table (declared entries and
-/// interned inline literals), and its catalog strings (each `CTSS`: a name and a description).
+/// interned inline literals), and its catalog strings (each `CTSS`: a name and a description);
+/// paired with the same fact apart from what a `$Me` name may name
+/// ([`mir::strings_read_besides_me`]).
 fn object_text_reads(
     strings: &BTreeMap<u16, StringsDecl>,
     dialog_strings: &DialogStringTable,
     catalog: &[&str],
-) -> mir::TableLocals {
-    mir::strings_read(
-        strings
-            .values()
-            .flat_map(|t| t.entries.iter().map(|(_, _, text)| text.as_str()))
-            .chain(
-                dialog_strings
-                    .entries
-                    .iter()
-                    .map(|(_, _, text)| text.as_str()),
-            )
-            .chain(catalog.iter().copied()),
+) -> (mir::TableLocals, mir::TableLocals) {
+    let texts: Vec<&str> = strings
+        .values()
+        .flat_map(|t| t.entries.iter().map(|(_, _, text)| text.as_str()))
+        .chain(
+            dialog_strings
+                .entries
+                .iter()
+                .map(|(_, _, text)| text.as_str()),
+        )
+        .chain(catalog.iter().copied())
+        .collect();
+    (
+        mir::strings_read(texts.iter().copied()),
+        mir::strings_read_besides_me(texts.iter().copied()),
     )
 }
 
-/// [`lower_object`], finishing every tree with `text_reads` as the object's text fact when it is
-/// given, and otherwise with the fact the strings known before any tree is lowered give, and
+/// [`lower_object`], finishing every tree with `text_reads` as the object's text facts (all
+/// reads, and those besides a `$Me` name's) when they are given, and otherwise with the fact the strings known before any tree is lowered give, and
 /// with `reads_global_34` as the object's global-34 fact (`ObjectEnv::reads_global_34`).
 fn lower_object_with(
     resolved: &ResolvedModule,
     obj: &ObjectDecl,
-    text_reads: Option<mir::TableLocals>,
+    text_reads: Option<(mir::TableLocals, mir::TableLocals)>,
     reads_global_34: bool,
 ) -> Result<ExpandedV2Object> {
     // 1. Resolve optional `from Template`.
@@ -927,7 +932,7 @@ fn lower_object_with(
                 .chain(v.description.as_deref())
         }))
         .collect();
-    let text_reads = text_reads
+    let (text_reads, text_reads_besides_me) = text_reads
         .unwrap_or_else(|| object_text_reads(&strings, &dialog_strings.borrow(), &catalog));
     // An object's `extern mod x { .. }` merges with the module's `x` (e.g. `use std::globals::*;`).
     for (name, (owner, decl)) in local_extern_mods.iter_mut() {
@@ -959,6 +964,7 @@ fn lower_object_with(
         string_names,
         dialog_strings,
         text_reads,
+        text_reads_besides_me,
         reads_global_34,
         saw_global_34: Cell::new(false),
         local_fns,
@@ -1606,7 +1612,10 @@ fn lower_object_with(
     // Likewise when a tree may read global 34 and the trees were finished without that fact.
     let final_reads = object_text_reads(&env.strings, &env.dialog_strings.borrow(), &catalog);
     let saw_global_34 = env.saw_global_34.get() && !env.reads_global_34;
-    if final_reads != env.text_reads || saw_global_34 {
+    if final_reads.0 != env.text_reads
+        || final_reads.1 != env.text_reads_besides_me
+        || saw_global_34
+    {
         return lower_object_with(
             resolved,
             obj,
