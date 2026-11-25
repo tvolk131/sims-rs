@@ -406,7 +406,7 @@ impl<'a> TreeLowerer<'a> {
         let cell = |c: &str, ty| Some((c.to_owned(), ty));
         match field {
             "hand" => cell("stack.slot[0]", ValueType::ObjectId),
-            "room" => cell("stack.room", ValueType::I16),
+            "room" => cell("stack.data[29]", ValueType::I16),
             "flags" => cell(
                 "stack.data[8]",
                 ValueType::Bitflags(ANY_BITFLAGS.to_owned()),
