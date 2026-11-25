@@ -146,6 +146,20 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// `self.<field>` or `self.attr[k]` / `self.data[k]`: one cell of the entry object.
+    fn is_self_cell(&self, expr: &V2Expr) -> bool {
+        let is_self = |e: &V2Expr| matches!(e, V2Expr::Ident(_, n) if self.is_self_ident(n));
+        match expr {
+            V2Expr::Field { base, field, .. } => is_self(base) && field != "sprite_flags",
+            V2Expr::Index { base, index, .. } => {
+                matches!(base.as_ref(), V2Expr::Field { base: root, field, .. }
+                    if is_self(root) && matches!(field.as_str(), "attr" | "data"))
+                    && self.eval_const_i16(index).is_ok()
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn lower_cmp_operands(
         &mut self,
         lhs: &V2Expr,
@@ -157,22 +171,25 @@ impl<'a> TreeLowerer<'a> {
         // right after its staging, so it needs no copy. The VM resolves the right operand
         // first, so `k` must be one that cannot fault (a temp or attribute can), or the
         // comparison would fault where the copy faulted on the career lookup.
+        // Dropping the copy is an in-place rewrite, which `finish` checks like the `self` prefix
+        // (it removes a node, an Expression and a local).
+        let rhs_const = self.eval_const_i16(rhs).is_ok();
         let job_cell = match self.builtin_job_data_call(lhs)? {
-            Some(call) if self.eval_const_i16(rhs).is_ok() => Some(call),
+            Some(call) if rhs_const && !self.env.in_place_off => Some(call),
             _ => None,
         };
-        // An in-place `self` read on the left (before the first cursor move) would likewise be
-        // read after the right operand, so unless that is a constant the left is staged first,
-        // as after a move.
-        let entry_cursor = self.entry_cursor;
-        if self.eval_const_i16(rhs).is_err() {
-            self.entry_cursor = false;
-        }
+        // Before the first cursor move, a `self` cell compared with a constant is read in place:
+        // the constant cannot fault, so the node reads the cell exactly when the staged copy did.
+        let self_cell_vs_const = rhs_const && self.is_self_cell(lhs);
+        let in_place = std::mem::replace(&mut self.self_in_place, self_cell_vs_const);
         let lowered_lhs = match job_cell {
-            Some((args, jspan)) => self.lower_job_data_cell(args, jspan),
+            Some((args, jspan)) => {
+                self.in_place_applied = true;
+                self.lower_job_data_cell(args, jspan)
+            }
             None => self.lower_value_expr(lhs),
         };
-        self.entry_cursor = entry_cursor;
+        self.self_in_place = in_place;
         let (l, l_ty) = lowered_lhs?;
         if op == V2BinOp::FlagTest
             && let ValueType::Bitflags(ref key) = l_ty

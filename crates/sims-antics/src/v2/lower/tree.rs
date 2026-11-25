@@ -46,7 +46,7 @@ impl<'a> TreeLowerer<'a> {
             pinned_locals: BTreeMap::new(),
             local_origins: BTreeMap::new(),
             stmt_span: None,
-            entry_cursor_applied: false,
+            in_place_applied: false,
             seen_decls: BTreeSet::new(),
             inline_call_sites: Vec::new(),
             dup_decl: None,
@@ -58,6 +58,7 @@ impl<'a> TreeLowerer<'a> {
             stmt_marks: Vec::new(),
             inherited_entry_save: false,
             entry_cursor: false,
+            self_in_place: false,
         }
     }
 
@@ -131,20 +132,21 @@ impl<'a> TreeLowerer<'a> {
             // the named locals after it.
             out = replace_outside_strings(&out, PIN_SLOT, "0");
         }
-        // Lowering emits no label and no branch by node number, so one in the body comes from
-        // raw code (the tree's or an inlined helper's), which may jump back into the in-place
-        // `self` prefix after a cursor move. (A body that does not parse counts as one.)
-        if self.entry_cursor_applied {
+        // An in-place rewrite (the `self` prefix, a `job_data` comparison without its copy)
+        // removes a node, an Expression and a local that main emits. Lowering emits no label and
+        // no branch by node number, so one in the body comes from raw code (the tree's or an
+        // inlined helper's): it may jump back into the prefix after a cursor move, and a number
+        // counts the removed node. A later read of global 34 could see a scratch pointer no
+        // Expression has set yet. Text may read a frame word the named locals after the removed
+        // local move into. (A body that does not parse counts as having raw control flow.)
+        if self.in_place_applied {
             let raw = raw_facts::raw_facts(&out, None);
-            // The prefix also removes the Expression that staged a `self` read, so a later read
-            // of global 34 could see a scratch pointer no Expression has set yet, and the staging
-            // local, so the named locals after it move down a word that text may read.
             if raw.defines_label
                 || raw.positional_target
                 || mir::may_read_global_34(&out)
                 || mir::reads_a_word(&facts.text_reads)
             {
-                self.env.entry_cursor_unsound.set(true);
+                self.env.in_place_unsound.set(true);
             }
         }
         Ok(mir::finish_body(out, &facts))
@@ -479,8 +481,8 @@ impl<'a> TreeLowerer<'a> {
 }
 
 /// Whether an `.air` identifier token of `body` is `name` (comments and strings are not tokens,
-/// and neither is a part of a qualified constant's name such as `name.tuning`: a local has no
-/// fields). A body that does not lex counts as naming it.
+/// and neither is a part of a qualified constant's name such as `name.tuning`, since a local has
+/// no fields, nor the tree a `call name` runs). A body that does not lex counts as naming it.
 fn names_token(body: &str, name: &str) -> bool {
     use crate::lexer::TokenKind as T;
     crate::lexer::tokenize(body).map_or(true, |tokens| {
@@ -488,10 +490,16 @@ fn names_token(body: &str, name: &str) -> bool {
             i.and_then(|i| tokens.get(i))
                 .is_some_and(|t| matches!(t.kind, T::Dot))
         };
+        let after_call = |i: usize| {
+            i.checked_sub(1)
+                .and_then(|i| tokens.get(i))
+                .is_some_and(|t| matches!(&t.kind, T::Ident(k) if k == "call"))
+        };
         tokens.iter().enumerate().any(|(i, t)| {
             matches!(&t.kind, T::Ident(n) if n == name)
                 && !dot(i.checked_sub(1))
                 && !dot(Some(i + 1))
+                && !after_call(i)
         })
     })
 }

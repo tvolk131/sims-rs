@@ -301,12 +301,14 @@ struct ObjectEnv<'a> {
     /// ([`mir::text_reads`](mod@crate::v2::mir)): every tree is finished with the object's final
     /// fact (`lower_object` lowers again when a later tree's inline dialog literal adds to it).
     text_reads: mir::TableLocals,
-    /// No tree gets the in-place `self` prefix (`lower_tree_body`): set when lowering the object
-    /// again after a tree that had one emitted raw control flow that may jump back into it.
-    entry_cursor_off: bool,
-    /// A tree had the in-place `self` prefix and emitted a raw label or a branch to a node by
-    /// number, so the object must be lowered again with [`Self::entry_cursor_off`].
-    entry_cursor_unsound: std::cell::Cell<bool>,
+    /// No tree gets an in-place rewrite (the `self` prefix of `lower_tree_body`, or a `job_data`
+    /// comparison without its copy): set when lowering the object again after a tree that used
+    /// one turned out to be unsafe for it (`TreeLowerer::finish`).
+    in_place_off: bool,
+    /// A tree used an in-place rewrite and its `.air` has a raw label or a branch to a node by
+    /// number, may read global 34, or has text that may read a frame word: the object must be
+    /// lowered again with [`Self::in_place_off`].
+    in_place_unsound: std::cell::Cell<bool>,
     local_fns: BTreeMap<String, (String, FnDecl)>,
     /// Object/template-local enums by short name -> canonical key.
     local_enums: BTreeMap<String, String>,
@@ -663,9 +665,9 @@ struct TreeLowerer<'a> {
     local_origins: BTreeMap<String, String>,
     /// The innermost statement being lowered (the origin of the locals it declares).
     stmt_span: Option<Span>,
-    /// The tree's in-place `self` prefix applied ([`Self::entry_cursor`] in a tree that moves
-    /// the cursor), which `finish` checks against the emitted raw control flow.
-    entry_cursor_applied: bool,
+    /// The tree used an in-place rewrite (the `self` prefix in a tree that moves the cursor, or a
+    /// `job_data` comparison without its copy), which `finish` checks.
+    in_place_applied: bool,
     /// Declarations lowered so far, by lowering instance (the inline-helper instances and the
     /// defer instance around them) and source span. Lowering one source declaration twice in
     /// the same instance means it was copied (a const binding's region), and each copy has its
@@ -699,8 +701,12 @@ struct TreeLowerer<'a> {
     inherited_entry_save: bool,
     /// The statement being lowered is one of the tree's leading top-level statements, none of
     /// which may move the cursor (see `lower_tree_body`): `stack_obj` still holds the entry
-    /// object, so a Sim tree's `self` reads and writes it in place.
+    /// object, so a Sim tree may select `self` in place.
     entry_cursor: bool,
+    /// The `self` being lowered is one the prefix may read in place
+    /// ([`Self::self_stack_target`]): a primitive's target, or a cell compared with a constant.
+    /// Every other `self` read is staged as main stages it, so no operand changes order.
+    self_in_place: bool,
 }
 
 struct FindBestObjectPlan {

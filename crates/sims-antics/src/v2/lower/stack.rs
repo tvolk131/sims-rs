@@ -63,7 +63,7 @@ impl<'a> TreeLowerer<'a> {
     /// Before the first statement that may move it, the cursor is that object.
     pub(super) fn self_stack_target(&self) -> &'static str {
         if self.explicit_stack_obj
-            && !self.entry_cursor
+            && !(self.entry_cursor && self.self_in_place)
             && matches!(self.tree_ctx, TreeContext::SimOnObject { .. })
         {
             "__self_obj"
@@ -100,7 +100,9 @@ impl<'a> TreeLowerer<'a> {
     /// Emits a statement whose target selector is the entry object (`self`) rather than the
     /// current cursor. In a Sim tree the primitive can only select it through `stack_obj`.
     pub(super) fn emit_on_self(&mut self, prim: String) {
+        let in_place = std::mem::replace(&mut self.self_in_place, true);
         let target = self.self_stack_target();
+        self.self_in_place = in_place;
         let saved = if target != "stack_obj" {
             let saved = self.save_stack_obj_for_move();
             self.stack_op(mir::StackObjOp::Set(target));

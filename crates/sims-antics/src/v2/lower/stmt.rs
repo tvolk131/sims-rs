@@ -20,13 +20,13 @@ impl<'a> TreeLowerer<'a> {
     /// Source order is control order only when no raw block branches by label or node number:
     /// such a branch from after a move may jump back before it. `finish` checks the tree's
     /// emitted `.air` for one when the prefix applied, and the object is then lowered again with
-    /// no prefix in any tree (`ObjectEnv::entry_cursor_off`).
+    /// no prefix in any tree (`ObjectEnv::in_place_off`).
     pub(super) fn lower_tree_body(&mut self, stmts: &[V2Stmt]) -> Result<()> {
         let sim = match &self.tree_ctx {
             TreeContext::SimOnObject { sim_name } => Some(sim_name.clone()),
             TreeContext::ObjectSelf => None,
         };
-        let mut prefix = sim.is_some() && !self.env.entry_cursor_off;
+        let mut prefix = sim.is_some() && !self.env.in_place_off;
         for stmt in stmts {
             prefix = prefix
                 && !stmts_may_clobber_stack_obj(
@@ -38,7 +38,7 @@ impl<'a> TreeLowerer<'a> {
                     0,
                 );
             self.entry_cursor = prefix;
-            self.entry_cursor_applied |= prefix && self.explicit_stack_obj;
+            self.in_place_applied |= prefix && self.explicit_stack_obj;
             let lowered = self.lower_stmt(stmt);
             self.entry_cursor = false;
             lowered?;

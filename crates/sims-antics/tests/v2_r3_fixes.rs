@@ -367,6 +367,37 @@ fn self_reads_in_place_before_the_first_cursor_move() {
     assert!(b.contains("stack_obj := __self_obj;"), "{b}");
 }
 
+/// Only a primitive's `self` target and a `self` cell compared with a constant are in place:
+/// a write, a read into an argument and a constant-folded flag test are staged as on main.
+#[test]
+fn the_in_place_prefix_covers_only_targets_and_constant_comparisons() {
+    let src = obj(
+        "Plain",
+        r#"    tree a (sim: Sim) {
+        stop_all_sounds(target: self);
+        if self.value == 1 {
+            temp[4] = 1;
+        }
+        self.value += 1;
+        set_to_next(all, dest: stack_obj);
+    }"#,
+    );
+    let air = expand("prefix_sites.antics", &src);
+    let a = tree(&air, "a");
+    let cmp = a
+        .find("if stack.attr[0] == 1")
+        .expect("in-place comparison");
+    assert!(
+        !a[..cmp].contains("stack_obj :="),
+        "the target is selected in place:\n{a}"
+    );
+    let write = a.find("stack.attr[0] +=").expect("the self write");
+    assert!(
+        a[cmp..write].contains("stack_obj := __self_obj;"),
+        "the write switches as on main:\n{a}"
+    );
+}
+
 /// `push_interaction(object: h)` with `h` an `@slot(N)` handle reads the object from word N.
 #[test]
 fn push_interaction_reads_a_slot_handle_in_place() {
@@ -434,7 +465,9 @@ fn a_raw_label_disables_in_place_self() {
         "Plain",
         r#"    tree a (sim: Sim) {
         raw { @again: temp[3] := 1; }
-        self.value += 1;
+        if self.value == 1 {
+            temp[4] = 1;
+        }
         if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
             return false;
         }
@@ -443,10 +476,9 @@ fn a_raw_label_disables_in_place_self() {
     );
     let air = expand("raw_back_edge.antics", &src);
     let a = tree(&air, "a");
-    let write = a.find("stack.attr[0]").expect("the self write");
     assert!(
-        a[..write].contains("stack_obj :="),
-        "the write switches to the entry object first:\n{a}"
+        !a.contains("stack.attr[0] == 1"),
+        "the self read is staged:\n{a}"
     );
 }
 
@@ -509,7 +541,9 @@ fn a_positional_raw_branch_disables_in_place_self() {
     let src = obj(
         "Plain",
         r#"    tree a (sim: Sim) {
-        self.value += 1;
+        if self.value == 1 {
+            temp[4] = 1;
+        }
         if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
             return false;
         }
@@ -518,10 +552,9 @@ fn a_positional_raw_branch_disables_in_place_self() {
     );
     let air = expand("raw_positional.antics", &src);
     let a = tree(&air, "a");
-    let write = a.find("stack.attr[0]").expect("the self write");
     assert!(
-        a[..write].contains("stack_obj :="),
-        "the write switches to the entry object first:\n{a}"
+        !a.contains("stack.attr[0] == 1"),
+        "the self read is staged:\n{a}"
     );
 }
 
@@ -533,7 +566,9 @@ fn a_padded_raw_search_ends_the_in_place_prefix() {
         "Plain",
         r#"    tree a (sim: Sim) {
         raw { set_to_next(all) pad 0xA5; }
-        self.value += 1;
+        if self.value == 1 {
+            temp[4] = 1;
+        }
         if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
             return false;
         }
@@ -541,10 +576,9 @@ fn a_padded_raw_search_ends_the_in_place_prefix() {
     );
     let air = expand("raw_padded_search.antics", &src);
     let a = tree(&air, "a");
-    let write = a.find("stack.attr[0]").expect("the self write");
     assert!(
-        a[..write].contains("stack_obj :="),
-        "the write switches to the entry object first:\n{a}"
+        !a.contains("stack.attr[0] == 1"),
+        "the self read is staged:\n{a}"
     );
 }
 
@@ -597,7 +631,9 @@ fn a_helper_raw_label_disables_in_place_self() {
     }
     tree a (sim: Sim) {
         checkpoint();
-        self.value += 1;
+        if self.value == 1 {
+            temp[4] = 1;
+        }
         if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
             return false;
         }
@@ -606,10 +642,9 @@ fn a_helper_raw_label_disables_in_place_self() {
     );
     let air = expand("raw_helper_label.antics", &src);
     let a = tree(&air, "a");
-    let write = a.find("stack.attr[0]").expect("the self write");
     assert!(
-        a[..write].contains("stack_obj :="),
-        "the write switches to the entry object first:\n{a}"
+        !a.contains("stack.attr[0] == 1"),
+        "the self read is staged:\n{a}"
     );
 }
 
@@ -686,7 +721,9 @@ fn same_spelled_out_operand_locals_of_different_helpers_do_not_share() {
 #[test]
 fn raw_labels_from_defaults_and_statement_named_helpers_disable_in_place_self() {
     let tail = r#"
-        self.value += 1;
+        if self.value == 1 {
+            temp[4] = 1;
+        }
         if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
             return false;
         }
@@ -716,10 +753,9 @@ fn raw_labels_from_defaults_and_statement_named_helpers_disable_in_place_self() 
     ] {
         let air = expand(name, &obj("Plain", &members));
         let a = tree(&air, "a");
-        let write = a.find("stack.attr[0]").expect("the self write");
         assert!(
-            a[..write].contains("stack_obj :="),
-            "{name}: the write switches to the entry object first:\n{a}"
+            !a.contains("stack.attr[0] == 1"),
+            "{name}: the self read is staged:\n{a}"
         );
     }
 }
@@ -1042,4 +1078,44 @@ fn a_raw_layout_tree_that_may_read_global_34_keeps_its_entry_save() {
     );
     let air = expand("raw_global34.antics", &src);
     assert!(tree(&air, "a").contains(SAVE), "{air}");
+}
+
+/// Dropping a `job_data` comparison's copy removes a node, so a tree with a raw branch to a node
+/// by number keeps the copy: the number would count the removed node.
+#[test]
+fn a_positional_raw_branch_keeps_the_job_data_copy() {
+    let src = r#"object "Round Three" {
+    guid: 0x7F40_0900;
+    @frame(locals: 1) tree a {
+        raw { op 2 (0, 0, 0, 0, 0, 2, 7, 7) -> true: 6, false: 6; }
+        if job_data(1, 1, 0) == 1 {
+            temp[3] = 21;
+        }
+        raw { if 1 == 1 { return false; } }
+        temp[4] = 10;
+        return true;
+    }
+}
+"#;
+    let air = expand("job_positional.antics", src);
+    let a = tree(&air, "a");
+    assert!(!a.contains("if scope(33, 0) == 1"), "the copy stays:\n{a}");
+}
+
+/// A raw `call` names a tree, not the entry object, even when the tree is spelled like it.
+#[test]
+fn a_raw_call_to_a_tree_named_like_the_entry_object_is_not_a_read() {
+    let src = r#"object "Round Three" {
+    guid: 0x7F40_0900;
+    @context(inherit) tree __self_obj {
+        return true;
+    }
+    @context(inherit) tree a {
+        raw { call __self_obj; }
+        return true;
+    }
+}
+"#;
+    let air = expand("raw_call_named.antics", src);
+    assert!(!tree(&air, "a").contains("= stack_obj"), "{air}");
 }

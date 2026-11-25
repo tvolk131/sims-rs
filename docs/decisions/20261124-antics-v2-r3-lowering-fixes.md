@@ -128,8 +128,8 @@ The two passes are compared after canonical renaming (`canonical_locals`): `let`
 declaration order, so generated names no longer matter.
 
 - The Sim pass declares its implicit entry object (`__self_obj`) when the body reads it, as the
-  object pass declares `__saved_stack_obj`. A read is an `.air` token naming it, so a comment does
-  not count. A raw block may read `__self_obj` or `__saved_stack_obj` but may not declare a local,
+  object pass declares `__saved_stack_obj`. A read is an `.air` token naming it, so a comment, a
+  field after a dot and the tree a raw `call` names do not count. A raw block may read `__self_obj` or `__saved_stack_obj` but may not declare a local,
   constant or label of either name (`check_raw_reserved_names`). A source constant named
   `__self_obj` is a constant to the raw blocks that read it, not the entry object, and so is a
   qualified constant such as `__self_obj.tuning`, which a raw block may declare.
@@ -159,14 +159,19 @@ declaration order, so generated names no longer matter.
 - **`self` before the first cursor move (`lower/stmt.rs` `lower_tree_body`).** In a Sim tree, the
   leading top-level statements before the first one that may move the cursor run with `stack_obj`
   still the entry object (`stmts_may_clobber_stack_obj`, which looks through called helpers). There
-  `self` reads and writes the stack object in place, with no switch and no staging local.
+  two `self` sites use the stack object in place, with no switch and no staging local: a
+  primitive's `self` target (`emit_on_self`), and a `self` cell compared with a compile-time
+  constant (`self.<field>`, `self.attr[k]`, `self.data[k]`). Every other `self` read and every
+  write is staged as on main. Both sites are marked by `self_in_place` while they lower.
   - Source order is control order only when no raw code defines a label or branches to a node by
     number. Otherwise a branch from after a move may jump back before it. Lowering itself emits
     neither, so the check reads the tree's finished `.air` (`raw_facts`). That covers raw code from
     every route: the tree's own blocks, helpers it calls, parameter defaults, and helpers named like
     statements. When a tree that used the prefix has such code, the object is lowered again with no
-    prefix in any tree (`ObjectEnv::entry_cursor_off`), as for the text fact.
-  - The prefix also drops the Expression that staged a `self` read and its local. So the same
+    prefix in any tree (`ObjectEnv::in_place_off`), as for the text fact.
+  - The prefix also drops the Expression that staged a `self` read and its local. The `job_data`
+    comparison below drops a copy the same way, so it is an in-place rewrite too: it sets the same
+    flag (`in_place_applied`) and is off under `in_place_off`. So the same
     fallback applies when the finished `.air` may read global 34 (section 1), whose value depends
     on the scratch pointer that Expression set. It also applies when the tree's text may read a
     frame word, because the named locals after the dropped local move down a word.
@@ -196,6 +201,9 @@ declaration order, so generated names no longer matter.
   - The VM resolves the right operand first. So an operand that can fault, such as a temp or an
     attribute, would fault where the copy faulted on the career lookup.
   - Any other right side is still copied to a local.
+  - Dropping the copy drops an Expression and a local, so the tree is checked after lowering like
+    the `self` prefix (section 5), and the object is lowered again with the copy when the check
+    fails.
 
 ## Verification
 
