@@ -647,6 +647,7 @@ fn collect_out_written(nodes: &[Stmt], locals: &BTreeSet<String>, out: &mut BTre
 #[cfg(test)]
 mod tests {
     use super::{drop_unread_entry_save, optimize_tree_body, parse_body, pin_in_place};
+    use std::collections::BTreeMap;
 
     #[test]
     fn dead_stores_unread_self_obj_and_coalescing() {
@@ -742,7 +743,11 @@ mod tests {
             "local[0]",
         ] {
             let body = format!("    let __a_1 = {operand};\n    return true;\n");
-            assert_eq!(optimize_tree_body(&body, true), body, "{operand}");
+            assert_eq!(
+                optimize_tree_body(&body, true, &BTreeMap::new()),
+                body,
+                "{operand}"
+            );
         }
         let body = "    let __a_1 = my.id;\n    let __b_2 = 5;\n    return true;\n";
         assert_eq!(
@@ -762,7 +767,11 @@ mod tests {
             "/* note */ my.attr[1] := 0;",
         ] {
             let body = format!("{dead}    {line}\n    return true;\n");
-            assert_eq!(optimize_tree_body(&body, true), body, "{line}");
+            assert_eq!(
+                optimize_tree_body(&body, true, &BTreeMap::new()),
+                body,
+                "{line}"
+            );
         }
         // A named `op:` argument and the operand-free builtin ops are not raw local references.
         for line in [
@@ -771,7 +780,11 @@ mod tests {
             "my.attr[1] := scope(12, 2);",
         ] {
             let body = format!("{dead}    {line}\n    return true;\n");
-            assert_ne!(optimize_tree_body(&body, true), body, "{line}");
+            assert_ne!(
+                optimize_tree_body(&body, true, &BTreeMap::new()),
+                body,
+                "{line}"
+            );
         }
     }
 
@@ -856,7 +869,7 @@ mod tests {
             "    while my.attr[0] < 3 {\n        my.attr[0] += 1;\n    }\n    return true;\n",
         ] {
             let body = format!("    let __o_1 = my.id;\n    stack_obj := __o_1;\n{tail}");
-            let out = optimize_tree_body(&body, true);
+            let out = optimize_tree_body(&body, true, &BTreeMap::new());
             assert!(out.starts_with("    stack_obj := my.id;\n"), "{out}");
         }
     }
