@@ -63,6 +63,7 @@ fn complete_collection_in_memory_chunk_roundtrip_parity() {
         return;
     }
 
+    let _install_sweep = crate::common::install_sweep_lock();
     let install = Install::detect(&PathBuf::from(&install_root))
         .expect("SIMS_INSTALL did not resolve to a valid Sims installation");
     let index = Index::build(&install).expect("failed to index SIMS_INSTALL");
