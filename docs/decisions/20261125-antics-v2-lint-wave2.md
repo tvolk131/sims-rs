@@ -24,11 +24,13 @@ Two more rules were asked for:
 
 `set_to_next` joins the builtins whose arguments write a local (`random_into`, `animate`, `relationship`). Its `dest:` argument is the only one that is both read and written.
 
-- **`uninitialized_local_read`** sees the read at the call, then the write. A `let c: ObjectId;` stepped before any assignment is reported at `dest: c`. The VM starts from cursor 0 there, and the fix is `= 0`. A read of `c` in another argument of the same call is reported too.
+- **`uninitialized_local_read`** sees the read at the call, then the write. A `let c: ObjectId;` stepped before any assignment is reported at `dest: c`. The VM starts from cursor 0 there, and the fix is `let c: ObjectId = 0;`: the help keeps the declared type. A read of `c` in another argument of the same call is reported too.
+- **`defer` bodies** run when the tree leaves, after the statements that follow them, so the read-before-assign scan skips them.
 - **`unused_decl`** counts `dest: x` as a read.
   - It now also tells pure writes apart: a local that only `random_into(x, ..)`, `animate(.., local: x)` or `relationship(.., value: x)` writes, and nothing reads, is unused.
   - Before, any mention counted as a read.
-  - A write is only taken as a write where the lint knows it is one. A user function or tree named like the builtin (`fn random_into(..)`, `fn animate(..)`) takes the call, so its arguments are reads. The names a file can call that way are its own functions and trees, the names it imports (by alias), and every template's members. A glob import of a non-`std` module may bring in any name, so there every builtin counts as taken. Another file's private methods do not count. `relationship` writes `value:` only without flag 4: with flags that are not a literal (a `const` name), the local counts as read.
+  - A write is only taken as a write where the lint knows it is one. A user function or tree named like the builtin (`fn random_into(..)`, `fn animate(..)`) takes the call, so its arguments are reads. The names a file can call that way are its own functions and trees, the names it imports (by alias), and every template's members. A glob import of a non-`std` module may bring in any name, and so may an object that extends a template the linted files do not declare. In both cases every builtin counts as taken. Another file's private methods do not count.
+  - That wide set only ever silences findings. `uninitialized_local_read` reports more for a user call, so it uses the narrow set: the file's own functions and trees, and the names it imports by name. `relationship` writes `value:` only without flag 4: with flags that are not a literal (a `const` name), the local counts as read.
   - `animate(.., local: x) |e| { .. }` as a statement writes `x` the same way, so a local only that writes is unused. A read of the event binding `e` in the handler reads the same frame word, so it counts as a read of `x`.
   - No open-pack or corpus file changes from this.
 - **`param[N]` and `temp[N]`** destinations are not locals. They get no `unused_decl` or `uninitialized_local_read` finding, and the step marks them written, like an assignment.
@@ -146,6 +148,13 @@ It reports only the first unreachable statement of a block, and notes which stat
   - a user tree named `animate`;
   - an event-binding read;
   - hex operands.
+
+- **Review round 3** (the last) found five more, all fixed with tests:
+  - templates outside the linted files;
+  - a glob import turning a builtin write into a reported read;
+  - an escaped label matching another tree's frame (labels are now decoded);
+  - `defer` bodies scanned in place;
+  - the initialization help dropping the declared type.
 
   Two false negatives stay:
   - `relationship` with a `const` that is 4 (flag 4 reads `value:`) gets no `uninitialized_local_read`. A non-literal flag is still taken as a write-only call there.

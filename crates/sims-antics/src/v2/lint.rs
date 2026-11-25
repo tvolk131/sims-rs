@@ -318,6 +318,7 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             lines: input.source.lines().collect(),
             symbols: &symbols,
             callables: file_callables(ast, &symbols),
+            sure_callables: file_sure_callables(ast),
             enums: file_enums(input, ast),
             states: file_states(ast),
             frames,
@@ -1477,6 +1478,9 @@ struct FileLinter<'a> {
     /// The bare names a call in this file may resolve to a user function or tree by (see
     /// [`file_callables`]); `None` when a glob import may bring in any name.
     callables: Option<BTreeSet<String>>,
+    /// The bare names a call in this file surely resolves to a user function or tree by:
+    /// the file's own functions and trees, and the names it imports by name.
+    sure_callables: BTreeSet<String>,
     /// Enums this file can name (see `file_enums`).
     enums: BTreeMap<String, Option<Vec<String>>>,
     /// The file's object states by name, with their type (`None` when two disagree).
@@ -1576,8 +1580,16 @@ struct TreeCx {
 /// takes the call over a builtin of the same name: the file's own functions and trees, the
 /// names it imports (by alias when it has one), and every template's members (an object may
 /// extend a template of another file). `None` when a glob import other than `std::*` may bring
-/// in any name. Another file's private methods are not visible here.
+/// in any name, or an object extends a template the linted files do not declare (its members
+/// are unknown). Another file's private methods are not visible here.
 fn file_callables(file: &V2File, symbols: &Symbols) -> Option<BTreeSet<String>> {
+    let unknown_template = file.items.iter().any(|item| {
+        matches!(item, V2Item::Object(o)
+            if o.from_template.as_ref().is_some_and(|(t, _)| !symbols.template_names.contains(t)))
+    });
+    if unknown_template {
+        return None;
+    }
     let mut out = symbols.template_fns.clone();
     for u in &file.uses {
         for item in &u.items {
@@ -1614,6 +1626,41 @@ fn file_callables(file: &V2File, symbols: &Symbols) -> Option<BTreeSet<String>> 
         }
     }
     Some(out)
+}
+
+/// The bare names a call in `file` surely resolves to a user function or tree by: its own
+/// functions and trees, and the names it imports by name (by alias when it has one).
+fn file_sure_callables(file: &V2File) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = file
+        .uses
+        .iter()
+        .flat_map(|u| &u.items)
+        .filter(|item| item.name != "*")
+        .map(|item| item.alias.clone().unwrap_or_else(|| item.name.clone()))
+        .collect();
+    for item in &file.items {
+        let members = match item {
+            V2Item::Fn(f) => {
+                out.insert(f.name.clone());
+                continue;
+            }
+            V2Item::Object(o) => &o.members,
+            V2Item::Template(t) => &t.members,
+            _ => continue,
+        };
+        for m in members {
+            match m {
+                ObjectMember::Fn(f) => {
+                    out.insert(f.name.clone());
+                }
+                ObjectMember::Tree(t) => {
+                    out.insert(t.ident.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 /// A file's object and template states by name, with their type (`None` when two
@@ -2073,6 +2120,13 @@ impl FileLinter<'_> {
         self.callables
             .as_ref()
             .is_none_or(|names| names.contains(name))
+    }
+
+    /// Whether a bare call to `name` in this file surely resolves to a user function or
+    /// tree. A rule that reports more when a call is a user's (a read of an unassigned
+    /// local) asks this, not [`Self::user_fn`].
+    fn sure_user_fn(&self, name: &str) -> bool {
+        self.sure_callables.contains(name)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4140,9 +4194,9 @@ impl FileLinter<'_> {
     fn unused_let(&mut self, list: &[V2Stmt], i: usize) {
         let (span, name, uninit) = match &list[i] {
             V2Stmt::Let { span, name, .. } | V2Stmt::LetSome { span, name, .. } => {
-                (*span, name, false)
+                (*span, name, None)
             }
-            V2Stmt::LetUninit { span, name, .. } => (*span, name, true),
+            V2Stmt::LetUninit { span, name, ty, .. } => (*span, name, Some(ty)),
             _ => return,
         };
         // `#[slot(N)] let`: the frame word is pinned so that code addressing it by number
@@ -4230,12 +4284,23 @@ impl FileLinter<'_> {
         if !read {
             return;
         }
-        if uninit && let Some(at) = first_unassigned_read(rest, name, &|f| self.user_fn(f)) {
+        if let Some(ty) = uninit
+            && let Some(at) = first_unassigned_read(rest, name, &|f| self.sure_user_fn(f))
+        {
+            // The initialized `let` keeps the declared type (`let c: ObjectId = 0;`).
+            let init = match ty {
+                V2Type::I16 => format!(": `let {name} = 0;`"),
+                V2Type::Bool => format!(": `let {name}: bool = false;`"),
+                V2Type::ObjectId | V2Type::Guid => {
+                    format!(": `let {name}: {} = 0;`", ty.display_name())
+                }
+                _ => " where it is declared".to_owned(),
+            };
             self.emit(
                 UNINITIALIZED_LOCAL_READ,
                 at,
                 format!("`{name}` is read before anything assigns it"),
-                Some(format!("assign it before this read, or initialize it: `let {name} = 0;` (one more node)")),
+                Some(format!("assign it before this read, or initialize it{init} (one more node)")),
                 None,
                 Some("the VM zeroes a tree's locals on entry, so this reads 0; say so with `= 0` if that is meant".to_owned()),
             );
@@ -4447,6 +4512,9 @@ fn first_unassigned_read(list: &[V2Stmt], name: &str, user: &dyn Fn(&str) -> boo
                     out.push(Event::Write);
                 }
                 V2Stmt::LetUninit { name: n, .. } if n == name => out.push(Event::Write),
+                // A `defer` body runs when the tree leaves, after everything that follows it
+                // here: its reads are not ordered against them, so it is not scanned.
+                V2Stmt::Defer { .. } => {}
                 // `relationship` writes its `value:` local only when it returns true (a
                 // missing row returns false first), and a call statement goes on either
                 // way: no write. As `relationship(..)?` or a test it is one.
@@ -5267,7 +5335,13 @@ fn parse_air_frames(air: &str) -> Vec<AirFrame> {
                     .parse()
                     .ok()
             });
-        Some((id, label.get(..end)?.to_owned(), args))
+        // The label as the source wrote it: `\x` is `x`.
+        let mut decoded = String::new();
+        let mut chars = label.get(..end)?.chars();
+        while let Some(c) = chars.next() {
+            decoded.push(if c == '\\' { chars.next()? } else { c });
+        }
+        Some((id, decoded, args))
     }
     fn frame(id: u16, label: String, args: Option<usize>, body: &str) -> Option<AirFrame> {
         let code = strip_air_comments(body);

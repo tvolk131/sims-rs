@@ -885,3 +885,55 @@ fn an_animation_event_read_reads_its_local() {
     );
     none(&source, "unused_decl");
 }
+
+// --- review round 3 ------------------------------------------------------------------------
+
+#[test]
+fn a_template_outside_the_linted_files_may_take_any_builtin_name() {
+    // `Base` is not among the linted files: its members are unknown.
+    let source = "use crate::shared::base::Base;\nobject \"Probe\" from Base {\n    guid: 0x7E00_1003;\n    init {\n        raw { remove_object(1); }\n        let x = 12;\n        animate(local: x);\n    }\n}\n";
+    none(source, "manual_raw_has_builtin");
+    none(source, "unused_decl");
+}
+
+#[test]
+fn a_glob_import_does_not_turn_a_builtin_write_into_a_read() {
+    let source = "use crate::shared::base::*;\nobject \"Glob Probe\" {\n    guid: 0x7E00_1104;\n    init {\n        let x: i16;\n        random_into(x, 10);\n        temp[1] = x;\n    }\n}\n";
+    none(source, "uninitialized_local_read");
+}
+
+#[test]
+fn escaped_labels_find_their_own_frame() {
+    let source = obj(
+        "    #[bhav(label = \"Before \\\"X\\\"\", args = 2)] fn first() {\n        temp[0] = 42;\n    }\n    \
+         #[bhav(label = \"Before \\\\\\\"X\\\\\\\"\")] fn second() {\n        self.level = 0;\n        self.mode = Mode::Off;\n        raw { set_to_next(person, dest: param[0]); }\n    }",
+    );
+    none(&source, "manual_raw_has_builtin");
+    // The first tree's own frame does have two arguments.
+    let source = obj(
+        "    #[bhav(label = \"Before \\\"X\\\"\", args = 2)] fn first() {\n        self.level = 0;\n        self.mode = Mode::Off;\n        raw { set_to_next(person, dest: param[1]); }\n    }",
+    );
+    one(&source, "manual_raw_has_builtin");
+}
+
+#[test]
+fn a_defer_body_runs_after_the_assignments_that_follow_it() {
+    let source = tree(
+        "        let x: ObjectId;\n        defer { set_to_next(person, dest: x); }\n        x = 0;",
+    );
+    none(&source, "uninitialized_local_read");
+}
+
+#[test]
+fn the_initialization_help_keeps_the_declared_type() {
+    let source = tree(
+        "        let x: ObjectId;\n        set_to_next(person, dest: x);\n        self.level = x.room;",
+    );
+    let d = one(&source, "uninitialized_local_read");
+    assert_eq!(
+        d.help.as_deref(),
+        Some(
+            "assign it before this read, or initialize it: `let x: ObjectId = 0;` (one more node)"
+        )
+    );
+}
