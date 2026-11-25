@@ -777,8 +777,8 @@ fn a_tree_that_may_read_global_34_keeps_its_expressions() {
     let src = obj(
         "Plain",
         r#"    tree a (sim: Sim) {
-        if self.value == global[34] {
-            return true;
+        if self.value == 1 {
+            temp[2] = global[34];
         }
         set_to_next(all, dest: stack_obj);
         return false;
@@ -787,9 +787,16 @@ fn a_tree_that_may_read_global_34_keeps_its_expressions() {
     let air = expand("global34_self.antics", &src);
     let a = tree(&air, "a");
     assert!(
-        a.contains("let __pre_stack_obj"),
+        !a.contains("stack.attr[0] == 1"),
         "the self read is staged:\n{a}"
     );
+    // Another global leaves the comparison in place.
+    let air = expand(
+        "global5_self.antics",
+        &src.replace("global[34]", "global[5]"),
+    );
+    let a = tree(&air, "a");
+    assert!(a.contains("stack.attr[0] == 1"), "in place:\n{a}");
     let src = obj(
         "Plain",
         r#"    tree a (sim: Sim) {
@@ -967,4 +974,72 @@ fn a_qualified_raw_constant_is_not_the_entry_object() {
 "#;
     let air = expand("raw_qualified.antics", src);
     assert!(!tree(&air, "a").contains("= stack_obj"), "{air}");
+}
+
+/// An in-place `self` read is staged and ordered as main stages the switched one: a loop
+/// header reads it on every iteration, and the operand left of it is read first.
+#[test]
+fn an_in_place_self_read_keeps_main_staging_order() {
+    let src = obj(
+        "Plain",
+        r#"    tree a (sim: Sim) {
+        while self.value < sim.person[3] {
+            self.value += 1;
+        }
+        if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
+            return false;
+        }
+    }
+    tree b (sim: Sim) {
+        if temp[8] == self.data[25] {
+            return false;
+        }
+        set_to_next(all, dest: stack_obj);
+    }
+    tree c (sim: Sim) {
+        if job_data(level: temp[8], career: self.data[25], field: 0) == 1 {
+            return false;
+        }
+        set_to_next(all, dest: stack_obj);
+    }"#,
+    );
+    let air = expand("self_order.antics", &src);
+    let a = tree(&air, "a");
+    let header = a
+        .find("while true")
+        .expect("the loop reads self in its body");
+    assert!(
+        !a[..header].contains("stack.attr[0]"),
+        "no read before the loop:\n{a}"
+    );
+    let b = tree(&air, "b");
+    let (temp, data) = (
+        b.find("temp[8]").unwrap(),
+        b.find("stack.data[25]").unwrap(),
+    );
+    assert!(temp < data, "temp[8] is read first:\n{b}");
+    let c = tree(&air, "c");
+    let (temp, data) = (
+        c.find("temp[8]").unwrap(),
+        c.find("stack.data[25]").unwrap(),
+    );
+    assert!(temp < data, "the level is read first:\n{c}");
+}
+
+/// The raw-layout path keeps the entry save of a tree that may read global 34.
+#[test]
+fn a_raw_layout_tree_that_may_read_global_34_keeps_its_entry_save() {
+    let src = obj(
+        "Plain",
+        r#"    tree a (sim: Sim) {
+        let n: i16;
+        raw { temp[2] := global[34]; }
+        set_to_next(all, dest: stack_obj);
+        random_into(n, Limits.draw)?;
+        temp[3] = n;
+    }
+    bcon 4097 "Limits" { draw = 6 }"#,
+    );
+    let air = expand("raw_global34.antics", &src);
+    assert!(tree(&air, "a").contains(SAVE), "{air}");
 }

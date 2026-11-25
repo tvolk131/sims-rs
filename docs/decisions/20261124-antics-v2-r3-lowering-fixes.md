@@ -80,8 +80,9 @@ may read global 34 (`may_read_global_34`) keeps every Expression main keeps:
   `scope(6, ..)` cell, or a raw `op` (its opcode a number or a constant);
 - a text tree takes `Unknown`, which is main's rule;
 - out-operands are not definitions there (section 5), so they make no store dead;
-- the optimizer does not drop its entry save (`drop_unread_entry_save_node`), which main does in
-  a tree that formats no text.
+- no pass drops its entry save: neither the optimizer (`drop_unread_entry_save_node`, which main
+  runs in a tree that formats no text) nor the final checks in `finish_body` (the raw-layout path
+  and the text path).
 
 The rule is a permission, not an obligation. As on main, dead-store elimination drops an unread
 save whose next node ignores the last result. It does this whatever the text reads, because the
@@ -169,6 +170,12 @@ declaration order, so generated names no longer matter.
     fallback applies when the finished `.air` may read global 34 (section 1), whose value depends
     on the scratch pointer that Expression set. It also applies when the tree's text may read a
     frame word, because the named locals after the dropped local move down a word.
+  - An in-place read is staged and ordered exactly as main stages the switched one. The purity
+    checks (which operands are staged and in what order, and whether a loop header is one node)
+    ask whether `self` switches after a move (`self_switches_after_move`), not where it reads now.
+    So the read stays inside a loop whose header reads it, and the operands main reads before it
+    stay first. The prefix saves only the switch and the staging local where the read is the last
+    operand read.
   - The VM resolves a comparison's right operand before its left. So a `self` read on the left of
     a comparison is staged first, as after a move, unless the right side is a compile-time
     constant (as for `job_data`). Otherwise a faulting right operand would fault before the `self`

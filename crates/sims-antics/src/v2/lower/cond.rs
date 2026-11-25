@@ -37,7 +37,7 @@ impl<'a> TreeLowerer<'a> {
             V2Expr::Field { base, .. } => match base.as_ref() {
                 // `stack_obj.<field>` is the stack object's own cell (no switch).
                 V2Expr::Ident(_, bname) => {
-                    (self.is_self_ident(bname) && self.self_stack_target() == "stack_obj")
+                    (self.is_self_ident(bname) && !self.self_switches_after_move())
                         || self.is_sim_ident(bname)
                         || self.is_bcon_table_ref(bname)
                         || bname == "stack_obj"
@@ -65,7 +65,7 @@ impl<'a> TreeLowerer<'a> {
                                 // In a Sim tree that moves the cursor, `self.f[i]` switches to
                                 // the entry object first, like the named fields above.
                                 V2Expr::Ident(_, rname) if (self.is_self_ident(rname)
-                                        && self.self_stack_target() == "stack_obj")
+                                        && !self.self_switches_after_move())
                                     || self.is_sim_ident(rname)
                                     || self.is_frame_me(rname)
                                     || rname == "stack_obj"

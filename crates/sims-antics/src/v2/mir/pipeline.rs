@@ -36,8 +36,12 @@ pub(crate) struct FrameFacts<'a> {
 pub(crate) fn finish_body(out: String, facts: &FrameFacts<'_>) -> String {
     let reads_text = reads_a_word(&facts.text_reads);
     let unmoved = |before: &str, after: &str| text_words_unmoved(before, after, facts);
+    // A tree that may read global 34 keeps its entry save, an Expression whose scratch-pointer
+    // write that read may depend on. (Keeping an unread save is always correct.)
+    let may_read_global_34 = may_read_global_34(&out);
     let out = if facts.keep_layout {
         if facts.has_self_obj_local
+            && !may_read_global_34
             && let Some(trimmed) = drop_unread_entry_save(&out, &unmoved)
         {
             trimmed
@@ -56,6 +60,7 @@ pub(crate) fn finish_body(out: String, facts: &FrameFacts<'_>) -> String {
         // changes hands.
         if facts.has_self_obj_local
             && reads_text
+            && !may_read_global_34
             && let Some(trimmed) = drop_unread_entry_save(&out, &unmoved)
         {
             trimmed

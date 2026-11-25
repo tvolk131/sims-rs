@@ -72,6 +72,15 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// Whether `self` is selected by a switch after the cursor moves (a Sim tree that moves it).
+    /// Purity decisions (which operands are staged, and in what order; a loop header's shape)
+    /// use this rather than [`Self::self_stack_target`]: an in-place `self` read before the
+    /// first move is staged and ordered exactly as main stages the switched one, so an in-place
+    /// read never moves ahead of, or out of a loop away from, the operands main reads around it.
+    pub(super) fn self_switches_after_move(&self) -> bool {
+        self.explicit_stack_obj && matches!(self.tree_ctx, TreeContext::SimOnObject { .. })
+    }
+
     pub(super) fn self_cell(&self, field: &str, ty: ValueType) -> LValue {
         if self.self_stack_target() == "__self_obj" {
             LValue::ForeignCell {
