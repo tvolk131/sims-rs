@@ -163,6 +163,58 @@ impl<'a> TreeLowerer<'a> {
         arg_span: Span,
         call_args: &[&V2Expr],
     ) -> Result<Binding> {
+        if !param.is_const {
+            return self.bind_helper_arg_value(
+                fn_mod,
+                is_local_fn,
+                fn_decl,
+                param,
+                arg_expr,
+                arg_span,
+                call_args,
+            );
+        }
+        if stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name) {
+            return Err(Error::at(
+                param.span,
+                format!("const parameter '{}' cannot be assigned or borrowed", param.name),
+            ));
+        }
+        let binding = self.bind_helper_arg_value(
+            fn_mod,
+            is_local_fn,
+            fn_decl,
+            param,
+            arg_expr,
+            arg_span,
+            call_args,
+        )?;
+        match binding {
+            Binding::ConstI16 { .. }
+            | Binding::ConstBool(_)
+            | Binding::ConstEnum { .. }
+            | Binding::ConstBitflag { .. } => Ok(binding),
+            _ => Err(Error::at(
+                arg_span,
+                format!(
+                    "const parameter '{}' of '{}' needs a compile-time constant argument",
+                    param.name, fn_decl.name
+                ),
+            )),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_helper_arg_value(
+        &mut self,
+        fn_mod: &str,
+        is_local_fn: bool,
+        fn_decl: &FnDecl,
+        param: &crate::v2::ast::FnParam,
+        arg_expr: &V2Expr,
+        arg_span: Span,
+        call_args: &[&V2Expr],
+    ) -> Result<Binding> {
         let read_only = !stmts_mutate_or_borrow_ident(&fn_decl.body, &param.name);
         // A caller local passed by value needs no `__arg_*` copy when nothing can change it
         // while the helper runs: the helper never mutates or borrows the parameter, and no

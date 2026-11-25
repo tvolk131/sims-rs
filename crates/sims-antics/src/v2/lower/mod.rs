@@ -621,6 +621,9 @@ struct TreeLowerer<'a> {
     value_return: Option<ValueReturnAbi>,
     /// The body being written.
     em: mir::Emitter,
+    /// Where each `temp[N]` range-loop step (`temp[N] += 1;` from `emit_continue_step`) was
+    /// written, with its text: the `#[temp]` counter check skips the loop's own steps.
+    temp_steps: Vec<(usize, String)>,
     next_id: usize,
     var_scopes: Vec<BTreeMap<String, Binding>>,
     cleanup_scopes: Vec<ScopeFrame>,

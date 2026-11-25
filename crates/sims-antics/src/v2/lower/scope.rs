@@ -137,7 +137,12 @@ impl<'a> TreeLowerer<'a> {
                 self.line("break;".to_owned());
                 self.em.dedent();
                 self.line("}".to_owned());
+                let at = self.em.mark();
                 self.line(format!("{var} {step} 1;"));
+                if var.starts_with("temp[") {
+                    let text = self.em.since(at).to_owned();
+                    self.temp_steps.push((at, text));
+                }
             }
         }
     }

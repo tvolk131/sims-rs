@@ -241,6 +241,9 @@ impl V2Type {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnParam {
     pub span: Span,
+    /// `const k: i16`: every call must pass a compile-time constant (the helper body is
+    /// specialized on it, e.g. by `const X = if k == 1 { .. } else { .. };`).
+    pub is_const: bool,
     pub name: String,
     pub ty: V2Type,
     pub default: Option<V2Expr>,
@@ -760,6 +763,9 @@ pub enum ForEachIter {
         end: V2Expr,
         inclusive: bool,
         rev: bool,
+        /// `#[temp(N)] for i in a..b`: the counter lives in `temp[N]` (shared with the trees the
+        /// body calls, as hand-written trees count) instead of a frame local.
+        temp: Option<u8>,
     },
     /// `lot.sims()`: every person on the lot (`set_to_next` person mode).
     LotSims,

@@ -24,6 +24,7 @@ impl<'a> TreeLowerer<'a> {
             used_saved_stack_obj: false,
             value_return: None,
             em: mir::Emitter::new(1),
+            temp_steps: Vec::new(),
             next_id: 0,
             var_scopes: vec![root_vars],
             cleanup_scopes: vec![ScopeFrame::block()],

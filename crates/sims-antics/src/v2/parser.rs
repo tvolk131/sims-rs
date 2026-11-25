@@ -695,6 +695,14 @@ impl Parser {
         let mut seen_names = BTreeSet::new();
         let mut seen_default = false;
         while !self.eat(&TokenKind::RParen) {
+            let const_span = self.span();
+            let is_const = self.eat_ident("const");
+            if is_const && !allow_defaults {
+                return Err(Error::at(
+                    const_span,
+                    "functional parameters cannot be 'const' (only inline 'fn' helpers specialize on constant arguments)",
+                ));
+            }
             let (name, span) = self.expect_binding_ident("parameter name")?;
             if !seen_names.insert(name.clone()) {
                 return Err(Error::at(
@@ -704,6 +712,14 @@ impl Parser {
             }
             self.expect(&TokenKind::Colon, "':'")?;
             let ty = self.parse_type()?;
+            if is_const && !matches!(ty, V2Type::I16 | V2Type::Bool | V2Type::Named(_)) {
+                return Err(Error::at(
+                    span,
+                    format!(
+                        "const parameter '{name}' must be i16, bool, or an enum or bitflags type"
+                    ),
+                ));
+            }
             let default = if self.eat(&TokenKind::Assign) {
                 if !allow_defaults {
                     return Err(Error::at(
@@ -732,6 +748,7 @@ impl Parser {
             };
             params.push(FnParam {
                 span,
+                is_const,
                 name,
                 ty,
                 default,
@@ -1612,7 +1629,24 @@ impl Parser {
         let mut wav_name = None;
         let mut explicit_id = None;
         if self.eat(&TokenKind::Assign) || self.eat(&TokenKind::Colon) {
-            if self.eat_ident("preset") {
+            if self.eat_ident("fwav") {
+                // `fwav(N[, wav: "name"])`: the FWAV with ID N (the default preset's samples).
+                self.expect(&TokenKind::LParen, "'('")?;
+                explicit_id = Some(self.expect_u16("FWAV sound id")?);
+                if self.eat(&TokenKind::Comma) && self.peek().kind != TokenKind::RParen {
+                    let (opt, ospan) = self.expect_ident("sound option ('wav')")?;
+                    if opt != "wav" && opt != "name" {
+                        return Err(Error::at(
+                            ospan,
+                            format!("unknown fwav option '{opt}' (expected 'wav')"),
+                        ));
+                    }
+                    self.expect(&TokenKind::Colon, "':'")?;
+                    wav_name = Some(self.expect_string("sound WAV name")?.0);
+                    self.eat(&TokenKind::Comma);
+                }
+                self.expect(&TokenKind::RParen, "')'")?;
+            } else if self.eat_ident("preset") {
                 self.expect(&TokenKind::LParen, "'('")?;
                 let (pname, pspan) = self.expect_string("sound preset name")?;
                 preset = parse_sound_preset(&pname, pspan)?;
@@ -2777,7 +2811,7 @@ impl Parser {
             ));
         }
         if self.peek().kind == TokenKind::HashBracket {
-            return self.parse_slot_let_stmt(span);
+            return self.parse_attr_stmt(span);
         }
         if let TokenKind::Ident(kw) = &self.peek().kind {
             match kw.as_str() {
@@ -2986,10 +3020,36 @@ impl Parser {
         })
     }
 
-    /// `#[slot(N)] let x ..;`: a `let` whose variable lives in frame word `local[N]`.
-    fn parse_slot_let_stmt(&mut self, span: Span) -> Result<V2Stmt> {
+    /// `#[slot(N)] let x ..;`: a `let` whose variable lives in frame word `local[N]`;
+    /// `#[temp(N)] for i in a..b { .. }`: a range loop counting in `temp[N]`.
+    fn parse_attr_stmt(&mut self, span: Span) -> Result<V2Stmt> {
         let attrs = self.parse_item_attrs()?;
-        attrs.only(&["slot"], "a statement")?;
+        attrs.only(&["slot", "temp"], "a statement")?;
+        if let Some((temp_span, t)) = attrs.temp {
+            if attrs.slot.is_some() {
+                return Err(Error::at(span, "'#[slot]' and '#[temp]' cannot be combined"));
+            }
+            if !matches!(&self.peek().kind, TokenKind::Ident(kw) if kw == "for") {
+                return Err(Error::at(
+                    self.span(),
+                    "'#[temp(N)]' must be followed by a range loop ('for i in a..b { .. }')",
+                ));
+            }
+            let for_span = self.span();
+            let mut stmt = self.parse_for_stmt(for_span)?;
+            let V2Stmt::ForEach {
+                iter: ForEachIter::Range { temp, .. },
+                ..
+            } = &mut stmt
+            else {
+                return Err(Error::at(
+                    temp_span,
+                    "'#[temp(N)]' applies to range loops ('for i in a..b'), not object iterators",
+                ));
+            };
+            *temp = Some(t);
+            return Ok(stmt);
+        }
         let Some((slot_span, n)) = attrs.slot else {
             return Err(Error::at(span, "expected '#[slot(N)] let ..'"));
         };
@@ -3214,6 +3274,7 @@ impl Parser {
                     end,
                     inclusive,
                     rev: true,
+                    temp: None,
                 }));
             }
             self.pos = saved_pos;
@@ -3246,6 +3307,7 @@ impl Parser {
             end,
             inclusive,
             rev: false,
+            temp: None,
         }))
     }
 

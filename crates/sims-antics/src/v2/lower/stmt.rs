@@ -535,9 +535,11 @@ impl<'a> TreeLowerer<'a> {
                     end,
                     inclusive,
                     rev,
+                    temp,
                 } = iter
                 {
-                    return self.lower_range_for(binding, start, end, *inclusive, *rev, body);
+                    return self
+                        .lower_range_for(binding, start, end, *inclusive, *rev, *temp, body);
                 }
                 if else_body.as_deref().is_some_and(stmts_exit_loop) {
                     return Err(Error::at(
@@ -1129,6 +1131,7 @@ impl<'a> TreeLowerer<'a> {
     /// edge) uses the edge-safe form `if a < b { i := first; while true { ...; if i == last {
     /// break; } i ±= 1; } }`, which never steps past the last value. Non-literal bounds are read
     /// once, start first; the loop variable is read-only.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn lower_range_for(
         &mut self,
         binding: &str,
@@ -1136,6 +1139,7 @@ impl<'a> TreeLowerer<'a> {
         end: &V2Expr,
         inclusive: bool,
         rev: bool,
+        temp: Option<u8>,
         body: &[V2Stmt],
     ) -> Result<()> {
         if self.stmts_write_ident(body, binding)? {
@@ -1170,7 +1174,18 @@ impl<'a> TreeLowerer<'a> {
         };
         let lo = snapshot(self, start)?;
         let hi = snapshot(self, end)?;
-        let iter_var = self.fresh(&format!("v_{binding}"));
+        // `#[temp(N)]`: the counter is `temp[N]` itself, set by a plain store.
+        let iter_var = match temp {
+            Some(t) => format!("temp[{t}]"),
+            None => self.fresh(&format!("v_{binding}")),
+        };
+        let set_iter = |c: &mut Self, value: &str| {
+            if temp.is_some() {
+                c.emit_store(&iter_var, ":=", value);
+            } else {
+                c.emit_let(&iter_var, value);
+            }
+        };
         let one_node = match (&lo, &hi, rev) {
             (_, _, false) if !inclusive => true,
             (_, Bound::Lit(h), false) => *h < i16::MAX,
@@ -1207,10 +1222,10 @@ impl<'a> TreeLowerer<'a> {
             let lo_adj = adjust(self, &lo, -1);
             let hi_adj = adjust(self, &hi, i16::from(inclusive));
             if rev {
-                self.emit_let(&iter_var, &hi_adj);
+                set_iter(self, &hi_adj);
                 self.line(format!("while {iter_var} dec_gt {lo_adj} {{"));
             } else {
-                self.emit_let(&iter_var, &lo_adj);
+                set_iter(self, &lo_adj);
                 self.line(format!("while {iter_var} inc_lt {hi_adj} {{"));
             }
         } else {
@@ -1235,7 +1250,7 @@ impl<'a> TreeLowerer<'a> {
             } else {
                 (lo_air, last_hi, "+=")
             };
-            self.emit_let(&iter_var, &first);
+            set_iter(self, &first);
             self.line("while true {".to_owned());
             edge_step = Some(ContinueStep::Range {
                 var: iter_var.clone(),
@@ -1254,14 +1269,33 @@ impl<'a> TreeLowerer<'a> {
             restore_stack_on_break: false,
             continue_step: edge_step.clone(),
         });
-        self.bind_var(
-            binding.to_owned(),
-            Binding::Local {
-                air_name: iter_var,
+        // A `#[temp]` counter is a read-only operand, not a frame local: a helper it is passed
+        // to gets its own copy.
+        let counter = if temp.is_some() {
+            Binding::Operand {
+                air: iter_var.clone(),
                 ty: ValueType::I16,
-            },
-        );
-        let res = self.lower_stmts(body);
+            }
+        } else {
+            Binding::Local {
+                air_name: iter_var.clone(),
+                ty: ValueType::I16,
+            }
+        };
+        self.bind_var(binding.to_owned(), counter);
+        let body_mark = self.em.mark();
+        let res = self.lower_stmts(body).and_then(|()| {
+            if temp.is_some() && air_writes_cell(&self.body_text_without_steps(body_mark, &iter_var), &iter_var) {
+                Err(Error::at(
+                    start.span(),
+                    format!(
+                        "the body of this '#[temp]' loop writes its counter '{iter_var}' (directly or through a nested '#[temp]' loop)"
+                    ),
+                ))
+            } else {
+                Ok(())
+            }
+        });
         let pop_res = self.pop_scope_and_run_cleanups();
         if let Some(step) = &edge_step {
             self.emit_continue_step(step);
@@ -2037,4 +2071,51 @@ impl<'a> TreeLowerer<'a> {
             self.emit_lvalue_assign(&lval, V2AssignOp::BitAnd, &inv)
         }
     }
+}
+
+impl TreeLowerer<'_> {
+    /// The text written since `mark`, without this `#[temp]` loop's own continue steps (each
+    /// still in place, unchanged: a step a trial lowering rewound over is not skipped).
+    fn body_text_without_steps(&self, mark: usize, counter: &str) -> String {
+        let text = self.em.text();
+        let mut steps: Vec<(usize, usize)> = self
+            .temp_steps
+            .iter()
+            .filter(|(at, step)| {
+                *at >= mark
+                    && text.get(*at..*at + step.len()) == Some(step.as_str())
+                    && step.trim_start().starts_with(&format!("{counter} "))
+            })
+            .map(|(at, step)| (*at, *at + step.len()))
+            .collect();
+        steps.sort_unstable();
+        let mut out = String::new();
+        let mut pos = mark;
+        for (start, end) in steps {
+            if start >= pos {
+                out.push_str(&text[pos..start]);
+                pos = end;
+            }
+        }
+        out.push_str(&text[pos..]);
+        out
+    }
+}
+
+/// Whether the `.air` text stores into `cell` (an assignment, compound assignment, or one of the
+/// in-place operators `inc_lt` / `dec_gt` / `flag_set` / `flag_clear` / `sqrt` with `cell` on the
+/// left). Calls and primitives that write temps as a side effect are not visible here.
+fn air_writes_cell(air: &str, cell: &str) -> bool {
+    const WRITES: &[&str] = &[
+        ":=", "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "inc_lt", "dec_gt",
+        "flag_set", "flag_clear", "sqrt",
+    ];
+    air.match_indices(cell).any(|(at, _)| {
+        let before_ok = air[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'));
+        let op = air[at + cell.len()..].split_whitespace().next().unwrap_or("");
+        before_ok && WRITES.contains(&op)
+    })
 }

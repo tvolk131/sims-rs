@@ -768,7 +768,7 @@ impl Model {
         }
 
         // Sounds: v2 can pin an FWAV's ID and event name when the name is a plain file
-        // name (`sound s = preset(.., wav: "name", id: N)`).
+        // name (`sound s = fwav(N, wav: "name")`).
         let original_sounds = fwav_sounds(iff);
         let mut sounds = BTreeMap::new();
         let mut sounds_skipped = BTreeMap::new();
@@ -3220,7 +3220,7 @@ impl Model {
         }
         for (id, sound) in &self.sounds {
             out.line(format!(
-                "sound {} = preset(\"ui_click\", wav: \"{}\", id: {id});",
+                "sound {} = fwav({id}, wav: \"{}\");",
                 sound.ident, sound.wav
             ));
         }

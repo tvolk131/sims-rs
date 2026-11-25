@@ -304,8 +304,8 @@ fn zero_local_loops_sounds_and_frame_kinds_round_trip() {
         "if p.kind == 0 {",
         "temp[1] += p.personality.playful;",
         "#[bhav(id = 4304, label = \"Kinded\", args = 0, locals = 0, format = 0x8002, revision = 0, kind = 3)]\n    fn kinded_4304() {",
-        "sound sound_0 = preset(\"ui_click\", wav: \"synth_chime\", id: 0);",
-        "sound sound_7 = preset(\"ui_click\", wav: \"synth_chime\", id: 7);",
+        "sound sound_0 = fwav(0, wav: \"synth_chime\");",
+        "sound sound_7 = fwav(7, wav: \"synth_chime\");",
         "play_sound(sound_0);",
         "play_sound(sound_7);",
         // In an interaction the default target is the object, `sim` the other one.

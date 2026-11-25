@@ -217,8 +217,8 @@ fn bcon_and_sound_identifiers_follow_resource_labels() {
         "temp[1] = Dial.e1;",
         "temp[2] = Dial.e2;",
         "temp[3] = Range.upper_band;",
-        "sound fable_ping = preset(\"ui_click\", wav: \"Fable-Ping\", id: 6);",
-        "sound fable_ping_8 = preset(\"ui_click\", wav: \"Fable_Ping\", id: 8);",
+        "sound fable_ping = fwav(6, wav: \"Fable-Ping\");",
+        "sound fable_ping_8 = fwav(8, wav: \"Fable_Ping\");",
         "play_sound(fable_ping);",
         "play_sound(fable_ping_8);",
     ] {
