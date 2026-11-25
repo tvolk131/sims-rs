@@ -1,0 +1,705 @@
+//! Rezoning, family import, credits and CAF voice previews.
+
+use super::*;
+
+impl NeighborhoodShell {
+    // =========================================================================
+    // Neighborhood Top-Bar Secondary Actions: Rezone, Import Family, Credits
+    // =========================================================================
+
+    pub(super) fn is_lot_rezonable(&self, lot_id: u16) -> bool {
+        destination_for_kind(self.kind).is_none()
+            && ((1..=10).contains(&lot_id) || (50..=80).contains(&lot_id))
+    }
+
+    pub(super) fn zoning_label(&self, zone: i32) -> &str {
+        if zone == 2 {
+            DialogStrings::get(&self.dialogs.zoning_types, 1, "Community")
+        } else {
+            DialogStrings::get(&self.dialogs.zoning_types, 0, "Residential")
+        }
+    }
+
+    pub(super) fn active_trip_blocking_rezone(
+        &self,
+        stored: &StoredNeighborhood,
+        house: u32,
+        saved_lot: Option<&[u8]>,
+    ) -> Option<String> {
+        let house_i32 = i32::try_from(house).unwrap_or(-1);
+        for fam in stored.families.values() {
+            let sec = fam.secondary_house();
+            if fam.house == house_i32 && sec != 0 {
+                return Some(format!(
+                    "Lot {house} has an active travel trip to lot {sec}; resume or abort the trip before rezoning."
+                ));
+            }
+            if sec == house_i32 && sec != 0 {
+                return Some(format!(
+                    "Lot {house} is the destination of an active travel trip from lot {}; resume or abort the trip before rezoning.",
+                    fam.house
+                ));
+            }
+        }
+        if saved_lot.is_some_and(|bytes| bytes.len() >= 4 && &bytes[0..4] == b"TRVL") {
+            return Some(format!(
+                "Lot {house} has an active travel trip in progress; resume or abort the trip before rezoning."
+            ));
+        }
+        None
+    }
+
+    pub(super) fn prompt_rezone_lot(&mut self, lot_id: u16) -> ShellOutcome {
+        let title = DialogStrings::get(&self.dialogs.rezone, 0, "Rezone").to_owned();
+        if !self.is_lot_rezonable(lot_id) {
+            self.open_dialog(
+                ShellDialogKind::Notice,
+                Message::notice(
+                    title,
+                    format!("Lot {lot_id} cannot be rezoned."),
+                    self.dialogs.ok(),
+                )
+                .with_frame(FrameStyle::Generic),
+            );
+            return ShellOutcome::redraw();
+        }
+        let _ = self.refresh_from_store();
+        let house = u32::from(lot_id);
+        let saved_lot = self
+            .store
+            .load_saved_lot(&self.neighborhood_id, house)
+            .ok()
+            .flatten();
+        if let Some(reason) =
+            self.active_trip_blocking_rezone(&self.stored, house, saved_lot.as_deref())
+        {
+            self.open_dialog(
+                ShellDialogKind::Notice,
+                Message::notice(title, reason, self.dialogs.ok()).with_frame(FrameStyle::Generic),
+            );
+            return ShellOutcome::redraw();
+        }
+        let current_zone = self
+            .stored
+            .zoning
+            .get(&(lot_id as i16))
+            .copied()
+            .unwrap_or(1);
+        let target_zone = if current_zone == 2 { 1 } else { 2 };
+        let current_label = self.zoning_label(current_zone).to_owned();
+        let target_label = self.zoning_label(target_zone).to_owned();
+        let base_tmpl = DialogStrings::get(&self.dialogs.rezone, 1, "Rezone %s to %s?");
+        let mut body = format_template(base_tmpl, &[&current_label, &target_label]);
+        let expected_occupant = self
+            .stored
+            .families
+            .iter()
+            .find(|(_, f)| f.house == i32::from(lot_id))
+            .map(|(&id, _)| id);
+        if let Some(fam_id) = expected_occupant {
+            let fam_name = self
+                .family_names
+                .get(&fam_id)
+                .cloned()
+                .unwrap_or_else(|| format!("Family {fam_id}"));
+            body.push_str(&format!(
+                "\n\n{fam_name} will be moved back to the Family Bin before rezoning."
+            ));
+        }
+        self.open_dialog(
+            ShellDialogKind::ConfirmRezone {
+                lot_id,
+                target_zone,
+                expected_instance_id: self.stored.instance_id,
+                expected_revision: self.stored.revision,
+                expected_occupant,
+            },
+            Message::confirm(title, body, vec![self.dialogs.yes(), self.dialogs.no()])
+                .with_frame(FrameStyle::Generic),
+        );
+        ShellOutcome::redraw()
+    }
+
+    /// Toggles `lot_id` zoning in REDB (`1` = Residential, `2` = Community),
+    /// atomically staging any household eviction and zoning update together
+    /// under strict `(instance_id, revision)` fencing, and refreshes map
+    /// metadata and hover overlays immediately.
+    pub fn execute_rezone(&mut self, lot_id: u16, target_zone: i32) -> Result<i32, String> {
+        self.execute_rezone_checked(lot_id, target_zone, None)
+    }
+
+    pub(super) fn execute_rezone_checked(
+        &mut self,
+        lot_id: u16,
+        target_zone: i32,
+        expected: Option<(u128, u64, Option<u16>)>,
+    ) -> Result<i32, String> {
+        if !self.is_lot_rezonable(lot_id) {
+            return Err(format!("lot {lot_id} is not eligible for rezoning"));
+        }
+        if target_zone != 1 && target_zone != 2 {
+            return Err(format!("unsupported zoning code {target_zone}"));
+        }
+        let house = u32::from(lot_id);
+        let snapshot = self
+            .store
+            .load_lot_snapshot(&self.neighborhood_id, house)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
+
+        if let Some(reason) = self.active_trip_blocking_rezone(
+            &snapshot.neighborhood,
+            house,
+            snapshot.saved_lot.as_deref(),
+        ) {
+            return Err(reason);
+        }
+
+        let live_occupant = snapshot
+            .neighborhood
+            .families
+            .iter()
+            .find(|(_, f)| f.house == i32::from(lot_id))
+            .map(|(&id, _)| id);
+
+        let (fence_instance_id, fence_revision) =
+            if let Some((exp_inst, exp_rev, exp_occ)) = expected {
+                if snapshot.neighborhood.instance_id != exp_inst
+                    || snapshot.neighborhood.revision != exp_rev
+                    || live_occupant != exp_occ
+                {
+                    return Err(
+                    "neighborhood state or lot occupancy changed since confirmation; please retry"
+                        .into(),
+                );
+                }
+                (exp_inst, exp_rev)
+            } else {
+                (
+                    snapshot.neighborhood.instance_id,
+                    snapshot.neighborhood.revision,
+                )
+            };
+
+        if live_occupant.is_some() {
+            // Stage the eviction in an ephemeral NeighborhoodStore so the
+            // evicted lot blob and updated zoning commit together in one
+            // fenced REDB transaction (never leaving a partial eviction behind).
+            let staging_dir = TempStagingDir::new("rezone-evict")?;
+            let staging_store = NeighborhoodStore::open(&staging_dir.path().join("stage.redb"))
+                .map_err(|e| e.to_string())?;
+            for (file_name, bytes) in &snapshot.character_files {
+                staging_store
+                    .save_character_file(&self.neighborhood_id, file_name, bytes)
+                    .map_err(|e| e.to_string())?;
+            }
+            if let Some(base_house) = &snapshot.base_house {
+                staging_store
+                    .save_base_house(&self.neighborhood_id, house, base_house)
+                    .map_err(|e| e.to_string())?;
+            }
+            if let Some(saved_lot) = &snapshot.saved_lot {
+                staging_store
+                    .save_lot_and_neighborhood(
+                        &self.neighborhood_id,
+                        house,
+                        saved_lot,
+                        &snapshot.neighborhood,
+                    )
+                    .map_err(|e| e.to_string())?;
+            } else {
+                staging_store
+                    .save_neighborhood(&self.neighborhood_id, &snapshot.neighborhood)
+                    .map_err(|e| e.to_string())?;
+            }
+            lifecycle::evict(
+                &self.install_root,
+                &staging_store,
+                &self.neighborhood_id,
+                house,
+            )
+            .map_err(|e| e.to_string())?;
+            let evicted_lot_bytes = staging_store
+                .load_saved_lot(&self.neighborhood_id, house)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "staged eviction lot missing after evict".to_owned())?;
+            let mut evicted_nh = staging_store
+                .load_neighborhood(&self.neighborhood_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "staged neighborhood missing after evict".to_owned())?;
+            evicted_nh.zoning.insert(lot_id as i16, target_zone);
+            self.store
+                .save_lot_and_neighborhood_checked(
+                    &self.neighborhood_id,
+                    house,
+                    Some((fence_instance_id, fence_revision)),
+                    &evicted_lot_bytes,
+                    &evicted_nh,
+                    &[],
+                )
+                .map_err(|e| e.to_string())?
+                .map_err(|conflict| format!("neighborhood modified concurrently ({conflict:?})"))?;
+        } else {
+            let mut updated = snapshot.neighborhood;
+            updated.zoning.insert(lot_id as i16, target_zone);
+            updated.revision = updated.revision.saturating_add(1);
+            self.store
+                .save_neighborhood_checked(
+                    &self.neighborhood_id,
+                    fence_instance_id,
+                    fence_revision,
+                    &updated,
+                )
+                .map_err(|e| e.to_string())?
+                .map_err(|conflict| format!("neighborhood modified concurrently ({conflict:?})"))?;
+        }
+
+        self.refresh_from_store()?;
+        self.note = Some(format!(
+            "Rezoned lot {lot_id} to {}.",
+            self.zoning_label(target_zone)
+        ));
+        Ok(target_zone)
+    }
+
+    /// Adds an extra directory scanned for `.FAM` files by `ImportFamily`
+    /// (prepended ahead of the install's `UserData*/Import` and `Export` folders).
+    pub fn add_import_search_dir(&mut self, dir: PathBuf) {
+        if !self.import_search_dirs.contains(&dir) {
+            self.import_search_dirs.insert(0, dir);
+        }
+        self.refresh_importable_families();
+    }
+
+    pub(super) fn scan_importable_families(&self) -> Vec<ImportableFamily> {
+        let mut dirs: Vec<(PathBuf, String)> = Vec::new();
+        for extra in &self.import_search_dirs {
+            let label = extra
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Import")
+                .to_owned();
+            dirs.push((extra.clone(), label));
+        }
+        if let Ok(user_dir) = resolve_user_dir(&self.install, self.slot) {
+            if let Some(imp) = resolve_dir_case_insensitive(&user_dir, "Import") {
+                dirs.push((imp, format!("{}/Import", self.neighborhood_id)));
+            }
+            if let Some(exp) = resolve_dir_case_insensitive(&user_dir, "Export") {
+                dirs.push((exp, format!("{}/Export", self.neighborhood_id)));
+            }
+        }
+        if let Ok(ud1) = self.install.file("UserData") {
+            if let Some(imp) = resolve_dir_case_insensitive(&ud1, "Import")
+                && !dirs.iter().any(|(d, _)| d == &imp)
+            {
+                dirs.push((imp, "UserData/Import".into()));
+            }
+            if let Some(exp) = resolve_dir_case_insensitive(&ud1, "Export")
+                && !dirs.iter().any(|(d, _)| d == &exp)
+            {
+                dirs.push((exp, "UserData/Export".into()));
+            }
+        }
+
+        let mut seen_paths = BTreeSet::new();
+        let mut out = Vec::new();
+        for (dir, source_label) in dirs {
+            let Ok(read_dir) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut entries: Vec<PathBuf> = read_dir
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_file()
+                        && p.extension()
+                            .and_then(|ext| ext.to_str())
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("fam"))
+                })
+                .collect();
+            entries.sort();
+            for path in entries {
+                let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                if !seen_paths.insert(canon) {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&path) else {
+                    continue;
+                };
+                let Ok(parsed) = FamilyFile::parse(&bytes) else {
+                    continue;
+                };
+                // Skip system NPC/stray households (`Strays_4000.FAM`).
+                if parsed.export_info.family_id >= 4000 {
+                    continue;
+                }
+                let member_count = parsed
+                    .export_info
+                    .member_ids
+                    .into_iter()
+                    .take_while(|&id| id != 0)
+                    .count();
+                if member_count == 0 {
+                    continue;
+                }
+                let family_name = parsed
+                    .iff
+                    .get(b"CTSS", 1000)
+                    .and_then(|c| StringTable::parse(parsed.iff.data(c)).ok())
+                    .and_then(|t| {
+                        t.get(0, US_ENGLISH)
+                            .or_else(|| t.get(0, 1))
+                            .map(str::to_owned)
+                    })
+                    .or_else(|| {
+                        parsed
+                            .name
+                            .get(0, US_ENGLISH)
+                            .or_else(|| parsed.name.get(0, 1))
+                            .map(str::to_owned)
+                    })
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("Family")
+                            .to_owned()
+                    });
+                out.push(ImportableFamily {
+                    path,
+                    family_name,
+                    member_count,
+                    budget: parsed.family.budget,
+                    source_label: source_label.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Rescans configured `Import/` and `Export/` folders for `.FAM` archives
+    /// and updates the top-bar Import button enabled state. Returns `true` if
+    /// availability changed.
+    pub fn refresh_importable_families(&mut self) -> bool {
+        let next = !self.scan_importable_families().is_empty();
+        if next != self.nbhd_state.has_importable_family {
+            self.nbhd_state.has_importable_family = next;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Scans installed `Import/` and `Export/` `.FAM` archives and opens the
+    /// native Family Import picker modal.
+    pub fn open_import_family_picker(&mut self) -> bool {
+        let candidates = self.scan_importable_families();
+        self.nbhd_state.has_importable_family = !candidates.is_empty();
+        let title = DialogStrings::get(&self.dialogs.import_strs, 8, "Import Family").to_owned();
+        if candidates.is_empty() {
+            self.open_dialog(
+                ShellDialogKind::Notice,
+                Message::notice(
+                    title,
+                    "No importable .FAM family files were found in UserData/Import.",
+                    self.dialogs.ok(),
+                )
+                .with_frame(FrameStyle::Generic),
+            );
+            return false;
+        }
+        let mut items = Vec::with_capacity(candidates.len());
+        let mut entries = BTreeMap::new();
+        for (idx, fam) in candidates.into_iter().enumerate() {
+            let id = format!("import_fam:{idx}");
+            let file_name = fam
+                .path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("family.FAM");
+            let members_word = if fam.member_count == 1 { "Sim" } else { "Sims" };
+            let description = format!(
+                "{} {} | {} | {}/{}",
+                fam.member_count,
+                members_word,
+                format_simoleons(fam.budget),
+                fam.source_label,
+                file_name,
+            );
+            items.push(ShopItem {
+                id: id.clone(),
+                name: fam.family_name.clone(),
+                description,
+                price: 0,
+                currency: CurrencyKind::Simoleons,
+                icon: None,
+                supports_try_on: false,
+                owned: false,
+                available: true,
+            });
+            entries.insert(id, fam);
+        }
+        self.clear_hover_state();
+        self.import_picker_entries = entries;
+        self.import_picker_snapshot = Some(ShopSnapshot {
+            kind: ShopKind::DowntownBoutique(WardrobeCategory::Everyday),
+            title_override: Some(title),
+            buy_label_override: Some("Import".into()),
+            shopper_name: None,
+            wallet: Wallet::default(),
+            items,
+            tried_on_item_id: None,
+            preview_image: None,
+            preview_label: None,
+            hide_wallet_and_prices: true,
+            choice: None,
+            body_shapes: Vec::new(),
+        });
+        self.import_picker.open();
+        true
+    }
+
+    pub fn close_import_family_picker(&mut self) {
+        self.import_picker.close();
+        self.import_picker_snapshot = None;
+        self.import_picker_entries.clear();
+    }
+
+    pub(super) fn handle_import_picker_command(&mut self, cmd: ShopCommand) -> ShellOutcome {
+        match cmd {
+            ShopCommand::Cancel => {
+                self.close_import_family_picker();
+                ShellOutcome::redraw()
+            }
+            // The import picker is a list, never a choice dialog.
+            ShopCommand::TryOn { .. }
+            | ShopCommand::RotatePreview(_)
+            | ShopCommand::NoSelection => ShellOutcome::redraw(),
+            ShopCommand::Buy { item_id, .. } => {
+                let Some(entry) = self.import_picker_entries.get(&item_id).cloned() else {
+                    return ShellOutcome::redraw();
+                };
+                self.close_import_family_picker();
+                let title =
+                    DialogStrings::get(&self.dialogs.import_strs, 8, "Import Family").to_owned();
+                match self.execute_import_family(&entry) {
+                    Ok(created) => {
+                        let body = format!(
+                            "{} imported into the Family Bin ({} members).",
+                            created.family_name,
+                            created.members.len()
+                        );
+                        self.note = Some(body.clone());
+                        self.open_dialog(
+                            ShellDialogKind::Notice,
+                            Message::notice(title, body, self.dialogs.ok())
+                                .with_frame(FrameStyle::Generic),
+                        );
+                    }
+                    Err(e) => {
+                        let body = format!("Could not import {}: {e}", entry.family_name);
+                        self.note = Some(body.clone());
+                        self.open_dialog(
+                            ShellDialogKind::Notice,
+                            Message::notice(title, body, self.dialogs.ok())
+                                .with_frame(FrameStyle::Generic),
+                        );
+                    }
+                }
+                ShellOutcome::redraw()
+            }
+        }
+    }
+
+    pub(super) fn execute_import_family(
+        &mut self,
+        entry: &ImportableFamily,
+    ) -> Result<sims_vm::caf::CreatedHousehold, String> {
+        let raw_bytes = std::fs::read(&entry.path).map_err(|e| e.to_string())?;
+        let parsed = FamilyFile::parse(&raw_bytes).map_err(|e| e.to_string())?;
+        let fam_bytes = if parsed.family.house == 0 && parsed.family.secondary_house() == 0 {
+            raw_bytes
+        } else {
+            // Normalize a house-exported `.FAM` into a Family Bin archive (`house = 0`,
+            // `secondary_house = 0`) so `import_family_fam` places it cleanly in the Family Bin.
+            let mut bin_family = parsed.family.clone();
+            bin_family.house = 0;
+            if bin_family.version >= 8 && bin_family.tail.len() >= 4 {
+                bin_family.tail[0..4].fill(0);
+            }
+            let fami_id = parsed.export_info.family_id;
+            let fami_bytes = encode_fami(&bin_family);
+            // Rewrite ONLY the IFF's effective resources in `resource_order`
+            // (preserving native `rsmp` lookup semantics and omitting stale,
+            // unlisted physical chunks so reparse never exposes shadowed data).
+            let tags: BTreeSet<[u8; 4]> = parsed
+                .iff
+                .chunks
+                .iter()
+                .map(|c| c.tag)
+                .filter(|tag| tag != b"rsmp" && tag != b"XXXX")
+                .collect();
+            let mut chunks: Vec<ChunkData> = Vec::with_capacity(parsed.iff.chunks.len());
+            for tag in tags {
+                let effective: Vec<&sims_formats::iff::Chunk> =
+                    match parsed.iff.resource_order(&tag) {
+                        Ok(list) => list,
+                        Err(_) => parsed.iff.all(&tag).collect(),
+                    };
+                for chunk in effective {
+                    let eff_flags = parsed.iff.resource_flags(chunk);
+                    // Clear `DELETED` (`4`) when emitting a mapless IFF so an
+                    // `rsmp`-listed live resource is never skipped by the
+                    // physical chunk scanner on reparse.
+                    let write_flags = eff_flags & !sims_formats::iff::DELETED;
+                    let data =
+                        if &chunk.tag == b"FAMI" && chunk.id == fami_id && (eff_flags >> 8) == 0 {
+                            fami_bytes.clone()
+                        } else {
+                            parsed.iff.data(chunk).to_vec()
+                        };
+                    chunks.push(ChunkData {
+                        tag: chunk.tag,
+                        id: chunk.id,
+                        flags: write_flags,
+                        label: chunk.label.clone(),
+                        data,
+                    });
+                }
+            }
+            write_iff(&chunks).map_err(|e| e.to_string())?
+        };
+
+        if self.import_caf_ctx.is_none() {
+            self.import_caf_ctx =
+                Some(CafContext::from_install(&self.install_root).map_err(|e| e.to_string())?);
+        }
+        let ctx = self.import_caf_ctx.as_ref().expect("import_caf_ctx");
+        let seed = self
+            .import_rng_seed
+            .wrapping_add(self.clock_us as u32)
+            .max(1);
+        self.import_rng_seed = self.import_rng_seed.wrapping_add(1).max(1);
+        let mut rng = CrtRng::from_state(seed);
+        let created = match import_family_fam(
+            ctx,
+            &self.store,
+            &self.neighborhood_id,
+            &fam_bytes,
+            US_ENGLISH,
+            &mut rng,
+        ) {
+            Ok(created) => created,
+            Err(sims_vm::caf::CafError::Content(sims_content::Error::Unsupported(_)))
+                if ctx.wardrobe.is_some() =>
+            {
+                // Some base-game / pre-Hot-Date `.FAM` archives hit unported
+                // legacy outfit replacement generators in `refresh_outfits`;
+                // fall back to preserving the archive's original body strings.
+                let fallback_ctx = CafContext {
+                    template_iff: ctx.template_iff.clone(),
+                    catalog_guids: ctx.catalog_guids.clone(),
+                    wardrobe: None,
+                    starting_funds: ctx.starting_funds,
+                };
+                let mut fallback_rng = CrtRng::from_state(seed);
+                import_family_fam(
+                    &fallback_ctx,
+                    &self.store,
+                    &self.neighborhood_id,
+                    &fam_bytes,
+                    US_ENGLISH,
+                    &mut fallback_rng,
+                )
+                .map_err(|e| e.to_string())?
+            }
+            Err(err) => return Err(err.to_string()),
+        };
+        self.family_names
+            .insert(created.family_id, created.family_name.clone());
+        self.refresh_from_store()?;
+        Ok(created)
+    }
+
+    /// Opens the native paginated Credits/About modal loaded from
+    /// `GameData/Credits.iff` (with fallback to `GameData/UIText.iff` `STR# 163`).
+    pub fn open_credits_modal(&mut self) {
+        let title = self
+            .chrome_strings
+            .bar
+            .get(sims_ui::neighborhood::BarButton::Credits.tooltip_index())
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| "Credits".into());
+        let mut pages =
+            sims_ui::book::load_credits_pages(&self.install, US_ENGLISH).unwrap_or_default();
+        if pages.is_empty() {
+            pages.push(BookPage {
+                heading: None,
+                category: None,
+                entries: vec![BookEntry {
+                    title: title.clone(),
+                    subtitle: None,
+                    body: "Credits data is unavailable in this install.".into(),
+                    badges: Vec::new(),
+                    highlight: false,
+                }],
+            });
+        }
+        self.clear_hover_state();
+        self.credits_snapshot = Some(ReferenceBookSnapshot {
+            title,
+            subtitle: None,
+            held_summary: Vec::new(),
+            pages,
+            use_magic_book_chrome: false,
+        });
+        self.credits_dialog.open();
+    }
+
+    /// Closes the credits book and, when it was open over a map, restores
+    /// the map's music, as every native close path does (`station_dtnhood`
+    /// `0x54b879`, `station_superstar` `0x565bf8`, `station_vacation`
+    /// `0x56a5ad`, `music_magictown` `0x552fc5`, `bkground_nhood1`
+    /// `0x5593ff`).
+    pub fn close_credits_modal(&mut self) {
+        if !self.credits_dialog.is_open() {
+            self.drop_credits_modal();
+            return;
+        }
+        self.drop_credits_modal();
+        if matches!(self.screen, ActiveScreen::Neighborhood) {
+            self.audio_queue
+                .push(Input::MusicMode(music_mode_for_kind(self.kind)));
+        }
+    }
+
+    /// Discards the credits book without touching the music, for resets
+    /// whose caller sets the music itself (entering a map, switching maps).
+    pub(super) fn drop_credits_modal(&mut self) {
+        self.credits_dialog.close();
+        self.credits_snapshot = None;
+    }
+
+    // =========================================================================
+    // CAF Simlish Voice Preview draining
+    // =========================================================================
+
+    pub(super) fn drain_caf_voice_previews(&mut self) {
+        let previews = match &mut self.screen {
+            ActiveScreen::CreateFamily(caf) => caf.take_voice_previews(),
+            _ => Vec::new(),
+        };
+        for preview in previews {
+            self.audio_queue.push(Input::PlayVoice {
+                voice: preview.voice,
+                category: preview.category,
+                pitch: preview.pitch,
+                seed: preview.seed,
+                object: None,
+            });
+        }
+    }
+}
