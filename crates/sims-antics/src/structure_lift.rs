@@ -1845,6 +1845,30 @@ pub fn lift_bhav_structured_with_context(
     callee_arities: Option<&BTreeMap<u16, usize>>,
     symbols: Option<&LiftSymbols>,
 ) -> StructuredLiftOutcome {
+    lift_structured(chunk, opts, callee_arities, symbols, false)
+}
+
+/// [`lift_bhav_structured_with_arities`], writing each two-way `if`/`else` with the branch
+/// whose first node comes first in the original tree as its `then` arm (negating the
+/// condition when that is the false branch). A compiler that lays nodes out in source order
+/// then keeps more of the original's node numbering, which a fault or a yield leaves on the
+/// stack. The statements and their behaviour are the same either way.
+#[must_use]
+pub fn lift_bhav_structured_in_node_order(
+    chunk: &BhavChunk,
+    opts: LiftOptions,
+    callee_arities: Option<&BTreeMap<u16, usize>>,
+) -> StructuredLiftOutcome {
+    lift_structured(chunk, opts, callee_arities, None, true)
+}
+
+fn lift_structured(
+    chunk: &BhavChunk,
+    opts: LiftOptions,
+    callee_arities: Option<&BTreeMap<u16, usize>>,
+    symbols: Option<&LiftSymbols>,
+    node_order: bool,
+) -> StructuredLiftOutcome {
     let scoped = symbols.map(|s| s.for_caller(chunk.id));
     let symbols = scoped.as_deref();
     let precheck = match structured_lift_precheck(chunk, callee_arities) {
@@ -1973,6 +1997,7 @@ pub fn lift_bhav_structured_with_context(
         loop_bodies: &loop_bodies,
         loop_ipdoms: &loop_ipdoms,
         out: header,
+        node_order,
         emitted_nodes: 0,
         max_emitted_nodes: 245, // Stay safely under MAX_BHAV_NODES (251)
     };
@@ -2234,6 +2259,8 @@ struct StructEmitter<'a> {
     loop_bodies: &'a BTreeMap<usize, BTreeSet<usize>>,
     loop_ipdoms: &'a BTreeMap<usize, BTreeMap<usize, usize>>,
     out: String,
+    /// Whether a two-way `if`/`else` puts the branch with the lower first node first.
+    node_order: bool,
     emitted_nodes: usize,
     max_emitted_nodes: usize,
 }
@@ -2585,11 +2612,17 @@ impl StructEmitter<'_> {
                         self.out.push_str("}\n");
                         r
                     } else {
+                        // A terminal target (253..=255) sorts after every node.
+                        let (first, second, cond) = if self.node_order && *on_false < *on_true {
+                            (*on_false, *on_true, format!("!{text}"))
+                        } else {
+                            (*on_true, *on_false, text.clone())
+                        };
                         self.indent(depth);
-                        let _ = write!(self.out, "if {text} {{");
+                        let _ = write!(self.out, "if {cond} {{");
                         self.push_comment(comment.as_deref());
                         let r1 = self.emit_region(
-                            *on_true,
+                            first,
                             branch_stop,
                             loop_ctx,
                             active,
@@ -2600,7 +2633,7 @@ impl StructEmitter<'_> {
                         self.out.push_str("} else {\n");
                         let r2 = r1.and_then(|()| {
                             self.emit_region(
-                                *on_false,
+                                second,
                                 branch_stop,
                                 loop_ctx,
                                 active,

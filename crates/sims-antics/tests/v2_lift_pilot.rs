@@ -158,8 +158,8 @@ object "Fable Calculator" {
         "globals::pick_a_dial(-2, 3)",
         "globals::pick_a_dial_306()",
         "globals::global_307()",
-        "if !compute_4300(2, 0, 0, 0) {",
-        "call 4300(temps);",
+        "return compute_4300(2, 0, 0, 0);",
+        "if !call 4300(temps) { return false; }",
     ] {
         assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
     }
