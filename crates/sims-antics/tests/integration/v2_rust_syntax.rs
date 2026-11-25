@@ -1036,3 +1036,68 @@ fn me_text_drops_an_entry_save_that_moves_no_named_local() {
     let air = air_with_message("Hello $Object", pinned);
     assert!(saves(&air), "{air}");
 }
+
+/// A bool helper whose tail is a constant, returned through `return leave();` in a tree whose
+/// raw block keeps the layout (so the helper is inlined for its tail condition), returns the
+/// constant with no test node, as it does without the raw block.
+#[test]
+fn constant_helper_tails_return_with_no_test_node() {
+    for (tail, ret) in [("false", "return false;"), ("true", "return true;")] {
+        let src = format!(
+            r#"use std::globals::*;
+
+object "Tail Probe" {{
+    guid: 0x7F40_0A30;
+    fn leave() -> bool {{
+        globals::standard_exit(50)?;
+        {tail}
+    }}
+    #[bhav(id = 4100)]
+    fn t(sim: Sim) -> bool {{
+        loop {{
+            raw {{ if !find_best_object(8, flags: 0) {{ break; }} }}
+            if sim.person[62] == 3 {{
+                return leave();
+            }}
+            sim.person[62] += 1;
+        }}
+        leave()
+    }}
+}}
+"#
+        );
+        let air = build(&src).0;
+        let t = &air[air.find("tree 4100").expect("tree 4100")..];
+        assert!(!t.contains("1 == 0") && !t.contains("1 == 1"), "{air}");
+        assert_eq!(t.matches(ret).count(), 2, "{air}");
+    }
+}
+
+/// A lint `allow` on its own line above an item's attributes covers the item, as it does
+/// directly above the item; and `frame_headroom` suggests a `#[bhav] fn`.
+#[test]
+fn lint_allow_above_attributes_covers_the_item() {
+    use sims_antics::v2::lint::lint_v2_source;
+    let many_nodes: String = (0..205).map(|_| "        sim.person[3] += 1;\n").collect();
+    let source = |allow: &str| {
+        format!(
+            "object \"Lint Probe\" {{\n    guid: 0x7F40_0A31;\n{allow}    #[bhav(label = \"Big\")]\n    fn big(sim: Sim) {{\n{many_nodes}    }}\n}}\n"
+        )
+    };
+    let headroom = |src: &str| {
+        lint_v2_source(src, "probe.antics")
+            .unwrap_or_else(|e| panic!("lint failed: {e}"))
+            .into_iter()
+            .filter(|d| d.rule == "frame_headroom")
+            .collect::<Vec<_>>()
+    };
+    let found = headroom(&source(""));
+    assert_eq!(found.len(), 1, "{found:#?}");
+    let help = found[0].help.as_deref().unwrap_or_default();
+    assert!(
+        help.contains("`#[bhav] fn`") && !help.contains("`tree`"),
+        "{help}"
+    );
+    let found = headroom(&source("    // antics-lint: allow(frame_headroom)\n"));
+    assert!(found.is_empty(), "{found:#?}");
+}

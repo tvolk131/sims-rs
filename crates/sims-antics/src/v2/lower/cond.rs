@@ -1183,6 +1183,14 @@ impl<'a> TreeLowerer<'a> {
                 // `return a == b;` tests `a == b` itself and returns on its exits, so the last
                 // result at each return is the test's own (a flipped `a != b` would invert it).
                 if let Some(pos) = self.try_lower_simple_air_cond(expr)? {
+                    // A helper inlined for its tail (`return leave();`) whose tail is a constant
+                    // returns it with no test node, as a written `return false;` does.
+                    if let V2Expr::Call { .. } = expr
+                        && let Some(b) = constant_test(&pos)
+                    {
+                        self.line(format!("return {b};"));
+                        return Ok(());
+                    }
                     self.line(format!("if {pos} {{"));
                     self.em.indent();
                     self.line("return true;".to_owned());
@@ -1207,5 +1215,15 @@ impl<'a> TreeLowerer<'a> {
                 }
             }
         }
+    }
+}
+
+/// The value of a test [`TreeLowerer::try_lower_simple_air_cond`] gives for a constant (`1 == 1` or
+/// `1 == 0`).
+fn constant_test(test: &str) -> Option<bool> {
+    match test {
+        "1 == 1" => Some(true),
+        "1 == 0" => Some(false),
+        _ => None,
     }
 }

@@ -470,9 +470,12 @@ impl Directives {
             // At the end of a line that opens a block (`if c { // antics-lint: allow(..)`,
             // where `fmt` puts the comment of a one-line `if c { .. } // ..`), it covers
             // the block through its closing `}`.
+            // On its own line above an item's attributes (`#[bhav(..)]`), it covers them and
+            // the item's line, as it does above the item itself.
             let last_line = match target {
                 Some(line) if code[n] => block_end_line(tokens, line).unwrap_or(line),
-                other => other.unwrap_or(0),
+                Some(line) => attributes_end_line(tokens, line).unwrap_or(line),
+                None => 0,
             };
             for name in names {
                 if rule(&name).is_none() {
@@ -575,6 +578,33 @@ fn scan_raw(
 }
 
 /// When the last token on 1-based `line` is a `{`, the line of its matching `}`.
+/// When `line` starts with attributes (`#[..]`), the line of the first token after them (the
+/// item they belong to).
+fn attributes_end_line(tokens: &[crate::v2::lexer::Token], line: usize) -> Option<usize> {
+    let mut i = tokens.iter().position(|t| t.span.line == line)?;
+    if tokens[i].kind != TokenKind::HashBracket {
+        return None;
+    }
+    while tokens.get(i)?.kind == TokenKind::HashBracket {
+        let mut depth = 0usize;
+        loop {
+            match tokens.get(i)?.kind {
+                TokenKind::HashBracket | TokenKind::LBracket => depth += 1,
+                TokenKind::RBracket => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    Some(tokens[i].span.line)
+}
+
 fn block_end_line(tokens: &[crate::v2::lexer::Token], line: usize) -> Option<usize> {
     let open = tokens.iter().rposition(|t| t.span.line == line)?;
     if tokens[open].kind != TokenKind::LBrace {
@@ -3124,7 +3154,10 @@ impl FileLinter<'_> {
                             b.label,
                             crate::lower::MAX_BHAV_NODES
                         ),
-                        Some("split it: move a self-contained part into its own `tree`".to_owned()),
+                        Some(
+                            "split it: move a self-contained part into its own `#[bhav] fn`"
+                                .to_owned(),
+                        ),
                         None,
                         None,
                     );
@@ -3147,7 +3180,7 @@ impl FileLinter<'_> {
                             ),
                             None => format!("tree {} \"{}\" uses {} locals", b.id, b.label, b.locals),
                         },
-                        Some("reuse locals across disjoint parts, call a helper `tree` instead of inlining a `fn` many times (each inlined call gets its own locals), or split the tree".to_owned()),
+                        Some("reuse locals across disjoint parts, call a `#[bhav] fn` instead of inlining a plain `fn` many times (each inlined call gets its own locals), or split the tree".to_owned()),
                         None,
                         None,
                     );

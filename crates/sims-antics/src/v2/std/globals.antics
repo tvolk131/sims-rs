@@ -10,6 +10,8 @@ pub extern mod globals {
     #[id(272)] fn standard_entry() -> Result;
     #[id(273)] fn standard_exit(delay: i16) -> Result;
     #[id(278)] fn multi_tile_entry() -> Result;
+    // Takes its delay as an argument (param 0), like 273, which it runs for each tile; its
+    // second parameter is a word it writes before reading.
     #[id(279)] fn multi_tile_exit(delay: i16) -> Result;
 
     // Waiting.
