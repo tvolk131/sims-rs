@@ -3700,6 +3700,72 @@ through their public interfaces only; the simulation never depends on it.
     integration tests now builds one `integration` binary. The exceptions
     are `sims-vm`'s `interpreter` and `sims-game`'s `ratchet` and
     `ui_oracle_tour`.
+- **Done (Batch 18 — `.antics` v2.1 Waves 1 and 2: typed `std`, PR I-3
+  and I-4, three lint waves and two lift waves; group arrivals, #463–#471):**
+  - **Travel (`sims-vm`, #464):**
+    - A `HouseholdGroup` trip to a Magic Town community lot (93–99) no
+      longer snaps back. When the destination has a native arrival and
+      its marker is on the lot, group travelers start off the lot at
+      [-16, -16], as Family arrivals do, and the marker places each one
+      exactly once. Lots 90–92 never snapped back.
+    - Routine 17's kind-2, 7 and 8 tokens (saved motives, the arrival
+      clock) have round-tripped since #426 and #430. A test now covers
+      departure, arrival and return.
+    - The lot shift (0x444991) is reached only from the `offset_world`
+      developer cheat, which the port does not have. 0x467436 empties
+      planner rectangles the port never keeps. Neither needs a port.
+  - **The `.antics` v2 language (Track 8):**
+    - PR I-3 (#466): the expansion-pack gaps.
+      - `remove_object(..)` / `x.remove()`;
+      - `find_best_object(..)` as an `if` / `while` test;
+      - `set_to_next(.., dest: x)`;
+      - the read-only `object_type`, `sub_index`, `has_function[N]` and
+        `job_field(F)`;
+      - a source `stack_obj = saved;` before the exit is kept;
+      - `global[CONST]` is no global-34 read unless the constant is 34.
+    - Typed `std` (#468):
+      - new `std::flags` (bitflags) and `std::engine` (enums) modules;
+      - zero-cost `as i16` and `T::from_raw`;
+      - one typed engine-word table with 13 new words, and
+        `world.expansions`;
+      - `std::globals` grows from 17 to 62 trees.
+      Numbered and named id/room reads build identical bytes.
+    - PR I-4 (#469):
+      - the temp-indexed and neighbor scopes (27, 30, 31, 24, 32) and
+        `fame`;
+      - `padN` bytes, `reach`, `make_new_character`, and `drop_onto`
+        parameters;
+      - inherit trees calling Sim trees;
+      - read-only helper parameters without a copy;
+      - scoped `keep_layout`: a raw block of lowering-shaped text no
+        longer pins the tree's layout;
+      - three lowering fixes: the inline constant tail, the foreign read
+        restore, and a partial write before a faulting read.
+      New `std::math`, `std::motives` and `std::budget` modules, and
+      open-pack's helpers delegate to `std::motives`.
+  - **Lint (Track 7):**
+    - #465: `shadowed_const`, `duplicate_std_global`,
+      `untyped_engine_field`, and two errors gated on the real compiler
+      (`raw_syntax`, `object_tree_me_field`). `unused_decl` is exact for
+      constants, and one detector (`is_v2_source`) tells v2 from `.air`.
+    - Wave 2 (#467): `set_to_next` destinations are read, BCON names in
+      raw blocks count as reads, `manual_raw_has_builtin` knows PR I-3's
+      forms, and there are new `stale_lint_allow` and `unreachable_code`
+      warnings.
+    - Wave 3 (#470): `untyped_engine_field` follows #468's words, and
+      there are new `untyped_engine_constant`, `prefer_question_mark` and
+      `prefer_method_syntax` warnings. Each such suggestion stands only
+      when the edited file builds the same `.iff` bytes.
+  - **Lift (Track 9):**
+    - #463: inline raw statements fall from 7,580 to 3,657 (strict),
+      every local is named, `bcon[N]` references fall from 36,235 to
+      4,597, and files with `more_globals` from 862 to 105.
+    - Wave 2 (#471): `?`, joined arms and shared tails, the #466
+      spellings, and named temps calls in behavioral mode. In behavioral
+      mode `?` rises from 1,218 to 31,286, raw blocks fall from 22,721 to
+      13,167, lint findings from 761 to 117, and the slowest object from
+      19 s to 10 s.
+    - Both keep 0 DIFFERENT and 0 timeouts in both modes.
 - **Next (in flight, in order of player impact):**
   - **Travel follow-ups:**
     - A hop that leaves travelers behind (Go Somewhere Else for one
@@ -3736,19 +3802,26 @@ through their public interfaces only; the simulation never depends on it.
   - **The `.antics` v2 toolchain:**
     - Node pinning (Track 8): about 8,600 strict lift trees fail only
       on node order (#459).
-    - A join construct for shared tails: about 5,900 trees (#459). It
-      would also stop the `frame_headroom` growth in behavioral mode
-      (#460).
+    - Shared suffixes across `match` arms and loop exits: the 46
+      behavioral `frame_headroom` findings left after #471 need a v2
+      form for them.
+    - Strict temps calls: a lowering rule that passes the temps without
+      copies, so strict mode can name them too (#471).
     - Readable locals: about 9,000 one-statement raw blocks are
       local-slot moves. This changes strict output, so it needs its own
       PR (#460).
     - `std::bcon` is deferred until the BCON slots have checkable
       clean-room names (#453).
-    - Open from #461:
-      - the inline constant-tail path can record the call before it as
-        the action result (this predates #461);
-      - `global[CONST]` still counts as a global-34 read, which is
-        conservative.
+    - `std::globals` (#468):
+      - tree 382 moves to `-> bool`, with the names that sit close to
+        the original labels renamed;
+      - a typed `bool + value` ABI for 282 and 333, with `#[temp(N)]`
+        parameters.
+    - Open from #469 (both predate it):
+      - a short-circuit constant leaf can leave the previous node's
+        result;
+      - a functional can call a Sim tree directly while an object runs
+        it, which needs a type for a functional's runner.
   - **Legacy mining backlog:** see
     `docs/legacy-mining-audit.md#porting-backlog`.
     - Parity-relevant items still open:

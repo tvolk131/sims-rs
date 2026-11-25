@@ -37,6 +37,7 @@ mod v2_lift_wave3;
 mod v2_lint;
 mod v2_lint_wave2;
 mod v2_lint_wave3;
+mod v2_lint_wave4;
 mod v2_pr_g;
 mod v2_pr_h;
 mod v2_pr_h_context;
