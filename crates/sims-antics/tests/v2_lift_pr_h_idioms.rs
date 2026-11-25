@@ -985,6 +985,65 @@ fn non_private_code_the_lift_drops_leaves_no_tree_proven() {
         "{:?}",
         constants.trees
     );
+    // The VM loads the last chunk of each constant table ID, deleted or not.
+    let deleted = ChunkData {
+        tag: *b"BCON",
+        id: 256,
+        flags: sims_formats::iff::DELETED,
+        label: "Global constants".to_owned(),
+        data: vec![1, 0, 77, 0],
+    };
+    let deleted = report(&rebuild(&iff, |_| {}, vec![deleted]));
+    assert!(
+        matches!(check_of(&deleted, 4300), TreeCheck::Inconclusive(why) if why.contains("BCON 256")),
+        "{:?}",
+        deleted.trees
+    );
+}
+
+#[test]
+fn a_global_tree_runs_with_this_object_as_owner() {
+    // Caller 4301 runs global tree 256, which this file does not hold. It runs with
+    // this object as owner, so it may run any private tree by name: the caller is
+    // proven only while every private tree is, in the same environment.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_013F;
+    strings 300 "Lines" {
+        a = "A",
+    }
+    @id(4300) @frame(locals: 0) tree pump "Pump" {
+        raw { op 0x0015 (0x2c, 0x01, 0, 0, 0, 0, 0, 0); }
+    }
+    @id(4301) @frame(locals: 0) tree caller "Caller" {
+        raw { op 0x0100 (0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff); }
+    }
+}"#;
+    let iff = compile(source);
+    let same = report(&iff);
+    assert!(proven(check_of(&same, 4300)), "{:?}", same.trees);
+    assert!(proven(check_of(&same, 4301)), "{:?}", same.trees);
+    // Pump reads a string table the lift cannot reproduce (its chunk is deleted).
+    let gap = report(&rebuild(
+        &iff,
+        |c| {
+            if &c.tag == b"STR#" && c.id == 300 {
+                c.flags |= sims_formats::iff::DELETED;
+            }
+        },
+        Vec::new(),
+    ));
+    assert!(!proven(check_of(&gap, 4300)), "{:?}", gap.trees);
+    assert!(!proven(check_of(&gap, 4301)), "{:?}", gap.trees);
+    // A private tree whose label the rebuilt file cannot store: the global tree may
+    // look it up by that label.
+    let long = format!("P{}", " ".repeat(62)) + "X";
+    let renamed = report(&relabel(&iff, 4300, &long));
+    assert!(!proven(check_of(&renamed, 4300)), "{:?}", renamed.trees);
+    assert!(
+        matches!(check_of(&renamed, 4301), TreeCheck::Inconclusive(why) if why.contains("global or semi-global")),
+        "{:?}",
+        renamed.trees
+    );
 }
 
 #[test]
@@ -1014,7 +1073,9 @@ fn a_deleted_definition_does_not_stand_in_for_the_live_one() {
 }"#;
     let iff = compile(source);
     let objd = iff.chunks.iter().find(|c| &c.tag == b"OBJD").expect("OBJD");
-    let at = 4 + 47 * 2;
+    // The VM's words start at the chunk's first word (the version), so word 47 is at
+    // byte 94.
+    let at = 47 * 2;
     let stale = ChunkData {
         tag: *b"OBJD",
         id: objd.id,

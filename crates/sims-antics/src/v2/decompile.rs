@@ -1048,6 +1048,14 @@ impl Model {
                     );
                 }
             }
+            if self.runs_shared_code(i) && !self.same_owner_environment(recompiled) {
+                return Some(
+                    "runs a global or semi-global tree, which runs with this object as owner \
+                     and may read tree labels, texts, sounds, definitions or callback tables \
+                     the rebuilt object gives differently"
+                        .to_owned(),
+                );
+            }
             if i.opcode == CREATE_OBJECT && callbacks() != Some(true) {
                 return Some(
                     "creates an object, whose callbacks the rebuilt object's tables give \
@@ -1173,10 +1181,53 @@ impl Model {
             .filter(|&id| id != 0)
     }
 
+    /// Whether instruction `i` may run a global or semi-global tree: directly, or as a
+    /// tree it runs by function or as a created object's callback. That tree runs with
+    /// this object as its owner, so it may run any of this file's trees by name, create
+    /// an object or read this file's resources, none of which the lift sees.
+    fn runs_shared_code(&self, i: &sims_formats::behavior::Instruction) -> bool {
+        (i.opcode >= 0x100 && !PRIVATE_TREES.contains(&i.opcode))
+            || self
+                .direct_named_callees(i)
+                .iter()
+                .any(|id| !PRIVATE_TREES.contains(id))
+    }
+
+    /// Whether the rebuilt object gives a global or semi-global tree running with it as
+    /// owner the same environment: tree labels and `GLOB` link, text tables, sounds,
+    /// definitions and callback tables.
+    fn same_owner_environment(&self, recompiled: &RecompiledFile) -> bool {
+        self.original_lookup == recompiled.lookup
+            && self.original_strings == recompiled.strings
+            && self.original_sounds == recompiled.sounds
+            && self.original_definitions.is_some()
+            && self.original_definitions == recompiled.definitions
+            && self.original_callbacks.is_some()
+            && self.original_callbacks.as_ref().map(|c| &c.tables)
+                == recompiled.callbacks.as_ref().map(|c| &c.tables)
+    }
+
+    /// The trees of this file instruction `i` may run in the original other than by
+    /// number: [`Self::direct_named_callees`], and every private tree when it may run
+    /// a global or semi-global tree ([`Self::runs_shared_code`]).
+    fn named_callees(&self, i: &sims_formats::behavior::Instruction) -> Vec<u16> {
+        let mut out = self.direct_named_callees(i);
+        if self.runs_shared_code(i) {
+            out.extend(
+                self.original_lookup
+                    .names
+                    .keys()
+                    .copied()
+                    .filter(|id| PRIVATE_TREES.contains(id)),
+            );
+        }
+        out
+    }
+
     /// The trees of this file instruction `i` may run by name in the original (the tree
     /// each name finds here, or every tree for a name not known here), by function, or
     /// as callbacks of an object it creates.
-    fn named_callees(&self, i: &sims_formats::behavior::Instruction) -> Vec<u16> {
+    fn direct_named_callees(&self, i: &sims_formats::behavior::Instruction) -> Vec<u16> {
         let mut out = Vec::new();
         for name in self.names_run(i, &self.original_strings) {
             match name {
@@ -1625,30 +1676,42 @@ fn fwav_sounds(iff: &Iff) -> BTreeMap<u16, String> {
 }
 
 /// The resources a tree can read through a primitive, keyed by tag and ID, as the VM
-/// reads them: each resource of that key in resource order (live chunks; every chunk
-/// of the tag in file order when the resource map does not parse). Also the trees and
-/// constants the lift never writes ([`foreign_code`]).
+/// reads them (`sims-vm` `load_library_with_pool`), plus the trees and constants the
+/// lift never writes ([`foreign_code`]):
+/// - `BHAV`, `BCON`, `FCNS`, `TTAB`, `SLOT`: the last chunk of each ID in file order,
+///   deleted ones included;
+/// - `STR#`: every chunk of the ID in file order (the VM keeps the last one that
+///   parses, deleted or not; comparing them all is stricter);
+/// - the rest: each resource of that key in resource order (live chunks; every chunk
+///   of the tag in file order when the resource map does not parse).
 fn resource_chunks(iff: &Iff) -> BTreeMap<([u8; 4], u16), Vec<Vec<u8>>> {
-    const TAGS: [&[u8; 4]; 11] = [
-        b"STR#", b"CTSS", b"TTAB", b"TTAs", b"SLOT", b"FCNS", b"GLOB", b"TPRP", b"OBJD", b"OBJf",
-        b"BCON",
-    ];
+    const LAST_CHUNK: [&[u8; 4]; 4] = [b"BCON", b"FCNS", b"TTAB", b"SLOT"];
+    const EVERY_CHUNK: [&[u8; 4]; 1] = [b"STR#"];
+    const RESOURCE_ORDER: [&[u8; 4]; 6] = [b"CTSS", b"TTAs", b"GLOB", b"TPRP", b"OBJD", b"OBJf"];
     let mut out: BTreeMap<([u8; 4], u16), Vec<Vec<u8>>> = BTreeMap::new();
-    for tag in TAGS {
-        let chunks = iff
-            .resource_order(tag)
-            .unwrap_or_else(|_| iff.chunks.iter().filter(|c| &c.tag == tag).collect());
-        for c in chunks {
-            if tag == b"BCON" && PRIVATE_BCONS.contains(&c.id) {
+    for c in &iff.chunks {
+        if LAST_CHUNK.contains(&&c.tag) {
+            if &c.tag == b"BCON" && PRIVATE_BCONS.contains(&c.id) {
                 // Written by the lift and checked as the trees' constants.
                 continue;
             }
+            out.insert((c.tag, c.id), vec![iff.data(c).to_vec()]);
+        } else if EVERY_CHUNK.contains(&&c.tag) {
             out.entry((c.tag, c.id))
                 .or_default()
                 .push(iff.data(c).to_vec());
         }
     }
-    // The VM loads the last BHAV chunk of each ID, deleted or not.
+    for tag in RESOURCE_ORDER {
+        let chunks = iff
+            .resource_order(tag)
+            .unwrap_or_else(|_| iff.chunks.iter().filter(|c| &c.tag == tag).collect());
+        for c in chunks {
+            out.entry((c.tag, c.id))
+                .or_default()
+                .push(iff.data(c).to_vec());
+        }
+    }
     for c in vm_kept_bhavs(iff).chunks {
         if !PRIVATE_TREES.contains(&c.id) {
             out.insert((c.tag, c.id), vec![iff.data(c).to_vec()]);

@@ -88,11 +88,17 @@ The code check compares a tree's frame and code. It does not compare the object 
 - **Create Object Instance** runs the new object's callbacks (`init`, then a turn of `main`), with or without its from-record flag. The new object may be this one, so every callback table must agree, and every callback tree is a callee.
 - **Definition and callback reads.** An Expression reading scope 21 (the stack object's definition words) or scope 35 (whether its callback table names a tree) needs this file's definitions (the live ones, in resource order, byte for byte), or its callback tables, to agree.
 - **The semi-global link.** Semi-global calls and constants go through `GLOB`, and so does every global tree a tree calls, since it runs with this object as its owner. When the rebuilt object's link differs (an empty name links nothing), no tree of the object is proven.
-- **Non-private code of this file.** The lift writes only private trees (4096–8191) and private constant tables (4096–4159). A file holding other trees or constant tables (for example the global file, or a file other objects link as their semi-global) is a file whose trees reach them by number, by a name another file supplies, or through constant addresses. When the rebuilt file does not keep them, no tree of the object is proven.
+- **Non-private code of this file.** The lift writes only private trees (4096–8191) and private constant tables (4096–4159). A file holding other trees or constant tables (for example the global file, or a file other objects link as their semi-global) is a file whose trees reach them by number, by a name another file supplies, or through constant addresses. When the rebuilt file does not keep them, no tree of the object is proven. The tables are compared as the VM loads them: the last chunk of each ID, deleted ones included.
+- **Global and semi-global trees a tree runs.** Such a tree (called by number, or run by function or as a created object's callback) runs with this object as its owner. The lift does not see its code, so it may run any private tree of this file by name, create an object, or read this file's texts, sounds, definitions or callback tables. Its caller is proven only when the rebuilt object gives the same tree labels and `GLOB` link, text tables, sounds, definitions and callback tables, and every private tree of the file is a callee. Resolving it would need the global and semi-global files' code in the lift options.
 
 **File roles.** The checks hold whichever role the lifted file plays for a running tree: the object's own file, another object's semi-global file, or the global file.
 
-**What the per-object note covers.** The lift's existing note lists the resources the rebuilt object does not reproduce, as the VM reads them (live resources in resource order; for trees, the last chunk of each ID). The list covers:
+**What the per-object note covers.** The lift's existing note lists the resources the rebuilt object does not reproduce, as the VM reads them (`sims-vm` `load_library_with_pool`):
+- `BHAV`, `BCON`, `FCNS`, `TTAB` and `SLOT`: the last chunk of each ID in file order, deleted ones included;
+- `STR#`: every chunk of the ID in file order (the VM keeps the last one that parses, deleted or not; comparing them all is stricter);
+- the others: the live resources in resource order.
+
+The list covers:
 - `STR#`, `CTSS`, `TTAB`, `TTAs`, `SLOT`, `FCNS`, `GLOB`, `TPRP`, `OBJD` and `OBJf`;
 - non-private BHAVs and BCONs.
 
