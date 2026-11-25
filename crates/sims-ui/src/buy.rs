@@ -9,7 +9,7 @@ use crate::frame::{Frame, Rect};
 use crate::hud::STRIP;
 use crate::thumbnail::{SIZE as CELL, TEMPLATE, Thumbnails};
 use sims_content::ui_graphics::US_ENGLISH;
-use sims_content::{BuyDefinition, BuyEligibility, BuyEntry, CatalogText};
+use sims_content::{BuyEligibility, CatalogText};
 use sims_content::{Catalog, Index, Install};
 use sims_formats::behavior::InteractionTable;
 use sims_formats::iff::Iff;
@@ -492,7 +492,7 @@ pub struct BuyCatalog {
 }
 
 /// OBJD byte offsets read by `0x4cb8e7..0x4cbaa8` and `0x457a36`; the words
-/// the catalog builder reads are [`BuyDefinition`]'s.
+/// the catalog builder reads are [`sims_content::BuyDefinition`]'s.
 const OBJD_PRICE: usize = 0x24;
 const OBJD_ROOM_SORT: usize = 0x4e;
 const OBJD_FUNC_SORT: usize = 0x50;
