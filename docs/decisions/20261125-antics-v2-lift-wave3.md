@@ -66,13 +66,13 @@ extras (`Plan::drop_wave3` runs first in every fallback chain).
 
 | Cell | Written as | Where |
 | --- | --- | --- |
-| scope 27, `k` < 8 | `h.sprite_flags[temp[k]]` | `h` is `self` in a Sim tree whose stack object stays put, else `stack_obj`; not under a cursor or Sims loop |
-| scope 30, `k` < 8 | `sim.person[temp[k]]` | Sim trees (not inherit trees) |
-| scope 31, `k` < 8 | `stack_obj.person[temp[k]]` | as scope 27 |
-| scope 24, 0..=9 | `h.neighbor.field[i]` | as scope 27 |
-| scope 32, 0..=255 | `h.neighbor.person[i]` | as scope 27 |
+| scope 27, `k` < 8 | `h.sprite_flags[temp[k]]` | `h` is `self` in a Sim tree whose stack object stays put, else `stack_obj`; not under a cursor (the lowering's cursor list has no sprite flags) or a Sims loop |
+| scope 30, `k` < 8 | `sim.person[temp[k]]`; `me.person[temp[k]]` in an inherit tree | Sim and inherit trees |
+| scope 31, `k` < 8 | `stack_obj.person[temp[k]]`; the binding's, `p.person[temp[k]]`, in a `for` loop whose cursor is the stack object | not in a Sims loop |
+| scope 24, 0..=9 | `h.neighbor.field[i]` | as scope 27, or through a cursor binding |
+| scope 32, 0..=255 | `h.neighbor.person[i]` | as scope 24 |
 | scopes 12 / 28 / 29, `m` < 16 | `advert.delta[m]` / `.personality[m]` / `.minimum[m]` | any tree |
-| person word 81 | `sim.fame`, `stack_obj.fame` (or the Sims-loop binding) | the lint's typed-word table does not name it, so the lift does |
+| person word 81 | `sim.fame` / `me.fame`, and the stack object's `stack_obj.fame` or a cursor or Sims-loop binding's `p.fame` | the lint's typed-word table does not name it, so the lift does |
 
 - The `i16` neighbor words get their names: `age`, `friend_count`, `family_house`,
   `family_friend_count`, and the person words `posture`, `pets_outside`, `job_type`,
@@ -94,10 +94,13 @@ extras (`Plan::drop_wave3` runs first in every fallback chain).
 - **`reach`.** Mode 1 is written `reach(mode: 1, moves: B, slot: param[p])`. Other modes are
   written `reach(mode: M, moves: B)`, but only when their parameter operand is 0, since an
   omitted `slot:` encodes 0.
-- **`make_new_character(skin:, age:, sex:, species:)`.** Written for locals named by the lift
-  (`slot_N`, declared `i16`) and species 0..=2.
-- **`drop_onto`.** A parameter slot is written `param[p]`, on either side. In an event
-  handler, parameter 0 is refused because the lift names it `event`.
+- **`make_new_character(skin:, age:, sex:, species:)`.** Written for species 0..=2. The three
+  locals get named `i16` declarations (`slot_N`), even when nothing else reads them.
+  - A pin that only this spelling needs marks the tree as using wave 3, so `drop_wave3`
+    removes the pin along with the spelling.
+- **`drop_onto`.** A parameter slot is written `param[p]`, on either side.
+  - The same holds inside an animation handler. There the argument names the parameter by
+    index, while the handler's `event` binding is a separate name for parameter 0.
 
 ## Decision 4: an `if` looping on itself keeps its `allow`
 
@@ -120,15 +123,15 @@ The corpus is all 1,191 lifted objects, at 10 workers. "Main" is main after #471
 
 | | behavioral, main | behavioral, wave 3 | strict, main | strict, wave 3 |
 | --- | ---: | ---: | ---: | ---: |
-| inline raw statements | 17,165 | 15,412 | 3,190 | 3,059 |
-| `raw {}` blocks | 12,563 | 11,312 | 19,538 | 19,436 |
-| lines inside inline raw | 88,507 | 81,292 | 6,265 | 5,918 |
-| total lines | 944,493 | 942,412 | 963,507 | 963,489 |
+| inline raw statements | 17,165 | 14,920 | 3,190 | 3,059 |
+| `raw {}` blocks | 12,563 | 10,820 | 19,538 | 19,436 |
+| lines inside inline raw | 88,507 | 80,800 | 6,265 | 5,918 |
+| total lines | 944,493 | 941,428 | 963,507 | 963,489 |
 | `untyped_engine_constant` | 12,789 | **0** | 1,291 | **0** |
 | `prefer_method_syntax` | 11,204 | **0** | 686 | **0** |
 | `prefer_question_mark` | 213 | **0** | 91 | **0** |
 | lint findings, all rules | 24,322 | 116 | 2,080 | 12 |
-| sweep time | 74.6 s | 68.5 s | 83.3 s | 92.9 s |
+| sweep time | 74.6 s | 73.5 s | 83.3 s | 88.1 s |
 
 - **What lint still reports** is unchanged from main: 116 behavioral (`manual_raw_has_builtin`
   64, `frame_headroom` 46, `negated_comparison` 3, `collapsible_if_chain` 2,
@@ -136,8 +139,8 @@ The corpus is all 1,191 lifted objects, at 10 workers. "Main" is main after #471
 - **Raw statements per file.** In four behavioral files the count rises by one: one raw block
   splits in two around a newly lifted neighbor `if`, so the raw text there is shorter.
 - **Sweep time.** The lint pass costs at least one extra build per file that has findings. The
-  timings were taken on a loaded machine, and the behavioral number varied by more than the
-  difference between runs.
+  timings were taken on a loaded machine: across sweeps of this change, behavioral ranged
+  from 65 s to 81 s and strict from 87 s to 98 s.
 - **Strict mode** writes most trees whole as raw, so the PR I-4 forms mostly help in
   behavioral mode. Padded calls that stay raw (about 2,500 `play_sound` and 640
   `clear_motive_changes` in strict, 414 and 240 in behavioral) sit in raw-fallback trees, or
@@ -145,10 +148,10 @@ The corpus is all 1,191 lifted objects, at 10 workers. "Main" is main after #471
   form builds there, but the tree has lost every extra.
 - **New spellings in behavioral output:**
   - `padN:` options on 2,871 `play_sound` and 629 `clear_motive_changes` calls;
-  - 687 `sprite_flags[temp[k]]` and 12 `person[temp[k]]`;
+  - 687 `sprite_flags[temp[k]]` and 504 `person[temp[k]]`, most of them in inherit trees;
   - 213 `advert.delta[m]`;
-  - about 500 neighbor cells, most of them named;
-  - 85 `fame`;
+  - 512 neighbor cells, most of them named;
+  - 112 `fame`;
   - 166 `reach(..)`, 196 `drop_onto` parameter slots and 13 `make_new_character(..)`.
 
 ## Consequences
