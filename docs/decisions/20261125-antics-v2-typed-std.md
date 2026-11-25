@@ -54,27 +54,32 @@ name (`parse_v2_std_file`).
   - It rejects object handles, so `stack_obj as i16` is an error.
   - Const evaluation folds it.
   - Only `i16` is accepted as a target: `as u8` is a parse error.
-- **`T::from_raw(expr)`** works for any enum or bitflags type `T`.
+- **`T::from_raw(expr)`** works for any bitflags type and any `std::engine` enum `T`.
   - It takes exactly one positional `i16` (or a `T`).
   - It lowers to its argument.
+  - A user enum is refused: it is closed, and a word with no variant would match a listed arm.
 
-Neither adds a node.
+Neither adds a node, and a comparison reads either one in place, as it reads the value it converts.
 
 ## Decision 3: engine words are lenient; engine enums are open
 
 - **A `std::flags` type, or the untyped `self.flags` word, is an engine word.** It takes raw `i16`
   operands exactly as before:
-  - `w = 5`, `n = w`, `w & 4`, `w flag_set 3`, `w flag_test 2`.
+  - `w = 5`, `n = w`, `w & 4`, `w > 0`, `w flag_set 3`, `w flag_test 2`.
 
   This is what keeps about 2,000 numeric `self.wall_placement flag_set N` uses in the lift corpus
   compiling. **User bitflags stay strict.**
 - **An `i16` cell takes a typed single-flag constant** of any bitflags type in
   `flag_test`/`flag_set`/`flag_clear`, for example `world.expansions flag_test Expansions::Pets`.
-  A multi-bit mask is an error.
+  A multi-bit mask is an error, and so is a constant that mixes two bitflags types. Past the
+  constant path, a flag operation takes only an `i16` bit number. A runtime bitflags value is a mask,
+  not a bit, so it is refused.
 - **Engine enums are strict in assignments.** `self.facing = 3` is an error; use
   `Direction::from_raw(3)`.
 - **Engine enums are open.** A word may hold a value with no variant, so a `match` on a
   `std::engine` enum needs a `_` arm, even when every variant is listed. User enums stay closed.
+  The verifier's `--v2-enum-domains` therefore assumes no domain for a `std::engine` parameter.
+  This is a 2-line change in `verify/domains.rs`.
 - **Primitive operands take engine constants as their numbers.** This covers any constant
   primitive operand: `refresh(target: RefreshTarget::StackObject, mode: RefreshMode::RecountRoom)`,
   and the `category:` of `can_afford`, `debit_funds` and `credit_funds`.
@@ -93,7 +98,7 @@ alias check.
 | `wall_adjacency` | data 5 | `WallAdjacency` |
 | `room_impact` | data 7 | `i16` |
 | `flags` | data 8 | any bitflags (`ObjectFlags`) |
-| `wall_placement` | data 13 | `WallPlacement` |
+| `wall_placement` | data 13 | `i16`, as before; takes `WallPlacement` constants |
 | `broken` | data 15 | `i16` |
 | `weight`, `support_strength` | data 27, 28 | `i16` |
 | `flags2` | data 40 | `ObjectFlags2` |
@@ -107,6 +112,9 @@ alias check.
 
 Notes on the table:
 
+- **`wall_placement` stays `i16`.** It was already a named `i16` word, and numeric code uses it
+  as one, for example as the destination of `random_into`. As an `i16` word it still takes typed
+  single-flag constants. The words that are new in this change are typed.
 - **A state of the same name wins** over an engine word, for `self` and for typed handles. Existing
   objects with `state value` keep their meaning.
 - **`container` is read-only.** The engine traps a script store of a different value into data
@@ -152,7 +160,14 @@ Changes to the existing entries:
 
 - **382 `ensure_standing` is now `-> bool`.** No caller treats its false exit as an error, and 34
   callers ignore it. With `-> Result`, those 34 statement calls could not be written.
-- **286's parameter is renamed `points`.** It is a skill value, not a skill index.
+- **286 keeps its parameter name `skill`**, so named calls still compile. Its comment says the
+  parameter is a skill value (0..1000), not a skill index.
+
+One compatibility edge: a file that has both `use std::globals::*;` and a local
+`extern mod globals` declaring one of the 45 new trees with another ABI is now refused, because
+the merge sees one tree called two ways. No file in the repository does this. The lift already puts
+such trees in `more_globals`, and `duplicate_std_global` points at the local declaration. The fix
+is to rename the local block.
 
 The existing names stay so that the open pack and the pilots keep compiling. Several are close to
 the original labels. Renaming them needs a migration and is left as a follow-up.

@@ -168,6 +168,12 @@ impl<'a> TreeLowerer<'a> {
                 rhs,
                 ..
             } => {
+                // Any bitflags type: both sides must still be the same type.
+                if expected_key == ANY_BITFLAGS {
+                    return Ok(self
+                        .try_eval_any_const_bitflag(expr)?
+                        .map(|(_, mask, bit)| (mask, bit)));
+                }
                 let Some((lmask, _)) = self.try_eval_const_bitflag(lhs, expected_key)? else {
                     return Ok(None);
                 };
@@ -605,9 +611,9 @@ impl<'a> TreeLowerer<'a> {
             }
             // `Enum::Variant as i16`, `Flags::A | Flags::B as i16`, or an i16 constant.
             V2Expr::Unary {
+                span,
                 op: V2UnaryOp::AsI16,
                 inner,
-                ..
             } => {
                 if let Some((_, mask, _)) = self.try_eval_any_const_bitflag(inner)? {
                     return Ok(mask);
@@ -615,7 +621,13 @@ impl<'a> TreeLowerer<'a> {
                 if let Some(v) = self.try_eval_any_const_enum(inner)? {
                     return Ok(v);
                 }
-                self.eval_const_i16(inner)
+                let as_int = self.eval_const_i16(inner);
+                if as_int.is_err()
+                    && let Ok(b) = self.eval_const_bool_required(inner, *span)
+                {
+                    return Ok(i16::from(b));
+                }
+                as_int
             }
             V2Expr::Ident(span, name) => {
                 if let Some(binding) = self.lookup_var(name) {

@@ -22,6 +22,23 @@ impl<'a> TreeLowerer<'a> {
                 inner,
                 ..
             } => matches!(inner.as_ref(), V2Expr::Int(_, _)),
+            // The conversions add no node: `x as i16` and `T::from_raw(x)` are `x`'s operand.
+            V2Expr::Unary {
+                op: V2UnaryOp::AsI16,
+                inner,
+                ..
+            } => self.is_pure_single_operand(inner),
+            V2Expr::Call {
+                callee,
+                type_args,
+                args,
+                ..
+            } if type_args.is_empty()
+                && matches!(args.as_slice(), [a] if a.name.is_none())
+                && self.raw_conversion_target(callee).is_some() =>
+            {
+                self.is_pure_single_operand(&args[0].value)
+            }
             V2Expr::Deref { inner, .. } => {
                 if let V2Expr::Ident(_, pname) = inner.as_ref() {
                     matches!(
@@ -211,9 +228,11 @@ impl<'a> TreeLowerer<'a> {
                 }
             }
             V2BinOp::Lt | V2BinOp::Le | V2BinOp::Gt | V2BinOp::Ge => {
-                if !matches!(l_ty, ValueType::I16 | ValueType::ObjectId)
-                    || !matches!(r_ty, ValueType::I16 | ValueType::ObjectId)
-                {
+                // An engine word compares as the `i16` it is.
+                let ordered = |t: &ValueType| {
+                    matches!(t, ValueType::I16 | ValueType::ObjectId) || is_engine_flags(t)
+                };
+                if !ordered(&l_ty) || !ordered(&r_ty) {
                     return Err(Error::at(
                         span,
                         format!(

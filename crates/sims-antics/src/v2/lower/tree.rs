@@ -667,14 +667,10 @@ const OBJECT_DATA_WORDS: &[(&str, EngineWord)] = &[
     ("room_impact", word(7, EngineWordTy::I16)),
     // Movement and intersection flags; any bitflags type converts (`std::flags::ObjectFlags`).
     ("flags", word(8, EngineWordTy::Flags(ANY_BITFLAGS))),
-    // The wall-placement rules.
-    (
-        "wall_placement",
-        word(
-            13,
-            EngineWordTy::Flags("bitflags::std::flags::WallPlacement"),
-        ),
-    ),
+    // The wall-placement rules (`std::flags::WallPlacement`). Stays `i16`, as it was before the
+    // typed words, so every numeric use still compiles; an `i16` word takes typed single-flag
+    // constants (`self.wall_placement flag_set WallPlacement::NoCorner`).
+    ("wall_placement", word(13, EngineWordTy::I16)),
     // Broken (a broken object sells for half).
     ("broken", word(15, EngineWordTy::I16)),
     // Weight, and the weight a container may hold.

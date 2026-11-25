@@ -112,7 +112,7 @@ pub extern mod globals {
     // Skills.
     // Shows the meter for a skill value (0..1000). False only off a home lot without expansion
     // bit 6 (`std::flags::Expansions::Pets`). Writes temp[0].
-    #[id(286)] fn show_skill_progress(points: i16) -> bool;
+    #[id(286)] fn show_skill_progress(skill: i16) -> bool;
 
     // Companions and conversations.
     #[id(332)] fn push_on_companion(interaction: i16) -> bool;

@@ -3866,9 +3866,13 @@ impl Parser {
     /// every binary operator.
     fn parse_unary_expr(&mut self) -> Result<V2Expr> {
         let mut expr = self.parse_prefix_expr()?;
+        // Each cast nests the expression one level deeper, so it counts toward the limit.
+        let mut casts = 0;
         while matches!(&self.peek().kind, TokenKind::Ident(s) if s == "as") {
             let span = self.span();
             self.bump();
+            self.enter_nesting(span)?;
+            casts += 1;
             if !self.eat_ident("i16") {
                 return Err(Error::at(
                     self.span(),
@@ -3880,6 +3884,9 @@ impl Parser {
                 op: V2UnaryOp::AsI16,
                 inner: Box::new(expr),
             };
+        }
+        for _ in 0..casts {
+            self.leave_nesting();
         }
         Ok(expr)
     }

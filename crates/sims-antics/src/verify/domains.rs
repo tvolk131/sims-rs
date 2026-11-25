@@ -294,8 +294,9 @@ pub fn v2_enum_param_domains(path: &Path, pack_dir: Option<&Path>) -> Result<Vec
         if matches!(name, "Height" | "Placement" | "Self") {
             return None;
         }
-        let (_, e) = resolved.module_scopes.get(module)?.enums.get(name)?;
-        Some(e.variants.iter().map(|v| v.value).collect())
+        let (owner, e) = resolved.module_scopes.get(module)?.enums.get(name)?;
+        // A `std::engine` enum is open: the word may hold a value with no variant.
+        (owner != "std::engine").then(|| e.variants.iter().map(|v| v.value).collect())
     };
 
     let mut out = Vec::new();

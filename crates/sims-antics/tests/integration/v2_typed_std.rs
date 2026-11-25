@@ -410,3 +410,124 @@ fn std_globals_call_the_documented_trees() {
         ],
     );
 }
+
+#[test]
+fn flag_operations_never_take_a_mask_as_a_bit() {
+    expect_err(
+        "runtime_mask.antics",
+        &sim_tree("", "let f = Height::from_raw(8); temp[0] flag_set f;"),
+        "takes a single flag constant or an i16 bit number, found 'Height'",
+    );
+    expect_err(
+        "runtime_mask_engine.antics",
+        &sim_tree("", "let f = Height::from_raw(8); self.flags flag_clear f;"),
+        "takes a single flag constant or an i16 bit number",
+    );
+    let two = "bitflags First { One = 5 }\nbitflags Second { Two = 5 }";
+    expect_err(
+        "mixed_set.antics",
+        &sim_tree(two, "temp[0] flag_set First::One | Second::Two;"),
+        "type mismatch",
+    );
+    expect_err(
+        "mixed_test.antics",
+        &sim_tree(
+            two,
+            "if temp[0] flag_test First::One | Second::Two { temp[1] = 1; }",
+        ),
+        "type mismatch",
+    );
+}
+
+#[test]
+fn from_raw_keeps_user_enums_closed() {
+    expect_err(
+        "closed.antics",
+        &sim_tree(
+            "enum Mode { Idle = 0, Active = 1 }",
+            "let m = Mode::from_raw(99);",
+        ),
+        "'Mode::from_raw' is only for 'std::engine' enums and bitflags types",
+    );
+    // A user bitflags type converts: any mask is a value of it.
+    expand(
+        "user_flags.antics",
+        &sim_tree(
+            "bitflags Mine { A = 1 }",
+            "let m = Mine::from_raw(self.n); self.n = m as i16;",
+        ),
+    );
+}
+
+#[test]
+fn engine_words_compare_and_convert_like_i16() {
+    let air = expand(
+        "compat.antics",
+        &sim_tree(
+            "use std::engine::Direction;",
+            "if self.wall_placement > 0 { temp[0] = 1; } \
+             random_into(self.wall_placement, 6); \
+             if self.flags2 > 0 { temp[0] = 2; } \
+             if temp[0] == Direction::East as i16 { temp[1] = 7; } \
+             if self.facing == Direction::from_raw(2) { temp[1] = 8; } \
+             refresh(target: true as i16, mode: 0);",
+        ),
+    );
+    expect_lines(
+        "compat",
+        &air,
+        &[
+            "if stack.data[13] > 0 {",
+            "random(stack.data[13], 6);",
+            "if stack.data[40] > 0 {",
+            "if temp[0] == 2 {",
+            "if stack.data[1] == 2 {",
+            "refresh(target: 1, mode: 0);",
+        ],
+    );
+    assert!(!air.contains("__cmp_l"), "a cast must not stage: {air}");
+    let casts = " as i16".repeat(65);
+    expect_err(
+        "deep_casts.antics",
+        &sim_tree("", &format!("temp[0] = 1{casts};")),
+        "nesting depth exceeds maximum",
+    );
+    // `show_skill_progress` keeps its parameter name for named calls.
+    let air = expand(
+        "skill_named.antics",
+        &sim_tree(
+            "use std::globals::*;",
+            "if !globals::show_skill_progress(skill: 250) { return error; }",
+        ),
+    );
+    expect_lines("skill_named", &air, &["call 286(250)"]);
+}
+
+#[test]
+fn engine_enum_parameters_get_no_verifier_domain() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("v2-typed-std-domains-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    let source = dir.join("open.antics");
+    std::fs::write(
+        &source,
+        r#"use std::engine::Direction;
+enum Closed { A = 0, B = 1 }
+object "Domains" {
+    guid: 0x7F40_0250;
+    state n: i16;
+    #[bhav] fn open(sim: Sim, d: Direction) {
+        match d { Direction::North => { self.n = 1; } _ => {} }
+    }
+    #[bhav] fn closed(sim: Sim, c: Closed) {
+        match c { Closed::A => { self.n = 1; } Closed::B => {} }
+    }
+}
+"#,
+    )
+    .expect("write source");
+    let found = sims_antics::verify::v2_enum_param_domains(&source, None).expect("extract");
+    let names: Vec<&str> = found.iter().map(|d| d.param_name.as_str()).collect();
+    // A `std::engine` word may hold any value, so only the closed user enum is assumed.
+    assert_eq!(names, ["c"], "{found:#?}");
+}

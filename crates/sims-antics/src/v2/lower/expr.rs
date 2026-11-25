@@ -1158,8 +1158,9 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
-    /// `T::from_raw(e)`: the operand of the `i16` expression `e`, typed `T` (no `.air` nodes).
-    /// Any word is accepted: engine enums stay open, so a `match` on one needs a `_` arm.
+    /// `T::from_raw(e)`: the operand of the `i16` expression `e`, typed `T` (no `.air` nodes),
+    /// for a bitflags type or a `std::engine` enum. Any word is accepted: engine enums stay
+    /// open, so a `match` on one needs a `_` arm.
     pub(super) fn lower_from_raw(
         &mut self,
         span: Span,
@@ -1172,6 +1173,18 @@ impl<'a> TreeLowerer<'a> {
             return Err(Error::at(
                 span,
                 format!("'{name}::from_raw' takes exactly one positional i16 argument"),
+            ));
+        }
+        // A user enum is closed: a `match` lists its variants with no `_`, so a word with no
+        // variant must not reach one.
+        if let ValueType::Enum(key) = &target
+            && !is_engine_enum_key(key)
+        {
+            return Err(Error::at(
+                span,
+                format!(
+                    "'{name}::from_raw' is only for 'std::engine' enums and bitflags types: '{name}' is a closed enum, so a word with no variant would match a listed arm"
+                ),
             ));
         }
         let (air, ty) = self.lower_value_expr(&args[0].value)?;

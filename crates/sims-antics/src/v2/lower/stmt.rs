@@ -219,6 +219,19 @@ impl<'a> TreeLowerer<'a> {
                     Some(r) => r,
                     None => self.lower_value_expr(value)?,
                 };
+                // Past the constant path, a flag operation takes a raw bit number: a runtime
+                // bitflags value is a mask, not a bit.
+                if matches!(op, V2AssignOp::FlagSet | V2AssignOp::FlagClear)
+                    && val_ty != ValueType::I16
+                {
+                    return Err(Error::at(
+                        value.span(),
+                        format!(
+                            "'flag_set'/'flag_clear' takes a single flag constant or an i16 bit number, found '{}'",
+                            self.env.display_value_type(&val_ty)
+                        ),
+                    ));
+                }
                 if *op != V2AssignOp::Set {
                     match &target_ty {
                         ValueType::Bool => {
