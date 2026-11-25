@@ -76,9 +76,13 @@ impl<'a> TreeLowerer<'a> {
     /// stable cell. Unknown effects (including primitives, calls, raw code, and indirect
     /// writes) force a snapshot. A Sim tree's `stack.attr` can address a different object
     /// even before the helper is entered, so only declared attributes on `my` qualify.
+    /// Any other plain cell (an object's, the Sim's, a global) is forwarded only when reading it
+    /// cannot fault (so moving or dropping the read changes nothing) and the helper is pure
+    /// ([`HelperCell::Pure`]).
     pub(super) fn can_forward_helper_cell(
         &self,
         air: &str,
+        arg_expr: &V2Expr,
         decl: &FnDecl,
         args: &[&V2Expr],
     ) -> bool {
@@ -96,6 +100,13 @@ impl<'a> TreeLowerer<'a> {
             && self.env.states.values().any(|s| s.attr_index == i as usize)
         {
             HelperCell::OwnAttr(i)
+        } else if is_plain_cell(air)
+            // Person words exist only on a Sim: the runner of a Sim tree.
+            && (!air.starts_with("my.person[")
+                || (matches!(self.tree_ctx, TreeContext::SimOnObject { .. }) && !self.inherit_tree))
+            && !self.expr_may_fault_read(arg_expr, false)
+        {
+            HelperCell::Pure
         } else {
             return false;
         };
@@ -263,7 +274,7 @@ impl<'a> TreeLowerer<'a> {
             loc
         };
         let bind_operand = |c: &mut Self, air: String, ty: ValueType| {
-            if read_only && c.can_forward_helper_cell(&air, fn_decl, call_args) {
+            if read_only && c.can_forward_helper_cell(&air, arg_expr, fn_decl, call_args) {
                 Binding::Operand { air, ty }
             } else {
                 Binding::Local {
@@ -1097,4 +1108,20 @@ impl<'a> TreeLowerer<'a> {
             (rv, vty)
         }))
     }
+}
+
+/// `air` names one cell of an object, the Sim, or the globals (`stack.attr[3]`, `my.person[8]`,
+/// `global[20]`): one word read in place, with no operator, call, or local.
+fn is_plain_cell(air: &str) -> bool {
+    let Some((head, rest)) = air.split_once('[') else {
+        return false;
+    };
+    let Some(index) = rest.strip_suffix(']') else {
+        return false;
+    };
+    index.parse::<u16>().is_ok()
+        && matches!(
+            head,
+            "global" | "stack.attr" | "stack.data" | "my.attr" | "my.data" | "my.person"
+        )
 }

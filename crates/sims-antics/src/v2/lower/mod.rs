@@ -738,6 +738,9 @@ enum HelperCell {
     Temp(i16),
     Param(i16),
     OwnAttr(i16),
+    /// Any other object, global or Sim cell: forwarded only into a helper whose body writes
+    /// nothing but its own locals and calls nothing, so no cell (and no cursor) changes.
+    Pure,
 }
 
 /// One lowering of a source declaration: the source call sites of the inlined helpers around

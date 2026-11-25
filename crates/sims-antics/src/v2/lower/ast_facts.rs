@@ -448,6 +448,9 @@ pub(super) fn stmts_preserve_helper_cell(
         V2Stmt::Let { init, .. } => expr_ok(init),
         V2Stmt::Assign { target, value, .. } => {
             let disjoint = match target {
+                // A pure helper writes only its own locals, never the cursor.
+                V2Expr::Ident(_, name) if cell == HelperCell::Pure => name != "stack_obj",
+                _ if cell == HelperCell::Pure => false,
                 // Bare identifiers in helper scope name local bindings or `stack_obj`.
                 V2Expr::Ident(..) => true,
                 V2Expr::Field { base, field, .. } => match cell {
