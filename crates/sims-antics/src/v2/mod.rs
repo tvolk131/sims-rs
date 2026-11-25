@@ -99,7 +99,14 @@ fn first_word(source: &str, attributes: bool) -> Option<&str> {
         if rest.starts_with(b"//") {
             pos = line_end(bytes, pos);
         } else if rest.starts_with(b"/*") {
-            pos = block_comment_end(bytes, pos);
+            // v2 block comments nest; `.air`'s end at the first `*/`.
+            pos = if attributes {
+                block_comment_end(bytes, pos)
+            } else {
+                source[pos + 2..]
+                    .find("*/")
+                    .map_or(bytes.len(), |n| pos + 2 + n + 2)
+            };
         } else if attributes && rest.starts_with(b"#[") {
             match attribute_end(bytes, pos) {
                 Some(end) => pos = end,
@@ -643,6 +650,8 @@ mod tests {
             "#[x]\nbcon 4096 \"T\" {}",
             // A `#[..]` line `.air` reads as a comment, whatever follows on it.
             "#[tag] generated source\ntree 4096 \"T\" { return true; }",
+            // `.air` block comments do not nest: the first `*/` ends this one.
+            "/* an opening marker /* is text */\ntree 4096 \"T\" { return true; }\n# */ generated",
         ] {
             assert!(!is_v2_source(source), "{source:?} is .air");
         }

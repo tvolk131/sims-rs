@@ -21,10 +21,10 @@ Separately, `check`, `equiv` and `fmt` used `is_v2_source`, which looked at the 
 
 ## Decision 1: one detector
 
-`is_v2_source` reads the file's first word twice, after skipping whitespace and `//` and nested `/* */` comments:
+`is_v2_source` reads the file's first word twice, after skipping whitespace and comments:
 
-1. **As `.air`.** It also skips `#` lines, which `.air` reads as comments, including `#[..]` lines. If the first word is `tree`, `interaction`, `bcon` or `str`, the file is `.air`.
-2. **As v2.** It skips `#[...]` attributes instead (balanced brackets, strings skipped). If any word follows, the file is v2: `use`, `const`, `fn`, `object`, `extern`, `enum` and so on. A mistyped keyword then gets the v2 parser's diagnostic.
+1. **As `.air`.** It skips `//` comments, `/* */` comments ending at the first `*/` (they do not nest in `.air`), and `#` lines, which `.air` reads as comments, including `#[..]` lines. If the first word is `tree`, `interaction`, `bcon` or `str`, the file is `.air`.
+2. **As v2.** It skips `//` comments, nested `/* */` comments, and `#[...]` attributes (balanced brackets, strings skipped). If any word follows, the file is v2: `use`, `const`, `fn`, `object`, `extern`, `enum` and so on. A mistyped keyword then gets the v2 parser's diagnostic.
 
 A file with no word at all is not v2.
 
@@ -35,11 +35,11 @@ A file with no word at all is not v2.
 | Rule | Severity | Fires on | Does not fire on |
 | --- | --- | --- | --- |
 | `shadowed_const` | warning | A block `const NAME = ..;` / `const (A, B) = ..;`, or a `const n: T` parameter, whose name is a file constant or a constant of the enclosing object or template. Also an object constant named like a file constant. | Names imported with `use` (not resolved here). |
-| `unused_decl` (constants) | warning | File, object and block constants no code names. | `pub` constants; template constants; `_` names; a name written anywhere in the file set other than as a `const` name (bodies, `guid:`, indices, other constants); a name a `raw` block uses; a block binding whose selector returns, breaks or continues (it is control flow). |
+| `unused_decl` (constants) | warning | File, object and block constants no code names. | `pub` constants; template constants; `_` names; a name written anywhere in the file set other than as a `const` name (bodies, `guid:`, indices, other constants); a name a `raw` block uses; a block binding whose selector returns, breaks or continues (it is control flow). When the selector calls something, the help says to keep the calls. |
 | `duplicate_std_global` | warning | An `extern mod` function (top level, object or template) whose ID, parameter types and slots, and return ABI equal a `std::globals` function. Names are ignored; the help lists the `std::globals` parameter names when they differ, since named arguments must change. | The same ID with another ABI. |
 | `untyped_engine_field` | warning | A cell read or written by an index written as a number, where the cell has a typed name lowering maps to the same operand (tables below). | Indices with no name; a constant index (a specialized `const` parameter may stand for several cells); anything in `raw { }`; `world.x` (it parses to `global[N]`, so the source text is checked); a handle name a parameter or local rebinds (`let me`, `self: Sim`). |
 | `raw_syntax` | error, cannot be allowed | A `raw { }` body that does not parse as `.air`. | See Decision 4. |
-| `object_tree_me_field` | error, cannot be allowed | `me.<field>` in an object's own tree (`init`, `main`, `load`, `reset`, `cleanup`, or a tree with no Sim parameter and no `context = inherit`). There `me` is the object, and lowering rejects every field. | `me.attr[N]` / `me.data[N]` and other indexed cells; Sim contexts; `context = inherit` trees; a local or parameter named `me`; a file set with a BCON table (own, template or `extern bcon`) named `me`. |
+| `object_tree_me_field` | error, cannot be allowed | `me.<field>` in an object's own tree (`init`, `main`, `load`, `reset`, `cleanup`, or a tree with no Sim parameter and no `context = inherit`). There `me` is the object, and lowering rejects every field. | Indexed cell groups (`me.attr[N]`, `data`, `person`, `motive`, `slot`, `sprite_flags`); Sim contexts; `context = inherit` trees; a parameter named `me` (a functional's guard included), or a local from its declaration to the end of its block; wherever `me` may be a BCON table: one the file set declares (own, template or `extern bcon`), a `use` importing `me` or a glob from outside `std`, or a template from another module. |
 
 Block `const` bindings are specialized away by the parser, so both constant rules read them from the token stream. A `const` followed by `NAME =`, `( .. ) =` or `NAME :` is a binding unless it is a declaration the AST holds. Its scope is the last object, template or helper that starts before it.
 
@@ -64,15 +64,23 @@ Each entry was checked against lowering (`lower/expr.rs`, `lower/lvalue.rs`, `lo
 
 Across corpus-v2, the rule reports 996 findings in 426 decompiled files. With every suggestion applied, all 426 files still pass `check`. The findings are real; the decompiler could print the typed names.
 
-## Decision 4: `raw_syntax` parses like lowering, and does not resolve names
+## Decision 4: `raw_syntax` reports only what `check` rejects
 
-The body is wrapped the way lowering validates it (`tree 4096 "__raw_check" { .. }`). It is preceded by the `const` lines lowering would declare for it:
+`raw_syntax` is an error that cannot be allowed, so it must not fire on code `check` accepts. It may miss some code `check` rejects: `check` is the authority.
 
-- each file or object constant, and each BCON entry `TABLE.entry` of an own table or an `extern bcon`, that the code names;
+Each block is first parsed the way lowering validates it (`tree 4096 "__raw_check" { .. }`). It is preceded by the `const` lines lowering would declare for it:
+
+- each file or object constant the code names;
+- each BCON entry `TABLE.entry`, of an own table or an `extern bcon`, as the `bcon[..]` operand lowering passes;
 - less the constants the block declares itself (by full name, `K` or `T.e`);
-- less the `.air` locals (`let` / `local`) any raw block of the tree declares, since `.air` locals are tree-wide and win over constants.
+- less the `.air` locals (`let` / `local`) the tree's raw blocks declare, since `.air` locals are tree-wide and win over constants.
 
-A constant brought in by `use` from another module is not resolved here. So when the parse stops at a name, or at the `.` of a `T.e`, that name is declared with a placeholder value and the body is parsed again (at most 32 names). Only an error that remains is reported. A stray word (`temp[0] := 1 nonsense;`) still fails at the same place, so it is still reported.
+A block that fails is parsed again in two more ways:
+
+1. **Every name declared.** No tree-wide locals are assumed, since one may sit in discarded code that declares nothing. Every other name the block uses (not a keyword, call, label, field, declaration, known constant, or the block's own constant) is declared as a constant, once as a number and once as a `bcon[..]` operand. A `use` may bring such a name in from another module, and the lint does not resolve modules.
+2. **Blocks read together.** When the tree has other raw blocks, all of them are parsed together, in order. In the emitted tree, one block may finish another's statement.
+
+An error is reported only if every reading fails, the shared reading's error falls inside the block, and the block's brackets balance. The block's own first error is the one reported. So a known constant is never declared twice, and a forward reference to the block's own constant is still reported.
 
 ## Consequences
 

@@ -2365,3 +2365,145 @@ fn duplicate_std_global_help_names_the_std_parameters() {
         "{d:?}"
     );
 }
+
+// --- review round 2 regressions ------------------------------------------------------------------
+
+/// A one-tree object around `init` statements.
+fn init(body: &str) -> String {
+    format!("object \"Probe\" {{ guid: 1; init {{ {body} }} }}\n")
+}
+
+/// Whether `check` compiles `source`.
+fn compiles(source: &str) -> bool {
+    sims_antics::compile_v2_source(
+        "probe.antics",
+        source,
+        &sims_antics::v2::PackResolverConfig::default(),
+    )
+    .is_ok()
+}
+
+#[test]
+fn a_functional_guard_sees_the_functional_parameters() {
+    let source = "object \"Probe\" { guid: 1; functional prep(me: ObjectId) { guard(sim) => me.data[2] == 0, run(sim) {} } }\n";
+    assert!(compiles(source));
+    none(source, "untyped_engine_field");
+}
+
+#[test]
+fn me_may_be_an_imported_bcon_table() {
+    for source in [
+        format!("use crate::imported::me;\n{}", init("temp[0] = me.room;")),
+        "use crate::imported::Base;\nobject \"Probe\" from Base { guid: 1; init { temp[0] = me.room; } }\n"
+            .to_owned(),
+    ] {
+        none(&source, "object_tree_me_field");
+    }
+}
+
+#[test]
+fn a_local_me_is_in_scope_only_after_it_and_in_its_block() {
+    // The initializer still reads the object's `me`.
+    one(
+        &init("let me: ObjectId = me.id; temp[0] = me.room;"),
+        "object_tree_me_field",
+    );
+    // After the `if`, `me` is the object again.
+    let source = init(
+        "if temp[0] == 1 { let me: ObjectId = self.id; temp[1] = me.room; } temp[2] = me.room;",
+    );
+    let d = one(&source, "object_tree_me_field");
+    assert_eq!(d.column, source.rfind("me.room").unwrap() + 1, "{d:?}");
+}
+
+#[test]
+fn only_cell_groups_of_me_may_be_indexed() {
+    let source = init("temp[0] = me.room[0];");
+    assert!(!compiles(&source));
+    one(&source, "object_tree_me_field");
+}
+
+#[test]
+fn raw_code_in_a_for_else_is_checked() {
+    let bad = init("for p in objects_by_guid(1) {} else { raw { temp[0] := ; } }");
+    assert!(!compiles(&bad));
+    one(&bad, "raw_syntax");
+    let good = format!(
+        "const COUNT = 4;\n{}",
+        init("for p in objects_by_guid(1) {} else { raw { let COUNT = 0; } } raw { COUNT := 1; }")
+    );
+    assert!(compiles(&good));
+    none(&good, "raw_syntax");
+}
+
+#[test]
+fn raw_syntax_reports_nothing_check_accepts() {
+    for source in [
+        // A local in discarded code declares nothing.
+        format!(
+            "const COUNT = 4;\n{}",
+            init("if false { raw { let COUNT = 0; } } raw { temp[COUNT] := 1; }")
+        ),
+        // One block finishes another's statement.
+        init("raw { temp[0] := 1 } raw { ; }"),
+    ] {
+        assert!(compiles(&source), "{source}");
+        none(&source, "raw_syntax");
+    }
+    // A constant `use` brings in, whatever the error points at, and many of them.
+    let names: Vec<String> = (0..40).map(|i| format!("K{i}")).collect();
+    let many = names
+        .iter()
+        .map(|n| format!("temp[{n}] := 1;"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for body in [
+        "raw { sleep(TICKS); }".to_owned(),
+        format!("raw {{ {many} }}"),
+    ] {
+        none(
+            &format!("use crate::tuning::*;\n{}", init(&body)),
+            "raw_syntax",
+        );
+    }
+}
+
+#[test]
+fn raw_syntax_reports_what_check_rejects() {
+    for source in [
+        // BCON entries are `bcon[..]` operands, which `sleep` does not take.
+        format!(
+            "extern bcon Tune {{ #[addr(16521)] value; }}\n{}",
+            init("raw { sleep(Tune.value); }")
+        ),
+        "object \"Probe\" { guid: 1; bcon 4096 \"Tune\" { value = 1 } init { raw { sleep(Tune.value); } } }\n"
+            .to_owned(),
+        // A forward reference to the block's own constant.
+        init("raw { temp[VALUE] := 1; const VALUE = 1; }"),
+        // A known constant is not declared twice: its own error stays.
+        format!("const COUNT = 4;\n{}", init("raw { COUNT := 1; }")),
+    ] {
+        assert!(!compiles(&source), "{source}");
+        let d = one(&source, "raw_syntax");
+        assert!(!d.message.contains("duplicate"), "{d:?}");
+    }
+}
+
+#[test]
+fn an_entry_named_like_a_keyword_is_no_control_flow() {
+    let source = format!(
+        "extern bcon Tune {{ #[addr(16521)] break; }}\n{}",
+        init("const UNUSED = if temp[0] == 1 { Tune.break } else { 1 }; temp[1] = 2;")
+    );
+    one(&source, "unused_decl");
+}
+
+#[test]
+fn an_unused_binding_with_calls_keeps_them() {
+    let source = format!(
+        "#[inline]\nfn noisy() -> bool {{\n    self.data[0] = 1;\n    return true;\n}}\n{}",
+        init("const UNUSED = if noisy() { 1 } else { 2 }; temp[0] = 1;")
+    );
+    let d = one(&source, "unused_decl");
+    assert!(d.help.as_deref().unwrap_or("").contains("keeping"), "{d:?}");
+}
