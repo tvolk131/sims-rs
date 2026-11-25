@@ -1,0 +1,34 @@
+// Built-in `std::globals`: clean-room signatures of commonly used global BHAV trees.
+//
+// `use std::globals::*;` brings `globals` into scope, so an object calls `globals::standard_entry()?;`
+// instead of copying its own `extern mod globals { .. }` block. The names are our own descriptions of
+// what each tree does; only the tree ids are engine facts.
+
+pub extern mod globals {
+    // Object set-up and tear-down.
+    #[id(271)] fn init_object() -> Result;
+    #[id(272)] fn standard_entry() -> Result;
+    #[id(273)] fn standard_exit(delay: i16) -> Result;
+    #[id(278)] fn multi_tile_entry() -> Result;
+    #[id(279)] fn multi_tile_exit(delay: i16) -> Result;
+
+    // Waiting.
+    #[id(280)] fn idle_ticks(ticks: i16) -> Result;
+    #[id(281)] fn wait_for_notify(a: i16, b: i16) -> bool;
+    #[id(370)] fn animated_idle_for(ticks: i16) -> Result;
+
+    // The Sim's body.
+    #[id(295)] fn flip_sim_around() -> Result;
+    #[id(382)] fn ensure_standing() -> Result;
+
+    // Questions about the Sim, the object and the lot.
+    #[id(288)] fn in_use() -> bool;
+    #[id(320)] fn is_downtown_lot() -> bool;
+    #[id(321)] fn is_residential_lot() -> bool;
+    #[id(363)] fn am_i_a_child() -> bool;
+    #[id(410)] fn can_join() -> bool;
+    #[id(424)] fn is_vacation_lot() -> bool;
+
+    // Skills.
+    #[id(286)] fn show_skill_progress(skill: i16) -> bool;
+}

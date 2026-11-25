@@ -18,7 +18,7 @@ use crate::v2::ast::{
     InteractionDecl, MatchArm, MatchExprArm, MatchPattern, MetaField, MetaFieldKind, ObjectDecl,
     ObjectMember, ParamType, ParamValue, ReturnAbi, SlotDecl, SoundDecl, SpriteDecl, StateDecl,
     StateInitValue, StateType, StringsDecl, TemplateDecl, TileDecl, TreeFrame, TreeMemberDecl,
-    V2AssignOp, V2BinOp, V2Expr, V2Stmt, V2Type, V2UnaryOp, VariantDecl, object_type_ident,
+    GuidValue, V2AssignOp, V2BinOp, V2Expr, V2Stmt, V2Type, V2UnaryOp, VariantDecl, object_type_ident,
 };
 use crate::v2::loader::{ModuleScope, ResolvedModule};
 use crate::v2::parser::snake_case_ident;

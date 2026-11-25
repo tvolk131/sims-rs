@@ -57,7 +57,7 @@ fn lower_object_with(
     let slug = make_slug(&obj.name);
 
     // 2. Merge metadata, params, states, sounds, slots, strings, hooks, interactions, functionals, local fns.
-    let mut guid: Option<u32> = None;
+    let mut guid: Option<(String, Span, GuidValue)> = None;
     let mut price: u16 = 100;
     let mut description = String::new();
     let mut catalog_sort_flags: u16 = 0;
@@ -142,6 +142,7 @@ fn lower_object_with(
     let mut bcon_decls: Vec<BconTableDecl> = Vec::new();
     let mut tree_members: Vec<OwnedTree> = Vec::new();
     let mut variant_decls: Vec<VariantDecl> = Vec::new();
+    let mut variant_owners: Vec<String> = Vec::new();
     // Every module that contributes members (templates + the object): helper-fn lookups from any
     // of their code must not be shadowed by an (inherited) tree ident.
     let mut member_modules: BTreeSet<String> = BTreeSet::new();
@@ -170,7 +171,7 @@ fn lower_object_with(
                     local_consts.insert(c.name.clone(), c.value);
                 }
                 ObjectMember::Meta(MetaField { span, kind }) => match kind {
-                    MetaFieldKind::Guid(v) => guid = Some(*v),
+                    MetaFieldKind::Guid(v) => guid = Some((owner_mod.to_owned(), *span, v.clone())),
                     MetaFieldKind::Price(v) => price = *v,
                     MetaFieldKind::Description(s) => description = s.clone(),
                     MetaFieldKind::Category(v) => catalog_sort_flags = *v,
@@ -505,6 +506,7 @@ fn lower_object_with(
                         return Err(Error::at(v.span, format!("duplicate variant '{}'", v.name)));
                     }
                     variant_decls.push(v.clone());
+                    variant_owners.push(owner_mod.to_owned());
                 }
                 ObjectMember::Tree(t) => {
                     if !seen_trees_here.insert(t.ident.clone()) {
@@ -534,15 +536,32 @@ fn lower_object_with(
     apply_members(&resolved.module_id, &obj.members, true)?;
 
     // 3. Validate GUID & resolve all parameters (checking unknown, type mismatch, and missing required).
-    let guid = guid.ok_or_else(|| {
-        Error::at(
-            obj.span,
-            format!(
-                "object '{}' is missing required 'guid: 0x...;' field",
-                obj.name
-            ),
-        )
-    })?;
+    let guid = match &guid {
+        Some((owner, span, value)) => {
+            resolve_guid_value(resolved, owner, &local_consts, value, *span)?
+        }
+        None => {
+            return Err(Error::at(
+                obj.span,
+                format!(
+                    "object '{}' is missing required 'guid: 0x...;' field",
+                    obj.name
+                ),
+            ));
+        }
+    };
+    let variant_guids = variant_decls
+        .iter()
+        .zip(&variant_owners)
+        .map(|(d, owner)| {
+            d.guid
+                .as_ref()
+                .map(|(span, value)| {
+                    Ok((*span, resolve_guid_value(resolved, owner, &local_consts, value, *span)?))
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     for (aname, (aspan, aval)) in &param_assigns {
         let Some(slot) = declared_params.get(aname) else {
@@ -1698,6 +1717,7 @@ fn lower_object_with(
 
     let variants = resolve_variants(
         &variant_decls,
+        &variant_guids,
         &manifest,
         &env.trees,
         !manifest.tiles.is_empty(),
@@ -1714,15 +1734,50 @@ fn lower_object_with(
     })
 }
 
+/// The value of an object or variant `guid:` (a literal, or a `const` visible from `owner_mod`:
+/// object/template-local first, then module-level and imported consts).
+pub(super) fn resolve_guid_value(
+    resolved: &ResolvedModule,
+    owner_mod: &str,
+    local_consts: &BTreeMap<String, i64>,
+    value: &GuidValue,
+    span: Span,
+) -> Result<u32> {
+    let name = match value {
+        GuidValue::Lit(v) => return Ok(*v),
+        GuidValue::Const(name) => name,
+    };
+    let v = local_consts
+        .get(name)
+        .copied()
+        .or_else(|| {
+            resolved
+                .module_scopes
+                .get(owner_mod)
+                .and_then(|s| s.consts.get(name))
+                .map(|(_, decl)| decl.value)
+        })
+        .ok_or_else(|| {
+            Error::at(
+                span,
+                format!("unknown const '{name}' in 'guid:' (expected a literal or a 'const')"),
+            )
+        })?;
+    u32::try_from(v)
+        .map_err(|_| Error::at(span, format!("guid const '{name}' = {v} is out of u32 range")))
+}
+
 /// Resolves `variant` declarations against the primary manifest and the standalone tree ids.
+/// `guids` holds each declaration's resolved `guid:` (see [`resolve_guid_value`]).
 pub(super) fn resolve_variants(
     decls: &[VariantDecl],
+    guids: &[Option<(Span, u32)>],
     manifest: &ObjectManifest,
     trees: &BTreeMap<String, CallableSig>,
     multi_tile: bool,
 ) -> Result<Vec<VariantSpec>> {
     let mut out: Vec<VariantSpec> = Vec::with_capacity(decls.len());
-    for d in decls {
+    for (d, guid) in decls.iter().zip(guids) {
         if d.name == manifest.name {
             return Err(Error::at(
                 d.span,
@@ -1738,8 +1793,7 @@ pub(super) fn resolve_variants(
                 "'variant' is not supported on multi-tile objects (their tiles own the OBJD group)",
             ));
         }
-        let (gspan, guid) = d
-            .guid
+        let (gspan, guid) = guid
             .ok_or_else(|| Error::at(d.span, format!("variant '{}' needs a 'guid:'", d.name)))?;
         if guid == manifest.guid || out.iter().any(|v| v.guid == guid) {
             return Err(Error::at(

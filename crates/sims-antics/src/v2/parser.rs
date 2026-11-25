@@ -5,6 +5,7 @@ use crate::audio::SoundPreset;
 use crate::error::{Error, Result, Span};
 use crate::parser::motive_by_name;
 use crate::v2::ast::{
+    GuidValue,
     AbiParam, AbiParamSlot, AdvertiseDecl, BconTableDecl, BitflagVariant, BitflagsDecl, CallArg,
     ConstDecl, ConstIntExpr, EnumDecl, EnumVariant, ExternBconDecl, ExternBconEntry, ExternFnDecl,
     ExternModDecl, FnDecl, FnParam, ForEachIter, FunctionalDecl, GuardBody, GuardDecl,
@@ -232,6 +233,16 @@ impl Parser {
     fn expect_u32(&mut self, desc: &str) -> Result<u32> {
         let (v, span) = self.parse_signed_int(desc)?;
         u32::try_from(v).map_err(|_| Error::at(span, format!("{desc} {v} out of u32 range")))
+    }
+
+    /// A `guid:` value: an integer literal or a `const` name (resolved during lowering).
+    fn parse_guid_value(&mut self, desc: &str) -> Result<GuidValue> {
+        if let TokenKind::Ident(name) = &self.peek().kind {
+            let name = name.clone();
+            self.bump();
+            return Ok(GuidValue::Const(name));
+        }
+        Ok(GuidValue::Lit(self.expect_u32(desc)?))
     }
 
     fn expect_i32(&mut self, desc: &str) -> Result<i32> {
@@ -1360,7 +1371,7 @@ impl Parser {
             let dup = match key.as_str() {
                 "guid" => decl
                     .guid
-                    .replace((kspan, self.expect_u32("variant guid")?))
+                    .replace((kspan, self.parse_guid_value("variant guid")?))
                     .is_some(),
                 "price" => {
                     let (v, vspan) = self.parse_signed_int("variant price")?;
@@ -1885,7 +1896,7 @@ impl Parser {
             ));
         }
         let kind = match key {
-            "guid" => MetaFieldKind::Guid(self.expect_u32("guid")?),
+            "guid" => MetaFieldKind::Guid(self.parse_guid_value("guid")?),
             "price" => MetaFieldKind::Price(self.expect_u16("price")?),
             "description" => MetaFieldKind::Description(self.expect_string("description")?.0),
             "category" => MetaFieldKind::Category(self.parse_category()?),

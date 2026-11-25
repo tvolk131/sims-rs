@@ -487,16 +487,7 @@ impl LoadedModuleData {
 /// The source of a built-in `std::<module>` (`use std::globals::*;`), if there is one.
 fn std_module_source(segs: &[String]) -> Option<String> {
     match segs {
-        [m] if m == "globals" => {
-            use std::fmt::Write as _;
-            let mut src = String::from(
-                "// Built-in std::globals: the engine globals' indices (`global[HOUR]` is `world.hour`).\n",
-            );
-            for (name, index) in crate::v2::parser::WORLD_GLOBALS {
-                let _ = writeln!(src, "pub const {} = {index};", name.to_ascii_uppercase());
-            }
-            Some(src)
-        }
+        [m] if m == "globals" => Some(include_str!("std/globals.antics").to_owned()),
         _ => None,
     }
 }

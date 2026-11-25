@@ -40,7 +40,10 @@ impl<'a> TreeLowerer<'a> {
             | V2Expr::Bool(..)
             | V2Expr::Str(..)
             | V2Expr::Ident(..)
-            | V2Expr::Path(..) => false,
+            | V2Expr::Path(..) => {
+                // `Table::entry` reads like `Table.entry` (an `extern bcon` read may trap).
+                matches!(self.bcon_field_ref(expr), Some(r) if !matches!(r, Ok((_, Some(_)))))
+            }
         }
     }
 
@@ -376,6 +379,9 @@ impl<'a> TreeLowerer<'a> {
             }
             V2Expr::Bool(_, b) => Ok((if *b { "1" } else { "0" }.to_owned(), ValueType::Bool)),
             V2Expr::Path(span, segs) => {
+                if let Some(r) = self.bcon_field_ref(expr) {
+                    return Ok((r?.0, ValueType::I16));
+                }
                 if segs.len() != 2 {
                     return Err(Error::at(
                         *span,

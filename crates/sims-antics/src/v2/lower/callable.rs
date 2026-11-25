@@ -420,14 +420,33 @@ impl<'a> TreeLowerer<'a> {
                 .is_bcon_table_name(&self.owner_module, name, self.in_object_scope)
     }
 
-    /// Resolves `Table.entry` to its `bcon[addr]` operand (and compile-time value for private
-    /// tables). `None` if `expr` is not a BCON table entry reference.
+    /// Resolves `Table.entry` (or the path form `Table::entry`) to its `bcon[addr]` operand (and
+    /// compile-time value for private tables). `None` if `expr` is not a BCON table entry reference.
+    /// An enum or bitflags type of the same name wins the path form.
     pub(super) fn bcon_field_ref(&self, expr: &V2Expr) -> Option<Result<(String, Option<i16>)>> {
-        let V2Expr::Field { span, base, field } = expr else {
-            return None;
-        };
-        let V2Expr::Ident(_, bname) = base.as_ref() else {
-            return None;
+        let (span, bname, field) = match expr {
+            V2Expr::Field { span, base, field } => {
+                let V2Expr::Ident(_, bname) = base.as_ref() else {
+                    return None;
+                };
+                (span, bname, field)
+            }
+            V2Expr::Path(span, segs) if segs.len() == 2 => {
+                let bname = &segs[0];
+                if self
+                    .env
+                    .lookup_enum(&self.owner_module, bname, self.in_object_scope)
+                    .is_some()
+                    || self
+                        .env
+                        .lookup_bitflags(&self.owner_module, bname, self.in_object_scope)
+                        .is_some()
+                {
+                    return None;
+                }
+                (span, bname, &segs[1])
+            }
+            _ => return None,
         };
         if !self.is_bcon_table_ref(bname) {
             return None;

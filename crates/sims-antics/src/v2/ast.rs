@@ -309,7 +309,7 @@ pub enum ObjectMember {
 pub struct VariantDecl {
     pub span: Span,
     pub name: String,
-    pub guid: Option<(Span, u32)>,
+    pub guid: Option<(Span, GuidValue)>,
     pub price: Option<(Span, i64)>,
     pub description: Option<String>,
     /// Standalone `#[bhav] fn` names replacing the primary OBJD's init / main trees.
@@ -353,9 +353,17 @@ pub struct MetaField {
     pub kind: MetaFieldKind,
 }
 
+/// An object or variant `guid:`: a literal (`guid: 0x7F00_0020;`) or a `const` name
+/// (`guid: CHEAP_FRIDGE;`), resolved during lowering like any other const.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuidValue {
+    Lit(u32),
+    Const(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetaFieldKind {
-    Guid(u32),
+    Guid(GuidValue),
     Price(u16),
     Description(String),
     Category(u16),
