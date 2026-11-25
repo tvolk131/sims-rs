@@ -672,6 +672,147 @@ impl<'a> TreeLowerer<'a> {
         })
     }
 
+    /// Remove Object Instance's flags from named options: `flags: N`, `no_yield: b` (bit 0: an
+    /// object that removes itself does not yield) and `skip_resets: b` (bit 1).
+    pub(super) fn remove_object_flags(&self, prim: &str, options: &[CallArg]) -> Result<u8> {
+        let mut flags = 0u8;
+        for a in options {
+            let Some(aname) = &a.name else {
+                return Err(Error::at(
+                    a.span,
+                    format!(
+                        "{prim}() only takes named options ('flags:', 'no_yield:', 'skip_resets:')"
+                    ),
+                ));
+            };
+            match aname.as_str() {
+                "flags" => {
+                    let v = self.eval_const_i16(&a.value)?;
+                    flags |= u8::try_from(v).map_err(|_| {
+                        Error::at(a.span, format!("{prim} flags {v} out of range 0..=255"))
+                    })?;
+                }
+                "no_yield" => {
+                    if self.eval_const_bool_required(&a.value, a.span)? {
+                        flags |= 1;
+                    }
+                }
+                "skip_resets" => {
+                    if self.eval_const_bool_required(&a.value, a.span)? {
+                        flags |= 2;
+                    }
+                }
+                other => {
+                    return Err(Error::at(
+                        a.span,
+                        format!(
+                            "unknown {prim} option '{other}' (expected 'flags', 'no_yield', or 'skip_resets')"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(flags)
+    }
+
+    /// `remove_object(target, ..)` / `target.remove(..)`: Remove Object Instance (opcode 18),
+    /// whose operand names the object by mode, not by value (`sims-vm` `primitives/remove.rs`):
+    /// 0 is the running object (`me`), 1 the stack object. So the target is `me` (the Sim handle
+    /// in a Sim tree), `stack_obj`, a handle that is the stack object itself (a cursor loop's
+    /// binding), or `self` where `self` is one of those. Another handle would need the stack
+    /// object moved to it first, which is a node the source should spell. The primitive takes
+    /// its false branch when the object is already gone.
+    pub(super) fn format_remove_object(
+        &self,
+        prim: &str,
+        target: &V2Expr,
+        options: &[CallArg],
+    ) -> Result<String> {
+        let flags = self.remove_object_flags(prim, options)?;
+        let other = || {
+            Error::at(
+                target.span(),
+                format!(
+                    "{prim}() removes 'me', 'stack_obj', or a handle the stack object holds; \
+                     select another object first ('stack_obj = x;') and remove 'stack_obj'"
+                ),
+            )
+        };
+        let V2Expr::Ident(_, name) = target else {
+            return Err(other());
+        };
+        let air = if name == "stack_obj" {
+            "stack_obj"
+        } else if self.is_self_ident(name) {
+            if self.inherit_tree {
+                return Err(Error::at(
+                    target.span(),
+                    format!(
+                        "{prim}(): a 'context = inherit' tree runs on whichever object calls it; \
+                         name 'me' or 'stack_obj'"
+                    ),
+                ));
+            }
+            match self.tree_ctx {
+                TreeContext::ObjectSelf => "me",
+                TreeContext::SimOnObject { .. } if self.self_stack_target() == "stack_obj" => {
+                    "stack_obj"
+                }
+                TreeContext::SimOnObject { .. } => {
+                    return Err(Error::at(
+                        target.span(),
+                        format!(
+                            "{prim}(self): this Sim tree moves 'stack_obj', so 'self' is no longer \
+                             the stack object; use 'destroy_self()', which selects it"
+                        ),
+                    ));
+                }
+            }
+        } else if self.is_my_ident(name) || self.is_frame_me(name) {
+            "me"
+        } else if self
+            .object_handle_air(name)
+            .is_some_and(|(air, _)| air == "stack_obj")
+        {
+            "stack_obj"
+        } else {
+            return Err(other());
+        };
+        Ok(if flags == 0 {
+            format!("remove_object({air})")
+        } else {
+            format!("remove_object({air}, flags: {flags})")
+        })
+    }
+
+    /// The method form: `target.remove(..)`.
+    pub(super) fn format_remove_method(
+        &self,
+        receiver: &V2Expr,
+        type_args: &[V2Type],
+        options: &[CallArg],
+        span: Span,
+    ) -> Result<String> {
+        if !type_args.is_empty() {
+            return Err(Error::at(
+                span,
+                "'.remove()' does not accept type arguments",
+            ));
+        }
+        self.format_remove_object("remove", receiver, options)
+    }
+
+    /// The call form: `remove_object(target, ..)`, its target the one positional argument.
+    pub(super) fn format_remove_object_call(&self, args: &[CallArg], span: Span) -> Result<String> {
+        let Some((target, options)) = args.split_first().filter(|(t, _)| t.name.is_none()) else {
+            return Err(Error::at(
+                span,
+                "remove_object(target [, flags: N, no_yield: b, skip_resets: b]) takes its target first",
+            ));
+        };
+        self.format_remove_object("remove_object", &target.value, options)
+    }
+
     pub(super) fn require_stack_obj_dest(prim: &str, arg: &CallArg) -> Result<()> {
         if matches!(&arg.value, V2Expr::Ident(_, name) if name == "stack_obj") {
             Ok(())

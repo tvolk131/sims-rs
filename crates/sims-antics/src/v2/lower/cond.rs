@@ -469,6 +469,15 @@ impl<'a> TreeLowerer<'a> {
                 method,
                 type_args,
                 args,
+            } if method == "remove" => Ok(Some(
+                self.format_remove_method(receiver, type_args, args, *span)?,
+            )),
+            V2Expr::MethodCall {
+                span,
+                receiver,
+                method,
+                type_args,
+                args,
             } if matches!(method.as_str(), "debit_funds" | "credit_funds") => Ok(Some(
                 self.format_budget_method(receiver, method, type_args, args, *span)?,
             )),
@@ -570,6 +579,16 @@ impl<'a> TreeLowerer<'a> {
             } if method == "is_type" && type_args.is_empty() => Ok(Some(format!(
                 "!{}",
                 self.format_is_type(receiver, args, *span)?
+            ))),
+            V2Expr::MethodCall {
+                span,
+                receiver,
+                method,
+                type_args,
+                args,
+            } if method == "remove" => Ok(Some(format!(
+                "!{}",
+                self.format_remove_method(receiver, type_args, args, *span)?
             ))),
             V2Expr::MethodCall {
                 span,

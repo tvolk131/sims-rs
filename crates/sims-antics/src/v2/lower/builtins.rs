@@ -475,6 +475,7 @@ impl<'a> TreeLowerer<'a> {
         match fname {
             "animate" => return Ok(Some(self.format_animate(args)?.0)),
             "set_to_next" => return Ok(Some(self.format_set_to_next(args, span)?)),
+            "remove_object" => return Ok(Some(self.format_remove_object_call(args, span)?)),
             // `inc_lt(&mut x, n)` / `dec_gt(&mut x, n)`: the VM's increment-and-compare
             // operators (`x = x ± 1` wrapping at i16, then compare with `n` as read before the
             // store). A condition; as a statement it is an empty `if`.
