@@ -267,13 +267,15 @@ fn inlined_out_operand_locals_share_across_copies_only() {
         random_into(r, 10)?;
         me.attr[2] = r;
     }
-    fn both() {
-        let ev: i16;
+    fn pick_one() {
         let pick: i16;
         random_into(pick, 2)?;
-        if pick == 0 {
-            animate(clip: 1, table: 0, local: ev);
-        }
+        me.attr[3] = pick;
+    }
+    fn pick_event() {
+        let ev: i16;
+        random_into(ev, 3)?;
+        me.attr[4] = ev;
     }
     tree a {
         react(1);
@@ -284,7 +286,8 @@ fn inlined_out_operand_locals_share_across_copies_only() {
         roll();
     }
     tree c {
-        both();
+        pick_one();
+        pick_event();
     }"#,
     );
     let air = expand("inline_share.antics", &src);
@@ -802,9 +805,11 @@ fn a_raw_call_to_a_tree_named_like_the_entry_object_is_not_a_read() {
 "#;
     let air = expand("raw_call_named.antics", src);
     assert!(!tree(&air, "a").contains("= stack_obj"), "{air}");
-    let src = src.replace("call __self_obj;", "subroutine(__self_obj);");
-    let air = expand("raw_subroutine_named.antics", &src);
-    assert!(!tree(&air, "a").contains("= stack_obj"), "{air}");
+    for form in ["subroutine(__self_obj);", "subroutine __self_obj;"] {
+        let src = src.replace("call __self_obj;", form);
+        let air = expand("raw_subroutine_named.antics", &src);
+        assert!(!tree(&air, "a").contains("= stack_obj"), "{form}:\n{air}");
+    }
 }
 
 /// Pinning a `push_interaction` handle into word 0 moves the named locals after it down a word,
@@ -837,10 +842,11 @@ fn text_that_reads_a_moved_word_keeps_the_push_interaction_copy() {
     assert!(a.contains("local[0] := stack_obj;"), "pinned:\n{a}");
 }
 
-/// A frame with no word makes Create Object with flag 0x10 fault, so a text tree whose text
-/// rules would empty its frame keeps main's text rule; a tree with no text empties it as on main.
+/// Create Object with flag 0x10 writes word 0 of the new object's bottom frame (and faults when
+/// it has none), so a text tree that may run as one keeps main's text rule: its declarations
+/// keep their words. A tree with no text empties its frame as on main.
 #[test]
-fn a_text_tree_keeps_a_frame_word_main_keeps() {
+fn a_bottom_frame_text_tree_keeps_main_text_rule() {
     let src = |text: &str| {
         obj(
             "Plain",
@@ -853,6 +859,22 @@ fn a_text_tree_keeps_a_frame_word_main_keeps() {
     assert_eq!(locals, 1);
     let (locals, _) = compiled(&src(""), 4097);
     assert_eq!(locals, 0);
+    // A local read before it is written stays in the word main gives it, after `spare`.
+    let read_first = obj(
+        "Plain",
+        "    main {\n        let spare: i16;\n        let inherited: i16;\n        \
+         me.data[11] = inherited;\n        dialog(kind: ok, title: title, message: msg);\n    }",
+    );
+    assert_eq!(compiled(&read_first, 4097).0, 2);
+    // The inherit check's Sim pass over such a tree takes the same rule, so both passes agree.
+    expand(
+        "inherit_bottom.antics",
+        &obj(
+            "Plain",
+            "    @context(inherit) tree a {\n        let spare: i16 = 7;\n        temp[1] = 1;\n        \
+             dialog(kind: ok, title: title, message: msg);\n    }",
+        ),
+    );
 }
 
 /// A tree that may read global 34 shares inlined out-operand locals as main does, so it fits
@@ -880,4 +902,9 @@ fn a_tree_that_may_read_global_34_shares_out_operand_locals_as_main() {
 }
 "#;
     expand("global34_frame.antics", src);
+    // So does a tree whose header fixes its frame size.
+    expand(
+        "fixed_frame.antics",
+        &src.replace("        temp[3] = global[34];\n", ""),
+    );
 }

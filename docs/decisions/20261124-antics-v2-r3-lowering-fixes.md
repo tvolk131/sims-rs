@@ -73,6 +73,9 @@ if it does not:
   word that would move.
 - **`Unknown`**: the save stays.
 
+A tree that may run as an object's bottom frame takes `Unknown` when it formats text
+(section 5, "Bottom frames").
+
 **Global 34.** Every Expression node, the save included, sets the object's scratch pointer, and
 a read of global 34 depends on it (`sims-vm` `primitives/expression.rs`). So a tree whose `.air`
 may read global 34 (`may_read_global_34`) keeps or drops an Expression exactly where main does.
@@ -136,7 +139,8 @@ declaration order, so generated names no longer matter.
 
 - The Sim pass declares its implicit entry object (`__self_obj`) when the body reads it, as the
   object pass declares `__saved_stack_obj`. A read is an `.air` token naming it, so a comment, a
-  field after a dot and the tree a raw `call x` or `subroutine(x)` names do not count. A raw
+  field after a dot and the tree a raw `call x`, `subroutine x` or `subroutine(x)` names do not
+  count. A raw
   block may read `__self_obj` or `__saved_stack_obj`. It may not declare a local, constant or
   label of either name in a tree whose lowering declares that name too
   (`raw_reserved_declarations`, checked in `finish`). Elsewhere, as on main, it may. Code a
@@ -159,8 +163,9 @@ declaration order, so generated names no longer matter.
   `break` arm keeps the old value live and the fall-through arm does not.
   - Disjoint inlined copies of a helper now share their local's word.
   - In `coalesce_locals`, a local written through an out-operand joins only classes of its own
-    declaration, and never the cross-helper merge (except in a tree that may read global 34,
-    section 1).
+    declaration, and never the cross-helper merge. A tree that may read global 34 (section 1)
+    or sets its frame size with `@frame(locals: K)` coalesces them as main does, so it fits the
+    frame main fits it in.
     - Lowering records each inlined local's declaration (`local_origins`: the helper and the
       innermost statement being lowered). That covers `let`, `let Some`, `for` and every other
       binding, so another helper's local of the same spelling is not a copy. The statement is
@@ -216,13 +221,16 @@ declaration order, so generated names no longer matter.
   moved word (section 1) and a pin enabled by a BCON range (above). It adds no rule of its own
   that removes an Expression. A tree that may read global 34 is the exception to applying them
   more widely: there the branch keeps and drops exactly what main does (section 1).
-- **An empty bottom frame.** Create Object with flag 0x10 (or 0x02) writes the first word of the
-  new object's bottom frame and faults when the frame has none. Main's passes never drop a text
-  tree's declarations or entry save, so the text rules (section 1) could empty a frame main keeps
-  a word in. A tree that may run as a bottom frame (an object-self tree with no arguments: an
-  object's or a variant's `main`) whose frame the text rules leave empty takes main's text rule
-  (`Unknown`) instead, when that keeps a word (`finish_body`, `has_frame_word`). Main's own
-  passes still empty a frame in a tree that formats no text, as before.
+- **Bottom frames.** Create Object with flag 0x10 (or 0x02) writes word 0 of the new object's
+  bottom frame, and faults when the frame has none. So in a tree that may run as one, which
+  local lives in which word is observable: a local read before it is written reads the
+  caller's `temp[0]` when it lives in word 0. A tree that formats text and may run as a bottom
+  frame takes main's text rule (`Unknown`): it keeps its declarations and entry save as main
+  does. This covers an object-self tree with no arguments (an object's or a variant's `main`),
+  and the inherit check's Sim pass over one, so both passes agree. The section 1 text rules apply
+  to the others. Main's own passes still drop declarations in a tree that formats no text, as
+  before. (Main's dead-store elimination can still drop a text tree's unread entry save, as
+  section 1 says.)
 
 ## Verification
 

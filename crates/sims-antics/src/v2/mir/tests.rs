@@ -107,8 +107,7 @@ fn pipeline_applies_frame_facts() {
     let mut declared = BTreeSet::new();
     declared.insert("D".to_owned());
     let facts = FrameFacts {
-        formats_text: false,
-        may_be_bottom_frame: false,
+        fixed_frame: false,
         text_reads: TableLocals::Known(BTreeSet::new()),
         keep_layout: true,
         has_self_obj_local: true,

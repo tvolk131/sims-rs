@@ -77,8 +77,16 @@ impl<'a> TreeLowerer<'a> {
         // A tree that may read global 34 keeps main's rule (every text tree reads): dropping
         // the entry save removes an Expression, whose scratch-pointer write that read depends on.
         // (The pinned slot's placeholder is not `.air` yet; it becomes word 0 below.)
+        // So does a tree that may run as an object's bottom frame (an object-self tree with no
+        // arguments, as an object's or a variant's `main` is, or the inherit check's Sim pass
+        // over one): Create Object with flag 0x10 or 0x02 writes that frame's word 0, so which
+        // local lives there is observable.
+        let bottom_frame = (matches!(self.tree_ctx, TreeContext::ObjectSelf)
+            || self.inherited_entry_save)
+            && self.frame_args == 0;
         let text_reads = if formats_text
-            && mir::may_read_global_34(&replace_outside_strings(self.em.text(), PIN_SLOT, "0"))
+            && (bottom_frame
+                || mir::may_read_global_34(&replace_outside_strings(self.em.text(), PIN_SLOT, "0")))
         {
             mir::TableLocals::Unknown
         } else if formats_text {
@@ -99,9 +107,7 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
         let facts = mir::FrameFacts {
-            formats_text,
-            may_be_bottom_frame: matches!(self.tree_ctx, TreeContext::ObjectSelf)
-                && self.frame_args == 0,
+            fixed_frame: self.frame_locals.is_some(),
             text_reads,
             keep_layout: self.keep_layout,
             has_self_obj_local: self.has_self_obj_local,
@@ -505,9 +511,10 @@ fn names_token(body: &str, name: &str) -> bool {
             i.and_then(|i| tokens.get(i))
                 .is_some_and(|t| matches!(&t.kind, T::Ident(k) if k == word))
         };
-        // The tree `call x` or `subroutine(x ..)` names.
+        // The tree `call x`, `subroutine x` or `subroutine(x ..)` names.
         let after_call = |i: usize| {
             ident(i.checked_sub(1), "call")
+                || ident(i.checked_sub(1), "subroutine")
                 || (i
                     .checked_sub(1)
                     .and_then(|i| tokens.get(i))
