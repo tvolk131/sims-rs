@@ -907,9 +907,10 @@ impl<'a> TreeLowerer<'a> {
                                     "helper function with return type must return a value",
                                 )
                             })?;
-                            return self.emit_inline_bool_edges(
+                            return self.emit_inline_return_edges(
                                 expr,
                                 arms.terminal,
+                                (&arms.on_true, &arms.on_false),
                                 &mut |c, edge| {
                                     c.emit_all_cleanups()?;
                                     let arm = if edge { &arms.on_true } else { &arms.on_false };

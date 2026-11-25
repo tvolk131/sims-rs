@@ -1173,9 +1173,70 @@ impl<'a> TreeLowerer<'a> {
             self.emit_bool_into_local(expr, &local)?;
             (format!("{local} != 0"), None)
         };
+        self.emit_test_edges(&test, restore.as_ref(), terminal, edge)
+    }
+
+    /// A helper's `return <cond>;` routing the caller's branch
+    /// ([`Self::emit_inline_bool_edges`]): a constant condition still emits a test node, so the
+    /// arm sees the condition as the last result (as a non-constant condition's test leaves it,
+    /// and as a called tree's return would), not the result of the primitive before it. Ending
+    /// an active action records that result (`release_use`), and primitives such as
+    /// `gosub_found_action` read it.
+    ///
+    /// The node is left out where nothing can see the difference: when the taken arm (`arms`
+    /// gives each edge's `.air`) starts with a cell assignment, which sets the last result
+    /// before anything reads it; or when the condition is `true` and the node before is a cell
+    /// assignment, which already left `true` (Expression's assignments return true). Local
+    /// assignments do not count, since the optimizer may drop them.
+    pub(super) fn emit_inline_return_edges(
+        &mut self,
+        expr: &V2Expr,
+        terminal: bool,
+        arms: (&str, &str),
+        edge: &mut dyn FnMut(&mut Self, bool) -> Result<()>,
+    ) -> Result<()> {
+        let value = match self.try_eval_const_bool(expr) {
+            Some(value) => Some(value),
+            None => match self.try_fold_literal_cond(expr) {
+                Some(value) => {
+                    self.check_folded_cond(expr)?;
+                    Some(value)
+                }
+                None => None,
+            },
+        };
+        let Some(value) = value else {
+            return self.emit_inline_bool_edges(expr, terminal, edge);
+        };
+        let taken = if value { arms.0 } else { arms.1 };
+        let arm_resets = taken.lines().next().is_some_and(is_cell_assignment);
+        let already_true = value
+            && self
+                .em
+                .text()
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .is_some_and(is_cell_assignment);
+        if arm_resets || already_true {
+            return edge(self, value);
+        }
+        let test = if value { "1 == 1" } else { "1 == 0" };
+        self.emit_test_edges(test, None, terminal, edge)
+    }
+
+    /// `if <test> { <true edge> } <false edge>` (or an `else` arm when not `terminal`); each
+    /// edge first restores the stack object to `restore` when given.
+    fn emit_test_edges(
+        &mut self,
+        test: &str,
+        restore: Option<&StackRestore>,
+        terminal: bool,
+        edge: &mut dyn FnMut(&mut Self, bool) -> Result<()>,
+    ) -> Result<()> {
         self.line(format!("if {test} {{"));
         self.em.indent();
-        if let Some(saved) = &restore {
+        if let Some(saved) = restore {
             self.emit_stack_restore(saved);
         }
         edge(self, true)?;
@@ -1187,7 +1248,7 @@ impl<'a> TreeLowerer<'a> {
             self.line("} else {".to_owned());
             self.em.indent();
             let arm_at = self.em.mark();
-            if let Some(saved) = &restore {
+            if let Some(saved) = restore {
                 self.emit_stack_restore(saved);
             }
             edge(self, false)?;
@@ -1198,7 +1259,7 @@ impl<'a> TreeLowerer<'a> {
             self.line("}".to_owned());
             return Ok(());
         }
-        if let Some(saved) = &restore {
+        if let Some(saved) = restore {
             self.emit_stack_restore(saved);
         }
         edge(self, false)?;
@@ -1312,4 +1373,37 @@ impl<'a> TreeLowerer<'a> {
             }
         }
     }
+}
+
+/// Whether an `.air` line is an assignment (an Expression node, which returns true) to a cell
+/// other than a named local: `stack.attr[0] := 1;`, `my.motive.fun += x;`, `temp[2] := 0;`. The
+/// optimizer may drop a local's store and a `stack_obj` move, so neither counts.
+fn is_cell_assignment(line: &str) -> bool {
+    let line = line.trim();
+    let Some(body) = line.strip_suffix(';') else {
+        return false;
+    };
+    let ops = [
+        " := ",
+        " += ",
+        " -= ",
+        " *= ",
+        " /= ",
+        " %= ",
+        " &= ",
+        " |= ",
+        " ^= ",
+        " flag_set ",
+        " flag_clear ",
+    ];
+    let Some(at) = ops.iter().filter_map(|op| body.find(op)).min() else {
+        return false;
+    };
+    let lhs = &body[..at];
+    let first = lhs.split(['.', '[', '(']).next().unwrap_or("");
+    !matches!(
+        first,
+        "let" | "if" | "while" | "return" | "break" | "continue" | "stack_obj" | "local"
+    ) && !lhs.contains(' ')
+        && (lhs.contains('.') || lhs.contains('[') || lhs.starts_with("scope("))
 }
