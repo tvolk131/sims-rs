@@ -110,7 +110,46 @@ so the `allow` cannot go stale.
 
 ## Results
 
-(filled from the final sweep)
+The corpus is all 1,191 lifted objects, at 10 workers. "Main" is main after #471.
+
+- **Gate:** both modes have 0 errors or timeouts, 0 DIFFERENT, 0 `fmt --check`-dirty files and
+  0 `untyped_engine_field` findings.
+- **Proofs:** every proven tree (Identical or Equivalent) is unchanged. Strict has 884 + 4,637;
+  behavioral has 870 + 4,651.
+- **Idiomatic trees:** unchanged. Strict has 8,503; behavioral has 25,308.
+
+| | behavioral, main | behavioral, wave 3 | strict, main | strict, wave 3 |
+| --- | ---: | ---: | ---: | ---: |
+| inline raw statements | 17,165 | 15,412 | 3,190 | 3,059 |
+| `raw {}` blocks | 12,563 | 11,312 | 19,538 | 19,436 |
+| lines inside inline raw | 88,507 | 81,292 | 6,265 | 5,918 |
+| total lines | 944,493 | 942,412 | 963,507 | 963,489 |
+| `untyped_engine_constant` | 12,789 | **0** | 1,291 | **0** |
+| `prefer_method_syntax` | 11,204 | **0** | 686 | **0** |
+| `prefer_question_mark` | 213 | **0** | 91 | **0** |
+| lint findings, all rules | 24,322 | 116 | 2,080 | 12 |
+| sweep time | 74.6 s | 68.5 s | 83.3 s | 92.9 s |
+
+- **What lint still reports** is unchanged from main: 116 behavioral (`manual_raw_has_builtin`
+  64, `frame_headroom` 46, `negated_comparison` 3, `collapsible_if_chain` 2,
+  `stale_lint_allow` 1) and 12 strict.
+- **Raw statements per file.** In four behavioral files the count rises by one: one raw block
+  splits in two around a newly lifted neighbor `if`, so the raw text there is shorter.
+- **Sweep time.** The lint pass costs at least one extra build per file that has findings. The
+  timings were taken on a loaded machine, and the behavioral number varied by more than the
+  difference between runs.
+- **Strict mode** writes most trees whole as raw, so the PR I-4 forms mostly help in
+  behavioral mode. Padded calls that stay raw (about 2,500 `play_sound` and 640
+  `clear_motive_changes` in strict, 414 and 240 in behavioral) sit in raw-fallback trees, or
+  in trees that some other spelling already pushed below wave 2. An example: the spelled
+  form builds there, but the tree has lost every extra.
+- **New spellings in behavioral output:**
+  - `padN:` options on 2,871 `play_sound` and 629 `clear_motive_changes` calls;
+  - 687 `sprite_flags[temp[k]]` and 12 `person[temp[k]]`;
+  - 213 `advert.delta[m]`;
+  - about 500 neighbor cells, most of them named;
+  - 85 `fame`;
+  - 166 `reach(..)`, 196 `drop_onto` parameter slots and 13 `make_new_character(..)`.
 
 ## Consequences
 
