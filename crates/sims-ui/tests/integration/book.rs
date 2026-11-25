@@ -1,3 +1,5 @@
+use crate::common::install_dir as install;
+use crate::common::intersects;
 use sims_content::Install;
 use sims_content::ui_graphics::UiGraphics;
 use sims_ui::art::Art;
@@ -6,23 +8,9 @@ use sims_ui::book::{
     ReferenceBookSnapshot, load_art, load_credits_pages, load_magic_book_entries,
 };
 use sims_ui::frame::{Frame, Rect};
-use std::path::PathBuf;
-
-fn install() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    path.is_dir().then_some(path)
-}
 
 fn center(r: Rect) -> (i32, i32) {
     (r.x + r.width / 2, r.y + r.height / 2)
-}
-
-fn intersects(a: Rect, b: Rect) -> bool {
-    let ax1 = i64::from(a.x) + i64::from(a.width);
-    let ay1 = i64::from(a.y) + i64::from(a.height);
-    let bx1 = i64::from(b.x) + i64::from(b.width);
-    let by1 = i64::from(b.y) + i64::from(b.height);
-    i64::from(a.x) < bx1 && ax1 > i64::from(b.x) && i64::from(a.y) < by1 && ay1 > i64::from(b.y)
 }
 
 fn sample_snapshot() -> ReferenceBookSnapshot {

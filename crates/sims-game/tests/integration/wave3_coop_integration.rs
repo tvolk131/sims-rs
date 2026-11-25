@@ -20,6 +20,7 @@
 // Real iroh QUIC loopback integration tests poll live sockets with wall-clock deadlines.
 #![allow(clippy::disallowed_methods)]
 
+use crate::common::install_root;
 use sims_game::coop::{CoopStartOptions, CoopTransport, IrohBridge};
 use sims_game::game::{Game, Options, goth_house};
 use sims_game::neighborhood::NeighborhoodShell;
@@ -34,11 +35,6 @@ use sims_vm::boot::Frames;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-
-fn install_root() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    dir.is_dir().then_some(dir)
-}
 
 struct TempDir(PathBuf);
 

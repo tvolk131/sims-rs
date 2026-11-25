@@ -19,23 +19,18 @@
 //!
 //! Needs an install (`SIMS_INSTALL`); skipped otherwise.
 
+use crate::common::install_root;
 use sims_game::Frames;
 use sims_game::Game;
 use sims_game::neighborhood::NeighborhoodShell;
 use sims_vm::travel::TravelTransport;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 const MAGIC_PORTAL_GUID: u32 = 0x2baa_0029;
 const MIDDLE_PED_MARKER_GUID: u32 = 0x12e8_4823;
 /// Ticks watched from the travelers' arrival. The marker sleeps 20 ticks
 /// before placing anyone; the old loop moved a traveler every 21.
 const WATCHED: u32 = 660;
-
-fn install_root() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    dir.is_dir().then_some(dir)
-}
 
 fn place_and_queue_magic_hole(game: &mut Game) {
     let jumper = game.lot().world().selected().expect("selected Goth Sim");

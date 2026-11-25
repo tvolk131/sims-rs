@@ -14,6 +14,7 @@
 //!    (`OptionsDialog::Notice` -> `OptionsDialog::ConfirmSaveBeforeQuit`) and exact
 //!    caret `next_blink_us` wakeups on `CheatConsole` and `PhotoAlbumDialog`.
 
+use crate::common::install_root as install;
 use sims_game::autosave_worker::{
     AutosaveWorker, build_save_manager_snapshot, format_save_label, validate_save_payload,
     validate_save_payload_cached,
@@ -34,11 +35,6 @@ use sims_ui::saves::SaveHealth;
 use sims_ui::shop::{CurrencyKind, ShopCommand, ShopItem, ShopKind, WardrobeCategory};
 use std::path::PathBuf;
 use std::time::Instant;
-
-fn install() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    dir.is_dir().then_some(dir)
-}
 
 fn temp_dir_and_redb(tag: &str) -> (PathBuf, PathBuf) {
     let dir = std::env::temp_dir().join(format!(

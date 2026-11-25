@@ -2,6 +2,7 @@
 //! over the lot and the panel over both. Needs `SIMS_INSTALL`; skipped
 //! when it is unset. Nothing from the game is kept.
 
+use crate::common::goth_options as options;
 use sims_game::game::goth_house;
 use sims_game::people::People;
 use sims_game::pick;
@@ -23,16 +24,6 @@ fn install() -> Option<PathBuf> {
             eprintln!("SIMS_INSTALL is not set; skipping the Goth house tests");
             None
         }
-    }
-}
-
-fn options(install: PathBuf) -> Options {
-    Options {
-        house: goth_house(&install),
-        install,
-        answers: vec![3],
-        play: false,
-        frames: Frames::default(),
     }
 }
 

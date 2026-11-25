@@ -1,5 +1,6 @@
 //! Unit and Complete Collection install tests for [`sims_ui::album`].
 
+use crate::common::install_dir as install;
 use sims_content::Install;
 use sims_content::ui_graphics::UiGraphics;
 use sims_formats::bitmap::Image;
@@ -10,12 +11,6 @@ use sims_ui::album::{
 use sims_ui::art::Art;
 use sims_ui::dialog::CARET_BLINK_US;
 use sims_ui::frame::{Frame, Rect};
-use std::path::PathBuf;
-
-fn install() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    path.is_dir().then_some(path)
-}
 
 fn center(r: Rect) -> [i32; 2] {
     [r.x + r.width / 2, r.y + r.height / 2]

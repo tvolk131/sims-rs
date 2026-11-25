@@ -1,12 +1,11 @@
 //! Saving the Goths' house in the window and going back to the save.
 //! Needs `SIMS_INSTALL`; skipped when it is unset.
 
-use sims_game::game::goth_house;
+use crate::common::goth_options as options;
 use sims_game::pace;
 use sims_game::view::Move;
 use sims_game::{Game, Options};
 use sims_ui::command::Speed;
-use sims_vm::boot::Frames;
 use std::path::PathBuf;
 
 fn install() -> Option<PathBuf> {
@@ -16,16 +15,6 @@ fn install() -> Option<PathBuf> {
             eprintln!("SIMS_INSTALL is not set; skipping the save tests");
             None
         }
-    }
-}
-
-fn options(install: PathBuf) -> Options {
-    Options {
-        house: goth_house(&install),
-        install,
-        answers: vec![3],
-        play: false,
-        frames: Frames::default(),
     }
 }
 

@@ -4,7 +4,7 @@
 //! SHA-256 digests only. Set `SIMS_PEOPLE_OUT` to a directory to write
 //! the images there.
 
-use sha2::{Digest, Sha256};
+use crate::common::hex;
 use sims_core::F32;
 use sims_people::math::Vec3;
 use sims_people::raster::{Camera, Canvas};
@@ -20,13 +20,6 @@ fn install() -> Option<PathBuf> {
             None
         }
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 #[test]

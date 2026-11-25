@@ -3,6 +3,7 @@
 //! Each module was a `tests/<name>.rs` binary of its own.
 
 mod caf_preview;
+mod common;
 mod goth_family;
 mod lot;
 mod offscreen;

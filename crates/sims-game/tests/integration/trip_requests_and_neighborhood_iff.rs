@@ -16,6 +16,7 @@
 //!
 //! Needs an install (`SIMS_INSTALL`); skipped otherwise.
 
+use crate::common::install_root;
 use sims_game::Frames;
 use sims_game::hud::DialogKey;
 use sims_game::neighborhood::NeighborhoodShell;
@@ -55,11 +56,6 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
-}
-
-fn install_root() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    dir.is_dir().then_some(dir)
 }
 
 fn open_shell(root: PathBuf, dir: &Path) -> NeighborhoodShell {

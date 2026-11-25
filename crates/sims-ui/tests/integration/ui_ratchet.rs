@@ -12,7 +12,7 @@
 //! `/Users/tommyvolk/Desktop/sims-rs/cache/caf-create-family-20261121/shots`),
 //! skipping cleanly in CI when absent.
 
-use sims_content::Install;
+use crate::common::detected_install as install;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_ui::art::Art;
 use sims_ui::caf::{self, CafController, CafTexts};
@@ -33,11 +33,6 @@ const DEFAULT_NB_ORACLE: &str =
     "/Users/tommyvolk/Desktop/sims-rs/cache/nb-save-movein-evict-20261121/shots";
 const DEFAULT_CAF_ORACLE: &str =
     "/Users/tommyvolk/Desktop/sims-rs/cache/caf-create-family-20261121/shots";
-
-fn install() -> Option<Install> {
-    let root = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    Install::detect(&root).ok()
-}
 
 fn oracle_dir(env_key: &str, default_path: &str) -> Option<PathBuf> {
     if let Some(p) = std::env::var_os(env_key) {

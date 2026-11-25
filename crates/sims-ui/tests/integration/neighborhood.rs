@@ -1,4 +1,4 @@
-use sims_content::Install;
+use crate::common::detected_install as install;
 use sims_content::ui_graphics::UiGraphics;
 use sims_formats::bitmap::Image;
 use sims_ui::art::Art;
@@ -10,12 +10,6 @@ use sims_ui::neighborhood::{
     format_lot_address, format_lot_popup_text, format_simoleons, load_art, popup_alpha_shift,
     tooltip_origin,
 };
-use std::path::PathBuf;
-
-fn install() -> Option<Install> {
-    let path = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    Install::detect(&path).ok()
-}
 
 fn rects_overlap(a: Rect, b: Rect) -> bool {
     a.width > 0

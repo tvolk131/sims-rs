@@ -2,20 +2,12 @@
 //! `SPR2 0x400..=0x43b`) and pond/natural water (`Arry 10`,
 //! `SPR2 0x800..=0x80f`) rendering against a real `SIMS_INSTALL`.
 
-use sims_content::Install;
+use crate::common::install;
 use sims_formats::lot::Array;
 use sims_render::{
     CacheHit, Camera, Canvas, Focus, Lot, LotCache, Walls, Zoom, depth::EMPTY, draw,
     draw_lot_in_viewport, lot::FULL, open_house,
 };
-use std::path::PathBuf;
-
-fn install() -> Option<Install> {
-    let root = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    Some(
-        Install::detect(&root).expect("SIMS_INSTALL should be a valid Complete Collection install"),
-    )
-}
 
 /// Recomputes 4-bit cardinal connectivity masks (`1=N(-y), 2=W(-x), 4=S(+y), 8=E(+x)`)
 /// for active (`< 16`) tiles in `buf`, matching `Sims.exe` `Arry 9` / `Arry 10`

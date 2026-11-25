@@ -5,6 +5,7 @@
 //! (`tests/ui_oracle_tour.rs`) stay binaries of their own.
 
 mod cheats_cache_and_open_pack;
+mod common;
 mod downtown_arrival;
 mod goth;
 mod magic_town_arrival;

@@ -4,6 +4,7 @@
 
 mod band_parity;
 mod build_preview;
+mod common;
 mod edge_on_strip;
 mod goth_house;
 mod lot_cache_parity;

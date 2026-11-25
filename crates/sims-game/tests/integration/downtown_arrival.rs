@@ -23,11 +23,11 @@
 //!
 //! Needs an install (`SIMS_INSTALL`); skipped otherwise.
 
+use crate::common::install_root;
 use sims_game::Frames;
 use sims_game::neighborhood::NeighborhoodShell;
 use sims_ui::shop::{CurrencyKind, ShopCommand};
 use sims_vm::travel::TravelRequest;
-use std::path::PathBuf;
 
 const DOWNTOWN_LOT: u32 = 21;
 const MIDDLE_PED_MARKER_GUID: u32 = 0xbc17_335c;
@@ -47,11 +47,6 @@ const KIND: usize = 65;
 const COMPANION_TOKEN: i32 = 1;
 /// The token kind of a traveler's saved state.
 const SAVED_STATE_TOKEN: i32 = 2;
-
-fn install_root() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    dir.is_dir().then_some(dir)
-}
 
 /// A trip Downtown and its first ARRIVAL ticks.
 struct Arrived {

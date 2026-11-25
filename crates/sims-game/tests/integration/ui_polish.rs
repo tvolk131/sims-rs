@@ -10,6 +10,7 @@
 //! - Smooth camera pan interpolation on portrait re-click / double-click in `Game` without
 //!   altering static `clock_us == 0` headless/ratchet frames.
 
+use crate::common::install_root as install;
 use sims_game::game::{CAMERA_PAN_DURATION_US, goth_house};
 use sims_game::hud::DialogKey;
 use sims_game::neighborhood::{HOVER_CARD_DELAY_US, NeighborhoodShell, ScreenKind, WATER_STEP_US};
@@ -27,11 +28,6 @@ fn temp_redb(tag: &str) -> (PathBuf, PathBuf) {
     std::fs::create_dir_all(&dir).expect("temp dir");
     let redb = dir.join("saves.redb");
     (dir, redb)
-}
-
-fn install() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    dir.is_dir().then_some(dir)
 }
 
 fn find_lot_hit_point(shell: &NeighborhoodShell, lot_id: u16) -> Option<[i32; 2]> {

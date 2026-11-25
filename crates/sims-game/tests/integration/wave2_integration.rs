@@ -19,6 +19,7 @@
 //!    (`VoiceCatalog` PCM mixing in `Mixer`, live lot `Game::play_sim_voice`, and
 //!    Create-a-Family `CafSession` Sim voice preview emission).
 
+use crate::common::install_root;
 use sims_audio::music::MusicMode;
 use sims_audio::voices::{VoiceAgeGender, VoicePitch};
 use sims_game::game::{Game, Options, goth_house};
@@ -35,11 +36,6 @@ use sims_vm::boot::Frames;
 use sims_vm::travel::TravelRequest;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-
-fn install_root() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    dir.is_dir().then_some(dir)
-}
 
 struct TempDir(PathBuf);
 

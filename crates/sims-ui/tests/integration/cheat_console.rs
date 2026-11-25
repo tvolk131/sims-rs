@@ -1,3 +1,4 @@
+use crate::common::install_dir as install;
 use sims_content::Install;
 use sims_content::ui_graphics::UiGraphics;
 use sims_ui::art::Art;
@@ -7,12 +8,6 @@ use sims_ui::cheat_console::{
 };
 use sims_ui::dialog::CARET_BLINK_US;
 use sims_ui::frame::Frame;
-use std::path::PathBuf;
-
-fn install() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    path.is_dir().then_some(path)
-}
 
 #[test]
 fn parses_all_classic_sims1_commands_and_semicolon_repetition() {

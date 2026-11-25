@@ -3,13 +3,13 @@
 //! Each module was a `tests/<name>.rs` binary of its own; `common` opens a
 //! saved house for them (and for `examples/hud.rs`).
 
-mod common;
 mod album;
 mod book;
 mod build;
 mod buy;
 mod caf;
 mod cheat_console;
+mod common;
 mod coop;
 mod dialog;
 mod family_bin;

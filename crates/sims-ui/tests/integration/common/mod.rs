@@ -36,6 +36,29 @@ pub fn install_root() -> Option<PathBuf> {
     std::env::var_os("SIMS_INSTALL").map(PathBuf::from)
 }
 
+/// The install `SIMS_INSTALL` names, or None to skip when it is unset or
+/// not a folder.
+pub fn install_dir() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
+    path.is_dir().then_some(path)
+}
+
+/// The install `SIMS_INSTALL` names, detected, or None to skip when it is
+/// unset or not an install.
+pub fn detected_install() -> Option<Install> {
+    let path = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
+    Install::detect(&path).ok()
+}
+
+/// Whether two rectangles overlap (touching edges do not).
+pub fn intersects(a: sims_ui::frame::Rect, b: sims_ui::frame::Rect) -> bool {
+    let ax1 = i64::from(a.x) + i64::from(a.width);
+    let ay1 = i64::from(a.y) + i64::from(a.height);
+    let bx1 = i64::from(b.x) + i64::from(b.width);
+    let by1 = i64::from(b.y) + i64::from(b.height);
+    i64::from(a.x) < bx1 && ax1 > i64::from(b.x) && i64::from(a.y) < by1 && ay1 > i64::from(b.y)
+}
+
 /// Opens `house` below the install at `root` and reads what the control
 /// panel shows.
 ///

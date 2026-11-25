@@ -1,3 +1,4 @@
+use crate::common::install_root as sims_install;
 use sims_content::Install;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_formats::bitmap::Image;
@@ -7,11 +8,6 @@ use sims_ui::loading::{
     LOAD_LOOP_ASSET, LOAD_MUSIC_MODE_ID, LoadingAudioCue, LoadingKind, LoadingLayout,
     LoadingScreen, LoadingState, LoadingStrings, art_id, load_art,
 };
-use std::path::PathBuf;
-
-fn sims_install() -> Option<PathBuf> {
-    std::env::var_os("SIMS_INSTALL").map(PathBuf::from)
-}
 
 fn rects_overlap(a: Rect, b: Rect) -> bool {
     a.width > 0

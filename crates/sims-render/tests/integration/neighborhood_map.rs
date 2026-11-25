@@ -1,8 +1,8 @@
 //! Integration tests for the Complete Collection neighborhood map renderer
 //! (`crates/sims-render/src/neighborhood.rs`) against a real `SIMS_INSTALL`.
 
+use crate::common::install;
 use sha2::{Digest, Sha256};
-use sims_content::Install;
 use sims_render::neighborhood::{
     COLOR_KEY_565, CommunityFilter, DEFAULT_HIGHLIGHT_RGB, LotStatus, LotZoning, MAP_HEIGHT,
     MAP_WIDTH, NeighborhoodKind, NeighborhoodMap, RenderOptions, Surface565, map_origin, pack_565,
@@ -33,13 +33,6 @@ fn neighborhood_map_supports_external_struct_literals() {
     };
     let canvas = map.render(&RenderOptions::default());
     assert_eq!((canvas.width, canvas.height), (800, 600));
-}
-
-fn install() -> Option<Install> {
-    let root = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    Some(
-        Install::detect(&root).expect("SIMS_INSTALL should be a valid Complete Collection install"),
-    )
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

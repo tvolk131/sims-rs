@@ -1,3 +1,4 @@
+use crate::common::install_root as sims_install;
 use sims_content::Install;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_ui::art::Art;
@@ -8,11 +9,6 @@ use sims_ui::travel::{
     TravelDialog, TravelDialogCommand, TravelDialogLayout, TravelDialogState, TravelLayout,
     TravelPress, TravelState, TravelStrings, TravelTransport, activates_on_press, load_art,
 };
-use std::path::PathBuf;
-
-fn sims_install() -> Option<PathBuf> {
-    std::env::var_os("SIMS_INSTALL").map(PathBuf::from)
-}
 
 fn rects_overlap(a: Rect, b: Rect) -> bool {
     a.width > 0

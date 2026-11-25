@@ -1,4 +1,4 @@
-use sims_content::Install;
+use crate::common::detected_install as install;
 use sims_content::ui_graphics::UiGraphics;
 use sims_formats::bitmap::Image;
 use sims_ui::art::Art;
@@ -8,12 +8,6 @@ use sims_ui::family_bin::{
     VISIBLE_ROWS, art_id, load_art,
 };
 use sims_ui::frame::{Frame, Rect};
-use std::path::PathBuf;
-
-fn install() -> Option<Install> {
-    let path = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    Install::detect(&path).ok()
-}
 
 fn rects_overlap(a: Rect, b: Rect) -> bool {
     a.width > 0

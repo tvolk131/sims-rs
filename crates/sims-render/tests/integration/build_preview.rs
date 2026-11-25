@@ -2,7 +2,7 @@
 //! (`crates/sims-render/src/build_preview.rs`) against a real Complete
 //! Collection `SIMS_INSTALL`.
 
-use sims_content::Install;
+use crate::common::install;
 use sims_render::build_preview::{
     DEFAULT_ROOF_PATTERN, RoofCatalog, RoofPitch, RoofPreviewConfig, RoofStyle, TerrainOverlay,
     TerrainTarget, TerrainTool, WaterAction, WaterOverlay, WaterTileStatus, WaterTool,
@@ -10,14 +10,6 @@ use sims_render::build_preview::{
     draw_terrain_preview, draw_water_preview, validate_terrain_overlay, validate_water_overlay,
 };
 use sims_render::{Camera, Canvas, Focus, Lot, Walls, Zoom, draw_lot, open_house};
-use std::path::PathBuf;
-
-fn install() -> Option<Install> {
-    let root = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    Some(
-        Install::detect(&root).expect("SIMS_INSTALL should be a valid Complete Collection install"),
-    )
-}
 
 #[test]
 fn complete_collection_roof_catalog_loads_all_18_bmps_and_default_r1() {

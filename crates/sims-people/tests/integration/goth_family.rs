@@ -2,7 +2,7 @@
 //! files. Needs `SIMS_INSTALL`; skipped when it is unset. Nothing from the
 //! game is kept: the tests pin names and SHA-256 digests only.
 
-use sha2::{Digest, Sha256};
+use crate::common::hex;
 use sims_people::appearance::load_appearance;
 use sims_people::math::{Transform, Vec3};
 use sims_people::raster::{Camera, Canvas};
@@ -17,13 +17,6 @@ fn install() -> Option<PathBuf> {
             None
         }
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 #[test]

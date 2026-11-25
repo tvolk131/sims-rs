@@ -2,6 +2,7 @@
 //! single-player + co-op lockstep + inline books) and PR #371 (native `CameraPanel`,
 //! 300 ms Neighborhood hover roof cross-fade, and temporal UI animations) into `sims-game`.
 
+use crate::common::install_root as install;
 use sims_game::coop::{CoopStartOptions, CoopTransport};
 use sims_game::game::goth_house;
 use sims_game::hud::{DIALOG_FADE_DURATION_MS, DialogKey};
@@ -16,11 +17,6 @@ use sims_vm::{SpecialPanelRequest, SpecialPanelResponse};
 use std::path::PathBuf;
 
 const MAGIC_PORTAL_GUID: u32 = 0x2baa_0029;
-
-fn install() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    dir.is_dir().then_some(dir)
-}
 
 fn temp_redb(tag: &str) -> (PathBuf, PathBuf) {
     let dir = std::env::temp_dir().join(format!(

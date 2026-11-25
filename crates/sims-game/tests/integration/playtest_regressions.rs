@@ -4,6 +4,7 @@
 //! 3. Real graphical destination maps for Magic Hole (`MagicTownLotPicker`) and
 //!    Cab (`DowntownLotPicker`), both in standalone `Game` and `NeighborhoodShell`.
 
+use crate::common::install_root;
 use sims_game::destination_picker::DestinationMapPicker;
 use sims_game::game::{SpecialLotEntry, goth_house};
 use sims_game::neighborhood::NeighborhoodShell;
@@ -16,11 +17,6 @@ use sims_vm::SpecialPanelRequest;
 use std::path::PathBuf;
 
 const MAGIC_PORTAL_GUID: u32 = 0x2baa_0029;
-
-fn install_root() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("SIMS_INSTALL")?);
-    dir.is_dir().then_some(dir)
-}
 
 fn temp_redb(tag: &str) -> (PathBuf, PathBuf) {
     let dir = std::env::temp_dir().join(format!(
