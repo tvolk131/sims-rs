@@ -3177,8 +3177,8 @@ fn on_disk_open_pack_is_pure_v2_expands_all_20_objects_and_passes_safety() {
                 file.display()
             );
             assert!(
-                !src.contains("@id(") && !src.contains("@guard_id("),
-                "migrated open-pack v2 file should not pin raw @id/@guard_id: {}",
+                !src.contains("#[id(") && !src.contains("#[guard_id("),
+                "migrated open-pack v2 file should not pin raw #[id]/#[guard_id]: {}",
                 file.display()
             );
             assert!(
@@ -6820,24 +6820,24 @@ object "D5" {
 
 const INTEROP_LAMP_V2: &str = r#"
 extern mod light_globals {
-    @id(256) fn add(a: i16, b: i16) -> i16 @ temp[0];
-    @id(257) fn is_dark(level: i16 @ temp[4]) -> bool;
-    @id(258) fn try_light(power: i16) -> Result;
+    #[id(256)] #[ret(temp = 0)] fn add(a: i16, b: i16) -> i16;
+    #[id(257)] fn is_dark(#[temp(4)] level: i16) -> bool;
+    #[id(258)] fn try_light(power: i16) -> Result;
 }
 
 extern mod lamp_semi {
-    @id(8192) fn doubled(x: i16) -> Result<i16 @ temp[1]>;
+    #[id(8192)] #[ret(temp = 1)] fn doubled(x: i16) -> Result<i16>;
 }
 
 extern bcon light_consts {
-    table_height_flag @ 16521;
-    by_chunk @ 257[3];
+    #[addr(16521)] table_height_flag;
+    #[bcon(257, 3)] by_chunk;
 }
 
 object "Interop Lamp" {
     guid: 0x7F30_0001;
     state quality: i16 = 3;
-    state glow @ 9: i16;
+    #[slot(9)] state glow: i16;
     state sum_lit: i16;
     state sum_tmp: i16;
     state dark: bool;
@@ -6851,11 +6851,13 @@ object "Interop Lamp" {
         bright = 25,
     }
 
-    @id(4143) tree "CT - Is Fridge" {
+    #[bhav(id = 4143, label = "CT - Is Fridge")]
+    fn ct_is_fridge() {
         return true;
     }
 
-    tree score "Quality Score" -> i16 @ temp[0] {
+    #[bhav(label = "Quality Score", ret_temp = 0)]
+    fn score() -> i16 {
         if self.quality > 0 {
             return (self.quality * 24) / 5 + 1;
         } else {
@@ -6863,7 +6865,8 @@ object "Interop Lamp" {
         }
     }
 
-    tree bump "Bump Hits" (sim: Sim, n: i16) {
+    #[bhav(label = "Bump Hits")]
+    fn bump(sim: Sim, n: i16) {
         self.fridge_hits += n;
     }
 
@@ -6935,13 +6938,14 @@ object "Interop Probe" {
     state got: i16;
 
     extern mod g {
-        @id(258) fn try_light(power: i16) -> Result;
+        #[id(258)] fn try_light(power: i16) -> Result;
     }
     extern mod s {
-        @id(8192) fn doubled(x: i16) -> Result<i16 @ temp[1]>;
+        #[id(8192)] #[ret(temp = 1)] fn doubled(x: i16) -> Result<i16>;
     }
 
-    @id(4200) tree probe "Probe" (sim: Sim, p: i16) -> Result {
+    #[bhav(id = 4200, label = "Probe")]
+    fn probe(sim: Sim, p: i16) -> Result {
         g::try_light(p)?;
         self.flag = 1;
         let d = s::doubled(self.quality)?;
@@ -6998,7 +7002,7 @@ fn maxis_interop_extern_calls_bcon_tables_sparse_states_and_trees_lower_exactly(
     );
 
     // extern mod: literal call (const args incl. a private BCON value), temps call, temp
-    // binding, `?` on Result / Result<T @ temp[1]>, and direct return capture.
+    // binding, `?` on Result / Result<T> (#[ret(temp = 1)]), and direct return capture.
     for needle in [
         "if call 256(2, 10) {\n    }\n    my.attr[1] := temp[0];",
         "temp[0] := my.attr[0];\n    temp[1] := bcon[129];\n    if call 256(temps) {\n    }\n    my.attr[2] := temp[0];",
@@ -7113,10 +7117,11 @@ fn maxis_interop_states_trees_and_destroy_flags_lower_compactly() {
 object "Sparse Holes" {
     guid: 0x7F30_0010;
     state a: i16;
-    state b @ 0: i16;
+    #[slot(0)] state b: i16;
     state c: i16 = 0;
-    state d @ 2: bool = true;
-    tree sum "Sum" (x: i16, y: i16 @ temp[5]) -> i16 @ temp[0] {
+    #[slot(2)] state d: bool = true;
+    #[bhav(label = "Sum", ret_temp = 0)]
+    fn sum(x: i16, #[temp(5)] y: i16) -> i16 {
         return x + y;
     }
     main {
@@ -7177,14 +7182,17 @@ object "Interop Review" {
     state nv: i16;
     state cleaned2: i16;
 
-    tree take "Take" (a: i16, b: i16) -> i16 @ temp[4] {
+    #[bhav(label = "Take", ret_temp = 4)]
+    fn take(a: i16, b: i16) -> i16 {
         return b;
     }
-    tree change "Change" -> i16 @ temp[4] {
+    #[bhav(label = "Change", ret_temp = 4)]
+    fn change() -> i16 {
         self.n = 5;
         return 0;
     }
-    tree chk "Check" {
+    #[bhav(label = "Check")]
+    fn chk() {
         let error = false;
         return error;
     }
@@ -7192,13 +7200,15 @@ object "Interop Review" {
         return error;
     }
 
-    @id(4210) tree read "Read" (sim: Sim, x: i16) -> Result<i16 @ temp[0]> {
+    #[bhav(id = 4210, label = "Read", ret_temp = 0)]
+    fn read(sim: Sim, x: i16) -> Result<i16> {
         if x > 0 {
             return x;
         }
         return None;
     }
-    @id(4211) tree use_read "Use Read" (sim: Sim, x: i16) -> Result {
+    #[bhav(id = 4211, label = "Use Read")]
+    fn use_read(sim: Sim, x: i16) -> Result {
         defer {
             self.cleaned += 1;
         }
@@ -7207,7 +7217,8 @@ object "Interop Review" {
     }
 
     // `cond?;` always takes the error exit, even with a local named `error` in scope.
-    @id(4212) tree try_err "Try Err" (sim: Sim) {
+    #[bhav(id = 4212, label = "Try Err")]
+    fn try_err(sim: Sim) {
         let error = true;
         defer {
             self.cleaned2 += 1;
@@ -7215,7 +7226,8 @@ object "Interop Review" {
         (self.n > 100)?;
         return false;
     }
-    tree none_val "None Val" -> Result<i16 @ temp[0]> {
+    #[bhav(label = "None Val", ret_temp = 0)]
+    fn none_val() -> Result<i16> {
         let None = 7;
         return None;
     }
@@ -7286,13 +7298,15 @@ fn maxis_interop_review_regressions_run_live() {
 object "Rebind" {
     guid: 0x7F30_0031;
     state count: i16;
-    tree copy "Copy" (actor: Sim, other: Self) {
+    #[bhav(label = "Copy")]
+    fn copy(actor: Sim, other: Self) {
         let actor = other;
         let n = actor.count;
         self.count = n + 1;
     }
-    extern bcon ext { first @ 257[0]; second @ 257[1]; }
-    tree take "Take" (a: i16 @ temp[0], b: i16 @ temp[1]) {
+    extern bcon ext { #[bcon(257, 0)] first; #[bcon(257, 1)] second; }
+    #[bhav(label = "Take")]
+    fn take(#[temp(0)] a: i16, #[temp(1)] b: i16) {
     }
     main {
         take(b: ext.second, a: 11);
@@ -7324,17 +7338,17 @@ fn maxis_interop_negative_diagnostics() {
 
     expect_err(
         "dup_temp.antics",
-        &obj("    extern mod m { @id(256) fn f(a: i16 @ temp[2], b: i16 @ temp[2]); }"),
-        "duplicate '@ temp[2]' binding",
+        &obj("    extern mod m { #[id(256)] fn f(#[temp(2)] a: i16, #[temp(2)] b: i16); }"),
+        "duplicate '#[temp(2)]' binding",
     );
     expect_err(
         "temp_range.antics",
-        &obj("    extern mod m { @id(256) fn f(a: i16 @ temp[8]); }"),
+        &obj("    extern mod m { #[id(256)] fn f(#[temp(8)] a: i16); }"),
         "temp slot 8 is out of range",
     );
     expect_err(
         "slot_collide.antics",
-        &obj("    state a @ 3: i16;\n    state b @ 3: i16;"),
+        &obj("    #[slot(3)] state a: i16;\n    #[slot(3)] state b: i16;"),
         "overlaps state 'a'",
     );
     expect_err(
@@ -7344,24 +7358,26 @@ fn maxis_interop_negative_diagnostics() {
     );
     expect_err(
         "bhav_id.antics",
-        &obj("    extern mod m { @id(4100) fn f(); }"),
+        &obj("    extern mod m { #[id(4100)] fn f(); }"),
         "must be a global (256..=4095) or semi-global (8192..) tree",
     );
     expect_err(
         "pos_temp.antics",
         &obj(
-            "    extern mod m { @id(256) fn f(a: i16, b: i16 @ temp[0]); }\n    init { m::f(1, b: 2); }",
+            "    extern mod m { #[id(256)] fn f(a: i16, #[temp(0)] b: i16); }\n    init { m::f(1, b: 2); }",
         ),
         "collides with positional parameter #0",
     );
     expect_err(
         "unused_result.antics",
-        &obj("    extern mod m { @id(256) fn f() -> Result; }\n    init { m::f(); }"),
+        &obj("    extern mod m { #[id(256)] fn f() -> Result; }\n    init { m::f(); }"),
         "unused Result",
     );
     expect_err(
         "try_value.antics",
-        &obj("    extern mod m { @id(256) fn f() -> i16 @ temp[0]; }\n    init { m::f()?; }"),
+        &obj(
+            "    extern mod m { #[id(256)] #[ret(temp = 0)] fn f() -> i16; }\n    init { m::f()?; }",
+        ),
         "'?' needs a call returning 'bool' or 'Result'",
     );
     expect_err(
@@ -7371,27 +7387,29 @@ fn maxis_interop_negative_diagnostics() {
     );
     expect_err(
         "sim_tree_ctx.antics",
-        &obj("    tree t (sim: Sim) { return true; }\n    init { t(); }"),
+        &obj("    #[bhav] fn t(sim: Sim) { return true; }\n    init { t(); }"),
         "Sim-on-object context",
     );
     expect_err(
         "tree_paths.antics",
-        &obj("    state q: i16;\n    tree t -> i16 @ temp[0] { if self.q > 0 { return 1; } }"),
+        &obj(
+            "    state q: i16;\n    #[bhav(ret_temp = 0)] fn t() -> i16 { if self.q > 0 { return 1; } }",
+        ),
         "must return on all control-flow paths",
     );
     expect_err(
         "try_defer.antics",
-        &obj("    extern mod m { @id(256) fn f() -> Result; }\n    init { defer { m::f()?; } }"),
+        &obj("    extern mod m { #[id(256)] fn f() -> Result; }\n    init { defer { m::f()?; } }"),
         "cannot exit out of a 'defer' block",
     );
     expect_err(
         "bcon_addr.antics",
-        &obj("    extern bcon c { x @ 30000; }"),
+        &obj("    extern bcon c { #[addr(30000)] x; }"),
         "out of range",
     );
     expect_err(
         "tree_builtin.antics",
-        &obj("    tree sleep { return true; }"),
+        &obj("    #[bhav] fn sleep() { return true; }"),
         "shadows the built-in",
     );
     expect_err(
@@ -7403,7 +7421,7 @@ fn maxis_interop_negative_diagnostics() {
         "sparse_enum.antics",
         &format!(
             "enum Mode {{ Off = 1, On = 2 }}\n{}",
-            obj("    state mode @ 9: Mode;")
+            obj("    #[slot(9)] state mode: Mode;")
         ),
         "requires an explicit initializer",
     );
@@ -7415,7 +7433,7 @@ fn maxis_interop_negative_diagnostics() {
     expect_err(
         "many_params.antics",
         &obj(&format!(
-            "    tree t ({}) {{ }}",
+            "    #[bhav] fn t({}) {{ }}",
             (0..256)
                 .map(|i| format!("p{i}: i16"))
                 .collect::<Vec<_>>()
@@ -7428,7 +7446,7 @@ fn maxis_interop_negative_diagnostics() {
     let mut cfg = PackResolverConfig::default();
     cfg.virtual_modules.insert(
         "test_pack::base".to_owned(),
-        "pub template Base {\n    tree check { return false; }\n}\n".to_owned(),
+        "pub template Base {\n    #[bhav] fn check() { return false; }\n}\n".to_owned(),
     );
     let src = "use test_pack::base::Base;\nfn check() -> bool { return true; }\nobject \"Derived\" from Base {\n    guid: 0x7F30_0021;\n    state x: i16;\n    init { if check() { self.x = 1; } }\n}\n";
     let err = compile_v2_source("derived.antics", src, &cfg).expect_err("shadowed helper");
@@ -7547,7 +7565,8 @@ object "Counting Frame" {
         random_into(self.rnd, 1);
     }
 
-    @id(4300) tree probe "Probe" (sim: Sim) {
+    #[bhav(id = 4300, label = "Probe")]
+    fn probe(sim: Sim) {
         self.age = sim.age;
         if sim.person[58] == 25 {
             self.age += 100;
@@ -7671,18 +7690,21 @@ object "Shape Probe" {
         }
     }
 
-    @id(4096) tree pinned "Pinned" {
+    #[bhav(id = 4096, label = "Pinned")]
+    fn pinned() {
         return true;
     }
-    tree helper "Helper" {
+    #[bhav(label = "Helper")]
+    fn helper() {
         return true;
     }
-    @frame(args: 3, locals: 2, format: 0x8002, revision: 5)
-    tree framed "Framed" (a: i16) {
+    #[bhav(label = "Framed", args = 3, locals = 2, format = 0x8002, revision = 5)]
+    fn framed(a: i16) {
         self.n = a;
     }
 
-    @id(4200) tree builtins "Builtins" (sim: Sim) {
+    #[bhav(id = 4200, label = "Builtins")]
+    fn builtins(sim: Sim) {
         let icon: i16 = 0;
         let ev: i16;
         push_interaction(menu: 2, object: 1, priority: 50, flags: 4, icon: icon);
@@ -7738,15 +7760,18 @@ object "Shape Probe" {
         framed(4);
     }
 
-    @id(4201) tree raw_safe "Raw Safe" (sim: Sim) {
+    #[bhav(id = 4201, label = "Raw Safe")]
+    fn raw_safe(sim: Sim) {
         raw { my.attr[0] := 1; call 256(temps); }
         self.n = 1;
     }
-    @id(4202) tree raw_clobber "Raw Clobber" (sim: Sim) {
+    #[bhav(id = 4202, label = "Raw Clobber")]
+    fn raw_clobber(sim: Sim) {
         raw { set_to_next(all); }
         self.n = 1;
     }
-    @id(4203) tree manual_stack "Manual Stack" (sim: Sim) {
+    #[bhav(id = 4203, label = "Manual Stack")]
+    fn manual_stack(sim: Sim) {
         let keep = stack_obj;
         stack_obj = sim;
         stack_obj = keep;
@@ -7831,7 +7856,8 @@ object "Shadow" {
     fn drop(x: i16) {
         self.n = x;
     }
-    tree grab "Grab" {
+    #[bhav(label = "Grab")]
+    fn grab() {
         return true;
     }
     init {
@@ -7863,7 +7889,7 @@ fn readability_negative_diagnostics() {
         format!("object \"Neg\" {{\n    guid: 0x7F40_0020;\n    state n: i16;\n{members}\n}}\n")
     };
     let init = |body: &str| obj(&format!("    init {{\n{body}\n    }}"));
-    let sim_tree = |body: &str| obj(&format!("    tree t (sim: Sim) {{\n{body}\n    }}"));
+    let sim_tree = |body: &str| obj(&format!("    #[bhav] fn t(sim: Sim) {{\n{body}\n    }}"));
 
     // Loops and ranges.
     expect_err(
@@ -7904,21 +7930,21 @@ fn readability_negative_diagnostics() {
         "does not fit in i16; use it where a GUID is expected",
     );
 
-    // @frame.
+    // #[frame].
     expect_err(
         "frame_args.antics",
-        &obj("    @frame(args: 1)\n    tree t (a: i16, b: i16) { }"),
+        &obj("    #[frame(args = 1)]\n    #[bhav] fn t(a: i16, b: i16) { }"),
         "is below its 2 positional parameter(s)",
     );
     expect_err(
         "frame_format.antics",
-        &obj("    @frame(format: 0x8009)\n    tree t { }"),
+        &obj("    #[frame(format = 0x8009)]\n    #[bhav] fn t() { }"),
         "not a supported BHAV format",
     );
     expect_err(
         "frame_on_fn.antics",
-        &obj("    @frame(args: 1)\n    fn f() { }"),
-        "only allowed on a standalone 'tree'",
+        &obj("    #[frame(args = 1)]\n    fn f() { }"),
+        "mark the fn '#[bhav]'",
     );
 
     // Builtins.
@@ -8015,7 +8041,7 @@ fn readability_negative_diagnostics() {
     expect_err(
         "builtin_guid_const.antics",
         &obj(
-            "    const KIND = 0x7F40_0021;\n    tree t (sim: Sim) { action_label(table: KIND, index: 1); }",
+            "    const KIND = 0x7F40_0021;\n    #[bhav] fn t(sim: Sim) { action_label(table: KIND, index: 1); }",
         ),
         "const 'KIND' (0x7f400021) does not fit in i16",
     );
@@ -8038,12 +8064,14 @@ fn readability_negative_diagnostics() {
     );
     expect_err(
         "frame_format_args.antics",
-        &obj("    @frame(format: 0x8000)\n    tree t (a: i16, b: i16, c: i16, d: i16, e: i16) { }"),
+        &obj(
+            "    #[frame(format = 0x8000)]\n    #[bhav] fn t(a: i16, b: i16, c: i16, d: i16, e: i16) { }",
+        ),
         "allows at most 4 arguments, not 5",
     );
     expect_err(
         "frame_format_pinned_args.antics",
-        &obj("    @frame(args: 6, format: 0x8001)\n    tree t { }"),
+        &obj("    #[frame(args = 6, format = 0x8001)]\n    #[bhav] fn t() { }"),
         "allows at most 4 arguments, not 6",
     );
 
@@ -8233,15 +8261,18 @@ object "Stack Cases" {
         *x = 0;
     }
 
-    @id(4300) tree raw_step "Raw Step" (sim: Sim) {
+    #[bhav(id = 4300, label = "Raw Step")]
+    fn raw_step(sim: Sim) {
         raw { if stack_obj inc_lt 3 { } }
         self.n = 1;
     }
-    @id(4301) tree borrow "Borrow" (sim: Sim) {
+    #[bhav(id = 4301, label = "Borrow")]
+    fn borrow(sim: Sim) {
         set_obj(&mut stack_obj);
         self.n = 2;
     }
-    @id(4302) tree cancel_defer "Cancel Defer" (sim: Sim) {
+    #[bhav(id = 4302, label = "Cancel Defer")]
+    fn cancel_defer(sim: Sim) {
         defer {
             self.n = 7;
         }
@@ -8322,7 +8353,7 @@ fn shadowed_builtins_folded_checks_and_local_slots() {
     let air = expand(
         "shadow_clobber.antics",
         &obj(
-            "    fn animate() { stack_obj = 0; }\n    tree t (sim: Sim) { animate(); self.n = 1; }",
+            "    fn animate() { stack_obj = 0; }\n    #[bhav] fn t(sim: Sim) { animate(); self.n = 1; }",
         ),
     );
     // The write stands (the self save it forced is unread, so the backend pass drops it).
@@ -8367,7 +8398,7 @@ fn shadowed_builtins_folded_checks_and_local_slots() {
     let air = expand(
         "create_local.antics",
         &obj(
-            "    tree t (sim: Sim) { let o: i16 = 0; create_object(0x7F40_0041, mode: local_pos, local: o); }",
+            "    #[bhav] fn t(sim: Sim) { let o: i16 = 0; create_object(0x7F40_0041, mode: local_pos, local: o); }",
         ),
     );
     assert!(
@@ -8376,13 +8407,13 @@ fn shadowed_builtins_folded_checks_and_local_slots() {
     );
     expect_err(
         "create_local_missing.antics",
-        &obj("    tree t (sim: Sim) { create_object(0x7F40_0041, mode: local_pos); }"),
+        &obj("    #[bhav] fn t(sim: Sim) { create_object(0x7F40_0041, mode: local_pos); }"),
         "reads a local; name it with 'local:'",
     );
     expect_err(
         "create_local_unused.antics",
         &obj(
-            "    tree t (sim: Sim) { let o: i16 = 0; create_object(0x7F40_0041, mode: here, local: o); }",
+            "    #[bhav] fn t(sim: Sim) { let o: i16 = 0; create_object(0x7F40_0041, mode: here, local: o); }",
         ),
         "does not read 'local:'",
     );
@@ -8390,7 +8421,7 @@ fn shadowed_builtins_folded_checks_and_local_slots() {
         "animate_enum_local.antics",
         &format!(
             "enum Ev {{ Z = 0 }}\n{}",
-            obj("    tree t (sim: Sim) { let e: Ev = Ev::Z; animate(clip: 1, local: e); }")
+            obj("    #[bhav] fn t(sim: Sim) { let e: Ev = Ev::Z; animate(clip: 1, local: e); }")
         ),
         "animate(local:) must name an i16 local variable",
     );
@@ -8462,7 +8493,8 @@ object "Match Probe" {
         }
     }
 
-    @id(4300) tree probe "Probe" (sim: Sim, n: i16) {
+    #[bhav(id = 4300, label = "Probe")]
+    fn probe(sim: Sim, n: i16) {
         self.r2 = band(n);
         self.r3 = match self.mode { Mode::Off => n, Mode::Low => n * 2, Mode::High => n + 100 };
         let big = match n { 0 => self.r3 > 3, _ => n > 5 };
@@ -8550,7 +8582,8 @@ object "Gap Probe" {
         }
     }
 
-    @id(4300) tree people "People" (sim: Sim) {
+    #[bhav(id = 4300, label = "People")]
+    fn people(sim: Sim) {
         self.ages = 0;
         self.visitors = 0;
         self.kinds = 0;
@@ -8564,26 +8597,30 @@ object "Gap Probe" {
         }
     }
 
-    @id(4301) tree sprites "Sprites" (sim: Sim) {
+    #[bhav(id = 4301, label = "Sprites")]
+    fn sprites(sim: Sim) {
         set_dynamic_sprite(index: 2, value: 1);
         self.sprite_flags[3] = 1;
         self.flag2 = self.sprite_flags[2] + self.sprite_flags[3] * 10;
         self.sprite_flags[3] = 0;
     }
 
-    @id(4304) tree slots "Slots" (sim: Sim) {
+    #[bhav(id = 4304, label = "Slots")]
+    fn slots(sim: Sim) {
         if self.slot[0] == 0 {
             self.slot0 = 1;
         }
     }
 
-    @id(4302) tree pusher "Pusher" (sim: Sim) {
+    #[bhav(id = 4302, label = "Pusher")]
+    fn pusher(sim: Sim) {
         let target = stack_obj;
         stack_obj = sim;
         target.push_interaction(menu: 0, priority: 2);
     }
 
-    @id(4303) tree counters "Counters" (sim: Sim, n: i16) {
+    #[bhav(id = 4303, label = "Counters")]
+    fn counters(sim: Sim, n: i16) {
         self.counter = 0;
         while inc_lt(&mut self.counter, 4) {
         }
@@ -8697,7 +8734,8 @@ object "Lamp Line" {
         self.kind = 1;
     }
 
-    tree init_budget "Init Budget" {
+    #[bhav(label = "Init Budget")]
+    fn init_budget() {
         self.level = 2;
         self.kind = 2;
     }
@@ -8835,7 +8873,7 @@ fn pr_e_negative_diagnostics() {
         );
     };
     let init = |body: &str| obj(&format!("    init {{ {body} }}"));
-    let sim_tree = |body: &str| obj(&format!("    tree t (sim: Sim) {{ {body} }}"));
+    let sim_tree = |body: &str| obj(&format!("    #[bhav] fn t(sim: Sim) {{ {body} }}"));
 
     // Expression match.
     expect_err(
@@ -8855,8 +8893,13 @@ fn pr_e_negative_diagnostics() {
     );
     expect_err(
         "match_block.antics",
-        &init("self.n = match self.n { 0 => { 1 }, _ => 2 };"),
-        "not a block",
+        &init("let v = match self.n { 0 => { self.n = 1; } _ => 2 }; self.n = v;"),
+        "must leave on every path",
+    );
+    expect_err(
+        "match_block_not_let.antics",
+        &init("self.n = match self.n { 0 => return, _ => 2 };"),
+        "only be a branch of 'let x = if ..'",
     );
     expect_err(
         "match_empty.antics",
@@ -8891,7 +8934,7 @@ fn pr_e_negative_diagnostics() {
     expect_err("param_init.antics", &init("param[0] = 1;"), "param");
     expect_err(
         "param_range.antics",
-        &obj("    tree t (sim: Sim, a: i16) { param[1] = 1; }"),
+        &obj("    #[bhav] fn t(sim: Sim, a: i16) { param[1] = 1; }"),
         "param",
     );
     // inc_lt takes a mutable i16 place.
@@ -8956,17 +8999,20 @@ object "Pr E Review" {
     state n: i16;
     state k: i16;
 
-    @id(4400) tree one_arm "One Arm" (sim: Sim) {
+    #[bhav(id = 4400, label = "One Arm")]
+    fn one_arm(sim: Sim) {
         self.n = match sim.person[12] { _ => 4 };
     }
 
-    @id(4401) tree sprite_ref "Sprite Ref" (sim: Sim) {
+    #[bhav(id = 4401, label = "Sprite Ref")]
+    fn sprite_ref(sim: Sim) {
         let i = self.k;
         bump(&mut self.sprite_flags[i], &mut i);
         self.n = i;
     }
 
-    @id(4402) tree pinned "Pinned" (sim: Sim) {
+    #[bhav(id = 4402, label = "Pinned")]
+    fn pinned(sim: Sim) {
         let o = stack_obj;
         stack_obj = sim;
         o.push_interaction(menu: 0, priority: 2);
@@ -9053,16 +9099,19 @@ object "Pr E Layout" {
     guid: 0x7F40_0172;
     state n: i16;
 
-    @id(4410) @frame(args: 6, format: 0x8002) tree wide "Wide" (a: i16) {
+    #[bhav(id = 4410, label = "Wide", args = 6, format = 0x8002)]
+    fn wide(a: i16) {
         self.n = param[5] + a;
     }
 
-    @id(4411) tree with_raw "With Raw" () {
+    #[bhav(id = 4411, label = "With Raw")]
+    fn with_raw() {
         let unused = 5;
         raw { my.attr[0] := 1; }
     }
 
-    @id(4412) tree caller "Caller" () {
+    #[bhav(id = 4412, label = "Caller")]
+    fn caller() {
         wide(1);
         let unused = 5;
     }
@@ -9105,28 +9154,28 @@ fn pr_e_review_negative_diagnostics() {
     // Arms must have the same type, not merely assignable ones.
     expect_err(
         "match_handle_i16.antics",
-        &obj("    tree t (sim: Sim) { let x = match self.n { 0 => 1, _ => stack_obj }; }"),
+        &obj("    #[bhav] fn t(sim: Sim) { let x = match self.n { 0 => 1, _ => stack_obj }; }"),
         "different types",
     );
     // The pinned push slot and raw .air cannot share a tree, in either order.
     expect_err(
         "pin_then_raw.antics",
         &obj(
-            "    tree t (sim: Sim) { let o = stack_obj; o.push_interaction(menu: 0); raw { my.attr[0] := 1; } }",
+            "    #[bhav] fn t(sim: Sim) { let o = stack_obj; o.push_interaction(menu: 0); raw { my.attr[0] := 1; } }",
         ),
         "cannot share a tree",
     );
     expect_err(
         "raw_then_pin.antics",
         &obj(
-            "    tree t (sim: Sim) { raw { my.attr[0] := 1; } let o = stack_obj; o.push_interaction(menu: 0); }",
+            "    #[bhav] fn t(sim: Sim) { raw { my.attr[0] := 1; } let o = stack_obj; o.push_interaction(menu: 0); }",
         ),
         "cannot share a tree",
     );
     // Variant trees run as the object's own init/main.
     expect_err(
         "variant_sim_tree.antics",
-        &obj("    tree t (sim: Sim) { }\n    variant \"V\" { guid: 0x7F40_0181, init: t }"),
+        &obj("    #[bhav] fn t(sim: Sim) { }\n    variant \"V\" { guid: 0x7F40_0181, init: t }"),
         "object-self tree with no parameters",
     );
     expect_err(
@@ -9138,14 +9187,14 @@ fn pr_e_review_negative_diagnostics() {
     expect_err(
         "variant_wide_frame.antics",
         &obj(
-            "    @frame(args: 5, format: 0x8002)\n    tree v () { }\n    variant \"V\" { guid: 0x7F40_0181, main: v }",
+            "    #[frame(args = 5, format = 0x8002)]\n    #[bhav] fn v() { }\n    variant \"V\" { guid: 0x7F40_0181, main: v }",
         ),
         "object-self tree with no parameters",
     );
     // A raw block in folded-away code emits nothing, so it does not conflict with the pin.
     compile_v2_source(
         "pin_discarded_raw.antics",
-        &obj("    tree t (sim: Sim) { match 0 { 1 => { raw { my.attr[0] := 1; } } _ => { } } let o = stack_obj; o.push_interaction(menu: 0); }"),
+        &obj("    #[bhav] fn t(sim: Sim) { match 0 { 1 => { raw { my.attr[0] := 1; } } _ => { } } let o = stack_obj; o.push_interaction(menu: 0); }"),
         &cfg,
     )
     .expect("discarded raw and a pinned push may share a tree");
@@ -9177,7 +9226,8 @@ object "Sugar Probe" {
     state r6: i16;
     state r7: i16;
 
-    @id(4300) tree probe "Probe" (sim: Sim, n: i16) {
+    #[bhav(id = 4300, label = "Probe")]
+    fn probe(sim: Sim, n: i16) {
         self.r0 = if n > 3 { 7 } else if n == 0 { 1 } else { 2 };
         let wide = if n > 3 || n == -1 { n } else { 4 };
         self.r1 = wide;
@@ -9298,14 +9348,16 @@ object "Gap Probe F" {
         }
     }
 
-    @id(4300) tree people "People" (sim: Sim) {
+    #[bhav(id = 4300, label = "People")]
+    fn people(sim: Sim) {
         self.vk = sim.visitor_kind;
         if sim.visitor_kind == 3 {
             self.vk += 10;
         }
     }
 
-    @id(4301) tree shelf "Shelf" (sim: Sim) {
+    #[bhav(id = 4301, label = "Shelf")]
+    fn shelf(sim: Sim) {
         let Some(t) = find_best_object(prep) else {
             self.ran = -1;
             return false;
@@ -9317,7 +9369,8 @@ object "Gap Probe F" {
         }
     }
 
-    @id(4302) tree stepper "Stepper" (sim: Sim) {
+    #[bhav(id = 4302, label = "Stepper")]
+    fn stepper(sim: Sim) {
         self.steps = 0;
         stack_obj.attr[5] = 0;
         while inc_lt(&mut stack_obj.attr[5], 3) {
@@ -9325,19 +9378,21 @@ object "Gap Probe F" {
         }
     }
 
-    @id(4303) tree pusher "Pusher" (sim: Sim) {
+    #[bhav(id = 4303, label = "Pusher")]
+    fn pusher(sim: Sim) {
         let o = stack_obj;
         stack_obj = sim;
         push_interaction(object: o, menu: 0, priority: 2, icon: o);
     }
 
-    @id(4304) tree banner "Banner" (sim: Sim) {
+    #[bhav(id = 4304, label = "Banner")]
+    fn banner(sim: Sim) {
         advert.delta[2] = 10;
         self.banner = 1;
     }
 
-    @id(4305) @frame(locals: 0, kind: 3)
-    tree waves "Waves" (sim: Sim) {
+    #[bhav(id = 4305, label = "Waves", locals = 0, kind = 3)]
+    fn waves(sim: Sim) {
         animate(clip: 3, event_local: 21);
         return true;
     }
@@ -9372,7 +9427,7 @@ fn pr_f_zero_raw_and_decompiler_gaps_run_live() {
     assert_eq!(obj.sounds_wav.len(), 2, "{:?}", obj.sounds_wav.keys());
     assert!(obj.sounds_wav.keys().all(|k| !k.contains("shared")));
 
-    // `@frame(kind:)` and `animate(event_local:)` outside a zero-local frame.
+    // `#[frame(kind = )]` and `animate(event_local:)` outside a zero-local frame.
     let waves =
         Behavior::parse(iff.data(iff.get(b"BHAV", 4305).expect("BHAV"))).expect("BHAV parse");
     assert_eq!((waves.kind, waves.locals), (3, 0));
@@ -9479,7 +9534,7 @@ fn pr_f_negative_diagnostics() {
         );
     };
     let init = |body: &str| obj(&format!("    init {{ {body} }}"));
-    let sim_tree = |body: &str| obj(&format!("    tree t (sim: Sim) {{ {body} }}"));
+    let sim_tree = |body: &str| obj(&format!("    #[bhav] fn t(sim: Sim) {{ {body} }}"));
 
     // `stack_obj` is never a binding.
     for (name, src) in [
@@ -9490,7 +9545,7 @@ fn pr_f_negative_diagnostics() {
         ),
         (
             "bind_param.antics",
-            obj("    tree t (sim: Sim, stack_obj: i16) { }"),
+            obj("    #[bhav] fn t(sim: Sim, stack_obj: i16) { }"),
         ),
     ] {
         expect_err(name, &src, "'stack_obj' is the frame's stack object");
@@ -9575,38 +9630,40 @@ fn pr_f_negative_diagnostics() {
     expect_err(
         "event_local_no_frame.antics",
         &sim_tree("animate(clip: 3, event_local: 5);"),
-        "add @frame(locals: K)",
+        "add #[frame(locals = K)]",
     );
     expect_err(
         "event_local_inside.antics",
-        &obj("    @frame(locals: 4)\n    tree t (sim: Sim) { animate(clip: 3, event_local: 2); }"),
+        &obj(
+            "    #[frame(locals = 4)]\n    #[bhav] fn t(sim: Sim) { animate(clip: 3, event_local: 2); }",
+        ),
         "is inside the frame",
     );
     expect_err(
         "event_local_needed.antics",
         &obj(
-            "    @frame(locals: 1)\n    tree t (sim: Sim) { let a = self.n; let b = a + 1; self.n = b; animate(clip: 3, event_local: 1); }",
+            "    #[frame(locals = 1)]\n    #[bhav] fn t(sim: Sim) { let a = self.n; let b = a + 1; self.n = b; animate(clip: 3, event_local: 1); }",
         ),
         "must lie outside the frame",
     );
     expect_err(
         "event_local_both.antics",
         &obj(
-            "    @frame(locals: 1)\n    tree t (sim: Sim) { let e = 0; animate(clip: 3, local: e, event_local: 4); }",
+            "    #[frame(locals = 1)]\n    #[bhav] fn t(sim: Sim) { let e = 0; animate(clip: 3, local: e, event_local: 4); }",
         ),
         "not both",
     );
     expect_err(
         "event_local_body.antics",
         &obj(
-            "    @frame(locals: 0)\n    tree t (sim: Sim) { animate(clip: 3, event_local: 4) |ev| { } }",
+            "    #[frame(locals = 0)]\n    #[bhav] fn t(sim: Sim) { animate(clip: 3, event_local: 4) |ev| { } }",
         ),
         "takes no '|event|' body",
     );
     expect_err(
         "frame_kind.antics",
-        &obj("    @frame(kind: 256)\n    tree t (sim: Sim) { }"),
-        "@frame kind must fit in a byte",
+        &obj("    #[frame(kind = 256)]\n    #[bhav] fn t(sim: Sim) { }"),
+        "'kind' must fit in a byte",
     );
 
     // Shared sound names.
@@ -9666,7 +9723,7 @@ fn pr_f_review_regressions_lower_soundly() {
     let t = tree_of(
         "raw_targets.antics",
         &obj(
-            "    @id(4300) tree t (sim: Sim) {\n        raw {\n            stack_obj := my.id;\n            random(temp[0], 1) -> true: 3, false: 3;\n            stack.attr[0] := 1;\n            return true;\n        }\n    }",
+            "    #[bhav(id = 4300)] fn t(sim: Sim) {\n        raw {\n            stack_obj := my.id;\n            random(temp[0], 1) -> true: 3, false: 3;\n            stack.attr[0] := 1;\n            return true;\n        }\n    }",
         ),
         4300,
     );
@@ -9682,7 +9739,7 @@ fn pr_f_review_regressions_lower_soundly() {
     let t = tree_of(
         "cursor_shadow.antics",
         &obj(
-            "    @id(4300) tree t (sim: Sim) { for o in lot.objects() { let sim = o; sim.attr[0] = 1; } }",
+            "    #[bhav(id = 4300)] fn t(sim: Sim) { for o in lot.objects() { let sim = o; sim.attr[0] = 1; } }",
         ),
         4300,
     );
@@ -9692,7 +9749,7 @@ fn pr_f_review_regressions_lower_soundly() {
     let t = tree_of(
         "sprite_scope.antics",
         &obj(
-            "    @id(4300) tree t (sim: Sim) { stack_obj = sim; temp[0] = 0; stack_obj.sprite_flags[0] = 1; return true; }",
+            "    #[bhav(id = 4300)] fn t(sim: Sim) { stack_obj = sim; temp[0] = 0; stack_obj.sprite_flags[0] = 1; return true; }",
         ),
         4300,
     );
@@ -9702,7 +9759,7 @@ fn pr_f_review_regressions_lower_soundly() {
     let t = tree_of(
         "pin_uninit.antics",
         &obj(
-            "    @id(4300) tree t (sim: Sim) { let o: ObjectId; push_interaction(object: o, menu: 0, priority: 2, icon: o); }",
+            "    #[bhav(id = 4300)] fn t(sim: Sim) { let o: ObjectId; push_interaction(object: o, menu: 0, priority: 2, icon: o); }",
         ),
         4300,
     );
@@ -9712,7 +9769,7 @@ fn pr_f_review_regressions_lower_soundly() {
     let t = tree_of(
         "icon_forward.antics",
         &obj(
-            "    @id(4300) tree t (sim: Sim) { push_interaction(object: 0, menu: 0, priority: 2, icon: self); stack_obj = sim; return true; }",
+            "    #[bhav(id = 4300)] fn t(sim: Sim) { push_interaction(object: 0, menu: 0, priority: 2, icon: self); stack_obj = sim; return true; }",
         ),
         4300,
     );
@@ -9722,7 +9779,7 @@ fn pr_f_review_regressions_lower_soundly() {
     tree_of(
         "frame_comment.antics",
         &obj(
-            "    @id(4300) @frame(locals: 0) tree t () {\n        raw { /* local[0] is unused */ }\n        animate(clip: 3, event_local: 1);\n        return true;\n    }",
+            "    #[bhav(id = 4300, locals = 0)] fn t() {\n        raw { /* local[0] is unused */ }\n        animate(clip: 3, event_local: 1);\n        return true;\n    }",
         ),
         4300,
     );
@@ -9731,7 +9788,7 @@ fn pr_f_review_regressions_lower_soundly() {
     let t = tree_of(
         "icon_self_object.antics",
         &obj(
-            "    @id(4300) tree t () { let o = stack_obj; push_interaction(object: o, menu: 0, priority: 2, icon: self); }",
+            "    #[bhav(id = 4300)] fn t() { let o = stack_obj; push_interaction(object: o, menu: 0, priority: 2, icon: self); }",
         ),
         4300,
     );
@@ -9741,7 +9798,7 @@ fn pr_f_review_regressions_lower_soundly() {
     let err = compile_v2_source(
         "event_local_sleep.antics",
         &obj(
-            "    @id(4300) @frame(locals: 0) tree t (sim: Sim) { animate(clip: 3, event_local: 1); sleep(1); return true; }",
+            "    #[bhav(id = 4300, locals = 0)] fn t(sim: Sim) { animate(clip: 3, event_local: 1); sleep(1); return true; }",
         ),
         &cfg,
     )
@@ -9759,7 +9816,7 @@ fn pr_f_review_regressions_lower_soundly() {
         tree_of(
             "event_local_dead.antics",
             &obj(&format!(
-                "    @id(4300) @frame(locals: 0) tree t (sim: Sim) {{ {body} }}"
+                "    #[bhav(id = 4300, locals = 0)] fn t(sim: Sim) {{ {body} }}"
             )),
             4300,
         );
@@ -9768,7 +9825,7 @@ fn pr_f_review_regressions_lower_soundly() {
     let err = compile_v2_source(
         "event_local_decl.antics",
         &obj(
-            "    @id(4300) @frame(locals: 0) tree t () { raw { local scratch; } animate(clip: 3, event_local: 0); return true; }",
+            "    #[bhav(id = 4300, locals = 0)] fn t() { raw { local scratch; } animate(clip: 3, event_local: 0); return true; }",
         ),
         &cfg,
     )

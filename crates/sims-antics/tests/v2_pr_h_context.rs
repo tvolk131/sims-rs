@@ -43,13 +43,15 @@ fn me_cells_lower_to_my_cells_in_both_contexts() {
     let air = expand(
         "frame_cells.antics",
         &obj(r#"
-    tree object_probe {
+    #[bhav]
+    fn object_probe() {
         me.person[9] = me.data[8];
         me.motive[3] = me.person[9];
         me.attr[2] = me.motive[3];
         self.charge = 5;
     }
-    tree sim_probe (actor: Sim) {
+    #[bhav]
+    fn sim_probe(actor: Sim) {
         me.person[9] = actor.data[8];
         me.motive[3] = me.person[9];
         me.attr[2] = me.motive[3];
@@ -73,10 +75,12 @@ fn me_preserves_existing_handle_bindings() {
     let air = expand(
         "bound_me.antics",
         &obj(r#"
-    tree bound_probe (me: ObjectId) {
+    #[bhav]
+    fn bound_probe(me: ObjectId) {
         me.attr[2] = 8;
     }
-    tree actor_probe (me: Sim) {
+    #[bhav]
+    fn actor_probe(me: Sim) {
         me.attr[2] = 8;
     }
 "#),
@@ -92,14 +96,17 @@ fn me_preserves_existing_handle_bindings() {
 #[test]
 fn both_callers_inherit_their_live_stack_object_with_no_wrapper() {
     let src = obj(r#"
-    @id(4200) tree object_probe {
+    #[bhav(id = 4200)]
+    fn object_probe() {
         stack_obj = self.id;
         shared_probe()?;
     }
-    @id(4201) tree sim_probe (actor: Sim) {
+    #[bhav(id = 4201)]
+    fn sim_probe(actor: Sim) {
         shared_probe()?;
     }
-    @id(4202) @context(inherit) tree shared_probe {
+    #[bhav(id = 4202, context = inherit)]
+    fn shared_probe() {
         stack_obj.attr[3] = me.data[4];
         stack_obj = me.slot[0];
         if stack_obj == 0 { return false; }
@@ -141,7 +148,8 @@ fn both_callers_inherit_their_live_stack_object_with_no_wrapper() {
 #[test]
 fn inherited_tree_preserves_raw_layout_and_ordinary_abi() {
     let src = obj(r#"
-    @id(4200) @context(inherit) tree cursor_step (n: i16) {
+    #[bhav(id = 4200, context = inherit)]
+    fn cursor_step(n: i16) {
         temp[0] = n;
         raw {
             local[0] := stack_obj;
@@ -149,7 +157,8 @@ fn inherited_tree_preserves_raw_layout_and_ordinary_abi() {
             if local[0] == stack_obj { return false; }
         }
     }
-    @id(4201) @context(inherit) tree delegate_step {
+    #[bhav(id = 4201, context = inherit)]
+    fn delegate_step() {
         cursor_step(3)?;
     }
 "#);
@@ -167,40 +176,40 @@ fn inherited_tree_preserves_raw_layout_and_ordinary_abi() {
 #[test]
 fn rejects_unproven_frame_assumptions() {
     expect_err(
-        "tree a (actor: Sim) { b(); } tree b {}",
+        "#[bhav] fn a(actor: Sim) { b(); } #[bhav] fn b() {}",
         "tree 'b' runs in the object's own context",
     );
     expect_err(
-        "tree a { stack_obj = self.id; b(stack_obj); } tree b (actor: Sim) {}",
+        "#[bhav] fn a() { stack_obj = self.id; b(stack_obj); } #[bhav] fn b(actor: Sim) {}",
         "tree 'b' runs in the Sim-on-object context",
     );
     expect_err(
-        "tree a (actor: Sim) { b(stack_obj); } tree b (actor: Sim) {}",
+        "#[bhav] fn a(actor: Sim) { b(stack_obj); } #[bhav] fn b(actor: Sim) {}",
         "tree 'b' expects the Sim handle as its first argument",
     );
     expect_err(
-        "@context(inherit) tree a { self.charge = 1; }",
-        "@context(inherit) tree 'a' depends on the caller's context",
+        "#[bhav(context = inherit)] fn a() { self.charge = 1; }",
+        "'context = inherit' fn 'a' depends on the caller's context",
     );
     expect_err(
-        "@context(inherit) tree a { b(); } tree b {}",
-        "@context(inherit) tree 'a' depends on the caller's context",
+        "#[bhav(context = inherit)] fn a() { b(); } #[bhav] fn b() {}",
+        "'context = inherit' fn 'a' depends on the caller's context",
     );
     expect_err(
-        "@context(inherit) tree a { destroy_self(); }",
-        "@context(inherit) tree 'a' depends on the caller's context",
+        "#[bhav(context = inherit)] fn a() { destroy_self(); }",
+        "'context = inherit' fn 'a' depends on the caller's context",
     );
     expect_err(
-        "@context(inherit) tree a (actor: Sim) {}",
-        "@context(inherit) cannot declare a Sim parameter",
+        "#[bhav(context = inherit)] fn a(actor: Sim) {}",
+        "'context = inherit' cannot declare a Sim parameter",
     );
     expect_err(
-        "@context(inherit) main {}",
-        "@context(inherit) is only allowed on a standalone 'tree'",
+        "#[context(inherit)] main {}",
+        "'#[context]' is not allowed on 'main'",
     );
-    expect_err("tree a { me.person[256] = 0; }", "me.person index");
+    expect_err("#[bhav] fn a() { me.person[256] = 0; }", "me.person index");
     expect_err(
-        "tree a { me.motive[16] = 0; }",
+        "#[bhav] fn a() { me.motive[16] = 0; }",
         "motive index 16 out of 0..16 range",
     );
 }

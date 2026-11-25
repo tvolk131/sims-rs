@@ -1,6 +1,6 @@
 //! `.antics` v2 Round 3 lowering fixes: the dialog entry save, out-operand writes, the
-//! `@context(inherit)` check, `self` before the first cursor move, `push_interaction` on an
-//! `@slot` handle and `job_data` comparisons. All sources are synthetic.
+//! `#[context(inherit)]` check, `self` before the first cursor move, `push_interaction` on an
+//! `#[slot]` handle and `job_data` comparisons. All sources are synthetic.
 
 use sims_antics::{PackResolverConfig, compile_v2_source, v2};
 
@@ -66,7 +66,8 @@ const SAVE: &str = "let __self_obj = stack_obj;";
 /// A Sim tree that moves the cursor with a search (which makes `self` the saved entry object)
 /// and never reads `self` afterwards, with a dialog and one unpinned local declared after the
 /// save (so dropping the save moves it from word 1 to word 0).
-const DIALOG_TREE: &str = r#"    tree a (sim: Sim) {
+const DIALOG_TREE: &str = r#"    #[bhav]
+    fn a(sim: Sim) {
         if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
             return false;
         }
@@ -84,8 +85,9 @@ fn dialog_entry_save_drops_when_no_text_reads_a_moved_word() {
         assert!(!tree(&air, "a").contains(SAVE), "{message}:\n{air}");
     }
     // Every named local pinned: dropping the save moves no word that `$Local:1` reads.
-    let pinned = r#"    tree a (sim: Sim) {
-        @slot(1) let n = sim.person[3];
+    let pinned = r#"    #[bhav]
+    fn a(sim: Sim) {
+        #[slot(1)] let n = sim.person[3];
         if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
             return false;
         }
@@ -97,8 +99,9 @@ fn dialog_entry_save_drops_when_no_text_reads_a_moved_word() {
     // The save is the highest word (after the pinned `n`), and the text reads only the word
     // below it: dropping it moves nothing. (`random_into` is not an Expression, so ordinary
     // dead-store elimination does not drop the save first.)
-    let highest = r#"    tree a (sim: Sim) {
-        @slot(0) let n: i16;
+    let highest = r#"    #[bhav]
+    fn a(sim: Sim) {
+        #[slot(0)] let n: i16;
         random_into(n, 4)?;
         if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
             return false;
@@ -125,7 +128,7 @@ fn dialog_entry_save_stays_when_text_may_read_a_moved_word() {
 #[test]
 fn a_later_dialog_literal_reaches_earlier_trees() {
     let members = format!(
-        "{DIALOG_TREE}\n    tree b (sim: Sim) {{\n        dialog(kind: ok, title: \"T\", message: \"Was $Local:0\");\n    }}"
+        "{DIALOG_TREE}\n    #[bhav] fn b(sim: Sim) {{\n        dialog(kind: ok, title: \"T\", message: \"Was $Local:0\");\n    }}"
     );
     let air = expand("save_late.antics", &obj("Plain text", &members));
     assert!(tree(&air, "a").contains(SAVE), "{air}");
@@ -137,7 +140,8 @@ fn a_later_dialog_literal_reaches_earlier_trees() {
 fn random_into_a_constant_range_defines_its_destination() {
     // (The raw statement keeps ordinary dead-store elimination from dropping the save before
     // the analysis sees it.)
-    let members = r#"    tree a (sim: Sim) {
+    let members = r#"    #[bhav]
+    fn a(sim: Sim) {
         let n: i16;
         raw { temp[7] := 0; }
         stack_obj = 0;
@@ -151,7 +155,8 @@ fn random_into_a_constant_range_defines_its_destination() {
     let air = expand("random_range.antics", &obj("Plain", members));
     assert!(!tree(&air, "a").contains(SAVE), "{air}");
     // A BCON range stays a `bcon[..]` cell in `.air`.
-    let members = r#"    tree a (sim: Sim) {
+    let members = r#"    #[bhav]
+    fn a(sim: Sim) {
         let n: i16;
         raw { temp[7] := 0; }
         stack_obj = 0;
@@ -173,7 +178,8 @@ fn random_into_a_constant_range_defines_its_destination() {
 fn ignored_local_bytes_reserve_no_frame_word() {
     let src = obj(
         "Plain",
-        r#"    @id(4300) tree a (sim: Sim) {
+        r#"    #[bhav(id = 4300)]
+    fn a(sim: Sim) {
         let n = sim.person[3];
         if !create_object(0x7F40_0901, mode: off_lot, flags: 1, dest: stack_obj) {
             return false;
@@ -181,7 +187,8 @@ fn ignored_local_bytes_reserve_no_frame_word() {
         relationship(column: 0, dir: 0, value: n);
         stack_obj.attr[0] = n;
     }
-    @id(4301) tree b (sim: Sim) {
+    #[bhav(id = 4301)]
+    fn b(sim: Sim) {
         let who: i16;
         who = sim.person[4];
         let n = sim.person[3];
@@ -206,7 +213,8 @@ fn ignored_local_bytes_reserve_no_frame_word() {
 fn inherit_check_compares_after_canonical_local_names() {
     let src = obj(
         "Plain",
-        r#"    @context(inherit) tree walk {
+        r#"    #[bhav(context = inherit)]
+    fn walk() {
         for p in lot.sims() {
             if !(p == me.data[11]) {
                 if p.kind == 1 {
@@ -216,7 +224,8 @@ fn inherit_check_compares_after_canonical_local_names() {
         }
         return false;
     }
-    tree caller (sim: Sim) {
+    #[bhav]
+    fn caller(sim: Sim) {
         walk()?;
     }"#,
     );
@@ -230,7 +239,8 @@ fn inherit_check_points_at_the_differing_statement() {
     let src = r#"object "Round Three" {
     guid: 0x7F40_0902;
     sound ding = preset("ui_click");
-    @context(inherit) tree beep {
+    #[bhav(context = inherit)]
+    fn beep() {
         me.data[3] = 1;
         if me.data[4] == 2 {
             play_sound(ding);
@@ -246,7 +256,7 @@ fn inherit_check_points_at_the_differing_statement() {
         "{err}"
     );
     let span = err.span.expect("span");
-    assert_eq!((span.line, span.column), (7, 13), "{err}");
+    assert_eq!((span.line, span.column), (8, 13), "{err}");
 }
 
 /// Disjoint inlined copies of a helper share their local's word even when a primitive writes it
@@ -277,15 +287,18 @@ fn inlined_out_operand_locals_share_across_copies_only() {
         random_into(ev, 3)?;
         me.attr[4] = ev;
     }
-    tree a {
+    #[bhav]
+    fn a() {
         react(1);
         react(2);
     }
-    tree b {
+    #[bhav]
+    fn b() {
         roll();
         roll();
     }
-    tree c {
+    #[bhav]
+    fn c() {
         pick_one();
         pick_event();
     }"#,
@@ -318,7 +331,8 @@ fn out_operand_locals_read_first_do_not_share() {
         random_into(ev, k)?;
         me.attr[1] = ev;
     }
-    tree a {
+    #[bhav]
+    fn a() {
         peek(2);
         peek(3);
     }"#,
@@ -335,7 +349,8 @@ fn out_operand_locals_read_first_do_not_share() {
 fn self_is_switched_to_before_the_first_cursor_move() {
     let src = obj(
         "Plain",
-        r#"    @frame(locals: 3) tree a (sim: Sim) {
+        r#"    #[bhav(locals = 3)]
+    fn a(sim: Sim) {
         if temp[0] == 0 { return true; }
         if self.data[10000] == 1 { return true; }
         set_to_next(all, dest: stack_obj);
@@ -351,13 +366,14 @@ fn self_is_switched_to_before_the_first_cursor_move() {
     );
 }
 
-/// `push_interaction(object: h)` with `h` an `@slot(N)` handle reads the object from word N.
+/// `push_interaction(object: h)` with `h` an `#[slot(N)]` handle reads the object from word N.
 #[test]
 fn push_interaction_reads_a_slot_handle_in_place() {
     let src = obj(
         "Plain",
-        r#"    tree a (sim: Sim) {
-        @slot(1) let target = stack_obj;
+        r#"    #[bhav]
+    fn a(sim: Sim) {
+        #[slot(1)] let target = stack_obj;
         stack_obj = sim.container;
         if !push_interaction(menu: 1, object: target, priority: 0, flags: 1, icon: target) {
             return false;
@@ -378,8 +394,9 @@ fn push_interaction_reads_a_slot_handle_in_place() {
     );
     let refused = obj(
         "Plain",
-        r#"    tree a (sim: Sim) {
-        @slot(1) let target = stack_obj;
+        r#"    #[bhav]
+    fn a(sim: Sim) {
+        #[slot(1)] let target = stack_obj;
         push_interaction(menu: 1, object: target, priority: 0, flags: 2);
     }"#,
     );
@@ -395,7 +412,8 @@ fn push_interaction_reads_a_slot_handle_in_place() {
 fn job_data_comparisons_keep_their_copy() {
     let src = obj(
         "Plain",
-        r#"    tree a (sim: Sim) {
+        r#"    #[bhav]
+    fn a(sim: Sim) {
         return job_data(sim.person[60], sim.person[61], 22) == 1;
     }"#,
     );
@@ -408,7 +426,8 @@ fn job_data_comparisons_keep_their_copy() {
 /// both, so text that may read that word keeps the save that would move it.
 #[test]
 fn dialog_entry_save_stays_when_text_may_read_the_idle_scratch_word() {
-    let members = r#"    @frame(args: 1) tree a (sim: Sim) {
+    let members = r#"    #[bhav(args = 1)]
+    fn a(sim: Sim) {
         if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
             return false;
         }
@@ -428,7 +447,8 @@ fn dialog_entry_save_stays_when_text_may_read_the_idle_scratch_word() {
 fn an_out_operand_keeps_the_old_value_on_the_exit_it_does_not_write() {
     let src = obj(
         "Plain",
-        r#"    tree a (sim: Sim) {
+        r#"    #[bhav]
+    fn a(sim: Sim) {
         let ev: i16 = 7;
         temp[0] = 1;
         while !animate(clip: 0, table: 0, local: ev) {}
@@ -442,13 +462,14 @@ fn an_out_operand_keeps_the_old_value_on_the_exit_it_does_not_write() {
     assert!(a.contains("= 7;"), "the initial store stays:\n{a}");
 }
 
-/// `@frame(locals: K)` sizes the frame with no `min_locals` floor, so an `@slot` word the body
+/// `#[frame(locals = K)]` sizes the frame with no `min_locals` floor, so an `#[slot]` word the body
 /// never names does not hold the named locals above it: dropping the save would move the
 /// `idle` scratch word that `$Local:1` reads.
 #[test]
 fn frame_locals_sets_no_allocation_floor() {
-    let members = r#"    @frame(args: 1, locals: 8) tree a (sim: Sim) {
-        @slot(7) let spare: i16;
+    let members = r#"    #[bhav(args = 1, locals = 8)]
+    fn a(sim: Sim) {
+        #[slot(7)] let spare: i16;
         if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
             return false;
         }
@@ -459,7 +480,7 @@ fn frame_locals_sets_no_allocation_floor() {
     let air = expand("frame_floor.antics", &obj("Was $Local:1", members));
     let a = tree(&air, "a");
     assert!(!a.contains("min_locals"), "{a}");
-    // `@slot` placement puts the kept save in word 0.
+    // `#[slot]` placement puts the kept save in word 0.
     assert!(a.contains("local[0] := stack_obj;"), "{a}");
 }
 
@@ -473,7 +494,7 @@ fn inherit_check_ignores_comments_and_raw_blocks_declare_no_compiler_local() {
         obj(
             "Plain",
             &format!(
-                "    @context(inherit) tree quiet {{\n        {raw}\n        return true;\n    }}"
+                "    #[bhav(context = inherit)] fn quiet() {{\n        {raw}\n        return true;\n    }}"
             ),
         )
     };
@@ -498,7 +519,8 @@ fn inherit_check_ignores_comments_and_raw_blocks_declare_no_compiler_local() {
         obj(
             "Plain",
             &format!(
-                "    tree s (sim: Sim) {{\n        set_to_next(all, dest: stack_obj);\n        \
+                "    #[bhav]
+    fn s(sim: Sim) {{\n        set_to_next(all, dest: stack_obj);\n        \
                  stop_all_sounds(target: self);\n        {raw}\n    }}"
             ),
         )
@@ -528,7 +550,7 @@ fn inherit_check_ignores_comments_and_raw_blocks_declare_no_compiler_local() {
     );
     let plain = obj(
         "Plain",
-        "    tree probe {\n        raw { const __self_obj = 17; temp[3] := __self_obj; }\n    }",
+        "    #[bhav] fn probe() {\n        raw { const __self_obj = 17; temp[3] := __self_obj; }\n    }",
     );
     let air = expand("raw_const_self.antics", &plain);
     assert!(
@@ -553,11 +575,13 @@ fn same_spelled_out_operand_locals_of_different_helpers_do_not_share() {
         random_into(event, 4)?;
         me.attr[2] = event;
     }
-    tree a {
+    #[bhav]
+    fn a() {
         first();
         second();
     }
-    tree b {
+    #[bhav]
+    fn b() {
         second();
         second();
     }"#,
@@ -598,11 +622,13 @@ fn out_operand_groups_follow_declarations_through_let_some_and_specialization() 
     fn nested(draw: bool) {
         pick(draw);
     }
-    tree a {
+    #[bhav]
+    fn a() {
         first(stack_obj);
         second(stack_obj);
     }
-    tree split_mode {
+    #[bhav]
+    fn split_mode() {
         nested(true);
         nested(false);
     }"#,
@@ -620,7 +646,8 @@ fn out_operand_groups_follow_declarations_through_let_some_and_specialization() 
 fn a_tree_that_may_read_global_34_keeps_its_entry_save() {
     let src = obj(
         "Plain",
-        r#"    tree a (sim: Sim) {
+        r#"    #[bhav]
+    fn a(sim: Sim) {
         raw { @entry: if 0 == global[34] { return true; } }
         set_to_next(all, dest: stack_obj);
         dialog(kind: ok, title: title, message: msg);
@@ -638,7 +665,8 @@ fn a_source_constant_named_like_the_entry_object_is_not_the_entry_object() {
     let src = r#"object "Round Three" {
     guid: 0x7F40_0900;
     const __self_obj = 7;
-    @context(inherit) tree a {
+    #[bhav(context = inherit)]
+    fn a() {
         raw { temp[0] := __self_obj; }
     }
 }
@@ -654,7 +682,8 @@ fn a_source_constant_named_like_the_entry_object_is_not_the_entry_object() {
 fn a_tree_that_may_read_global_34_keeps_stores_out_operands_kill() {
     let src = obj(
         "Plain",
-        r#"    tree a {
+        r#"    #[bhav]
+    fn a() {
         let n: i16 = 7;
         if 0 == global[34] {
             temp[2] = 1;
@@ -683,7 +712,8 @@ fn a_raw_op_with_a_named_opcode_may_read_global_34() {
             "Plain",
             &format!(
                 r#"    const EXPR = 2;
-    tree a (sim: Sim) {{
+    #[bhav]
+    fn a(sim: Sim) {{
         set_to_next(all, dest: stack_obj);
         {raw}
         dialog(kind: ok, title: title, message: msg);
@@ -710,7 +740,8 @@ fn only_a_raw_expression_or_ui_effect_naming_global_34_reads_it() {
         obj(
             "Plain",
             &format!(
-                r#"    tree a {{
+                r#"    #[bhav]
+    fn a() {{
         let n: i16 = 7;
         if 0 == global[5] {{
             temp[2] = 1;
@@ -718,7 +749,8 @@ fn only_a_raw_expression_or_ui_effect_naming_global_34_reads_it() {
         random_into(n, 1)?;
         temp[1] = n;
     }}
-    tree b {{
+    #[bhav]
+    fn b() {{
         raw {{ {raw} }}
     }}"#
             ),
@@ -794,11 +826,13 @@ fn a_callee_that_may_read_global_34_keeps_main_rules_in_its_caller() {
         obj(
             "Plain",
             &format!(
-                r#"    @context(inherit) tree reader {{
+                r#"    #[bhav(context = inherit)]
+    fn reader() {{
         raw {{ my.motive[0] := {cell}; temp[2] := my.motive[0]; }}
         return true;
     }}
-    tree witness (sim: Sim) {{
+    #[bhav]
+    fn witness(sim: Sim) {{
         reader();
         if temp[4] == 0 {{ return true; }}
         set_to_next(all, dest: stack_obj);
@@ -823,7 +857,7 @@ fn declaration_groups_never_overflow_the_largest_frame() {
             "    fn h{i}() {{ let n{i}: i16 = me.attr[0]; random_into(n{i}, 4)?; temp[0] = n{i}; }}\n"
         ));
     }
-    src.push_str("    tree a {\n");
+    src.push_str("    #[bhav] fn a() {\n");
     for i in 0..240 {
         src.push_str(&format!("        let x{i}: i16;\n"));
     }
@@ -847,7 +881,8 @@ fn declaration_groups_never_overflow_the_largest_frame() {
 fn an_unread_entry_save_goes_before_a_global_34_read_as_on_main() {
     let src = obj(
         "Plain",
-        r#"    @frame(locals: 1) tree a (sim: Sim) {
+        r#"    #[bhav(locals = 1)]
+    fn a(sim: Sim) {
         raw { temp[2] := global[34]; }
         set_to_next(all, dest: stack_obj);
         return true;
@@ -863,7 +898,8 @@ fn an_unread_entry_save_goes_before_a_global_34_read_as_on_main() {
 fn a_qualified_raw_constant_is_not_the_entry_object() {
     let src = r#"object "Round Three" {
     guid: 0x7F40_0900;
-    @context(inherit) tree a {
+    #[bhav(context = inherit)]
+    fn a() {
         raw { const __self_obj.tuning = 42; temp[0] := __self_obj.tuning; }
     }
 }
@@ -880,7 +916,8 @@ fn a_qualified_raw_constant_is_not_the_entry_object() {
 fn a_raw_layout_tree_that_may_read_global_34_keeps_its_entry_save() {
     let src = obj(
         "Plain",
-        r#"    tree a (sim: Sim) {
+        r#"    #[bhav]
+    fn a(sim: Sim) {
         let n: i16;
         raw { temp[2] := global[34]; }
         set_to_next(all, dest: stack_obj);
@@ -904,10 +941,12 @@ fn a_raw_layout_tree_that_may_read_global_34_keeps_its_entry_save() {
 fn a_raw_call_to_a_tree_named_like_the_entry_object_is_not_a_read() {
     let src = r#"object "Round Three" {
     guid: 0x7F40_0900;
-    @context(inherit) tree __self_obj {
+    #[bhav(context = inherit)]
+    fn __self_obj() {
         return true;
     }
-    @context(inherit) tree a {
+    #[bhav(context = inherit)]
+    fn a() {
         raw { call __self_obj; }
         return true;
     }
@@ -929,7 +968,8 @@ fn a_raw_call_to_a_tree_named_like_the_entry_object_is_not_a_read() {
 fn push_interaction_pins_only_where_main_pins() {
     let members = |range: &str, text: &str| {
         format!(
-            r#"    tree a (sim: Sim) {{
+            r#"    #[bhav]
+    fn a(sim: Sim) {{
         let h = stack_obj;
         let n: i16;
         random_into(n, {range})?;
@@ -1004,7 +1044,8 @@ fn a_bottom_frame_text_tree_keeps_main_text_rule() {
         "inherit_bottom.antics",
         &obj(
             "Plain",
-            "    @context(inherit) tree a {\n        let spare: i16 = 7;\n        temp[1] = 1;\n        \
+            "    #[bhav(context = inherit)]
+    fn a() {\n        let spare: i16 = 7;\n        temp[1] = 1;\n        \
              dialog(kind: ok, title: title, message: msg);\n    }",
         ),
     );
@@ -1027,7 +1068,8 @@ fn a_tree_that_may_read_global_34_shares_out_operand_locals_as_main() {
         random_into(event, 4)?;
         temp[2] = event;
     }
-    tree a {
+    #[bhav]
+    fn a() {
         first();
         second();
         temp[3] = global[34];
@@ -1041,11 +1083,11 @@ fn a_tree_that_may_read_global_34_shares_out_operand_locals_as_main() {
     // So does a tree whose header fixes its frame size, by `locals:` or by a format.
     expand(
         "fixed_frame.antics",
-        &plain.replace("    tree a {", "    @frame(locals: 1) tree a {"),
+        &plain.replace("    #[bhav] fn a() {", "    #[bhav(locals = 1)] fn a() {"),
     );
 }
 
-/// `@frame(format: 0x8001)` holds four locals, so its tree shares inlined out-operand locals as
+/// `#[frame(format = 0x8001)]` holds four locals, so its tree shares inlined out-operand locals as
 /// main does and fits them.
 #[test]
 fn a_format_limited_frame_shares_out_operand_locals_as_main() {
@@ -1057,7 +1099,7 @@ fn a_format_limited_frame_shares_out_operand_locals_as_main() {
         })
         .collect();
     let src = format!(
-        "object \"Round Three\" {{\n    guid: 0x7F40_0900;\n{helpers}    @frame(format: 0x8001) tree a {{\n        h0();\n        h1();\n        h2();\n        h3();\n        h4();\n    }}\n}}\n"
+        "object \"Round Three\" {{\n    guid: 0x7F40_0900;\n{helpers}    #[bhav(format = 0x8001)] fn a() {{\n        h0();\n        h1();\n        h2();\n        h3();\n        h4();\n    }}\n}}\n"
     );
     expand("format_limit.antics", &src);
 }

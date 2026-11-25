@@ -409,7 +409,7 @@ impl<'a> ObjectEnv<'a> {
             ));
         }
         // Positional args passed through `call(temps)` land in `temp[0..positional]`; an explicit
-        // `@ temp[N]` binding inside that window would be overwritten.
+        // `#[temp(N)]` binding inside that window would be overwritten.
         for p in params {
             if let AbiParamSlot::Temp(t) = p.slot
                 && usize::from(t) < positional
@@ -417,7 +417,7 @@ impl<'a> ObjectEnv<'a> {
                 return Err(Error::at(
                     p.span,
                     format!(
-                        "parameter '{}' '@ temp[{t}]' collides with positional parameter #{t} of {display}, which is passed in temp[{t}] by 'call(temps)' (bind explicit temps at or above temp[{positional}])",
+                        "parameter '{}' '#[temp({t})]' collides with positional parameter #{t} of {display}, which is passed in temp[{t}] by 'call(temps)' (bind explicit temps at or above temp[{positional}])",
                         p.name
                     ),
                 ));
@@ -443,7 +443,7 @@ impl<'a> ObjectEnv<'a> {
             params: out_params,
             ret,
             // An `extern` declares its callee's whole frame; standalone trees refine this from
-            // `@frame(args:)`.
+            // `#[frame(args = )]`.
             frame_args: Some(positional),
         })
     }

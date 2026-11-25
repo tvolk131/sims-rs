@@ -189,6 +189,7 @@ fn scan(source: &str) -> Result<Scanned> {
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => (Class::Ident, scan_ident_end(bytes, pos)),
             b'0'..=b'9' => (Class::Number, scan_number_end(bytes, pos)),
             b'"' => (Class::Str, scan_string_end(bytes, pos)?),
+            b'#' if bytes.get(pos + 1) == Some(&b'[') => (Class::Punct, pos + 2),
             b'#' => (Class::Color, scan_ident_end(bytes, pos + 1)),
             _ => (Class::Punct, pos + punct_len(bytes, pos)?),
         };
@@ -501,8 +502,8 @@ fn punct_len(bytes: &[u8], pos: usize) -> Result<usize> {
         (b'&', Some(b'&' | b'=')) => 2,
         (b'|', Some(b'|' | b'=')) => 2,
         (
-            b'{' | b'}' | b'(' | b')' | b'[' | b']' | b';' | b',' | b'.' | b'@' | b'?' | b':'
-            | b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^',
+            b'{' | b'}' | b'(' | b')' | b'[' | b']' | b';' | b',' | b'.' | b'?' | b':' | b'='
+            | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^',
             _,
         ) => 1,
         _ => {
@@ -575,7 +576,6 @@ fn member_keyword(s: &str) -> Option<&'static str> {
         "slot" => "slot",
         "strings" => "strings",
         "bcon" => "bcon",
-        "tree" => "tree",
         "init" | "main" | "load" | "reset" | "cleanup" => "lifecycle",
         "functional" => "functional",
         "interaction" => "interaction",
@@ -618,7 +618,7 @@ fn analyze(toks: &[Tok]) -> Analysis {
             continue;
         }
         match text(i) {
-            "{" | "(" | "[" => stack.push(i),
+            "{" | "(" | "[" | "#[" => stack.push(i),
             "}" | ")" | "]" => {
                 if let Some(o) = stack.pop() {
                     partner[o] = Some(i);
@@ -635,7 +635,7 @@ fn analyze(toks: &[Tok]) -> Analysis {
     // Process innermost-first so `BrokenGroup` can see nested non-empty blocks: iterate openers
     // in order of decreasing index (inner openers come later).
     let mut openers: Vec<usize> = (0..n)
-        .filter(|&i| toks[i].class == Class::Punct && matches!(text(i), "{" | "(" | "["))
+        .filter(|&i| toks[i].class == Class::Punct && matches!(text(i), "{" | "(" | "[" | "#["))
         .filter(|&i| partner[i].is_some())
         .collect();
     openers.reverse();
@@ -789,18 +789,12 @@ fn analyze(toks: &[Tok]) -> Analysis {
         }
     }
 
-    // `@id(...)` / `@frame(...)` / `@guard_id(...)` attributes.
+    // `#[name]` / `#[name(...)]` attributes.
     let mut attr_at = vec![false; n];
     let mut attr_close = vec![false; n];
-    for i in 0..n.saturating_sub(2) {
-        if is_punct(i, "@")
-            && toks[i + 1].class == Class::Ident
-            && matches!(
-                text(i + 1),
-                "id" | "frame" | "guard_id" | "slot" | "context"
-            )
-            && is_punct(i + 2, "(")
-            && let Some(c) = partner[i + 2]
+    for i in 0..n {
+        if is_punct(i, "#[")
+            && let Some(c) = partner[i]
         {
             attr_at[i] = true;
             attr_close[c] = true;
@@ -886,7 +880,7 @@ fn scan_members(toks: &[Tok], a: &Analysis, start: usize, end: usize, forced: &m
                 j += 1;
                 continue;
             }
-            if t.class == Class::Punct && matches!(t.text.as_str(), "{" | "(" | "[") {
+            if t.class == Class::Punct && matches!(t.text.as_str(), "{" | "(" | "[" | "#[") {
                 let Some(c) = a.partner[j] else {
                     j += 1;
                     continue;
@@ -942,9 +936,9 @@ fn member_kind(toks: &[Tok], a: &Analysis, mut i: usize) -> &'static str {
         let Some(t) = toks.get(i) else {
             return "field";
         };
-        if t.class == Class::Punct && t.text == "@" && a.attr_at[i] {
-            // Skip `@name(...)`.
-            match a.partner.get(i + 2).copied().flatten() {
+        if t.class == Class::Punct && t.text == "#[" && a.attr_at[i] {
+            // Skip `#[...]`.
+            match a.partner.get(i).copied().flatten() {
                 Some(c) => {
                     i = c + 1;
                     continue;
@@ -1011,7 +1005,7 @@ impl<'a> Printer<'a> {
 
     fn is_opener(&self, i: usize) -> bool {
         self.toks[i].class == Class::Punct
-            && matches!(self.text(i), "{" | "(" | "[")
+            && matches!(self.text(i), "{" | "(" | "[" | "#[")
             && self.a.partner[i].is_some()
     }
 

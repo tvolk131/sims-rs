@@ -1,7 +1,7 @@
 //! The per-tree backend pipeline: from the body lowering wrote (already carrying the lowering's
 //! own bookkeeping, such as the `__saved_stack_obj` save and the resolved pin slot) to the final
 //! `.air` body: the entry-save drop or the optimizer, the pinned slot, the raw blocks'
-//! constants, and `@slot(N)` frame placement.
+//! constants, and `#[slot(N)]` frame placement.
 
 use super::*;
 
@@ -11,14 +11,14 @@ pub(crate) struct FrameFacts<'a> {
     /// (`ObjectEnv::reads_global_34`), or it pins a `push_interaction` slot, which must pin
     /// exactly where main's body lets it. Its text reads are then `Unknown` when it formats text.
     pub(crate) main_rules: bool,
-    /// The tree's header sets its frame size (`@frame(locals: K)`), which main's coalescing
+    /// The tree's header sets its frame size (`#[frame(locals = K)]`), which main's coalescing
     /// fits: out-operand locals share words as on main.
     pub(crate) fixed_frame: bool,
     /// The frame words the tree's text may read: what the object's strings read
     /// ([`text_reads`](mod@super::text_reads)) when the tree formats text (a raw block's, or a
     /// dialog or action string in the body), and none when it does not.
     pub(crate) text_reads: TableLocals,
-    /// Keep the body's node layout: a raw block, `local[N]` read, or `@slot` in the tree may
+    /// Keep the body's node layout: a raw block, `local[N]` read, or `#[slot]` in the tree may
     /// depend on it, so only the unread entry save may go.
     pub(crate) keep_layout: bool,
     /// The tree starts with the Sim-tree entry save `let __self_obj = stack_obj;`.
@@ -29,9 +29,9 @@ pub(crate) struct FrameFacts<'a> {
     pub(crate) raw_consts: &'a BTreeMap<String, String>,
     /// Names the raw blocks declare themselves.
     pub(crate) raw_declared: &'a BTreeSet<String>,
-    /// The tree has `@slot(N) let` locals, placed by `assign_frame_slots`.
+    /// The tree has `#[slot(N)] let` locals, placed by `assign_frame_slots`.
     pub(crate) has_slots: bool,
-    /// The `@slot(N)` locals.
+    /// The `#[slot(N)]` locals.
     pub(crate) pinned_locals: &'a BTreeMap<String, usize>,
     /// Each inlined helper local's declaration (`TreeLowerer::local_origins`).
     pub(crate) local_origins: &'a BTreeMap<String, String>,

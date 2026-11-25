@@ -7,25 +7,52 @@ use crate::parser::motive_by_name;
 use crate::v2::ast::{
     AbiParam, AbiParamSlot, AdvertiseDecl, BconTableDecl, BitflagVariant, BitflagsDecl, CallArg,
     ConstDecl, ConstIntExpr, EnumDecl, EnumVariant, ExternBconDecl, ExternBconEntry, ExternFnDecl,
-    ExternModDecl, FnDecl, FnParam, ForEachIter, FunctionalDecl, GuardBody, GuardDecl,
+    ExternModDecl, FnDecl, FnParam, ForEachIter, FunctionalDecl, GuardBody, GuardDecl, GuidValue,
     InteractionDecl, LifecycleBlock, MatchArm, MatchExprArm, MatchPattern, MetaField,
     MetaFieldKind, ObjectDecl, ObjectMember, ParamAssignDecl, ParamDecl, ParamType, ParamValue,
     ReturnAbi, SlotDecl, SoundDecl, SpriteDecl, StateDecl, StateInitValue, StateType, StringsDecl,
-    TemplateDecl, TileDecl, TreeFrame, TreeMemberDecl, UseDecl, UseItem, V2AssignOp, V2BinOp,
-    V2Expr, V2File, V2Item, V2Stmt, V2Type, V2UnaryOp, VariantDecl,
+    TemplateDecl, TileDecl, TreeMemberDecl, UseDecl, UseItem, V2AssignOp, V2BinOp, V2Expr, V2File,
+    V2Item, V2Stmt, V2Type, V2UnaryOp, VariantDecl,
 };
+use crate::v2::attrs::{Attr, AttrArg, AttrValue, ItemAttrs};
 use crate::v2::lexer::{Token, TokenKind, tokenize};
 use crate::v2::specialize::{self, Arm, BlockItem, ConstBinding, Selector};
 use std::collections::BTreeSet;
 
 const MAX_NESTING_DEPTH: usize = 64;
 
-/// Highest explicit `state name @ <slot>` attribute index accepted by the parser.
+/// Highest explicit `#[slot(N)] state name` attribute index accepted by the parser.
 pub(crate) const MAX_STATE_SLOT: u16 = 255;
-/// Number of shared per-thread SimAntics temporaries (`temp[0..=7]`).
-const TEMP_COUNT: i64 = 8;
 
 /// Parses a `.antics` v2 source file into a [`V2File`] AST.
+/// The engine globals `world.<name>` names (`world.hour` is `global[0]`), as the engine uses
+/// them (sims-vm `tick.rs`, `daily.rs`, `selection.rs`, `coop.rs`).
+pub(crate) const WORLD_GLOBALS: &[(&str, u8)] = &[
+    ("hour", 0),
+    ("day", 1),
+    // The selected Sim's object ID (0 = none).
+    ("selected_sim", 3),
+    // 0 day, 1 dusk, 2 night, 3 dawn.
+    ("time_of_day", 4),
+    ("minute", 5),
+    ("second", 6),
+    ("month", 7),
+    ("year", 8),
+    // The lot (house number) being played.
+    ("house", 10),
+    ("paused", 17),
+    ("days_played", 28),
+    ("free_will", 30),
+];
+
+/// The global index of `world.<name>`.
+pub(crate) fn world_global(name: &str) -> Option<u8> {
+    WORLD_GLOBALS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|&(_, i)| i)
+}
+
 pub fn parse_v2_file(source: &str) -> Result<V2File> {
     let tokens = tokenize(source)?;
     let mut parser = Parser {
@@ -33,6 +60,8 @@ pub fn parse_v2_file(source: &str) -> Result<V2File> {
         pos: 0,
         depth: 0,
         bound_vars: std::collections::BTreeSet::new(),
+        tails: Vec::new(),
+        arm_tails: Vec::new(),
     };
     parser.parse_file()
 }
@@ -45,6 +74,12 @@ struct Parser {
     /// bindings). A const binding may not yield one of these: a variable can change, or be
     /// written through a frame-word alias, between the test and a use in the region.
     bound_vars: std::collections::BTreeSet<String>,
+    /// Expression statements written without `;` before a `}`: only a value-returning
+    /// function body's last one is allowed (a tail expression, `return` of it).
+    tails: Vec<Span>,
+    /// Bare match-arm expressions (`0 => f(),`): statements in general, but the value of a
+    /// value-returning function's final `match` (`match a { 0 => 1, _ => 2 }`).
+    arm_tails: Vec<Span>,
 }
 
 impl Parser {
@@ -128,6 +163,14 @@ impl Parser {
                 format!("'stack_obj' is the frame's stack object and cannot be used as a {desc}"),
             ));
         }
+        if name == "world" {
+            return Err(Error::at(
+                span,
+                format!(
+                    "'world' names the engine globals ('world.hour') and cannot be used as a {desc}"
+                ),
+            ));
+        }
         self.bound_vars.insert(name.clone());
         Ok((name, span))
     }
@@ -195,6 +238,16 @@ impl Parser {
         u32::try_from(v).map_err(|_| Error::at(span, format!("{desc} {v} out of u32 range")))
     }
 
+    /// A `guid:` value: an integer literal or a `const` name (resolved during lowering).
+    fn parse_guid_value(&mut self, desc: &str) -> Result<GuidValue> {
+        if let TokenKind::Ident(name) = &self.peek().kind {
+            let name = name.clone();
+            self.bump();
+            return Ok(GuidValue::Const(name));
+        }
+        Ok(GuidValue::Lit(self.expect_u32(desc)?))
+    }
+
     fn expect_i32(&mut self, desc: &str) -> Result<i32> {
         let (v, span) = self.parse_signed_int(desc)?;
         i32::try_from(v).map_err(|_| Error::at(span, format!("{desc} {v} out of i32 range")))
@@ -227,16 +280,88 @@ impl Parser {
         self.depth = self.depth.saturating_sub(1);
     }
 
+    /// Parses every outer attribute (`#[name]`, `#[name(args)]`) in front of an item.
+    fn parse_attrs(&mut self) -> Result<Vec<Attr>> {
+        let mut out = Vec::new();
+        while self.peek().kind == TokenKind::HashBracket {
+            let span = self.span();
+            self.bump();
+            let (name, _) = self.expect_ident("attribute name")?;
+            let args = if self.eat(&TokenKind::LParen) {
+                let mut args = Vec::new();
+                while !self.eat(&TokenKind::RParen) {
+                    let aspan = self.span();
+                    let first = self.parse_attr_value()?;
+                    let arg = match first {
+                        AttrValue::Ident(key) if self.eat(&TokenKind::Assign) => AttrArg {
+                            span: aspan,
+                            key: Some(key),
+                            value: self.parse_attr_value()?,
+                        },
+                        value => AttrArg {
+                            span: aspan,
+                            key: None,
+                            value,
+                        },
+                    };
+                    args.push(arg);
+                    if !self.eat(&TokenKind::Comma) {
+                        self.expect(&TokenKind::RParen, "')'")?;
+                        break;
+                    }
+                }
+                Some(args)
+            } else {
+                None
+            };
+            self.expect(&TokenKind::RBracket, "']' closing the attribute")?;
+            out.push(Attr { span, name, args });
+        }
+        Ok(out)
+    }
+
+    fn parse_attr_value(&mut self) -> Result<AttrValue> {
+        match &self.peek().kind {
+            TokenKind::Str(s) => {
+                let s = s.clone();
+                self.bump();
+                Ok(AttrValue::Str(s))
+            }
+            TokenKind::Ident(s) => {
+                let s = s.clone();
+                self.bump();
+                Ok(AttrValue::Ident(s))
+            }
+            _ => {
+                let (v, _) = self.parse_signed_int("attribute value (integer, string, or name)")?;
+                Ok(AttrValue::Int(v))
+            }
+        }
+    }
+
+    /// Parses the attributes in front of an item into their facts.
+    fn parse_item_attrs(&mut self) -> Result<ItemAttrs> {
+        let attrs = self.parse_attrs()?;
+        ItemAttrs::collect(attrs)
+    }
+
     fn parse_file(&mut self) -> Result<V2File> {
         let mut uses = Vec::new();
         let mut items = Vec::new();
         while self.peek().kind != TokenKind::Eof {
             let span = self.span();
+            let attrs = self.parse_item_attrs()?;
             if self.eat_ident("use") {
+                attrs.only(&[], "a 'use' declaration")?;
                 uses.push(self.parse_use(span)?);
                 continue;
             }
             let is_pub = self.eat_ident("pub");
+            if self.is_ident("fn") {
+                attrs.only(&["inline"], "a top-level 'fn' (an inline helper)")?;
+            } else {
+                attrs.only(&[], "a top-level item")?;
+            }
             let (kw, kw_span) = self.expect_ident(
                 "top-level item ('use', 'const', 'fn', 'template', 'object', 'enum', 'bitflags', 'extern')",
             )?;
@@ -284,7 +409,67 @@ impl Parser {
                 }
             }
         }
+        if let Some(&span) = self.tails.first() {
+            return Err(Error::at(
+                span,
+                "expected ';' after this expression (one without ';' is a tail expression, allowed only as the last statement of a function that returns a value)",
+            ));
+        }
         Ok(V2File { uses, items })
+    }
+
+    /// A function body; with `value`, a last expression without `;` is its `return`.
+    fn parse_fn_body(&mut self, value: bool) -> Result<Vec<V2Stmt>> {
+        let mut body = self.parse_block()?;
+        if value {
+            // Spans are dropped from the tail lists only after the whole body is converted:
+            // `const` specialization copies the code after a `const X = if ..` into each
+            // branch, so one tail can end several copies.
+            let mut used = Vec::new();
+            self.tails_to_returns(&mut body, &mut used);
+            self.tails.retain(|t| !used.contains(t));
+            self.arm_tails.retain(|t| !used.contains(t));
+        }
+        Ok(body)
+    }
+
+    /// Turns the tail expression ending `body` into `return <expr>;`, looking through a final
+    /// `if` / `match` statement into each of its branches (`if a > b { a } else { b }`,
+    /// `match a { 0 => 1, _ => 2 }`). Each converted span is pushed to `used`.
+    fn tails_to_returns(&self, body: &mut [V2Stmt], used: &mut Vec<Span>) {
+        match body.last_mut() {
+            Some(last @ V2Stmt::Expr { .. }) => {
+                if let V2Stmt::Expr { span, .. } = last
+                    && self.tails.contains(span)
+                {
+                    used.push(*span);
+                    tail_to_return(last);
+                }
+            }
+            Some(V2Stmt::If {
+                then_body,
+                else_body,
+                ..
+            }) => {
+                self.tails_to_returns(then_body, used);
+                self.tails_to_returns(else_body, used);
+            }
+            Some(V2Stmt::Match { arms, .. }) => {
+                for arm in arms {
+                    // A bare arm (`0 => 1,`) is the arm's value.
+                    if let [last @ V2Stmt::Expr { .. }] = arm.body.as_mut_slice()
+                        && let V2Stmt::Expr { span, .. } = last
+                        && self.arm_tails.contains(span)
+                    {
+                        used.push(*span);
+                        tail_to_return(last);
+                    } else {
+                        self.tails_to_returns(&mut arm.body, used);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn parse_use(&mut self, span: Span) -> Result<UseDecl> {
@@ -294,6 +479,16 @@ impl Parser {
         let mut items = Vec::new();
 
         while self.eat(&TokenKind::ColonColon) {
+            if self.peek().kind == TokenKind::Star {
+                // `use pack::module::*;`: every `pub` item (local items shadow them).
+                let star = self.bump().span;
+                items.push(UseItem {
+                    span: star,
+                    name: "*".to_owned(),
+                    alias: None,
+                });
+                break;
+            }
             if self.eat(&TokenKind::LBrace) {
                 while !self.eat(&TokenKind::RBrace) {
                     let (name, ispan) = self.expect_ident("imported item name")?;
@@ -538,6 +733,14 @@ impl Parser {
         let mut seen_names = BTreeSet::new();
         let mut seen_default = false;
         while !self.eat(&TokenKind::RParen) {
+            let const_span = self.span();
+            let is_const = self.eat_ident("const");
+            if is_const && !allow_defaults {
+                return Err(Error::at(
+                    const_span,
+                    "functional parameters cannot be 'const' (only inline 'fn' helpers specialize on constant arguments)",
+                ));
+            }
             let (name, span) = self.expect_binding_ident("parameter name")?;
             if !seen_names.insert(name.clone()) {
                 return Err(Error::at(
@@ -547,6 +750,14 @@ impl Parser {
             }
             self.expect(&TokenKind::Colon, "':'")?;
             let ty = self.parse_type()?;
+            if is_const && !matches!(ty, V2Type::I16 | V2Type::Bool | V2Type::Named(_)) {
+                return Err(Error::at(
+                    span,
+                    format!(
+                        "const parameter '{name}' must be i16, bool, or an enum or bitflags type"
+                    ),
+                ));
+            }
             let default = if self.eat(&TokenKind::Assign) {
                 if !allow_defaults {
                     return Err(Error::at(
@@ -575,6 +786,7 @@ impl Parser {
             };
             params.push(FnParam {
                 span,
+                is_const,
                 name,
                 ty,
                 default,
@@ -595,7 +807,7 @@ impl Parser {
         } else {
             None
         };
-        let body = self.parse_block()?;
+        let body = self.parse_fn_body(return_type.is_some())?;
         Ok(FnDecl {
             span,
             is_pub,
@@ -606,31 +818,7 @@ impl Parser {
         })
     }
 
-    /// Parses `temp[N]` (after `@`) and validates `N` against the 8 SimAntics temporaries.
-    fn parse_temp_slot(&mut self, what: &str) -> Result<u8> {
-        let (kw, kspan) = self.expect_ident("'temp' ABI binding")?;
-        if kw != "temp" {
-            return Err(Error::at(
-                kspan,
-                format!("{what} ABI binding must be 'temp[N]', found '{kw}'"),
-            ));
-        }
-        self.expect(&TokenKind::LBracket, "'['")?;
-        let (v, vspan) = self.parse_signed_int("temp slot")?;
-        self.expect(&TokenKind::RBracket, "']'")?;
-        if !(0..TEMP_COUNT).contains(&v) {
-            return Err(Error::at(
-                vspan,
-                format!(
-                    "{what} temp slot {v} is out of range (SimAntics has temp[0]..=temp[{}])",
-                    TEMP_COUNT - 1
-                ),
-            ));
-        }
-        Ok(v as u8)
-    }
-
-    /// Parses a BHAV-call ABI parameter list `(a: i16, b: i16 @ temp[1], ...)`.
+    /// Parses a BHAV-call ABI parameter list `(a: i16, #[temp(1)] b: i16, ...)`.
     /// When `allow_sim` is set, a leading `name: Sim` binds the Sim-on-object context.
     fn parse_abi_params(
         &mut self,
@@ -644,7 +832,9 @@ impl Parser {
         let mut seen_temps: BTreeSet<u8> = BTreeSet::new();
         let mut first = true;
         while !self.eat(&TokenKind::RParen) {
+            let attrs = self.parse_item_attrs()?;
             let (name, span) = self.expect_binding_ident("parameter name")?;
+            attrs.only(&["temp"], &format!("parameter '{name}'"))?;
             if !seen_names.insert(name.clone()) {
                 return Err(Error::at(
                     span,
@@ -654,23 +844,30 @@ impl Parser {
             self.expect(&TokenKind::Colon, "':'")?;
             let ty = self.parse_type()?;
             if ty == V2Type::Sim {
+                if let Some((tspan, _)) = attrs.temp {
+                    return Err(Error::at(
+                        tspan,
+                        format!(
+                            "'{name}: Sim' selects the frame context and takes no '#[temp(N)]'"
+                        ),
+                    ));
+                }
                 if !(allow_sim && first) {
                     return Err(Error::at(
                         span,
                         format!(
-                            "'{name}: Sim' is only allowed as the first parameter of a 'tree' (it selects the Sim-on-object context)"
+                            "'{name}: Sim' is only allowed as the first parameter of a '#[bhav] fn' (it selects the Sim-on-object context)"
                         ),
                     ));
                 }
                 sim_binding = Some(name);
             } else {
-                let slot = if self.eat(&TokenKind::At) {
-                    let t = self.parse_temp_slot(&format!("{what} parameter '{name}'"))?;
+                let slot = if let Some((_, t)) = attrs.temp {
                     if !seen_temps.insert(t) {
                         return Err(Error::at(
                             span,
                             format!(
-                                "duplicate '@ temp[{t}]' binding for parameter '{name}' in {what}"
+                                "duplicate '#[temp({t})]' binding for parameter '{name}' in {what}"
                             ),
                         ));
                     }
@@ -700,34 +897,41 @@ impl Parser {
         Ok((sim_binding, params))
     }
 
-    /// Parses an optional `-> bool | -> Result | -> T @ temp[N] | -> Result<T @ temp[N]>` ABI.
-    fn parse_return_abi(&mut self, what: &str) -> Result<ReturnAbi> {
+    /// Parses an optional `-> bool | -> Result | -> T | -> Result<T>` ABI. A value result
+    /// (`-> T`, `-> Result<T>`) names the temporary the callee leaves it in with `ret_temp`
+    /// (`#[ret(temp = N)]` or `#[bhav(ret_temp = N)]`).
+    fn parse_return_abi(&mut self, what: &str, ret_temp: Option<(Span, u8)>) -> Result<ReturnAbi> {
+        let no_value = |ret: ReturnAbi| match ret_temp {
+            Some((span, _)) => Err(Error::at(
+                span,
+                format!("{what} returns no value, so it takes no '#[ret(temp = N)]'"),
+            )),
+            None => Ok(ret),
+        };
         if !self.eat(&TokenKind::Arrow) {
-            return Ok(ReturnAbi::Void);
+            return no_value(ReturnAbi::Void);
         }
         let rspan = self.span();
         if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "Result") {
             self.bump();
             if !self.eat(&TokenKind::Lt) {
-                return Ok(ReturnAbi::Result);
+                return no_value(ReturnAbi::Result);
             }
             let ty = self.parse_type()?;
-            if !self.eat(&TokenKind::At) {
+            self.expect(&TokenKind::Gt, "'>'")?;
+            let Some((_, temp)) = ret_temp else {
                 return Err(Error::at(
                     rspan,
                     format!(
-                        "{what} 'Result<{}>' return requires an explicit '@ temp[N]' binding (e.g. 'Result<i16 @ temp[0]>')",
+                        "{what} 'Result<{}>' return requires the temporary that carries it: add '#[ret(temp = N)]'",
                         ty.display_name()
                     ),
                 ));
-            }
-            let temp = self.parse_temp_slot(&format!("{what} return"))?;
-            self.expect(&TokenKind::Gt, "'>'")?;
+            };
             return Ok(ReturnAbi::ResultValue { ty, temp });
         }
         let ty = self.parse_type()?;
-        if self.eat(&TokenKind::At) {
-            let temp = self.parse_temp_slot(&format!("{what} return"))?;
+        if let Some((_, temp)) = ret_temp {
             return Ok(ReturnAbi::Value { ty, temp });
         }
         if ty == V2Type::Bool {
@@ -736,44 +940,31 @@ impl Parser {
         Err(Error::at(
             rspan,
             format!(
-                "{what} '-> {}' return requires an explicit '@ temp[N]' binding (e.g. '-> {} @ temp[0]')",
-                ty.display_name(),
+                "{what} '-> {}' return requires the temporary that carries it: add '#[ret(temp = N)]'",
                 ty.display_name()
             ),
         ))
     }
 
-    /// Parses `extern mod name { @id(N) fn f(...) [-> Abi]; ... }` (after `extern mod`).
+    /// Parses `extern mod name { #[id(N)] fn f(...) [-> Abi]; ... }` (after `extern mod`).
     fn parse_extern_mod(&mut self, span: Span, is_pub: bool) -> Result<ExternModDecl> {
         let (name, _) = self.expect_ident("extern mod name")?;
         self.expect(&TokenKind::LBrace, "'{'")?;
         let mut fns: Vec<ExternFnDecl> = Vec::new();
         while !self.eat(&TokenKind::RBrace) {
             let fspan = self.span();
-            let mut id: Option<u16> = None;
-            while self.eat(&TokenKind::At) {
-                let (attr, aspan) = self.expect_ident("attribute name ('id')")?;
-                if attr != "id" {
-                    return Err(Error::at(
-                        aspan,
-                        format!("unknown annotation '@{attr}' on extern fn (expected '@id(N)')"),
-                    ));
-                }
-                self.expect(&TokenKind::LParen, "'('")?;
-                let ispan = self.span();
-                let v = self.expect_u16("BHAV tree id")?;
-                self.expect(&TokenKind::RParen, "')'")?;
-                if !(256..=4095).contains(&v) && v < 8192 {
-                    return Err(Error::at(
-                        ispan,
-                        format!(
-                            "extern BHAV @id({v}) must be a global (256..=4095) or semi-global (8192..) tree"
-                        ),
-                    ));
-                }
-                if id.replace(v).is_some() {
-                    return Err(Error::at(aspan, "duplicate @id annotation"));
-                }
+            let attrs = self.parse_item_attrs()?;
+            attrs.only(&["id", "ret"], "an extern fn")?;
+            if let Some((ispan, v)) = attrs.id
+                && !(256..=4095).contains(&v)
+                && v < 8192
+            {
+                return Err(Error::at(
+                    ispan,
+                    format!(
+                        "extern BHAV #[id({v})] must be a global (256..=4095) or semi-global (8192..) tree"
+                    ),
+                ));
             }
             let (kw, kspan) = self.expect_ident("'fn' inside extern mod")?;
             if kw != "fn" {
@@ -783,10 +974,10 @@ impl Parser {
                 ));
             }
             let (fname, nspan) = self.expect_ident("extern fn name")?;
-            let Some(id) = id else {
+            let Some((_, id)) = attrs.id else {
                 return Err(Error::at(
                     nspan,
-                    format!("extern fn '{name}::{fname}' requires an '@id(N)' BHAV annotation"),
+                    format!("extern fn '{name}::{fname}' requires an '#[id(N)]' BHAV attribute"),
                 ));
             };
             if fns.iter().any(|f| f.name == fname) {
@@ -797,7 +988,7 @@ impl Parser {
             }
             let what = format!("extern fn '{name}::{fname}'");
             let (_, params) = self.parse_abi_params(&what, false)?;
-            let ret = self.parse_return_abi(&what)?;
+            let ret = self.parse_return_abi(&what, attrs.ret_temp)?;
             self.expect(&TokenKind::Semicolon, "';' after extern fn signature")?;
             fns.push(ExternFnDecl {
                 span: fspan,
@@ -815,12 +1006,20 @@ impl Parser {
         })
     }
 
-    /// Parses `extern bcon name { entry @ <address>; entry @ <bcon_id>[<index>]; ... }`.
+    /// Parses `extern bcon name { #[addr(<address>)] entry; #[bcon(<chunk id>, <index>)] entry; ... }`.
     fn parse_extern_bcon(&mut self, span: Span, is_pub: bool) -> Result<ExternBconDecl> {
-        let (name, _) = self.expect_ident("extern bcon name")?;
+        let (name, name_span) = self.expect_ident("extern bcon name")?;
+        if name == "world" {
+            return Err(Error::at(
+                name_span,
+                "'world' names the engine globals ('world.hour') and cannot name a bcon",
+            ));
+        }
         self.expect(&TokenKind::LBrace, "'{'")?;
         let mut entries: Vec<ExternBconEntry> = Vec::new();
         while !self.eat(&TokenKind::RBrace) {
+            let attrs = self.parse_item_attrs()?;
+            attrs.only(&["addr", "bcon"], "an extern bcon entry")?;
             let (ename, espan) = self.expect_ident("extern bcon entry name")?;
             if entries.iter().any(|e| e.name == ename) {
                 return Err(Error::at(
@@ -828,42 +1027,13 @@ impl Parser {
                     format!("duplicate entry '{ename}' in 'extern bcon {name}'"),
                 ));
             }
-            self.expect(&TokenKind::At, "'@' (constant address)")?;
-            let aspan = self.span();
-            let (first, _) = self.parse_signed_int("BCON address")?;
-            let address = if self.eat(&TokenKind::LBracket) {
-                let (entry, _) = self.parse_signed_int("BCON entry index")?;
-                self.expect(&TokenKind::RBracket, "']'")?;
-                let table = u16::try_from(first)
-                    .ok()
-                    .and_then(bcon_chunk_table)
-                    .ok_or_else(|| {
-                        Error::at(
-                            aspan,
-                            format!(
-                                "BCON chunk id {first} is not addressable (expected 4096..=4159 private, 8192..=8255 semi-global, or 256..=319 global)"
-                            ),
-                        )
-                    })?;
-                if !(0..=127).contains(&entry) {
-                    return Err(Error::at(
-                        aspan,
-                        format!("BCON entry index {entry} is out of range 0..=127"),
-                    ));
-                }
-                (table << 7) | entry as u16
-            } else {
-                u16::try_from(first)
-                    .ok()
-                    .filter(|&a| (a >> 7) <= 191)
-                    .ok_or_else(|| {
-                        Error::at(
-                            aspan,
-                            format!(
-                                "BCON address {first} is out of range 0..=24575 (table = address >> 7 must be <= 191)"
-                            ),
-                        )
-                    })?
+            let Some((_, address)) = attrs.address else {
+                return Err(Error::at(
+                    espan,
+                    format!(
+                        "extern bcon entry '{ename}' needs its constant: '#[bcon(<chunk id>, <entry>)] {ename};' or '#[addr(<address>)] {ename};'"
+                    ),
+                ));
             };
             entries.push(ExternBconEntry {
                 span: espan,
@@ -896,6 +1066,12 @@ impl Parser {
                 ));
             }
         };
+        if label == "world" || snake_case_ident(&label) == "world" {
+            return Err(Error::at(
+                span,
+                "'world' names the engine globals ('world.hour') and cannot name a bcon table",
+            ));
+        }
         self.expect(&TokenKind::LBrace, "'{'")?;
         let mut entries: Vec<(Span, String, i16)> = Vec::new();
         while !self.eat(&TokenKind::RBrace) {
@@ -916,44 +1092,26 @@ impl Parser {
         })
     }
 
-    /// Parses `tree [ident] ["Label"] [(params)] [-> Abi] { ... }` (after `tree`).
-    fn parse_tree_member(&mut self, span: Span, pinned_id: Option<u16>) -> Result<TreeMemberDecl> {
-        let ident = if let TokenKind::Ident(s) = &self.peek().kind {
-            let s = s.clone();
-            self.bump();
-            Some(s)
-        } else {
-            None
-        };
-        let label = if let TokenKind::Str(s) = &self.peek().kind {
-            let s = s.clone();
-            self.bump();
-            Some(s)
-        } else {
-            None
-        };
-        let (ident, label) = match (ident, label) {
-            (Some(i), Some(l)) => (i, l),
-            (Some(i), None) => (i.clone(), i),
-            (None, Some(l)) => (snake_case_ident(&l), l),
-            (None, None) => {
-                return Err(Error::at(
-                    span,
-                    "'tree' requires a name or a \"Label\" (e.g. 'tree \"CT - Is Fridge\" { ... }')",
-                ));
-            }
-        };
-        let what = format!("tree '{ident}'");
-        let (sim_binding, params) = if self.peek().kind == TokenKind::LParen {
-            self.parse_abi_params(&what, true)?
-        } else {
-            (None, Vec::new())
-        };
-        let ret = self.parse_return_abi(&what)?;
-        let body = self.parse_block()?;
+    /// Parses `name(params) [-> Abi] { ... }` after the `fn` of a `#[bhav] fn`.
+    fn parse_bhav_fn(&mut self, span: Span, attrs: &ItemAttrs) -> Result<TreeMemberDecl> {
+        let (ident, _) = self.expect_ident("BHAV function name")?;
+        let label = attrs
+            .label
+            .as_ref()
+            .map_or_else(|| ident.clone(), |(_, l)| l.clone());
+        let what = format!("'#[bhav] fn {ident}'");
+        if self.peek().kind != TokenKind::LParen {
+            return Err(Error::at(
+                self.span(),
+                format!("expected '(' after {what} (write '()' for no parameters)"),
+            ));
+        }
+        let (sim_binding, params) = self.parse_abi_params(&what, true)?;
+        let ret = self.parse_return_abi(&what, attrs.ret_temp)?;
+        let body = self.parse_fn_body(ret != ReturnAbi::Void)?;
         Ok(TreeMemberDecl {
             span,
-            pinned_id,
+            pinned_id: attrs.id.map(|(_, id)| id),
             ident,
             label,
             sim_binding,
@@ -961,73 +1119,8 @@ impl Parser {
             params,
             ret,
             body,
-            frame: None,
+            frame: attrs.frame,
         })
-    }
-
-    /// Parses the `key: value, ...)` tail of `@frame(` (the `(` is consumed).
-    fn parse_frame_fields(&mut self, span: Span) -> Result<TreeFrame> {
-        let mut frame = TreeFrame {
-            span,
-            ..TreeFrame::default()
-        };
-        while !self.eat(&TokenKind::RParen) {
-            let (key, kspan) =
-                self.expect_ident("'args', 'locals', 'format', 'revision', 'kind', or 'empty'")?;
-            if key == "empty" && self.peek().kind != TokenKind::Colon {
-                if std::mem::replace(&mut frame.empty, true) {
-                    return Err(Error::at(kspan, "duplicate @frame field 'empty'"));
-                }
-                if !self.eat(&TokenKind::Comma) {
-                    self.expect(&TokenKind::RParen, "')'")?;
-                    break;
-                }
-                continue;
-            }
-            self.expect(&TokenKind::Colon, "':'")?;
-            let dup = match key.as_str() {
-                "args" => frame
-                    .args
-                    .replace(u8::try_from(self.expect_u16("BHAV args")?).map_err(|_| {
-                        Error::at(kspan, "@frame args must fit in a byte (0..=255)")
-                    })?)
-                    .is_some(),
-                "locals" => frame
-                    .locals
-                    .replace(self.expect_u16("BHAV locals")?)
-                    .is_some(),
-                "format" => frame
-                    .format
-                    .replace(self.expect_u16("BHAV format")?)
-                    .is_some(),
-                "revision" => frame
-                    .revision
-                    .replace(self.expect_u32("BHAV revision")?)
-                    .is_some(),
-                "kind" => frame
-                    .kind
-                    .replace(u8::try_from(self.expect_u16("BHAV kind")?).map_err(|_| {
-                        Error::at(kspan, "@frame kind must fit in a byte (0..=255)")
-                    })?)
-                    .is_some(),
-                other => {
-                    return Err(Error::at(
-                        kspan,
-                        format!(
-                            "unknown @frame field '{other}' (expected args, locals, format, revision, kind, or empty)"
-                        ),
-                    ));
-                }
-            };
-            if dup {
-                return Err(Error::at(kspan, format!("duplicate @frame field '{key}'")));
-            }
-            if !self.eat(&TokenKind::Comma) {
-                self.expect(&TokenKind::RParen, "')'")?;
-                break;
-            }
-        }
-        Ok(frame)
     }
 
     /// Parses `NAME = <integer>;` after `const`.
@@ -1082,96 +1175,63 @@ impl Parser {
         self.expect(&TokenKind::LBrace, "'{'")?;
         let mut members = Vec::new();
         while !self.eat(&TokenKind::RBrace) {
-            // Parse optional member annotations.
-            let mut pinned_id: Option<u16> = None;
-            let mut pinned_guard_id: Option<u16> = None;
-            let mut frame: Option<TreeFrame> = None;
-            let mut inherit_context = None;
-            while self.eat(&TokenKind::At) {
-                let (attr, aspan) =
-                    self.expect_ident("attribute name ('id', 'guard_id', 'frame', or 'context')")?;
-                self.expect(&TokenKind::LParen, "'('")?;
-                if attr == "frame" {
-                    if frame.is_some() {
-                        return Err(Error::at(aspan, "duplicate @frame annotation"));
-                    }
-                    frame = Some(self.parse_frame_fields(aspan)?);
-                    continue;
-                }
-                if attr == "context" {
-                    if inherit_context.replace(aspan).is_some() {
-                        return Err(Error::at(aspan, "duplicate @context annotation"));
-                    }
-                    let (mode, span) = self.expect_ident("'inherit'")?;
-                    if mode != "inherit" {
-                        return Err(Error::at(span, "expected '@context(inherit)'"));
-                    }
-                    self.expect(&TokenKind::RParen, "')'")?;
-                    continue;
-                }
-                let id = self.expect_u16("BHAV tree id")?;
-                self.expect(&TokenKind::RParen, "')'")?;
-                match attr.as_str() {
-                    "id" => {
-                        if pinned_id.replace(id).is_some() {
-                            return Err(Error::at(aspan, "duplicate @id annotation"));
-                        }
-                    }
-                    "guard_id" => {
-                        if pinned_guard_id.replace(id).is_some() {
-                            return Err(Error::at(aspan, "duplicate @guard_id annotation"));
-                        }
-                    }
-                    other => {
-                        return Err(Error::at(aspan, format!("unknown annotation '@{other}'")));
-                    }
-                }
-            }
-
+            let attrs = self.parse_item_attrs()?;
             let span = self.span();
             let (kw, kw_span) = self.expect_ident("object or template member")?;
-            if (pinned_id.is_some() || pinned_guard_id.is_some())
-                && !matches!(
-                    kw.as_str(),
-                    "init"
-                        | "main"
-                        | "load"
-                        | "reset"
-                        | "cleanup"
-                        | "functional"
-                        | "interaction"
-                        | "tree"
-                )
-            {
-                return Err(Error::at(
-                    kw_span,
-                    "@id/@guard_id annotations are only allowed on init, main, load, reset, cleanup, functional, interaction, or tree",
-                ));
-            }
-            if let Some(f) = &frame
-                && !matches!(
-                    kw.as_str(),
-                    "tree" | "init" | "main" | "load" | "reset" | "cleanup"
-                )
-            {
-                return Err(Error::at(
-                    f.span,
-                    "@frame(...) is only allowed on a standalone 'tree' or on init, main, load, reset, or cleanup",
-                ));
-            }
-            if let Some(span) = inherit_context
-                && kw != "tree"
-            {
-                return Err(Error::at(
-                    span,
-                    "@context(inherit) is only allowed on a standalone 'tree'",
-                ));
-            }
-            if pinned_guard_id.is_some() && !matches!(kw.as_str(), "functional" | "interaction") {
-                return Err(Error::at(
-                    kw_span,
-                    "@guard_id is only allowed on functional or interaction declarations",
-                ));
+            let pinned_id = attrs.id.map(|(_, id)| id);
+            let pinned_guard_id = attrs.guard_id.map(|(_, id)| id);
+            let frame = attrs.frame;
+            match kw.as_str() {
+                "init" | "main" | "load" | "reset" | "cleanup" => {
+                    let what = format!("'{kw}'");
+                    attrs.only(&["id", "frame", "bhav"], &what)?;
+                    if let Some(span) = attrs
+                        .label
+                        .as_ref()
+                        .map(|(s, _)| *s)
+                        .or(attrs.inherit)
+                        .or(attrs.ret_temp.map(|(s, _)| s))
+                    {
+                        return Err(Error::at(
+                            span,
+                            format!(
+                                "{what} takes only the BHAV id and header fields ('#[bhav(id = N, locals = L, ..)]')"
+                            ),
+                        ));
+                    }
+                }
+                "functional" | "interaction" => {
+                    attrs.only(&["id", "guard_id"], &format!("'{kw}'"))?;
+                }
+                "fn" => {
+                    if attrs.bhav.is_some() {
+                        attrs.only(&["bhav", "id", "frame", "context", "ret"], "a '#[bhav] fn'")?;
+                    } else {
+                        if let Some((name, aspan)) = attrs
+                            .present
+                            .iter()
+                            .find(|(n, _)| matches!(n.as_str(), "id" | "frame" | "context" | "ret"))
+                        {
+                            return Err(Error::at(
+                                *aspan,
+                                format!(
+                                    "'#[{name}]' describes a BHAV chunk: mark the fn '#[bhav]' (a plain 'fn' is an inline helper)"
+                                ),
+                            ));
+                        }
+                        attrs.only(&["inline"], "an inline 'fn'")?;
+                    }
+                }
+                "pub" => attrs.only(&["inline"], "a 'pub fn' (an inline helper)")?,
+                "state" => attrs.only(&["slot"], "a 'state' field")?,
+                "tree" => {
+                    return Err(Error::at(
+                        kw_span,
+                        "the 'tree' keyword was removed: a standalone BHAV is '#[bhav] fn name(..) { .. }' \
+                         (label, id and header go in the attribute: '#[bhav(id = N, label = \"Name\")]')",
+                    ));
+                }
+                _ => attrs.only(&[], &format!("'{kw}'"))?,
             }
 
             match kw.as_str() {
@@ -1189,7 +1249,9 @@ impl Parser {
                              declare flat top-level 'state name: bool = false;' items instead",
                         ));
                     }
-                    members.push(ObjectMember::State(self.parse_state_decl(kw_span)?));
+                    members.push(ObjectMember::State(
+                        self.parse_state_decl(kw_span, attrs.slot)?,
+                    ));
                 }
                 "sound" => {
                     members.push(ObjectMember::Sound(self.parse_sound_decl(kw_span)?));
@@ -1265,22 +1327,21 @@ impl Parser {
                         pinned_guard_id,
                     )?));
                 }
-                "fn" => {
-                    members.push(ObjectMember::Fn(self.parse_fn(kw_span, false)?));
-                }
-                "tree" => {
-                    let mut tree = self.parse_tree_member(kw_span, pinned_id)?;
-                    if let Some(span) = inherit_context {
+                "fn" if attrs.bhav.is_some() => {
+                    let mut tree = self.parse_bhav_fn(kw_span, &attrs)?;
+                    if let Some(span) = attrs.inherit {
                         if tree.sim_binding.is_some() {
                             return Err(Error::at(
                                 span,
-                                "@context(inherit) cannot declare a Sim parameter",
+                                "'context = inherit' cannot declare a Sim parameter",
                             ));
                         }
                         tree.inherit_context = true;
                     }
-                    tree.frame = frame;
                     members.push(ObjectMember::Tree(tree));
+                }
+                "fn" => {
+                    members.push(ObjectMember::Fn(self.parse_fn(kw_span, false)?));
                 }
                 "bcon" => {
                     members.push(ObjectMember::Bcon(self.parse_bcon_table(kw_span)?));
@@ -1346,7 +1407,7 @@ impl Parser {
         Ok(members)
     }
 
-    /// `variant "Name" { guid: ..., price: ..., init: tree, main: tree, description: "..." }`
+    /// `variant "Name" { guid: ..., price: ..., init: name, main: name, description: "..." }`
     fn parse_variant_decl(&mut self, span: Span) -> Result<VariantDecl> {
         let (name, _) = self.expect_string("variant catalog name")?;
         self.expect(&TokenKind::LBrace, "'{'")?;
@@ -1365,7 +1426,7 @@ impl Parser {
             let dup = match key.as_str() {
                 "guid" => decl
                     .guid
-                    .replace((kspan, self.expect_u32("variant guid")?))
+                    .replace((kspan, self.parse_guid_value("variant guid")?))
                     .is_some(),
                 "price" => {
                     let (v, vspan) = self.parse_signed_int("variant price")?;
@@ -1376,7 +1437,7 @@ impl Parser {
                     .replace(self.expect_string("variant description")?.0)
                     .is_some(),
                 "init" | "main" => {
-                    let (ident, ispan) = self.expect_ident("standalone tree name")?;
+                    let (ident, ispan) = self.expect_ident("standalone #[bhav] fn name")?;
                     let slot = if key == "init" {
                         &mut decl.init
                     } else {
@@ -1494,11 +1555,9 @@ impl Parser {
         }
     }
 
-    fn parse_state_decl(&mut self, span: Span) -> Result<StateDecl> {
+    fn parse_state_decl(&mut self, span: Span, slot: Option<(Span, i64)>) -> Result<StateDecl> {
         let (name, _) = self.expect_ident("state field name")?;
-        let slot = if self.eat(&TokenKind::At) {
-            let sspan = self.span();
-            let (v, _) = self.parse_signed_int("state attribute slot")?;
+        let slot = if let Some((sspan, v)) = slot {
             let slot = u16::try_from(v)
                 .ok()
                 .filter(|&s| s <= MAX_STATE_SLOT)
@@ -1608,7 +1667,24 @@ impl Parser {
         let mut wav_name = None;
         let mut explicit_id = None;
         if self.eat(&TokenKind::Assign) || self.eat(&TokenKind::Colon) {
-            if self.eat_ident("preset") {
+            if self.eat_ident("fwav") {
+                // `fwav(N[, wav: "name"])`: the FWAV with ID N (the default preset's samples).
+                self.expect(&TokenKind::LParen, "'('")?;
+                explicit_id = Some(self.expect_u16("FWAV sound id")?);
+                if self.eat(&TokenKind::Comma) && self.peek().kind != TokenKind::RParen {
+                    let (opt, ospan) = self.expect_ident("sound option ('wav')")?;
+                    if opt != "wav" && opt != "name" {
+                        return Err(Error::at(
+                            ospan,
+                            format!("unknown fwav option '{opt}' (expected 'wav')"),
+                        ));
+                    }
+                    self.expect(&TokenKind::Colon, "':'")?;
+                    wav_name = Some(self.expect_string("sound WAV name")?.0);
+                    self.eat(&TokenKind::Comma);
+                }
+                self.expect(&TokenKind::RParen, "')'")?;
+            } else if self.eat_ident("preset") {
                 self.expect(&TokenKind::LParen, "'('")?;
                 let (pname, pspan) = self.expect_string("sound preset name")?;
                 preset = parse_sound_preset(&pname, pspan)?;
@@ -1892,7 +1968,7 @@ impl Parser {
             ));
         }
         let kind = match key {
-            "guid" => MetaFieldKind::Guid(self.expect_u32("guid")?),
+            "guid" => MetaFieldKind::Guid(self.parse_guid_value("guid")?),
             "price" => MetaFieldKind::Price(self.expect_u16("price")?),
             "description" => MetaFieldKind::Description(self.expect_string("description")?.0),
             "category" => MetaFieldKind::Category(self.parse_category()?),
@@ -2247,7 +2323,7 @@ impl Parser {
         let kind = if self.eat(&TokenKind::FatArrow) {
             GuardBody::Expr(self.parse_expr()?)
         } else {
-            GuardBody::Block(self.parse_block()?)
+            GuardBody::Block(self.parse_fn_body(true)?)
         };
         Ok(GuardDecl {
             span,
@@ -2604,6 +2680,7 @@ impl Parser {
             let mut names = Vec::new();
             loop {
                 let (n, s) = self.expect_ident("bound name")?;
+                reject_world_binding(&n, s)?;
                 names.push((s, n));
                 if !self.eat(&TokenKind::Comma) {
                     break;
@@ -2622,6 +2699,7 @@ impl Parser {
             (names, true)
         } else {
             let (n, s) = self.expect_ident("bound name")?;
+            reject_world_binding(&n, s)?;
             (vec![(s, n)], false)
         };
         self.expect(&TokenKind::Assign, "'='")?;
@@ -2733,7 +2811,8 @@ impl Parser {
         let span = self.span();
         if self.peek().kind == TokenKind::LBrace {
             // `{ value }` or a block of statements.
-            let (saved_pos, saved_depth) = (self.pos, self.depth);
+            let (saved_pos, saved_depth, saved_tails, saved_arm_tails) =
+                (self.pos, self.depth, self.tails.len(), self.arm_tails.len());
             self.bump();
             let starts_stmt = matches!(
                 &self.peek().kind,
@@ -2747,39 +2826,14 @@ impl Parser {
             }
             self.pos = saved_pos;
             self.depth = saved_depth;
+            self.tails.truncate(saved_tails);
+            self.arm_tails.truncate(saved_arm_tails);
             return Ok(Arm::Diverge(self.parse_block()?));
         }
         if !in_match {
             return Err(Error::at(span, "expected '{' after the condition"));
         }
-        if self.is_ident("break") || self.is_ident("continue") || self.is_ident("return") {
-            let kw_span = self.span();
-            let stmt = if self.eat_ident("break") {
-                V2Stmt::Break { span: kw_span }
-            } else if self.eat_ident("continue") {
-                V2Stmt::Continue { span: kw_span }
-            } else {
-                self.bump(); // 'return'
-                if matches!(self.peek().kind, TokenKind::Comma | TokenKind::RBrace) {
-                    V2Stmt::Return {
-                        span: kw_span,
-                        value: None,
-                    }
-                } else if self.is_ident("error")
-                    && matches!(self.peek_at(1).kind, TokenKind::Comma | TokenKind::RBrace)
-                {
-                    self.bump();
-                    V2Stmt::ReturnError {
-                        span: kw_span,
-                        from_try: false,
-                    }
-                } else {
-                    V2Stmt::Return {
-                        span: kw_span,
-                        value: Some(self.parse_expr()?),
-                    }
-                }
-            };
+        if let Some(stmt) = self.parse_bare_exit()? {
             return Ok(Arm::Diverge(vec![stmt]));
         }
         Ok(values_arm(span, self.parse_expr()?))
@@ -2798,10 +2852,8 @@ impl Parser {
                 "a const binding must be a statement of a '{ ... }' block (its region is the statements after it)",
             ));
         }
-        if self.peek().kind == TokenKind::At
-            && matches!(&self.peek_at(1).kind, TokenKind::Ident(a) if a == "slot")
-        {
-            return self.parse_slot_let_stmt(span);
+        if self.peek().kind == TokenKind::HashBracket {
+            return self.parse_attr_stmt(span);
         }
         if let TokenKind::Ident(kw) = &self.peek().kind {
             match kw.as_str() {
@@ -2878,7 +2930,13 @@ impl Parser {
                 value,
             });
         }
-        self.expect(&TokenKind::Semicolon, "';'")?;
+        if self.peek().kind == TokenKind::RBrace {
+            // A tail expression if it ends a value-returning function body (else an error at
+            // the end of the file).
+            self.tails.push(span);
+        } else {
+            self.expect(&TokenKind::Semicolon, "';'")?;
+        }
         Ok(V2Stmt::Expr { span, expr: lhs })
     }
 
@@ -3004,20 +3062,48 @@ impl Parser {
         })
     }
 
-    /// `@slot(N) let x ..;`: a `let` whose variable lives in frame word `local[N]`.
-    fn parse_slot_let_stmt(&mut self, span: Span) -> Result<V2Stmt> {
-        self.bump(); // '@'
-        self.bump(); // 'slot'
-        self.expect(&TokenKind::LParen, "'('")?;
-        let slot_span = self.span();
-        let n = self.expect_u16("local slot")?;
+    /// `#[slot(N)] let x ..;`: a `let` whose variable lives in frame word `local[N]`;
+    /// `#[temp(N)] for i in a..b { .. }`: a range loop counting in `temp[N]`.
+    fn parse_attr_stmt(&mut self, span: Span) -> Result<V2Stmt> {
+        let attrs = self.parse_item_attrs()?;
+        attrs.only(&["slot", "temp"], "a statement")?;
+        if let Some((temp_span, t)) = attrs.temp {
+            if attrs.slot.is_some() {
+                return Err(Error::at(
+                    span,
+                    "'#[slot]' and '#[temp]' cannot be combined",
+                ));
+            }
+            if !matches!(&self.peek().kind, TokenKind::Ident(kw) if kw == "for") {
+                return Err(Error::at(
+                    self.span(),
+                    "'#[temp(N)]' must be followed by a range loop ('for i in a..b { .. }')",
+                ));
+            }
+            let for_span = self.span();
+            let mut stmt = self.parse_for_stmt(for_span)?;
+            let V2Stmt::ForEach {
+                iter: ForEachIter::Range { temp, .. },
+                ..
+            } = &mut stmt
+            else {
+                return Err(Error::at(
+                    temp_span,
+                    "'#[temp(N)]' applies to range loops ('for i in a..b'), not object iterators",
+                ));
+            };
+            *temp = Some(t);
+            return Ok(stmt);
+        }
+        let Some((slot_span, n)) = attrs.slot else {
+            return Err(Error::at(span, "expected '#[slot(N)] let ..'"));
+        };
         let n = u8::try_from(n)
             .map_err(|_| Error::at(slot_span, format!("local slot {n} is out of range 0..=255")))?;
-        self.expect(&TokenKind::RParen, "')'")?;
         if !matches!(&self.peek().kind, TokenKind::Ident(kw) if kw == "let") {
             return Err(Error::at(
                 self.span(),
-                "'@slot(N)' must be followed by a 'let' statement",
+                "'#[slot(N)]' must be followed by a 'let' statement",
             ));
         }
         let let_span = self.span();
@@ -3048,7 +3134,7 @@ impl Parser {
             }),
             _ => Err(Error::at(
                 let_span,
-                "'@slot(N)' applies to 'let x = ..;' and 'let x: T;', not 'let Some(..)'",
+                "'#[slot(N)]' applies to 'let x = ..;' and 'let x: T;', not 'let Some(..)'",
             )),
         }
     }
@@ -3233,6 +3319,7 @@ impl Parser {
                     end,
                     inclusive,
                     rev: true,
+                    temp: None,
                 }));
             }
             self.pos = saved_pos;
@@ -3265,6 +3352,7 @@ impl Parser {
             end,
             inclusive,
             rev: false,
+            temp: None,
         }))
     }
 
@@ -3308,9 +3396,18 @@ impl Parser {
     /// A match arm's body without braces: a statement (`return x;`), or an expression or
     /// assignment ended by `,` or by the match's closing `}` (`0 => f(),`, `1 => x = 2,`).
     fn parse_arm_stmt(&mut self) -> Result<V2Stmt> {
-        let (saved_pos, saved_depth) = (self.pos, self.depth);
+        let (saved_pos, saved_depth, saved_tails, saved_arm_tails) =
+            (self.pos, self.depth, self.tails.len(), self.arm_tails.len());
         let stmt_err = match self.parse_stmt() {
             Ok(s) => {
+                // `_ => f() }`: the last arm's expression ends at the match's `}`.
+                // Only one without ';' is the arm's value (`_ => f() }`).
+                if let V2Stmt::Expr { span, .. } = &s
+                    && self.tails.contains(span)
+                {
+                    self.tails.retain(|t| t != span);
+                    self.arm_tails.push(*span);
+                }
                 let _ = self.eat(&TokenKind::Comma);
                 return Ok(s);
             }
@@ -3318,6 +3415,8 @@ impl Parser {
         };
         self.pos = saved_pos;
         self.depth = saved_depth;
+        self.tails.truncate(saved_tails);
+        self.arm_tails.truncate(saved_arm_tails);
         let span = self.span();
         let short = (|| {
             let lhs = self.parse_expr()?;
@@ -3330,6 +3429,7 @@ impl Parser {
                     value,
                 }
             } else {
+                self.arm_tails.push(span);
                 V2Stmt::Expr { span, expr: lhs }
             };
             if self.eat(&TokenKind::Comma) || self.peek().kind == TokenKind::RBrace {
@@ -3426,19 +3526,24 @@ impl Parser {
                 let arm_span = self.span();
                 let pattern = self.parse_match_pattern()?;
                 self.expect(&TokenKind::FatArrow, "'=>'")?;
-                if self.peek().kind == TokenKind::LBrace {
-                    return Err(Error::at(
-                        self.span(),
-                        "a 'match' expression arm is a value ('Pattern => expr'), not a block",
-                    ));
-                }
-                let value = self.parse_expr()?;
+                let braced = self.peek().kind == TokenKind::LBrace;
+                let value = if braced {
+                    self.parse_value_branch()?
+                } else if let Some(stmt) = self.parse_bare_exit()? {
+                    V2Expr::Block {
+                        span: arm_span,
+                        body: vec![stmt],
+                    }
+                } else {
+                    self.parse_expr()?
+                };
                 arms.push(MatchExprArm {
                     span: arm_span,
                     pattern,
                     value,
                 });
-                if !self.eat(&TokenKind::Comma) {
+                // A `{ .. }` arm needs no `,` before the next arm (as in Rust).
+                if !self.eat(&TokenKind::Comma) && !braced {
                     self.expect(&TokenKind::RBrace, "',' or '}'")?;
                     return Ok(());
                 }
@@ -3493,18 +3598,101 @@ impl Parser {
         res
     }
 
-    /// `{ value }`: one branch of an `if` expression.
+    /// One branch of an `if` expression.
     fn parse_if_expr_branch(&mut self) -> Result<V2Expr> {
+        if self.peek().kind != TokenKind::LBrace {
+            return Err(Error::at(self.span(), "expected '{'"));
+        }
+        self.parse_value_branch()
+    }
+
+    /// `{ value }`, or a diverging block `{ ..; return x; }` (a `V2Expr::Block`, which lowering
+    /// accepts only in a `let` initializer and checks leaves on every path). A block that starts
+    /// with a statement keyword is a block; otherwise a lone expression before `}` is a value.
+    /// Keywords that can name a binding (`loop`, `animate`, ..) are a value when they alone fill
+    /// the braces (`{ loop }`); a statement falls back to a block below.
+    fn parse_value_branch(&mut self) -> Result<V2Expr> {
+        let span = self.span();
+        let (saved_pos, saved_depth, saved_tails, saved_arm_tails) =
+            (self.pos, self.depth, self.tails.len(), self.arm_tails.len());
         self.expect(&TokenKind::LBrace, "'{'")?;
-        let value = self.parse_expr()?;
-        if self.peek().kind != TokenKind::RBrace {
+        let alone = self.peek_at(1).kind == TokenKind::RBrace;
+        let starts_stmt = matches!(
+            &self.peek().kind,
+            TokenKind::Ident(k) if matches!(k.as_str(), "break" | "continue" | "return")
+                || (!alone && matches!(k.as_str(), "let" | "while" | "loop" | "for"))
+        ) || matches!(
+            self.peek().kind,
+            TokenKind::RawBlock(_) | TokenKind::HashBracket
+        );
+        if !starts_stmt {
+            match self.parse_expr() {
+                Ok(value) if self.eat(&TokenKind::RBrace) => return Ok(value),
+                Ok(_) => {}
+                // Not a lone value: a block of statements (`if a { return 1; } return 2;`)
+                // may still parse; if it does not, the value's error is the one to show.
+                Err(e) => {
+                    self.pos = saved_pos;
+                    self.depth = saved_depth;
+                    self.tails.truncate(saved_tails);
+                    self.arm_tails.truncate(saved_arm_tails);
+                    return match self.parse_block() {
+                        Ok(body) => self.diverging_block(span, body),
+                        Err(_) => Err(e),
+                    };
+                }
+            }
+        }
+        self.pos = saved_pos;
+        self.depth = saved_depth;
+        self.tails.truncate(saved_tails);
+        self.arm_tails.truncate(saved_arm_tails);
+        let body = self.parse_block()?;
+        self.diverging_block(span, body)
+    }
+
+    /// A branch block, which yields no value: one ending in an expression without `;` is
+    /// rejected (blocks that compute a value are not supported).
+    fn diverging_block(&mut self, span: Span, body: Vec<V2Stmt>) -> Result<V2Expr> {
+        if let Some(V2Stmt::Expr { span: tail, .. }) = body.last()
+            && self.tails.contains(tail)
+        {
             return Err(Error::at(
-                self.span(),
-                "an 'if' expression branch is one value ('{ expr }'), not a block of statements",
+                *tail,
+                "a branch value is one expression ('{ expr }'), not a block of statements ending in a value (a block branch must leave: '{ ..; return x; }')",
             ));
         }
-        self.bump();
-        Ok(value)
+        Ok(V2Expr::Block { span, body })
+    }
+
+    /// A bare `break`, `continue`, `return`, `return error` or `return value` as a `match` arm
+    /// (`_ => return false,`), ending before the arm's `,` / `}`.
+    fn parse_bare_exit(&mut self) -> Result<Option<V2Stmt>> {
+        let span = self.span();
+        Ok(Some(if self.eat_ident("break") {
+            V2Stmt::Break { span }
+        } else if self.eat_ident("continue") {
+            V2Stmt::Continue { span }
+        } else if self.eat_ident("return") {
+            if matches!(self.peek().kind, TokenKind::Comma | TokenKind::RBrace) {
+                V2Stmt::Return { span, value: None }
+            } else if self.is_ident("error")
+                && matches!(self.peek_at(1).kind, TokenKind::Comma | TokenKind::RBrace)
+            {
+                self.bump();
+                V2Stmt::ReturnError {
+                    span,
+                    from_try: false,
+                }
+            } else {
+                V2Stmt::Return {
+                    span,
+                    value: Some(self.parse_expr()?),
+                }
+            }
+        } else {
+            return Ok(None);
+        }))
     }
 
     /// A match pattern, with `A | B | ..` alternatives.
@@ -3575,205 +3763,60 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<V2Expr> {
-        self.parse_or_expr()
+        self.parse_bin_expr(1)
     }
 
-    fn parse_or_expr(&mut self) -> Result<V2Expr> {
-        let mut lhs = self.parse_and_expr()?;
-        let mut chain = 0usize;
-        while self.peek().kind == TokenKind::OrOr {
-            let span = self.bump().span;
-            chain += 1;
-            if self.depth + chain > MAX_NESTING_DEPTH {
-                return Err(Error::at(
-                    span,
-                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
-                ));
-            }
-            let rhs = self.parse_and_expr()?;
-            lhs = V2Expr::Binary {
-                span,
-                lhs: Box::new(lhs),
-                op: V2BinOp::Or,
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_and_expr(&mut self) -> Result<V2Expr> {
-        let mut lhs = self.parse_cmp_expr()?;
-        let mut chain = 0usize;
-        while self.peek().kind == TokenKind::AndAnd {
-            let span = self.bump().span;
-            chain += 1;
-            if self.depth + chain > MAX_NESTING_DEPTH {
-                return Err(Error::at(
-                    span,
-                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
-                ));
-            }
-            let rhs = self.parse_cmp_expr()?;
-            lhs = V2Expr::Binary {
-                span,
-                lhs: Box::new(lhs),
-                op: V2BinOp::And,
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_cmp_expr(&mut self) -> Result<V2Expr> {
-        let lhs = self.parse_bitor_expr()?;
-        let op = match &self.peek().kind {
-            TokenKind::EqEq => Some(V2BinOp::Eq),
-            TokenKind::BangEq => Some(V2BinOp::Ne),
-            TokenKind::Lt => Some(V2BinOp::Lt),
-            TokenKind::LtEq => Some(V2BinOp::Le),
-            TokenKind::Gt => Some(V2BinOp::Gt),
-            TokenKind::GtEq => Some(V2BinOp::Ge),
-            TokenKind::Ident(s) if s == "flag_test" => Some(V2BinOp::FlagTest),
-            _ => None,
-        };
-        if let Some(op) = op {
-            let span = self.bump().span;
-            let rhs = self.parse_bitor_expr()?;
-            Ok(V2Expr::Binary {
-                span,
-                lhs: Box::new(lhs),
-                op,
-                rhs: Box::new(rhs),
-            })
-        } else {
-            Ok(lhs)
-        }
-    }
-
-    fn parse_bitor_expr(&mut self) -> Result<V2Expr> {
-        let mut lhs = self.parse_bitxor_expr()?;
-        let mut chain = 0usize;
-        while self.peek().kind == TokenKind::Pipe {
-            let span = self.bump().span;
-            chain += 1;
-            if self.depth + chain > MAX_NESTING_DEPTH {
-                return Err(Error::at(
-                    span,
-                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
-                ));
-            }
-            let rhs = self.parse_bitxor_expr()?;
-            lhs = V2Expr::Binary {
-                span,
-                lhs: Box::new(lhs),
-                op: V2BinOp::BitOr,
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_bitxor_expr(&mut self) -> Result<V2Expr> {
-        let mut lhs = self.parse_bitand_expr()?;
-        let mut chain = 0usize;
-        while self.peek().kind == TokenKind::Caret {
-            let span = self.bump().span;
-            chain += 1;
-            if self.depth + chain > MAX_NESTING_DEPTH {
-                return Err(Error::at(
-                    span,
-                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
-                ));
-            }
-            let rhs = self.parse_bitand_expr()?;
-            lhs = V2Expr::Binary {
-                span,
-                lhs: Box::new(lhs),
-                op: V2BinOp::BitXor,
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_bitand_expr(&mut self) -> Result<V2Expr> {
-        let mut lhs = self.parse_add_expr()?;
-        let mut chain = 0usize;
-        while self.peek().kind == TokenKind::Amp {
-            let span = self.bump().span;
-            chain += 1;
-            if self.depth + chain > MAX_NESTING_DEPTH {
-                return Err(Error::at(
-                    span,
-                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
-                ));
-            }
-            let rhs = self.parse_add_expr()?;
-            lhs = V2Expr::Binary {
-                span,
-                lhs: Box::new(lhs),
-                op: V2BinOp::BitAnd,
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_add_expr(&mut self) -> Result<V2Expr> {
-        let mut lhs = self.parse_mul_expr()?;
-        let mut chain = 0usize;
-        loop {
-            let op = match self.peek().kind {
-                TokenKind::Plus => V2BinOp::Add,
-                TokenKind::Minus => V2BinOp::Sub,
-                _ => break,
-            };
-            let span = self.bump().span;
-            chain += 1;
-            if self.depth + chain > MAX_NESTING_DEPTH {
-                return Err(Error::at(
-                    span,
-                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
-                ));
-            }
-            let rhs = self.parse_mul_expr()?;
-            lhs = V2Expr::Binary {
-                span,
-                lhs: Box::new(lhs),
-                op,
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_mul_expr(&mut self) -> Result<V2Expr> {
+    /// Parses binary expressions using precedence climbing so deeply parenthesized expressions
+    /// do not stack 8 recursive-descent frames per `(` in unoptimized debug builds.
+    fn parse_bin_expr(&mut self, min_prec: u8) -> Result<V2Expr> {
         let mut lhs = self.parse_unary_expr()?;
         let mut chain = 0usize;
-        loop {
-            let op = match self.peek().kind {
-                TokenKind::Star => V2BinOp::Mul,
-                TokenKind::Slash => V2BinOp::Div,
-                TokenKind::Percent => V2BinOp::Mod,
-                _ => break,
-            };
-            let span = self.bump().span;
-            chain += 1;
-            if self.depth + chain > MAX_NESTING_DEPTH {
-                return Err(Error::at(
-                    span,
-                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
-                ));
+        let mut max_prec = u8::MAX;
+        while let Some((op, prec)) = Self::peek_bin_op(&self.peek().kind) {
+            if prec < min_prec || prec > max_prec {
+                break;
             }
-            let rhs = self.parse_unary_expr()?;
+            let span = self.bump().span;
+            if prec != 3 {
+                chain += 1;
+                if self.depth + chain > MAX_NESTING_DEPTH {
+                    return Err(expr_nesting_err(span));
+                }
+            }
+            let rhs = self.parse_bin_expr(prec + 1)?;
             lhs = V2Expr::Binary {
                 span,
                 lhs: Box::new(lhs),
                 op,
                 rhs: Box::new(rhs),
             };
+            // Comparison operators (precedence 3) are non-associative.
+            max_prec = if prec == 3 { 2 } else { prec };
         }
         Ok(lhs)
+    }
+
+    fn peek_bin_op(kind: &TokenKind) -> Option<(V2BinOp, u8)> {
+        match kind {
+            TokenKind::OrOr => Some((V2BinOp::Or, 1)),
+            TokenKind::AndAnd => Some((V2BinOp::And, 2)),
+            TokenKind::EqEq => Some((V2BinOp::Eq, 3)),
+            TokenKind::BangEq => Some((V2BinOp::Ne, 3)),
+            TokenKind::Lt => Some((V2BinOp::Lt, 3)),
+            TokenKind::LtEq => Some((V2BinOp::Le, 3)),
+            TokenKind::Gt => Some((V2BinOp::Gt, 3)),
+            TokenKind::GtEq => Some((V2BinOp::Ge, 3)),
+            TokenKind::Ident(s) if s == "flag_test" => Some((V2BinOp::FlagTest, 3)),
+            TokenKind::Pipe => Some((V2BinOp::BitOr, 4)),
+            TokenKind::Caret => Some((V2BinOp::BitXor, 5)),
+            TokenKind::Amp => Some((V2BinOp::BitAnd, 6)),
+            TokenKind::Plus => Some((V2BinOp::Add, 7)),
+            TokenKind::Minus => Some((V2BinOp::Sub, 7)),
+            TokenKind::Star => Some((V2BinOp::Mul, 8)),
+            TokenKind::Slash => Some((V2BinOp::Div, 8)),
+            TokenKind::Percent => Some((V2BinOp::Mod, 8)),
+            _ => None,
+        }
     }
 
     fn parse_unary_expr(&mut self) -> Result<V2Expr> {
@@ -3888,6 +3931,16 @@ impl Parser {
                             method: field,
                             type_args: Vec::new(),
                             args,
+                        };
+                    } else if matches!(&expr, V2Expr::Ident(_, w) if w == "world") {
+                        // `world.hour` is the engine global it names: `global[0]`.
+                        let Some(index) = world_global(&field) else {
+                            return Err(unknown_world_global_err(span, &field));
+                        };
+                        expr = V2Expr::Index {
+                            span,
+                            base: Box::new(V2Expr::Ident(span, "global".to_owned())),
+                            index: Box::new(V2Expr::Int(span, i64::from(index))),
                         };
                     } else {
                         expr = V2Expr::Field {
@@ -4061,23 +4114,7 @@ impl Parser {
             TokenKind::LParen => {
                 self.bump();
                 self.enter_nesting(tok.span)?;
-                let res = (|| {
-                    let first = self.parse_expr()?;
-                    if self.eat(&TokenKind::Comma) {
-                        let mut elems = vec![first];
-                        while !self.eat(&TokenKind::RParen) {
-                            elems.push(self.parse_expr()?);
-                            if !self.eat(&TokenKind::Comma) {
-                                self.expect(&TokenKind::RParen, "')'")?;
-                                break;
-                            }
-                        }
-                        Ok(V2Expr::Tuple(tok.span, elems))
-                    } else {
-                        self.expect(&TokenKind::RParen, "')'")?;
-                        Ok(first)
-                    }
-                })();
+                let res = self.parse_paren_or_tuple_expr(tok.span);
                 self.leave_nesting();
                 res
             }
@@ -4087,6 +4124,49 @@ impl Parser {
             )),
         }
     }
+
+    fn parse_paren_or_tuple_expr(&mut self, span: Span) -> Result<V2Expr> {
+        let first = self.parse_expr()?;
+        if self.eat(&TokenKind::Comma) {
+            let mut elems = vec![first];
+            while !self.eat(&TokenKind::RParen) {
+                elems.push(self.parse_expr()?);
+                if !self.eat(&TokenKind::Comma) {
+                    self.expect(&TokenKind::RParen, "')'")?;
+                    break;
+                }
+            }
+            Ok(V2Expr::Tuple(span, elems))
+        } else {
+            self.expect(&TokenKind::RParen, "')'")?;
+            Ok(first)
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn expr_nesting_err(span: Span) -> Error {
+    Error::at(
+        span,
+        format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn unknown_world_global_err(span: Span, field: &str) -> Error {
+    Error::at(
+        span,
+        format!(
+            "unknown engine global 'world.{field}' (expected {}; or write 'global[N]')",
+            WORLD_GLOBALS
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
 }
 
 /// Maps an addressable BCON chunk id to its SimAntics operand table index (`address >> 7`),
@@ -4244,4 +4324,28 @@ fn values_arm(span: Span, value: V2Expr) -> Arm {
         V2Expr::Tuple(_, items) => Arm::Values(span, items),
         v => Arm::Values(span, vec![v]),
     }
+}
+
+/// An expression statement `expr` as `return expr;`.
+fn tail_to_return(stmt: &mut V2Stmt) {
+    let V2Stmt::Expr { span, .. } = *stmt else {
+        return;
+    };
+    if let V2Stmt::Expr { expr, .. } = std::mem::replace(stmt, V2Stmt::Break { span }) {
+        *stmt = V2Stmt::Return {
+            span,
+            value: Some(expr),
+        };
+    }
+}
+
+/// `world` names the engine globals (`world.hour`), so no binding may take it.
+fn reject_world_binding(name: &str, span: Span) -> Result<()> {
+    if name == "world" {
+        return Err(Error::at(
+            span,
+            "'world' names the engine globals ('world.hour') and cannot be used as a const binding",
+        ));
+    }
+    Ok(())
 }

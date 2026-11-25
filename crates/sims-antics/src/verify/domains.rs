@@ -212,11 +212,11 @@ pub struct V2EnumDomain {
     pub domain: ParamDomain,
 }
 
-/// Every enum-typed positional parameter of every standalone `tree` in the v2 source at
+/// Every enum-typed positional parameter of every standalone `#[bhav] fn` in the v2 source at
 /// `path`, with its enum's exact variant values.
 ///
 /// `param[i]` counts positional parameters only: a leading `sim: Sim` binding and
-/// `@ temp[N]` parameters are not BHAV parameters. Trees are matched to BHAV IDs by label
+/// `#[temp(N)]` parameters are not BHAV parameters. Trees are matched to BHAV IDs by label
 /// in the lowered object, so the source must declare exactly one object.
 pub fn v2_enum_param_domains(path: &Path, pack_dir: Option<&Path>) -> Result<Vec<V2EnumDomain>> {
     use crate::v2::ast::{AbiParamSlot, ObjectMember, V2Type};
@@ -313,7 +313,7 @@ pub fn v2_enum_param_domains(path: &Path, pack_dir: Option<&Path>) -> Result<Vec
             };
             let labeled = by_label.get(tree.label.as_str()).map(Vec::as_slice);
             let id = match (tree.pinned_id, labeled) {
-                // `@id(N)` names the BHAV even when other trees share the label.
+                // `#[id(N)]` names the BHAV even when other trees share the label.
                 (Some(pinned), Some(ids)) if ids.contains(&pinned) => pinned,
                 (Some(pinned), _) => {
                     return Err(Error::new(format!(
@@ -343,7 +343,7 @@ pub fn v2_enum_param_domains(path: &Path, pack_dir: Option<&Path>) -> Result<Vec
                 .iter()
                 .filter(|p| p.slot == AbiParamSlot::Positional)
                 .count();
-            // `@frame(args: N)` may give it more.
+            // `#[frame(args = N)]` may give it more.
             let args = compiled.behaviors.get(&id).map(|b| usize::from(b.args));
             if args.is_none_or(|args| args < positional_count) {
                 return Err(Error::new(format!(

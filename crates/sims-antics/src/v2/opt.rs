@@ -291,7 +291,7 @@ fn unwrap_single_pass_loops(nodes: &mut Vec<Stmt>) {
 /// Drops plain stores (`let x = e;`, `x := e;` from a non-faulting operand) to v2 locals that
 /// are dead after the store. A dropped `let` keeps its declaration, which emits no node.
 fn drop_dead_local_stores(nodes: &mut Vec<Stmt>, text_reads: bool, out_defs: bool) {
-    // An `@slot` local's stores stay: the word is pinned so a frame matches one that other
+    // An `#[slot]` local's stores stay: the word is pinned so a frame matches one that other
     // code (a raw block, a later tree reusing the frame) reads by number.
     let mut names = Vec::new();
     collect_lets(nodes, &mut names);
@@ -351,7 +351,7 @@ fn drop_dead_local_stores(nodes: &mut Vec<Stmt>, text_reads: bool, out_defs: boo
 /// `t := e; d := t;` with `t` a v2 local that is dead afterwards becomes `d := e;`: one
 /// expression node reading `e` where two read it in turn, with nothing in between.
 fn forward_copies(nodes: &mut Vec<Stmt>, text_reads: bool, out_defs: bool) {
-    // An `@slot` local's stores stay: the word is pinned so a frame matches one that other
+    // An `#[slot]` local's stores stay: the word is pinned so a frame matches one that other
     // code (a raw block, a later tree reusing the frame) reads by number.
     let mut names = Vec::new();
     collect_lets(nodes, &mut names);
@@ -474,7 +474,7 @@ fn drop_unused_decls(nodes: &mut Vec<Stmt>, text_reads: bool) {
         counts
             .into_iter()
             .filter(|&(name, _)| !(keep_user && is_source_local(name)))
-            // A pinned `@slot` word stays declared: dropping it would free its number.
+            // A pinned `#[slot]` word stays declared: dropping it would free its number.
             .filter(|&(name, _)| !name.starts_with("__slot"))
             .filter(|&(_, (reads, writes))| reads == 0 && writes <= 1)
             .map(|(name, _)| name.to_owned())

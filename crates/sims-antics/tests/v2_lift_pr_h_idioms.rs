@@ -1,5 +1,5 @@
-//! `lift --v2` writes v2 PR H's spellings: lifecycle `@frame`, in-place `set_to_next`,
-//! `return error`, `@slot` lets, `const` branch specialization and `@context(inherit)`.
+//! `lift --v2` writes v2 PR H's spellings: lifecycle `#[frame]`, in-place `set_to_next`,
+//! `return error`, `#[slot]` lets, `const` branch specialization and `#[context(inherit)]`.
 //! Every object is synthetic (GUIDs in the clean-room 0x7E00_xxxx range).
 
 use sims_antics::compile_v2_source;
@@ -69,17 +69,17 @@ fn lifecycle_trees_stay_blocks_with_their_header() {
     let (lifted, trees) = lift(
         r#"object "Fable Kiln" {
     guid: 0x7E00_0120;
-    @id(4200) @frame(args: 4, locals: 1) main { temp[0] = param[1]; }
-    @id(4201) init { temp[1] = 2; }
+    #[id(4200)] #[frame(args = 4, locals = 1)] main { temp[0] = param[1]; }
+    #[id(4201)] init { temp[1] = 2; }
 }"#,
     );
     has(
         &lifted,
         &[
-            "@id(4200) @frame(args: 4, locals: 1, format: 0x8002, revision: ",
-            ") main {",
-            // The default header reproduces `init`, so it takes no `@frame`.
-            "@id(4201) init {",
+            "#[bhav(id = 4200, args = 4, locals = 1, format = 0x8002, revision = ",
+            ")]\n    main {",
+            // The default header reproduces `init`, so it takes no `#[frame]`.
+            "#[id(4201)]\n    init {",
             "temp[0] = param[1];",
         ],
     );
@@ -93,7 +93,8 @@ fn cursor_steps_and_error_returns_lift_as_builtins() {
         r#"object "Fable Sieve" {
     guid: 0x7E00_0121;
     const PROBE = 0x7E00_0121;
-    @id(4300) @frame(locals: 0) tree step -> bool {
+    #[bhav(id = 4300, locals = 0)]
+    fn step() -> bool {
         if !set_to_next(part, dest: stack_obj) { return false; }
         while set_to_next(guid, PROBE, dest: stack_obj) {
             if temp[0] > 3 { return error; }
@@ -120,7 +121,8 @@ fn builtin_locals_are_pinned_with_slot() {
     let (lifted, _) = lift(
         r#"object "Fable Plumb" {
     guid: 0x7E00_0122;
-    @id(4300) @frame(locals: 3) tree pinned {
+    #[bhav(id = 4300, locals = 3)]
+    fn pinned() {
         raw {
             local[2] := 14;
             find_location(mode: 1, flags: 1, local: 2);
@@ -132,8 +134,8 @@ fn builtin_locals_are_pinned_with_slot() {
     has(
         &lifted,
         &[
-            "@slot(0) let slot_0: i16;",
-            "@slot(2) let slot_2: i16;",
+            "#[slot(0)] let slot_0: i16;",
+            "#[slot(2)] let slot_2: i16;",
             "slot_2 = 14;",
             "find_location(mode: 1, flags: 1, local: slot_2);",
         ],
@@ -146,7 +148,8 @@ fn a_tail_if_with_literal_only_differences_is_a_const_binding() {
     let (lifted, _) = lift(
         r#"object "Fable Scale" {
     guid: 0x7E00_0123;
-    @id(4300) @frame(locals: 0) tree weigh {
+    #[bhav(id = 4300, locals = 0)]
+    fn weigh() {
         temp[2] = 1;
         const (LOW, HIGH) = if temp[0] > 3 { (5, 50) } else { (6, 60) };
         temp[1] = LOW;
@@ -167,7 +170,8 @@ fn a_tail_if_with_literal_only_differences_is_a_const_binding() {
     let (lifted, _) = lift(
         r#"object "Fable Scale" {
     guid: 0x7E00_0124;
-    @id(4300) @frame(locals: 0) tree weigh {
+    #[bhav(id = 4300, locals = 0)]
+    fn weigh() {
         if temp[0] > 3 { temp[1] = 5; } else { temp[2] = 6; }
     }
 }"#,
@@ -180,13 +184,16 @@ fn a_tree_both_contexts_call_is_written_inherit() {
     let (lifted, _) = lift(
         r#"object "Fable Bell" {
     guid: 0x7E00_0125;
-    @id(4300) @frame(locals: 0) @context(inherit) tree ring "Ring" {
+    #[bhav(id = 4300, label = "Ring", locals = 0, context = inherit)]
+    fn ring() {
         me.person[3] = 1;
         me.motive[2] = 4;
         temp[0] = stack_obj.attr[1];
     }
-    @id(4301) @frame(locals: 0) tree from_object "From Object" { ring(); }
-    @id(4302) @frame(locals: 0) tree from_sim "From Sim" (sim: Sim) {
+    #[bhav(id = 4301, label = "From Object", locals = 0)]
+    fn from_object() { ring(); }
+    #[bhav(id = 4302, label = "From Sim", locals = 0)]
+    fn from_sim(sim: Sim) {
         sim.motive[1] = 2;
         ring();
     }
@@ -195,7 +202,8 @@ fn a_tree_both_contexts_call_is_written_inherit() {
     has(
         &lifted,
         &[
-            "@context(inherit) tree ring_4300 \"Ring\" {",
+            "label = \"Ring\"",
+            "context = inherit)]\n    fn ring_4300() {",
             "me.person[3] = 1;",
             "me.motive[2] = 4;",
             "temp[0] = stack_obj.attr[1];",
@@ -208,11 +216,13 @@ fn argless_calls_between_sim_trees_name_the_sim() {
     let (lifted, _) = lift(
         r#"object "Fable Lute" {
     guid: 0x7E00_0126;
-    @id(4300) @frame(locals: 0) tree tune "Tune" (sim: Sim) {
+    #[bhav(id = 4300, label = "Tune", locals = 0)]
+    fn tune(sim: Sim) {
         sim.motive[1] = 2;
         sim.motive[2] = 3;
     }
-    @id(4301) @frame(locals: 0) tree play "Play" (sim: Sim) {
+    #[bhav(id = 4301, label = "Play", locals = 0)]
+    fn play(sim: Sim) {
         sim.motive[3] = 1;
         tune(sim);
     }
@@ -248,8 +258,8 @@ fn a_lifecycle_tree_the_compiler_would_rename_is_not_proven() {
         &compile(
             r#"object "Fable Clock" {
     guid: 0x7E00_0127;
-    @id(4200) main { temp[0] = 1; }
-    @id(4201) init { temp[1] = 2; }
+    #[id(4200)] main { temp[0] = 1; }
+    #[id(4201)] init { temp[1] = 2; }
 }"#,
         ),
         4200,
@@ -257,7 +267,7 @@ fn a_lifecycle_tree_the_compiler_would_rename_is_not_proven() {
     );
     let report = report(&iff);
     assert!(
-        report.source.contains("@id(4200) main {"),
+        report.source.contains("#[id(4200)]\n    main {"),
         "{}",
         report.source
     );
@@ -277,13 +287,14 @@ fn a_lifecycle_tree_the_compiler_would_rename_is_not_proven() {
 fn labels_keep_quotes_spaces_and_western_letters() {
     let source = r#"object "Fable Clock" {
     guid: 0x7E00_012D;
-    @id(4300) @frame(locals: 0) tree a "A" { temp[0] = 1; }
+    #[bhav(id = 4300, label = "A", locals = 0)]
+    fn a() { temp[0] = 1; }
 }"#;
     for label in ["Caf\u{e9} \"Test\"", "Grill ", "   "] {
         let (lifted, _) = lift_iff(&relabel(&compile(source), 4300, label));
         let written = label.replace('"', "\\\"");
         assert!(
-            lifted.contains(&format!("\"{written}\" {{")),
+            lifted.contains(&format!("label = \"{written}\"")),
             "{label:?}:\n{lifted}"
         );
     }
@@ -302,10 +313,10 @@ fn a_lifecycle_revision_is_kept() {
     let (lifted, _) = lift(
         r#"object "Fable Ledger" {
     guid: 0x7E00_0128;
-    @id(4200) @frame(revision: 7) main { temp[0] = 1; }
+    #[id(4200)] #[frame(revision = 7)] main { temp[0] = 1; }
 }"#,
     );
-    has(&lifted, &["revision: 7) main {"]);
+    has(&lifted, &["revision = 7)]\n    main {"]);
 }
 
 #[test]
@@ -313,7 +324,8 @@ fn signed_literals_lift_as_const_bindings_of_one_sign() {
     let (lifted, _) = lift(
         r#"object "Fable Gauge" {
     guid: 0x7E00_0129;
-    @id(4300) @frame(locals: 0) tree dip {
+    #[bhav(id = 4300, locals = 0)]
+    fn dip() {
         if temp[0] > 3 { temp[1] = -5; } else { temp[1] = -6; }
         temp[4] = 7;
     }
@@ -324,7 +336,8 @@ fn signed_literals_lift_as_const_bindings_of_one_sign() {
     let (lifted, _) = lift(
         r#"object "Fable Gauge" {
     guid: 0x7E00_012A;
-    @id(4300) @frame(locals: 0) tree dip {
+    #[bhav(id = 4300, locals = 0)]
+    fn dip() {
         if temp[0] > 3 { temp[1] = -5; } else { temp[1] = 6; }
         temp[4] = 7;
     }
@@ -338,12 +351,15 @@ fn an_inherit_tree_reads_the_stack_objects_person_kind() {
     let (lifted, _) = lift(
         r#"object "Fable Gong" {
     guid: 0x7E00_012B;
-    @id(4300) @frame(locals: 0) @context(inherit) tree ring "Ring" {
+    #[bhav(id = 4300, label = "Ring", locals = 0, context = inherit)]
+    fn ring() {
         me.person[3] = 1;
         temp[0] = stack_obj.person[65];
     }
-    @id(4301) @frame(locals: 0) tree from_object "From Object" { ring(); }
-    @id(4302) @frame(locals: 0) tree from_sim "From Sim" (sim: Sim) {
+    #[bhav(id = 4301, label = "From Object", locals = 0)]
+    fn from_object() { ring(); }
+    #[bhav(id = 4302, label = "From Sim", locals = 0)]
+    fn from_sim(sim: Sim) {
         sim.motive[1] = 2;
         ring();
     }
@@ -358,8 +374,9 @@ fn a_beside_step_names_its_local() {
     let (lifted, _) = lift(
         r#"object "Fable Hinge" {
     guid: 0x7E00_012C;
-    @id(4300) @frame(locals: 3) tree near -> bool {
-        @slot(2) let side: i16 = 1;
+    #[bhav(id = 4300, locals = 3)]
+    fn near() -> bool {
+        #[slot(2)] let side: i16 = 1;
         if !set_to_next(beside, dest: stack_obj, local: side) { return false; }
         return true;
     }
@@ -368,7 +385,7 @@ fn a_beside_step_names_its_local() {
     has(
         &lifted,
         &[
-            "@slot(2) let slot_2: i16;",
+            "#[slot(2)] let slot_2: i16;",
             "set_to_next(beside, dest: stack_obj, local: slot_2)",
         ],
     );
@@ -384,8 +401,10 @@ fn a_tree_run_by_name_keeps_its_name_table() {
     strings 303 "Tree names" {
         pump = "Pump",
     }
-    @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 1; }
-    @id(4301) @frame(locals: 0) tree caller "Caller" {
+    #[bhav(id = 4300, label = "Pump", locals = 0)]
+    fn pump() { temp[0] = 1; }
+    #[bhav(id = 4301, label = "Caller", locals = 0)]
+    fn caller() {
         raw { run_tree_by_name(table: 303, index: 1, mode: 0); }
     }
 }"#;
@@ -397,8 +416,9 @@ fn a_tree_run_by_name_keeps_its_name_table() {
     strings 303 "Tree names" {
         tick = "Tick",
     }
-    @id(4200) main { temp[0] = 1; }
-    @id(4301) @frame(locals: 0) tree caller "Caller" {
+    #[id(4200)] main { temp[0] = 1; }
+    #[bhav(id = 4301, label = "Caller", locals = 0)]
+    fn caller() {
         raw { run_tree_by_name(table: 303, index: 1, mode: 0); }
     }
 }"#;
@@ -452,25 +472,32 @@ fn a_tree_run_by_name_is_proven_only_with_the_tree_it_runs() {
     strings 303 "Tree names" {
         pump = "Pump",
     }
-    @id(4300) @frame(locals: 0) tree pump "Pump" {
+    #[bhav(id = 4300, label = "Pump", locals = 0)]
+    fn pump() {
         raw { op 0x0015 (0x2c, 0x01, 0, 0, 0, 0, 0, 0); }
     }
-    @id(4301) @frame(locals: 0) tree caller "Caller" {
+    #[bhav(id = 4301, label = "Caller", locals = 0)]
+    fn caller() {
         raw { run_tree_by_name(table: 303, index: 1, mode: 0); }
     }
-    @id(4302) @frame(locals: 0) tree ask "route ask to move animation" {
+    #[bhav(id = 4302, label = "route ask to move animation", locals = 0)]
+    fn ask() {
         raw { op 0x0015 (0x2c, 0x01, 0, 0, 0, 0, 0, 0); }
     }
-    @id(4303) @frame(locals: 0) tree route "Route" {
+    #[bhav(id = 4303, label = "Route", locals = 0)]
+    fn route() {
         raw { op 0x002d (0, 0, 0, 0, 0, 0, 0, 0); }
     }
-    @id(4304) @frame(locals: 0) tree grab "CT - Grab" {
+    #[bhav(id = 4304, label = "CT - Grab", locals = 0)]
+    fn grab() {
         raw { op 0x0015 (0x2c, 0x01, 0, 0, 0, 0, 0, 0); }
     }
-    @id(4305) @frame(locals: 0) tree reach "Reach" {
+    #[bhav(id = 4305, label = "Reach", locals = 0)]
+    fn reach() {
         raw { op 0x002f (0, 0, 0, 0, 0, 0, 0, 0); }
     }
-    @id(4306) @frame(locals: 0) tree relative "Relative" {
+    #[bhav(id = 4306, label = "Relative", locals = 0)]
+    fn relative() {
         raw { op 0x001b (0, 0, 0, 0, 0, 0, 0, 0); }
     }
 }"#;
@@ -508,8 +535,9 @@ fn a_lookup_tries_exact_names_before_ignoring_case() {
     strings 303 "Tree names" {
         main = "Main",
     }
-    @id(4200) main { temp[0] = 1; }
-    @id(4301) @frame(locals: 0) tree caller "Caller" {
+    #[id(4200)] main { temp[0] = 1; }
+    #[bhav(id = 4301, label = "Caller", locals = 0)]
+    fn caller() {
         raw { run_tree_by_name(table: 303, index: 1, mode: 0); }
     }
 }"#;
@@ -530,8 +558,10 @@ fn a_deleted_last_chunk_names_its_tree() {
     strings 303 "Tree names" {
         pump = "Pump",
     }
-    @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 1; }
-    @id(4301) @frame(locals: 0) tree caller "Caller" {
+    #[bhav(id = 4300, label = "Pump", locals = 0)]
+    fn pump() { temp[0] = 1; }
+    #[bhav(id = 4301, label = "Caller", locals = 0)]
+    fn caller() {
         raw { run_tree_by_name(table: 303, index: 1, mode: 0); }
     }
 }"#;
@@ -628,8 +658,9 @@ fn with_callbacks(iff: &Iff, entries: &[(u16, u16)]) -> Iff {
 fn a_callback_tree_is_proven_only_where_the_rebuilt_object_runs_it() {
     let source = r#"object "Fable Bellows" {
     guid: 0x7E00_0133;
-    @id(4200) main { temp[0] = 1; }
-    @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 2; }
+    #[id(4200)] main { temp[0] = 1; }
+    #[bhav(id = 4300, label = "Pump", locals = 0)]
+    fn pump() { temp[0] = 2; }
 }"#;
     let iff = compile(source);
     // One tree as both `init` and `main`.
@@ -667,7 +698,8 @@ fn a_functional_call_is_proven_only_with_the_callback_it_runs() {
         guard(sim) => true,
         run(sim) { return 3; }
     }
-    @id(4301) @frame(locals: 0) tree caller "Caller" {
+    #[bhav(id = 4301, label = "Caller", locals = 0)]
+    fn caller() {
         raw { op 0x0014 (0, 0, 0, 0, 0, 0, 0, 0); }
     }
 }"#;
@@ -687,10 +719,12 @@ fn a_semi_global_link_is_kept_or_no_tree_is_proven() {
     // tree of the object is proven, whatever it calls.
     let source = r#"object "Fable Bellows" {
     guid: 0x7E00_0135;
-    @id(4301) @frame(locals: 0) tree caller "Caller" {
+    #[bhav(id = 4301, label = "Caller", locals = 0)]
+    fn caller() {
         raw { op 0x2000 (0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff); }
     }
-    @id(4302) @frame(locals: 0) tree plain "Plain" { temp[0] = 1; }
+    #[bhav(id = 4302, label = "Plain", locals = 0)]
+    fn plain() { temp[0] = 1; }
 }"#;
     let glob = |data: &[u8]| ChunkData {
         tag: *b"GLOB",
@@ -722,8 +756,9 @@ fn definitions_sharing_a_chunk_id_share_its_callbacks() {
     // definition runs 4200 as `main` here.
     let source = r#"object "Fable Bellows" {
     guid: 0x7E00_0136;
-    @id(4200) main { temp[0] = 1; }
-    @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 2; }
+    #[id(4200)] main { temp[0] = 1; }
+    #[bhav(id = 4300, label = "Pump", locals = 0)]
+    fn pump() { temp[0] = 2; }
 }"#;
     let iff = compile(source);
     let objd = iff.chunks.iter().find(|c| &c.tag == b"OBJD").expect("OBJD");
@@ -769,8 +804,10 @@ fn a_global_table_name_keeps_this_files_entry() {
     strings 303 "Tree names" {
         pump = "Pump",
     }
-    @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 7; }
-    @id(4301) @frame(locals: 0) tree caller "Caller" {
+    #[bhav(id = 4300, label = "Pump", locals = 0)]
+    fn pump() { temp[0] = 7; }
+    #[bhav(id = 4301, label = "Caller", locals = 0)]
+    fn caller() {
         raw { run_tree_by_name(table: 303, index: 1, mode: 0, global: true); }
     }
 }"#;
@@ -792,21 +829,27 @@ fn reads_of_definitions_and_callbacks_need_the_same_tables() {
     // its callback table names a tree; the stack object may be this object.
     let source = r#"object "Fable Bellows" {
     guid: 0x7E00_0139;
-    @id(4200) main { temp[0] = 1; }
-    @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 2; }
-    @id(4301) @frame(locals: 0) tree words "Words" {
+    #[id(4200)] main { temp[0] = 1; }
+    #[bhav(id = 4300, label = "Pump", locals = 0)]
+    fn pump() { temp[0] = 2; }
+    #[bhav(id = 4301, label = "Words", locals = 0)]
+    fn words() {
         raw { op 0x0002 (0, 0, 2, 0, 0, 5, 8, 21); }
     }
-    @id(4302) @frame(locals: 0) tree slots "Slots" {
+    #[bhav(id = 4302, label = "Slots", locals = 0)]
+    fn slots() {
         raw { op 0x0002 (0, 0, 18, 0, 0, 5, 8, 35); }
     }
-    @id(4303) @frame(locals: 0) tree mine "Mine" {
+    #[bhav(id = 4303, label = "Mine", locals = 0)]
+    fn mine() {
         raw { op 0x0002 (0, 0, 0, 0, 0, 5, 8, 36); }
     }
-    @id(4304) @frame(locals: 0) tree theirs "Theirs" {
+    #[bhav(id = 4304, label = "Theirs", locals = 0)]
+    fn theirs() {
         raw { op 0x0002 (0, 0, 0, 0, 0, 5, 8, 37); }
     }
-    @id(4305) @frame(locals: 0) tree neighbor "Neighbor" {
+    #[bhav(id = 4305, label = "Neighbor", locals = 0)]
+    fn neighbor() {
         raw { op 0x0002 (0, 0, 2, 0, 0, 5, 8, 38); }
     }
 }"#;
@@ -882,9 +925,11 @@ fn primitives_that_run_callbacks_need_the_same_tables() {
         let source = format!(
             r#"object "Fable Bellows" {{
     guid: 0x7E00_{:04X};
-    @id(4200) main {{ temp[0] = 1; }}
-    @id(4300) @frame(locals: 0) tree pump "Pump" {{ temp[0] = 2; }}
-    @id(4301) @frame(locals: 0) tree caller "Caller" {{
+    #[id(4200)] main {{ temp[0] = 1; }}
+    #[bhav(id = 4300, label = "Pump", locals = 0)]
+    fn pump() {{ temp[0] = 2; }}
+    #[bhav(id = 4301, label = "Caller", locals = 0)]
+    fn caller() {{
         raw {{ op {op}; }}
     }}
 }}"#,
@@ -912,8 +957,9 @@ fn an_objf_table_overrides_the_definition_words() {
     // the OBJD words still name 4200.
     let source = r#"object "Fable Bellows" {
     guid: 0x7E00_013B;
-    @id(4200) main { temp[0] = 1; }
-    @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 2; }
+    #[id(4200)] main { temp[0] = 1; }
+    #[bhav(id = 4300, label = "Pump", locals = 0)]
+    fn pump() { temp[0] = 2; }
 }"#;
     let iff = compile(source);
     let (init, main) = init_and_main(&iff);
@@ -971,8 +1017,10 @@ fn non_private_code_the_lift_drops_leaves_no_tree_proven() {
     // supplies, so none is proven.
     let source = r#"object "Fable Bellows" {
     guid: 0x7E00_013C;
-    @id(4300) @frame(locals: 0) tree pump "Pump" { temp[0] = 2; }
-    @id(4301) @frame(locals: 0) tree caller "Caller" {
+    #[bhav(id = 4300, label = "Pump", locals = 0)]
+    fn pump() { temp[0] = 2; }
+    #[bhav(id = 4301, label = "Caller", locals = 0)]
+    fn caller() {
         raw { op 0x0100 (0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff); }
     }
 }"#;
@@ -1047,10 +1095,12 @@ fn a_global_tree_runs_with_this_object_as_owner() {
     strings 300 "Lines" {
         a = "A",
     }
-    @id(4300) @frame(locals: 0) tree pump "Pump" {
+    #[bhav(id = 4300, label = "Pump", locals = 0)]
+    fn pump() {
         raw { op 0x0015 (0x2c, 0x01, 0, 0, 0, 0, 0, 0); }
     }
-    @id(4301) @frame(locals: 0) tree caller "Caller" {
+    #[bhav(id = 4301, label = "Caller", locals = 0)]
+    fn caller() {
         raw { op 0x0100 (0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff); }
     }
 }"#;
@@ -1087,8 +1137,9 @@ fn a_name_entry_zero_looks_nothing_up() {
     // Entry 0 names no tree in either table, so a changed label is not seen.
     let source = r#"object "Fable Bellows" {
     guid: 0x7E00_013D;
-    @id(4200) main { temp[0] = 1; }
-    @id(4301) @frame(locals: 0) tree caller "Caller" {
+    #[id(4200)] main { temp[0] = 1; }
+    #[bhav(id = 4301, label = "Caller", locals = 0)]
+    fn caller() {
         raw { run_tree_by_name(table: 303, index: 0, mode: 0, global: true); }
     }
 }"#;
@@ -1102,8 +1153,9 @@ fn a_deleted_definition_does_not_stand_in_for_the_live_one() {
     // make a changed definition word look reproduced.
     let source = r#"object "Fable Bellows" {
     guid: 0x7E00_013E;
-    @id(4200) main { temp[0] = 1; }
-    @id(4301) @frame(locals: 0) tree words "Words" {
+    #[id(4200)] main { temp[0] = 1; }
+    #[bhav(id = 4301, label = "Words", locals = 0)]
+    fn words() {
         raw { op 0x0002 (0, 0, 47, 0, 0, 5, 8, 21); }
     }
 }"#;
@@ -1167,7 +1219,8 @@ fn a_name_this_file_lacks_may_run_another_files_tree() {
     strings 303 "Tree names" {
         a = "GlobalOnly",
     }
-    @id(4301) @frame(locals: 0) tree caller "Caller" {
+    #[bhav(id = 4301, label = "Caller", locals = 0)]
+    fn caller() {
         raw { run_tree_by_name(table: 303, index: 1, mode: 0); }
     }
 }"#;
@@ -1180,7 +1233,8 @@ fn a_global_tree_sees_the_owners_slots() {
     // this file's SLOT table; the rebuilt object drops a container entry.
     let source = r#"object "Fable Bellows" {
     guid: 0x7E00_0141;
-    @id(4301) @frame(locals: 0) tree caller "Caller" {
+    #[bhav(id = 4301, label = "Caller", locals = 0)]
+    fn caller() {
         raw { op 0x0100 (0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff); }
     }
 }"#;
@@ -1219,7 +1273,8 @@ fn a_functional_call_may_run_another_objects_callback() {
     // this thread and may read this object's definition.
     let source = r#"object "Fable Bellows" {
     guid: 0x7E00_0142;
-    @id(4301) @frame(locals: 0) tree caller "Caller" {
+    #[bhav(id = 4301, label = "Caller", locals = 0)]
+    fn caller() {
         raw { op 0x0014 (0, 0, 0, 0, 0, 0, 0, 0); }
     }
 }"#;
@@ -1233,7 +1288,8 @@ fn a_global_call_waits_on_every_private_tree() {
     // by name, is not proven either.
     let source = r#"object "Fable Bellows" {
     guid: 0x7E00_0143;
-    @id(4301) @frame(locals: 0) tree caller "Caller" {
+    #[bhav(id = 4301, label = "Caller", locals = 0)]
+    fn caller() {
         raw { op 0x0100 (0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff); }
     }
 }"#;
@@ -1265,7 +1321,8 @@ fn catalog_strings_and_the_portrait_are_owner_data() {
     // writes none of these chunks as given here.
     let source = r#"object "Fable Bellows" {
     guid: 0x7E00_0144;
-    @id(4301) @frame(locals: 0) tree caller "Caller" {
+    #[bhav(id = 4301, label = "Caller", locals = 0)]
+    fn caller() {
         raw { op 0x0100 (0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff); }
     }
 }"#;

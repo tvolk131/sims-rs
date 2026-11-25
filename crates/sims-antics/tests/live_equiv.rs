@@ -3332,7 +3332,8 @@ object "Domain Probe" {
 
     state served: i16;
 
-    tree serve "Serve" (sim: Sim, meal: Meal, count: i16) {
+    #[bhav(label = "Serve")]
+    fn serve(sim: Sim, meal: Meal, count: i16) {
         BODY
     }
 
@@ -3624,7 +3625,8 @@ pub enum Mode {
 pub template Gadget {
     state level: i16;
 
-    tree run_mode "Run Mode" (mode: Mode) {
+    #[bhav(label = "Run Mode")]
+    fn run_mode(mode: Mode) {
         self.level = 1;
         if mode == Mode::Turbo {
             self.level = 2;
@@ -3675,7 +3677,8 @@ fn v2_enum_domains_follow_the_declaring_module() {
     let overridden = mode_pack(
         &dir.join("overridden"),
         r#"
-    tree run_mode "Run Mode Two" (mode: Mode) {
+    #[bhav(label = "Run Mode Two")]
+    fn run_mode(mode: Mode) {
         self.level = 3;
     }
 "#,
@@ -3691,7 +3694,7 @@ fn v2_enum_domains_follow_the_declaring_module() {
     );
 }
 
-/// `@frame(args: 2)` gives a tree more arguments than positional parameters; the enum
+/// `#[frame(args = 2)]` gives a tree more arguments than positional parameters; the enum
 /// parameter is still `param[0]`.
 #[test]
 fn v2_enum_domains_allow_extra_frame_arguments() {
@@ -3702,8 +3705,8 @@ fn v2_enum_domains_allow_extra_frame_arguments() {
         ENUM_OBJECT
             .replace("BODY", PLAIN_BODY.trim_start())
             .replace(
-                "    tree serve \"Serve\"",
-                "    @frame(args: 3)\n    tree serve \"Serve\"",
+                "    #[bhav(label = \"Serve\")]",
+                "    #[bhav(label = \"Serve\", args = 3)]",
             ),
     )
     .unwrap();
@@ -3726,7 +3729,7 @@ fn verify_equiv_cli_v2_enum_domains_check_labels() {
         &relabeled_source,
         ENUM_OBJECT
             .replace("BODY", PLAIN_BODY.trim_start())
-            .replace("tree serve \"Serve\"", "tree serve \"Reset\""),
+            .replace("#[bhav(label = \"Serve\")]", "#[bhav(label = \"Reset\")]"),
     )
     .unwrap();
     let relabeled = dir.join("relabeled.iff");
@@ -3812,7 +3815,7 @@ fn param_domains_never_restrict_a_kind_4_entry() {
     assert_counterexample(&live_with(&a, &b, &with_domains(&[(4200, 0, "0")]), &opts));
 }
 
-/// `@id(N)` names a tree's BHAV even when another tree shares its label.
+/// `#[bhav(id = N)]` names a tree's BHAV even when another tree shares its label.
 #[test]
 fn v2_enum_domains_follow_pinned_ids() {
     let dir = scratch_dir("enum-pinned");
@@ -3822,8 +3825,8 @@ fn v2_enum_domains_follow_pinned_ids() {
         ENUM_OBJECT
             .replace("BODY", PLAIN_BODY.trim_start())
             .replace(
-                "    tree serve \"Serve\"",
-                "    @id(4201) tree tidy \"Serve\" () {\n        self.served = 0;\n    }\n\n    @id(4200) tree serve \"Serve\"",
+                "    #[bhav(label = \"Serve\")]",
+                "    #[bhav(id = 4201, label = \"Serve\")] fn tidy() {\n        self.served = 0;\n    }\n\n    #[bhav(id = 4200, label = \"Serve\")]",
             ),
     )
     .unwrap();

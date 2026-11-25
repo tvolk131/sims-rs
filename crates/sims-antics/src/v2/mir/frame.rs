@@ -1,4 +1,4 @@
-//! Frame allocation: the pinned `push_interaction` slot (`pin_in_place`), `@slot(N)` placement
+//! Frame allocation: the pinned `push_interaction` slot (`pin_in_place`), `#[slot(N)]` placement
 //! (`assign_frame_slots`), definite-definition flow, and local renaming.
 
 use super::*;
@@ -50,7 +50,7 @@ pub(crate) fn pin_in_place(body: &str, ranges: DrawRanges) -> String {
     out
 }
 
-/// Places a tree's `@slot(N) let` locals (`pinned`, which lowering names and numbers) in
+/// Places a tree's `#[slot(N)] let` locals (`pinned`, which lowering names and numbers) in
 /// `local[N]` and every other generated local (`__..`) in the lowest frame word nothing else
 /// names, in declaration order. `.air` alone would put the named locals after the highest
 /// explicit slot, so pinning a high word would grow the frame by that many words.
@@ -112,7 +112,7 @@ fn plan_frame_slots(
     Some((usage, slots))
 }
 
-/// Which local occupies each frame word of the finished tree `body` (before `@slot(N)`
+/// Which local occupies each frame word of the finished tree `body` (before `#[slot(N)]`
 /// placement, which `has_slots` says runs), read the way `.air` reads the placed body: a word
 /// the placed body names (`local[N]`) holds the local placed there, or itself, and every
 /// remaining `let` takes the word `.air` gives it, after the highest named word and the
@@ -716,7 +716,7 @@ pub(crate) fn locals_defined_before_reads(nodes: &[Stmt], ranges: DrawRanges) ->
 
 /// The coalescing class of a local, or `None` when it must keep its own slot.
 pub(crate) fn merge_group(name: &str) -> Option<String> {
-    // `@slot(N)` locals (`__slot<N>_..`) are frame words of their own: never merged.
+    // `#[slot(N)]` locals (`__slot<N>_..`) are frame words of their own: never merged.
     if matches!(name, "__self_obj" | "__saved_stack_obj") || name.starts_with("__slot") {
         return None;
     }
