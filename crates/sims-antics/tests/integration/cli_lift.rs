@@ -2171,6 +2171,7 @@ fn install_fridges_cli_lift_is_fully_structured_and_equivalent() {
         eprintln!("install_fridges_cli_lift: skipped (SIMS_INSTALL empty)");
         return;
     }
+    let _install_sweep = crate::common::install_sweep_lock();
     let install = sims_content::Install::detect(Path::new(&root))
         .expect("SIMS_INSTALL did not resolve to a valid Sims installation");
     let objects = install

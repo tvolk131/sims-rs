@@ -32,25 +32,5 @@ install-catalog = ["dep:sims-content", "dep:sims-vm"]
 # `sims-vm`. Without it nothing is confirmed, so a difference is only ever inconclusive.
 vm-replay = ["dep:sims-content", "dep:sims-sim", "dep:sims-vm"]
 
-[[test]]
-name = "cli_lift"
-required-features = ["install-catalog"]
-
-[[test]]
-name = "structured_equiv"
-required-features = ["install-catalog"]
-
-[[test]]
-name = "live_equiv"
-required-features = ["vm-replay"]
-
-[[test]]
-name = "live_equiv_corpus"
-required-features = ["vm-replay"]
-
-[[test]]
-name = "antics_test_runner"
-required-features = ["vm-replay"]
-
 [lints]
 workspace = true

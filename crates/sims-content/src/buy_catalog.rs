@@ -8,13 +8,16 @@
 //! - [`BuyLabels`]: the category buttons' text (`UIText.iff` STR# 150,
 //!   200–207 and 210, loaded at 0x5057a2–0x5058cb and shown by 0x506765).
 //! - [`Catalog::buy_entries`]: all three together over an install.
+//!   [`Catalog::buy_entries_visiting`] does the same and shows the caller
+//!   each definition in its open file, so a caller reading more of the
+//!   file does not read every object file a second time.
 //!
 //! Languages are the game's codes, 1 for US English, as the string
 //! resources store them.
 
 use crate::{Catalog, Error, Index, Install, Result};
 use sims_formats::behavior::InteractionTable;
-use sims_formats::iff::Iff;
+use sims_formats::iff::{Chunk, Iff};
 use std::collections::BTreeMap;
 
 /// The definition words the Buy catalog reads, from an `OBJD` payload.
@@ -528,6 +531,21 @@ pub struct BuyCatalog {
     pub diagnostics: Vec<String>,
 }
 
+/// One definition [`Catalog::buy_entries_visiting`] parsed, in its open
+/// file.
+#[derive(Debug, Clone, Copy)]
+pub struct BuyVisit<'a> {
+    /// Index into [`Catalog::objects`].
+    pub object: usize,
+    /// The definition's own file.
+    pub iff: &'a Iff,
+    /// The definition's `OBJD` chunk in [`Self::iff`].
+    pub chunk: &'a Chunk,
+    pub definition: &'a BuyDefinition,
+    /// What the catalog lists for it, if it is listed and its text read.
+    pub entry: Option<&'a BuyEntry>,
+}
+
 impl Catalog {
     /// The definitions the Buy catalog lists (0x4cd81a–0x4cd8ab) and their
     /// text, for game language `language`.
@@ -539,6 +557,20 @@ impl Catalog {
     /// semi-global, for a table), as `Object::resource` and
     /// [`Catalog::semi_globals`] give them.
     pub fn buy_entries(&self, index: &Index, language: u8) -> Result<BuyCatalog> {
+        self.buy_entries_visiting(index, language, |_| {})
+    }
+
+    /// [`Self::buy_entries`], calling `visit` once for every definition it
+    /// parses, listed or not, while the definition's file is open.
+    ///
+    /// Definitions come in registration order. One whose file, `OBJD`
+    /// chunk or definition words cannot be read is not visited.
+    pub fn buy_entries_visiting(
+        &self,
+        index: &Index,
+        language: u8,
+        mut visit: impl FnMut(BuyVisit<'_>),
+    ) -> Result<BuyCatalog> {
         let mut catalog = BuyCatalog::default();
         let read = |number: usize| -> std::result::Result<Iff, String> {
             let resource = &index.resources[number];
@@ -624,6 +656,13 @@ impl Catalog {
             };
             definitions.push(Some(definition));
             if !listed {
+                visit(BuyVisit {
+                    object: number,
+                    iff,
+                    chunk,
+                    definition: &definition,
+                    entry: None,
+                });
                 continue;
             }
             let cats = iff.get(b"CATS", definition.strings).map(|c| iff.data(c));
@@ -637,16 +676,35 @@ impl Catalog {
                 language,
                 definition.kind == 2,
             ) {
-                Ok(text) => catalog.entries.push(BuyEntry {
-                    object: number,
-                    definition,
-                    text,
-                }),
-                Err(e) => catalog.diagnostics.push(format!(
-                    "{} catalog text #{}: {e}",
-                    location(),
-                    definition.strings
-                )),
+                Ok(text) => {
+                    let entry = BuyEntry {
+                        object: number,
+                        definition,
+                        text,
+                    };
+                    visit(BuyVisit {
+                        object: number,
+                        iff,
+                        chunk,
+                        definition: &entry.definition,
+                        entry: Some(&entry),
+                    });
+                    catalog.entries.push(entry);
+                }
+                Err(e) => {
+                    catalog.diagnostics.push(format!(
+                        "{} catalog text #{}: {e}",
+                        location(),
+                        definition.strings
+                    ));
+                    visit(BuyVisit {
+                        object: number,
+                        iff,
+                        chunk,
+                        definition: &definition,
+                        entry: None,
+                    });
+                }
             }
         }
         Ok(catalog)

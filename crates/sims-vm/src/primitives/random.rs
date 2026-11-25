@@ -50,22 +50,36 @@ impl Machine<'_, '_> {
             ));
         }
         // Check that the store will succeed before consuming a draw. A
-        // local in range always takes the store.
+        // local in range always takes the store, and any other cell its own
+        // value, except object data words 2, 3 and 11: those take only the
+        // value they already hold (`store`), so they are checked with the
+        // draw itself below.
         match destination {
-            Cell::Motive(..) => {}
+            Cell::Motive(..) | Cell::Data(_, 2 | 3 | 11) => {}
             Cell::Local(_) => self.probe(destination)?,
             _ => {
                 let old = self.value(destination)?;
                 self.store(destination, old)?;
             }
         }
-        let rng = match self.stream {
-            Stream::Lot => &mut self.world.lot_rng,
-            Stream::Global => &mut self.world.global_rng,
+        // The draw comes from the stream as the check above left it (a
+        // store can run a callback that draws). It is taken from a copy,
+        // kept once the store is known to succeed. A negative range is
+        // reinterpreted as unsigned, as the original's unsigned modulo does.
+        let mut rng = match self.stream {
+            Stream::Lot => self.world.lot_rng,
+            Stream::Global => self.world.global_rng,
         };
-        // A negative range is reinterpreted as unsigned, as the original's
-        // unsigned modulo does.
         let value = rng.next_u32() % (i32::from(range) as u32);
+        if let Cell::Data(_, 2 | 3 | 11) = destination {
+            // Stores nothing or faults, with no other effect, so the copy
+            // is still the stream's state.
+            self.store(destination, value as i16)?;
+        }
+        match self.stream {
+            Stream::Lot => self.world.lot_rng = rng,
+            Stream::Global => self.world.global_rng = rng,
+        }
         if let Cell::Motive(id, index) = destination {
             self.set_motive(id, index, Ext::from_i32(value as i32).to_f32())?;
         } else {

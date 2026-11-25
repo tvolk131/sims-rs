@@ -9946,4 +9946,103 @@ mod tests {
         .unwrap();
         assert_eq!(token(&returned.home_lot.world), 1, "the return took it");
     }
+
+    /// Lot 22 holds eight objects whose room tree first sets their own ID
+    /// (object data word 11) to their stack object, themselves. That store
+    /// changes nothing in the original (a plain word store, 0x452e8b). The
+    /// VM refused it, which in play mode reset each object and stopped the
+    /// scheduler's pass partway: the lot's tick count advanced on about
+    /// every other frame, so after a trip on from lot 21 the cab sign's Go
+    /// Home asked for the trip home only after about 3,800 frames. Now each
+    /// frame is a full pass, and the call asks in time.
+    #[test]
+    fn go_home_from_a_second_downtown_lot_asks_for_the_trip_home_in_time() {
+        /// The cab sign's Go Home.
+        const GO_HOME: u16 = 0x107b;
+        /// Frames a Sim may take to walk to the sign and call.
+        const CALL_FRAMES: u32 = 3000;
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard) = live_store(&root, "travel-on-go-home");
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let leader_guid = nh.family_in(5).unwrap().1.members[0];
+        let mut home =
+            crate::lifecycle::enter_lot(&root, &store, "UserData", 5, &[3], Frames::default())
+                .unwrap();
+        for _ in 0..30 {
+            home.step_play().unwrap();
+        }
+        let departed = depart_to_destination(
+            &root,
+            &store,
+            "UserData",
+            &mut home,
+            &TravelRequest::downtown(21, leader_guid),
+        )
+        .unwrap();
+        let mut downtown = departed.destination_lot;
+        let traveler = person_with_guid(&downtown.world, leader_guid).unwrap();
+        ask_for_trip(&mut downtown, traveler, 22, 0, 30, 0);
+        // No scripted answers: the player answers every dialog.
+        let on = travel_on_from_request(
+            &root,
+            &store,
+            &departed.session,
+            &mut downtown,
+            &TripDeparture::default(),
+        )
+        .unwrap();
+        let mut lot = on.destination_lot;
+        assert_eq!(lot.load.house, 22);
+        lot.wait_for_answers();
+        // One frame, answering any dialog it shows with its first button.
+        let step = |lot: &mut Lot| loop {
+            match lot.step_play() {
+                Ok(update) => {
+                    assert_eq!(update.errors, [], "tick {}", lot.world.ticks);
+                    return;
+                }
+                Err(crate::boot::StepError::Asking { .. }) => {
+                    let first = lot.asking().unwrap().shown.answers[0];
+                    lot.answer(first).unwrap();
+                }
+                Err(e) => panic!("{e:?}"),
+            }
+        };
+
+        // Every frame is a full pass.
+        let start = lot.world.ticks;
+        for _ in 0..400 {
+            step(&mut lot);
+        }
+        assert_eq!(lot.world.ticks.wrapping_sub(start), 400);
+
+        let traveler = person_with_guid(&lot.world, leader_guid).unwrap();
+        let objects: Vec<u16> = lot.world.objects.keys().copied().collect();
+        let go_home = objects
+            .into_iter()
+            .filter(|&object| object != traveler)
+            .find_map(|object| {
+                let menu = lot.pie_menu(traveler, object).ok()?;
+                menu.entries
+                    .into_iter()
+                    .find(|e| e.action.action == GO_HOME)
+                    .map(|e| e.action)
+            })
+            .expect("the cab sign offers Go Home");
+        lot.pick(traveler, go_home).unwrap();
+        let asked = (0..CALL_FRAMES).find(|_| {
+            step(&mut lot);
+            lot.world.trip_request.is_some()
+        });
+        assert!(
+            asked.is_some(),
+            "no trip request within {CALL_FRAMES} frames"
+        );
+        let request = lot.world.trip_request.clone().unwrap();
+        assert_eq!(request.house, 5);
+        assert_eq!(request.leader_guid, leader_guid);
+        assert_eq!(request.caller, traveler);
+    }
 }
