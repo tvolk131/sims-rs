@@ -656,158 +656,136 @@ impl BuyCatalog {
     /// Every other definition but a person or a non-master tile keeps its
     /// catalog name for [`Self::display_for_object`].
     pub fn load(index: &Index, catalog: &Catalog) -> Self {
-        let listing = catalog
-            .buy_entries(index, US_ENGLISH)
-            .map(|listing| listing.entries)
-            .unwrap_or_default();
-        let listed: BTreeMap<usize, &BuyEntry> =
-            listing.iter().map(|entry| (entry.object, entry)).collect();
         let mut items = Vec::new();
-        let mut master_by_part = BTreeMap::new();
         let mut fallback_names = BTreeMap::new();
-        // Each GUID's registered definition, by file, so each file is parsed
-        // once.
-        let mut by_resource: BTreeMap<usize, Vec<(u32, usize, u16)>> = BTreeMap::new();
-        for (&guid, &object) in &catalog.by_guid {
-            let obj = &catalog.objects[object];
-            by_resource
-                .entry(obj.resource)
-                .or_default()
-                .push((guid, object, obj.chunk));
-        }
-
-        for (res_idx, entries) in by_resource {
-            let Some(resource) = index.resources.get(res_idx) else {
-                continue;
-            };
-            let Ok(bytes) = resource.read() else {
-                continue;
-            };
-            let Ok(iff) = Iff::parse(bytes) else {
-                continue;
-            };
-            let mut master_guids: BTreeMap<u16, u32> = BTreeMap::new();
-            let mut part_masters: Vec<(u32, u16)> = Vec::new();
-            for (guid, object, chunk_id) in entries {
-                let Some(chunk) = iff.get(b"OBJD", chunk_id) else {
-                    continue;
-                };
-                let data = iff.data(chunk);
-                let Ok(definition) = BuyDefinition::parse(data) else {
-                    continue;
-                };
-                if definition.master != 0 {
-                    if definition.is_master() {
-                        master_guids.insert(definition.master, guid);
-                    } else {
-                        part_masters.push((guid, definition.master));
-                    }
+        // A multi-tile object's master GUID by (file, master ID), and each
+        // part's (GUID, file, master ID). Where one file has two masters
+        // with an ID, the greater GUID wins, as when files were read GUID
+        // by GUID.
+        let mut master_guids: BTreeMap<(usize, u16), u32> = BTreeMap::new();
+        let mut part_masters: Vec<(u32, usize, u16)> = Vec::new();
+        // One pass over the object files: `buy_entries` decides the listing
+        // and text, and shows each definition in its open file so the
+        // catalog's own words are read from the same parse. It reports
+        // unreadable files as diagnostics and leaves them out, as reading
+        // them here would.
+        let _ = catalog.buy_entries_visiting(index, US_ENGLISH, |visit| {
+            let object = &catalog.objects[visit.object];
+            let guid = object.guid;
+            // Only each GUID's registered definition.
+            if catalog.by_guid.get(&guid) != Some(&visit.object) {
+                return;
+            }
+            let iff = visit.iff;
+            let chunk = visit.chunk;
+            let definition = *visit.definition;
+            let data = iff.data(chunk);
+            if definition.master != 0 {
+                if definition.is_master() {
+                    master_guids
+                        .entry((object.resource, definition.master))
+                        .and_modify(|g: &mut u32| *g = (*g).max(guid))
+                        .or_insert(guid);
+                } else {
+                    part_masters.push((guid, object.resource, definition.master));
                 }
-                // 0x4575b8, 0x4575d2: never a non-master tile or a person.
-                if definition.eligibility() == BuyEligibility::Excluded {
-                    continue;
-                }
-                // 0x4cb905..0x4cbaa8: keep the object whenever any residential
-                // (`+0x4e` room or `+0x50` function) or expansion commercial
-                // catalog sort word is nonzero.
-                let room_sort = read_i16(data, OBJD_ROOM_SORT) as u16;
-                let function_sort = read_i16(data, OBJD_FUNC_SORT) as u16;
-                let downtown_sort = read_i16(data, OBJD_DOWNTOWN_SORT) as u16;
-                let vacation_sort = read_i16(data, OBJD_VACATION_SORT) as u16;
-                let community_sort = read_i16(data, OBJD_COMMUNITY_SORT) as u16;
-                let studio_sort = read_i16(data, OBJD_STUDIO_SORT) as u16;
-                let magic_sort = read_i16(data, OBJD_MAGIC_SORT) as u16;
-                let any_sort = room_sort
-                    | function_sort
-                    | downtown_sort
-                    | vacation_sort
-                    | community_sort
-                    | studio_sort
-                    | magic_sort;
-                let (raw_name, description) = match listed.get(&object) {
-                    Some(entry) if any_sort != 0 => (
-                        entry.text.name.clone(),
-                        decode_text(&entry.text.description),
-                    ),
-                    listing => {
-                        let cats = iff.get(b"CATS", definition.strings).map(|c| iff.data(c));
-                        let ctss = iff
-                            .get(b"CTSS", definition.strings)
-                            .map(|c| (iff.data(c), iff.resource_flags(c)));
-                        match CatalogText::read(
-                            cats,
-                            ctss,
-                            iff.label_bytes(chunk),
-                            US_ENGLISH,
-                            false,
-                        ) {
-                            Ok(text) => {
-                                fallback_names.insert(guid, decode_text(&text.name));
-                                continue;
-                            }
-                            // Unreadable text takes the native empty-name
-                            // rule: `*` and the OBJD label.
-                            Err(_) => {
-                                let mut name = b"*".to_vec();
-                                name.extend_from_slice(iff.label_bytes(chunk));
-                                // `buy_entries` leaves out a definition whose
-                                // catalog text it cannot read, so a damaged
-                                // CATS or CTSS would hide a buyable object.
-                                // List one that has a sort word and graphics,
-                                // a master, or an interaction table, as the
-                                // earlier rule did; damaged text never lists
-                                // an object that would not be listed anyway.
-                                let buyable = definition.eligibility() == BuyEligibility::Listed
-                                    || definition.interactions > 0;
-                                if listing.is_none() && any_sort != 0 && buyable {
-                                    (name, String::new())
-                                } else {
-                                    fallback_names.insert(guid, decode_text(&name));
-                                    continue;
-                                }
+            }
+            // 0x4575b8, 0x4575d2: never a non-master tile or a person.
+            if definition.eligibility() == BuyEligibility::Excluded {
+                return;
+            }
+            // 0x4cb905..0x4cbaa8: keep the object whenever any residential
+            // (`+0x4e` room or `+0x50` function) or expansion commercial
+            // catalog sort word is nonzero.
+            let room_sort = read_i16(data, OBJD_ROOM_SORT) as u16;
+            let function_sort = read_i16(data, OBJD_FUNC_SORT) as u16;
+            let downtown_sort = read_i16(data, OBJD_DOWNTOWN_SORT) as u16;
+            let vacation_sort = read_i16(data, OBJD_VACATION_SORT) as u16;
+            let community_sort = read_i16(data, OBJD_COMMUNITY_SORT) as u16;
+            let studio_sort = read_i16(data, OBJD_STUDIO_SORT) as u16;
+            let magic_sort = read_i16(data, OBJD_MAGIC_SORT) as u16;
+            let any_sort = room_sort
+                | function_sort
+                | downtown_sort
+                | vacation_sort
+                | community_sort
+                | studio_sort
+                | magic_sort;
+            let (raw_name, description) = match visit.entry {
+                Some(entry) if any_sort != 0 => (
+                    entry.text.name.clone(),
+                    decode_text(&entry.text.description),
+                ),
+                listing => {
+                    let cats = iff.get(b"CATS", definition.strings).map(|c| iff.data(c));
+                    let ctss = iff
+                        .get(b"CTSS", definition.strings)
+                        .map(|c| (iff.data(c), iff.resource_flags(c)));
+                    match CatalogText::read(cats, ctss, iff.label_bytes(chunk), US_ENGLISH, false) {
+                        Ok(text) => {
+                            fallback_names.insert(guid, decode_text(&text.name));
+                            return;
+                        }
+                        // Unreadable text takes the native empty-name
+                        // rule: `*` and the OBJD label.
+                        Err(_) => {
+                            let mut name = b"*".to_vec();
+                            name.extend_from_slice(iff.label_bytes(chunk));
+                            // `buy_entries` leaves out a definition whose
+                            // catalog text it cannot read, so a damaged
+                            // CATS or CTSS would hide a buyable object.
+                            // List one that has a sort word and graphics,
+                            // a master, or an interaction table, as the
+                            // earlier rule did; damaged text never lists
+                            // an object that would not be listed anyway.
+                            let buyable = definition.eligibility() == BuyEligibility::Listed
+                                || definition.interactions > 0;
+                            if listing.is_none() && any_sort != 0 && buyable {
+                                (name, String::new())
+                            } else {
+                                fallback_names.insert(guid, decode_text(&name));
+                                return;
                             }
                         }
                     }
-                };
-                let price = i32::from(read_i16(data, OBJD_PRICE));
-                let function_subsort = read_i16(data, OBJD_FUNC_SUBSORT) as u16;
-                let build_mode_type = read_i16(data, OBJD_BUILD_TYPE);
-                let mut ratings = [0i16; 7];
-                for (i, slot) in ratings.iter_mut().enumerate() {
-                    *slot = read_i16(data, OBJD_RATING_BASE + i * 2);
                 }
-                let skill_flags = read_i16(data, OBJD_RATING_SKILLS) as u16;
-                let (usage_restriction, group_activity) =
-                    read_ttab_usage(&iff, definition.interactions);
-                items.push((
-                    raw_name.clone(),
-                    BuyItem {
-                        guid,
-                        price,
-                        name: decode_text(&raw_name),
-                        description,
-                        room_sort,
-                        function_sort,
-                        function_subsort,
-                        downtown_sort,
-                        vacation_sort,
-                        community_sort,
-                        studio_sort,
-                        magic_sort,
-                        build_mode_type,
-                        ratings,
-                        skill_flags,
-                        usage_restriction,
-                        group_activity,
-                    },
-                ));
+            };
+            let price = i32::from(read_i16(data, OBJD_PRICE));
+            let function_subsort = read_i16(data, OBJD_FUNC_SUBSORT) as u16;
+            let build_mode_type = read_i16(data, OBJD_BUILD_TYPE);
+            let mut ratings = [0i16; 7];
+            for (i, slot) in ratings.iter_mut().enumerate() {
+                *slot = read_i16(data, OBJD_RATING_BASE + i * 2);
             }
-            for (part_guid, master_id) in part_masters {
-                if let Some(&master_guid) = master_guids.get(&master_id) {
-                    master_by_part.insert(part_guid, master_guid);
-                }
-            }
-        }
+            let skill_flags = read_i16(data, OBJD_RATING_SKILLS) as u16;
+            let (usage_restriction, group_activity) = read_ttab_usage(iff, definition.interactions);
+            items.push((
+                raw_name.clone(),
+                BuyItem {
+                    guid,
+                    price,
+                    name: decode_text(&raw_name),
+                    description,
+                    room_sort,
+                    function_sort,
+                    function_subsort,
+                    downtown_sort,
+                    vacation_sort,
+                    community_sort,
+                    studio_sort,
+                    magic_sort,
+                    build_mode_type,
+                    ratings,
+                    skill_flags,
+                    usage_restriction,
+                    group_activity,
+                },
+            ));
+        });
+        let master_by_part = part_masters
+            .into_iter()
+            .filter_map(|(part, file, master)| Some((part, *master_guids.get(&(file, master))?)))
+            .collect();
 
         // 0x4cd9a5 -> 0x430100 -> memcmp (0x6363e0): sort by price ascending,
         // then raw catalog name bytes (Windows-1252) ascending, then GUID.

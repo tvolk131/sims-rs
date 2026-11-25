@@ -31,8 +31,8 @@ mod wardrobe;
 pub use animations::{Animations, Channel, Clip, Event, Track};
 pub use assets::Assets;
 pub use buy_catalog::{
-    BuyCatalog, BuyDefinition, BuyEligibility, BuyEntry, BuyLabels, CatalogText, has_interactions,
-    master_of,
+    BuyCatalog, BuyDefinition, BuyEligibility, BuyEntry, BuyLabels, BuyVisit, CatalogText,
+    has_interactions, master_of,
 };
 pub use catalog::{Catalog, Object};
 pub use error::Error;
