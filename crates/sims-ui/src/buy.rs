@@ -9,7 +9,7 @@ use crate::frame::{Frame, Rect};
 use crate::hud::STRIP;
 use crate::thumbnail::{SIZE as CELL, TEMPLATE, Thumbnails};
 use sims_content::ui_graphics::US_ENGLISH;
-use sims_content::{BuyDefinition, BuyEligibility, BuyEntry, CatalogText};
+use sims_content::{BuyEligibility, CatalogText};
 use sims_content::{Catalog, Index, Install};
 use sims_formats::behavior::InteractionTable;
 use sims_formats::iff::Iff;
@@ -492,7 +492,7 @@ pub struct BuyCatalog {
 }
 
 /// OBJD byte offsets read by `0x4cb8e7..0x4cbaa8` and `0x457a36`; the words
-/// the catalog builder reads are [`BuyDefinition`]'s.
+/// the catalog builder reads are [`sims_content::BuyDefinition`]'s.
 const OBJD_PRICE: usize = 0x24;
 const OBJD_ROOM_SORT: usize = 0x4e;
 const OBJD_FUNC_SORT: usize = 0x50;
@@ -656,51 +656,46 @@ impl BuyCatalog {
     /// Every other definition but a person or a non-master tile keeps its
     /// catalog name for [`Self::display_for_object`].
     pub fn load(index: &Index, catalog: &Catalog) -> Self {
-        let listing = catalog
-            .buy_entries(index, US_ENGLISH)
-            .map(|listing| listing.entries)
-            .unwrap_or_default();
-        let listed: BTreeMap<usize, &BuyEntry> =
-            listing.iter().map(|entry| (entry.object, entry)).collect();
         let mut items = Vec::new();
-        let mut master_by_part = BTreeMap::new();
         let mut fallback_names = BTreeMap::new();
-        // Each GUID's registered definition, by file, so each file is parsed
-        // once.
-        let mut by_resource: BTreeMap<usize, Vec<(u32, usize, u16)>> = BTreeMap::new();
+        // A multi-tile object's master GUID by (file, master ID), and each
+        // part's (GUID, file, master ID). Where one file has two masters
+        // with an ID, the greater GUID wins, as when files were read GUID
+        // by GUID.
+        let mut master_guids: BTreeMap<(usize, u16), u32> = BTreeMap::new();
+        let mut part_masters: Vec<(u32, usize, u16)> = Vec::new();
+        // The GUIDs each definition is registered under (`by_guid`), in
+        // ascending order. `Catalog::build` gives each definition at most
+        // its own GUID, but every entry is honored, as reading the files
+        // GUID by GUID did.
+        let mut guids_of: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
         for (&guid, &object) in &catalog.by_guid {
-            let obj = &catalog.objects[object];
-            by_resource
-                .entry(obj.resource)
-                .or_default()
-                .push((guid, object, obj.chunk));
+            guids_of.entry(object).or_default().push(guid);
         }
-
-        for (res_idx, entries) in by_resource {
-            let Some(resource) = index.resources.get(res_idx) else {
-                continue;
+        // One pass over the object files: `buy_entries` decides the listing
+        // and text, and shows each definition in its open file so the
+        // catalog's own words are read from the same parse. It reports
+        // unreadable files as diagnostics and leaves them out, as reading
+        // them here would.
+        let _ = catalog.buy_entries_visiting(index, US_ENGLISH, |visit| {
+            // Only a GUID's registered definition.
+            let Some(guids) = guids_of.get(&visit.object) else {
+                return;
             };
-            let Ok(bytes) = resource.read() else {
-                continue;
-            };
-            let Ok(iff) = Iff::parse(bytes) else {
-                continue;
-            };
-            let mut master_guids: BTreeMap<u16, u32> = BTreeMap::new();
-            let mut part_masters: Vec<(u32, u16)> = Vec::new();
-            for (guid, object, chunk_id) in entries {
-                let Some(chunk) = iff.get(b"OBJD", chunk_id) else {
-                    continue;
-                };
+            let resource = catalog.objects[visit.object].resource;
+            for &guid in guids {
+                let iff = visit.iff;
+                let chunk = visit.chunk;
+                let definition = *visit.definition;
                 let data = iff.data(chunk);
-                let Ok(definition) = BuyDefinition::parse(data) else {
-                    continue;
-                };
                 if definition.master != 0 {
                     if definition.is_master() {
-                        master_guids.insert(definition.master, guid);
+                        master_guids
+                            .entry((resource, definition.master))
+                            .and_modify(|g: &mut u32| *g = (*g).max(guid))
+                            .or_insert(guid);
                     } else {
-                        part_masters.push((guid, definition.master));
+                        part_masters.push((guid, resource, definition.master));
                     }
                 }
                 // 0x4575b8, 0x4575d2: never a non-master tile or a person.
@@ -724,7 +719,7 @@ impl BuyCatalog {
                     | community_sort
                     | studio_sort
                     | magic_sort;
-                let (raw_name, description) = match listed.get(&object) {
+                let (raw_name, description) = match visit.entry {
                     Some(entry) if any_sort != 0 => (
                         entry.text.name.clone(),
                         decode_text(&entry.text.description),
@@ -778,7 +773,7 @@ impl BuyCatalog {
                 }
                 let skill_flags = read_i16(data, OBJD_RATING_SKILLS) as u16;
                 let (usage_restriction, group_activity) =
-                    read_ttab_usage(&iff, definition.interactions);
+                    read_ttab_usage(iff, definition.interactions);
                 items.push((
                     raw_name.clone(),
                     BuyItem {
@@ -802,12 +797,11 @@ impl BuyCatalog {
                     },
                 ));
             }
-            for (part_guid, master_id) in part_masters {
-                if let Some(&master_guid) = master_guids.get(&master_id) {
-                    master_by_part.insert(part_guid, master_guid);
-                }
-            }
-        }
+        });
+        let master_by_part = part_masters
+            .into_iter()
+            .filter_map(|(part, file, master)| Some((part, *master_guids.get(&(file, master))?)))
+            .collect();
 
         // 0x4cd9a5 -> 0x430100 -> memcmp (0x6363e0): sort by price ascending,
         // then raw catalog name bytes (Windows-1252) ascending, then GUID.
