@@ -453,6 +453,12 @@ fn is_engine_flags_key(key: &str) -> bool {
     key == ANY_BITFLAGS || key.starts_with("bitflags::std::flags::")
 }
 
+/// Whether enum `key` is an engine enum (a `std::engine` type): open, so a `match` on it needs
+/// a `_` arm.
+fn is_engine_enum_key(key: &str) -> bool {
+    key.starts_with("enum::std::engine::")
+}
+
 /// [`is_engine_flags_key`] of a value type.
 fn is_engine_flags(ty: &ValueType) -> bool {
     matches!(ty, ValueType::Bitflags(k) if is_engine_flags_key(k))

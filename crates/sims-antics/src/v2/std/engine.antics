@@ -1,1 +1,62 @@
-// Built-in `std::engine`: closed sets of engine values, as `enum` types.
+// Built-in `std::engine`: engine value sets, as `enum` types.
+//
+// Engine enums are open: a word may hold a value with no variant (`Direction::from_raw(w)`
+// accepts any word, `facing as i16` reads it back), so a `match` on one needs a `_` arm. The
+// names are our own descriptions; only the values are engine facts (see `crates/sims-vm`).
+
+// Object data word 1 (`self.facing`): eighths of a turn, clockwise from north (toward the lower
+// second tile coordinate). Objects normally face the even values.
+pub enum Direction {
+    North = 0,
+    NorthEast = 1,
+    East = 2,
+    SouthEast = 3,
+    South = 4,
+    SouthWest = 5,
+    West = 6,
+    NorthWest = 7,
+}
+
+// The ledger a budget change goes to. Categories 0 to 5 carry no confirmed meaning; 8 and above
+// are refused.
+pub enum BudgetCategory {
+    Buy = 6,
+    Build = 7,
+}
+
+// Whose drawing a refresh updates.
+pub enum RefreshTarget {
+    Me = 0,
+    StackObject = 1,
+}
+
+// What a refresh does.
+pub enum RefreshMode {
+    // Redraw the object and what it holds.
+    Redraw = 0,
+    // Mark the object's room for recounting, through the room's objects.
+    RecountRoomBroadcast = 1,
+    // Mark the object's room for recounting directly.
+    RecountRoom = 2,
+}
+
+// Definition word 9 (`x.object_type`): the kinds of object the engine treats specially.
+pub enum ObjectType {
+    Person = 2,
+    // A controller: no distance, no interactions with people.
+    Controller = 7,
+    Door = 8,
+    TileCursor = 9,
+    // A token a visitor holds to use a lodging.
+    KeyToken = 13,
+}
+
+// Person data word 65 (`sim.gender_kind`): sex and species.
+pub enum PersonKind {
+    Male = 0,
+    Female = 1,
+    MaleDog = 2,
+    FemaleDog = 3,
+    MaleCat = 4,
+    FemaleCat = 5,
+}

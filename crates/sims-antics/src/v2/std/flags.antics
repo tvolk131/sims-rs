@@ -2,30 +2,123 @@
 //
 // Bits are 1-based (`Floor = 1` is mask 0x0001). Every bit below is one the engine reads or
 // writes (see `crates/sims-vm`); a bit with no confirmed meaning is left out, and a raw word
-// still converts both ways (`ObjectFlags::from_raw(w)`, `flags as i16`). The names are our own
-// descriptions; only the word and bit positions are engine facts.
+// still converts both ways (`ObjectFlags::from_raw(w)`, `flags as i16`). An engine word also
+// takes raw `i16` operands exactly as before (`self.wall_placement flag_set 3`). The names are
+// our own descriptions; only the word and bit positions are engine facts.
 //
 // `Height` and `Placement` are prelude types: every module sees them without a `use`.
 
-// Object data word 4: the surface heights an object may be placed at.
+// Object data word 4 (`self.allowed_heights`): bit h lets the object sit in a container slot
+// of height h; bit 1 also allows the ground or a floor. The engine names no height; these names
+// describe the usual surface at each height.
 pub bitflags Height {
     Floor = 1,
     LowTable = 2,
     Table = 3,
     Counter = 4,
+    // The height a slot of height 0 with a vertical offset becomes.
     NonStandard = 5,
+    // A person's carrying slot.
     InHand = 6,
     Sitting = 7,
     EndTable = 8,
 }
 
-// The tile kinds an object may be placed on.
+// Object data word 42 (`self.placement`): what the object may stand on.
 pub bitflags Placement {
+    // A floor.
     Floor = 1,
+    // Bare ground with no floor.
     Terrain = 2,
+    // A water tile.
     Water = 3,
+    // A tile whose corners differ in height.
     Sloped = 9,
+    // Above the ground with no floor beneath.
     Air = 10,
+    // A footprint that crosses walls.
+    CrossWalls = 11,
+    // A pool tile.
     Pool = 12,
+    // Pool tiles only.
+    PoolOnly = 13,
+    // Water tiles only.
     WaterOnly = 14,
+}
+
+// Object data word 8 (`self.flags`): how the object blocks people and takes part in play.
+pub bitflags ObjectFlags {
+    // With `NotSolid`: still in a person's way.
+    InTheWay = 2,
+    NotSolid = 3,
+    // A solid object a person may pass.
+    Passable = 5,
+    // Busy: cannot be picked up, and stops a fire.
+    InUse = 6,
+    // A person was interrupted while idling.
+    Interrupted = 7,
+    // A seat faces the object from a neighbouring tile.
+    SeatBeside = 9,
+    // Takes no interactions now.
+    NoInteractions = 10,
+    StopsFire = 12,
+    // Makes the water tile it stands on standable.
+    FloatsOnWater = 13,
+    // May share a container slot height with another object.
+    SharesSlots = 14,
+    Hidden = 15,
+}
+
+// Object data word 5 (`self.wall_adjacency`, written by the engine): the walls beside the
+// object's tile, relative to its facing.
+pub bitflags WallAdjacency {
+    WallLeft = 1,
+    WallRight = 2,
+    WallFront = 3,
+    WallBehind = 4,
+}
+
+// Object data word 13 (`self.wall_placement`): the walls the object needs or forbids, relative
+// to its facing.
+pub bitflags WallPlacement {
+    NeedsWallFront = 1,
+    NeedsWallRight = 2,
+    NeedsWallBehind = 3,
+    NeedsWallLeft = 4,
+    NoCorner = 5,
+    NeedsCorner = 6,
+    NeedsDiagonal = 7,
+    DiagonalAllowed = 8,
+    NoWallFront = 9,
+    NoWallRight = 10,
+    NoWallBehind = 11,
+    NoWallLeft = 12,
+}
+
+// Object data word 40 (`self.flags2`): the object's second flags word.
+pub bitflags ObjectFlags2 {
+    CatchesFire = 6,
+    LightSource = 11,
+}
+
+// Object data word 43 (`self.buy_flags`): what Buy mode may do with the object.
+pub bitflags BuyFlags {
+    CanPickUp = 2,
+    CanSell = 4,
+    // Left out of the lot's value.
+    NotValued = 5,
+}
+
+// Global word 20 (`world.expansions`): the installed expansion content.
+pub bitflags Expansions {
+    // The dating district.
+    Dating = 3,
+    // The vacation district.
+    Vacations = 4,
+    // The pets district (pets allowed).
+    Pets = 6,
+    // The fame district.
+    Fame = 7,
+    // The magic district (pets allowed).
+    Magic = 8,
 }
