@@ -59,52 +59,127 @@ use crate::manifest::PackManifest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// Returns `true` if `source` begins with a high-level `.antics` v2 top-level keyword
-/// (`use`, `pub`, `fn`, `template`, `object`, `enum`, `bitflags`, `extern`) rather than `.air` IR (`bcon`, `str`, `tree`, `interaction`).
+/// Whether `source` is `.antics` v2 rather than `.air` (Antics IR), which shares the
+/// `.antics` extension. Every command that takes either (`check`, `equiv`, `fmt`, `lint`)
+/// decides with this.
 ///
-/// Scans only leading whitespace/comments and the first identifier so v2 files containing
-/// later lexer errors are still routed to the v2 compiler for accurate diagnostics.
+/// The two languages' top-level keywords are disjoint. `.air` starts every item with
+/// `tree`, `interaction`, `bcon` or `str`; v2 with `use`, `pub`, `const`, `fn`,
+/// `template`, `object`, `enum`, `bitflags` or `extern`, optionally after `#[..]`
+/// attributes. So the first keyword past whitespace, comments and attributes decides:
+/// anything but an `.air` keyword is v2, which sends a mistyped keyword to the v2 parser
+/// and its diagnostics. A file with no keyword at all (empty, or only comments) is not
+/// v2.
+///
+/// The file is read both ways, and `.air` wins when its reading starts with an `.air`
+/// keyword. Both skip whitespace, `//` and nested `/* */` comments. `.air` skips a `#` line
+/// comment to the end of its line, even one starting `#[`. v2 skips a `#[..]` attribute
+/// (to its matching `]`, past strings), and the next keyword may follow on the same line.
 #[must_use]
 pub fn is_v2_source(source: &str) -> bool {
+    let air_word = |w: Option<&str>| matches!(w, Some("tree" | "interaction" | "bcon" | "str"));
+    let v2 = first_word(source, true);
+    if air_word(first_word(source, false)) {
+        // The languages' comment rules can disagree (`.air` comments do not nest, and `#[`
+        // starts one): then the file is v2 only if it parses as v2.
+        return v2.is_some() && !air_word(v2) && parse_v2_file(source).is_ok();
+    }
+    v2.is_some()
+}
+
+/// The first word of `source` past whitespace, comments and, with `attributes`, v2
+/// `#[..]` attributes (without, every `#` starts an `.air` comment line).
+fn first_word(source: &str, attributes: bool) -> Option<&str> {
     let bytes = source.as_bytes();
     let mut pos = 0usize;
-    while pos < bytes.len() {
-        while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\r' | b'\n') {
+    loop {
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
             pos += 1;
         }
-        if pos + 1 < bytes.len() && bytes[pos] == b'/' && bytes[pos + 1] == b'/' {
-            pos += 2;
-            while pos < bytes.len() && bytes[pos] != b'\n' {
-                pos += 1;
+        let rest = &bytes[pos..];
+        if rest.starts_with(b"//") {
+            pos = line_end(bytes, pos);
+        } else if rest.starts_with(b"/*") {
+            // v2 block comments nest; `.air`'s end at the first `*/`.
+            pos = if attributes {
+                block_comment_end(bytes, pos)
+            } else {
+                source[pos + 2..]
+                    .find("*/")
+                    .map_or(bytes.len(), |n| pos + 2 + n + 2)
+            };
+        } else if attributes && rest.starts_with(b"#[") {
+            match attribute_end(bytes, pos) {
+                Some(end) => pos = end,
+                // An unclosed `[` is broken v2.
+                None => pos = line_end(bytes, pos),
             }
-            continue;
+        } else if rest.starts_with(b"#") {
+            pos = line_end(bytes, pos);
+        } else {
+            break;
         }
-        if pos + 1 < bytes.len() && bytes[pos] == b'/' && bytes[pos + 1] == b'*' {
-            pos += 2;
-            let mut depth = 1usize;
-            while pos + 1 < bytes.len() && depth > 0 {
-                if bytes[pos] == b'/' && bytes[pos + 1] == b'*' {
-                    depth += 1;
-                    pos += 2;
-                } else if bytes[pos] == b'*' && bytes[pos + 1] == b'/' {
-                    depth -= 1;
-                    pos += 2;
-                } else {
-                    pos += 1;
-                }
-            }
-            continue;
-        }
-        break;
     }
     let start = pos;
     while pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
         pos += 1;
     }
-    matches!(
-        &source[start..pos],
-        "use" | "pub" | "fn" | "template" | "object" | "enum" | "bitflags" | "extern"
-    )
+    (start < bytes.len()).then(|| &source[start..pos])
+}
+
+/// The offset of the `\n` ending the line `at` is on (or the end of `bytes`).
+fn line_end(bytes: &[u8], at: usize) -> usize {
+    bytes[at..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(bytes.len(), |n| at + n)
+}
+
+/// One past the `*/` closing the (nested) block comment opening at `at`.
+fn block_comment_end(bytes: &[u8], mut at: usize) -> usize {
+    let mut depth = 0usize;
+    while at < bytes.len() {
+        if bytes[at..].starts_with(b"/*") {
+            depth += 1;
+            at += 2;
+        } else if bytes[at..].starts_with(b"*/") {
+            depth -= 1;
+            at += 2;
+            if depth == 0 {
+                return at;
+            }
+        } else {
+            at += 1;
+        }
+    }
+    bytes.len()
+}
+
+/// One past the `]` closing the `#[` attribute at `at`, skipping nested brackets and string
+/// literals; `None` when it never closes.
+fn attribute_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = at + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Expands one `.antics` v2 source file on disk into its lowered `.air` (Antics IR) text.
@@ -536,4 +611,67 @@ pub(crate) fn resolve_v2_object_path_in_pack(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_v2_source;
+
+    #[test]
+    fn v2_detection_reads_past_consts_comments_and_attributes() {
+        for source in [
+            "use std::globals::*;\nobject \"A\" {}",
+            "const HOUR = 0;\nconst B = 1;\nconst C = 2;\nobject \"A\" {}",
+            "// a header\n/* nested /* block */ comment */\nconst X = 1;",
+            "pub const X = 1;",
+            "extern mod globals { #[id(256)] fn f(); }",
+            "#[inline]\nfn helper() {}",
+            "#[bhav(id = 4096, label = \"a ] b\")] #[inline] fn f() {}",
+            "#[a]\n#[b(c = [1, 2])]\nobject \"A\" {}",
+            "enum Mode { A, B }",
+            "bitflags F { a = 1 }",
+            "template T {}",
+            // A mistyped keyword goes to the v2 parser and its diagnostic.
+            "objekt \"A\" {}",
+            // A nested v2 comment hiding a line `.air` would read as a tree.
+            "/* a /* b */\ntree x\n*/\nobject \"A\" { guid: 1; }",
+        ] {
+            assert!(is_v2_source(source), "{source:?} is v2");
+        }
+    }
+
+    #[test]
+    fn air_detection_by_its_four_keywords() {
+        for source in [
+            "tree 4096 \"main\" { return true; }",
+            "interaction 4097 \"x\" { return true; }",
+            "bcon 4096 \"T\" { a = 1; }",
+            "str 300 \"s\" { \"a\" }",
+            "# an .air comment\n// another\n/* and a block */\ntree 4096 \"main\" {}",
+            // `.air` reads `#[` as a comment line too; the keyword after it decides.
+            "#[not an attribute\ntree 4096 \"main\" {}",
+            "#[x]\nbcon 4096 \"T\" {}",
+            // A `#[..]` line `.air` reads as a comment, whatever follows on it.
+            "#[tag] generated source\ntree 4096 \"T\" { return true; }",
+            // `.air` block comments do not nest: the first `*/` ends this one.
+            "/* an opening marker /* is text */\ntree 4096 \"T\" { return true; }\n# */ generated",
+            // `.air` reads a v2 comment's line as a tree; v2 does not parse it.
+            "/* a /* b */\ntree 4096 \"T\" { return true; }\n*/",
+        ] {
+            assert!(!is_v2_source(source), "{source:?} is .air");
+        }
+    }
+
+    #[test]
+    fn a_file_with_no_keyword_is_not_v2() {
+        for source in [
+            "",
+            "  \n",
+            "// only a comment\n",
+            "/* unclosed",
+            "# air comment",
+        ] {
+            assert!(!is_v2_source(source), "{source:?}");
+        }
+    }
 }
