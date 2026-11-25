@@ -25,6 +25,10 @@ pub fn options_path(saves: &Path) -> PathBuf {
 /// `<saves stem>.options.iff` an older build saved, else None. Saving
 /// always writes [`options_path`], so the old file is only ever read, and
 /// only until the first save.
+///
+/// The old file names no saves file: every saves file with that stem
+/// wrote and read it, so each of them may load it here, as before, until
+/// it saves Options of its own.
 pub fn options_to_load(saves: &Path) -> Option<PathBuf> {
     [options_path(saves), legacy_sibling(saves, "options.iff")]
         .into_iter()

@@ -25,6 +25,7 @@ impl Game {
             default_name,
         ) = std::thread::scope(|scope| {
             let idx_handle = scope.spawn(|| -> Result<_, String> {
+                let index = Index::build(&install).map_err(|e| e.to_string())?;
                 let neighborhood_dir = house
                     .parent()
                     .and_then(Path::parent)
@@ -32,7 +33,7 @@ impl Game {
                 let neighborhood =
                     Neighborhood::open(neighborhood_dir).map_err(|e| e.to_string())?;
                 let (characters, index, catalog) =
-                    neighborhood_index_and_catalog(&install, &neighborhood, &pool)?;
+                    catalog_with_characters(index, &neighborhood, &pool)?;
                 let house_file = House::load(house, &catalog).map_err(|e| e.to_string())?;
                 // Match `sims_render::open_house` house validation and initial
                 // screen-centre pick before consuming `BaseAssets` or VM boot results.
@@ -1017,7 +1018,8 @@ impl Game {
         let install = Install::detect(install_root).map_err(|e| e.to_string())?;
         let neighborhood = Neighborhood::open(neighborhood_dir).map_err(|e| e.to_string())?;
         let pool = Arc::new(ArchivePool::new());
-        let (_, index, catalog) = neighborhood_index_and_catalog(&install, &neighborhood, &pool)?;
+        let index = Index::build(&install).map_err(|e| e.to_string())?;
+        let (_, index, catalog) = catalog_with_characters(index, &neighborhood, &pool)?;
         let catalog = Arc::new(catalog);
         let index = Arc::new(index);
         let base_assets = BaseAssets::load(&install).map_err(|e| e.to_string())?;
@@ -1258,14 +1260,13 @@ impl Game {
     }
 }
 
-/// Builds the install's index with `neighborhood`'s Characters folder
-/// (returned when it has one) added, and its catalog.
-fn neighborhood_index_and_catalog(
-    install: &Install,
+/// Adds `neighborhood`'s Characters folder (returned when it has one) to
+/// the install's `index`, and builds its catalog.
+fn catalog_with_characters(
+    mut index: Index,
     neighborhood: &Neighborhood,
     pool: &ArchivePool,
 ) -> Result<(Option<PathBuf>, Index, Catalog), String> {
-    let mut index = Index::build(install).map_err(|e| e.to_string())?;
     let characters = neighborhood.characters().map_err(|e| e.to_string())?;
     if let Some(characters) = &characters {
         index

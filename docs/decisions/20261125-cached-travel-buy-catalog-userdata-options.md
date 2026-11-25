@@ -33,6 +33,7 @@
 - **Deleted:** its eligibility function, CTSS reader, OBJD field offsets and the matching unit test.
 - **Names change for some objects.** The native rule names an object with an empty catalog name `*` plus its OBJD label, and reads CATS as description first, then name. Some names therefore change. They now match the original.
 - **Unlisted objects** use the same `CatalogText::read` rule for their fallback names.
+- **Unreadable catalog text.** `buy_entries` leaves out a definition whose CATS or CTSS cannot be read. `BuyCatalog::load` still lists such an object when it has a catalog sort word, so a damaged string table cannot hide it. It is listed as `*` plus its OBJD label, with no description. On main it was listed with an empty name. No object on the reference install takes this path.
 - **`BuyLabels` is not used.** Neither crate had its own category-label loading to replace.
 - `sims-game`'s three Buy catalog loads share `hud::load_buy_catalog`.
 
@@ -40,14 +41,14 @@
 
 - **New location.** Options are saved as `<saves file name>.userdata/Options.iff`, beside #442's `Neighborhood.iff` folders. The helpers are in `sims_game::user_files`.
 - **Who uses them.** The shell, the opening path and the standalone binary all use the same helpers.
-- **Backward read.** When the folder has no `Options.iff`, Options load from an older build's `<saves stem>.options.iff` if present. The next save writes the folder. Nothing writes the sibling file any more.
+- **Backward read.** When the folder has no `Options.iff`, Options load from an older build's `<saves stem>.options.iff` if present. The next save writes the folder. Nothing writes the sibling file any more. The old file names no saves file, since every saves file with that stem wrote and read it. So any of them may load it until it saves Options of its own, as before.
 - **The CAF names sidecar stays a legacy sibling** (`<saves stem>.caf-names.tsv`). Nothing writes it. It is read once, to migrate into the store. Its rows are keyed by neighborhood and instance ID, so a shared file cannot migrate into the wrong store.
 
 ### Deduplication
 
 - `game/opening.rs`:
   - `load_lot_assets`, `load_hud_static` and `load_people_assets` replace the two copies of the asset workers;
-  - `neighborhood_index_and_catalog` replaces the two house-opening index and catalog builds.
+  - `catalog_with_characters` replaces the two house-opening character and catalog builds. Each caller still builds the index where it did before, so the same error wins when several fail.
 - `sound.rs`: `streamed_players` replaces the two copies of the mode music, radio, ambience and voice setup.
 - No behaviour change is intended.
 

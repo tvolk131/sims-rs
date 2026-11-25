@@ -724,17 +724,40 @@ impl BuyCatalog {
                     | community_sort
                     | studio_sort
                     | magic_sort;
-                let Some(entry) = listed.get(&object).filter(|_| any_sort != 0) else {
-                    let cats = iff.get(b"CATS", definition.strings).map(|c| iff.data(c));
-                    let ctss = iff
-                        .get(b"CTSS", definition.strings)
-                        .map(|c| (iff.data(c), iff.resource_flags(c)));
-                    if let Ok(text) =
-                        CatalogText::read(cats, ctss, iff.label_bytes(chunk), US_ENGLISH, false)
-                    {
-                        fallback_names.insert(guid, decode_text(&text.name));
+                let (raw_name, description) = match listed.get(&object) {
+                    Some(entry) if any_sort != 0 => (
+                        entry.text.name.clone(),
+                        decode_text(&entry.text.description),
+                    ),
+                    listing => {
+                        let cats = iff.get(b"CATS", definition.strings).map(|c| iff.data(c));
+                        let ctss = iff
+                            .get(b"CTSS", definition.strings)
+                            .map(|c| (iff.data(c), iff.resource_flags(c)));
+                        match CatalogText::read(
+                            cats,
+                            ctss,
+                            iff.label_bytes(chunk),
+                            US_ENGLISH,
+                            false,
+                        ) {
+                            Ok(text) => {
+                                fallback_names.insert(guid, decode_text(&text.name));
+                                continue;
+                            }
+                            // `buy_entries` leaves out a definition whose
+                            // catalog text it cannot read, so a damaged
+                            // CATS or CTSS would hide a buyable object.
+                            // List it by the native empty-name rule: `*`
+                            // and its OBJD label.
+                            Err(_) if listing.is_none() && any_sort != 0 => {
+                                let mut name = b"*".to_vec();
+                                name.extend_from_slice(iff.label_bytes(chunk));
+                                (name, String::new())
+                            }
+                            Err(_) => continue,
+                        }
                     }
-                    continue;
                 };
                 let price = i32::from(read_i16(data, OBJD_PRICE));
                 let function_subsort = read_i16(data, OBJD_FUNC_SUBSORT) as u16;
@@ -747,12 +770,12 @@ impl BuyCatalog {
                 let (usage_restriction, group_activity) =
                     read_ttab_usage(&iff, definition.interactions);
                 items.push((
-                    entry.text.name.clone(),
+                    raw_name.clone(),
                     BuyItem {
                         guid,
                         price,
-                        name: decode_text(&entry.text.name),
-                        description: decode_text(&entry.text.description),
+                        name: decode_text(&raw_name),
+                        description,
                         room_sort,
                         function_sort,
                         function_subsort,
