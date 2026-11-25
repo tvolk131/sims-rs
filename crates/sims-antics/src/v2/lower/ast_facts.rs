@@ -746,10 +746,9 @@ pub(super) fn expr_may_clobber_stack_obj(
     match expr {
         V2Expr::Call { callee, args, .. } => {
             if let V2Expr::Ident(_, fname) = callee.as_ref() {
-                if matches!(
-                    fname.as_str(),
-                    "find_best_object" | "create_object" | "set_to_next"
-                ) {
+                if matches!(fname.as_str(), "find_best_object" | "create_object")
+                    || (fname == "set_to_next" && set_to_next_steps_stack_obj(args))
+                {
                     return true;
                 }
                 // `distance_to` points `stack_obj` at its target unless that already is it.
@@ -1008,10 +1007,20 @@ impl ExplicitStackOps {
                         .filter_map(|p| p.default.as_ref())
                         .any(|expr| self.in_expr(expr, env, &module, is_local)))
         } else {
-            matches!(name, "set_to_next" | "find_best_object")
+            name == "find_best_object"
+                || (name == "set_to_next" && set_to_next_steps_stack_obj(args))
                 || (name == "create_object" && has_create_dest(args))
         }
     }
+}
+
+/// Whether a `set_to_next` call steps `stack_obj`: it does unless its `dest:` names another
+/// cell (a local, `param[N]` or `temp[N]`), which is then the only cell it writes (`sims-vm`
+/// `primitives/set_to_next.rs`).
+pub(super) fn set_to_next_steps_stack_obj(args: &[CallArg]) -> bool {
+    args.iter()
+        .find(|a| a.name.as_deref() == Some("dest"))
+        .is_none_or(|a| matches!(&a.value, V2Expr::Ident(_, n) if n == "stack_obj"))
 }
 
 pub(super) fn has_create_dest(args: &[CallArg]) -> bool {

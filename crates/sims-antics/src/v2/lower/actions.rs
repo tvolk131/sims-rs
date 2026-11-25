@@ -824,9 +824,55 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// The cell `set_to_next(.., dest: x)` steps: Set To Next reads the cursor there and
+    /// writes the next one back into it (`sims-vm` `primitives/set_to_next.rs`, operand bit 7
+    /// with the destination scope and index), so it is both read and written. That is
+    /// `stack_obj`, an `i16` or untyped `ObjectId` local, `param[N]`, or `temp[N]`. A typed
+    /// handle is refused: the next object need not be of its type.
+    fn set_to_next_dest(&mut self, dest: &V2Expr) -> Result<String> {
+        let refuse = |what: String| Error::at(dest.span(), what);
+        match dest {
+            V2Expr::Ident(_, name) => match self.lookup_var(name) {
+                None if name == "stack_obj" => Ok("stack_obj".to_owned()),
+                Some(Binding::Local { air_name, ty }) => match ty {
+                    ValueType::I16 | ValueType::ObjectId => Ok(air_name.clone()),
+                    ValueType::ObjectRef(_) => Err(refuse(format!(
+                        "set_to_next(dest: {name}): '{name}' is a typed object handle, and the next object need not be of its type; step an untyped 'ObjectId' local"
+                    ))),
+                    _ => Err(refuse(format!(
+                        "set_to_next(dest: {name}) needs an i16 or ObjectId local, not '{}'",
+                        self.env.display_value_type(ty)
+                    ))),
+                },
+                Some(Binding::BhavParam { index, .. }) => Err(refuse(format!(
+                    "set_to_next(dest: {name}): parameter '{name}' is immutable; step its word with 'dest: param[{index}]'"
+                ))),
+                _ => Err(refuse(format!(
+                    "set_to_next(dest:) steps 'stack_obj', a local, 'param[N]', or 'temp[N]', not '{name}'"
+                ))),
+            },
+            V2Expr::Index { base, .. }
+                if matches!(base.as_ref(), V2Expr::Ident(_, b)
+                    if matches!(b.as_str(), "param" | "temp") && self.lookup_var(b).is_none()) =>
+            {
+                match self.resolve_lvalue(dest)? {
+                    LValue::Direct { air, .. } => Ok(air),
+                    _ => Err(refuse(
+                        "set_to_next(dest:) steps 'stack_obj', a local, 'param[N]', or 'temp[N]'"
+                            .to_owned(),
+                    )),
+                }
+            }
+            _ => Err(refuse(
+                "set_to_next(dest:) steps 'stack_obj', a local, 'param[N]', or 'temp[N]'"
+                    .to_owned(),
+            )),
+        }
+    }
+
     /// Steps the current stack object without initializing or restoring it. The explicit
     /// destination spelling preserves the AIR primitive's destination flag in the operand.
-    pub(super) fn format_set_to_next(&self, args: &[CallArg], span: Span) -> Result<String> {
+    pub(super) fn format_set_to_next(&mut self, args: &[CallArg], span: Span) -> Result<String> {
         let bound =
             self.bind_builtin_args("set_to_next", args, &["mode", "guid"], &["dest", "local"])?;
         let mode_arg = bound
@@ -856,8 +902,8 @@ impl<'a> TreeLowerer<'a> {
             let _ = write!(air, ", guid: {guid:#010x}");
         }
         if let Some(arg) = bound.get("dest") {
-            Self::require_stack_obj_dest("set_to_next", arg)?;
-            air.push_str(", dest: stack_obj");
+            let dest = self.set_to_next_dest(&arg.value)?;
+            let _ = write!(air, ", dest: {dest}");
         }
         match (mode, bound.get("local")) {
             (9, Some(arg)) => {
