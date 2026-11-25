@@ -46,8 +46,12 @@ impl Game {
     }
 
     /// Saves the current Options preferences to `path` as an `Options.iff`
-    /// (`Optn` 128) file (`0x4e6505..0x4e685e`).
+    /// (`Optn` 128) file (`0x4e6505..0x4e685e`), making its folder if it
+    /// has none yet.
     pub fn save_options(&self, path: &Path) -> Result<(), String> {
+        if let Some(folder) = path.parent().filter(|f| !f.as_os_str().is_empty()) {
+            std::fs::create_dir_all(folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+        }
         self.hud
             .controls
             .options

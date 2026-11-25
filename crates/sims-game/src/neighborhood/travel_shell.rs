@@ -104,8 +104,8 @@ impl NeighborhoodShell {
     }
 
     /// Opens an unoccupied travel destination community lot in Build/Buy edit
-    /// mode via [`vm_travel::open_destination_for_edit`]. Edits persist via
-    /// [`Self::save_current_lot`] / [`Self::leave_lot`].
+    /// mode via [`vm_travel::open_destination_for_edit_with_cache`]. Edits
+    /// persist via [`Self::save_current_lot`] / [`Self::leave_lot`].
     pub fn open_destination_for_edit(&mut self, destination_house: u32) -> Result<(), String> {
         self.start_load_audio();
         self.present_loading_step(
@@ -127,8 +127,16 @@ impl NeighborhoodShell {
                 return Err(err);
             }
         };
-        let lot = match vm_travel::open_destination_for_edit(
-            &self.install_root,
+        let install_assets = match self.ensure_install_assets() {
+            Ok(assets) => assets,
+            Err(err) => {
+                let fallback = self.desired_music_mode();
+                self.stop_load_audio(fallback);
+                return Err(err);
+            }
+        };
+        let lot = match vm_travel::open_destination_for_edit_with_cache(
+            install_assets.vm_cache(),
             &self.store,
             &self.neighborhood_id,
             destination_house,
@@ -142,7 +150,6 @@ impl NeighborhoodShell {
                 return Err(err.to_string());
             }
         };
-        let install_assets = self.ensure_install_assets().ok();
         let mut game = match Game::from_loaded_lot_cached(
             &self.install_root,
             lot,
@@ -150,7 +157,7 @@ impl NeighborhoodShell {
             &snapshot.character_files,
             snapshot.base_house.as_deref(),
             self.play,
-            install_assets.as_ref(),
+            Some(&install_assets),
         ) {
             Ok(game) => game,
             Err(err) => {
@@ -159,9 +166,7 @@ impl NeighborhoodShell {
                 return Err(err);
             }
         };
-        if self.options_file.is_file() {
-            let _ = game.load_options(&self.options_file);
-        }
+        self.load_saved_options(&mut game);
         game.coop_set_player_name(self.coop_player_name.clone());
         game.coop_set_iroh_config(self.coop_iroh_config);
         game.coop_set_travel_blocked(true);
@@ -492,7 +497,7 @@ impl NeighborhoodShell {
     /// request to carry out or refuse.
     ///
     /// - **From home** (the phone's Go Downtown, the Magic Hole...): the
-    ///   departure is [`vm_travel::depart_from_request_with`]. Routine 17
+    ///   departure is [`vm_travel::depart_from_request_with_with_cache`]. Routine 17
     ///   already wrote the travelers' tokens and the script paid the fare.
     ///   The lot picker the script asked with recorded the same destination
     ///   ([`Game::take_pending_travel_lot`]) and gives the transport
@@ -501,12 +506,15 @@ impl NeighborhoodShell {
     ///   it plans itself.
     /// - **Home from a destination** (a destination script's Go Home, which
     ///   asks for house -1, resolved by 0x45a22d to the family's house): the
-    ///   return is [`vm_travel::return_from_request`].
+    ///   return is [`vm_travel::return_from_request_with_cache`].
+    /// - **From a destination to another** (a destination's Go Somewhere
+    ///   Else, tree 0x1016): the trip goes on with
+    ///   [`vm_travel::travel_on_from_request_with_cache`], keeping its home.
     ///
-    /// A trip the shell cannot make (co-op, a trip from a destination to
-    /// another, editing a destination, a house that is no destination, or a
-    /// departure or return the VM refuses) shows a notice and is declined
-    /// ([`Game::decline_trip`]): the lot drops the request and goes on.
+    /// A trip the shell cannot make (co-op, editing a destination, a house
+    /// that is no destination, or a departure, return or trip on the VM
+    /// refuses) shows a notice and is declined ([`Game::decline_trip`]): the
+    /// lot drops the request and goes on.
     pub fn pump_trip_request(&mut self) -> bool {
         let ActiveScreen::Lot(session) = &mut self.screen else {
             return false;
@@ -529,11 +537,9 @@ impl NeighborhoodShell {
         let home = session.active_trip.as_ref().map(|t| t.home_house);
         let refusal = if session.game.coop_active() {
             Some("Leave the co-op session before traveling to a destination.".to_owned())
-        } else if home.is_some_and(|home| home != house) {
-            Some("Return home before starting another destination trip.".to_owned())
         } else if session.is_destination_edit {
             Some("Travel is unavailable while editing a destination lot.".to_owned())
-        } else if home.is_none()
+        } else if home != Some(house)
             && TravelDestination::classify(house, &self.stored.zoning).is_none()
         {
             Some(format!("Lot {} is not a travel destination.", trip.house))
@@ -545,14 +551,19 @@ impl NeighborhoodShell {
             report_travel_refusal(&mut self.screen, msg);
             return true;
         }
-        let failed = if home.is_some() {
-            self.return_home(true)
+        let failed = match home {
+            Some(home) if home == house => self
+                .return_home(true)
                 .err()
-                .map(|err| format!("Could not return home to lot {house}: {err}"))
-        } else {
-            self.depart(Departure::Trip { house, transport })
+                .map(|err| format!("Could not return home to lot {house}: {err}")),
+            Some(_) => self
+                .depart(Departure::Onward { house, transport })
                 .err()
-                .map(|err| format!("Could not travel to lot {house}: {err}"))
+                .map(|err| format!("Could not travel to lot {house}: {err}")),
+            None => self
+                .depart(Departure::Trip { house, transport })
+                .err()
+                .map(|err| format!("Could not travel to lot {house}: {err}")),
         };
         if let Some(msg) = failed
             && let ActiveScreen::Lot(session) = &mut self.screen
@@ -564,7 +575,7 @@ impl NeighborhoodShell {
     }
 
     /// Departs from the currently open home lot to a travel destination via
-    /// [`vm_travel::depart_to_destination`], driving [`LoadingScreen`] audio
+    /// [`vm_travel::depart_to_destination_with_cache`], driving [`LoadingScreen`] audio
     /// cues and wrapping the booted destination lot into the active session.
     pub fn depart_to_destination(
         &mut self,
@@ -573,25 +584,32 @@ impl NeighborhoodShell {
         self.depart(Departure::Request(request))
     }
 
-    /// Departs from the open home lot ([`Departure`]), driving
-    /// [`LoadingScreen`] audio cues and wrapping the booted destination lot
-    /// into the active session.
+    /// Departs from the open home lot, or from the open destination for a
+    /// trip on ([`Departure`]), driving [`LoadingScreen`] audio cues and
+    /// wrapping the booted destination lot into the active session.
     pub(super) fn depart(&mut self, source: Departure) -> Result<TravelSession, String> {
         let (destination_house, transport) = match &source {
             Departure::Request(request) => (request.destination_house, request.transport),
-            Departure::Trip { house, transport } => (*house, *transport),
+            Departure::Trip { house, transport } | Departure::Onward { house, transport } => {
+                (*house, *transport)
+            }
         };
         self.note = None;
         self.flush_background_saves();
-        let nh_id = match &self.screen {
+        let (nh_id, leaving_trip) = match &self.screen {
             ActiveScreen::Lot(session) => {
                 if session.game.coop_active() {
                     return Err("Leave the co-op session before traveling to a destination.".into());
                 }
-                if session.active_trip.is_some() {
-                    return Err("already on an active travel trip".into());
+                let onward = matches!(source, Departure::Onward { .. });
+                match (&session.active_trip, onward) {
+                    (Some(_), false) => return Err("already on an active travel trip".into()),
+                    (None, true) => {
+                        return Err("no active travel trip to travel on from".into());
+                    }
+                    _ => {}
                 }
-                session.neighborhood_id.clone()
+                (session.neighborhood_id.clone(), session.active_trip.clone())
             }
             _ => return Err("no home lot is open for travel departure".into()),
         };
@@ -609,32 +627,60 @@ impl NeighborhoodShell {
             Some(format!("Destination Lot {destination_house}")),
             0.2,
         );
+        let install_assets = match self.ensure_install_assets() {
+            Ok(assets) => assets,
+            Err(err) => {
+                let fallback = self.desired_music_mode();
+                self.stop_load_audio(fallback);
+                return Err(err);
+            }
+        };
         let departure = {
             let ActiveScreen::Lot(session) = &mut self.screen else {
                 let fallback = self.desired_music_mode();
                 self.stop_load_audio(fallback);
                 return Err("no home lot is open for travel departure".into());
             };
-            let departed = match &source {
-                Departure::Request(request) => vm_travel::depart_to_destination(
-                    &self.install_root,
+            let cache = install_assets.vm_cache();
+            let trip_departure = |transport| vm_travel::TripDeparture {
+                transport,
+                answers: self.answers.clone(),
+                frames: self.frames.clone(),
+                view_centre: None,
+            };
+            let departed = match (&source, &leaving_trip) {
+                (Departure::Request(request), _) => vm_travel::depart_to_destination_with_cache(
+                    cache,
                     &self.store,
                     &nh_id,
                     session.game.lot_mut(),
                     request,
                 ),
-                Departure::Trip { transport, .. } => vm_travel::depart_from_request_with(
-                    &self.install_root,
-                    &self.store,
-                    &nh_id,
-                    session.game.lot_mut(),
-                    &vm_travel::TripDeparture {
-                        transport: *transport,
-                        answers: self.answers.clone(),
-                        frames: self.frames.clone(),
-                        view_centre: None,
-                    },
-                ),
+                (Departure::Trip { transport, .. }, _) => {
+                    vm_travel::depart_from_request_with_with_cache(
+                        cache,
+                        &self.store,
+                        &nh_id,
+                        session.game.lot_mut(),
+                        &trip_departure(*transport),
+                    )
+                }
+                (Departure::Onward { transport, .. }, trip) => trip
+                    .as_ref()
+                    .ok_or_else(|| {
+                        vm_travel::TravelError::Lot(
+                            "no active travel trip to travel on from".into(),
+                        )
+                    })
+                    .and_then(|trip| {
+                        vm_travel::travel_on_from_request_with_cache(
+                            cache,
+                            &self.store,
+                            trip,
+                            session.game.lot_mut(),
+                            &trip_departure(*transport),
+                        )
+                    }),
             };
             match departed {
                 Ok(dep) => dep,
@@ -655,7 +701,6 @@ impl NeighborhoodShell {
         );
         let trip = departure.session;
         let dest_house = trip.destination_house;
-        let install_assets = self.ensure_install_assets().ok();
         let post_commit_res: Result<(Game, StoredNeighborhood), String> = (|| {
             let snapshot = self
                 .store
@@ -675,7 +720,7 @@ impl NeighborhoodShell {
                 &snapshot.character_files,
                 snapshot.base_house.as_deref(),
                 self.play,
-                install_assets.as_ref(),
+                Some(&install_assets),
             )?;
             Ok((game, snapshot.neighborhood))
         })();
@@ -704,9 +749,7 @@ impl NeighborhoodShell {
                 return Err(err);
             }
         };
-        if self.options_file.is_file() {
-            let _ = game.load_options(&self.options_file);
-        }
+        self.load_saved_options(&mut game);
         game.coop_set_player_name(self.coop_player_name.clone());
         game.coop_set_iroh_config(self.coop_iroh_config);
         game.coop_set_travel_blocked(true);
@@ -744,15 +787,15 @@ impl NeighborhoodShell {
     }
 
     /// Returns the traveling household from the active destination lot back to
-    /// their reconciled home lot via [`vm_travel::return_from_destination`].
+    /// their reconciled home lot via [`vm_travel::return_from_destination_with_cache`].
     pub fn return_from_destination(&mut self) -> Result<ReturnReport, String> {
         self.return_home(false)
     }
 
     /// Returns home from the active destination lot: through the trip home
-    /// a script asked for ([`vm_travel::return_from_request`]) when
+    /// a script asked for ([`vm_travel::return_from_request_with_cache`]) when
     /// `requested`, else as the shell's own Go Home
-    /// ([`vm_travel::return_from_destination`]).
+    /// ([`vm_travel::return_from_destination_with_cache`]).
     pub(super) fn return_home(&mut self, requested: bool) -> Result<ReturnReport, String> {
         self.note = None;
         let (nh_id, trip) = match &self.screen {
@@ -777,6 +820,14 @@ impl NeighborhoodShell {
             Some(format!("Home Lot {}", trip.home_house)),
             0.2,
         );
+        let install_assets = match self.ensure_install_assets() {
+            Ok(assets) => assets,
+            Err(err) => {
+                let fallback = self.desired_music_mode();
+                self.stop_load_audio(fallback);
+                return Err(err);
+            }
+        };
         let ret = {
             let ActiveScreen::Lot(session) = &mut self.screen else {
                 let fallback = self.desired_music_mode();
@@ -784,8 +835,8 @@ impl NeighborhoodShell {
                 return Err("no active travel destination lot is open".into());
             };
             let returned = if requested {
-                vm_travel::return_from_request(
-                    &self.install_root,
+                vm_travel::return_from_request_with_cache(
+                    install_assets.vm_cache(),
                     &self.store,
                     &trip,
                     session.game.lot_mut(),
@@ -793,8 +844,8 @@ impl NeighborhoodShell {
                     self.frames.clone(),
                 )
             } else {
-                vm_travel::return_from_destination(
-                    &self.install_root,
+                vm_travel::return_from_destination_with_cache(
+                    install_assets.vm_cache(),
                     &self.store,
                     &trip,
                     session.game.lot_mut(),
@@ -817,7 +868,6 @@ impl NeighborhoodShell {
             Some(format!("Home Lot {home_house}")),
             0.75,
         );
-        let install_assets = self.ensure_install_assets().ok();
         let post_commit_res: Result<(Game, StoredNeighborhood), String> = (|| {
             let snapshot = self
                 .store
@@ -836,7 +886,7 @@ impl NeighborhoodShell {
                 &snapshot.character_files,
                 snapshot.base_house.as_deref(),
                 self.play,
-                install_assets.as_ref(),
+                Some(&install_assets),
             )?;
             Ok((game, snapshot.neighborhood))
         })();
@@ -864,9 +914,7 @@ impl NeighborhoodShell {
                 return Err(err);
             }
         };
-        if self.options_file.is_file() {
-            let _ = game.load_options(&self.options_file);
-        }
+        self.load_saved_options(&mut game);
         game.set_album_button_enabled(true);
         game.set_neighborhood_slot(self.slot);
         game.set_special_lot_catalog(self.build_special_lot_catalog());
@@ -924,7 +972,7 @@ impl NeighborhoodShell {
     }
 
     /// Resumes an interrupted active travel trip for `home_house` directly into
-    /// its destination lot via [`vm_travel::resume_active_trip`].
+    /// its destination lot via [`vm_travel::resume_active_trip_with_cache`].
     pub fn resume_active_trip(&mut self, home_house: u32) -> Result<TravelSession, String> {
         self.start_load_audio();
         self.present_loading_step(
@@ -932,8 +980,16 @@ impl NeighborhoodShell {
             Some(format!("Resuming Trip (Lot {home_house})")),
             0.2,
         );
-        let resumed = match vm_travel::resume_active_trip(
-            &self.install_root,
+        let install_assets = match self.ensure_install_assets() {
+            Ok(assets) => assets,
+            Err(err) => {
+                let fallback = self.desired_music_mode();
+                self.stop_load_audio(fallback);
+                return Err(err);
+            }
+        };
+        let resumed = match vm_travel::resume_active_trip_with_cache(
+            install_assets.vm_cache(),
             &self.store,
             &self.neighborhood_id,
             home_house,
@@ -969,7 +1025,6 @@ impl NeighborhoodShell {
             .get(&trip.home_family)
             .map(|f| f.members.clone())
             .unwrap_or_default();
-        let install_assets = self.ensure_install_assets().ok();
         let mut game = match Game::from_loaded_lot_cached(
             &self.install_root,
             resumed.destination_lot,
@@ -977,7 +1032,7 @@ impl NeighborhoodShell {
             &snapshot.character_files,
             snapshot.base_house.as_deref(),
             self.play,
-            install_assets.as_ref(),
+            Some(&install_assets),
         ) {
             Ok(game) => game,
             Err(err) => {
@@ -986,9 +1041,7 @@ impl NeighborhoodShell {
                 return Err(err);
             }
         };
-        if self.options_file.is_file() {
-            let _ = game.load_options(&self.options_file);
-        }
+        self.load_saved_options(&mut game);
         game.coop_set_player_name(self.coop_player_name.clone());
         game.coop_set_iroh_config(self.coop_iroh_config);
         game.coop_set_travel_blocked(true);
@@ -1025,17 +1078,31 @@ impl NeighborhoodShell {
     }
 
     /// Aborts a crash-interrupted travel trip for `home_house` via
-    /// [`vm_travel::abort_active_trip`], restoring the frozen home lot bytes in
+    /// [`vm_travel::abort_active_trip_with_cache`], restoring the frozen home lot bytes in
     /// REDB and refreshing the neighborhood view.
+    ///
+    /// Aborting opens no lot, so it does not need the install's lot assets:
+    /// when they fail to load, it aborts through the uncached
+    /// [`vm_travel::abort_active_trip`], and the trip can still be recovered.
     pub fn abort_active_trip(&mut self, home_house: u32) -> Result<u32, String> {
-        let restored = vm_travel::abort_active_trip(
-            &self.install_root,
-            &self.store,
-            &self.neighborhood_id,
-            home_house,
-            &self.answers,
-            self.frames.clone(),
-        )
+        let restored = match self.ensure_install_assets() {
+            Ok(install_assets) => vm_travel::abort_active_trip_with_cache(
+                install_assets.vm_cache(),
+                &self.store,
+                &self.neighborhood_id,
+                home_house,
+                &self.answers,
+                self.frames.clone(),
+            ),
+            Err(_) => vm_travel::abort_active_trip(
+                &self.install_root,
+                &self.store,
+                &self.neighborhood_id,
+                home_house,
+                &self.answers,
+                self.frames.clone(),
+            ),
+        }
         .map_err(|e| e.to_string())?;
         self.refresh_from_store()?;
         Ok(restored.report.home_house)

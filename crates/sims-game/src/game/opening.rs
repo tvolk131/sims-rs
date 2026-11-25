@@ -25,18 +25,15 @@ impl Game {
             default_name,
         ) = std::thread::scope(|scope| {
             let idx_handle = scope.spawn(|| -> Result<_, String> {
-                let mut index = Index::build(&install).map_err(|e| e.to_string())?;
+                let index = Index::build(&install).map_err(|e| e.to_string())?;
                 let neighborhood_dir = house
                     .parent()
                     .and_then(Path::parent)
                     .ok_or("the house file is not in a Houses folder")?;
                 let neighborhood =
                     Neighborhood::open(neighborhood_dir).map_err(|e| e.to_string())?;
-                let characters = neighborhood.characters().map_err(|e| e.to_string())?;
-                if let Some(ref chars) = characters {
-                    index.add_characters(chars).map_err(|e| e.to_string())?;
-                }
-                let catalog = Catalog::build_with_pool(&index, &pool).map_err(|e| e.to_string())?;
+                let (characters, index, catalog) =
+                    catalog_with_characters(index, &neighborhood, &pool)?;
                 let house_file = House::load(house, &catalog).map_err(|e| e.to_string())?;
                 // Match `sims_render::open_house` house validation and initial
                 // screen-centre pick before consuming `BaseAssets` or VM boot results.
@@ -488,102 +485,10 @@ impl Game {
         let character_files = &snapshot.character_files;
         let (lot_res, render_and_index_res, hud_static_res, people_assets_res) =
             std::thread::scope(|scope| {
-                let assets_handle = scope.spawn(|| -> Result<_, String> {
-                    if let Some(shared) = cached {
-                        let (idx_cat_res, base_res) = std::thread::scope(|inner| {
-                            let base_handle = inner.spawn(|| {
-                                BaseAssets::load(&shared.install).map_err(|e| e.to_string())
-                            });
-                            let idx_cat_res = if character_files.is_empty() {
-                                Ok((
-                                    Arc::clone(&shared.base_index),
-                                    Arc::clone(&shared.base_catalog),
-                                ))
-                            } else {
-                                (|| -> Result<_, String> {
-                                    let mut index = (*shared.base_index).clone();
-                                    index
-                                        .add_character_files(character_files)
-                                        .map_err(|e| e.to_string())?;
-                                    let catalog = Catalog::build_with_pool(&index, &shared.pool)
-                                        .map_err(|e| e.to_string())?;
-                                    Ok((Arc::new(index), Arc::new(catalog)))
-                                })()
-                            };
-                            (
-                                idx_cat_res,
-                                base_handle.join().expect("base assets worker panicked"),
-                            )
-                        });
-                        let (index, catalog) = idx_cat_res?;
-                        let base = base_res?;
-                        return Ok((
-                            shared.install.clone(),
-                            index,
-                            catalog,
-                            Ok(shared.hud_shared.clone()),
-                            base,
-                            shared.floor_plugins.clone(),
-                            shared.wall_plugins.clone(),
-                        ));
-                    }
-                    let install = Install::detect(install_root).map_err(|e| e.to_string())?;
-                    let (idx_cat_res, base_res, (floor_plugins, wall_plugins)) =
-                        std::thread::scope(|inner| {
-                            let plugins_handle =
-                                inner.spawn(|| Surfaces::plugins_with_pool(&install, &pool));
-                            let base_handle = inner
-                                .spawn(|| BaseAssets::load(&install).map_err(|e| e.to_string()));
-                            let idx_cat_res = (|| -> Result<_, String> {
-                                let mut index =
-                                    Index::build(&install).map_err(|e| e.to_string())?;
-                                if !character_files.is_empty() {
-                                    index
-                                        .add_character_files(character_files)
-                                        .map_err(|e| e.to_string())?;
-                                }
-                                let catalog = Catalog::build_with_pool(&index, &pool)
-                                    .map_err(|e| e.to_string())?;
-                                let index = Arc::new(index);
-                                let catalog = Arc::new(catalog);
-                                let hud_shared_res = HudShared::load(&index, &catalog, &pool);
-                                Ok((index, catalog, hud_shared_res))
-                            })();
-                            (
-                                idx_cat_res,
-                                base_handle.join().expect("base assets worker panicked"),
-                                plugins_handle
-                                    .join()
-                                    .expect("surface plugins worker panicked"),
-                            )
-                        });
-                    let (index, catalog, hud_shared_res) = idx_cat_res?;
-                    let base = base_res?;
-                    Ok((
-                        install,
-                        index,
-                        catalog,
-                        hud_shared_res,
-                        base,
-                        floor_plugins,
-                        wall_plugins,
-                    ))
-                });
-                let hud_handle = scope.spawn(|| -> Result<HudStatic, String> {
-                    if let Some(shared) = cached {
-                        return Ok(shared.hud_static.clone());
-                    }
-                    let install = Install::detect(install_root).map_err(|e| e.to_string())?;
-                    HudStatic::load(&install, Arc::clone(&pool))
-                });
-                let people_handle = scope.spawn(|| -> Result<_, String> {
-                    if let Some(shared) = cached {
-                        return Ok((shared.content_assets.clone(), shared.people_library.clone()));
-                    }
-                    let content_assets = ContentAssets::scan(install_root)?;
-                    let people_library = PeopleLibrary::scan_with_pool(&content_assets, &pool)?;
-                    Ok((content_assets, people_library))
-                });
+                let assets_handle =
+                    scope.spawn(|| load_lot_assets(install_root, character_files, &pool, cached));
+                let hud_handle = scope.spawn(|| load_hud_static(install_root, &pool, cached));
+                let people_handle = scope.spawn(|| load_people_assets(install_root, &pool, cached));
                 let lot_res = match cached {
                     Some(shared) => sims_vm::lifecycle::enter_lot_with_cache(
                         &shared.vm_cache,
@@ -875,102 +780,10 @@ impl Game {
         let pool = cached.map_or_else(|| Arc::new(ArchivePool::new()), |c| Arc::clone(&c.pool));
         let (render_and_index_res, hud_static_res, people_assets_res) =
             std::thread::scope(|scope| {
-                let assets_handle = scope.spawn(|| -> Result<_, String> {
-                    if let Some(shared) = cached {
-                        let (idx_cat_res, base_res) = std::thread::scope(|inner| {
-                            let base_handle = inner.spawn(|| {
-                                BaseAssets::load(&shared.install).map_err(|e| e.to_string())
-                            });
-                            let idx_cat_res = if character_files.is_empty() {
-                                Ok((
-                                    Arc::clone(&shared.base_index),
-                                    Arc::clone(&shared.base_catalog),
-                                ))
-                            } else {
-                                (|| -> Result<_, String> {
-                                    let mut index = (*shared.base_index).clone();
-                                    index
-                                        .add_character_files(character_files)
-                                        .map_err(|e| e.to_string())?;
-                                    let catalog = Catalog::build_with_pool(&index, &shared.pool)
-                                        .map_err(|e| e.to_string())?;
-                                    Ok((Arc::new(index), Arc::new(catalog)))
-                                })()
-                            };
-                            (
-                                idx_cat_res,
-                                base_handle.join().expect("base assets worker panicked"),
-                            )
-                        });
-                        let (index, catalog) = idx_cat_res?;
-                        let base = base_res?;
-                        return Ok((
-                            shared.install.clone(),
-                            index,
-                            catalog,
-                            Ok(shared.hud_shared.clone()),
-                            base,
-                            shared.floor_plugins.clone(),
-                            shared.wall_plugins.clone(),
-                        ));
-                    }
-                    let install = Install::detect(install_root).map_err(|e| e.to_string())?;
-                    let (idx_cat_res, base_res, (floor_plugins, wall_plugins)) =
-                        std::thread::scope(|inner| {
-                            let plugins_handle =
-                                inner.spawn(|| Surfaces::plugins_with_pool(&install, &pool));
-                            let base_handle = inner
-                                .spawn(|| BaseAssets::load(&install).map_err(|e| e.to_string()));
-                            let idx_cat_res = (|| -> Result<_, String> {
-                                let mut index =
-                                    Index::build(&install).map_err(|e| e.to_string())?;
-                                if !character_files.is_empty() {
-                                    index
-                                        .add_character_files(character_files)
-                                        .map_err(|e| e.to_string())?;
-                                }
-                                let catalog = Catalog::build_with_pool(&index, &pool)
-                                    .map_err(|e| e.to_string())?;
-                                let index = Arc::new(index);
-                                let catalog = Arc::new(catalog);
-                                let hud_shared_res = HudShared::load(&index, &catalog, &pool);
-                                Ok((index, catalog, hud_shared_res))
-                            })();
-                            (
-                                idx_cat_res,
-                                base_handle.join().expect("base assets worker panicked"),
-                                plugins_handle
-                                    .join()
-                                    .expect("surface plugins worker panicked"),
-                            )
-                        });
-                    let (index, catalog, hud_shared_res) = idx_cat_res?;
-                    let base = base_res?;
-                    Ok((
-                        install,
-                        index,
-                        catalog,
-                        hud_shared_res,
-                        base,
-                        floor_plugins,
-                        wall_plugins,
-                    ))
-                });
-                let hud_handle = scope.spawn(|| -> Result<HudStatic, String> {
-                    if let Some(shared) = cached {
-                        return Ok(shared.hud_static.clone());
-                    }
-                    let install = Install::detect(install_root).map_err(|e| e.to_string())?;
-                    HudStatic::load(&install, Arc::clone(&pool))
-                });
-                let people_handle = scope.spawn(|| -> Result<_, String> {
-                    if let Some(shared) = cached {
-                        return Ok((shared.content_assets.clone(), shared.people_library.clone()));
-                    }
-                    let content_assets = ContentAssets::scan(install_root)?;
-                    let people_library = PeopleLibrary::scan_with_pool(&content_assets, &pool)?;
-                    Ok((content_assets, people_library))
-                });
+                let assets_handle =
+                    scope.spawn(|| load_lot_assets(install_root, character_files, &pool, cached));
+                let hud_handle = scope.spawn(|| load_hud_static(install_root, &pool, cached));
+                let people_handle = scope.spawn(|| load_people_assets(install_root, &pool, cached));
                 (
                     assets_handle
                         .join()
@@ -1205,13 +1018,9 @@ impl Game {
         let install = Install::detect(install_root).map_err(|e| e.to_string())?;
         let neighborhood = Neighborhood::open(neighborhood_dir).map_err(|e| e.to_string())?;
         let pool = Arc::new(ArchivePool::new());
-        let mut index = Index::build(&install).map_err(|e| e.to_string())?;
-        if let Some(characters) = neighborhood.characters().map_err(|e| e.to_string())? {
-            index
-                .add_characters(&characters)
-                .map_err(|e| e.to_string())?;
-        }
-        let catalog = Arc::new(Catalog::build_with_pool(&index, &pool).map_err(|e| e.to_string())?);
+        let index = Index::build(&install).map_err(|e| e.to_string())?;
+        let (_, index, catalog) = catalog_with_characters(index, &neighborhood, &pool)?;
+        let catalog = Arc::new(catalog);
         let index = Arc::new(index);
         let base_assets = BaseAssets::load(&install).map_err(|e| e.to_string())?;
         let (floor_plugins, wall_plugins) = Surfaces::plugins_with_pool(&install, &pool);
@@ -1449,4 +1258,146 @@ impl Game {
         }
         result
     }
+}
+
+/// Adds `neighborhood`'s Characters folder (returned when it has one) to
+/// the install's `index`, and builds its catalog.
+fn catalog_with_characters(
+    mut index: Index,
+    neighborhood: &Neighborhood,
+    pool: &ArchivePool,
+) -> Result<(Option<PathBuf>, Index, Catalog), String> {
+    let characters = neighborhood.characters().map_err(|e| e.to_string())?;
+    if let Some(characters) = &characters {
+        index
+            .add_characters(characters)
+            .map_err(|e| e.to_string())?;
+    }
+    let catalog = Catalog::build_with_pool(&index, pool).map_err(|e| e.to_string())?;
+    Ok((characters, index, catalog))
+}
+
+/// What a lot's render and HUD need from the install: the install, its
+/// index and catalog with the lot's character files added, the shared HUD
+/// data, the base render assets, and the floor and wall plugins.
+type LotAssets = (
+    Install,
+    Arc<Index>,
+    Arc<Catalog>,
+    Result<HudShared, String>,
+    BaseAssets,
+    BTreeMap<u16, SurfacePlugin>,
+    BTreeMap<u16, SurfacePlugin>,
+);
+
+/// Loads [`LotAssets`], from `cached` when it is `Some` (building a
+/// catalog only when the lot adds character files) and from the install
+/// at `install_root` otherwise.
+fn load_lot_assets(
+    install_root: &Path,
+    character_files: &BTreeMap<String, Vec<u8>>,
+    pool: &Arc<ArchivePool>,
+    cached: Option<&Arc<InstallAssets>>,
+) -> Result<LotAssets, String> {
+    if let Some(shared) = cached {
+        let (idx_cat_res, base_res) = std::thread::scope(|inner| {
+            let base_handle =
+                inner.spawn(|| BaseAssets::load(&shared.install).map_err(|e| e.to_string()));
+            let idx_cat_res = if character_files.is_empty() {
+                Ok((
+                    Arc::clone(&shared.base_index),
+                    Arc::clone(&shared.base_catalog),
+                ))
+            } else {
+                (|| -> Result<_, String> {
+                    let mut index = (*shared.base_index).clone();
+                    index
+                        .add_character_files(character_files)
+                        .map_err(|e| e.to_string())?;
+                    let catalog = Catalog::build_with_pool(&index, &shared.pool)
+                        .map_err(|e| e.to_string())?;
+                    Ok((Arc::new(index), Arc::new(catalog)))
+                })()
+            };
+            (
+                idx_cat_res,
+                base_handle.join().expect("base assets worker panicked"),
+            )
+        });
+        let (index, catalog) = idx_cat_res?;
+        let base = base_res?;
+        return Ok((
+            shared.install.clone(),
+            index,
+            catalog,
+            Ok(shared.hud_shared.clone()),
+            base,
+            shared.floor_plugins.clone(),
+            shared.wall_plugins.clone(),
+        ));
+    }
+    let install = Install::detect(install_root).map_err(|e| e.to_string())?;
+    let (idx_cat_res, base_res, (floor_plugins, wall_plugins)) = std::thread::scope(|inner| {
+        let plugins_handle = inner.spawn(|| Surfaces::plugins_with_pool(&install, pool));
+        let base_handle = inner.spawn(|| BaseAssets::load(&install).map_err(|e| e.to_string()));
+        let idx_cat_res = (|| -> Result<_, String> {
+            let mut index = Index::build(&install).map_err(|e| e.to_string())?;
+            if !character_files.is_empty() {
+                index
+                    .add_character_files(character_files)
+                    .map_err(|e| e.to_string())?;
+            }
+            let catalog = Catalog::build_with_pool(&index, pool).map_err(|e| e.to_string())?;
+            let index = Arc::new(index);
+            let catalog = Arc::new(catalog);
+            let hud_shared_res = HudShared::load(&index, &catalog, pool);
+            Ok((index, catalog, hud_shared_res))
+        })();
+        (
+            idx_cat_res,
+            base_handle.join().expect("base assets worker panicked"),
+            plugins_handle
+                .join()
+                .expect("surface plugins worker panicked"),
+        )
+    });
+    let (index, catalog, hud_shared_res) = idx_cat_res?;
+    let base = base_res?;
+    Ok((
+        install,
+        index,
+        catalog,
+        hud_shared_res,
+        base,
+        floor_plugins,
+        wall_plugins,
+    ))
+}
+
+/// Loads the HUD's static art, from `cached` when it is `Some`.
+fn load_hud_static(
+    install_root: &Path,
+    pool: &Arc<ArchivePool>,
+    cached: Option<&Arc<InstallAssets>>,
+) -> Result<HudStatic, String> {
+    if let Some(shared) = cached {
+        return Ok(shared.hud_static.clone());
+    }
+    let install = Install::detect(install_root).map_err(|e| e.to_string())?;
+    HudStatic::load(&install, Arc::clone(pool))
+}
+
+/// Scans the install's content and people library, from `cached` when it
+/// is `Some`.
+fn load_people_assets(
+    install_root: &Path,
+    pool: &Arc<ArchivePool>,
+    cached: Option<&Arc<InstallAssets>>,
+) -> Result<(ContentAssets, PeopleLibrary), String> {
+    if let Some(shared) = cached {
+        return Ok((shared.content_assets.clone(), shared.people_library.clone()));
+    }
+    let content_assets = ContentAssets::scan(install_root)?;
+    let people_library = PeopleLibrary::scan_with_pool(&content_assets, pool)?;
+    Ok((content_assets, people_library))
 }

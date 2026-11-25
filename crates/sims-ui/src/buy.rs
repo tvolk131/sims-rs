@@ -9,10 +9,12 @@ use crate::frame::{Frame, Rect};
 use crate::hud::STRIP;
 use crate::thumbnail::{SIZE as CELL, TEMPLATE, Thumbnails};
 use sims_content::ui_graphics::US_ENGLISH;
+use sims_content::{BuyDefinition, BuyEligibility, BuyEntry, CatalogText};
 use sims_content::{Catalog, Index, Install};
 use sims_formats::behavior::InteractionTable;
 use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
+use std::collections::BTreeMap;
 
 /// Which lot catalog mode Buy Mode filters against (`0x4cb8e7..0x4cbaa8`,
 /// `0x507288`). Residential lots use By-Function / By-Room (`+0x4e`/`+0x50`),
@@ -489,16 +491,11 @@ pub struct BuyCatalog {
     sell_labels: SellLabels,
 }
 
-/// OBJD byte offsets read by `0x4cd149`, `0x4cb8e7..0x4cbaa8`, and `0x457a36`.
-const OBJD_GRAPHICS: usize = 0x08;
-const OBJD_TTAB: usize = 0x0e;
-const OBJD_TYPE: usize = 0x12;
-const OBJD_MASTER: usize = 0x14;
-const OBJD_SUB_INDEX: usize = 0x16;
+/// OBJD byte offsets read by `0x4cb8e7..0x4cbaa8` and `0x457a36`; the words
+/// the catalog builder reads are [`BuyDefinition`]'s.
 const OBJD_PRICE: usize = 0x24;
 const OBJD_ROOM_SORT: usize = 0x4e;
 const OBJD_FUNC_SORT: usize = 0x50;
-const OBJD_CTSS: usize = 0x52;
 const OBJD_BUILD_TYPE: usize = 0x8a;
 const OBJD_RATING_BASE: usize = 0xa4;
 const OBJD_RATING_SKILLS: usize = 0xb2;
@@ -508,9 +505,6 @@ const OBJD_VACATION_SORT: usize = 0xc2;
 const OBJD_COMMUNITY_SORT: usize = 0xc6;
 const OBJD_STUDIO_SORT: usize = 0xce;
 const OBJD_MAGIC_SORT: usize = 0xd0;
-
-/// Object type 2 is a person (excluded at `0x4575d2`).
-const PERSON_TYPE: i16 = 2;
 
 /// Function-sort category bitmasks in UI slot order `0..8` (`0x507288`).
 pub const FUNCTION_BITS: [u16; 8] = [0x01, 0x02, 0x20, 0x08, 0x04, 0x10, 0x80, 0x40];
@@ -654,23 +648,32 @@ pub fn resource_ids() -> Vec<i32> {
 impl BuyCatalog {
     /// Builds the residential Buy Mode catalog from `index` and `catalog`
     /// (`0x4cd149`, `0x4cd9a5`).
+    ///
+    /// Which definitions the catalog lists, and their name and description,
+    /// are [`Catalog::buy_entries`]'s (`0x4cd81a..0x4cd8ab`, `0x457d3b`),
+    /// for the GUID's registered definition. Of those, it keeps the ones
+    /// with any residential or commercial sort word (`0x4cb905..0x4cbaa8`).
+    /// Every other definition but a person or a non-master tile keeps its
+    /// catalog name for [`Self::display_for_object`].
     pub fn load(index: &Index, catalog: &Catalog) -> Self {
+        let listing = catalog
+            .buy_entries(index, US_ENGLISH)
+            .map(|listing| listing.entries)
+            .unwrap_or_default();
+        let listed: BTreeMap<usize, &BuyEntry> =
+            listing.iter().map(|entry| (entry.object, entry)).collect();
         let mut items = Vec::new();
-        let mut master_by_part = std::collections::BTreeMap::new();
-        let mut fallback_names = std::collections::BTreeMap::new();
-        // Cache parsed IFF files per resource index so multi-OBJD archives
-        // are parsed once.
-        let mut by_resource: std::collections::BTreeMap<usize, Vec<(u32, u16)>> =
-            std::collections::BTreeMap::new();
-        for (&guid, &idx) in &catalog.by_guid {
-            let obj = &catalog.objects[idx];
-            if i16::try_from(obj.kind).unwrap_or(0) == PERSON_TYPE {
-                continue;
-            }
+        let mut master_by_part = BTreeMap::new();
+        let mut fallback_names = BTreeMap::new();
+        // Each GUID's registered definition, by file, so each file is parsed
+        // once.
+        let mut by_resource: BTreeMap<usize, Vec<(u32, usize, u16)>> = BTreeMap::new();
+        for (&guid, &object) in &catalog.by_guid {
+            let obj = &catalog.objects[object];
             by_resource
                 .entry(obj.resource)
                 .or_default()
-                .push((guid, obj.chunk));
+                .push((guid, object, obj.chunk));
         }
 
         for (res_idx, entries) in by_resource {
@@ -683,38 +686,26 @@ impl BuyCatalog {
             let Ok(iff) = Iff::parse(bytes) else {
                 continue;
             };
-            let mut master_guids: std::collections::BTreeMap<i16, u32> =
-                std::collections::BTreeMap::new();
-            let mut part_masters: Vec<(u32, i16)> = Vec::new();
-            for (guid, chunk_id) in entries {
+            let mut master_guids: BTreeMap<u16, u32> = BTreeMap::new();
+            let mut part_masters: Vec<(u32, u16)> = Vec::new();
+            for (guid, object, chunk_id) in entries {
                 let Some(chunk) = iff.get(b"OBJD", chunk_id) else {
                     continue;
                 };
                 let data = iff.data(chunk);
-                let master = read_i16(data, OBJD_MASTER);
-                let sub_index = read_i16(data, OBJD_SUB_INDEX);
-                if master != 0 {
-                    if sub_index == -1 {
-                        master_guids.insert(master, guid);
+                let Ok(definition) = BuyDefinition::parse(data) else {
+                    continue;
+                };
+                if definition.master != 0 {
+                    if definition.is_master() {
+                        master_guids.insert(definition.master, guid);
                     } else {
-                        part_masters.push((guid, master));
+                        part_masters.push((guid, definition.master));
                     }
                 }
-                // 0x4575b8: skip non-master tiles of multi-tile objects.
-                if master != 0 && sub_index != -1 {
+                // 0x4575b8, 0x4575d2: never a non-master tile or a person.
+                if definition.eligibility() == BuyEligibility::Excluded {
                     continue;
-                }
-                let kind = read_i16(data, OBJD_TYPE);
-                if kind == PERSON_TYPE {
-                    continue;
-                }
-                let ctss_id = read_i16(data, OBJD_CTSS);
-                let (mut name, description, mut raw_name) = read_ctss(&iff, ctss_id);
-                // 0x457d3b: when the catalog string table is missing or its
-                // name entry is empty, fall back to the OBJD chunk label.
-                if name.is_empty() && !chunk.label.is_empty() {
-                    name = chunk.label.clone();
-                    raw_name = cp1252_bytes(&chunk.label);
                 }
                 // 0x4cb905..0x4cbaa8: keep the object whenever any residential
                 // (`+0x4e` room or `+0x50` function) or expansion commercial
@@ -733,16 +724,51 @@ impl BuyCatalog {
                     | community_sort
                     | studio_sort
                     | magic_sort;
-                // 0x457588 / 0x4575a1: needs graphics (master != 0 ||
-                // base_graphic_id != 0) or an interaction table.
-                let graphics = read_i16(data, OBJD_GRAPHICS);
-                let ttab = read_i16(data, OBJD_TTAB);
-                if !is_buy_catalog_eligible(any_sort, master, graphics, ttab) {
-                    if !name.is_empty() {
-                        fallback_names.insert(guid, name);
+                let (raw_name, description) = match listed.get(&object) {
+                    Some(entry) if any_sort != 0 => (
+                        entry.text.name.clone(),
+                        decode_text(&entry.text.description),
+                    ),
+                    listing => {
+                        let cats = iff.get(b"CATS", definition.strings).map(|c| iff.data(c));
+                        let ctss = iff
+                            .get(b"CTSS", definition.strings)
+                            .map(|c| (iff.data(c), iff.resource_flags(c)));
+                        match CatalogText::read(
+                            cats,
+                            ctss,
+                            iff.label_bytes(chunk),
+                            US_ENGLISH,
+                            false,
+                        ) {
+                            Ok(text) => {
+                                fallback_names.insert(guid, decode_text(&text.name));
+                                continue;
+                            }
+                            // Unreadable text takes the native empty-name
+                            // rule: `*` and the OBJD label.
+                            Err(_) => {
+                                let mut name = b"*".to_vec();
+                                name.extend_from_slice(iff.label_bytes(chunk));
+                                // `buy_entries` leaves out a definition whose
+                                // catalog text it cannot read, so a damaged
+                                // CATS or CTSS would hide a buyable object.
+                                // List one that has a sort word and graphics,
+                                // a master, or an interaction table, as the
+                                // earlier rule did; damaged text never lists
+                                // an object that would not be listed anyway.
+                                let buyable = definition.eligibility() == BuyEligibility::Listed
+                                    || definition.interactions > 0;
+                                if listing.is_none() && any_sort != 0 && buyable {
+                                    (name, String::new())
+                                } else {
+                                    fallback_names.insert(guid, decode_text(&name));
+                                    continue;
+                                }
+                            }
+                        }
                     }
-                    continue;
-                }
+                };
                 let price = i32::from(read_i16(data, OBJD_PRICE));
                 let function_subsort = read_i16(data, OBJD_FUNC_SUBSORT) as u16;
                 let build_mode_type = read_i16(data, OBJD_BUILD_TYPE);
@@ -751,13 +777,14 @@ impl BuyCatalog {
                     *slot = read_i16(data, OBJD_RATING_BASE + i * 2);
                 }
                 let skill_flags = read_i16(data, OBJD_RATING_SKILLS) as u16;
-                let (usage_restriction, group_activity) = read_ttab_usage(&iff, ttab);
+                let (usage_restriction, group_activity) =
+                    read_ttab_usage(&iff, definition.interactions);
                 items.push((
-                    raw_name,
+                    raw_name.clone(),
                     BuyItem {
                         guid,
                         price,
-                        name,
+                        name: decode_text(&raw_name),
                         description,
                         room_sort,
                         function_sort,
@@ -783,7 +810,7 @@ impl BuyCatalog {
         }
 
         // 0x4cd9a5 -> 0x430100 -> memcmp (0x6363e0): sort by price ascending,
-        // then raw CTSS catalog bytes (Windows-1252) ascending, then GUID.
+        // then raw catalog name bytes (Windows-1252) ascending, then GUID.
         items.sort_by(|(raw_a, a), (raw_b, b)| {
             a.price
                 .cmp(&b.price)
@@ -1581,12 +1608,6 @@ fn read_ttab_usage(iff: &Iff, ttab_id: i16) -> (Option<UsageRestriction>, bool) 
     (restriction, group_activity)
 }
 
-/// Whether an OBJD entry passes the Buy Mode catalog sort & art/interaction
-/// filter (`0x4cb905..0x4cbaa8`, `0x457588`).
-fn is_buy_catalog_eligible(any_sort: u16, master: i16, graphics: i16, ttab: i16) -> bool {
-    any_sort != 0 && !(master == 0 && graphics == 0 && ttab <= 0)
-}
-
 fn read_i16(data: &[u8], offset: usize) -> i16 {
     if offset + 2 > data.len() {
         return 0;
@@ -1594,45 +1615,9 @@ fn read_i16(data: &[u8], offset: usize) -> i16 {
     i16::from_le_bytes([data[offset], data[offset + 1]])
 }
 
-fn read_ctss(iff: &Iff, ctss_id: i16) -> (String, String, Vec<u8>) {
-    let Ok(id) = u16::try_from(ctss_id) else {
-        return (String::new(), String::new(), Vec::new());
-    };
-    // 0x40621d..0x40635e: look up legacy `CATS` first (raw NUL-terminated name
-    // followed by optional NUL-terminated description), then `CTSS`.
-    if let Some(chunk) = iff.get(b"CATS", id) {
-        let data = iff.data(chunk);
-        let name_end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-        let raw_name = data[..name_end].to_vec();
-        let name = sims_formats::strings::decode(&raw_name, US_ENGLISH);
-        let description = if name_end + 1 < data.len() {
-            let rest = &data[name_end + 1..];
-            let desc_end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
-            sims_formats::strings::decode(&rest[..desc_end], US_ENGLISH)
-        } else {
-            String::new()
-        };
-        return (name, description, raw_name);
-    }
-    let Some(chunk) = iff.get(b"CTSS", id) else {
-        return (String::new(), String::new(), Vec::new());
-    };
-    let Ok(table) = StringTable::parse(iff.data(chunk)) else {
-        return (String::new(), String::new(), Vec::new());
-    };
-    let pick = |index: usize| {
-        table
-            .entries
-            .iter()
-            .filter(|e| e.language == US_ENGLISH)
-            .nth(index)
-            .or_else(|| table.entries.get(index))
-    };
-    let (name, raw_name) = pick(0)
-        .map(|e| (e.text.clone(), e.raw_text.clone()))
-        .unwrap_or_default();
-    let description = pick(1).map(|e| e.text.clone()).unwrap_or_default();
-    (name, description, raw_name)
+/// Catalog text, in the game's code page, as a string.
+fn decode_text(bytes: &[u8]) -> String {
+    sims_formats::strings::decode(bytes, US_ENGLISH)
 }
 
 /// Encodes a Unicode string to Windows-1252 bytes for `BuyCatalog::from_items`
@@ -1839,51 +1824,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_cats_is_parsed_as_nul_strings_before_ctss() {
-        // Legacy `CATS` only (`0x40621d` -> `0x40631f`): raw NUL-terminated
-        // name + description in Windows-1252.
-        let cats_payload = b"Legacy Lamp\x99\0Legacy description\0";
-        let iff = Iff::parse(build_iff(&[(b"CATS", 2008, cats_payload)])).unwrap();
-        let (name, desc, raw) = read_ctss(&iff, 2008);
-        assert_eq!(name, "Legacy Lamp™");
-        assert_eq!(desc, "Legacy description");
-        assert_eq!(raw, b"Legacy Lamp\x99");
-
-        // When both `CATS` and `CTSS` share the same ID, native `0x40621d`
-        // uses `CATS` first.
-        let mut ctss_payload = Vec::new();
-        ctss_payload.extend_from_slice(&(-3i16).to_le_bytes()); // format -3
-        ctss_payload.extend_from_slice(&2u16.to_le_bytes()); // 2 entries
-        ctss_payload.push(US_ENGLISH);
-        ctss_payload.extend_from_slice(b"CTSS Lamp\0\0");
-        ctss_payload.push(US_ENGLISH);
-        ctss_payload.extend_from_slice(b"CTSS description\0\0");
-        let both = Iff::parse(build_iff(&[
-            (b"CTSS", 2008, &ctss_payload),
-            (b"CATS", 2008, cats_payload),
-        ]))
-        .unwrap();
-        let (name, desc, _) = read_ctss(&both, 2008);
-        assert_eq!(name, "Legacy Lamp™");
-        assert_eq!(desc, "Legacy description");
-
-        // With `CTSS` alone, `read_ctss` falls through to `StringTable::parse`.
-        let ctss_only = Iff::parse(build_iff(&[(b"CTSS", 2008, &ctss_payload)])).unwrap();
-        let (name, desc, _) = read_ctss(&ctss_only, 2008);
-        assert_eq!(name, "CTSS Lamp");
-        assert_eq!(desc, "CTSS description");
-    }
-
-    #[test]
     fn function_only_residential_item_is_retained_and_filtered_by_function() {
-        // OBJD eligibility helper used by `BuyCatalog::load` retains an object
-        // whose ONLY nonzero sort word is `function_sort` (`+0x50`) and rejects
-        // an object with all sort words zero.
-        let room_sort: u16 = 0;
-        let function_sort: u16 = 0x0001;
-        assert!(is_buy_catalog_eligible(room_sort | function_sort, 0, 1, 0));
-        assert!(!is_buy_catalog_eligible(0, 0, 1, 0));
-
         // An object with `room_sort == 0`, `function_sort != 0`, and
         // `function_subsort != 0` must be included in Residential ByFunction
         // (`0x50765c`) and `items_for_zone(BuyZone::Residential)`.
