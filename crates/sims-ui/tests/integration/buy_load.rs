@@ -10,6 +10,8 @@ use sims_ui::buy::BuyCatalog;
 use std::time::{Duration, Instant};
 
 #[test]
+// Wall-clock timing is this test's purpose; it never feeds the simulation.
+#[allow(clippy::disallowed_methods)]
 fn buy_catalog_load_time_and_dump() {
     let Some(root) = common::install_root() else {
         eprintln!("skipping: set SIMS_INSTALL to time BuyCatalog::load");
