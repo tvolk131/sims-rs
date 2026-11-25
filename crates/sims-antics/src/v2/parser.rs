@@ -3763,205 +3763,60 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<V2Expr> {
-        self.parse_or_expr()
+        self.parse_bin_expr(1)
     }
 
-    fn parse_or_expr(&mut self) -> Result<V2Expr> {
-        let mut lhs = self.parse_and_expr()?;
-        let mut chain = 0usize;
-        while self.peek().kind == TokenKind::OrOr {
-            let span = self.bump().span;
-            chain += 1;
-            if self.depth + chain > MAX_NESTING_DEPTH {
-                return Err(Error::at(
-                    span,
-                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
-                ));
-            }
-            let rhs = self.parse_and_expr()?;
-            lhs = V2Expr::Binary {
-                span,
-                lhs: Box::new(lhs),
-                op: V2BinOp::Or,
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_and_expr(&mut self) -> Result<V2Expr> {
-        let mut lhs = self.parse_cmp_expr()?;
-        let mut chain = 0usize;
-        while self.peek().kind == TokenKind::AndAnd {
-            let span = self.bump().span;
-            chain += 1;
-            if self.depth + chain > MAX_NESTING_DEPTH {
-                return Err(Error::at(
-                    span,
-                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
-                ));
-            }
-            let rhs = self.parse_cmp_expr()?;
-            lhs = V2Expr::Binary {
-                span,
-                lhs: Box::new(lhs),
-                op: V2BinOp::And,
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_cmp_expr(&mut self) -> Result<V2Expr> {
-        let lhs = self.parse_bitor_expr()?;
-        let op = match &self.peek().kind {
-            TokenKind::EqEq => Some(V2BinOp::Eq),
-            TokenKind::BangEq => Some(V2BinOp::Ne),
-            TokenKind::Lt => Some(V2BinOp::Lt),
-            TokenKind::LtEq => Some(V2BinOp::Le),
-            TokenKind::Gt => Some(V2BinOp::Gt),
-            TokenKind::GtEq => Some(V2BinOp::Ge),
-            TokenKind::Ident(s) if s == "flag_test" => Some(V2BinOp::FlagTest),
-            _ => None,
-        };
-        if let Some(op) = op {
-            let span = self.bump().span;
-            let rhs = self.parse_bitor_expr()?;
-            Ok(V2Expr::Binary {
-                span,
-                lhs: Box::new(lhs),
-                op,
-                rhs: Box::new(rhs),
-            })
-        } else {
-            Ok(lhs)
-        }
-    }
-
-    fn parse_bitor_expr(&mut self) -> Result<V2Expr> {
-        let mut lhs = self.parse_bitxor_expr()?;
-        let mut chain = 0usize;
-        while self.peek().kind == TokenKind::Pipe {
-            let span = self.bump().span;
-            chain += 1;
-            if self.depth + chain > MAX_NESTING_DEPTH {
-                return Err(Error::at(
-                    span,
-                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
-                ));
-            }
-            let rhs = self.parse_bitxor_expr()?;
-            lhs = V2Expr::Binary {
-                span,
-                lhs: Box::new(lhs),
-                op: V2BinOp::BitOr,
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_bitxor_expr(&mut self) -> Result<V2Expr> {
-        let mut lhs = self.parse_bitand_expr()?;
-        let mut chain = 0usize;
-        while self.peek().kind == TokenKind::Caret {
-            let span = self.bump().span;
-            chain += 1;
-            if self.depth + chain > MAX_NESTING_DEPTH {
-                return Err(Error::at(
-                    span,
-                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
-                ));
-            }
-            let rhs = self.parse_bitand_expr()?;
-            lhs = V2Expr::Binary {
-                span,
-                lhs: Box::new(lhs),
-                op: V2BinOp::BitXor,
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_bitand_expr(&mut self) -> Result<V2Expr> {
-        let mut lhs = self.parse_add_expr()?;
-        let mut chain = 0usize;
-        while self.peek().kind == TokenKind::Amp {
-            let span = self.bump().span;
-            chain += 1;
-            if self.depth + chain > MAX_NESTING_DEPTH {
-                return Err(Error::at(
-                    span,
-                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
-                ));
-            }
-            let rhs = self.parse_add_expr()?;
-            lhs = V2Expr::Binary {
-                span,
-                lhs: Box::new(lhs),
-                op: V2BinOp::BitAnd,
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_add_expr(&mut self) -> Result<V2Expr> {
-        let mut lhs = self.parse_mul_expr()?;
-        let mut chain = 0usize;
-        loop {
-            let op = match self.peek().kind {
-                TokenKind::Plus => V2BinOp::Add,
-                TokenKind::Minus => V2BinOp::Sub,
-                _ => break,
-            };
-            let span = self.bump().span;
-            chain += 1;
-            if self.depth + chain > MAX_NESTING_DEPTH {
-                return Err(Error::at(
-                    span,
-                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
-                ));
-            }
-            let rhs = self.parse_mul_expr()?;
-            lhs = V2Expr::Binary {
-                span,
-                lhs: Box::new(lhs),
-                op,
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(lhs)
-    }
-
-    fn parse_mul_expr(&mut self) -> Result<V2Expr> {
+    /// Parses binary expressions using precedence climbing so deeply parenthesized expressions
+    /// do not stack 8 recursive-descent frames per `(` in unoptimized debug builds.
+    fn parse_bin_expr(&mut self, min_prec: u8) -> Result<V2Expr> {
         let mut lhs = self.parse_unary_expr()?;
         let mut chain = 0usize;
-        loop {
-            let op = match self.peek().kind {
-                TokenKind::Star => V2BinOp::Mul,
-                TokenKind::Slash => V2BinOp::Div,
-                TokenKind::Percent => V2BinOp::Mod,
-                _ => break,
-            };
-            let span = self.bump().span;
-            chain += 1;
-            if self.depth + chain > MAX_NESTING_DEPTH {
-                return Err(Error::at(
-                    span,
-                    format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
-                ));
+        let mut max_prec = u8::MAX;
+        while let Some((op, prec)) = Self::peek_bin_op(&self.peek().kind) {
+            if prec < min_prec || prec > max_prec {
+                break;
             }
-            let rhs = self.parse_unary_expr()?;
+            let span = self.bump().span;
+            if prec != 3 {
+                chain += 1;
+                if self.depth + chain > MAX_NESTING_DEPTH {
+                    return Err(expr_nesting_err(span));
+                }
+            }
+            let rhs = self.parse_bin_expr(prec + 1)?;
             lhs = V2Expr::Binary {
                 span,
                 lhs: Box::new(lhs),
                 op,
                 rhs: Box::new(rhs),
             };
+            // Comparison operators (precedence 3) are non-associative.
+            max_prec = if prec == 3 { 2 } else { prec };
         }
         Ok(lhs)
+    }
+
+    fn peek_bin_op(kind: &TokenKind) -> Option<(V2BinOp, u8)> {
+        match kind {
+            TokenKind::OrOr => Some((V2BinOp::Or, 1)),
+            TokenKind::AndAnd => Some((V2BinOp::And, 2)),
+            TokenKind::EqEq => Some((V2BinOp::Eq, 3)),
+            TokenKind::BangEq => Some((V2BinOp::Ne, 3)),
+            TokenKind::Lt => Some((V2BinOp::Lt, 3)),
+            TokenKind::LtEq => Some((V2BinOp::Le, 3)),
+            TokenKind::Gt => Some((V2BinOp::Gt, 3)),
+            TokenKind::GtEq => Some((V2BinOp::Ge, 3)),
+            TokenKind::Ident(s) if s == "flag_test" => Some((V2BinOp::FlagTest, 3)),
+            TokenKind::Pipe => Some((V2BinOp::BitOr, 4)),
+            TokenKind::Caret => Some((V2BinOp::BitXor, 5)),
+            TokenKind::Amp => Some((V2BinOp::BitAnd, 6)),
+            TokenKind::Plus => Some((V2BinOp::Add, 7)),
+            TokenKind::Minus => Some((V2BinOp::Sub, 7)),
+            TokenKind::Star => Some((V2BinOp::Mul, 8)),
+            TokenKind::Slash => Some((V2BinOp::Div, 8)),
+            TokenKind::Percent => Some((V2BinOp::Mod, 8)),
+            _ => None,
+        }
     }
 
     fn parse_unary_expr(&mut self) -> Result<V2Expr> {
@@ -4080,17 +3935,7 @@ impl Parser {
                     } else if matches!(&expr, V2Expr::Ident(_, w) if w == "world") {
                         // `world.hour` is the engine global it names: `global[0]`.
                         let Some(index) = world_global(&field) else {
-                            return Err(Error::at(
-                                span,
-                                format!(
-                                    "unknown engine global 'world.{field}' (expected {}; or write 'global[N]')",
-                                    WORLD_GLOBALS
-                                        .iter()
-                                        .map(|(n, _)| *n)
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                ),
-                            ));
+                            return Err(unknown_world_global_err(span, &field));
                         };
                         expr = V2Expr::Index {
                             span,
@@ -4269,23 +4114,7 @@ impl Parser {
             TokenKind::LParen => {
                 self.bump();
                 self.enter_nesting(tok.span)?;
-                let res = (|| {
-                    let first = self.parse_expr()?;
-                    if self.eat(&TokenKind::Comma) {
-                        let mut elems = vec![first];
-                        while !self.eat(&TokenKind::RParen) {
-                            elems.push(self.parse_expr()?);
-                            if !self.eat(&TokenKind::Comma) {
-                                self.expect(&TokenKind::RParen, "')'")?;
-                                break;
-                            }
-                        }
-                        Ok(V2Expr::Tuple(tok.span, elems))
-                    } else {
-                        self.expect(&TokenKind::RParen, "')'")?;
-                        Ok(first)
-                    }
-                })();
+                let res = self.parse_paren_or_tuple_expr(tok.span);
                 self.leave_nesting();
                 res
             }
@@ -4295,6 +4124,49 @@ impl Parser {
             )),
         }
     }
+
+    fn parse_paren_or_tuple_expr(&mut self, span: Span) -> Result<V2Expr> {
+        let first = self.parse_expr()?;
+        if self.eat(&TokenKind::Comma) {
+            let mut elems = vec![first];
+            while !self.eat(&TokenKind::RParen) {
+                elems.push(self.parse_expr()?);
+                if !self.eat(&TokenKind::Comma) {
+                    self.expect(&TokenKind::RParen, "')'")?;
+                    break;
+                }
+            }
+            Ok(V2Expr::Tuple(span, elems))
+        } else {
+            self.expect(&TokenKind::RParen, "')'")?;
+            Ok(first)
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn expr_nesting_err(span: Span) -> Error {
+    Error::at(
+        span,
+        format!("expression nesting exceeds maximum depth of {MAX_NESTING_DEPTH}"),
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn unknown_world_global_err(span: Span, field: &str) -> Error {
+    Error::at(
+        span,
+        format!(
+            "unknown engine global 'world.{field}' (expected {}; or write 'global[N]')",
+            WORLD_GLOBALS
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
 }
 
 /// Maps an addressable BCON chunk id to its SimAntics operand table index (`address >> 7`),
