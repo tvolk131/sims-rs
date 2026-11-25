@@ -1209,7 +1209,18 @@ const NON_YIELDING_CALLS: &[&str] = &[
 ];
 
 /// Methods that never yield.
-const NON_YIELDING_METHODS: &[&str] = &["is_type", "set", "clear", "contains", "is_empty"];
+const NON_YIELDING_METHODS: &[&str] = &[
+    "is_type",
+    "set",
+    "clear",
+    "contains",
+    "is_empty",
+    "play_sound",
+    "stop_all_sounds",
+    "refresh",
+    "debit_funds",
+    "credit_funds",
+];
 
 /// `.air` primitives a v2 builtin spells with the same operands, with that spelling.
 ///

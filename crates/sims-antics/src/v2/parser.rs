@@ -25,6 +25,34 @@ const MAX_NESTING_DEPTH: usize = 64;
 pub(crate) const MAX_STATE_SLOT: u16 = 255;
 
 /// Parses a `.antics` v2 source file into a [`V2File`] AST.
+/// The engine globals `world.<name>` names (`world.hour` is `global[0]`), as the engine uses
+/// them (sims-vm `tick.rs`, `daily.rs`, `selection.rs`, `coop.rs`).
+pub(crate) const WORLD_GLOBALS: &[(&str, u8)] = &[
+    ("hour", 0),
+    ("day", 1),
+    // The selected Sim's object ID (0 = none).
+    ("selected_sim", 3),
+    // 0 day, 1 dusk, 2 night, 3 dawn.
+    ("time_of_day", 4),
+    ("minute", 5),
+    ("second", 6),
+    ("month", 7),
+    ("year", 8),
+    // The lot (house number) being played.
+    ("house", 10),
+    ("paused", 17),
+    ("days_played", 28),
+    ("free_will", 30),
+];
+
+/// The global index of `world.<name>`.
+pub(crate) fn world_global(name: &str) -> Option<u8> {
+    WORLD_GLOBALS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|&(_, i)| i)
+}
+
 pub fn parse_v2_file(source: &str) -> Result<V2File> {
     let tokens = tokenize(source)?;
     let mut parser = Parser {
@@ -129,6 +157,14 @@ impl Parser {
             return Err(Error::at(
                 span,
                 format!("'stack_obj' is the frame's stack object and cannot be used as a {desc}"),
+            ));
+        }
+        if name == "world" {
+            return Err(Error::at(
+                span,
+                format!(
+                    "'world' names the engine globals ('world.hour') and cannot be used as a {desc}"
+                ),
             ));
         }
         self.bound_vars.insert(name.clone());
@@ -394,6 +430,16 @@ impl Parser {
         let mut items = Vec::new();
 
         while self.eat(&TokenKind::ColonColon) {
+            if self.peek().kind == TokenKind::Star {
+                // `use pack::module::*;`: every `pub` item (local items shadow them).
+                let star = self.bump().span;
+                items.push(UseItem {
+                    span: star,
+                    name: "*".to_owned(),
+                    alias: None,
+                });
+                break;
+            }
             if self.eat(&TokenKind::LBrace) {
                 while !self.eat(&TokenKind::RBrace) {
                     let (name, ispan) = self.expect_ident("imported item name")?;
@@ -896,7 +942,13 @@ impl Parser {
 
     /// Parses `extern bcon name { #[addr(<address>)] entry; #[bcon(<chunk id>, <index>)] entry; ... }`.
     fn parse_extern_bcon(&mut self, span: Span, is_pub: bool) -> Result<ExternBconDecl> {
-        let (name, _) = self.expect_ident("extern bcon name")?;
+        let (name, name_span) = self.expect_ident("extern bcon name")?;
+        if name == "world" {
+            return Err(Error::at(
+                name_span,
+                "'world' names the engine globals ('world.hour') and cannot name a bcon",
+            ));
+        }
         self.expect(&TokenKind::LBrace, "'{'")?;
         let mut entries: Vec<ExternBconEntry> = Vec::new();
         while !self.eat(&TokenKind::RBrace) {
@@ -948,6 +1000,12 @@ impl Parser {
                 ));
             }
         };
+        if label == "world" || snake_case_ident(&label) == "world" {
+            return Err(Error::at(
+                span,
+                "'world' names the engine globals ('world.hour') and cannot name a bcon table",
+            ));
+        }
         self.expect(&TokenKind::LBrace, "'{'")?;
         let mut entries: Vec<(Span, String, i16)> = Vec::new();
         while !self.eat(&TokenKind::RBrace) {
@@ -3886,6 +3944,26 @@ impl Parser {
                             method: field,
                             type_args: Vec::new(),
                             args,
+                        };
+                    } else if matches!(&expr, V2Expr::Ident(_, w) if w == "world") {
+                        // `world.hour` is the engine global it names: `global[0]`.
+                        let Some(index) = world_global(&field) else {
+                            return Err(Error::at(
+                                span,
+                                format!(
+                                    "unknown engine global 'world.{field}' (expected {}; or write 'global[N]')",
+                                    WORLD_GLOBALS
+                                        .iter()
+                                        .map(|(n, _)| *n)
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                            ));
+                        };
+                        expr = V2Expr::Index {
+                            span,
+                            base: Box::new(V2Expr::Ident(span, "global".to_owned())),
+                            index: Box::new(V2Expr::Int(span, i64::from(index))),
                         };
                     } else {
                         expr = V2Expr::Field {

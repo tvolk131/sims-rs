@@ -1838,6 +1838,79 @@ impl<'a> TreeLowerer<'a> {
                     self.emit_run_functional(receiver, args, *span, None)?;
                     Ok(())
                 }
+                // `x.play_sound(s)`, `x.stop_all_sounds()`, `x.refresh(mode)`: the builtin with
+                // `target: x` (the same primitive as the call form).
+                "play_sound" | "stop_all_sounds" | "refresh" => {
+                    if !type_args.is_empty() {
+                        return Err(Error::at(
+                            *span,
+                            format!("'.{method}()' does not accept type arguments"),
+                        ));
+                    }
+                    if let Some(a) = args.iter().find(|a| a.name.as_deref() == Some("target")) {
+                        return Err(Error::at(
+                            a.span,
+                            format!("'.{method}()' takes no 'target:'; the receiver is the target"),
+                        ));
+                    }
+                    let mut full = args.clone();
+                    if method == "refresh" {
+                        // `x.refresh(mode)`: its one positional argument is the mode.
+                        for a in &mut full {
+                            if a.name.is_none() {
+                                a.name = Some("mode".to_owned());
+                            }
+                        }
+                    }
+                    full.push(CallArg {
+                        span: receiver.span(),
+                        name: Some("target".to_owned()),
+                        value: (**receiver).clone(),
+                    });
+                    match method.as_str() {
+                        "refresh" => {
+                            let prim = self
+                                .format_prim_builtin("refresh", &full, *span)?
+                                .expect("refresh is a primitive builtin");
+                            self.line(format!("{prim};"));
+                        }
+                        _ => {
+                            let (prim, on_self) = if method == "play_sound" {
+                                self.format_play_sound(&full, *span)?
+                            } else {
+                                self.format_stop_all_sounds(&full)?
+                            };
+                            if on_self {
+                                self.emit_on_self(prim);
+                            } else {
+                                self.line(format!("{prim};"));
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                // `sim.debit_funds(n)` / `sim.credit_funds(n)`: the Sim's household budget (the
+                // lot's family; the same primitive as `debit_funds(n)`).
+                "debit_funds" | "credit_funds" => {
+                    if !type_args.is_empty() {
+                        return Err(Error::at(
+                            *span,
+                            format!("'.{method}()' does not accept type arguments"),
+                        ));
+                    }
+                    if !matches!(receiver.as_ref(), V2Expr::Ident(_, n) if self.is_sim_ident(n)) {
+                        return Err(Error::at(
+                            receiver.span(),
+                            format!(
+                                "'.{method}()' is called on the interaction's Sim (its household's budget)"
+                            ),
+                        ));
+                    }
+                    let s =
+                        self.format_alter_budget(args, *span, false, method == "credit_funds")?;
+                    self.line(format!("{s};"));
+                    Ok(())
+                }
                 "set" => {
                     if !type_args.is_empty() {
                         return Err(Error::at(*span, "'.set()' does not accept type arguments"));

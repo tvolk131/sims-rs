@@ -228,6 +228,10 @@ impl<'a> TreeLowerer<'a> {
                             "prep_score" => Ok(self.self_cell("prep_score", ValueType::I16)),
                             "cook_score" => Ok(self.self_cell("cook_score", ValueType::I16)),
                             "in_use" => Ok(self.self_cell("in_use", ValueType::I16)),
+                            other if object_data_field(other).is_some() => Ok(self.self_cell(
+                                &format!("data[{}]", object_data_field(other).unwrap_or_default()),
+                                ValueType::I16,
+                            )),
                             "motive" | "skill" | "priority" => Err(Error::at(
                                 *span,
                                 format!(
@@ -254,10 +258,17 @@ impl<'a> TreeLowerer<'a> {
                                 air: "my.person.priority".to_owned(),
                                 ty: ValueType::I16,
                             }),
+                            other if sim_person_field(other).is_some() => Ok(LValue::Direct {
+                                air: format!(
+                                    "my.person[{}]",
+                                    sim_person_field(other).unwrap_or_default()
+                                ),
+                                ty: ValueType::I16,
+                            }),
                             _ => Err(Error::at(
                                 *span,
                                 format!(
-                                    "cannot assign to '{bname}.{field}' (use '{bname}.motive.<name>', '{bname}.skill.<name>', '{bname}.personality.<trait>', '{bname}.age', '{bname}.priority', '{bname}.attr[i]', '{bname}.data[i]', or '{bname}.person[i]'; use 'self.<state>' for object state)"
+                                    "cannot assign to '{bname}.{field}' (use '{bname}.motive.<name>', '{bname}.skill.<name>', '{bname}.personality.<trait>', '{bname}.age', '{bname}.priority', '{bname}.job_level' (and the other named person words), '{bname}.attr[i]', '{bname}.data[i]', or '{bname}.person[i]'; use 'self.<state>' for object state)"
                                 ),
                             )),
                         };
@@ -316,7 +327,7 @@ impl<'a> TreeLowerer<'a> {
                                 other => match Self::handle_field_cell(other, false) {
                                     Some((cell, ty)) => Ok(LValue::ForeignCell {
                                         obj_air,
-                                        cell: cell.to_owned(),
+                                        cell,
                                         setup: None,
                                         ty,
                                     }),
@@ -333,19 +344,19 @@ impl<'a> TreeLowerer<'a> {
                     }
                     if let Some((obj_air, maybe_sim)) = self.object_handle_air(bname) {
                         let (cell, ty) = match field.as_str() {
-                            "graphic" => ("stack.data[0]", ValueType::I16),
+                            "graphic" => ("stack.data[0]".to_owned(), ValueType::I16),
                             other => Self::handle_field_cell(other, maybe_sim).ok_or_else(|| {
                                 Error::at(
                                     *span,
                                     format!(
-                                        "unknown field '{bname}.{other}' on an object handle (expected graphic, hand, room, age, priority, is_visitor, visitor_kind, kind, motive.<name>, skill.<name>, attr[i], data[i], person[i], motive[m], slot[i], or sprite_flags[i])"
+                                        "unknown field '{bname}.{other}' on an object handle (expected graphic, hand, room, flags, room_impact, wall_placement, broken, age, priority, is_visitor, visitor_kind, kind, posture, pets_outside, job_type, job_level, family, motive.<name>, skill.<name>, attr[i], data[i], person[i], motive[m], slot[i], or sprite_flags[i])"
                                     ),
                                 )
                             })?,
                         };
                         return Ok(LValue::ForeignCell {
                             obj_air,
-                            cell: cell.to_owned(),
+                            cell,
                             setup: None,
                             ty,
                         });

@@ -353,24 +353,27 @@ impl<'a> TreeLowerer<'a> {
 
     /// The object or Sim cell behind `handle.<field>` that every handle shares: `hand`, `room`,
     /// `flags` (object data word 8), and (untyped handles only) the person words `age`, `priority`, `is_visitor`, and `kind`.
-    pub(super) fn handle_field_cell(
-        field: &str,
-        maybe_sim: bool,
-    ) -> Option<(&'static str, ValueType)> {
+    pub(super) fn handle_field_cell(field: &str, maybe_sim: bool) -> Option<(String, ValueType)> {
+        let cell = |c: &str, ty| Some((c.to_owned(), ty));
         match field {
-            "hand" => Some(("stack.slot[0]", ValueType::ObjectId)),
-            "room" => Some(("stack.room", ValueType::I16)),
-            "flags" => Some((
+            "hand" => cell("stack.slot[0]", ValueType::ObjectId),
+            "room" => cell("stack.room", ValueType::I16),
+            "flags" => cell(
                 "stack.data[8]",
                 ValueType::Bitflags(ANY_BITFLAGS.to_owned()),
-            )),
+            ),
+            other if object_data_field(other).is_some() => {
+                object_data_field(other).map(|i| (format!("stack.data[{i}]"), ValueType::I16))
+            }
             _ if !maybe_sim => None,
-            "age" => Some(("stack.person[58]", ValueType::I16)),
-            "priority" => Some(("stack.person.priority", ValueType::I16)),
-            "is_visitor" => Some(("stack.person[32]", ValueType::Bool)),
-            "visitor_kind" => Some(("stack.person[32]", ValueType::I16)),
-            "kind" => Some(("stack.person[65]", ValueType::I16)),
-            _ => None,
+            "age" => cell("stack.person[58]", ValueType::I16),
+            "priority" => cell("stack.person.priority", ValueType::I16),
+            "is_visitor" => cell("stack.person[32]", ValueType::Bool),
+            "visitor_kind" => cell("stack.person[32]", ValueType::I16),
+            "kind" => cell("stack.person[65]", ValueType::I16),
+            other => {
+                sim_person_field(other).map(|i| (format!("stack.person[{i}]"), ValueType::I16))
+            }
         }
     }
 
@@ -546,4 +549,43 @@ fn names_token(body: &str, name: &str) -> bool {
                 && !after_call(i)
         })
     })
+}
+
+/// Object-data words every object exposes by name: `self.broken` is `self.data[15]`, read and
+/// written exactly like it. The indices are the engine's (sims-vm `placement.rs`, `buy.rs`).
+const OBJECT_DATA_FIELDS: &[(&str, u8)] = &[
+    // Whether the object lights the room it stands in (sims-vm `LIGHTS_ROOM`).
+    ("room_impact", 7),
+    // The wall-placement rules (sims-vm `DATA_WALL_RULES`).
+    ("wall_placement", 13),
+    // Broken (sims-vm `DATA_BROKEN`; a broken object sells for half).
+    ("broken", 15),
+];
+
+/// Person-data words a Sim exposes by name: `sim.job_level` is `sim.person[57]`, read and
+/// written exactly like it. The indices are the engine's (sims-vm `outfits.rs`, `caf.rs`,
+/// `autonomy.rs`, `animate.rs`).
+const SIM_PERSON_FIELDS: &[(&str, u8)] = &[
+    ("posture", 0),
+    ("pets_outside", 34),
+    ("job_type", 56),
+    // A child's school grade.
+    ("job_level", 57),
+    ("family", 61),
+];
+
+/// The object-data word of a named object field (`broken` → 15).
+pub(super) fn object_data_field(name: &str) -> Option<u8> {
+    OBJECT_DATA_FIELDS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|&(_, i)| i)
+}
+
+/// The person-data word of a named Sim field (`job_level` → 57).
+pub(super) fn sim_person_field(name: &str) -> Option<u8> {
+    SIM_PERSON_FIELDS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|&(_, i)| i)
 }

@@ -62,6 +62,7 @@ use self::object::*;
 use self::prim_table::*;
 use self::raw::*;
 use self::schema::*;
+use self::tree::{object_data_field, sim_person_field};
 use self::trees::*;
 
 const MAX_INLINE_DEPTH: usize = 16;

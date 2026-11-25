@@ -467,6 +467,40 @@ struct LoadedModuleData {
     scope: ModuleScope,
 }
 
+impl LoadedModuleData {
+    /// Every name a `use module::*;` imports, sorted.
+    fn pub_names(&self) -> BTreeSet<String> {
+        self.pub_functions
+            .keys()
+            .chain(self.pub_templates.keys())
+            .chain(self.pub_enums.keys())
+            .chain(self.pub_bitflags.keys())
+            .chain(self.pub_objects.keys())
+            .chain(self.pub_extern_mods.keys())
+            .chain(self.pub_extern_bcons.keys())
+            .chain(self.pub_consts.keys())
+            .cloned()
+            .collect()
+    }
+}
+
+/// The source of a built-in `std::<module>` (`use std::globals::*;`), if there is one.
+fn std_module_source(segs: &[String]) -> Option<String> {
+    match segs {
+        [m] if m == "globals" => {
+            use std::fmt::Write as _;
+            let mut src = String::from(
+                "// Built-in std::globals: the engine globals' indices (`global[HOUR]` is `world.hour`).\n",
+            );
+            for (name, index) in crate::v2::parser::WORLD_GLOBALS {
+                let _ = writeln!(src, "pub const {} = {index};", name.to_ascii_uppercase());
+            }
+            Some(src)
+        }
+        _ => None,
+    }
+}
+
 struct ModuleLoader<'a> {
     config: &'a PackResolverConfig,
     loaded: BTreeMap<String, LoadedModuleData>,
@@ -621,7 +655,35 @@ impl<'a> ModuleLoader<'a> {
                 .loaded
                 .get(&target_key)
                 .expect("load_module_path inserts into self.loaded");
-            for item in &use_decl.items {
+            let glob_items: Vec<crate::v2::ast::UseItem>;
+            let use_items = match use_decl.items.as_slice() {
+                [only] if only.name == "*" => {
+                    glob_items = target
+                        .pub_names()
+                        .into_iter()
+                        // A name already bound here (a local item or an earlier import)
+                        // shadows the glob's.
+                        .filter(|n| {
+                            !(functions.contains_key(n)
+                                || templates.contains_key(n)
+                                || enums.contains_key(n)
+                                || bitflags.contains_key(n)
+                                || imported_objects.contains_key(n)
+                                || extern_mods.contains_key(n)
+                                || extern_bcons.contains_key(n)
+                                || consts.contains_key(n))
+                        })
+                        .map(|name| crate::v2::ast::UseItem {
+                            span: only.span,
+                            name,
+                            alias: None,
+                        })
+                        .collect();
+                    glob_items.as_slice()
+                }
+                items => items,
+            };
+            for item in use_items {
                 let local_name = item.alias.as_ref().unwrap_or(&item.name);
                 if crate::v2::ast::is_reserved_type_name(local_name) {
                     return Err(Error::at(
@@ -823,7 +885,20 @@ impl<'a> ModuleLoader<'a> {
             return Ok(canonical_key);
         }
 
-        // 2. Resolve pack root on disk.
+        // 2. The built-in `std` modules.
+        if pack_seg == "std" {
+            let Some(src) = std_module_source(mod_segs) else {
+                return Err(Error::at(
+                    span,
+                    format!("unknown built-in module '{canonical_key}' (expected 'std::globals')"),
+                ));
+            };
+            let parsed = parse_v2_file(&src).map_err(|e| e.with_context(&canonical_key))?;
+            self.resolve_parsed_module(canonical_key.clone(), &parsed, false)?;
+            return Ok(canonical_key);
+        }
+
+        // 3. Resolve pack root on disk.
         let root_canon = if self.config.pack_aliases.contains(pack_seg) {
             self.config.pack_root.as_ref().ok_or_else(|| {
                 Error::at(
