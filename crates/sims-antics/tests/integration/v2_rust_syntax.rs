@@ -649,3 +649,79 @@ fn functional_kind_names_follow_the_engine_table() {
     let (air, _, _) = build(&finder);
     assert!(air.contains("find_best_object(gardening"), "{air}");
 }
+
+#[test]
+fn local_extern_globals_merge_with_std() {
+    let body = |externs: &str| {
+        format!(
+            "object \"Syntax Probe\" {{
+    guid: 0x7F50_0001;
+    state n: i16;
+{externs}    interaction \"Use\" {{
+        run(sim) {{
+            globals::standard_entry()?;
+            globals::robot_hum(2)?;
+            if !globals::am_i_a_child() {{
+                self.n = 1;
+            }}
+            globals::standard_exit(3)?;
+        }}
+    }}
+}}
+"
+        )
+    };
+    let copied = "extern mod globals {
+    #[id(272)] fn standard_entry() -> Result;
+    #[id(273)] fn standard_exit(delay: i16) -> Result;
+    #[id(363)] fn am_i_a_child() -> bool;
+    #[id(4000)] fn robot_hum(level: i16) -> Result;
+}
+
+";
+    let expected = format!("{copied}{}", body(""));
+    // A top-level local block and an object-member block both add to std's.
+    let local = "extern mod globals {
+    #[id(4000)] fn robot_hum(level: i16) -> Result;
+    #[id(272)] fn standard_entry() -> Result;
+}
+
+";
+    assert_same(
+        "top-level block merges",
+        &format!("use std::globals::*;\n\n{local}{}", body("")),
+        &expected,
+    );
+    assert_same(
+        "object block merges",
+        &format!(
+            "use std::globals::*;\n\n{}",
+            body("    extern mod globals {\n        #[id(4000)] fn robot_hum(level: i16) -> Result;\n    }\n")
+        ),
+        &expected,
+    );
+    // The same tree under a second name is fine when it is called the same way.
+    assert_same(
+        "alias of one tree",
+        &format!(
+            "use std::globals::*;\n\n{}",
+            body("    extern mod globals {\n        #[id(4000)] fn robot_hum(level: i16) -> Result;\n        #[id(272)] fn enter() -> Result;\n    }\n")
+        ),
+        &expected,
+    );
+    // Genuine conflicts are refused, naming both declarations.
+    expect_err(
+        &format!(
+            "use std::globals::*;\n\n{}",
+            body("    extern mod globals {\n        #[id(4000)] fn robot_hum(level: i16) -> Result;\n        #[id(274)] fn standard_entry() -> Result;\n    }\n")
+        ),
+        "extern mod 'globals' declares fn 'standard_entry' twice, differently: `#[id(274)] fn standard_entry() -> Result`",
+    );
+    expect_err(
+        &format!(
+            "use std::globals::*;\n\nextern mod globals {{\n    #[id(4000)] fn robot_hum(level: i16) -> Result;\n    #[id(273)] fn leave() -> Result;\n}}\n\n{}",
+            body("")
+        ),
+        "extern mod 'globals' calls tree 273 two ways",
+    );
+}

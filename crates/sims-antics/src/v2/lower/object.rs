@@ -929,6 +929,22 @@ fn lower_object_with(
         .collect();
     let text_reads = text_reads
         .unwrap_or_else(|| object_text_reads(&strings, &dialog_strings.borrow(), &catalog));
+    // An object's `extern mod x { .. }` merges with the module's `x` (e.g. `use std::globals::*;`).
+    for (name, (owner, decl)) in local_extern_mods.iter_mut() {
+        if let Some((scope_owner, scope_decl)) = resolved
+            .module_scopes
+            .get(owner.as_str())
+            .and_then(|sc| sc.extern_mods.get(name))
+        {
+            *decl = crate::v2::loader::merge_extern_mods(
+                owner,
+                decl,
+                scope_owner,
+                scope_decl,
+                decl.span,
+            )?;
+        }
+    }
     let env = ObjectEnv {
         resolved,
         name: obj.name.clone(),
