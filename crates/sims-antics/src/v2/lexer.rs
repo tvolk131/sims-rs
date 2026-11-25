@@ -35,7 +35,8 @@ pub enum TokenKind {
     Dot,
     DotDot,   // ..
     DotDotEq, // ..=
-    At,
+    /// `#[`: opens an outer attribute (`#[bhav(id = 4096)]`).
+    HashBracket,
     Question, // ?
     Arrow,    // ->
     FatArrow, // =>
@@ -138,8 +139,12 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>> {
                 }
             }
             b'@' => {
-                lexer.bump();
-                TokenKind::At
+                return Err(Error::at(
+                    span,
+                    "'@' is not .antics v2 syntax: annotations are Rust-style attributes \
+                     ('#[id(N)]', '#[slot(N)]', '#[frame(locals = N)]', '#[context(inherit)]', \
+                     '#[temp(N)]', '#[ret(temp = N)]', '#[addr(N)]', '#[bcon(T, E)]')",
+                ));
             }
             b'?' => {
                 lexer.bump();
@@ -278,6 +283,11 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>> {
                 }
             }
             b'"' => TokenKind::Str(lexer.lex_string(span)?),
+            b'#' if lexer.bytes.get(lexer.pos + 1) == Some(&b'[') => {
+                lexer.bump();
+                lexer.bump();
+                TokenKind::HashBracket
+            }
             b'#' => TokenKind::Color(lexer.lex_color(span)?),
             b'0'..=b'9' => lexer.lex_number(span)?,
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
