@@ -1467,10 +1467,17 @@ impl<'a> TreeLowerer<'a> {
             let found_var = self.fresh(&format!("v_{name}"));
             let raw_var = self.fresh("fbo_raw");
             let cand_var = self.fresh("fbo_cand");
+            // The fallback takes a candidate only when its score word (the one Find Best
+            // Object reads for the kind) is positive.
             let score_field = match plan.kind_name.as_str() {
-                "prep" => Some("stack.prep_score"),
-                "cook" => Some("stack.cook_score"),
-                _ => None,
+                "prep" => Some("stack.prep_score".to_owned()),
+                "cook" => Some("stack.cook_score".to_owned()),
+                kind => match crate::parser::function_kind(kind).map(|k| k.search) {
+                    Some(crate::parser::FunctionSearch::Score(word)) => {
+                        Some(format!("stack.data[{word}]"))
+                    }
+                    _ => None,
+                },
             };
             let guard_summary = schema
                 .functionals
@@ -1527,7 +1534,7 @@ impl<'a> TreeLowerer<'a> {
                     self.em.indent();
                     extra_blocks += 1;
                 }
-                if let (Some(sf), Some(bvar)) = (score_field, &best_var) {
+                if let (Some(sf), Some(bvar)) = (score_field.as_deref(), &best_var) {
                     self.line(format!("if {sf} > 0 {{"));
                     self.em.indent();
                     self.line(format!("if {found_var} == 0 {{"));

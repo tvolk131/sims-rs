@@ -58,14 +58,17 @@ Three names stay but now mean the engine's function:
 
 `find_best_object(kind)` is refused for a kind the engine never searches, because it would always
 fail. The untyped search also takes `category4`, as raw `.air` does. A `functional` block's
-`score:` is accepted only for a scored kind.
+`score:` is accepted only for a scored kind. A typed search's fallback scan takes a candidate only
+when the kind's own score word is positive, for every scored kind (it checked only `prep` and
+`cook` before, which no longer covered the renamed kinds).
 
 ### 2. A local `extern mod` merges with an imported one (`loader.rs` `merge_extern_mods`)
 
 `use std::globals::*;` together with an object's or module's own `extern mod globals { .. }` now
 gives one module holding both sets of functions.
 
-A declaration's types (an enum, an object) resolve in the module that owns it. The merged block
+A declaration's module types (an enum, bitflags, an object, `Self`) resolve in the module that
+owns it. Built-in types (`Height`, `Placement`, ..) are the same everywhere and do not count. The merged block
 has one owner, so only one side may name module types: that side owns the merge. The merge is
 refused, with an error naming both owners, when:
 
@@ -73,7 +76,9 @@ refused, with an error naming both owners, when:
 - one name is declared twice with a different signature (parameter types or ABI slots, or
   return);
 - a function calls its tree differently from any function of the other side with that tree id
-  (every alias is checked, not only the first).
+  (every alias is checked, not only the first, and before an exact duplicate is skipped);
+- an object's own block would take a module's declaration that names a module type: the object's
+  block resolves types in the object's scope, where a local type may shadow it.
 
 The same declaration in both is fine. Neither the result nor the refusal depends on import
 order. This applies to object-member `extern mod` blocks
@@ -90,12 +95,16 @@ So a call whose receiver is already `stack_obj` leaves the caller's cursor where
 Before this, the call saved and restored the cursor through a local that never held the found
 object, so the cursor that a `find_best_object` had just found was clobbered.
 
+The receiver stays in place unless the argument code moves the cursor (reading another object's
+cells moves it and puts back the entry object). Then the cursor is saved before the argument code
+and selected again for the call, and nothing is restored after it.
+
 ### 4. `me` is the Sim handle in inherit trees (`TreeLowerer::is_my_ident`)
 
 In a `#[context(inherit)]` tree, `me` (the frame's own object) reads typed fields and calls
 methods the same way the `sim` handle does in a Sim tree. For example:
 
-- `me.person.body`;
+- `me.skill.body`;
 - `me.motive.mood = ..`;
 - `me.id`;
 - `play_sound` and `refresh(target: me)`.
@@ -119,10 +128,14 @@ extra local or node.
 
 ### 6. Bare exit arms
 
-A match arm's short form takes `break` or `continue` followed by the arm's end, or `return` not
-followed by an assignment, as the exit. So `1 => break,` lowers as the statement, and `fmt`
-keeps it. A binding named `break` that the arm assigns (`_ => break += 1,`) still parses as the
-assignment.
+A match arm's short form is, in order:
+
+1. an assignment ended by the arm's `,` or `}` (also to a binding named `break` or `return`:
+   `_ => break += 1,`, `_ => return.person[3] += 1,`);
+2. a bare exit ended by the arm's end (`1 => break,`, `_ => return flag_set,`);
+3. an expression (the arm's value).
+
+So `1 => break,` lowers as the statement, and `fmt` keeps it.
 
 ### 7. `$Me` text and the entry save (`mir::text_words_unmoved`)
 
@@ -181,8 +194,9 @@ idles (`AirLocalUsage::uses_idle_scratch`). Before this, the word was assumed fo
   That node sets the last result, and when the return ends an active action, `release_use`
   records the last result in the action's flag. The call before the node may have left the other
   result. So the node stays, and a test pins it.
-  - The inline-branch path (no raw block) already returns the constant without the node. Whether
-    that path changes the recorded result is a separate question, flagged to the coordinator.
+  - The inline-branch path (no raw block) already returns the constant without the node, which can
+    leave the call before it as the recorded result (pre-existing on main). It is flagged to the
+    coordinator, not changed here.
 - A lint `allow` comment on its own line above an item's attributes (`#[bhav(..)]`) covers the
   attributes and the item's line, as it does directly above the item. Before this, it covered
   only the attribute line, and a finding on the `fn` line was still reported.

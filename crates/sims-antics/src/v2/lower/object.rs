@@ -941,6 +941,21 @@ fn lower_object_with(
             .get(owner.as_str())
             .and_then(|sc| sc.extern_mods.get(name))
         {
+            // The object's block resolves its types in the object's scope, where a local type
+            // may shadow the one the module's declaration names.
+            if let Some(f) = scope_decl
+                .fns
+                .iter()
+                .find(|f| crate::v2::loader::names_module_types(f))
+            {
+                return Err(Error::at(
+                    decl.span,
+                    format!(
+                        "object '{}' cannot add to extern mod '{name}' of {scope_owner}: its fn '{}' names a type of its module; add the fns to a module-level block instead",
+                        obj.name, f.name
+                    ),
+                ));
+            }
             (*owner, *decl) = crate::v2::loader::merge_extern_mods(
                 owner,
                 decl,

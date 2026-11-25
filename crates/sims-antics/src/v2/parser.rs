@@ -3417,55 +3417,58 @@ impl Parser {
         self.depth = saved_depth;
         self.tails.truncate(saved_tails);
         self.arm_tails.truncate(saved_arm_tails);
-        let span = self.span();
-        let short = (|| {
-            // `1 => break,` / `_ => return false,`: the exit itself. A binding of that name
-            // that the arm assigns (`_ => break += 1,`) is followed by its assignment.
-            let next = &self.peek_at(1).kind;
-            let bare_exit = ((self.is_ident("break") || self.is_ident("continue"))
-                && matches!(next, TokenKind::Comma | TokenKind::RBrace))
-                || (self.is_ident("return")
-                    && !matches!(
-                        next,
-                        TokenKind::Assign
-                            | TokenKind::PlusEq
-                            | TokenKind::MinusEq
-                            | TokenKind::StarEq
-                            | TokenKind::SlashEq
-                            | TokenKind::PercentEq
-                            | TokenKind::AmpEq
-                            | TokenKind::PipeEq
-                            | TokenKind::CaretEq
-                    )
-                    && !matches!(next, TokenKind::Ident(w) if w == "flag_set" || w == "flag_clear"));
-            let stmt = if bare_exit && let Some(exit) = self.parse_bare_exit()? {
-                exit
-            } else {
-                let lhs = self.parse_expr()?;
-                if let Some(op) = self.try_eat_assign_op() {
-                    let value = self.parse_expr()?;
-                    V2Stmt::Assign {
-                        span,
-                        target: lhs,
-                        op,
-                        value,
-                    }
-                } else {
-                    self.arm_tails.push(span);
-                    V2Stmt::Expr { span, expr: lhs }
-                }
-            };
-            if self.eat(&TokenKind::Comma) || self.peek().kind == TokenKind::RBrace {
-                Ok(stmt)
-            } else {
-                Err(Error::at(
-                    self.span(),
-                    "expected ',' or '}' after a match arm",
-                ))
-            }
-        })();
+        let short = self.parse_short_arm();
         // Neither form fits: the statement's diagnostic is the one to report.
         short.map_err(|_| stmt_err)
+    }
+
+    /// A match arm's short form, ended by `,` or the match's `}`: an assignment
+    /// (`1 => x = 2,`, also to a binding named `break` or `return`), a bare exit
+    /// (`1 => break,`, `_ => return false,`), or an expression (the arm's value).
+    fn parse_short_arm(&mut self) -> Result<V2Stmt> {
+        let span = self.span();
+        let at = (self.pos, self.depth, self.tails.len(), self.arm_tails.len());
+        let restore = |p: &mut Self| {
+            p.pos = at.0;
+            p.depth = at.1;
+            p.tails.truncate(at.2);
+            p.arm_tails.truncate(at.3);
+        };
+        let ends_arm =
+            |p: &mut Self| p.eat(&TokenKind::Comma) || p.peek().kind == TokenKind::RBrace;
+        let assign = (|| {
+            let target = self.parse_expr().ok()?;
+            let op = self.try_eat_assign_op()?;
+            let value = self.parse_expr().ok()?;
+            ends_arm(self).then_some(V2Stmt::Assign {
+                span,
+                target,
+                op,
+                value,
+            })
+        })();
+        if let Some(stmt) = assign {
+            return Ok(stmt);
+        }
+        restore(self);
+        if self.is_ident("break") || self.is_ident("continue") || self.is_ident("return") {
+            if let Ok(Some(exit)) = self.parse_bare_exit()
+                && ends_arm(self)
+            {
+                return Ok(exit);
+            }
+            restore(self);
+        }
+        let expr = self.parse_expr()?;
+        self.arm_tails.push(span);
+        if ends_arm(self) {
+            Ok(V2Stmt::Expr { span, expr })
+        } else {
+            Err(Error::at(
+                self.span(),
+                "expected ',' or '}' after a match arm",
+            ))
+        }
     }
 
     fn parse_match_stmt(&mut self, span: Span) -> Result<V2Stmt> {

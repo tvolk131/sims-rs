@@ -1212,3 +1212,104 @@ fn extern_merges_do_not_depend_on_import_order() {
         );
     }
 }
+
+/// Round 2 review regressions: `stack_obj.run_functional` with arguments keeps the found
+/// cursor, a short arm's `return` binding, and the typed search's score check for every
+/// scored kind.
+#[test]
+fn review_round_2_regressions() {
+    let tree = |air: &str, name: &str| {
+        let at = air.find(&format!("\"{name}\"")).expect("tree");
+        let rest = &air[at..];
+        rest[..rest.find("\n}\n").expect("tree end")].to_owned()
+    };
+    let air = build(&obj(r#"    #[bhav]
+    fn a(sim: Sim) -> bool {
+        raw { if !find_best_object(15) { return false; } }
+        if !stack_obj.run_functional(4, 7) { return false; }
+        stack_obj.data[25] = 1;
+        return true;
+    }
+    #[bhav]
+    fn b(sim: Sim, other: ObjectId) -> bool {
+        raw { if !find_best_object(15) { return false; } }
+        if !stack_obj.run_functional(4, other.data[3]) { return false; }
+        stack_obj.data[25] = 1;
+        return true;
+    }"#))
+    .0;
+    // A literal argument leaves the cursor alone.
+    let a = tree(&air, "a");
+    assert!(!a.contains("stack_obj :="), "{a}");
+    // Argument code that moves the cursor: the found one is saved first and selected again.
+    let b = tree(&air, "b");
+    let saved = b.find("let __rf_obj_1 = stack_obj;").expect("cursor saved");
+    let moved = b.find("stack_obj := param[0];").expect("argument read");
+    let call = b.find("run_functional_tree(4)").expect("call");
+    let reselect = b
+        .find("stack_obj := __rf_obj_1;")
+        .expect("cursor selected again");
+    assert!(saved < moved && moved < reselect && reselect < call, "{b}");
+    assert!(!b[call..].contains("stack_obj :="), "{b}");
+    // A binding named `return` assigned in a short arm, and `return <name>` of a binding whose
+    // name is an assignment word.
+    let air = build(&obj(
+        "    #[bhav]\n    fn a(return: ObjectId, flag_set: bool) -> bool {\n        match self.n {\n            0 => return.person[3] += 1,\n            1 => return flag_set,\n            _ => {}\n        }\n        return true;\n    }",
+    ))
+    .0;
+    assert!(air.contains("+= 1"), "{air}");
+    // The typed search's fallback checks the kind's own score word (gardening: data word 64).
+    let air = build(
+        r#"object "Garden Bed" {
+    guid: 0x7F40_0A51;
+    functional gardening { score: 0, run(sim) { return; } }
+    interaction "Tend" {
+        run(sim) {
+            let Some(bed) = find_best_object::<Self>(gardening) else { return; };
+            bed.data[2] = 1;
+        }
+    }
+}
+"#,
+    )
+    .0;
+    assert!(air.contains("if stack.data[64] > 0 {"), "{air}");
+}
+
+/// Round 2 extern merge regressions: exact duplicates still check every alias, built-in types
+/// merge across modules, and an object's block cannot take a module's typed declarations.
+#[test]
+fn extern_merge_round_2_regressions() {
+    let compile = |modules: &[(&str, &str)], src: &str| {
+        let mut cfg = PackResolverConfig::default();
+        for (name, body) in modules {
+            cfg.virtual_modules
+                .insert((*name).to_owned(), (*body).to_owned());
+        }
+        v2::expand_v2_source_to_objects("case.antics", src, &cfg)
+            .map(|o| o[0].air_source.clone())
+            .map_err(|e| e.to_string())
+    };
+    let object =
+        "object \"Bridge Probe\" {\n    guid: 0x7F40_0A52;\n    init { bridge::common(1)?; }\n}\n";
+    let a = "pub extern mod bridge {\n    #[id(4000)] fn common(n: i16) -> Result;\n    #[id(4000)] fn alias() -> bool;\n}\n";
+    let b = "pub extern mod bridge { #[id(4000)] fn common(n: i16) -> Result; }\n";
+    for (first, second) in [("a", "b"), ("b", "a")] {
+        let src = format!("use crate::{first}::bridge;\nuse crate::{second}::bridge;\n{object}");
+        let err = compile(&[("crate::a", a), ("crate::b", b)], &src).expect_err("two ABIs");
+        assert!(err.contains("calls tree 4000 two ways"), "{err}");
+    }
+    let take = "pub extern mod bridge { #[id(4000)] fn take(h: Height) -> Result; }\n";
+    let put = "pub extern mod bridge { #[id(4001)] fn put(p: Placement) -> Result; }\n";
+    let src = format!(
+        "use crate::t::bridge;\nuse crate::p::bridge;\n{}",
+        object.replace("bridge::common(1)?;", "bridge::ping_none();")
+    );
+    let err = compile(&[("crate::t", take), ("crate::p", put)], &src)
+        .expect_err("ping_none is not declared");
+    assert!(!err.contains("both name types"), "{err}");
+    let typed = "pub enum Mode { Shared = 10 }\npub extern mod bridge { #[id(4000)] fn send(mode: Mode) -> Result; }\n";
+    let src = "use crate::typed::bridge;\nuse crate::typed::Mode as ImportedMode;\nobject \"Bridge Probe\" {\n    guid: 0x7F40_0A52;\n    enum Mode { Local = 20 }\n    extern mod bridge { #[id(4001)] fn ping() -> Result; }\n    init { bridge::send(ImportedMode::Shared)?; }\n}\n";
+    let err = compile(&[("crate::typed", typed)], src).expect_err("typed module block");
+    assert!(err.contains("names a type of its module"), "{err}");
+}

@@ -517,9 +517,11 @@ fn same_extern_abi(a: &ExternFnDecl, b: &ExternFnDecl) -> bool {
             .all(|(x, y)| x.ty == y.ty && x.slot == y.slot)
 }
 
+/// Whether `ty` names a type that resolves in the declaring scope: an enum, bitflags or object of
+/// a module, or `Self` (built-in types such as `Height` are the same everywhere).
 fn names_a_module_type(ty: &V2Type) -> bool {
     match ty {
-        V2Type::Named(_) => true,
+        V2Type::Named(name) => name == "Self" || !crate::v2::ast::is_reserved_type_name(name),
         V2Type::MutRef(inner) => names_a_module_type(inner),
         _ => false,
     }
@@ -527,7 +529,7 @@ fn names_a_module_type(ty: &V2Type) -> bool {
 
 /// Whether `f` names a type of its module (an enum, an object), which resolves in the scope
 /// that owns its declaration.
-fn names_module_types(f: &ExternFnDecl) -> bool {
+pub(crate) fn names_module_types(f: &ExternFnDecl) -> bool {
     f.params.iter().any(|p| names_a_module_type(&p.ty))
         || matches!(&f.ret, ReturnAbi::Value { ty, .. } | ReturnAbi::ResultValue { ty, .. } if names_a_module_type(ty))
 }
@@ -567,6 +569,23 @@ pub(crate) fn merge_extern_mods(
     };
     let mut merged = base.clone();
     for f in &extra.fns {
+        // Every fn of the other side for the same tree, an exact duplicate's aliases too.
+        if let Some(b) = base
+            .fns
+            .iter()
+            .find(|b| b.id == f.id && !same_extern_abi(b, f))
+        {
+            return Err(Error::at(
+                at,
+                format!(
+                    "extern mod '{}' calls tree {} two ways: `{}` in {base_owner} and `{}` in {extra_owner}",
+                    base.name,
+                    f.id,
+                    extern_fn_text(b),
+                    extern_fn_text(f)
+                ),
+            ));
+        }
         if let Some(b) = base.fns.iter().find(|b| b.name == f.name) {
             let same = b.id == f.id
                 && same_extern_abi(b, f)
@@ -583,22 +602,6 @@ pub(crate) fn merge_extern_mods(
                     "extern mod '{}' declares fn '{}' twice, differently: `{}` in {base_owner} and `{}` in {extra_owner}",
                     base.name,
                     f.name,
-                    extern_fn_text(b),
-                    extern_fn_text(f)
-                ),
-            ));
-        }
-        if let Some(b) = base
-            .fns
-            .iter()
-            .find(|b| b.id == f.id && !same_extern_abi(b, f))
-        {
-            return Err(Error::at(
-                at,
-                format!(
-                    "extern mod '{}' calls tree {} two ways: `{}` in {base_owner} and `{}` in {extra_owner}",
-                    base.name,
-                    f.id,
                     extern_fn_text(b),
                     extern_fn_text(f)
                 ),

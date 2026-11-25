@@ -80,7 +80,10 @@ impl<'a> TreeLowerer<'a> {
         let is_fixed =
             |air: &str| air.parse::<i16>().is_ok() || air.starts_with("bcon.") || air == "my.id";
         let positional = args[1..].iter().filter(|a| a.name.is_none()).count();
-        let staged_target = if positional == 0 || is_fixed(&target_air) {
+        // The live cursor as receiver stays in place unless argument code moves it (below).
+        let receiver_is_cursor = target_air == "stack_obj";
+        let args_at = self.em.mark();
+        let mut staged_target = if positional == 0 || is_fixed(&target_air) || receiver_is_cursor {
             target_air
         } else {
             let staged = self.fresh("rf_obj");
@@ -149,10 +152,25 @@ impl<'a> TreeLowerer<'a> {
                 }
             }
         }
+        // Argument code that reads another object's cells moves the cursor and puts back the
+        // entry object, not the cursor the receiver named: save the cursor before it and select
+        // it again for the call (which leaves the caller's frame's cursor as it was).
+        let mut cursor_saved = false;
+        if receiver_is_cursor && self.em.since(args_at).contains("stack_obj :=") {
+            let args_text = self.em.split_off(args_at);
+            let staged = self.fresh("rf_obj");
+            self.emit_let(&staged, "stack_obj");
+            self.em.append(&args_text);
+            staged_target = staged;
+            cursor_saved = true;
+        }
         for (i, (val, _, _)) in staged_args.iter().enumerate() {
             self.line(format!("temp[{i}] := {val};"));
         }
-        let saved_stack_obj = if staged_target != "stack_obj" {
+        let saved_stack_obj = if cursor_saved {
+            self.stack_op(mir::StackObjOp::Set(&staged_target));
+            StackRestore::Unmoved
+        } else if staged_target != "stack_obj" {
             let saved = self.save_stack_obj_for_move();
             self.stack_op(mir::StackObjOp::Set(&staged_target));
             StackRestore::Moved(saved)
