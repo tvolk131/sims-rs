@@ -5,6 +5,7 @@
 //! `Neighborhood.iff` the original's save wrote last; it is local and never
 //! committed, and without it that test does nothing.
 
+use crate::common::{TempDb, TempDir};
 use sims_formats::iff::Iff;
 use sims_formats::neighborhood::{Family, Inventory, InventoryItem, Neighbor, Relationship};
 use sims_formats::neighborhood_file::{NeighborhoodFile, parse_family_name};
@@ -14,47 +15,6 @@ use sims_sim::neighborhood_save::{SAVE_INPUTS_FORMAT, SaveInputs, TEMPORARY_FILE
 use sims_sim::{NeighborhoodStore, StoredNeighborhood};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-
-struct TempDb(PathBuf);
-
-impl TempDb {
-    fn new(label: &str) -> Self {
-        let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "sims-sim-save-{label}-{}-{n}.redb",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        Self(path)
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(label: &str) -> Self {
-        let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("sims-sim-save-{label}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 fn family(house: i32, number: i32, members: Vec<u32>) -> Family {
     Family {

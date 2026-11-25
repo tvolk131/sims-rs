@@ -1,9 +1,7 @@
 //! The Buy catalog's eligibility, catalog text and category labels, on
 //! synthetic resources. No game data.
 
-mod common;
-
-use common::{Tree, far};
+use crate::common::{Tree, far};
 use sims_content::{
     BuyDefinition, BuyEligibility, BuyLabels, Catalog, CatalogText, Index, Install,
     has_interactions, master_of,
@@ -463,7 +461,7 @@ fn installed_buy_catalog_reads_cleanly() {
         return;
     };
     let install = Install::detect(std::path::Path::new(&root)).unwrap();
-    let index = Index::build(&install).unwrap();
+    let index = crate::common::installed_index(&install);
     let catalog = Catalog::build(&index).unwrap();
     let buy = catalog.buy_entries(&index, 1).unwrap();
     assert!(buy.diagnostics.is_empty(), "{:?}", buy.diagnostics);

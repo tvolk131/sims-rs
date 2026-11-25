@@ -3,19 +3,13 @@
 
 use sha2::{Digest, Sha256};
 use sims_audio::decode::Kind;
-use sims_audio::files::{self, SoundFiles, key};
+use sims_audio::files::{self, key};
 use sims_audio::{mp3, xa};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 fn install() -> Option<PathBuf> {
-    match std::env::var_os("SIMS_INSTALL") {
-        Some(path) => Some(PathBuf::from(path)),
-        None => {
-            eprintln!("SIMS_INSTALL is not set; skipping the install sound census");
-            None
-        }
-    }
+    crate::common::install("the install sound census")
 }
 
 /// FNV-1a over 16-bit samples: cheap enough for a billion samples in an
@@ -138,7 +132,7 @@ fn decode_one(entry: &files::Entry) -> Result<Decoded, String> {
 #[test]
 fn every_sound_file_in_the_install_decodes() {
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
+    let files = crate::common::sound_files(&root);
     assert!(files.problems.is_empty(), "{:?}", files.problems);
     // Every entry, shadowed ones too, so every file on disk is decoded.
     let all: Vec<&files::Entry> = files.iter().chain(&files.shadowed).collect();
@@ -228,7 +222,7 @@ fn every_sound_file_in_the_install_decodes() {
 #[test]
 fn known_samples_decode_to_pinned_pcm() {
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
+    let files = crate::common::sound_files(&root);
     let mut got_all = Vec::new();
     for path in [
         "sounddata\\phone\\Phone_ring.xa",
@@ -267,7 +261,7 @@ fn known_samples_decode_to_pinned_pcm() {
 #[ignore = "decodes about eight hours of music; run with --release -- --ignored"]
 fn every_mp3_decodes_in_full() {
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
+    let files = crate::common::sound_files(&root);
     let mut count = 0;
     for entry in files.iter().filter(|e| e.extension() == "mp3") {
         let bytes = entry.read().unwrap();

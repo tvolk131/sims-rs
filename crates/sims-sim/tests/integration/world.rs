@@ -1,4 +1,5 @@
-use sims_content::{Catalog, House, Index, Install, Neighborhood};
+use crate::common::{self, TempDb};
+use sims_content::{Catalog, House, Install, Neighborhood};
 use sims_core::{CrtRng, F32, GameRng};
 use sims_formats::lot::Array;
 use sims_formats::saved_objects::{Frame, Slot};
@@ -1353,24 +1354,9 @@ fn any_field_change_changes_the_hash() {
     assert_ne!(changed.hash(), base);
 }
 
-struct Temp(PathBuf);
-impl Temp {
-    fn new(name: &str) -> Self {
-        let path =
-            std::env::temp_dir().join(format!("sims-sim-{name}-{}.redb", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        Self(path)
-    }
-}
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 #[test]
 fn snapshots_round_trip_through_redb() {
-    let file = Temp::new("snapshots");
+    let file = TempDb::new("snapshots");
     let world = world();
     {
         let store = Snapshots::open(&file.0).unwrap();
@@ -1391,7 +1377,7 @@ fn snapshots_round_trip_through_redb() {
 
 #[test]
 fn saved_lots_round_trip_through_redb_apart_from_the_snapshots() {
-    let file = Temp::new("lots");
+    let file = TempDb::new("lots");
     let world = world();
     {
         let store = Snapshots::open(&file.0).unwrap();
@@ -1414,7 +1400,7 @@ fn saved_lots_round_trip_through_redb_apart_from_the_snapshots() {
 
 #[test]
 fn snapshot_floor_rotations_round_trip_and_clear_on_plain_save() {
-    let file = Temp::new("snapshot-floor-rot");
+    let file = TempDb::new("snapshot-floor-rot");
     let world = world();
     let mut overwritten = world.clone();
     overwritten.ticks += 7;
@@ -1564,7 +1550,7 @@ fn the_selected_sim_is_the_first_marked_person() {
 
 #[test]
 fn read_only_snapshots_never_write_the_file() {
-    let file = Temp::new("read-only");
+    let file = TempDb::new("read-only");
     assert!(ReadOnlySnapshots::open(&file.0).is_err());
     assert!(!file.0.exists(), "opening to read created the file");
     let world = world();
@@ -1616,7 +1602,7 @@ fn boots_the_goth_house() {
     let root = PathBuf::from(root);
     let install = Install::detect(&root).unwrap();
     let neighborhood = Neighborhood::open(&install.file("UserData").unwrap()).unwrap();
-    let mut index = Index::build(&install).unwrap();
+    let mut index = common::installed_index(&install);
     let characters = neighborhood.characters().unwrap().unwrap();
     index.add_characters(&characters).unwrap();
     let catalog = Catalog::build(&index).unwrap();
@@ -1632,7 +1618,7 @@ fn boots_the_goth_house() {
     assert_eq!(people, 3);
     let again = World::from_house(&house, &catalog).unwrap();
     assert_eq!(again.hash(), world.hash());
-    let file = Temp::new("goth");
+    let file = TempDb::new("goth");
     let store = Snapshots::open(&file.0).unwrap();
     store.save("boot", &world).unwrap();
     assert_eq!(

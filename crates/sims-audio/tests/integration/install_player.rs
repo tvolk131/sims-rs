@@ -3,7 +3,6 @@
 
 use sha2::{Digest, Sha256};
 use sims_audio::files::SoundFiles;
-use sims_audio::module::Module;
 use sims_audio::player::{NoSources, Player, RATE, Samples, TIMER_FRAMES};
 use sims_audio::stations::StationLists;
 use sims_audio::{Pcm, SoundEvent};
@@ -11,18 +10,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 fn install() -> Option<PathBuf> {
-    match std::env::var_os("SIMS_INSTALL") {
-        Some(path) => Some(PathBuf::from(path)),
-        None => {
-            eprintln!("SIMS_INSTALL is not set; skipping the install sound player");
-            None
-        }
-    }
+    crate::common::install("the install sound player")
 }
 
 fn player(root: &Path, seed: u64) -> Player<SoundFiles> {
-    let files = SoundFiles::scan(root).unwrap();
-    let modules = Module::load_all(&files).unwrap();
+    let files = crate::common::sound_files(root);
+    let modules = crate::common::modules(root);
     Player::new(modules, files, seed)
 }
 
@@ -65,7 +58,7 @@ fn the_registry_grows_to_24593_buckets() {
     // shared by a patch and a track), then every station patch (366
     // more): the unpause walks 24,593 buckets.
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
+    let files = crate::common::sound_files(&root);
     let mut player = player(&root, 1);
     let tables = player.registry().len();
     player.add_stations(&StationLists::build(&files));
@@ -79,7 +72,7 @@ fn the_registry_grows_to_24593_buckets() {
 #[test]
 fn the_phone_rings() {
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
+    let files = crate::common::sound_files(&root);
     let mut player = player(&root, 1);
     player.handle(
         &SoundEvent::Play {
@@ -101,7 +94,7 @@ fn the_phone_rings() {
 #[test]
 fn a_sim_takes_a_soft_footstep() {
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
+    let files = crate::common::sound_files(&root);
     let footsteps: Vec<(String, Vec<i16>)> = (1..=5)
         .map(|n| format!("sounddata\\footstep\\footstep_soft{n}.xa"))
         .map(|p| {
@@ -187,8 +180,8 @@ impl Samples for Stub {
 #[test]
 fn every_event_definition_runs_without_a_bad_instruction() {
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
-    let modules = Module::load_all(&files).unwrap();
+    let files = crate::common::sound_files(&root);
+    let modules = crate::common::modules(&root);
     // Every definition, module by module: a name several modules define
     // is run once per module, not only as the module that wins.
     let definitions: Vec<(usize, String)> = modules
@@ -269,8 +262,7 @@ fn every_event_definition_runs_without_a_bad_instruction() {
 #[test]
 fn the_first_module_defining_an_event_name_wins() {
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
-    let modules = Module::load_all(&files).unwrap();
+    let modules = crate::common::modules(&root);
     // Names (ignoring case) defined by more than one module, and how many
     // of the shadowed definitions differ from the one that wins.
     let mut first: BTreeMap<String, (usize, &sims_audio::hot::Event)> = BTreeMap::new();
@@ -301,7 +293,7 @@ fn the_first_module_defining_an_event_name_wins() {
 #[test]
 fn the_stations_are_built_from_their_directories() {
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
+    let files = crate::common::sound_files(&root);
     let lists = StationLists::build(&files);
     // Each station's sub lists and patches.
     let counts: Vec<String> = sims_audio::stations::STATIONS
@@ -346,7 +338,7 @@ fn the_stations_are_built_from_their_directories() {
 #[test]
 fn a_television_plays_its_station() {
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
+    let files = crate::common::sound_files(&root);
     let mut player = player(&root, 1);
     player.add_stations(&StationLists::build(&files));
     player.handle(
@@ -372,7 +364,7 @@ fn a_television_plays_its_station() {
 #[test]
 fn the_backyard_ambience_plays() {
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
+    let files = crate::common::sound_files(&root);
     let mut player = player(&root, 3);
     player.add_scores(&files);
     player.add_stations(&sims_audio::stations::StationLists::build(&files));
@@ -418,7 +410,7 @@ fn the_backyard_ambience_plays() {
 #[test]
 fn the_night_and_beach_loops_play_in_live_mode() {
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
+    let files = crate::common::sound_files(&root);
     let mut player = player(&root, 1);
     // Use empty scores so every sample heard comes from `nite_loop`
     // (2985) and `BeachLoop` (68259) in the install's tables, not FSC
@@ -508,7 +500,7 @@ fn the_night_and_beach_loops_play_in_live_mode() {
 #[test]
 fn effects_volume_slider_starts_and_stops_installed_night_loop() {
     let Some(root) = install() else { return };
-    let files = SoundFiles::scan(&root).unwrap();
+    let files = crate::common::sound_files(&root);
     let mut player = player(&root, 1);
     player.add_stations(&StationLists::build(&files));
 
