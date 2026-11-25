@@ -12,7 +12,8 @@ fn source(helpers: &str, args: &str, body: &str) -> String {
     state other: i16;
     const TEST_GUID = 0x7F40_0502;
     {helpers}
-    @id({PROBE}) tree probe "Probe" {args} {{
+    #[bhav(id = {PROBE}, label = "Probe")]
+    fn probe() {args} {{
         {body}
     }}
 }}

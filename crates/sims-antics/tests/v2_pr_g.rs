@@ -45,7 +45,7 @@ fn obj(members: &str) -> String {
 }
 
 fn sim_tree(body: &str) -> String {
-    obj(&format!("    tree t (sim: Sim) {{ {body} }}"))
+    obj(&format!("    #[bhav] fn t(sim: Sim) {{ {body} }}"))
 }
 
 #[test]
@@ -156,7 +156,7 @@ fn v1_builtin_arguments_are_strict() {
 fn n2_entry_save_only_when_the_entry_stack_object_is_read_after_a_move() {
     let tree = |body: &str| {
         obj(&format!(
-            "    extern mod g {{ @id(300) fn probe() -> bool; }}\n    tree t (sim: Sim) -> bool {{ {body} }}"
+            "    extern mod g {{ #[id(300)] fn probe() -> bool; }}\n    #[bhav] fn t(sim: Sim) -> bool {{ {body} }}"
         ))
     };
     // A call comes first and the loop moves `stack_obj`, but nothing reads the entry stack
@@ -210,9 +210,12 @@ fn n2_entry_save_only_when_the_entry_stack_object_is_read_after_a_move() {
 fn empty_frame_tree_has_zero_nodes_and_plain_braces_still_return_true() {
     let cfg = PackResolverConfig::default();
     let src = obj(
-        "    @id(4200) @frame(empty) tree unused \"Unused\" (sim: Sim, a: i16) {}\n    \
-         @id(4201) tree plain \"Plain\" {}\n    \
-         @id(4202) @frame(args: 2, empty, locals: 1) tree pinned \"Pinned\" {}",
+        "    #[bhav(id = 4200, label = \"Unused\", empty)]
+    fn unused(sim: Sim, a: i16) {}\n    \
+         #[bhav(id = 4201, label = \"Plain\")]
+         fn plain() {}\n    \
+         #[bhav(id = 4202, label = \"Pinned\", args = 2, empty, locals = 1)]
+         fn pinned() {}",
     );
     let air = expand("empty.antics", &src);
     assert!(air.contains("tree 4200 \"Unused\" (args: 1) {\n}"), "{air}");
@@ -239,18 +242,18 @@ fn empty_frame_tree_has_zero_nodes_and_plain_braces_still_return_true() {
 
     expect_err(
         "empty_body.antics",
-        &obj("    @frame(empty) tree t { self.n = 1; }"),
-        "@frame(empty) tree 't' has no nodes, so its body must be '{}'",
+        &obj("    #[bhav(empty)] fn t() { self.n = 1; }"),
+        "#[frame(empty)] tree 't' has no nodes, so its body must be '{}'",
     );
     expect_err(
         "empty_dup.antics",
-        &obj("    @frame(empty, empty) tree t {}"),
+        &obj("    #[bhav(empty, empty)] fn t() {}"),
         "duplicate @frame field 'empty'",
     );
     // A return value is not required of a tree that has no nodes.
     expand(
         "empty_ret.antics",
-        &obj("    @frame(empty) tree t -> bool {}"),
+        &obj("    #[bhav(empty)] fn t() -> bool {}"),
     );
 }
 
@@ -259,7 +262,8 @@ fn tier2_primitives_lower_to_their_opcodes() {
     let cfg = PackResolverConfig::default();
     let src = obj(r#"    const LIBRARY_SOUND = 0x0123;
     sound chime = preset("chime");
-    @id(4210) tree prims "Prims" (sim: Sim) {
+    #[bhav(id = 4210, label = "Prims")]
+    fn prims(sim: Sim) {
         let other = 0;
         let score = 0;
         change_suit(index: 2, scope: 1, remove: true);
@@ -276,7 +280,8 @@ fn tier2_primitives_lower_to_their_opcodes() {
         stop_all_sounds(stack_obj);
         self.n = score;
     }
-    @id(4211) tree object_side "Object Side" {
+    #[bhav(id = 4211, label = "Object Side")]
+    fn object_side() {
         play_sound(chime, stack_obj);
         play_sound(chime);
     }"#);
@@ -358,7 +363,7 @@ fn tier2_primitives_lower_to_their_opcodes() {
 fn tier2_sim_and_handle_fields() {
     let air = expand(
         "fields.antics",
-        &obj("    bitflags Marks { High = 3 }\n    tree t (sim: Sim) { \
+        &obj("    bitflags Marks { High = 3 }\n    #[bhav] fn t(sim: Sim) { \
              sim.attr[1] = 4; \
              sim.data[3] = sim.attr[1]; \
              sim.priority = 50; \
@@ -398,8 +403,9 @@ fn tier2_sim_and_handle_fields() {
 #[test]
 fn tier2_job_data_reads_scope_33_through_the_temps() {
     let src = obj(
-        "    extern mod g { @id(300) fn rate(a: i16, b: i16) -> bool; }\n    \
-         tree t (sim: Sim) { \
+        "    extern mod g { #[id(300)] fn rate(a: i16, b: i16) -> bool; }\n    \
+         #[bhav]
+         fn t(sim: Sim) { \
              let career = 3; \
              self.n = job_data(career, level: 2, field: 5); \
              temp[0] = 7; \
@@ -474,8 +480,9 @@ fn tier3_call_conditions_and_staged_temps_cost_no_extra_nodes() {
     let air = expand(
         "loops.antics",
         &obj(
-            "    extern mod g { @id(300) fn probe() -> bool; @id(301) fn rate(a: i16, b: i16) -> bool; }\n    \
-             tree t (sim: Sim) { \
+            "    extern mod g { #[id(300)] fn probe() -> bool; #[id(301)] fn rate(a: i16, b: i16) -> bool; }\n    \
+             #[bhav]
+             fn t(sim: Sim) { \
                  while !g::probe() { self.n += 1; } \
                  while g::probe() { self.n -= 1; } \
                  if g::rate(temp[0], self.n) { self.n = 0; } \
@@ -533,7 +540,7 @@ fn tier3_const_patterns_match_their_value() {
     let air = expand(
         "const_match.antics",
         &obj(
-            "    const LOW = 2;\n    const HIGH = 0x40;\n    tree t (sim: Sim) { \
+            "    const LOW = 2;\n    const HIGH = 0x40;\n    #[bhav] fn t(sim: Sim) { \
                  match self.n { LOW => { self.n = 1; } HIGH | 7 => { self.n = 3; } _ => {} } \
              }",
         ),
@@ -543,17 +550,17 @@ fn tier3_const_patterns_match_their_value() {
     for (name, members, needle) in [
         (
             "const_dup.antics",
-            "    const LOW = 2;\n    tree t { match self.n { 2 => {} LOW => {} _ => {} } }",
+            "    const LOW = 2;\n    #[bhav] fn t() { match self.n { 2 => {} LOW => {} _ => {} } }",
             "duplicate match arm for value 2 ('LOW')",
         ),
         (
             "const_wide.antics",
-            "    const BIG = 70000;\n    tree t { match self.n { BIG => {} _ => {} } }",
+            "    const BIG = 70000;\n    #[bhav] fn t() { match self.n { BIG => {} _ => {} } }",
             "outside the i16 range",
         ),
         (
             "not_const.antics",
-            "    tree t { match self.n { nothing => {} _ => {} } }",
+            "    #[bhav] fn t() { match self.n { nothing => {} _ => {} } }",
             "unexpected identifier pattern 'nothing'",
         ),
     ] {
@@ -566,7 +573,7 @@ fn tier3_match_arms_without_braces() {
     let air = expand(
         "short_arms.antics",
         &obj(
-            "    extern mod g { @id(300) fn probe() -> bool; }\n    tree t (sim: Sim) { \
+            "    extern mod g { #[id(300)] fn probe() -> bool; }\n    #[bhav] fn t(sim: Sim) { \
                  match self.n { 0 => g::probe(), 1 => self.n = 5, 2 => self.n += 1 } \
                  match self.n { 3 => return; _ => self.n = 0 } \
              }",
@@ -578,7 +585,7 @@ fn tier3_match_arms_without_braces() {
     assert!(air.contains("stack.attr[0] := 0;"), "{air}");
     expect_err(
         "short_arm_missing_comma.antics",
-        &obj("    tree t { match self.n { 0 => self.n = 1 1 => self.n = 2, _ => {} } }"),
+        &obj("    #[bhav] fn t() { match self.n { 0 => self.n = 1 1 => self.n = 2, _ => {} } }"),
         "expected ';'",
     );
 }

@@ -48,7 +48,8 @@ fn compare_air(members: &str, air_body: &str) {
 #[test]
 fn for_else_targets_the_false_exit_without_a_flag() {
     compare_air(
-        r#"@id(4300) tree scan (sim: Sim) -> bool {
+        r#"#[bhav(id = 4300)]
+fn scan(sim: Sim) -> bool {
             for visitor in lot.sims() {
                 if visitor.age >= 18 { break; }
             } else {
@@ -78,7 +79,7 @@ fn for_else_handles_every_object_iterator() {
         ("self.parts()", 3),
     ] {
         let tree = compile_tree(&format!(
-            "@id(4300) tree scan {{ for candidate in {iter} {{ break; }} else {{ return error; }} return true; }}"
+            "#[bhav(id = 4300)] fn scan() {{ for candidate in {iter} {{ break; }} else {{ return error; }} return true; }}"
         ));
         let step = tree
             .instructions
@@ -106,7 +107,8 @@ fn for_else_handles_every_object_iterator() {
 #[test]
 fn for_else_can_fall_through_and_continue_skips_it() {
     compare_air(
-        r#"@id(4300) tree scan {
+        r#"#[bhav(id = 4300)]
+fn scan() {
             for item in lot.objects() {
                 if item == 3 { break; }
                 continue;
@@ -134,7 +136,8 @@ fn for_else_restores_self_on_break_but_not_on_unmoved_exhaustion() {
     // Every iteration breaks after moving the cursor back, so exhaustion still has the entry
     // object and keeps the iterator's false result (no restore store replaces it).
     compare_air(
-        r#"@id(4300) tree scan (sim: Sim) {
+        r#"#[bhav(id = 4300)]
+fn scan(sim: Sim) {
             for item in lot.sims() {
                 stack_obj = item;
                 temp[0] = stack_obj;
@@ -164,7 +167,8 @@ fn for_else_restores_self_on_break_but_not_on_unmoved_exhaustion() {
 #[test]
 fn explicit_steps_keep_the_current_cursor_and_allow_temp_writes() {
     compare_air(
-        r#"@id(4300) @frame(locals: 0) tree scan (sim: Sim) -> bool {
+        r#"#[bhav(id = 4300, locals = 0)]
+fn scan(sim: Sim) -> bool {
             while set_to_next(guid, PROBE, dest: stack_obj) {
                 temp[0] = stack_obj;
                 if stack_obj.graphic == 3 { return true; }
@@ -178,7 +182,8 @@ fn explicit_steps_keep_the_current_cursor_and_allow_temp_writes() {
         return false;"#,
     );
     compare_air(
-        r#"@id(4300) @frame(locals: 0) tree step -> bool {
+        r#"#[bhav(id = 4300, locals = 0)]
+fn step() -> bool {
             return set_to_next(part, dest: stack_obj);
         }"#,
         "if set_to_next(3, dest: stack_obj) { return true; } return false;",
@@ -188,7 +193,8 @@ fn explicit_steps_keep_the_current_cursor_and_allow_temp_writes() {
 #[test]
 fn category_and_on_tile_keep_the_operand_bytes() {
     let tree = compile_tree(
-        r#"@id(4300) @frame(locals: 0, args: 1) tree scan -> bool {
+        r#"#[bhav(id = 4300, locals = 0, args = 1)]
+fn scan() -> bool {
             if !set_to_next(category, guid: PROBE, dest: stack_obj) { return false; }
             return set_to_next(8);
         }"#,
@@ -207,7 +213,8 @@ fn category_and_on_tile_keep_the_operand_bytes() {
 #[test]
 fn create_object_can_leave_the_result_in_stack_obj() {
     compare_air(
-        r#"@id(4300) @frame(locals: 0) tree spawn -> bool {
+        r#"#[bhav(id = 4300, locals = 0)]
+fn spawn() -> bool {
             if !create_object(PROBE, mode: here, dest: stack_obj) { return false; }
             temp[2] = stack_obj;
             return true;
@@ -217,7 +224,8 @@ fn create_object_can_leave_the_result_in_stack_obj() {
         return true;"#,
     );
     compare_air(
-        r#"@id(4300) @frame(locals: 0) tree spawn -> bool {
+        r#"#[bhav(id = 4300, locals = 0)]
+fn spawn() -> bool {
             return create_object::<Self>(dest: stack_obj);
         }"#,
         "if create_object(0x7f400800, mode: here, flags: 0) { return true; } return false;",
@@ -227,7 +235,8 @@ fn create_object_can_leave_the_result_in_stack_obj() {
 #[test]
 fn sim_self_access_preserves_the_cursor_at_a_join_and_on_the_back_edge() {
     compare_air(
-        r#"@id(4300) tree scan (sim: Sim) {
+        r#"#[bhav(id = 4300)]
+fn scan(sim: Sim) {
             while temp[1] != 0 {
                 if temp[2] != 0 { set_to_next(part, dest: stack_obj); }
                 self.value = 7;
@@ -267,7 +276,7 @@ fn cursor_syntax_rejects_unsupported_forms() {
         ("set_to_next(128);", "out of range"),
         ("create_object(PROBE, dest: temp[0]);", "expects stack_obj"),
     ] {
-        let src = source(&format!("@id(4300) tree probe {{ {body} }}"));
+        let src = source(&format!("#[bhav(id = 4300)] fn probe() {{ {body} }}"));
         let err = compile_v2_source("cursor.antics", &src, &PackResolverConfig::default())
             .expect_err(body);
         assert!(err.message.contains(expected), "{body}: {err}");

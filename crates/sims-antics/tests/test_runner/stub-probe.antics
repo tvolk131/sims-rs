@@ -8,8 +8,8 @@ object "Stub Probe" {
     sprite: Sprite::procedural("floor_lamp", primary: #101010, accent: #202020, trim: #303030);
 
     extern mod g {
-        @id(300) fn probe() -> bool;
-        @id(301) fn rate(a: i16) -> bool;
+        #[id(300)] fn probe() -> bool;
+        #[id(301)] fn rate(a: i16) -> bool;
     }
 
     state hits: i16 = 0;
@@ -22,7 +22,8 @@ object "Stub Probe" {
         }
     }
 
-    @id(4400) tree ask "Ask" {
+    #[bhav(id = 4400, label = "Ask")]
+    fn ask() {
         if g::probe() {
             self.hits += 1;
             return true;
@@ -31,14 +32,16 @@ object "Stub Probe" {
         return false;
     }
 
-    @id(4401) tree rated "Rated" {
+    #[bhav(id = 4401, label = "Rated")]
+    fn rated() {
         if g::rate(self.hits) {
             return true;
         }
         return false;
     }
 
-    @id(4402) tree nudge "Nudge" {
+    #[bhav(id = 4402, label = "Nudge")]
+    fn nudge() {
         push_interaction(menu: 0, object: self, priority: 3, flags: 0);
     }
 

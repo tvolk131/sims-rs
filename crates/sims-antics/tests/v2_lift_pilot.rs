@@ -53,18 +53,21 @@ fn lifts_dialog_action_label_destroy_and_animation() {
     let iff = compile(
         r#"object "Fable Kiosk" {
     guid: 0x7E00_00A0;
-    @id(4300) tree confirm {
+    #[bhav(id = 4300)]
+    fn confirm() {
         dialog(kind: yes_no, message: 3, title: 2)?;
         action_label(table: 431, index: 4);
         destroy_self(no_yield: true);
     }
-    @id(4301) @frame(locals: 2) tree spin {
+    #[bhav(id = 4301, locals = 2)]
+    fn spin() {
         raw {
             while !animate(clip: 11, table: 2, events: 1, flags: 32, local: 1) {}
             temp[3] := local[1];
         }
     }
-    @id(4302) tree stop_spin {
+    #[bhav(id = 4302)]
+    fn stop_spin() {
         raw {
             while !animate(clip: 0, flags: 0, local: 1) {}
             action_string(table: 432, index: 5) pad 0xff;
@@ -91,7 +94,8 @@ fn lifts_stack_sprite_flags() {
     let iff = compile(
         r#"object "Fable Tiles" {
     guid: 0x7E00_00A1;
-    @id(4300) tree update_tiles {
+    #[bhav(id = 4300)]
+    fn update_tiles() {
         stack_obj.sprite_flags[3] = 1;
         temp[3] = stack_obj.sprite_flags[6];
     }
@@ -112,26 +116,30 @@ fn lifts_stack_sprite_flags() {
 fn lifts_literal_private_calls_and_names_library_calls() {
     let iff = compile(
         r#"extern mod services {
-    @id(305) fn choose(a: i16, b: i16) -> bool;
-    @id(306) fn older() -> bool;
-    @id(307) fn fallback() -> bool;
+    #[id(305)] fn choose(a: i16, b: i16) -> bool;
+    #[id(306)] fn older() -> bool;
+    #[id(307)] fn fallback() -> bool;
 }
 object "Fable Calculator" {
     guid: 0x7E00_00A2;
-    @id(4300) tree compute(a: i16, b: i16, c: i16, d: i16) {
+    #[bhav(id = 4300)]
+    fn compute(a: i16, b: i16, c: i16, d: i16) {
         temp[3] = a;
         return true;
     }
-    @id(4301) tree caller {
+    #[bhav(id = 4301)]
+    fn caller() {
         if compute(1, 0, 0, 0) { temp[4] = 9; }
         if services::choose(-2, 3) { temp[5] = 10; }
         if services::older() { temp[6] = 11; }
         if services::fallback() { temp[7] = 12; }
     }
-    @id(4302) tree conditional_tail {
+    #[bhav(id = 4302)]
+    fn conditional_tail() {
         raw { call 4300(2, 0, 0, 0); }
     }
-    @id(4303) tree forwards_temps {
+    #[bhav(id = 4303)]
+    fn forwards_temps() {
         raw { call 4300(temps); }
     }
 }"#,
@@ -166,7 +174,8 @@ fn bcon_and_sound_identifiers_follow_resource_labels() {
     bcon 4101 "Range" { chosen = 13 }
     sound original = preset("ui_click", wav: "Fable-Ping", id: 6);
     sound other = preset("ui_click", wav: "Fable_Ping", id: 8);
-    @id(4300) tree ring {
+    #[bhav(id = 4300)]
+    fn ring() {
         temp[0] = Dial.first;
         temp[1] = Dial.second;
         temp[2] = Dial.third;
@@ -273,7 +282,8 @@ fn cli_uses_explicit_global_labels() {
     let library_object = compile(
         r#"object "Fable Aux" {
     guid: 0x7E00_00A6;
-    @id(4300) tree choose "Dial - Adjust" { return true; }
+    #[bhav(id = 4300, label = "Dial - Adjust")]
+    fn choose() { return true; }
 }"#,
     );
     let behavior = library_object.get(b"BHAV", 4300).expect("library tree");
@@ -286,10 +296,11 @@ fn cli_uses_explicit_global_labels() {
     }])
     .expect("write global IFF");
     let caller = compile(
-        r#"extern mod aux { @id(305) fn use_dial() -> bool; }
+        r#"extern mod aux { #[id(305)] fn use_dial() -> bool; }
 object "Fable Remote" {
     guid: 0x7E00_00A7;
-    @id(4300) tree dial { if aux::use_dial() { temp[2] = 42; } }
+    #[bhav(id = 4300)]
+    fn dial() { if aux::use_dial() { temp[2] = 42; } }
 }"#,
     );
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("v2-lift-pilot");
@@ -322,13 +333,16 @@ fn trees_showing_text_prove_through_lifted_strings() {
     guid: 0x7E00_00A4;
     strings 301 "Dialog prim string set" { ask = "Go on? $Local:0", head = "Sign \"A\"" }
     strings 431 "Action labels" { a = "Read", b = "Wave" }
-    @id(4300) tree confirm {
+    #[bhav(id = 4300)]
+    fn confirm() {
         dialog(kind: yes_no, message: ask, title: head, icon_mode: 1)?;
     }
-    @id(4301) tree label {
+    #[bhav(id = 4301)]
+    fn label() {
         action_label(table: 431, index: 2);
     }
-    @id(4302) tree plain {
+    #[bhav(id = 4302)]
+    fn plain() {
         temp[0] = 1;
     }
 }"#;
@@ -400,7 +414,8 @@ fn tables_the_vm_reads_another_way_are_not_written() {
     let source = r#"object "Fable Notice" {
     guid: 0x7E00_00A6;
     strings 301 "Dialog prim string set" { ask = "Alpha" }
-    @id(4300) tree confirm {
+    #[bhav(id = 4300)]
+    fn confirm() {
         dialog(kind: 0, message: 1, title: 1)?;
     }
 }"#;
@@ -498,13 +513,16 @@ fn fallback_text_tables_and_tableless_dialogs() {
     guid: 0x7E00_00A5;
     strings 301 "Dialog prim string set" { ask = "Go on?" }
     strings 431 "Notes" { a = "Read" }
-    @id(4300) tree confirm {
+    #[bhav(id = 4300)]
+    fn confirm() {
         dialog(kind: yes_no, message: ask)?;
     }
-    @id(4301) tree note {
+    #[bhav(id = 4301)]
+    fn note() {
         raw { show_string(table: 431, index: 1); }
     }
-    @id(4302) tree pick {
+    #[bhav(id = 4302)]
+    fn pick() {
         dialog(kind: 5)?;
     }
 }"#,
@@ -541,13 +559,15 @@ fn zero_node_trees_lift_as_frame_empty() {
     let iff = compile(
         r#"object "Fable Empty" {
     guid: 0x7E00_00B0;
-    @id(4300) @frame(args: 4, empty) tree start_fire "start fire" {}
-    @id(4301) tree other "Other" { temp[0] = 1; }
+    #[bhav(id = 4300, label = "start fire", args = 4, empty)]
+    fn start_fire() {}
+    #[bhav(id = 4301, label = "Other")]
+    fn other() { temp[0] = 1; }
 }"#,
     );
     let lifted = round_trip(&iff, &DecompileV2Options::default());
     assert!(
-        lifted.contains("revision: 0, empty) tree start_fire_4300 \"start fire\" {}"),
+        lifted.contains("revision: 0, empty) #[bhav(label = \"start fire\")] fn start_fire_4300() {}"),
         "{lifted}"
     );
 }
@@ -557,11 +577,13 @@ fn lifts_suit_burn_and_look_primitives() {
     let iff = compile(
         r#"object "Fable Costume Stand" {
     guid: 0x7E00_00B0;
-    @id(4300) tree adjust {
+    #[bhav(id = 4300)]
+    fn adjust() {
         change_suit(index: 3, scope: 1, remove: true);
         if burn(mode: 1, flags: 2) { look_towards(mode: -1); }
     }
-    @id(4301) tree trim {
+    #[bhav(id = 4301)]
+    fn trim() {
         raw { change_suit(index: 4, scope: 1) pad(7: 0xff); }
     }
 }"#,
@@ -583,11 +605,13 @@ fn lifts_literal_drop_slots_and_supported_routing_modes() {
     let iff = compile(
         r#"object "Fable Parcel Rack" {
     guid: 0x7E00_00B1;
-    @id(4300) @frame(args: 1) tree place {
+    #[bhav(id = 4300, args = 1)]
+    fn place() {
         if route_to(0, flags: 1, source: 0) { snap(3, mode: 4); }
         drop_onto(src: -1, dst: 2);
     }
-    @id(4301) @frame(args: 1) tree parameter_slot {
+    #[bhav(id = 4301, args = 1)]
+    fn parameter_slot() {
         raw { drop_onto(param[0], 2); }
     }
 }"#,
@@ -609,7 +633,8 @@ fn lifts_location_local_and_generic_calls() {
     let iff = compile(
         r#"object "Fable Survey Kit" {
     guid: 0x7E00_00B2;
-    @id(4300) @frame(locals: 2) tree survey {
+    #[bhav(id = 4300, locals = 2)]
+    fn survey() {
         raw {
             local[1] := 12;
             if find_location(mode: 3, flags: 1, local: 1) {
@@ -618,7 +643,8 @@ fn lifts_location_local_and_generic_calls() {
             find_location(mode: 1, flags: 0);
         }
     }
-    @id(4301) @frame(locals: 3) tree pinned {
+    #[bhav(id = 4301, locals = 3)]
+    fn pinned() {
         raw {
             local[1] := 12;
             local[2] := 14;
@@ -647,7 +673,8 @@ fn lifts_relationship_locals_and_keeps_other_value_operands_raw() {
     let iff = compile(
         r#"object "Fable Matchbook" {
     guid: 0x7E00_00B3;
-    @id(4300) @frame(args: 1, locals: 2) tree score {
+    #[bhav(id = 4300, args = 1, locals = 2)]
+    fn score() {
         raw {
             local[0] := 11;
             relationship(column: 1, dir: 2, flags: 0, local: 0, value: local[1]);
@@ -657,7 +684,8 @@ fn lifts_relationship_locals_and_keeps_other_value_operands_raw() {
             }
         }
     }
-    @id(4301) @frame(args: 1) tree nonlocals {
+    #[bhav(id = 4301, args = 1)]
+    fn nonlocals() {
         raw {
             relationship(column: 1, dir: 0, flags: 4, value: 12);
             relationship(column: 1, dir: 0, flags: 4, value: temp[0]);
@@ -680,7 +708,7 @@ fn lifts_relationship_locals_and_keeps_other_value_operands_raw() {
     // Only the non-local values stay raw: `@slot` pins the named locals without a raw
     // block.
     assert_eq!(lifted.matches("raw {").count(), 1, "{lifted}");
-    assert!(lifted.contains("@slot(1) let slot_1: i16;"), "{lifted}");
+    assert!(lifted.contains("#[slot(1)] let slot_1: i16;"), "{lifted}");
 }
 
 #[test]
@@ -689,12 +717,14 @@ fn lifts_flagged_sound_and_keeps_the_reserved_flags_byte_raw() {
         r#"object "Fable Bell Cabinet" {
     guid: 0x7E00_00B4;
     sound trill = preset("ui_click", wav: "Fable-Trill", id: 6);
-    @id(4300) tree ring {
+    #[bhav(id = 4300)]
+    fn ring() {
         play_sound(trill, stack_obj, flags: 5);
         play_sound(99, flags: 8);
         stop_all_sounds(stack_obj);
     }
-    @id(4301) tree reserved {
+    #[bhav(id = 4301)]
+    fn reserved() {
         raw { play_sound(6, flags: 255); }
     }
 }"#,
@@ -716,7 +746,8 @@ fn lifts_job_data_with_the_staged_career_and_level() {
     let iff = compile(
         r#"object "Fable Ledger" {
     guid: 0x7E00_00B5;
-    @id(4300) tree lookup {
+    #[bhav(id = 4300)]
+    fn lookup() {
         temp[3] = job_data(4, 2, 5);
         temp[4] = job_data(temp[0], 3, 6);
     }
@@ -737,14 +768,17 @@ fn lifts_distance_with_and_without_a_stack_object_move() {
     let iff = compile(
         r#"object "Fable Range Meter" {
     guid: 0x7E00_00B6;
-    @id(4300) tree measure {
+    #[bhav(id = 4300)]
+    fn measure() {
         temp[7] = distance_to(stack_obj, from: self, temp: 3);
     }
-    @id(4301) tree measure_self {
+    #[bhav(id = 4301)]
+    fn measure_self() {
         temp[7] = distance_to(self, temp: 2);
         temp[6] = stack_obj;
     }
-    @id(4302) tree keep_distance_in_temp {
+    #[bhav(id = 4302)]
+    fn keep_distance_in_temp() {
         raw { get_distance_to(temp[0]); }
         temp[7] = 2;
     }
@@ -766,7 +800,8 @@ fn lifts_sim_attributes_data_container_and_personality() {
     let iff = compile(
         r#"object "Fable Profile Card" {
     guid: 0x7E00_00B7;
-    @id(4300) tree profile (sim: Sim) {
+    #[bhav(id = 4300)]
+    fn profile(sim: Sim) {
         sim.attr[3] = 1;
         sim.data[4] = sim.attr[3];
         temp[2] = sim.container;
@@ -795,7 +830,8 @@ fn lifts_handle_flags_and_preserves_numeric_flag_operations() {
     let iff = compile(
         r#"object "Fable Switchboard" {
     guid: 0x7E00_00B8;
-    @id(4300) tree switch {
+    #[bhav(id = 4300)]
+    fn switch() {
         stack_obj.flags = self.flags;
         if stack_obj.flags.is_empty() { self.flags = stack_obj.flags; }
         raw {
@@ -824,12 +860,17 @@ fn comparisons_returned_whole_lift_as_return() {
     let iff = compile(
         r#"object "Fable Gauge" {
     guid: 0x7E00_00B1;
-    state level @ 2: i16;
-    @id(4300) tree full "Full" { return self.level > 3; }
-    @id(4301) tree empty "Empty" { return !(self.level == 0); }
-    @id(4302) tree low "Low" { if self.level > 3 { return false; } else { return true; } }
-    @id(4303) tree rich "Rich" { return can_afford(5, category: 0); }
-    @id(4304) tree poor "Poor" { if can_afford(5, category: 0) { return false; } return true; }
+    #[slot(2)] state level: i16;
+    #[bhav(id = 4300, label = "Full")]
+    fn full() { return self.level > 3; }
+    #[bhav(id = 4301, label = "Empty")]
+    fn empty() { return !(self.level == 0); }
+    #[bhav(id = 4302, label = "Low")]
+    fn low() { if self.level > 3 { return false; } else { return true; } }
+    #[bhav(id = 4303, label = "Rich")]
+    fn rich() { return can_afford(5, category: 0); }
+    #[bhav(id = 4304, label = "Poor")]
+    fn poor() { if can_afford(5, category: 0) { return false; } return true; }
 }"#,
     );
     let lifted = round_trip(&iff, &DecompileV2Options::default());
@@ -852,7 +893,7 @@ fn redundant_bool_return_suggestions_prove_equivalent() {
     // primitive call with a `bool` literal argument (which must not count as foldable).
     let object = |body: &str| {
         format!(
-            "object \"Fable Pantry\" {{\n    guid: 0x7E00_00B2;\n    state level @ 2: i16;\n    @id(4300) tree ran \"Ran\" {{\n        self.level = 1;\n{body}\n    }}\n}}"
+            "object \"Fable Pantry\" {{\n    guid: 0x7E00_00B2;\n    #[slot(2)] state level: i16;\n    #[bhav(id = 4300, label = \"Ran\")] fn ran() {{\n        self.level = 1;\n{body}\n    }}\n}}"
         )
     };
     let flagged = object(
@@ -881,7 +922,8 @@ fn an_empty_string_table_lifts_empty() {
         r#"object "Fable Sign" {
     guid: 0x7E00_00B3;
     strings 431 "Empty" {}
-    @id(4300) tree label { action_label(table: 431, index: 1); }
+    #[bhav(id = 4300)]
+    fn label() { action_label(table: 431, index: 1); }
 }"#,
     );
     let lifted = round_trip(&iff, &DecompileV2Options::default());
@@ -895,7 +937,8 @@ fn picker_dialogs_read_no_strings() {
     let source = r#"object "Fable Map" {
     guid: 0x7E00_00B4;
     strings 301 "Dialog prim string set" { ask = "Alpha" }
-    @id(4300) tree pick { dialog(kind: 5, message: 1)?; }
+    #[bhav(id = 4300)]
+    fn pick() { dialog(kind: 5, message: 1)?; }
 }"#;
     let mut table = vec![0xFD, 0xFF, 2, 0];
     for (language, text) in [(1u8, "Alpha"), (2, "Alphe")] {
@@ -927,7 +970,8 @@ fn a_lifecycle_tree_written_plain_says_so() {
     let iff = compile(
         r#"object "Fable Plinth" {
     guid: 0x7E00_00B5;
-    @id(4300) @frame(empty) tree rest "Rest" {}
+    #[bhav(id = 4300, label = "Rest", empty)]
+    fn rest() {}
 }"#,
     );
     let objd = iff.chunks.iter().find(|c| &c.tag == b"OBJD").unwrap();

@@ -3332,7 +3332,8 @@ object "Domain Probe" {
 
     state served: i16;
 
-    tree serve "Serve" (sim: Sim, meal: Meal, count: i16) {
+    #[bhav(label = "Serve")]
+    fn serve(sim: Sim, meal: Meal, count: i16) {
         BODY
     }
 
@@ -3624,7 +3625,8 @@ pub enum Mode {
 pub template Gadget {
     state level: i16;
 
-    tree run_mode "Run Mode" (mode: Mode) {
+    #[bhav(label = "Run Mode")]
+    fn run_mode(mode: Mode) {
         self.level = 1;
         if mode == Mode::Turbo {
             self.level = 2;
@@ -3675,7 +3677,8 @@ fn v2_enum_domains_follow_the_declaring_module() {
     let overridden = mode_pack(
         &dir.join("overridden"),
         r#"
-    tree run_mode "Run Mode Two" (mode: Mode) {
+    #[bhav(label = "Run Mode Two")]
+    fn run_mode(mode: Mode) {
         self.level = 3;
     }
 "#,
@@ -3703,7 +3706,7 @@ fn v2_enum_domains_allow_extra_frame_arguments() {
             .replace("BODY", PLAIN_BODY.trim_start())
             .replace(
                 "    tree serve \"Serve\"",
-                "    @frame(args: 3)\n    tree serve \"Serve\"",
+                "    #[frame(args = 3)]\n    tree serve \"Serve\"",
             ),
     )
     .unwrap();
@@ -3823,7 +3826,7 @@ fn v2_enum_domains_follow_pinned_ids() {
             .replace("BODY", PLAIN_BODY.trim_start())
             .replace(
                 "    tree serve \"Serve\"",
-                "    @id(4201) tree tidy \"Serve\" () {\n        self.served = 0;\n    }\n\n    @id(4200) tree serve \"Serve\"",
+                "    #[bhav(id = 4201, label = \"Serve\")] fn tidy() {\n        self.served = 0;\n    }\n\n    #[id(4200)] tree serve \"Serve\"",
             ),
     )
     .unwrap();

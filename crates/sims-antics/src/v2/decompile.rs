@@ -3132,7 +3132,7 @@ impl Model {
                         _ => (String::new(), String::new()),
                     };
                 let ident = &self.extern_calls[id];
-                out.line(format!("@id({id}) fn {ident}({params}) -> bool;{comment}"));
+                out.line(format!("#[id({id})] fn {ident}({params}) -> bool;{comment}"));
             }
             out.indent -= 1;
             out.line("}");
@@ -3142,7 +3142,7 @@ impl Model {
             out.line("extern bcon library_consts {");
             out.indent += 1;
             for (addr, name) in &self.extern_bcons {
-                out.line(format!("{name} @ {addr};"));
+                out.line(format!("#[addr({addr})] {name};"));
             }
             out.indent -= 1;
             out.line("}");
@@ -3211,7 +3211,7 @@ impl Model {
         }
         let strings_lines = strings_start..out.lines.len();
         for s in &self.states {
-            out.line(format!("state attr_{s} @ {s}: i16;"));
+            out.line(format!("#[slot({s})] state attr_{s}: i16;"));
         }
         if !self.sounds.is_empty() {
             out.line("");
@@ -3242,7 +3242,8 @@ impl Model {
             let as_lifecycle = t.lifecycle.filter(|_| !plan.standalone.contains(&t.id));
             match as_lifecycle {
                 Some(kind) if !plan.framed.contains(&t.id) => {
-                    out.line(format!("@id({}) {} {{", t.id, kind.keyword()));
+                    out.line(format!("#[id({})]", t.id));
+                    out.line(format!("{} {{", kind.keyword()));
                 }
                 Some(kind) => {
                     // The block keeps the tree's own header, as a plain tree does.
@@ -3250,17 +3251,13 @@ impl Model {
                     let frame_kind = if b.kind == 0 {
                         String::new()
                     } else {
-                        format!(", kind: {}", b.kind)
+                        format!(", kind = {}", b.kind)
                     };
                     out.line(format!(
-                        "@id({}) @frame(args: {}, locals: {}, format: {:#06x}, revision: {}{frame_kind}) {} {{",
-                        t.id,
-                        b.args,
-                        b.locals,
-                        b.format,
-                        b.revision,
-                        kind.keyword()
+                        "#[bhav(id = {}, args = {}, locals = {}, format = {:#06x}, revision = {}{frame_kind})]",
+                        t.id, b.args, b.locals, b.format, b.revision,
                     ));
+                    out.line(format!("{} {{", kind.keyword()));
                 }
                 None => {
                     if let Some(kind) = t.lifecycle {
@@ -3277,36 +3274,31 @@ impl Model {
                     if let Some(&arity) = self.literal_calls.get(&t.id) {
                         params.extend(call_params(arity));
                     }
-                    let ctx = if params.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", params.join(", "))
-                    };
                     let mut kind = if b.kind == 0 {
                         String::new()
                     } else {
-                        format!(", kind: {}", b.kind)
+                        format!(", kind = {}", b.kind)
                     };
-                    // A 0-node tree (entering it faults) is `@frame(empty)` with a `{}` body.
+                    // A 0-node tree (entering it faults) is `empty` with a `{}` body.
                     if b.instructions.is_empty() {
                         kind.push_str(", empty");
                     }
                     let context = if plan.inherits(t) {
                         extras.insert(t.id);
-                        " @context(inherit)"
+                        ", context = inherit"
                     } else {
                         ""
                     };
+                    let label = if t.label == t.ident {
+                        String::new()
+                    } else {
+                        format!(", label = \"{}\"", v2_string_literal(&t.label))
+                    };
                     out.line(format!(
-                        "@id({}) @frame(args: {}, locals: {}, format: {:#06x}, revision: {}{kind}){context} tree {} \"{}\"{ctx} {{",
-                        t.id,
-                        b.args,
-                        b.locals,
-                        b.format,
-                        b.revision,
-                        t.ident,
-                        v2_string_literal(&t.label)
+                        "#[bhav(id = {}{label}, args = {}, locals = {}, format = {:#06x}, revision = {}{kind}{context})]",
+                        t.id, b.args, b.locals, b.format, b.revision,
                     ));
+                    out.line(format!("fn {}({}) {{", t.ident, params.join(", ")));
                 }
             }
             out.indent += 1;
@@ -3342,10 +3334,10 @@ impl Model {
                         extras: std::cell::Cell::new(false),
                     };
                     if named_locals > 0 && tr.extra() {
-                        // `@slot` pins each word the builtins address by number; the
+                        // `#[slot]` pins each word the builtins address by number; the
                         // build keeps a pinned word in the frame even when nothing names it.
                         for i in 0..named_locals {
-                            out.line(format!("@slot({i}) let slot_{i}: i16;"));
+                            out.line(format!("#[slot({i})] let slot_{i}: i16;"));
                         }
                     }
                     let body = match tr.hoisted_save {
@@ -3965,7 +3957,7 @@ impl Translator<'_> {
             || then_arm.len() != else_arm.len()
             || then_arm.iter().any(|l| {
                 let t = l.trim_start();
-                l.contains("raw {") || t.starts_with('@') || t.starts_with("let ") || t.is_empty()
+                l.contains("raw {") || t.starts_with("#[") || t.starts_with("let ") || t.is_empty()
             })
         {
             return;

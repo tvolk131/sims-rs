@@ -67,7 +67,8 @@ fn tree<'a>(air: &'a str, name: &str) -> &'a str {
 fn out_operand_writes_do_not_keep_the_entry_save() {
     let air = expand(
         "outs.antics",
-        &obj(r#"    tree t (sim: Sim) {
+        &obj(r#"    #[bhav]
+    fn t(sim: Sim) {
         let a: i16;
         let ev: i16;
         random_into(a, 10);
@@ -79,13 +80,15 @@ fn out_operand_writes_do_not_keep_the_entry_save() {
         route_to(front);
         raw { if random(temp[0], 3) { temp[1] := 2; } }
     }
-    tree u (sim: Sim) {
+    #[bhav]
+    fn u(sim: Sim) {
         let a: i16;
         relationship(column: 0, dir: 0, flags: 0, value: a);
         stack_obj = sim.container;
         sim.attr[1] = a;
     }
-    tree v (sim: Sim) {
+    #[bhav]
+    fn v(sim: Sim) {
         let ev: i16;
         stack_obj = sim.container;
         animate(clip: 1, table: 0, events: 1, local: ev) |e| {
@@ -106,7 +109,8 @@ fn out_operand_writes_do_not_keep_the_entry_save() {
 fn a_read_of_an_unwritten_out_operand_keeps_the_entry_save() {
     let air = expand(
         "unwritten.antics",
-        &obj(r#"    tree t (sim: Sim) {
+        &obj(r#"    #[bhav]
+    fn t(sim: Sim) {
         let a: i16;
         let ev: i16;
         random_into(a, 10);
@@ -115,7 +119,8 @@ fn a_read_of_an_unwritten_out_operand_keeps_the_entry_save() {
         while !animate(clip: 1, table: 0, events: 0, local: ev) {}
         sim.attr[1] = ev;
     }
-    tree u (sim: Sim) {
+    #[bhav]
+    fn u(sim: Sim) {
         let a: i16;
         let ev: i16;
         random_into(a, 10);
@@ -124,7 +129,8 @@ fn a_read_of_an_unwritten_out_operand_keeps_the_entry_save() {
         if relationship(column: 0, dir: 0, flags: 1, value: ev) {}
         sim.attr[1] = ev;
     }
-    tree v (sim: Sim) {
+    #[bhav]
+    fn v(sim: Sim) {
         let a: i16;
         let ev: i16;
         random_into(a, 10);
@@ -152,7 +158,8 @@ fn a_read_of_an_unwritten_out_operand_keeps_the_entry_save() {
 fn sim_cells_do_not_clobber_the_stack_object() {
     let air = expand(
         "sim_cells.antics",
-        &obj(r#"    tree t (sim: Sim) {
+        &obj(r#"    #[bhav]
+    fn t(sim: Sim) {
         sim.attr[2] = sim.data[3];
         self.n = 1;
     }"#),
@@ -169,7 +176,8 @@ fn sim_cells_do_not_clobber_the_stack_object() {
 fn raw_blocks_that_restore_the_stack_object_drop_the_save() {
     let air = expand(
         "raw_restore.antics",
-        &obj(r#"    tree t (sim: Sim) {
+        &obj(r#"    #[bhav]
+    fn t(sim: Sim) {
         raw {
             local[0] := stack_obj;
             stack_obj := my.data[2];
@@ -197,7 +205,8 @@ fn text_formatting_keeps_user_locals_in_place() {
         title = "Count",
         msg = "From $Local:0 to $Local:1",
     }
-    tree t {
+    #[bhav]
+    fn t() {
         let start = self.n;
         let stop = self.n + 4;
         dialog(kind: ok, title: title, message: msg);
@@ -219,7 +228,8 @@ fn text_formatting_keeps_user_locals_in_place() {
 fn relationship_value_takes_cells_and_constants() {
     let air = expand(
         "rel.antics",
-        &obj(r#"    tree t (sim: Sim) {
+        &obj(r#"    #[bhav]
+    fn t(sim: Sim) {
         let o = 0;
         relationship(column: 0, dir: 2, flags: 4, local: o, value: 25);
         relationship(column: 1, dir: 0, flags: 4, value: self.n);
@@ -257,7 +267,7 @@ fn relationship_value_takes_cells_and_constants() {
     ] {
         expect_err(
             name,
-            &obj(&format!("    tree t (sim: Sim) {{ {body} }}")),
+            &obj(&format!("    #[bhav] fn t(sim: Sim) {{ {body} }}")),
             needle,
         );
     }
@@ -269,7 +279,8 @@ fn relationship_value_takes_cells_and_constants() {
 fn relationship_reads_store_into_their_local() {
     let air = expand(
         "rel_write.antics",
-        &obj(r#"    tree t (sim: Sim) {
+        &obj(r#"    #[bhav]
+    fn t(sim: Sim) {
         let score = 3;
         relationship(column: 0, dir: 0, flags: 0, value: score);
         self.n = score;
@@ -288,10 +299,14 @@ fn relationship_reads_store_into_their_local() {
 fn return_compare_keeps_its_operator() {
     let air = expand(
         "ret.antics",
-        &obj(r#"    tree a { return self.n == 1; }
-    tree b { return self.n != 1; }
-    tree c { return !(self.n == 1); }
-    tree d { if self.n != 1 { return true; } return false; }"#),
+        &obj(r#"    #[bhav]
+    fn a() { return self.n == 1; }
+    #[bhav]
+    fn b() { return self.n != 1; }
+    #[bhav]
+    fn c() { return !(self.n == 1); }
+    #[bhav]
+    fn d() { if self.n != 1 { return true; } return false; }"#),
     );
     assert!(tree(&air, "a").contains("if my.attr[0] == 1 {"));
     assert!(tree(&air, "b").contains("if my.attr[0] != 1 {"));
@@ -327,7 +342,8 @@ fn specialize_guid_into_a_primitive_operand() {
         "spec_guid.antics",
         &obj(r#"    const ITEM_A = 0x7F40_1001;
     const ITEM_B = 0x7F40_1002;
-    tree take (sim: Sim) {
+    #[bhav]
+    fn take(sim: Sim) {
         loop {
             const ITEM = match self.n {
                 1 => ITEM_A,
@@ -366,7 +382,8 @@ fn specialize_guid_into_a_primitive_operand() {
 fn specialize_label_with_a_statement_between() {
     let air = expand(
         "spec_label.antics",
-        &obj(r#"    tree label (spell: i16) {
+        &obj(r#"    #[bhav]
+    fn label(spell: i16) {
         const LABEL = match spell {
             1 => 13,
             2 => 14,
@@ -402,7 +419,8 @@ fn specialize_label_with_a_statement_between() {
 fn specialize_a_tuple_into_a_two_statement_tail() {
     let air = expand(
         "spec_tuple.antics",
-        &obj(r#"    tree odds (sim: Sim) {
+        &obj(r#"    #[bhav]
+    fn odds(sim: Sim) {
         const (WEAR, ODDS) = if self.n == 1 {
             (10, 100)
         } else if self.n == 2 {
@@ -441,7 +459,8 @@ fn specialize_inline_builtin_operands() {
     let air = expand(
         "spec_inline.antics",
         &obj(r#"    const CLIP_C = 3;
-    tree anim (sim: Sim) {
+    #[bhav]
+    fn anim(sim: Sim) {
         let roll: i16;
         let ev: i16;
         random_into(roll, 3);
@@ -473,7 +492,8 @@ fn specialize_regions_patterns_and_nesting() {
     let air = expand(
         "spec_regions.antics",
         &obj(r#"    const LOW = 1;
-    tree t (k: i16) {
+    #[bhav]
+    fn t(k: i16) {
         const BASE = match k {
             1 => 10,
             _ => 20,
@@ -483,7 +503,8 @@ fn specialize_regions_patterns_and_nesting() {
         self.attr[2] = total;
         return true;
     }
-    tree u (k: i16) {
+    #[bhav]
+    fn u(k: i16) {
         const PICK = match k {
             0 => LOW,
             _ => 2,
@@ -500,7 +521,8 @@ fn specialize_regions_patterns_and_nesting() {
         self.attr[5] = B;
         return true;
     }
-    tree w (k: i16) {
+    #[bhav]
+    fn w(k: i16) {
         const UNUSED = match k {
             0 => 1,
             _ => return false,
@@ -586,7 +608,7 @@ fn specialize_rejects_unsound_bindings() {
     ] {
         expect_err(
             name,
-            &obj(&format!("    tree t (k: i16) {{ {body} return true; }}")),
+            &obj(&format!("    #[bhav] fn t(k: i16) {{ {body} return true; }}")),
             needle,
         );
     }
@@ -595,7 +617,8 @@ fn specialize_rejects_unsound_bindings() {
 /// `fmt` keeps a binding as written (it is token based), and lint accepts it.
 #[test]
 fn specialize_survives_fmt_and_lint() {
-    let src = obj(r#"    tree label (spell: i16) {
+    let src = obj(r#"    #[bhav]
+    fn label(spell: i16) {
         const LABEL = match spell {
             1 => 13,
             _ => return false,
@@ -644,7 +667,7 @@ fn raw_blocks_resolve_consts_and_tuning_entries() {
     }
 "#;
     let named = obj(&format!(
-        r#"{consts}    @id(4300) tree t (sim: Sim) {{
+        r#"{consts}    #[bhav(id = 4300)] fn t(sim: Sim) {{
         raw {{
             my.attr[SLOT] := SLOT;
             expr(my.attr[0] == SLOT) -> true: @done, false: exit;
@@ -662,7 +685,7 @@ fn raw_blocks_resolve_consts_and_tuning_entries() {
 "#
     ));
     let literal = obj(&format!(
-        r#"{consts}    @id(4300) tree t (sim: Sim) {{
+        r#"{consts}    #[bhav(id = 4300)] fn t(sim: Sim) {{
         raw {{
             my.attr[3] := 3;
             expr(my.attr[0] == 3) -> true: @done, false: exit;
@@ -702,7 +725,8 @@ fn raw_blocks_resolve_consts_and_tuning_entries() {
 /// or after the declaration, since `.air` locals are tree-wide.
 #[test]
 fn raw_locals_shadow_consts_tree_wide() {
-    let body = r#"    @id(4300) tree t {
+    let body = r#"    #[bhav(id = 4300)]
+    fn t() {
         raw { temp[0] := k; }
         raw {
             local k;
@@ -745,8 +769,9 @@ fn bhav_locals(name: &str, src: &str, id: u16) -> u16 {
 /// around it (not the words after it), so the frame stays as small as the pin allows.
 #[test]
 fn slot_lets_pin_their_word_and_pack_the_rest() {
-    let src = obj(r#"    tree t (sim: Sim) {
-        @slot(3) let ev: i16;
+    let src = obj(r#"    #[bhav]
+    fn t(sim: Sim) {
+        #[slot(3)] let ev: i16;
         let a = sim.attr[2];
         let b = sim.attr[3] + a;
         while !animate(clip: 1, table: 0, events: 0, local: ev) {
@@ -780,8 +805,9 @@ fn slot_lets_share_words_with_raw_and_text() {
         title = "Count",
         msg = "Left $Local:2",
     }
-    tree u (sim: Sim) {
-        @slot(5) let pref: i16;
+    #[bhav]
+    fn u(sim: Sim) {
+        #[slot(5)] let pref: i16;
         if sim.attr[0] == 1 {
             pref = sim.data[9];
         }
@@ -793,8 +819,9 @@ fn slot_lets_share_words_with_raw_and_text() {
             temp[1] := __w;
         }
     }
-    tree v {
-        @slot(2) let left = self.n + 4;
+    #[bhav]
+    fn v() {
+        #[slot(2)] let left = self.n + 4;
         dialog(kind: ok, title: title, message: msg);
     }
 "#),
@@ -821,9 +848,10 @@ fn slot_lets_share_words_with_raw_and_text() {
 fn slot_lets_reject_unsound_pins() {
     expect_err(
         "slot_twice.antics",
-        &obj(r#"    tree t {
-        @slot(1) let a = 1;
-        @slot(1) let b = 2;
+        &obj(r#"    #[bhav]
+    fn t() {
+        #[slot(1)] let a = 1;
+        #[slot(1)] let b = 2;
         self.n = a + b;
     }
 "#),
@@ -832,33 +860,35 @@ fn slot_lets_reject_unsound_pins() {
     expect_err(
         "slot_inline.antics",
         &obj(r#"    fn helper() -> i16 {
-        @slot(1) let a = 1;
+        #[slot(1)] let a = 1;
         return a;
     }
-    tree t { self.n = helper(); }
+    #[bhav]
+    fn t() { self.n = helper(); }
 "#),
         "not allowed in an inlined helper",
     );
     expect_err(
         "slot_push.antics",
-        &obj(r#"    tree go_run (sim: Sim) {
-        @slot(1) let a = 1;
+        &obj(r#"    #[bhav]
+    fn go_run(sim: Sim) {
+        #[slot(1)] let a = 1;
         let o = stack_obj;
         stack_obj = sim;
         push_interaction(object: o, menu: 0, priority: 2, icon: o);
         self.n = a;
     }
 "#),
-        "cannot share a tree with '@slot(N) let'",
+        "cannot share a tree with '#[slot(N)] let'",
     );
     expect_err(
         "slot_range.antics",
-        &obj("    tree t { @slot(300) let a = 1; self.n = a; }\n"),
+        &obj("    #[bhav] fn t() { #[slot(300)] let a = 1; self.n = a; }\n"),
         "out of range",
     );
     expect_err(
         "slot_some.antics",
-        &obj("    tree t { @slot(1) let Some(x) = find(PROBE) else { return; } }\n"),
+        &obj("    #[bhav] fn t() { #[slot(1)] let Some(x) = find(PROBE) else { return; } }\n"),
         "applies to 'let x = ..;'",
     );
 }
@@ -866,12 +896,13 @@ fn slot_lets_reject_unsound_pins() {
 /// Disjoint scopes may reuse a slot, and `@slot` survives `fmt` and `lint`.
 #[test]
 fn slot_lets_reuse_across_scopes_and_survive_fmt() {
-    let src = obj(r#"    tree t {
+    let src = obj(r#"    #[bhav]
+    fn t() {
         if self.n == 1 {
-            @slot(2) let a = 1;
+            #[slot(2)] let a = 1;
             self.n = a;
         } else {
-            @slot(2) let b: i16;
+            #[slot(2)] let b: i16;
             self.n = b;
         }
     }
@@ -899,16 +930,16 @@ fn slot_lets_reuse_across_scopes_and_survive_fmt() {
 /// `param[N]` below the declared count is addressable.
 #[test]
 fn lifecycle_blocks_take_frames() {
-    let src = obj(r#"    @id(4100) @frame(args: 4, locals: 2) main {
+    let src = obj(r#"    #[id(4100)] #[frame(args = 4, locals = 2)] main {
         loop {
             sleep(10);
             self.n += param[3];
         }
     }
-    @frame(locals: 1, revision: 3) init {
+    #[frame(locals = 1, revision = 3)] init {
         self.n = 5;
     }
-    @frame(locals: 0) load { self.n = 0; }
+    #[frame(locals = 0)] load { self.n = 0; }
 "#);
     let air = expand("lifeframe.antics", &src);
     let headers: Vec<&str> = air.lines().filter(|l| l.starts_with("tree ")).collect();
@@ -931,8 +962,8 @@ fn lifecycle_blocks_take_frames() {
 fn lifecycle_frames_are_checked() {
     expect_err(
         "lifeempty.antics",
-        &obj("    @frame(empty) main { }\n"),
-        "@frame(empty) is only allowed on a standalone 'tree'",
+        &obj("    #[frame(empty)] main { }\n"),
+        "#[frame(empty)] is only allowed on a standalone 'tree'",
     );
     expect_err(
         "lifeparam.antics",
@@ -941,7 +972,7 @@ fn lifecycle_frames_are_checked() {
     );
     expect_err(
         "lifeconst.antics",
-        &obj("    @frame(locals: 1) const K = 1;\n"),
-        "@frame(...) is only allowed on a standalone 'tree' or on init, main",
+        &obj("    #[frame(locals = 1)] const K = 1;\n"),
+        "#[frame(...)] is only allowed on a standalone 'tree' or on init, main",
     );
 }
