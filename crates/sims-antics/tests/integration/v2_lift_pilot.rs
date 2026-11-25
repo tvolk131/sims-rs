@@ -669,7 +669,7 @@ fn lifts_location_local_and_generic_calls() {
 }
 
 #[test]
-fn lifts_relationship_locals_and_keeps_other_value_operands_raw() {
+fn lifts_relationship_locals_and_other_value_operands() {
     let iff = compile(
         r#"object "Fable Matchbook" {
     guid: 0x7E00_00B3;
@@ -705,9 +705,9 @@ fn lifts_relationship_locals_and_keeps_other_value_operands_raw() {
     ] {
         assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
     }
-    // Only the non-local values stay raw: `#[slot]` pins the named locals without a raw
-    // block.
-    assert_eq!(lifted.matches("raw {").count(), 1, "{lifted}");
+    // Temps, parameters and (with flag 4) literals are values v2 names too, and `#[slot]`
+    // pins the named locals: nothing stays raw.
+    assert_eq!(lifted.matches("raw {").count(), 0, "{lifted}");
     assert!(lifted.contains("#[slot(1)] let slot_1: i16;"), "{lifted}");
 }
 
