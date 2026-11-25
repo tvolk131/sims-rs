@@ -159,6 +159,7 @@ pub(super) fn lower_standalone_tree(
         ctx.begin_body(explicit);
     }
     ctx.frame_locals = d.frame.and_then(|f| f.locals);
+    ctx.frame_format = d.frame.and_then(|f| f.format);
     ctx.frame_args = d.frame.and_then(|f| f.args).map_or_else(
         || {
             sig.params

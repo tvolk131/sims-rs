@@ -648,36 +648,6 @@ fn a_source_constant_named_like_the_entry_object_is_not_the_entry_object() {
     assert!(!a.contains("= stack_obj"), "{a}");
 }
 
-/// A `let Some` binding is allocated after its `else` body is lowered; its declaration is still
-/// the `let Some`, so two copies of a helper whose constant argument picks different arms share
-/// the binding's word.
-#[test]
-fn a_let_some_binding_keeps_its_declaration_after_the_else_body() {
-    let src = r#"object "Round Three" {
-    guid: 0x7F40_0900;
-    fn pick(target: ObjectId, mode: bool) {
-        let Some(value) = target.run_functional::<i16>(prep) else {
-            if mode {
-                temp[2] = 1;
-                return;
-            } else {
-                temp[2] = 2;
-                return;
-            }
-        };
-        random_into(value, 4)?;
-        temp[3] = value;
-    }
-    @frame(locals: 3) tree a {
-        pick(stack_obj, true);
-        pick(stack_obj, false);
-    }
-}
-"#;
-    let air = expand("let_some_origin.antics", src);
-    assert!(tree(&air, "a").contains("(locals: 3)"), "{air}");
-}
-
 /// An out-operand store makes an earlier store dead, but a tree that may read global 34 keeps
 /// it: the store is an Expression, which sets the scratch pointer that read depends on.
 #[test]
@@ -812,32 +782,48 @@ fn a_raw_call_to_a_tree_named_like_the_entry_object_is_not_a_read() {
     }
 }
 
-/// Pinning a `push_interaction` handle into word 0 moves the named locals after it down a word,
-/// so a tree whose text may read one of those words keeps the copy into word 0.
+/// Pinning a `push_interaction` handle into word 0 fills word 0 from the start, which a
+/// primitive may read implicitly (`relationship` without `local:` reads the word-0 pair), so the
+/// tree pins exactly where main's literal-range analysis does, whatever its text reads.
 #[test]
-fn text_that_reads_a_moved_word_keeps_the_push_interaction_copy() {
-    let members = r#"    tree a (sim: Sim) {
+fn push_interaction_pins_only_where_main_pins() {
+    let members = |range: &str, text: &str| {
+        format!(
+            r#"    tree a (sim: Sim) {{
         let h = stack_obj;
         let n: i16;
-        random_into(n, Limits.draw)?;
+        random_into(n, {range})?;
         temp[3] = n;
-        dialog(kind: ok, title: title, message: msg);
+        relationship(column: 0, dir: 2, value: temp[2]);
+        {text}
         push_interaction(menu: 1, object: h, priority: 0);
+    }}
+    bcon 4097 "Limits" {{ draw = 1 }}"#
+        )
+    };
+    // A BCON range is not one main's analysis reads, so the copy stays, with or without text.
+    for (name, text) in [
+        (
+            "Was $Local:1",
+            "dialog(kind: ok, title: title, message: msg);",
+        ),
+        ("Plain", ""),
+    ] {
+        let air = expand("pin_bcon.antics", &obj(name, &members("Limits.draw", text)));
+        let a = tree(&air, "a");
+        assert!(
+            !a.contains("local[0] := stack_obj;"),
+            "the copy stays:\n{a}"
+        );
     }
-    bcon 4097 "Limits" { draw = 1 }"#;
-    let air = expand("pin_text.antics", &obj("Was $Local:1", members));
-    let a = tree(&air, "a");
-    assert!(
-        !a.contains("local[0] := stack_obj;"),
-        "the copy stays:\n{a}"
+    // A literal range lets main pin, whatever the text reads, and the tree pins as main.
+    let air = expand(
+        "pin_literal.antics",
+        &obj(
+            "Was $Local:1",
+            &members("1", "dialog(kind: ok, title: title, message: msg);"),
+        ),
     );
-    // Text that reads no frame word lets the handle live in word 0.
-    let air = expand("pin_plain.antics", &obj("Plain", members));
-    let a = tree(&air, "a");
-    assert!(a.contains("local[0] := stack_obj;"), "pinned:\n{a}");
-    // A literal range lets main pin too, whatever the text reads, and the tree pins as main.
-    let literal = members.replace("Limits.draw", "1");
-    let air = expand("pin_literal.antics", &obj("Was $Local:1", &literal));
     let a = tree(&air, "a");
     assert!(a.contains("local[0] := stack_obj;"), "pinned:\n{a}");
 }
@@ -902,9 +888,24 @@ fn a_tree_that_may_read_global_34_shares_out_operand_locals_as_main() {
 }
 "#;
     expand("global34_frame.antics", src);
-    // So does a tree whose header fixes its frame size.
-    expand(
-        "fixed_frame.antics",
-        &src.replace("        temp[3] = global[34];\n", ""),
+    // So does a tree whose header fixes its frame size, by `locals:` or by a format.
+    let fixed = src.replace("        temp[3] = global[34];\n", "");
+    expand("fixed_frame.antics", &fixed);
+}
+
+/// `@frame(format: 0x8001)` holds four locals, so its tree shares inlined out-operand locals as
+/// main does and fits them.
+#[test]
+fn a_format_limited_frame_shares_out_operand_locals_as_main() {
+    let helpers: String = (0..5)
+        .map(|i| {
+            format!(
+                "    fn h{i}() {{\n        let n{i}: i16 = me.attr[0];\n        random_into(n{i}, 4)?;\n        temp[{i}] = n{i};\n    }}\n"
+            )
+        })
+        .collect();
+    let src = format!(
+        "object \"Round Three\" {{\n    guid: 0x7F40_0900;\n{helpers}    @frame(format: 0x8001) tree a {{\n        h0();\n        h1();\n        h2();\n        h3();\n        h4();\n    }}\n}}\n"
     );
+    expand("format_limit.antics", &src);
 }

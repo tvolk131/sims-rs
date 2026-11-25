@@ -87,10 +87,10 @@ Expression faults on main and succeeds after a kept save. So such a tree takes m
 - a text tree takes `Unknown`, which is main's rule;
 - out-operands are not definitions there (section 5), so they make no store dead;
 - a `random` defines its destination only with a literal range (`DrawRanges::Literal`, main's
-  rule from section 2), wherever that decides whether the entry save or a pin's copies go;
+  rule from section 2), wherever that decides whether the entry save goes;
 - the entry save goes where main drops it, in the optimizer (`drop_unread_entry_save_node`) and
   the raw-layout path, and the text checks keep it as main's text rule does;
-- the pinned slot pins as on main, without section 5's text guard;
+- the pinned slot pins as on main, as it does in every tree (section 5);
 - out-operand locals coalesce as on main (no `decl:` groups), so the tree fits the frame main
   fits it in.
 
@@ -164,8 +164,9 @@ declaration order, so generated names no longer matter.
   - Disjoint inlined copies of a helper now share their local's word.
   - In `coalesce_locals`, a local written through an out-operand joins only classes of its own
     declaration, and never the cross-helper merge. A tree that may read global 34 (section 1)
-    or sets its frame size with `@frame(locals: K)` coalesces them as main does, so it fits the
-    frame main fits it in.
+    or bounds its frame, with `@frame(locals: K)` or with a `@frame(format: F)` (formats
+    `0x8000`/`0x8001` hold four locals), coalesces them as main does, so it fits the frame main
+    fits it in.
     - Lowering records each inlined local's declaration (`local_origins`: the helper and the
       innermost statement being lowered). That covers `let`, `let Some`, `for` and every other
       binding, so another helper's local of the same spelling is not a copy. The statement is
@@ -195,11 +196,11 @@ declaration order, so generated names no longer matter.
     change of its own.
 - **The pinned `push_interaction` slot (`mir/pipeline.rs`).** `pin_in_place` makes a pushed
   handle live in word 0 and drops its copies, which moves every named local down a word and fills
-  word 0 from the start. Section 2 lets it apply to more trees (a `random` with a BCON range now
-  defines its destination). Where main's literal-range analysis pins too, the tree pins as main
-  does, since main's layout is the one its text already reads. Where only the wider range rule
-  pins, a tree whose text may read a frame word keeps the copies unless the text reads neither
-  word 0 nor a word that changes hands. Before the body is final, the slot
+  word 0 from the start. A primitive may read word 0 without naming it (`relationship` without
+  `local:` reads the word-0 pair), and the pin scan does not see such reads, so filling word 0
+  early can change what one reads. The tree therefore pins exactly where main's literal-range
+  analysis pins (`DrawRanges::Literal`), never on section 2's wider range rule, whatever its text
+  reads. Before the body is final, the slot
   is a placeholder (`@pin@`) that the lexer does not read. Global 34 is checked on the body with
   word 0 in its place, so a pinned text tree is no longer `Unknown` for that reason alone.
 - **`push_interaction(object: <@slot(N) handle>)` (`lower/builtins.rs`).** It emits `object: N`
@@ -218,7 +219,7 @@ declaration order, so generated names no longer matter.
   the unread save of a tree that formats no text. The last result and scratch pointer such a
   fault leaves then differ from the unoptimized tree's. This branch applies the same rules to
   more trees, namely a store an out-operand kills (above), the save of a text tree that reads no
-  moved word (section 1) and a pin enabled by a BCON range (above). It adds no rule of its own
+  moved word (section 1). It adds no rule of its own
   that removes an Expression. A tree that may read global 34 is the exception to applying them
   more widely: there the branch keeps and drops exactly what main does (section 1).
 - **Bottom frames.** Create Object with flag 0x10 (or 0x02) writes word 0 of the new object's
@@ -247,7 +248,8 @@ declaration order, so generated names no longer matter.
     the `idle` scratch word), a later literal reaching earlier trees, read-first helper locals, an
     out-operand's unwritten exit, the kept `self` switch and `job_data` copy, raw blocks' own
     entry-object names (including discarded code and inherited trees), main's
-    choices in trees that may read global 34, and the pinned slot under text.
+    choices in trees that may read global 34 or bound their frame by a format, and the pinned
+    slot pinning only where main pins.
   - The `opt.rs` unit tests cover the pipeline's text veto.
 
 ## What would reopen this

@@ -79,24 +79,12 @@ fn finish_frame(out: String, facts: &FrameFacts<'_>) -> String {
             facts.local_origins,
             !facts.fixed_frame,
         );
-        // Pinning moves every named local down a word and fills word 0 from the start. Main
-        // pins whenever its literal-range analysis lets it, and the tree does too. Where only
-        // this branch's wider range rule lets it pin, a tree whose text may read a frame word
-        // keeps its copies unless the text reads neither word 0 nor a word that changes hands.
+        // Pinning moves every named local down a word and fills word 0 from the start, which a
+        // primitive may read implicitly (`relationship` without `local:` reads the word-0 pair).
+        // The tree pins exactly where main's literal-range analysis pins, never on this branch's
+        // wider range rule.
         let out = if facts.pinned {
-            let pinned = pin_in_place(&out, ranges);
-            let main_pins = may_read_global_34 || pin_in_place(&out, DrawRanges::Literal) != out;
-            let text_ok = main_pins
-                || match text_reads {
-                    TableLocals::Known(words) if words.is_empty() => true,
-                    TableLocals::Known(words) => !words.contains(&0) && unmoved(&out, &pinned),
-                    TableLocals::Unknown => false,
-                };
-            if pinned == out || text_ok {
-                pinned
-            } else {
-                out
-            }
+            pin_in_place(&out, DrawRanges::Literal)
         } else {
             out
         };

@@ -52,6 +52,7 @@ impl<'a> TreeLowerer<'a> {
             keep_layout: false,
             param_words_used: 0,
             frame_locals: None,
+            frame_format: None,
             event_local: None,
             sleep_span: None,
             stmt_marks: Vec::new(),
@@ -107,7 +108,7 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
         let facts = mir::FrameFacts {
-            fixed_frame: self.frame_locals.is_some(),
+            fixed_frame: self.frame_locals.is_some() || self.frame_format.is_some(),
             text_reads,
             keep_layout: self.keep_layout,
             has_self_obj_local: self.has_self_obj_local,
@@ -130,7 +131,7 @@ impl<'a> TreeLowerer<'a> {
         // source constant of that name, which a raw block reads as a constant, is not the entry
         // object, and neither is a raw block's own local or label of that name. The inherit
         // check's Sim lowering emits no entry save of its own (`track_stack_obj`), only this one.
-        let mut declares_self_obj = self.has_self_obj_local && !self.inherited_entry_save;
+        let declares_self_obj = self.has_self_obj_local && !self.inherited_entry_save;
         if self.inherited_entry_save
             && !self.raw_consts.contains_key(mir::SELF_OBJ)
             && !self
@@ -141,7 +142,6 @@ impl<'a> TreeLowerer<'a> {
         {
             let save = mir::StackObjOp::Save(mir::SELF_OBJ).text();
             out = format!("    {save}\n{out}");
-            declares_self_obj = true;
         }
         // A raw block may declare an entry-object local of its own only where lowering declares
         // none of that name.
@@ -173,6 +173,7 @@ impl<'a> TreeLowerer<'a> {
     /// the frame, as on a standalone `tree`.
     pub(super) fn set_lifecycle_frame(&mut self, frame: &TreeFrame) {
         self.frame_locals = frame.locals;
+        self.frame_format = frame.format;
         self.frame_args = frame.args.map_or(0, usize::from);
     }
 

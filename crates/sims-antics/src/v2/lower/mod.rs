@@ -675,6 +675,9 @@ struct TreeLowerer<'a> {
     param_words_used: usize,
     /// The tree's `@frame(locals: K)`, which `animate(event_local:)` must stay outside.
     frame_locals: Option<u16>,
+    /// The tree's `@frame(format: F)`, whose format may bound the frame (`0x8000`/`0x8001` hold
+    /// four locals).
+    frame_format: Option<u16>,
     /// The first `animate(event_local: N)`, as `(span, N)`.
     event_local: Option<(Span, u8)>,
     /// The first `sleep`/`idle`, which `.air` lowers through `idle()`: it cannot share a tree
