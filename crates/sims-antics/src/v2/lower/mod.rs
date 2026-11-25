@@ -63,7 +63,7 @@ use self::object::*;
 use self::prim_table::*;
 use self::raw::*;
 use self::schema::*;
-use self::tree::{definition_field, object_data_field, sim_person_field};
+use self::tree::{definition_field, object_data_word, sim_person_word};
 use self::trees::*;
 
 const MAX_INLINE_DEPTH: usize = 16;
@@ -457,6 +457,22 @@ fn is_engine_flags_key(key: &str) -> bool {
 /// a `_` arm.
 fn is_engine_enum_key(key: &str) -> bool {
     key.starts_with("enum::std::engine::")
+}
+
+/// The bitflags key a `flag_test`/`flag_set`/`flag_clear` constant is checked against: the
+/// target's own type, or (an `i16` cell) any bitflags type.
+fn flag_op_key(ty: &ValueType) -> Option<&str> {
+    match ty {
+        ValueType::Bitflags(key) => Some(key),
+        ValueType::I16 => Some(ANY_BITFLAGS),
+        _ => None,
+    }
+}
+
+/// A user bitflags type, whose flag operations take only its own constants (an engine word or
+/// an `i16` cell also takes a raw bit number).
+fn is_strict_flags(ty: &ValueType) -> bool {
+    matches!(ty, ValueType::Bitflags(_)) && !is_engine_flags(ty)
 }
 
 /// [`is_engine_flags_key`] of a value type.

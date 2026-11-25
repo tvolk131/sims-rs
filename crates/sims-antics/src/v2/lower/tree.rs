@@ -401,28 +401,23 @@ impl<'a> TreeLowerer<'a> {
     }
 
     /// The object or Sim cell behind `handle.<field>` that every handle shares: `hand`, `room`,
-    /// `flags` (object data word 8), and (untyped handles only) the person words `age`, `priority`, `is_visitor`, and `kind`.
+    /// the named object-data words (`flags`, `facing`, `value`, ...), and (untyped handles
+    /// only) the person words `age`, `priority`, `is_visitor`, `kind`, and the named ones.
     pub(super) fn handle_field_cell(field: &str, maybe_sim: bool) -> Option<(String, ValueType)> {
         let cell = |c: &str, ty| Some((c.to_owned(), ty));
         match field {
             "hand" => cell("stack.slot[0]", ValueType::ObjectId),
             "room" => cell("stack.data[29]", ValueType::I16),
-            "flags" => cell(
-                "stack.data[8]",
-                ValueType::Bitflags(ANY_BITFLAGS.to_owned()),
-            ),
-            other if object_data_field(other).is_some() => {
-                object_data_field(other).map(|i| (format!("stack.data[{i}]"), ValueType::I16))
-            }
+            other if object_data_word(other).is_some() => object_data_word(other)
+                .map(|w| (format!("stack.data[{}]", w.index), w.value_type())),
             _ if !maybe_sim => None,
             "age" => cell("stack.person[58]", ValueType::I16),
             "priority" => cell("stack.person.priority", ValueType::I16),
             "is_visitor" => cell("stack.person[32]", ValueType::Bool),
             "visitor_kind" => cell("stack.person[32]", ValueType::I16),
             "kind" => cell("stack.person[65]", ValueType::I16),
-            other => {
-                sim_person_field(other).map(|i| (format!("stack.person[{i}]"), ValueType::I16))
-            }
+            other => sim_person_word(other)
+                .map(|w| (format!("stack.person[{}]", w.index), w.value_type())),
         }
     }
 
@@ -600,27 +595,126 @@ fn names_token(body: &str, name: &str) -> bool {
     })
 }
 
-/// Object-data words every object exposes by name: `self.broken` is `self.data[15]`, read and
-/// written exactly like it. The indices are the engine's (sims-vm `placement.rs`, `buy.rs`).
-const OBJECT_DATA_FIELDS: &[(&str, u8)] = &[
-    // Whether the object lights the room it stands in (sims-vm `LIGHTS_ROOM`).
-    ("room_impact", 7),
-    // The wall-placement rules (sims-vm `DATA_WALL_RULES`).
-    ("wall_placement", 13),
-    // Broken (sims-vm `DATA_BROKEN`; a broken object sells for half).
-    ("broken", 15),
+/// The type of a named engine word.
+#[derive(Clone, Copy)]
+pub(super) enum EngineWordTy {
+    I16,
+    ObjectId,
+    /// A bitflags type by key (`std::flags`, or the untyped engine flags word).
+    Flags(&'static str),
+    /// An engine enum by key (`std::engine`).
+    Enum(&'static str),
+}
+
+/// A named object-data or person-data word.
+#[derive(Clone, Copy)]
+pub(super) struct EngineWord {
+    pub(super) index: u8,
+    pub(super) ty: EngineWordTy,
+    /// Whether a script may store into it. The engine traps a store of a different value
+    /// into object data words 2, 3 and 11, so those are read-only by name.
+    pub(super) writable: bool,
+}
+
+impl EngineWord {
+    pub(super) fn value_type(self) -> ValueType {
+        match self.ty {
+            EngineWordTy::I16 => ValueType::I16,
+            EngineWordTy::ObjectId => ValueType::ObjectId,
+            EngineWordTy::Flags(key) => ValueType::Bitflags(key.to_owned()),
+            EngineWordTy::Enum(key) => ValueType::Enum(key.to_owned()),
+        }
+    }
+}
+
+const fn word(index: u8, ty: EngineWordTy) -> EngineWord {
+    EngineWord {
+        index,
+        ty,
+        writable: true,
+    }
+}
+
+const DIRECTION_KEY: &str = "enum::std::engine::Direction";
+const PERSON_KIND_KEY: &str = "enum::std::engine::PersonKind";
+
+/// Object-data words every object (Sims included) exposes by name: `self.broken` is
+/// `self.data[15]`, read and written exactly like it. The indices and meanings are the
+/// engine's (sims-vm `placement.rs`, `placement/find.rs`, `buy.rs`, `daily.rs`).
+const OBJECT_DATA_WORDS: &[(&str, EngineWord)] = &[
+    // Facing, 0..7 in eighths of a turn clockwise from north.
+    ("facing", word(1, EngineWordTy::Enum(DIRECTION_KEY))),
+    // The object whose slot holds this one (read-only).
+    (
+        "container",
+        EngineWord {
+            index: 2,
+            ty: EngineWordTy::ObjectId,
+            writable: false,
+        },
+    ),
+    // The levels the object may stand at.
+    ("allowed_heights", word(4, EngineWordTy::Flags(HEIGHT_KEY))),
+    // Which sides have a wall, relative to the facing (written by the engine).
+    (
+        "wall_adjacency",
+        word(
+            5,
+            EngineWordTy::Flags("bitflags::std::flags::WallAdjacency"),
+        ),
+    ),
+    // Nonzero: the object lights the room it stands in.
+    ("room_impact", word(7, EngineWordTy::I16)),
+    // Movement and intersection flags; any bitflags type converts (`std::flags::ObjectFlags`).
+    ("flags", word(8, EngineWordTy::Flags(ANY_BITFLAGS))),
+    // The wall-placement rules.
+    (
+        "wall_placement",
+        word(
+            13,
+            EngineWordTy::Flags("bitflags::std::flags::WallPlacement"),
+        ),
+    ),
+    // Broken (a broken object sells for half).
+    ("broken", word(15, EngineWordTy::I16)),
+    // Weight, and the weight a container may hold.
+    ("weight", word(27, EngineWordTy::I16)),
+    ("support_strength", word(28, EngineWordTy::I16)),
+    // The second flags word.
+    (
+        "flags2",
+        word(
+            40,
+            EngineWordTy::Flags("bitflags::std::flags::ObjectFlags2"),
+        ),
+    ),
+    // The current (depreciated) value.
+    ("value", word(41, EngineWordTy::I16)),
+    // What the object may stand on.
+    ("placement", word(42, EngineWordTy::Flags(PLACEMENT_KEY))),
+    // Buy-mode flags.
+    (
+        "buy_flags",
+        word(43, EngineWordTy::Flags("bitflags::std::flags::BuyFlags")),
+    ),
+    ("category", word(59, EngineWordTy::I16)),
 ];
 
 /// Person-data words a Sim exposes by name: `sim.job_level` is `sim.person[57]`, read and
 /// written exactly like it. The indices are the engine's (sims-vm `outfits.rs`, `caf.rs`,
-/// `autonomy.rs`, `animate.rs`).
-const SIM_PERSON_FIELDS: &[(&str, u8)] = &[
-    ("posture", 0),
-    ("pets_outside", 34),
-    ("job_type", 56),
+/// `autonomy.rs`, `animate.rs`, `people.rs`, `travel.rs`).
+const SIM_PERSON_WORDS: &[(&str, EngineWord)] = &[
+    ("posture", word(0, EngineWordTy::I16)),
+    ("pets_outside", word(34, EngineWordTy::I16)),
+    ("job_type", word(56, EngineWordTy::I16)),
     // A child's school grade.
-    ("job_level", 57),
-    ("family", 61),
+    ("job_level", word(57, EngineWordTy::I16)),
+    ("family", word(61, EngineWordTy::I16)),
+    // Sex and species.
+    ("gender_kind", word(65, EngineWordTy::Enum(PERSON_KIND_KEY))),
+    // A date's link: the companion's word names the leader, the leader's names the companion
+    // negated, 0 none. A store queues the date indicator.
+    ("date_partner", word(77, EngineWordTy::I16)),
 ];
 
 /// Read-only words of an object's definition, read through the stack object (`sims-vm`
@@ -637,17 +731,17 @@ pub(super) fn definition_field(name: &str) -> Option<u8> {
 }
 
 /// The object-data word of a named object field (`broken` → 15).
-pub(super) fn object_data_field(name: &str) -> Option<u8> {
-    OBJECT_DATA_FIELDS
+pub(super) fn object_data_word(name: &str) -> Option<EngineWord> {
+    OBJECT_DATA_WORDS
         .iter()
         .find(|(n, _)| *n == name)
-        .map(|&(_, i)| i)
+        .map(|&(_, w)| w)
 }
 
 /// The person-data word of a named Sim field (`job_level` → 57).
-pub(super) fn sim_person_field(name: &str) -> Option<u8> {
-    SIM_PERSON_FIELDS
+pub(super) fn sim_person_word(name: &str) -> Option<EngineWord> {
+    SIM_PERSON_WORDS
         .iter()
         .find(|(n, _)| *n == name)
-        .map(|&(_, i)| i)
+        .map(|&(_, w)| w)
 }

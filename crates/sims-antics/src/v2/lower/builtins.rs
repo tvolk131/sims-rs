@@ -30,6 +30,8 @@ impl<'a> TreeLowerer<'a> {
                 }
                 v
             }
+            // A `std::engine` variant or `std::flags` constant is its number.
+            _ if let Some(v) = self.try_eval_engine_const(expr)? => i64::from(v),
             _ => match self.literal_compare_operand(expr) {
                 Some((_, v)) => i64::from(v),
                 None => i64::from(self.eval_const_i16(expr).map_err(|_| {

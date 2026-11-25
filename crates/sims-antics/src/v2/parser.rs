@@ -24,7 +24,6 @@ const MAX_NESTING_DEPTH: usize = 64;
 /// Highest explicit `#[slot(N)] state name` attribute index accepted by the parser.
 pub(crate) const MAX_STATE_SLOT: u16 = 255;
 
-/// Parses a `.antics` v2 source file into a [`V2File`] AST.
 /// The engine globals `world.<name>` names (`world.hour` is `global[0]`), as the engine uses
 /// them (sims-vm `tick.rs`, `daily.rs`, `selection.rs`, `coop.rs`).
 pub(crate) const WORLD_GLOBALS: &[(&str, u8)] = &[
@@ -41,6 +40,8 @@ pub(crate) const WORLD_GLOBALS: &[(&str, u8)] = &[
     // The lot (house number) being played.
     ("house", 10),
     ("paused", 17),
+    // The installed-expansions mask (`std::flags::Expansions`).
+    ("expansions", 20),
     ("days_played", 28),
     ("free_will", 30),
 ];
@@ -53,6 +54,7 @@ pub(crate) fn world_global(name: &str) -> Option<u8> {
         .map(|&(_, i)| i)
 }
 
+/// Parses a `.antics` v2 source file into a [`V2File`] AST.
 pub fn parse_v2_file(source: &str) -> Result<V2File> {
     parse_v2_source(source, false)
 }

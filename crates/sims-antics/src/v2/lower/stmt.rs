@@ -172,16 +172,17 @@ impl<'a> TreeLowerer<'a> {
                 // Handle bitflags `flag_set` / `flag_clear` explicitly (1-based bit index!).
                 // An engine word also takes a raw bit number (`w flag_set 3`), lowered below
                 // exactly as for an `i16` cell.
+                // An `i16` target takes a single flag constant of any bitflags type.
                 if matches!(op, V2AssignOp::FlagSet | V2AssignOp::FlagClear)
-                    && let ValueType::Bitflags(ref key) = target_ty
+                    && let Some(key) = flag_op_key(&target_ty)
                     && let const_bit = self.try_eval_const_bitflag(value, key)?
-                    && (const_bit.is_some() || !is_engine_flags(&target_ty))
+                    && (const_bit.is_some() || is_strict_flags(&target_ty))
                 {
                     let Some((_, Some(bit))) = const_bit else {
                         return Err(Error::at(
                             value.span(),
                             format!(
-                                "'flag_set'/'flag_clear' on bitflags '{}' requires a single flag constant (use '.set(...)' / '.clear(...)' for masks)",
+                                "'flag_set'/'flag_clear' on '{}' requires a single flag constant (use '.set(...)' / '.clear(...)' for masks)",
                                 self.env.display_value_type(&target_ty)
                             ),
                         ));

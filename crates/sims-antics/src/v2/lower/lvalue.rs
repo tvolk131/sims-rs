@@ -7,6 +7,23 @@ impl<'a> TreeLowerer<'a> {
     /// Slots (`x.hand`, `x.slot[i]`) and rooms (`x.room`) of Sims, `self`, and object handles
     /// can be read but not written: the VM's slot and room scopes have no write path.
     pub(super) fn reject_read_only_sim_slot(&self, target: &V2Expr) -> Result<()> {
+        // A read-only named engine word (`container`, object data word 2): the engine traps a
+        // store of a different value. A state of the same name wins over the engine word.
+        if let V2Expr::Field { span, base, field } = target
+            && let V2Expr::Ident(_, name) = base.as_ref()
+            && object_data_word(field).is_some_and(|w| !w.writable)
+            && (self.is_my_ident(name)
+                || self.is_self_ident(name)
+                || self.object_handle_air(name).is_some())
+            && !self.handle_has_state(name, field)
+        {
+            return Err(Error::at(
+                *span,
+                format!(
+                    "'{name}.{field}' is read-only (the engine refuses a script store into this word)"
+                ),
+            ));
+        }
         let (span, name, what) = match target {
             V2Expr::Field { span, base, field } if field == "hand" || field == "room" => {
                 match base.as_ref() {
@@ -224,23 +241,12 @@ impl<'a> TreeLowerer<'a> {
                         }
                         return match field.as_str() {
                             "graphic" => Ok(self.self_cell("data[0]", ValueType::I16)),
-                            "flags" => Ok(self.self_cell(
-                                "data[8]",
-                                ValueType::Bitflags(ANY_BITFLAGS.to_owned()),
-                            )),
-                            "allowed_heights" => Ok(self
-                                .self_cell("data[4]", ValueType::Bitflags(HEIGHT_KEY.to_owned()))),
-                            "placement" => Ok(self.self_cell(
-                                "data[42]",
-                                ValueType::Bitflags(PLACEMENT_KEY.to_owned()),
-                            )),
                             "prep_score" => Ok(self.self_cell("prep_score", ValueType::I16)),
                             "cook_score" => Ok(self.self_cell("cook_score", ValueType::I16)),
                             "in_use" => Ok(self.self_cell("in_use", ValueType::I16)),
-                            other if object_data_field(other).is_some() => Ok(self.self_cell(
-                                &format!("data[{}]", object_data_field(other).unwrap_or_default()),
-                                ValueType::I16,
-                            )),
+                            other if let Some(w) = object_data_word(other) => {
+                                Ok(self.self_cell(&format!("data[{}]", w.index), w.value_type()))
+                            }
                             "motive" | "skill" | "priority" => Err(Error::at(
                                 *span,
                                 format!(
@@ -267,12 +273,13 @@ impl<'a> TreeLowerer<'a> {
                                 air: "my.person.priority".to_owned(),
                                 ty: ValueType::I16,
                             }),
-                            other if sim_person_field(other).is_some() => Ok(LValue::Direct {
-                                air: format!(
-                                    "my.person[{}]",
-                                    sim_person_field(other).unwrap_or_default()
-                                ),
-                                ty: ValueType::I16,
+                            other if let Some(w) = sim_person_word(other) => Ok(LValue::Direct {
+                                air: format!("my.person[{}]", w.index),
+                                ty: w.value_type(),
+                            }),
+                            other if let Some(w) = object_data_word(other) => Ok(LValue::Direct {
+                                air: format!("my.data[{}]", w.index),
+                                ty: w.value_type(),
                             }),
                             _ => Err(Error::at(
                                 *span,
@@ -321,18 +328,6 @@ impl<'a> TreeLowerer<'a> {
                                     obj_air,
                                     ty: ValueType::I16,
                                 }),
-                                "allowed_heights" => Ok(LValue::ForeignCell {
-                                    cell: "stack.data[4]".to_owned(),
-                                    setup: None,
-                                    obj_air,
-                                    ty: ValueType::Bitflags(HEIGHT_KEY.to_owned()),
-                                }),
-                                "placement" => Ok(LValue::ForeignCell {
-                                    cell: "stack.data[42]".to_owned(),
-                                    setup: None,
-                                    obj_air,
-                                    ty: ValueType::Bitflags(PLACEMENT_KEY.to_owned()),
-                                }),
                                 other => match Self::handle_field_cell(other, false) {
                                     Some((cell, ty)) => Ok(LValue::ForeignCell {
                                         obj_air,
@@ -358,7 +353,7 @@ impl<'a> TreeLowerer<'a> {
                                 Error::at(
                                     *span,
                                     format!(
-                                        "unknown field '{bname}.{other}' on an object handle (expected graphic, hand, room, flags, room_impact, wall_placement, broken, age, priority, is_visitor, visitor_kind, kind, posture, pets_outside, job_type, job_level, family, motive.<name>, skill.<name>, attr[i], data[i], person[i], motive[m], slot[i], or sprite_flags[i])"
+                                        "unknown field '{bname}.{other}' on an object handle (expected graphic, hand, room, a named object-data word (flags, facing, container, value, ...), age, priority, is_visitor, visitor_kind, kind, a named person word (job_level, gender_kind, ...), motive.<name>, skill.<name>, attr[i], data[i], person[i], motive[m], slot[i], or sprite_flags[i])"
                                     ),
                                 )
                             })?,

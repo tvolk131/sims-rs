@@ -146,16 +146,13 @@ impl<'a> TreeLowerer<'a> {
                         }
                         let prop_air = match field.as_str() {
                             "graphic" => format!("{}.data[0]", self.self_prefix()),
-                            "flags" => format!("{}.data[8]", self.self_prefix()),
-                            "allowed_heights" => format!("{}.data[4]", self.self_prefix()),
-                            "placement" => format!("{}.data[42]", self.self_prefix()),
                             "prep_score" => format!("{}.data[31]", self.self_prefix()),
                             "cook_score" => format!("{}.data[32]", self.self_prefix()),
                             "in_use" => format!("{}.data[25]", self.self_prefix()),
                             "id" => format!("{}.data[11]", self.self_prefix()),
                             "room" => format!("{}.data[29]", self.self_prefix()),
-                            other => match object_data_field(other) {
-                                Some(i) => format!("{}.data[{i}]", self.self_prefix()),
+                            other => match object_data_word(other) {
+                                Some(w) => format!("{}.data[{}]", self.self_prefix(), w.index),
                                 None => return true,
                             },
                         };
@@ -169,9 +166,10 @@ impl<'a> TreeLowerer<'a> {
                             "hand" => "my.slot[0]".to_owned(),
                             "age" => "my.person[58]".to_owned(),
                             "visitor_kind" => "my.person[32]".to_owned(),
-                            other => match sim_person_field(other) {
-                                Some(i) => format!("my.person[{i}]"),
-                                None => return true,
+                            other => match (sim_person_word(other), object_data_word(other)) {
+                                (Some(w), _) => format!("my.person[{}]", w.index),
+                                (None, Some(w)) => format!("my.data[{}]", w.index),
+                                (None, None) => return true,
                             },
                         };
                         return sim_air == canon_target;
@@ -556,19 +554,18 @@ impl<'a> TreeLowerer<'a> {
                             "hand" => Ok(("my.slot[0]".to_owned(), ValueType::ObjectId)),
                             "age" => Ok(("my.person[58]".to_owned(), ValueType::I16)),
                             "visitor_kind" => Ok(("my.person[32]".to_owned(), ValueType::I16)),
-                            // Object data word 2: the object whose slot holds the Sim (read-only).
-                            "container" => Ok(("my.data[2]".to_owned(), ValueType::ObjectId)),
-                            other if sim_person_field(other).is_some() => Ok((
-                                format!(
-                                    "my.person[{}]",
-                                    sim_person_field(other).unwrap_or_default()
-                                ),
-                                ValueType::I16,
-                            )),
+                            other if let Some(w) = sim_person_word(other) => {
+                                Ok((format!("my.person[{}]", w.index), w.value_type()))
+                            }
+                            // The named object-data words (`container` is word 2, the object
+                            // whose slot holds the Sim).
+                            other if let Some(w) = object_data_word(other) => {
+                                Ok((format!("my.data[{}]", w.index), w.value_type()))
+                            }
                             other => Err(Error::at(
                                 *span,
                                 format!(
-                                    "unknown Sim property '{bname}.{other}' (expected motive, skill, personality, id, priority, room, hand, age, visitor_kind, container, posture, pets_outside, job_type, job_level, family, attr[i], data[i], slot[i], or person[i]; use 'self.<state>' for object state)"
+                                    "unknown Sim property '{bname}.{other}' (expected motive, skill, personality, id, priority, room, hand, age, visitor_kind, a named person word (posture, job_level, gender_kind, date_partner, ...), a named object-data word (container, facing, flags, value, ...), attr[i], data[i], slot[i], or person[i]; use 'self.<state>' for object state)"
                                 ),
                             )),
                         };

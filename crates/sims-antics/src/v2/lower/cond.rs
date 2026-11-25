@@ -168,17 +168,18 @@ impl<'a> TreeLowerer<'a> {
     ) -> Result<(String, String)> {
         let (l, l_ty) = self.lower_value_expr(lhs)?;
         // An engine word also takes a raw bit number (`w flag_test 3`), compared below exactly
-        // as an `i16` word is.
+        // as an `i16` word is; an `i16` word takes a single flag constant of any bitflags type
+        // (`world.expansions flag_test Expansions::Pets`).
         if op == V2BinOp::FlagTest
-            && let ValueType::Bitflags(ref key) = l_ty
+            && let Some(key) = flag_op_key(&l_ty)
             && let const_bit = self.try_eval_const_bitflag(rhs, key)?
-            && (const_bit.is_some() || !is_engine_flags(&l_ty))
+            && (const_bit.is_some() || is_strict_flags(&l_ty))
         {
             let Some((_, Some(bit))) = const_bit else {
                 return Err(Error::at(
                     rhs.span(),
                     format!(
-                        "'flag_test' on bitflags '{}' requires a single flag constant (use '.contains(...)' for masks)",
+                        "'flag_test' on '{}' requires a single flag constant (use '.contains(...)' for masks)",
                         self.env.display_value_type(&l_ty)
                     ),
                 ));

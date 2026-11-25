@@ -60,6 +60,22 @@ impl<'a> TreeLowerer<'a> {
 
     /// Resolves a compile-time constant of any enum (`Enum::Variant` or `Binding::ConstEnum`).
     pub(super) fn try_eval_any_const_enum(&self, expr: &V2Expr) -> Result<Option<i16>> {
+        Ok(self.try_eval_keyed_const_enum(expr)?.map(|(_, v)| v))
+    }
+
+    /// A constant of an engine type (a `std::engine` variant or a `std::flags` mask), which a
+    /// primitive's numeric operand takes as its number.
+    pub(super) fn try_eval_engine_const(&self, expr: &V2Expr) -> Result<Option<i16>> {
+        if let Some((key, mask, _)) = self.try_eval_any_const_bitflag(expr)? {
+            return Ok(is_engine_flags_key(&key).then_some(mask));
+        }
+        Ok(self
+            .try_eval_keyed_const_enum(expr)?
+            .and_then(|(key, v)| is_engine_enum_key(&key).then_some(v)))
+    }
+
+    /// [`Self::try_eval_any_const_enum`] with the enum's key.
+    fn try_eval_keyed_const_enum(&self, expr: &V2Expr) -> Result<Option<(String, i16)>> {
         match expr {
             V2Expr::Path(span, segs) if segs.len() == 2 => {
                 let Some(e) =
@@ -74,10 +90,10 @@ impl<'a> TreeLowerer<'a> {
                         format!("enum '{}' has no variant '{}'", e.display_name, segs[1]),
                     )
                 })?;
-                Ok(Some(val))
+                Ok(Some((e.canonical_key.clone(), val)))
             }
             V2Expr::Ident(_, name) => match self.lookup_var(name) {
-                Some(Binding::ConstEnum { value, .. }) => Ok(Some(*value)),
+                Some(Binding::ConstEnum { key, value }) => Ok(Some((key.clone(), *value))),
                 _ => Ok(None),
             },
             _ => Ok(None),
