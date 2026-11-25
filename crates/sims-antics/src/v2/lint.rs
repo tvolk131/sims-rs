@@ -11,9 +11,16 @@
 //!
 //! `enum_wildcard_all_covered`, `raw_syntax` and `object_tree_me_field` cannot be
 //! suppressed. An `allow` that suppresses nothing is itself a finding (`stale_lint_allow`).
+//!
+//! Some findings are kept only if their suggestion builds: `untyped_engine_constant`,
+//! `prefer_question_mark`, `prefer_method_syntax`, and `untyped_engine_field` past its
+//! static tables. Each one carries a source edit, and the file is built again with it. The
+//! finding stands only when every object comes out with the same `.iff` bytes.
+//!
 //! See `docs/decisions/20261124-antics-v2-lint.md`,
-//! `docs/decisions/20261125-antics-v2-new-lints.md` and
-//! `docs/decisions/20261125-antics-v2-lint-wave2.md`.
+//! `docs/decisions/20261125-antics-v2-new-lints.md`,
+//! `docs/decisions/20261125-antics-v2-lint-wave2.md` and
+//! `docs/decisions/20261125-antics-v2-lint-wave3.md`.
 
 use crate::error::{Error, Result, Span};
 use crate::v2::ast::{
@@ -108,6 +115,9 @@ pub const RAW_SYNTAX: &str = "raw_syntax";
 pub const OBJECT_TREE_ME_FIELD: &str = "object_tree_me_field";
 pub const STALE_LINT_ALLOW: &str = "stale_lint_allow";
 pub const UNREACHABLE_CODE: &str = "unreachable_code";
+pub const UNTYPED_ENGINE_CONSTANT: &str = "untyped_engine_constant";
+pub const PREFER_QUESTION_MARK: &str = "prefer_question_mark";
+pub const PREFER_METHOD_SYNTAX: &str = "prefer_method_syntax";
 
 /// Every rule `lint` knows.
 pub const LINT_RULES: &[LintRule] = &[
@@ -185,7 +195,19 @@ pub const LINT_RULES: &[LintRule] = &[
     ),
     warn(
         UNTYPED_ENGINE_FIELD,
-        "`global[N]`, `self.data[N]` or a Sim's `data` / `person` / `slot` cell that has a typed name",
+        "`global[N]`, or a `data` / `person` / `slot` cell of `self`, a Sim or a handle, that has a typed name",
+    ),
+    warn(
+        UNTYPED_ENGINE_CONSTANT,
+        "a number standing for a named `std::flags` bit or `std::engine` value",
+    ),
+    warn(
+        PREFER_QUESTION_MARK,
+        "`if !f(..) { return error; }` on a `Result` call instead of `f(..)?;`",
+    ),
+    warn(
+        PREFER_METHOD_SYNTAX,
+        "a builtin call whose target has a method form (`x.play_sound(s)`)",
     ),
     LintRule {
         name: RAW_SYNTAX,
@@ -345,12 +367,30 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             written: BTreeSet::new(),
             assigned: None,
             air_consts: BTreeMap::new(),
+            source: &input.source,
+            uses: &ast.uses,
+            item_names: ast
+                .items
+                .iter()
+                .filter_map(item_name)
+                .map(str::to_owned)
+                .collect(),
+            std_globals: ast.uses.iter().any(|u| {
+                (u.module_path == ["std", "globals"] && u.items.iter().any(|i| i.name == "*"))
+                    || (u.module_path == ["std"]
+                        && u.items
+                            .iter()
+                            .any(|i| i.name == "globals" && i.alias.is_none()))
+            }),
+            pending: Vec::new(),
+            stmt: None,
             diags: Vec::new(),
         };
         cx.lint_file(ast);
         cx.const_scopes(ast, tokens);
         cx.duplicate_std_globals(ast);
         cx.frame_headroom(ast, compiled.as_deref());
+        let pending = std::mem::take(&mut cx.pending);
         let mut diags = cx.diags;
         // The two errors that cannot be allowed stand only where `check` rejects the file
         // (the lint reads lowering's rules approximately): lowering stops on the line of one
@@ -388,7 +428,8 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
                 note: None,
             });
         }
-        if compiles {
+        if let Some(original) = compiled.as_deref() {
+            diags.extend(verified(input, original, pending));
             diags.extend(stale_allows(&directives, &diags, &input.name));
         }
         for mut d in diags {
@@ -1546,6 +1587,18 @@ struct FileLinter<'a> {
     /// The constants a `raw` block of the object being linted may name, as lowering
     /// declares them for it (`NAME` or `TABLE.entry` -> `.air` value).
     air_consts: BTreeMap<String, String>,
+    /// The file's source.
+    source: &'a str,
+    /// Its `use` declarations.
+    uses: &'a [crate::v2::ast::UseDecl],
+    /// The names of its top-level items.
+    item_names: BTreeSet<String>,
+    /// It imports `std::globals` (`globals::f` calls a `std::globals` tree).
+    std_globals: bool,
+    /// Findings that stand only if their rewrite builds the same bytes ([`verified`]).
+    pending: Vec<Pending>,
+    /// The statement being linted.
+    stmt: Option<Span>,
     diags: Vec<LintDiagnostic>,
 }
 
@@ -2444,23 +2497,28 @@ impl FileLinter<'_> {
                 let V2Expr::Ident(at, root) = root.as_ref() else {
                     return;
                 };
-                if self.bound.contains(root) {
-                    return;
-                }
-                let table = if root == "self" {
+                let kind = if self.bound.contains(root) || root == "stack_obj" {
+                    Root::Handle
+                } else if root == "self" {
                     if self.sims.iter().any(|s| s == "self") {
                         return;
                     }
-                    SELF_FIELDS
+                    Root::Object
                 } else if self.sims.iter().any(|s| s == root) {
-                    SIM_FIELDS
+                    Root::Sim
                 } else {
                     return;
+                };
+                let table = match kind {
+                    Root::Object => SELF_FIELDS,
+                    Root::Sim => SIM_FIELDS,
+                    Root::Handle => &[],
                 };
                 let Some(&typed) = table
                     .iter()
                     .find(|f| f.cell == field.as_str() && f.index == n)
                 else {
+                    self.trial_engine_field(x, parent, *at, root, kind, field, n);
                     return;
                 };
                 (*at, format!("{root}.{}", typed.name), typed)
@@ -3261,6 +3319,7 @@ impl FileLinter<'_> {
     }
 
     fn lint_stmt(&mut self, s: &V2Stmt) {
+        self.stmt = Some(stmt_span(s));
         self.written.clear();
         self.assigned = None;
         if let V2Stmt::Assign { target, value, .. } = s {
@@ -3270,8 +3329,18 @@ impl FileLinter<'_> {
         for e in stmt_exprs(s) {
             self.lint_expr(e);
         }
+        if let V2Stmt::Assign {
+            target,
+            op: V2AssignOp::FlagSet | V2AssignOp::FlagClear,
+            value,
+            ..
+        } = s
+        {
+            self.flag_constant(target, value);
+        }
         self.written.clear();
         self.assigned = None;
+        self.prefer_question_mark(s);
         match s {
             V2Stmt::While {
                 span,
@@ -3304,7 +3373,10 @@ impl FileLinter<'_> {
                 let pats: Vec<&MatchPattern> = arms.iter().map(|a| &a.pattern).collect();
                 self.enum_wildcard(&pats);
             }
-            V2Stmt::Expr { span, expr } => self.dropped_bool_call(*span, expr),
+            V2Stmt::Expr { span, expr } => {
+                self.dropped_bool_call(*span, expr);
+                self.prefer_method_syntax(expr);
+            }
             V2Stmt::RawAir { span, code } => {
                 self.raw_builtin(*span, code);
                 self.raw_blocks.push((*span, code.clone()));
@@ -3342,6 +3414,13 @@ impl FileLinter<'_> {
             self.untyped_engine_field(x, parent);
             self.object_tree_me_field(x, parent);
             match x {
+                V2Expr::Binary {
+                    lhs,
+                    op: V2BinOp::FlagTest,
+                    rhs,
+                    ..
+                } => self.flag_constant(lhs, rhs),
+                V2Expr::Call { .. } | V2Expr::MethodCall { .. } => self.call_constants(x),
                 V2Expr::Int(span, v) if *v > 0xFFFF => {
                     let text = self.text_at(*span);
                     if text.starts_with("0x") || text.starts_with("0X") {
@@ -4432,6 +4511,895 @@ impl FileLinter<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// Rewrites checked by building them
+// ---------------------------------------------------------------------------------------
+
+/// One source edit: bytes `start..end` become `text`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fix {
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+/// A finding that stands only if its rewrite builds the file to the same bytes.
+#[derive(Debug, Clone)]
+struct Pending {
+    diag: LintDiagnostic,
+    fixes: Vec<Fix>,
+    /// A `use` line the rewrite needs, inserted at the top of the file.
+    import: Option<String>,
+    /// The statement it is in: two findings of one statement are built apart, so a rewrite
+    /// that builds only with another (two cells compared, typed alike only together) does
+    /// not stand.
+    stmt: Option<Span>,
+}
+
+/// The most builds one file's pending findings may take.
+const TRIAL_BUDGET: usize = 48;
+
+/// What a `x.data[N]` root is, for the typed names its cells have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Root {
+    /// `self` in a body where it is an object.
+    Object,
+    /// A name of the running Sim.
+    Sim,
+    /// `stack_obj`, or a local holding an object handle.
+    Handle,
+}
+
+/// The pending findings whose rewrite builds `input` to the bytes of `original`. A group of
+/// findings is built with all their rewrites; a group that fails is split in halves until
+/// each finding stands or falls alone, within [`TRIAL_BUDGET`] builds.
+fn verified(
+    input: &LintInput,
+    original: &[crate::compile::CompiledObject],
+    pending: Vec<Pending>,
+) -> Vec<LintDiagnostic> {
+    if pending.is_empty() {
+        return Vec::new();
+    }
+    // A pack file builds against its pack, under its file name, as `expand_for_lint` does.
+    let pack = match (&input.path, &input.pack_dir) {
+        (Some(path), Some(pack)) => match crate::v2::loader::read_v2_checked_file(path, Some(pack))
+        {
+            Ok((_, config)) => {
+                let label = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("<input.antics>")
+                    .to_owned();
+                Some((label, config))
+            }
+            Err(_) => return Vec::new(),
+        },
+        _ => None,
+    };
+    let builds_same = |source: &str| {
+        let lowered = match &pack {
+            Some((label, config)) => crate::v2::resolve_v2_source(label, source, config)
+                .and_then(|r| crate::v2::lower_resolved_module(&r)),
+            None => crate::v2::expand_v2_source_to_objects(
+                &input.name,
+                source,
+                &crate::v2::PackResolverConfig::default(),
+            ),
+        };
+        let Ok(objects) = lowered else {
+            return false;
+        };
+        objects.len() == original.len()
+            && objects.into_iter().zip(original).all(|(e, o)| {
+                crate::v2::compile_expanded_v2_object(e).is_ok_and(|c| c.iff_bytes == o.iff_bytes)
+            })
+    };
+    let mut budget = TRIAL_BUDGET;
+    let mut stands = Vec::new();
+    // Findings of one statement, and findings whose fixes overlap (a `refresh` constant and
+    // the call's method form), go in separate groups.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (i, p) in pending.iter().enumerate() {
+        let clashes = |g: &Vec<usize>| {
+            g.iter().any(|&j| {
+                let q = &pending[j];
+                (q.stmt.is_some() && q.stmt == p.stmt)
+                    || q.fixes
+                        .iter()
+                        .any(|a| p.fixes.iter().any(|b| a.start < b.end && b.start < a.end))
+            })
+        };
+        match groups.iter_mut().find(|g| !clashes(g)) {
+            Some(g) => g.push(i),
+            None => groups.push(vec![i]),
+        }
+    }
+    groups.reverse();
+    while let Some(group) = groups.pop() {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        let rewritten = apply_fixes(&input.source, group.iter().map(|&i| &pending[i]));
+        if rewritten.is_some_and(|s| builds_same(&s)) {
+            stands.extend(group);
+        } else if group.len() > 1 {
+            let (a, b) = group.split_at(group.len() / 2);
+            groups.push(b.to_vec());
+            groups.push(a.to_vec());
+        }
+    }
+    stands.sort_unstable();
+    stands
+        .into_iter()
+        .map(|i| pending[i].diag.clone())
+        .collect()
+}
+
+/// `source` with the fixes and imports of `pending` applied, or `None` when two fixes overlap.
+fn apply_fixes<'p>(source: &str, pending: impl Iterator<Item = &'p Pending>) -> Option<String> {
+    let mut fixes: Vec<&Fix> = Vec::new();
+    let mut imports = BTreeSet::new();
+    for p in pending {
+        fixes.extend(&p.fixes);
+        imports.extend(p.import.as_deref());
+    }
+    fixes.sort_by_key(|f| (f.start, f.end));
+    fixes.dedup();
+    if fixes.windows(2).any(|w| w[1].start < w[0].end) {
+        return None;
+    }
+    let mut out = source.to_owned();
+    for f in fixes.iter().rev() {
+        source.get(f.start..f.end)?;
+        out.replace_range(f.start..f.end, &f.text);
+    }
+    // A `use` goes before every item; the lines it adds change no built byte.
+    let mut head: String = imports.into_iter().map(|i| format!("{i}\n")).collect();
+    head.push_str(&out);
+    Some(head)
+}
+
+/// Where an expression's text starts (a call's, field's or index's span is its `(`, `.` or `[`).
+fn expr_start(e: &V2Expr) -> Span {
+    match e {
+        V2Expr::Field { base, .. } | V2Expr::Index { base, .. } => expr_start(base),
+        V2Expr::Call { callee, .. } => expr_start(callee),
+        V2Expr::MethodCall { receiver, .. } => expr_start(receiver),
+        V2Expr::Try { inner, .. }
+        | V2Expr::Unary {
+            op: V2UnaryOp::AsI16,
+            inner,
+            ..
+        } => expr_start(inner),
+        V2Expr::Binary { lhs, .. } => expr_start(lhs),
+        other => other.span(),
+    }
+}
+
+/// One past the bracket closing the group that opens at `open`, or `None` when the group
+/// holds a comment (a rewrite would drop it) or does not close.
+fn group_end(src: &str, open: usize) -> Option<usize> {
+    let b = src.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < b.len() {
+        match b[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += usize::from(b[i] == b'\\') + 1;
+                }
+            }
+            b'/' if matches!(b.get(i + 1), Some(b'/' | b'*')) => return None,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The trimmed top-level comma-separated parts of `src[from..to]` (a call's arguments).
+fn split_args(src: &str, from: usize, to: usize) -> Option<Vec<&str>> {
+    let b = src.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = from;
+    let mut i = from;
+    while i < to {
+        match b[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.checked_sub(1)?,
+            b'"' => {
+                i += 1;
+                while i < to && b[i] != b'"' {
+                    i += usize::from(b[i] == b'\\') + 1;
+                }
+            }
+            b',' if depth == 0 => {
+                parts.push(src.get(start..i)?.trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let last = src.get(start..to)?.trim();
+    if !last.is_empty() {
+        parts.push(last);
+    }
+    Some(parts)
+}
+
+/// `at` past any whitespace in `src`.
+fn skip_ws(src: &str, at: usize) -> usize {
+    src.get(at..)
+        .map_or(at, |rest| at + rest.len() - rest.trim_start().len())
+}
+
+/// Whether `text` holds a `//` or `/*` comment outside its strings.
+fn has_comment(text: &str) -> bool {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += usize::from(b[i] == b'\\') + 1;
+                }
+            }
+            b'/' if matches!(b.get(i + 1), Some(b'/' | b'*')) => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The types `std::flags` and `std::engine` declare: (module, type) -> each value or bit
+/// and its name.
+type StdEngineTypes = BTreeMap<(&'static str, String), Vec<(i64, String)>>;
+
+/// [`StdEngineTypes`], read from the `std` sources.
+fn std_engine_types() -> &'static StdEngineTypes {
+    static TYPES: std::sync::OnceLock<StdEngineTypes> = std::sync::OnceLock::new();
+    TYPES.get_or_init(|| {
+        let mut out = BTreeMap::new();
+        for (module, src) in [
+            ("flags", include_str!("std/flags.antics")),
+            ("engine", include_str!("std/engine.antics")),
+        ] {
+            let Ok(file) = crate::v2::parser::parse_v2_std_file(src) else {
+                continue;
+            };
+            for item in file.items {
+                let (name, values) = match item {
+                    V2Item::Bitflags(b) => (
+                        b.name,
+                        b.flags
+                            .into_iter()
+                            .map(|f| (i64::from(f.bit), f.name))
+                            .collect(),
+                    ),
+                    V2Item::Enum(e) => (
+                        e.name,
+                        e.variants
+                            .into_iter()
+                            .map(|v| (i64::from(v.value), v.name))
+                            .collect(),
+                    ),
+                    _ => continue,
+                };
+                out.insert((module, name), values);
+            }
+        }
+        out
+    })
+}
+
+/// The name `std::<module>::<ty>` gives `value` (a bit number for a bitflags type).
+fn std_engine_name(module: &'static str, ty: &str, value: i64) -> Option<&'static str> {
+    std_engine_types()
+        .get(&(module, ty.to_owned()))?
+        .iter()
+        .find(|(v, _)| *v == value)
+        .map(|(_, n)| n.as_str())
+}
+
+/// The `std::flags` type of an object's data word, by index.
+fn data_flags(index: i64) -> Option<&'static str> {
+    Some(match index {
+        4 => "Height",
+        5 => "WallAdjacency",
+        8 => "ObjectFlags",
+        13 => "WallPlacement",
+        40 => "ObjectFlags2",
+        42 => "Placement",
+        43 => "BuyFlags",
+        _ => return None,
+    })
+}
+
+/// The `std::flags` type of an object's named flag word.
+fn field_flags(field: &str) -> Option<&'static str> {
+    Some(match field {
+        "allowed_heights" => "Height",
+        "wall_adjacency" => "WallAdjacency",
+        "flags" => "ObjectFlags",
+        "wall_placement" => "WallPlacement",
+        "flags2" => "ObjectFlags2",
+        "placement" => "Placement",
+        "buy_flags" => "BuyFlags",
+        _ => return None,
+    })
+}
+
+impl FileLinter<'_> {
+    /// The byte offset of `at` in the source.
+    fn offset(&self, at: Span) -> Option<usize> {
+        let line = *self.line_starts.get(at.line.checked_sub(1)?)?;
+        let at = line + at.column.checked_sub(1)?;
+        (at <= self.source.len()).then_some(at)
+    }
+
+    /// Queues a finding that stands only if `fixes` (with `import`) build the file to the
+    /// same bytes; its suggestion is `suggestion`.
+    #[allow(clippy::too_many_arguments)]
+    fn propose(
+        &mut self,
+        rule_name: &'static str,
+        at: Span,
+        message: String,
+        help: String,
+        suggestion: String,
+        fixes: Vec<Fix>,
+        import: Option<String>,
+    ) {
+        let severity = rule(rule_name).map_or(Severity::Warning, |r| r.severity);
+        self.pending.push(Pending {
+            diag: LintDiagnostic {
+                rule: rule_name,
+                severity,
+                file: self.file.to_owned(),
+                line: at.line,
+                column: at.column,
+                message,
+                help: Some(help),
+                suggestion: Some(suggestion),
+                note: None,
+            },
+            fixes,
+            import,
+            stmt: self.stmt,
+        });
+    }
+
+    /// `untyped_engine_field` for a cell the static tables do not name (a `std` engine word,
+    /// a Sim's new person words, `stack_obj` and handles): proposed, and kept when the
+    /// typed spelling builds the same bytes.
+    #[allow(clippy::too_many_arguments)]
+    fn trial_engine_field(
+        &mut self,
+        x: &V2Expr,
+        parent: Option<&V2Expr>,
+        at: Span,
+        root: &str,
+        kind: Root,
+        cell: &str,
+        n: i64,
+    ) {
+        let tables: &[&[TypedField]] = match kind {
+            Root::Object => &[OBJECT_WORDS],
+            Root::Sim => &[SIM_WORDS, OBJECT_WORDS],
+            Root::Handle => &[HANDLE_WORDS, OBJECT_WORDS],
+        };
+        let Some(&field) = tables
+            .iter()
+            .flat_map(|t| t.iter())
+            .find(|f| f.cell == cell && f.index == n)
+        else {
+            return;
+        };
+        // A state of the same name wins over the engine word.
+        if kind != Root::Sim && self.states.contains_key(field.name) {
+            return;
+        }
+        // An engine enum (`Direction`, `PersonKind`) is no `i16`: it stands in for the cell
+        // only cast back (`self.facing as i16`).
+        if ENUM_WORDS.contains(&field.name)
+            && !matches!(
+                parent,
+                Some(V2Expr::Unary {
+                    op: V2UnaryOp::AsI16,
+                    ..
+                })
+            )
+        {
+            return;
+        }
+        if self.written.contains(&addr(x)) && !field.writable {
+            return;
+        }
+        if field.object_id {
+            let compared = matches!(
+                parent,
+                Some(V2Expr::Binary {
+                    op: V2BinOp::Eq | V2BinOp::Ne,
+                    ..
+                })
+            );
+            if !compared && self.assigned != Some(addr(x)) {
+                return;
+            }
+        }
+        let V2Expr::Index { span: open, .. } = x else {
+            return;
+        };
+        let (Some(start), Some(open)) = (self.offset(at), self.offset(*open)) else {
+            return;
+        };
+        let Some(end) = group_end(self.source, open) else {
+            return;
+        };
+        let raw = self.source[start..end].to_owned();
+        let typed = format!("{root}.{}", field.name);
+        self.propose(
+            UNTYPED_ENGINE_FIELD,
+            at,
+            format!("`{raw}` is `{typed}`"),
+            format!("write `{typed}`; it names the same cell"),
+            typed.clone(),
+            vec![Fix {
+                start,
+                end,
+                text: typed,
+            }],
+            None,
+        );
+    }
+
+    /// How this file spells `std::<module>::<ty>`, and the `use` line it needs first:
+    /// `None` when another item of the file or another import is named `ty`.
+    fn engine_type_scope(&self, module: &str, ty: &str) -> Option<(String, Option<String>)> {
+        // Prelude types: every module sees them.
+        if matches!(ty, "Height" | "Placement") {
+            return Some((ty.to_owned(), None));
+        }
+        if self.item_names.contains(ty) {
+            return None;
+        }
+        let mut glob = false;
+        for u in self.uses {
+            let std_module =
+                u.module_path.len() == 2 && u.module_path[0] == "std" && u.module_path[1] == module;
+            for item in &u.items {
+                let local = item.alias.as_deref().unwrap_or(&item.name);
+                if std_module && item.name == "*" {
+                    glob = true;
+                } else if std_module && item.name == ty {
+                    return Some((local.to_owned(), None));
+                } else if local == ty {
+                    return None;
+                }
+            }
+        }
+        if glob {
+            return Some((ty.to_owned(), None));
+        }
+        Some((ty.to_owned(), Some(format!("use std::{module}::{ty};"))))
+    }
+
+    /// `untyped_engine_constant`: the literal `lit` where a `std::<module>::<ty>` value
+    /// goes, when the type names it.
+    fn engine_constant(&mut self, lit: &V2Expr, module: &'static str, ty: &str) {
+        let V2Expr::Int(at, v) = lit else {
+            return;
+        };
+        let text = self.text_at(*at);
+        // A literal, not a constant.
+        if !text.starts_with(|c: char| c.is_ascii_digit()) {
+            return;
+        }
+        let len = text
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(text.len());
+        let raw = text[..len].to_owned();
+        let Some(variant) = std_engine_name(module, ty, *v) else {
+            return;
+        };
+        let Some((spelled, import)) = self.engine_type_scope(module, ty) else {
+            return;
+        };
+        let Some(start) = self.offset(*at) else {
+            return;
+        };
+        let typed = format!("{spelled}::{variant}");
+        let what = if module == "flags" {
+            format!("bit {v} of `{ty}`")
+        } else {
+            format!("`{ty}` value {v}")
+        };
+        let help = match &import {
+            Some(line) => format!("write `{typed}` and add `{line}`; it builds the same nodes"),
+            None => format!("write `{typed}`; it builds the same nodes"),
+        };
+        self.propose(
+            UNTYPED_ENGINE_CONSTANT,
+            *at,
+            format!("`{raw}` is {what}, `{typed}`"),
+            help,
+            typed.clone(),
+            vec![Fix {
+                start,
+                end: start + len,
+                text: typed,
+            }],
+            import,
+        );
+    }
+
+    /// The `std::flags` type of the engine word `place` (`global[20]`, an object's flag
+    /// words by name or number).
+    fn flag_word_type(&self, place: &V2Expr) -> Option<&'static str> {
+        match place {
+            V2Expr::Index { base, index, .. } => {
+                let V2Expr::Int(_, n) = index.as_ref() else {
+                    return None;
+                };
+                match base.as_ref() {
+                    V2Expr::Ident(_, g) if g == "global" => (*n == 20).then_some("Expansions"),
+                    V2Expr::Field {
+                        base: root, field, ..
+                    } if field == "data" && matches!(root.as_ref(), V2Expr::Ident(..)) => {
+                        data_flags(*n)
+                    }
+                    _ => None,
+                }
+            }
+            V2Expr::Field {
+                base: root, field, ..
+            } => {
+                let V2Expr::Ident(_, root) = root.as_ref() else {
+                    return None;
+                };
+                // A state of the same name wins over the engine word.
+                if root == "self" && self.states.contains_key(field) {
+                    return None;
+                }
+                field_flags(field)
+            }
+            _ => None,
+        }
+    }
+
+    /// `untyped_engine_constant` on a flag operation: `place flag_set N` / `flag_clear N` /
+    /// `flag_test N`.
+    fn flag_constant(&mut self, place: &V2Expr, bit: &V2Expr) {
+        if let Some(ty) = self.flag_word_type(place) {
+            self.engine_constant(bit, "flags", ty);
+        }
+    }
+
+    /// `untyped_engine_constant` on a builtin's arguments: the `category:` of the budget
+    /// calls, and `refresh`'s target and mode.
+    fn call_constants(&mut self, x: &V2Expr) {
+        let (name, args, method) = match x {
+            V2Expr::Call { callee, args, .. } => match callee.as_ref() {
+                V2Expr::Ident(_, name) if !self.user_fn(name) => (name.as_str(), args, false),
+                _ => return,
+            },
+            V2Expr::MethodCall { method, args, .. } => (method.as_str(), args, true),
+            _ => return,
+        };
+        let named = |key: &str| args.iter().find(|a| a.name.as_deref() == Some(key));
+        let positional = |k: usize| args.iter().filter(|a| a.name.is_none()).nth(k);
+        match name {
+            "can_afford" | "debit_funds" | "credit_funds" if !method || name != "can_afford" => {
+                if let Some(a) = named("category") {
+                    self.engine_constant(&a.value, "engine", "BudgetCategory");
+                }
+            }
+            "refresh" if method => {
+                if let Some(a) = named("mode").or_else(|| positional(0)) {
+                    self.engine_constant(&a.value, "engine", "RefreshMode");
+                }
+            }
+            "refresh" => {
+                if let Some(a) = named("target").or_else(|| positional(0)) {
+                    self.engine_constant(&a.value, "engine", "RefreshTarget");
+                }
+                let mode =
+                    named("mode").or_else(|| positional(usize::from(named("target").is_none())));
+                if let Some(a) = mode {
+                    self.engine_constant(&a.value, "engine", "RefreshMode");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The name of `callee` when it surely returns `Result`: a tree or `extern` function of
+    /// the file set, or a `std::globals` tree the file imports.
+    fn result_callee(&self, callee: &V2Expr) -> Option<String> {
+        if let Some((name, kind)) = self.symbols.call_kind(callee) {
+            return (kind == RetKind::Result).then_some(name);
+        }
+        let V2Expr::Path(_, segs) = callee else {
+            return None;
+        };
+        let [module, name] = segs.as_slice() else {
+            return None;
+        };
+        if module != "globals"
+            || !self.std_globals
+            || self.symbols.returns.contains_key(&segs.join("::"))
+        {
+            return None;
+        }
+        std_globals()
+            .iter()
+            .find(|f| &f.name == name)
+            .filter(|f| ret_kind(&f.ret) == RetKind::Result)
+            .map(|_| segs.join("::"))
+    }
+
+    /// `prefer_question_mark`: `if !f(..) { return error; }` or
+    /// `if f(..) {} else { return error; }` on a call that returns `Result`.
+    fn prefer_question_mark(&mut self, s: &V2Stmt) {
+        let V2Stmt::If {
+            span,
+            cond,
+            then_body,
+            else_body,
+        } = s
+        else {
+            return;
+        };
+        let error = |b: &[V2Stmt]| {
+            matches!(
+                b,
+                [V2Stmt::ReturnError {
+                    from_try: false,
+                    ..
+                }]
+            )
+        };
+        let (call, else_form) = match cond {
+            V2Expr::Unary {
+                op: V2UnaryOp::Not,
+                inner,
+                ..
+            } if error(then_body) && else_body.is_empty() => (inner.as_ref(), false),
+            c if then_body.is_empty() && error(else_body) => (c, true),
+            _ => return,
+        };
+        let V2Expr::Call {
+            span: open, callee, ..
+        } = call
+        else {
+            return;
+        };
+        // A written `return error;` returns a binding named `error`.
+        if self.bound.contains("error") {
+            return;
+        }
+        let Some(name) = self.result_callee(callee) else {
+            return;
+        };
+        let src = self.source;
+        let (Some(start), Some(call_start), Some(open)) = (
+            self.offset(*span),
+            self.offset(expr_start(call)),
+            self.offset(*open),
+        ) else {
+            return;
+        };
+        // Not the `if` of an `else if`: `else f()?;` is no statement.
+        if !src[start..].starts_with("if") || src[..start].trim_end().ends_with("else") {
+            return;
+        }
+        let Some(call_end) = group_end(src, open) else {
+            return;
+        };
+        let block = |at: usize| {
+            let at = skip_ws(src, at);
+            src[at..]
+                .starts_with('{')
+                .then(|| group_end(src, at))
+                .flatten()
+        };
+        let Some(mut end) = block(call_end) else {
+            return;
+        };
+        if else_form {
+            let at = skip_ws(src, end);
+            if !src[at..].starts_with("else") {
+                return;
+            }
+            let Some(e) = block(at + 4) else {
+                return;
+            };
+            end = e;
+        }
+        if has_comment(&src[start..end]) {
+            return;
+        }
+        let text = format!("{}?;", &src[call_start..call_end]);
+        self.propose(
+            PREFER_QUESTION_MARK,
+            *span,
+            format!("this `if` only returns the error of `{name}`"),
+            format!("write `{text}`; `?` returns the error the same way"),
+            text.clone(),
+            vec![Fix { start, end, text }],
+            None,
+        );
+    }
+
+    /// `prefer_method_syntax`: a builtin call statement whose target has a method form:
+    /// `play_sound(s, x)` is `x.play_sound(s)`, `refresh(target: 0, mode: m)` is
+    /// `self.refresh(m)`.
+    fn prefer_method_syntax(&mut self, expr: &V2Expr) {
+        let V2Expr::Call {
+            span: open,
+            callee,
+            type_args,
+            args,
+        } = expr
+        else {
+            return;
+        };
+        let V2Expr::Ident(name_at, name) = callee.as_ref() else {
+            return;
+        };
+        if !type_args.is_empty() || self.user_fn(name) {
+            return;
+        }
+        let src = self.source;
+        let (Some(start), Some(open)) = (self.offset(*name_at), self.offset(*open)) else {
+            return;
+        };
+        let Some(end) = group_end(src, open) else {
+            return;
+        };
+        let Some(parts) = split_args(src, open + 1, end - 1) else {
+            return;
+        };
+        if parts.len() != args.len() {
+            return;
+        }
+        let named = |key: &str| args.iter().position(|a| a.name.as_deref() == Some(key));
+        let nth_positional = |k: usize| {
+            args.iter()
+                .enumerate()
+                .filter(|(_, a)| a.name.is_none())
+                .nth(k)
+                .map(|(i, _)| i)
+        };
+        let ident = |i: usize| match &args[i].value {
+            V2Expr::Ident(_, n) => Some(n.clone()),
+            _ => None,
+        };
+        // The receiver, the method, and the argument texts it keeps.
+        let (receiver, method, kept): (String, &str, Vec<String>) = match name.as_str() {
+            "play_sound" => {
+                let Some(t) = named("target").or_else(|| nth_positional(1)) else {
+                    return;
+                };
+                let Some(receiver) = ident(t) else {
+                    return;
+                };
+                let kept = (0..args.len())
+                    .filter(|&i| i != t)
+                    .map(|i| parts[i].to_owned());
+                (receiver, "play_sound", kept.collect())
+            }
+            "stop_all_sounds" => {
+                let Some(t) = named("target").or_else(|| nth_positional(0)) else {
+                    return;
+                };
+                if args.len() != 1 {
+                    return;
+                }
+                let Some(receiver) = ident(t) else {
+                    return;
+                };
+                (receiver, "stop_all_sounds", Vec::new())
+            }
+            "refresh" => {
+                let Some(t) = named("target").or_else(|| nth_positional(0)) else {
+                    return;
+                };
+                let m = named("mode")
+                    .or_else(|| nth_positional(usize::from(named("target").is_none())));
+                let Some(m) = m.filter(|_| args.len() == 2) else {
+                    return;
+                };
+                let target = match &args[t].value {
+                    V2Expr::Path(_, segs) if segs.len() == 2 && segs[0] == "RefreshTarget" => {
+                        match segs[1].as_str() {
+                            "Me" => Some(true),
+                            "StackObject" => Some(false),
+                            _ => return,
+                        }
+                    }
+                    V2Expr::Int(_, 0) => Some(true),
+                    V2Expr::Int(_, 1) => Some(false),
+                    V2Expr::Ident(..) => None,
+                    _ => return,
+                };
+                let receiver = match target {
+                    None => ident(t).unwrap_or_default(),
+                    Some(false) => "stack_obj".to_owned(),
+                    // `me` of the tree: the object in its own tree, the Sim in a Sim's
+                    // body, else (an inline helper runs in its caller's frame) `me`.
+                    Some(true) if self.object_me => "self".to_owned(),
+                    Some(true) => match self.sims.first() {
+                        Some(sim) if self.sim_body => sim.clone(),
+                        _ => "me".to_owned(),
+                    },
+                };
+                let mode_text = parts[m]
+                    .strip_prefix("mode:")
+                    .map_or(parts[m], str::trim_start);
+                (receiver, "refresh", vec![mode_text.to_owned()])
+            }
+            "push_interaction" => {
+                let Some(t) = named("object") else {
+                    return;
+                };
+                if args.iter().any(|a| a.name.is_none()) {
+                    return;
+                }
+                let Some(receiver) = ident(t) else {
+                    return;
+                };
+                let kept = (0..args.len())
+                    .filter(|&i| i != t)
+                    .map(|i| parts[i].to_owned());
+                (receiver, "push_interaction", kept.collect())
+            }
+            "remove_object" => {
+                if args.first().is_none_or(|a| a.name.is_some()) {
+                    return;
+                }
+                let Some(receiver) = ident(0) else {
+                    return;
+                };
+                (
+                    receiver,
+                    "remove",
+                    parts[1..].iter().map(|p| (*p).to_owned()).collect(),
+                )
+            }
+            _ => return,
+        };
+        let text = format!("{receiver}.{method}({})", kept.join(", "));
+        self.propose_method(name, *name_at, start, end, text);
+    }
+
+    fn propose_method(&mut self, name: &str, at: Span, start: usize, end: usize, text: String) {
+        self.propose(
+            PREFER_METHOD_SYNTAX,
+            at,
+            format!("`{name}(..)` has a method form on its target"),
+            format!("write `{text}`; it builds the same primitive"),
+            text.clone(),
+            vec![Fix { start, end, text }],
+            None,
+        );
+    }
+}
+
 /// The first read of `name` with no assignment before it on any path (`None` when every
 /// read follows some assignment, or a `&mut name` / `raw` mention ends the search).
 fn first_unassigned_read(list: &[V2Stmt], name: &str, user: &dyn Fn(&str) -> bool) -> Option<Span> {
@@ -4711,6 +5679,20 @@ fn raw_balanced(code: &str) -> bool {
 }
 
 /// The names v2 code refers to a BCON table labelled `label` by.
+/// The name a top-level item declares in its module (an object's is a display name).
+fn item_name(item: &V2Item) -> Option<&str> {
+    match item {
+        V2Item::Const(c) => Some(&c.name),
+        V2Item::Fn(f) => Some(&f.name),
+        V2Item::Template(t) => Some(&t.name),
+        V2Item::Enum(e) => Some(&e.name),
+        V2Item::Bitflags(b) => Some(&b.name),
+        V2Item::ExternMod(m) => Some(&m.name),
+        V2Item::ExternBcon(b) => Some(&b.name),
+        V2Item::Object(_) => None,
+    }
+}
+
 fn bcon_names(label: &str) -> Vec<String> {
     let mut names = vec![
         crate::v2::ast::object_type_ident(label),
@@ -4969,6 +5951,53 @@ const SIM_FIELDS: &[TypedField] = &[
     typed("person", 57, "job_level", true, false),
     typed("person", 58, "age", true, false),
     typed("person", 61, "family", true, false),
+];
+
+/// Object-data words every object (Sims included) names (`lower/tree.rs`
+/// `OBJECT_DATA_WORDS`), past [`SELF_FIELDS`]: `untyped_engine_field` proposes them and
+/// keeps a proposal that builds the same bytes (the typed words are not all `i16`).
+const OBJECT_WORDS: &[TypedField] = &[
+    typed("data", 1, "facing", true, false),
+    typed("data", 2, "container", false, true),
+    typed("data", 4, "allowed_heights", true, false),
+    typed("data", 5, "wall_adjacency", true, false),
+    typed("data", 7, "room_impact", true, false),
+    typed("data", 8, "flags", true, false),
+    typed("data", 13, "wall_placement", true, false),
+    typed("data", 15, "broken", true, false),
+    typed("data", 27, "weight", true, false),
+    typed("data", 28, "support_strength", true, false),
+    typed("data", 40, "flags2", true, false),
+    typed("data", 41, "value", true, false),
+    typed("data", 42, "placement", true, false),
+    typed("data", 43, "buy_flags", true, false),
+    typed("data", 59, "category", true, false),
+];
+
+/// The typed words whose type is a `std::engine` enum.
+const ENUM_WORDS: &[&str] = &["facing", "gender_kind"];
+
+/// A Sim's person words past [`SIM_FIELDS`] (`lower/tree.rs` `SIM_PERSON_WORDS`).
+const SIM_WORDS: &[TypedField] = &[
+    typed("person", 65, "gender_kind", true, false),
+    typed("person", 77, "date_partner", true, false),
+];
+
+/// The cells `stack_obj` and handles name (`lower/tree.rs` `handle_field_cell`), besides
+/// [`OBJECT_WORDS`]; the person words only through an untyped handle.
+const HANDLE_WORDS: &[TypedField] = &[
+    typed("slot", 0, "hand", false, true),
+    typed("data", 29, "room", false, false),
+    typed("person", 0, "posture", true, false),
+    typed("person", 32, "visitor_kind", false, false),
+    typed("person", 33, "priority", true, false),
+    typed("person", 34, "pets_outside", true, false),
+    typed("person", 56, "job_type", true, false),
+    typed("person", 57, "job_level", true, false),
+    typed("person", 58, "age", true, false),
+    typed("person", 61, "family", true, false),
+    typed("person", 65, "kind", true, false),
+    typed("person", 77, "date_partner", true, false),
 ];
 
 fn stmt_span(s: &V2Stmt) -> Span {
