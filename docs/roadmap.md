@@ -3603,9 +3603,6 @@ through their public interfaces only; the simulation never depends on it.
       builder (#441).
     - `sims-ui` takes its listing and text from `Catalog::buy_entries`
       (#452).
-    - `BuyCatalog::load` reads each object file once again
-      (`Catalog::buy_entries_visiting`), taking back the load time #452
-      added.
   - **The interface (Track 1):**
     - Wave 3 of the UI honesty audit (#405): native catalog order,
       rendered thumbnails, choice dialogs, the album, roof arrows and the
@@ -3657,10 +3654,54 @@ through their public interfaces only; the simulation never depends on it.
       `legacy/crates/sims-runtime` (#449) and `legacy/fixtures/suites`
       (#451).
     - What they held is under the `legacy-final` tag.
+- **Done (Batch 17 — lot 22 Go Home, the `.antics` v2 Rust-like syntax
+  and its lift, #453–#461):**
+  - **Travel and saves (`sims-vm`, `sims-game`, #458):**
+    - A store of the value an object data word (2, 3 or 11) already
+      holds succeeds, as in the original. Lot 22's room tree no longer
+      faults every pass, so its ticks run at full rate and the cab
+      sign's Go Home asks after 2,110 frames (3,793 before).
+    - The `sims-game` trip test now returns from lot 22 through the
+      cab sign's Go Home, with no `return_from_destination` fallback. Its
+      leftover scripted answer had been saying "No" to the cab dialog.
+    - The tick fuzzer no longer picks objects parked off the lot, so
+      strict seeds 0x64, 0x6c and 0x6b were harness artifacts. A strict
+      sweep of 32 seeds (0x64–0x83) passes.
+    - `caf::export_stored_family_fam` writes a family's FAMh into its
+      Family Bin export (after FAMs, before CTSS #1000, as 0x410696
+      does).
+  - **Buy catalog (#454):** `BuyCatalog::load` reads each object file
+    once again (`Catalog::buy_entries_visiting`). Load time falls from
+    about 171 ms to 93 ms, below what it was before #452.
+  - **The `.antics` v2 language (Track 8):**
+    - PR I-1 (#453): Rust-like syntax. It adds `#[bhav] fn` attributes,
+      expression-oriented `if`/`match` with tail returns, typed
+      `world.*` and Sim fields, methods, and `use std::globals::*`.
+      Every new spelling compiles to the same nodes as its long form.
+    - PR I-2 (#461): the pilots' fixes.
+      - One functional-kinds table matching the engine's RFT and FBO.
+        This is a breaking rename; the old names fail with a hint.
+      - `std::globals` merges with a local `extern mod globals`.
+      - `stack_obj.run_functional` keeps a found cursor.
+      - `me.*` works in `#[context(inherit)]` trees.
+      - `sim.debit_funds`/`credit_funds` work as bool expressions.
+      - Match arms can be a bare `break` or `continue`.
+      - A tighter `$Me` rule for the entry save.
+  - **Lift (Track 9):**
+    - Corpus-driven fixes (#459): all 1,191 Complete Collection files
+      lift with 0 timeouts. Idiomatic trees rise from 29.4% to 32.3%,
+      lint findings fall from 268 to 7, and 1,101 files use
+      `use std::globals::*`.
+    - `lift --v2 --behavioral` (#460) is opt-in and checks trees under
+      the verifier's behavioral relation. 96.5% of trees are idiomatic
+      (32.3% strict), with 0 DIFFERENT. The default output is unchanged.
+  - **Tests:** `sims-antics` builds one integration test binary, 30 → 1
+    (#455), with features gated per module. Every workspace crate with
+    integration tests now builds one `integration` binary. The exceptions
+    are `sims-vm`'s `interpreter` and `sims-game`'s `ratchet` and
+    `ui_oracle_tour`.
 - **Next (in flight, in order of player impact):**
   - **Travel follow-ups:**
-    - After a trip on to lot 22, the cab sign's Go Home makes no trip
-      request (#452).
     - A hop that leaves travelers behind (Go Somewhere Else for one
       member of a family, mode 0) needs session support for the members
       who stay (#443).
@@ -3680,7 +3721,8 @@ through their public interfaces only; the simulation never depends on it.
       `0x45a131`);
     - slot-1 animated objects;
     - pets (#442).
-  - **Saves:** `export_family_fam` still writes no FAMh (#451).
+  - **Saves:** the shell has no Family Bin Export button yet. One
+    should call `export_stored_family_fam` (#458).
   - **Buy catalog:**
     - `BuyLabels` (the category button text) is not used by `sims-ui`
       yet.
@@ -3689,11 +3731,24 @@ through their public interfaces only; the simulation never depends on it.
   - **Co-op:**
     - a build identity in `Hello`, so that mixed builds are rejected even
       when the protocol is unchanged;
-    - the strict script errors the tick fuzzer finds (seeds 0x64, 0x6c
-      and 0x6b, #449).
-  - **The `.antics` v2 redesign:** the Rust-like v2 redesign (Track 8)
-    is next, and the PR-level follow-ups are in the ADRs.
-  - **Tests:** `sims-antics` still builds one binary per test file (29).
+    - whether the co-op executor should refuse a peer's pick on an
+      object parked off the lot (#458).
+  - **The `.antics` v2 toolchain:**
+    - Node pinning (Track 8): about 8,600 strict lift trees fail only
+      on node order (#459).
+    - A join construct for shared tails: about 5,900 trees (#459). It
+      would also stop the `frame_headroom` growth in behavioral mode
+      (#460).
+    - Readable locals: about 9,000 one-statement raw blocks are
+      local-slot moves. This changes strict output, so it needs its own
+      PR (#460).
+    - `std::bcon` is deferred until the BCON slots have checkable
+      clean-room names (#453).
+    - Open from #461:
+      - the inline constant-tail path can record the call before it as
+        the action result (this predates #461);
+      - `global[CONST]` still counts as a global-34 read, which is
+        conservative.
   - **Legacy mining backlog:** see
     `docs/legacy-mining-audit.md#porting-backlog`.
     - Parity-relevant items still open:
