@@ -261,3 +261,85 @@ fn temps_calls_to_trees_with_arguments_lift_in_behavioral_mode() {
     has(heat, &["(temp[0], temp[1])", "args = 4, locals = 2,"]);
     lacks(heat, &["call 4300(temps)", "raw"]);
 }
+
+#[test]
+fn set_to_next_into_a_local_declares_the_local() {
+    // The destination is the only reference to the local.
+    let source = r#"object "Fable Compass" {
+    guid: 0x7E00_0157;
+    #[bhav(id = 4300, locals = 1)]
+    fn scan() {
+        #[slot(0)] let cursor: i16;
+        if set_to_next(person, dest: cursor) {
+            temp[0] = 1;
+        }
+    }
+}"#;
+    for behavioral in [false, true] {
+        let lifted = lift(source, behavioral);
+        has(
+            &lifted,
+            &[
+                "#[slot(0)] let slot_0: i16;",
+                "set_to_next(person, dest: slot_0)",
+            ],
+        );
+        lacks(&lifted, &["raw"]);
+    }
+}
+
+#[test]
+fn function_cells_v2_cannot_name_stay_scoped() {
+    // v2 names functions 0..=255; cell 256 keeps its scope spelling.
+    let source = r#"object "Fable Sextant" {
+    guid: 0x7E00_0158;
+    #[bhav(id = 4300, locals = 0)]
+    fn probe() {
+        stack_obj = temp[0];
+        if stack_obj.has_function[255] { temp[2] = 1; }
+        raw {
+            if scope(35, 256) != 0 { temp[1] := 1; }
+        }
+        temp[3] = 1;
+    }
+}"#;
+    for behavioral in [false, true] {
+        let lifted = lift(source, behavioral);
+        has(&lifted, &["stack_obj.has_function[255]"]);
+        lacks(&lifted, &["has_function[256]"]);
+    }
+}
+
+#[test]
+fn shared_tails_keep_the_comments_before_them() {
+    let source = r#"object "Fable Lantern" {
+    guid: 0x7E00_0159;
+    #[bhav(id = 4300, locals = 0)]
+    fn trap() {
+        if temp[0] == 1 {
+            temp[1] = 1;
+            loop { breakpoint(1); }
+        } else {
+            temp[1] = 2;
+            loop { breakpoint(1); }
+        }
+    }
+    #[bhav(id = 4301, locals = 0)]
+    fn halt() {
+        if temp[0] == 1 {
+            loop { breakpoint(1); }
+        } else {
+            loop { breakpoint(1); }
+        }
+    }
+}"#;
+    for behavioral in [false, true] {
+        // `lift` checks the text lints clean: each loop keeps its `allow`.
+        let lifted = lift(source, behavioral);
+        let halt = tree(&lifted, 4301);
+        assert_eq!(halt.matches("breakpoint(1);").count(), 2, "{halt}");
+    }
+    let lifted = lift(source, true);
+    let trap = tree(&lifted, 4300);
+    assert_eq!(trap.matches("breakpoint(1);").count(), 1, "{trap}");
+}

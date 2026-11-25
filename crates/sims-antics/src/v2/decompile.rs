@@ -2973,6 +2973,7 @@ fn prim_operands<'a>(p: &'a PrimitiveCall, out: &mut Vec<&'a OperandRef>) {
         PrimitiveCall::AlterBudget { amount, .. } => out.push(amount),
         PrimitiveCall::TestObjectType { object, .. } => out.push(object),
         PrimitiveCall::Breakpoint { cond } => out.push(cond),
+        PrimitiveCall::SetToNext { dest: Some(d), .. } => out.push(d),
         PrimitiveCall::Padded { call, .. } => prim_operands(call, out),
         _ => {}
     }
@@ -3282,11 +3283,20 @@ fn builtin_local(s: &Stmt) -> Option<u16> {
             flags,
             ..
         } if flags & 1 != 0 || *i != 0 => Some(u16::from(*i)),
+        // Mode 9 reads a local; a `dest:` may be one.
         PrimitiveCall::SetToNext {
-            mode,
-            local: LocalRef::Index(i),
-            ..
-        } if mode & 0x7F == 9 => Some(u16::from(*i)),
+            mode, local, dest, ..
+        } => {
+            let read = match local {
+                LocalRef::Index(i) if mode & 0x7F == 9 => Some(u16::from(*i)),
+                _ => None,
+            };
+            let dest = dest
+                .as_ref()
+                .and_then(direct_local)
+                .and_then(|v| u16::try_from(v).ok());
+            read.into_iter().chain(dest).max()
+        }
         PrimitiveCall::Relationship {
             direction,
             local: LocalRef::Index(i),
@@ -4958,15 +4968,23 @@ impl Translator<'_> {
         }
         // The statements every arm ends with move after the chain.
         let arm_indent = indent + 4;
+        // A statement starts at its first line, or at the comments just before it (a lint
+        // `allow` belongs to the statement it precedes); a comment is not a statement.
         let starts = |body: &[String]| -> Vec<usize> {
-            (0..body.len())
-                .filter(|&i| {
-                    let l = &body[i];
-                    l.len() - l.trim_start().len() == arm_indent
-                        && !l.trim_start().starts_with('}')
-                        && !l.trim().is_empty()
-                })
-                .collect()
+            let mut out = Vec::new();
+            let mut comments: Option<usize> = None;
+            for (i, l) in body.iter().enumerate() {
+                let t = l.trim_start();
+                if l.len() - t.len() != arm_indent || t.starts_with('}') || t.is_empty() {
+                    continue;
+                }
+                if t.starts_with("//") {
+                    comments.get_or_insert(i);
+                } else {
+                    out.push(comments.take().unwrap_or(i));
+                }
+            }
+            out
         };
         let mut tail: Vec<String> = Vec::new();
         if arms.len() > 1
@@ -5836,9 +5854,10 @@ impl Translator<'_> {
                     let not = if *op == CompareOp::Ne { "!" } else { "" };
                     return Some(format!("{not}{flags}.is_empty()"));
                 }
-                // `x.has_function[N]` is a bool: it is the test against 0.
+                // `x.has_function[N]` is a bool: it is the test against 0. v2 names functions
+                // 0..=255.
                 if let OperandRef::Direct(Operand { scope: 35, index }) = lhs
-                    && *index >= 0
+                    && (0..=255).contains(index)
                     && is_operand(rhs, 7, 0)
                     && matches!(op, CompareOp::Eq | CompareOp::Ne | CompareOp::Gt)
                     && self.extra()

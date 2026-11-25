@@ -49,7 +49,8 @@ After an if-chain is written, its arms are compared as text:
 - **Joined arms.** Adjacent arms with the same body become one arm whose test is the arms'
   tests joined with `||`.
 - **Shared tails.** When the chain has a final `else`, the statements that end every arm move
-  after the chain. Three conditions apply:
+  after the chain. Comments just before a statement (such as a lint `allow`) move with it, and
+  a comment does not count as a statement. Three conditions apply:
   - every arm keeps at least one statement;
   - no arm declares a `let` or `const` of its own;
   - no test is a `let` condition.
@@ -73,14 +74,15 @@ extras are dropped.
   - It also works as a condition.
   - Removing the tree's own object keeps `destroy_self`.
 - **`set_to_next(.., dest: x)`.** `x` may be a local, a parameter or a temp, not only the
-  stack object.
+  stack object. A local destination is declared like any other local the tree names.
 - **`find_best_object(kind[, flags: f])` as a condition.**
   - It is used with no origin and outside a cursor loop.
   - The kind is named from the function table.
   - A search with no kind stays raw.
 - **Definition cells.** Read on the definition's handle:
   - definition cells 9 and 11 are `x.object_type` and `x.sub_index`;
-  - a function-flag cell tested against 0 is `x.has_function[N]` or `!x.has_function[N]`;
+  - a function-flag cell tested against 0 is `x.has_function[N]` or `!x.has_function[N]`,
+    for the functions v2 names (0 to 255);
   - the handle is `self` in a Sim tree that never moves `stack_obj`, and `stack_obj`
     otherwise;
   - none is written inside a cursor loop.
@@ -167,18 +169,18 @@ Two fallback chains change.
 | Identical / equivalent / inconclusive / omitted | 884 / 4,637 / 20,684 / 1 | 884 / 4,637 / 20,684 / 1 | 870 / 4,651 / 20,684 / 1 | 870 / 4,651 / 20,684 / 1 |
 | DIFFERENT | 0 | 0 | 0 | 0 |
 | Idiomatic / raw-fallback trees | 8,494 / 17,711 | 8,511 / 17,694 | 25,308 / 897 | 25,308 / 897 |
-| Inline `raw {}` statements | 3,636 | 3,201 | 27,796 | 18,569 |
-| Lines inside inline `raw {}` blocks | 7,184 | 6,281 | 153,806 | 102,231 |
-| `raw {}` blocks (inline and whole-tree) | 19,887 | 19,533 | 22,721 | 13,147 |
+| Inline `raw {}` statements | 3,636 | 3,201 | 27,796 | 18,552 |
+| Lines inside inline `raw {}` blocks | 7,184 | 6,281 | 153,806 | 102,220 |
+| `raw {}` blocks (inline and whole-tree) | 19,887 | 19,533 | 22,721 | 13,131 |
 | `if !..return error` | 1,313 | 581 | 33,497 | 5,263 |
 | `?` | 199 | 2,034 | 1,218 | 32,072 |
-| Lines | 971,842 | 965,773 | 1,137,208 | 950,317 |
+| Lines | 971,842 | 965,773 | 1,137,208 | 950,286 |
 | fmt-dirty files | 0 | 0 | 0 | 0 |
 | Lint findings | 12 | 10 | 100 | 51 |
 | `frame_headroom` | 3 | 3 | 70 | 46 |
 | `negated_comparison` | 9 | 7 | 27 | 3 |
 | `untyped_engine_field` | 0 | 0 | 0 | 0 |
-| Wall time, 10 workers | 108 s | 83 s | 70 s | 71 s |
+| Wall time, 10 workers | 108 s | 85 s | 70 s | 73 s |
 
 - **Verdicts.** Every count is unchanged. Per file, no tree loses a proof.
 - **Idiomatic trees.** No file has fewer idiomatic trees in either mode. 17 strict files have
