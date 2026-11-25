@@ -174,6 +174,67 @@ fn flag_words_are_named_by_their_typed_field() {
     }
 }
 
+/// `source` with every `rule` suggestion applied at once, as the lift applies them.
+fn apply_all(source: &str, rule: &str) -> (usize, String) {
+    let found = of(source, rule);
+    let lines: Vec<&str> = source.lines().collect();
+    let mut starts = vec![0];
+    for l in &lines {
+        starts.push(starts.last().unwrap() + l.len() + 1);
+    }
+    let mut edits: Vec<(usize, usize, String)> = found
+        .iter()
+        .map(|d| {
+            let at = starts[d.line - 1] + d.column - 1;
+            let end = at + source[at..].find(']').expect("an indexed cell") + 1;
+            (at, end, d.suggestion.clone().expect("a suggestion"))
+        })
+        .collect();
+    edits.sort();
+    let mut out = source.to_owned();
+    for (at, end, text) in edits.iter().rev() {
+        out.replace_range(at..end, text);
+    }
+    (found.len(), out)
+}
+
+#[test]
+fn flag_words_in_arithmetic_are_named_together() {
+    // Engine words are lenient `i16`s, so all three build together too.
+    let source = tree(
+        "",
+        "        temp[0] = self.data[8] + self.data[4] + self.data[42];",
+    );
+    let (n, fixed) = apply_all(&source, "untyped_engine_field");
+    assert_eq!(n, 3, "{fixed}");
+    assert!(
+        fixed.contains("temp[0] = self.flags + self.allowed_heights + self.placement;"),
+        "{fixed}"
+    );
+    assert_eq!(iff(&source), iff(&fixed));
+}
+
+#[test]
+fn suggestions_that_build_only_apart_are_not_all_kept() {
+    // Each name builds alone, but `ObjectFlags2` and `BuyFlags` do not compare: the lift
+    // applies every suggestion, so only one is kept.
+    let source = tree(
+        "",
+        "        if self.data[40] == self.data[43] {\n            temp[0] = 1;\n        }",
+    );
+    let (n, fixed) = apply_all(&source, "untyped_engine_field");
+    assert_eq!(n, 1, "{fixed}");
+    assert_eq!(iff(&source), iff(&fixed));
+    // Words of one type still pair up.
+    let source = tree(
+        "",
+        "        if self.data[40] == stack_obj.data[40] {\n            temp[0] = 1;\n        }",
+    );
+    let (n, fixed) = apply_all(&source, "untyped_engine_field");
+    assert_eq!(n, 2, "{fixed}");
+    assert_eq!(iff(&source), iff(&fixed));
+}
+
 #[test]
 fn container_is_read_only_and_an_object_id() {
     let source = tree(
@@ -697,6 +758,116 @@ fn no_method_form_for_a_user_function_or_a_call_used_as_a_value() {
         &tree("", "        play_sound(5, /* here */ stack_obj);"),
         "prefer_method_syntax",
     );
+}
+
+// --- what the trial build cannot see -------------------------------------------------------
+
+#[test]
+fn a_rewrite_that_builds_only_beside_another_does_not_stand() {
+    // Either `let` typed alone gives the `if` arms two types; both together build.
+    let source = tree(
+        "",
+        "        let a = self.data[40];\n        let b = self.data[40];\n        let v = if temp[0] == 0 { a } else { b };\n        temp[1] = v;",
+    );
+    none(&source, "untyped_engine_field");
+}
+
+#[test]
+fn wide_strings_before_a_rewrite_on_its_line() {
+    // The lexer counts a string's characters: the rewrite still lands on the `if`.
+    let source = tree(
+        "",
+        "        dialog(kind: ok, title: \"ééé\", message: \"M\"); /*é*/if !lib::must() { return error; }",
+    );
+    rewrites(
+        &source,
+        "prefer_question_mark",
+        "if !lib::must() { return error; }",
+        "lib::must()?;",
+    );
+    // The lift reads a field's column as a byte offset: after a wide string it is not one.
+    none(
+        &tree(
+            "",
+            "        dialog(kind: ok, title: \"ééé\", message: \"M\"); temp[0] = stack_obj.data[41];",
+        ),
+        "untyped_engine_field",
+    );
+    one(
+        &tree("", "        temp[0] = stack_obj.data[41];"),
+        "untyped_engine_field",
+    );
+}
+
+#[test]
+fn a_field_is_reported_only_as_text_the_lift_can_replace() {
+    for body in [
+        "        temp[0] = stack_obj /* ] */ .data[41];",
+        "        temp[0] = stack_obj.data[\n            41\n        ];",
+    ] {
+        none(&tree("", body), "untyped_engine_field");
+    }
+}
+
+#[test]
+fn an_allow_the_budget_did_not_reach_is_not_stale() {
+    // Each `let` rewrite fails alone, and each takes its own build: the budget runs out
+    // before the allowed cell is tried.
+    let mut body = String::new();
+    for i in 0..50 {
+        body.push_str(&format!(
+            "        let bits{i} = self.data[40]; bits{i} flag_set Height::Table; temp[0] = bits{i};\n"
+        ));
+    }
+    body.push_str(
+        "        // antics-lint: allow(untyped_engine_field)\n        temp[1] = self.data[41];",
+    );
+    let source = tree("", &body);
+    none(&source, "stale_lint_allow");
+    none(&source, "untyped_engine_field");
+}
+
+#[test]
+fn a_typed_handles_state_is_no_engine_flag_word() {
+    let source = obj(
+        "",
+        "    state flags2: i16;\n    #[bhav(label = \"Probe\")] fn probe(h: Self) {\n        h.flags2 flag_set 6;\n        stack_obj.flags2 flag_set 6;\n    }",
+    );
+    let d = one(&source, "untyped_engine_constant");
+    assert_eq!(d.line, line_of(&source, "stack_obj.flags2"), "{d:#?}");
+}
+
+#[test]
+fn a_helper_no_tree_calls_is_not_rewritten() {
+    // Unused, the helper is not built: a rewrite there is unchecked.
+    let helper = "    fn helper() {\n        temp[0] = stack_obj.data[41];\n    }\n";
+    let unused = obj(
+        "",
+        &format!(
+            "{helper}    #[bhav(label = \"Probe\")] fn probe() {{\n        temp[1] = 1;\n    }}"
+        ),
+    );
+    none(&unused, "untyped_engine_field");
+    let used = obj(
+        "",
+        &format!("{helper}    #[bhav(label = \"Probe\")] fn probe() {{\n        helper();\n    }}"),
+    );
+    rewrites(
+        &used,
+        "untyped_engine_field",
+        "stack_obj.data[41]",
+        "stack_obj.value",
+    );
+}
+
+#[test]
+fn a_comment_anywhere_in_the_replaced_text_keeps_the_call() {
+    for body in [
+        "        play_sound /* why /* nested */ so */ (5, stack_obj);",
+        "        play_sound // why\n            (5, stack_obj);",
+    ] {
+        none(&tree("", body), "prefer_method_syntax");
+    }
 }
 
 // --- suppression and the open pack --------------------------------------------------------

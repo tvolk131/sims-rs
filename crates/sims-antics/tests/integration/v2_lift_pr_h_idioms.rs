@@ -365,7 +365,8 @@ fn an_inherit_tree_reads_the_stack_objects_person_kind() {
     }
 }"#,
     );
-    has(&lifted, &["temp[0] = stack_obj.person[65];"]);
+    // The lift names the word `untyped_engine_field` suggests.
+    has(&lifted, &["temp[0] = stack_obj.kind;"]);
     assert!(!lifted.contains("raw {"), "{lifted}");
 }
 

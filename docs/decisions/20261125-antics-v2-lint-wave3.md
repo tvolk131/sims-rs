@@ -4,7 +4,7 @@
 
 - **Status:** Accepted
 - **Scope:** `crates/sims-antics/src/v2/lint.rs`, `sims-antics lint`; test-only lines in
-  `v2/decompile.rs`
+  `v2/decompile.rs`, `v2_lint.rs`, `v2_lift_pilot.rs` and `v2_lift_pr_h_idioms.rs`
 - **Track:** Track 7 (`.antics` v2.1 Wave 2, Stream 4b)
 - **Builds on:** [20261125-antics-v2-lint-wave2.md](20261125-antics-v2-lint-wave2.md),
   [20261125-antics-v2-typed-std.md](20261125-antics-v2-typed-std.md)
@@ -50,11 +50,33 @@ How the builds run:
 
 - **Groups.** A file's pending findings are built together in groups, and a failing group is
   split in halves.
-- **What shares a group.** Findings of one statement, and findings whose edits overlap (a
-  `refresh` constant and the call's method form), never share a group. A group build therefore
-  never accepts an edit that builds only alongside another, such as two `ObjectId` cells compared
-  with each other. Each accepted finding builds on its own, given the rest of its group.
-- **Budget.** A file gets at most 48 builds. On the corpus, the most any file needed was 3.
+- **What shares a group.** A group must never accept an edit that builds only alongside another,
+  such as two `ObjectId` cells compared with each other. These never share a group:
+  - findings of one statement;
+  - findings whose edits overlap (a `refresh` constant and the call's method form);
+  - two `untyped_engine_field` findings of one body when either sits in a statement that binds
+    names (`let`, `match`, `for`). The binding carries the typed word's type to later statements:
+    `let a = self.data[40]; let b = self.data[40]; let v = if c { a } else { b };` builds with
+    both edits and with neither, but not with one.
+
+  Other rewrites cannot meet: types reach another statement only through a binding, and another
+  body only through declared signatures. So each accepted finding builds as it would alone.
+- **Built together.** The lift applies every `untyped_engine_field` suggestion at once, so the
+  kept ones of a file are also built together. Each may build alone and still fail beside
+  another: `self.data[40] == self.data[43]` names `flags2` and `buy_flags`, which do not compare.
+  When the whole set fails, its halves join one at a time, each only if it builds with what was
+  kept so far. What fails, or what the budget does not reach, is dropped. A set that one group
+  already built whole needs no more builds.
+- **Budget.** A file gets at most 48 builds, plus 16 to build its kept `untyped_engine_field`
+  findings together. On the corpus, the most any file needed was 3, plus one joint build (68
+  files). A finding the budget leaves untried is not reported, but it still counts as a finding for
+  `stale_lint_allow`, so an `allow` of it is not called stale.
+- **What a build cannot check.** A plain `fn` is built only where it is inlined. A rewrite in one
+  that no tree of the file calls is not proposed.
+- **Edits that lose text.** A rewrite whose replaced text holds a comment is not proposed.
+- **Source offsets.** The lexer counts a string literal's characters and everything else by bytes.
+  Rewrite offsets therefore add each wide string's extra bytes, and an offset inside a character is
+  refused.
 - **Imports.** A `use` line a finding needs is inserted at the top for the build. A test showed
   that line numbers do not reach the `.iff`.
 - **Where checks run.** Only a file that builds is checked. A pack file builds against its pack
@@ -75,7 +97,7 @@ literal index. The name depends on the root:
 - **`stack_obj` and handle locals:** `hand`, `room`, the person words (`age`, `priority`,
   `visitor_kind`, `kind`, ...), then the object words.
 
-Two filters run before a proposal is built:
+These filters run before a proposal is built:
 
 - **Read-only names** (`container`, `hand`, `room`, `visitor_kind`) are skipped where the cell is
   written. `ObjectId` names are proposed only where compared with `==` / `!=` or assigned whole,
@@ -83,6 +105,11 @@ Two filters run before a proposal is built:
 - **The enum words** `facing` (`Direction`) and `gender_kind` (`PersonKind`) are proposed only
   under `as i16`. Their other uses never type-check alone: on the corpus none of these proposals
   built. Pairs such as `self.data[1] = stack_obj.data[1]` would need both rewritten.
+- **The lift's reading.** The lift replaces each cell from the diagnostic's column, read as a
+  byte offset, to the next `]`. A cell is proposed only when that reads it exactly:
+  - it is on one line;
+  - it holds no `]` but its own;
+  - no wide string precedes it on its line.
 
 A state of the same name keeps the cell. `world.expansions` (`global[20]`) was already covered,
 because the rule reads the parser's `WORLD_GLOBALS`. `duplicate_std_global` reads
@@ -104,6 +131,8 @@ Rules for the suggestion:
 
 - **No guessing.** Only literals are reported, and only when the type names the value. A named
   constant is left alone, and so is a bit without a name.
+- **Typed handles.** A flag word named on a typed handle (`h: Self`) may be a state of its object,
+  so it takes no constant. `self`, `me`, Sims and `stack_obj` do.
 - **Names come from the `std` source.** They are read from `std/flags.antics` and
   `std/engine.antics`, so the lint cannot disagree with them.
 - **Spelling the type.**
@@ -160,7 +189,7 @@ target, or a call holding a comment.
 - **Open pack:** 0 findings with `--deny-warnings`. Its build is unchanged: the change touches only
   the lint.
 - **Corpus** (`cache/scratch/corpus-v2-behavioral`, 1,191 lifted files): 0 errors. Lint time is
-  2.6 s against 1.8 s on main, at 8 threads.
+  3.0 s against 2.1 s on main, at 8 threads on a loaded machine.
 
   | rule | main | this change |
   | --- | ---: | ---: |
@@ -176,11 +205,18 @@ target, or a call holding a comment.
 
 - **Lift (Track 9).**
   - The lift applies `untyped_engine_field` suggestions, so lifted objects now name `stack_obj`,
-    handle and new object words. One lift unit test that pinned `stack_obj.data[28]` now expects
-    `stack_obj.support_strength`.
+    handle and new object words. Lift tests that pinned the numbered cells now expect the names:
+    - in `decompile.rs`: `support_strength`, `flags`, `wall_adjacency` and `allowed_heights`;
+    - in `v2_lift_pilot.rs`: `sim.allowed_heights` and `stack_obj.flags flag_set 13`; the bit
+      stays a number;
+    - in `v2_lift_pr_h_idioms.rs`: `stack_obj.kind`.
   - Lifted text does not yet use the three new spellings. The lift tests' lint-clean assertion
     ignores those three rules for now; the coordinator approved this test-only edit in
     `decompile.rs`.
   - **Follow-up for Track 9 Stream 3b:** emit the spellings, then drop the filter.
+- **Earlier lint tests.** Two `v2_lint.rs` cases predate #468:
+  - The bitflags words in `i16` arithmetic now build, because engine words are lenient. That
+    case moved to the wave 3 tests as a finding.
+  - A functional parameter `me` is a handle, so `me.data[2] == 0` is now `me.container`.
 - **Cost.** A file with pending findings builds at least once more inside `lint`. `stale_lint_allow`
   and the new rules need a building file.
