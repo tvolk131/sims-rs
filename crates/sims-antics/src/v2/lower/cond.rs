@@ -153,10 +153,12 @@ impl<'a> TreeLowerer<'a> {
         rhs: &V2Expr,
         span: Span,
     ) -> Result<(String, String)> {
-        // `job_data(..) <op> x` with an `x` that lowers to no setup: the comparison node reads
-        // the career cell right after its staging, so it needs no copy.
+        // `job_data(..) <op> k` with a constant `k`: the comparison node reads the career cell
+        // right after its staging, so it needs no copy. The VM resolves the right operand
+        // first, so `k` must be one that cannot fault (a temp or attribute can), or the
+        // comparison would fault where the copy faulted on the career lookup.
         let job_cell = match self.builtin_job_data_call(lhs)? {
-            Some(call) if self.is_pure_single_operand(rhs) => Some(call),
+            Some(call) if self.eval_const_i16(rhs).is_ok() => Some(call),
             _ => None,
         };
         let (l, l_ty) = match job_cell {

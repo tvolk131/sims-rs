@@ -131,6 +131,23 @@ pub(super) fn raw_air_stmts_clobber_stack_obj(stmts: &[crate::ast::Stmt]) -> boo
     })
 }
 
+/// Whether a raw block defines a label (another raw block may branch to it). A block that does
+/// not parse on its own counts as defining one.
+pub(super) fn raw_air_defines_label(code: &str) -> bool {
+    let wrapped = format!("tree 4096 \"__raw_labels\" {{\n{code}\n}}\n");
+    match crate::parser::parse_module(&wrapped) {
+        Ok(module) => match module.items.first() {
+            Some(crate::ast::Item::Tree(tree)) => {
+                let mut labels = BTreeSet::new();
+                collect_raw_air_labels(&tree.body, &mut labels);
+                !labels.is_empty()
+            }
+            _ => true,
+        },
+        Err(_) => true,
+    }
+}
+
 pub(super) fn collect_raw_air_labels<'a>(
     stmts: &'a [crate::ast::Stmt],
     labels: &mut BTreeSet<&'a str>,

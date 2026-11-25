@@ -12,6 +12,12 @@
 //! A numeric string index the object does not hold reads nothing in the compiled object. Text
 //! from any other file (a host file a compiled tree is spliced into) is not the compiler's to
 //! see: under the v2 frame contract only `@slot(N)` fixes the word an unpinned local lives in.
+//!
+//! One string outside the object is formatted too: a dialog button whose label string is
+//! missing gets the game's default label (`STR#` 142 of `GameData/UIText.iff`). The fact
+//! assumes those labels hold no token, as `sims-vm` does: it formats a dialog with a default
+//! label only after checking the install's labels hold no `$`
+//! (`sims_vm::labels_hold_no_token`), and fails loudly otherwise.
 
 use super::*;
 

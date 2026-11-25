@@ -114,7 +114,10 @@ fn plan_frame_slots(
 /// placement, which `has_slots` says runs): an explicit `local[N]` holds itself, a placed local
 /// its [`assign_frame_slots`] word, and every other `let` the word `.air` gives it, after the
 /// highest explicit or placed word and the `min_locals` floor (`push_frame_floor`: the highest
-/// `@slot` word plus one), in declaration order. `None` if `.air` cannot parse the body.
+/// `@slot` word plus one), in declaration order. The word right after those holds
+/// [`IDLE_SCRATCH`]: `.air` saves `param[0]` there around an `idle` when the tree uses both
+/// (a fact the slot scan does not report, so the word is always counted as taken). `None` if
+/// `.air` cannot parse the body.
 pub(crate) fn frame_occupancy(
     body: &str,
     pinned: &BTreeMap<String, usize>,
@@ -141,11 +144,18 @@ pub(crate) fn frame_occupancy(
     };
     let first = words.keys().last().map_or(0, |w| w + 1).max(floor);
     let placed = usage.lets.iter().filter(|n| !slots.contains_key(*n));
+    let mut end = first;
     for (word, name) in (first..).zip(placed) {
         words.insert(word, name.clone());
+        end = word + 1;
     }
+    words.insert(end, IDLE_SCRATCH.to_owned());
     Some(words)
 }
+
+/// The occupant [`frame_occupancy`] gives the word after the named locals, where `.air` keeps
+/// its `param[0]` save around an `idle` (not a name any local can have).
+pub(crate) const IDLE_SCRATCH: &str = "<idle scratch>";
 
 /// `body` with each local of `slots` written as `local[K]`, found by the `.air` lexer: `let x;`
 /// (or `local x;`) goes, `let x = v;` becomes `local[K] := v;`, and every other operand `x`

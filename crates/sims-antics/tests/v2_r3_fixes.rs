@@ -406,3 +406,78 @@ fn job_data_compares_without_a_copy() {
     let b = tree(&air, "b");
     assert!(b.contains("let __job_0 = scope(33, 22);"), "{b}");
 }
+
+/// A raw label before the first cursor move may be reached again from after it (a raw back
+/// edge), so source order is not control order: a tree whose raw blocks define a label reads
+/// `self` through the entry object everywhere.
+#[test]
+fn a_raw_label_disables_in_place_self() {
+    let src = obj(
+        "Plain",
+        r#"    tree a (sim: Sim) {
+        raw { @again: temp[3] := 1; }
+        self.value += 1;
+        if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
+            return false;
+        }
+        raw { random(temp[2], 1) -> true: @again, false: false; }
+    }"#,
+    );
+    let air = expand("raw_back_edge.antics", &src);
+    let a = tree(&air, "a");
+    let write = a.find("stack.attr[0]").expect("the self write");
+    assert!(
+        a[..write].contains("stack_obj :="),
+        "the write switches to the entry object first:\n{a}"
+    );
+}
+
+/// `.air` keeps `param[0]` in the word after the named locals around an `idle` when a tree uses
+/// both, so text that may read that word keeps the save that would move it.
+#[test]
+fn dialog_entry_save_stays_when_text_may_read_the_idle_scratch_word() {
+    let members = r#"    @frame(args: 1) tree a (sim: Sim) {
+        if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
+            return false;
+        }
+        stack_obj.attr[0] = param[0];
+        sleep(1);
+        dialog(kind: ok, title: title, message: msg);
+    }"#;
+    let air = expand("save_scratch.antics", &obj("Was $Local:1", members));
+    assert!(tree(&air, "a").contains(SAVE), "{air}");
+    let air = expand("save_scratch_plain.antics", &obj("Plain text", members));
+    assert!(!tree(&air, "a").contains(SAVE), "{air}");
+}
+
+/// The VM resolves a comparison's right operand first, so `job_data(..) <op> x` reads the cell
+/// in place only when `x` cannot fault; a temp keeps the copy (the career lookup faults first).
+#[test]
+fn job_data_compares_in_place_only_against_a_constant() {
+    let src = obj(
+        "Plain",
+        r#"    tree a (sim: Sim) {
+        return job_data(9999, 1, 22) == temp[99];
+    }"#,
+    );
+    let air = expand("job_temp.antics", &src);
+    let a = tree(&air, "a");
+    assert!(a.contains("let __job"), "{a}");
+}
+
+/// An out-operand that writes on only one exit leaves the old value on the other: the loop
+/// exits when `animate` returns true, which does not write `ev`, so its initial 7 must stay.
+#[test]
+fn an_out_operand_keeps_the_old_value_on_the_exit_it_does_not_write() {
+    let src = obj(
+        "Plain",
+        r#"    tree a (sim: Sim) {
+        let ev: i16 = 7;
+        while !animate(clip: 0, table: 0, local: ev) {}
+        sim.person[3] = ev;
+    }"#,
+    );
+    let air = expand("out_keep.antics", &src);
+    let a = tree(&air, "a");
+    assert!(a.contains("= 7;"), "the initial store stays:\n{a}");
+}

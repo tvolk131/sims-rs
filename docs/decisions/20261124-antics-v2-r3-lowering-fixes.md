@@ -61,8 +61,11 @@ if it does not:
   and no `let` in a `const` binding's region. Any other result keeps those rules.
 - **`Known(S)`**: the unread save is dropped only if every word in `S` keeps the same occupant
   (`frame_occupancy`, in the frame layout `.air` will assign) with and without the save. The save's
-  own word always changes hands. So this drops the save when every named local is `@slot`-pinned or
-  the save is the highest word, and keeps it whenever `$Local:N` could read a word that would move.
+  own word always changes hands. So does the word after the named locals, where `.air` keeps
+  `param[0]` around an `idle` when the tree uses both. The slot scan does not report that, so the
+  word is always counted as taken. So this drops the save when every named local is
+  `@slot`-pinned or the save is the highest word, and keeps it whenever `$Local:N` could read a
+  word that would move.
 - **`Unknown`**: the save stays.
 
 The rule is a permission, not an obligation. As on main, dead-store elimination drops an unread
@@ -72,6 +75,11 @@ save is a compiler temporary, not a source local. Under the `$Local:N` contract 
 
 Text in another file (a host file a compiled tree is spliced into) is outside what the compiler can
 see. Under the same contract, `@slot(N)` is the way to fix the words such text reads.
+
+One string outside the object is formatted too: a dialog button with no label string gets the
+game's default label (`STR#` 142 of `GameData/UIText.iff`). The fact assumes those labels hold no
+token. `sims-vm` makes the same assumption, checks it against the install
+(`labels_hold_no_token`) and fails loudly when it does not hold.
 
 ### 2. `random` ranges (2b, `mir/frame.rs`)
 
@@ -123,15 +131,19 @@ declaration order, so generated names no longer matter.
 - **`self` before the first cursor move (`lower/stmt.rs` `lower_tree_body`).** In a Sim tree, the
   leading top-level statements before the first one that may move the cursor run with `stack_obj`
   still the entry object (`stmts_may_clobber_stack_obj`, which looks through called helpers). There
-  `self` reads and writes the stack object in place, with no switch and no staging local.
+  `self` reads and writes the stack object in place, with no switch and no staging local. Source
+  order is control order only without raw labels: a raw branch from after a move may jump back to
+  a label before it. So a tree whose raw blocks define a label gets no such prefix. A raw block in
+  an inlined helper or under a cleanup must hold its own labels, so it cannot jump back.
 - **`push_interaction(object: <@slot(N) handle>)` (`lower/builtins.rs`).** It emits `object: N`
   with flag 0x02, so the VM reads the handle from its own pinned word. There is no copy into word 0
   and no pin, so it can share a tree with other `@slot` lets. An explicit flag 0x02 is refused, as
   for any handle.
-- **`job_data` comparisons (`lower/cond.rs`, `lower/expr.rs`).** `job_data(..) <op> x` reads the
-  `scope(33, field)` cell directly in the comparison node, when `x` lowers with no setup. Otherwise
-  the value is still copied to a local, because a later staged operand would overwrite the temps the
-  cell reads.
+- **`job_data` comparisons (`lower/cond.rs`, `lower/expr.rs`).** `job_data(..) <op> k` reads the
+  `scope(33, field)` cell directly in the comparison node when `k` is a compile-time constant.
+  - The VM resolves the right operand first. So an operand that can fault, such as a temp or an
+    attribute, would fault where the copy faulted on the career lookup.
+  - Any other right side is still copied to a local.
 
 ## Verification
 
@@ -144,8 +156,10 @@ declaration order, so generated names no longer matter.
   - Piano R2 is modulo {4110}, the separate over-2048-instruction path.
 - **`open-pack`.** `verify` reports 0 violations, and all 20 objects build byte-identical to main.
 - **Tests.**
-  - `tests/v2_r3_fixes.rs` (synthetic) covers each fix and its negative cases: kept saves, a later
-    literal reaching earlier trees, read-first helper locals, and loops that move the cursor.
+  - `tests/v2_r3_fixes.rs` (synthetic) covers each fix and its negative cases: kept saves (including
+    the `idle` scratch word), a later literal reaching earlier trees, read-first helper locals, an
+    out-operand's unwritten exit, loops and raw back edges that move the cursor, and a faulting
+    `job_data` comparand.
   - The `opt.rs` unit tests cover the pipeline's text veto.
 
 ## What would reopen this

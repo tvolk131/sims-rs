@@ -16,12 +16,20 @@ impl<'a> TreeLowerer<'a> {
     /// they call) run with `stack_obj` still the entry object, so `self` needs no switch there.
     /// Whatever a statement lowers, including a `return`'s cleanups, is emitted inside it, and
     /// a cleanup still pending after it is lowered from its AST where it is emitted.
+    ///
+    /// Source order is control order only without raw labels: a raw branch from after a move
+    /// may jump back to a label before it, so a tree whose raw blocks define a label has no
+    /// such prefix.
     pub(super) fn lower_tree_body(&mut self, stmts: &[V2Stmt]) -> Result<()> {
         let sim = match &self.tree_ctx {
             TreeContext::SimOnObject { sim_name } => Some(sim_name.clone()),
             TreeContext::ObjectSelf => None,
         };
-        let mut prefix = sim.is_some();
+        let mut prefix = sim.is_some()
+            && !specialize::stmts_any(
+                stmts,
+                &|s| matches!(s, V2Stmt::RawAir { code, .. } if raw_air_defines_label(code)),
+            );
         for stmt in stmts {
             prefix = prefix
                 && !stmts_may_clobber_stack_obj(
