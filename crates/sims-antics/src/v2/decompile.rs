@@ -272,6 +272,7 @@ pub fn decompile_iff_to_v2_report(
                 if !unblamed
                     && !tree.is_some_and(|id| plan.add_frame(&model, id))
                     && !tree.is_some_and(|id| plan.name_builtin_locals_only(id, &generated))
+                    && !tree.is_some_and(|id| plan.drop_inherit(&model, id))
                     && !tree.is_some_and(|id| plan.drop_extras(id, &generated))
                     && !tree.is_some_and(|id| plan.number_raw_bcons(id, &generated))
                     && !plan.lower_at_line(&model, &generated, line)
@@ -286,6 +287,7 @@ pub fn decompile_iff_to_v2_report(
                     Some(id) => {
                         plan.add_frame(&model, id)
                             || plan.name_builtin_locals_only(id, &generated)
+                            || plan.drop_inherit(&model, id)
                             || plan.drop_extras(id, &generated)
                             || plan.number_raw_bcons(id, &generated)
                             || plan.lower_tree(&model, id)
@@ -323,6 +325,7 @@ pub fn decompile_iff_to_v2_report(
                 if !changed {
                     for &id in &unproven {
                         changed |= plan.name_builtin_locals_only(id, &generated)
+                            || plan.drop_inherit(&model, id)
                             || plan.drop_extras(id, &generated)
                             || plan.other_order(&mut model, id)
                             || plan.lower_tree(&model, id)
@@ -2583,12 +2586,21 @@ fn assigns_stack_obj(body: &[Stmt]) -> bool {
                 is_operand(lhs, 10, 0) && assign_op_of(*operator).is_some()
             }
             PrimitiveCall::Random { dst, .. } => is_operand(dst, 10, 0),
+            // Without bit 7 the step writes `stack_obj`, whatever `dest` says.
+            PrimitiveCall::SetToNext { mode, dest, .. } => {
+                mode & 0x80 == 0 || dest.as_ref().is_some_and(|d| is_operand(d, 10, 0))
+            }
             _ => false,
         }
     }
     fn cond_moves(c: &Condition) -> bool {
         match c {
             Condition::Primitive { prim, .. } => prim_moves(prim),
+            Condition::Compare {
+                lhs,
+                op: CompareOp::IncLt | CompareOp::DecGt,
+                ..
+            } => is_operand(lhs, 10, 0),
             Condition::Not(inner) => cond_moves(inner),
             _ => false,
         }
@@ -3220,7 +3232,7 @@ impl Plan {
         // trees prefer), or from an inherit tree (which, lowered in both contexts, calls
         // only inherit trees); never a lifecycle tree or a variant's init/main. A tree whose
         // body depends on the context fails to compile as inherit and drops back to its own
-        // context with its extras (`drop_extras`).
+        // context (`drop_inherit`), keeping its other extras.
         let mut inherit = BTreeSet::new();
         loop {
             let before = inherit.len();
@@ -3274,6 +3286,13 @@ impl Plan {
         model.tree(id).is_some_and(|t| t.lifecycle.is_some())
             && !self.standalone.contains(&id)
             && self.framed.insert(id)
+    }
+
+    /// Writes tree `id` in its own context from now on, when the last round wrote it
+    /// inherit. Tried before its other extras: a callee the closure made inherit may depend
+    /// on the context, and its other idioms may still hold in its own.
+    fn drop_inherit(&mut self, model: &Model, id: u16) -> bool {
+        model.tree(id).is_some_and(|t| self.inherits(t)) && self.inherit.remove(&id)
     }
 
     /// Names tree `id`'s locals only where builtins address them from now on, when the last
@@ -5160,9 +5179,9 @@ impl Translator<'_> {
                 span,
                 prim,
                 branches: None,
-            } if self.extra()
-                && let Some((lhs, code, rhs)) = expr_parts(prim)
-                && let Some(op) = assign_op_of(code) =>
+            } if let Some((lhs, code, rhs)) = expr_parts(prim)
+                && let Some(op) = assign_op_of(code)
+                && self.extra() =>
             {
                 self.simple(&Stmt::Assign {
                     span: *span,
@@ -6373,6 +6392,27 @@ object "Fable Lamp" {
     }
 
     #[test]
+    fn a_sim_tree_whose_step_moves_stack_obj_names_its_cells_by_stack_obj() {
+        // A step with no destination moves `stack_obj` itself.
+        let lifted = lift_source(
+            r#"object "Fable Quill" {
+    guid: 0x7E00_0143;
+    #[bhav(id = 4300, label = "Look", locals = 0)]
+    fn look(sim: Sim) {
+        raw {
+            my.motive[1] := 2;
+            if set_to_next(person) {
+                stack.data[25] := 100;
+            }
+        }
+    }
+}"#,
+        );
+        has(&lifted, &["stack_obj.data[25] = 100;"]);
+        assert!(!lifted.contains("self.data[25]"), "{lifted}");
+    }
+
+    #[test]
     fn bit_operations_and_sim_slots_leave_raw() {
         let lifted = lift_source(
             r#"object "Fable Spool" {
@@ -6438,6 +6478,44 @@ object "Fable Lamp" {
         assert!(!lifted.contains("raw {"), "{lifted}");
         has(&lifted, &["play_sound(5, me);"]);
         assert_eq!(lifted.matches("context = inherit").count(), 2, "{lifted}");
+    }
+
+    #[test]
+    fn a_callee_that_fails_as_inherit_keeps_its_other_idioms() {
+        let lifted = lift_source(
+            r#"object "Fable Gong" {
+    guid: 0x7E00_0145;
+    #[bhav(id = 4300, label = "Strike", locals = 0)]
+    fn strike(sim: Sim) {
+        raw {
+            my.motive[1] := 2;
+            if call 4301(temps) {
+                temp[0] := 1;
+            }
+        }
+    }
+    #[bhav(id = 4301, label = "Swing", locals = 0)]
+    fn swing() {
+        raw {
+            if call 4302(temps) {
+                temp[1] := 1;
+            }
+        }
+    }
+    #[bhav(id = 4302, label = "Fade", locals = 0)]
+    fn fade() {
+        raw {
+            my.attr[2] := 1;
+            play_sound(5);
+            remove_object(me);
+        }
+    }
+}"#,
+        );
+        // The leaf drops back to the object's context and keeps its idioms.
+        let leaf = &lifted[lifted.find("fn fade_4302").expect("leaf")..];
+        assert!(!leaf.contains("raw {"), "{lifted}");
+        has(leaf, &["self.attr_2 = 1;", "play_sound(5);"]);
     }
 
     #[test]

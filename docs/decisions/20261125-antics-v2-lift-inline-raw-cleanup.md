@@ -55,12 +55,14 @@ Each is an extra idiom (`Translator::extra`), so a tree it breaks is rewritten w
   form depends on the caller's context, which `context = inherit` refuses. Callees of an
   inherit tree are written inherit too: lowered in both contexts, it may call only inherit
   trees. A callee whose body depends on the context fails as inherit and drops back to its own
-  context, as before.
+  context. That is tried before its other extras, which may still hold there.
 - **Self-loops.** A loop whose whole body is one primitive (the original's node loops on
   itself) carries the same `unbounded_loop_without_yield` allow that breakpoint traps already
   had.
-- **A search moves `stack_obj`.** A Sim tree that calls `find_best_interaction()`, draws a
-  random number into `stack_obj`, or assigns it through `expr(..)` names the stack object's cells
+- **A search moves `stack_obj`.** A Sim tree that calls `find_best_interaction()`, steps
+  `set_to_next` into `stack_obj` (its default destination), draws a random number into
+  `stack_obj`, counts it with `inc_lt`/`dec_gt`, or assigns it through `expr(..)` names the
+  stack object's cells
   `stack_obj.*`, so `self` never means the found object (lint
   `stack_obj_clobber_after_self`).
 
