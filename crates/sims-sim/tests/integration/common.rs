@@ -35,12 +35,14 @@ impl Drop for TempDb {
     }
 }
 
-/// A directory in the temporary directory, made now and removed on drop.
+/// An empty directory in the temporary directory, made now and removed on
+/// drop. Anything a killed run left at the same path is cleared first.
 pub struct TempDir(pub PathBuf);
 
 impl TempDir {
     pub fn new(label: &str) -> Self {
         let path = temp_path(label, "");
+        let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         Self(path)
     }

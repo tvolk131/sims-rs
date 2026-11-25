@@ -87,7 +87,10 @@ was repeated.
 - **Stale selectors elsewhere.** Docs that name an old target need the new
   selector:
   - `docs/repository-workflow.md` ("Avatar-codec test selectors"):
-    `--test avatar_codecs` becomes `--test integration avatar_codecs::`;
+    `--test avatar_codecs` becomes `--test integration avatar_codecs::`.
+    An `--exact` name needs the full path, e.g.
+    `avatar_codecs::avatar::skeleton_hierarchy_and_truncations`; the old
+    `avatar::…` name would select zero tests and still exit 0;
   - file paths in `docs/legacy-mining-audit.md`.
 
   Older ADRs keep their paths as written at the time.
