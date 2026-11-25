@@ -428,7 +428,7 @@ fn go_somewhere_else(shell: &mut NeighborhoodShell, leader: u32) -> Option<Strin
 
 /// A trip Downtown alone, on to another Downtown lot, and home from there:
 /// Go Somewhere Else carries the trip on through the shell (a new trip ID,
-/// the same home, the file following), and the shell's Go Home from the
+/// the same home, the file following), and the cab sign's Go Home on the
 /// second lot returns the traveler.
 #[test]
 fn a_destination_go_somewhere_else_travels_on_through_the_shell() {
@@ -482,9 +482,28 @@ fn a_destination_go_somewhere_else_travels_on_through_the_shell() {
         "the traveler arrived"
     );
 
-    // The shell's Go Home from the second lot returns to the trip's home.
-    let report = shell.return_from_destination().expect("return home");
-    assert_eq!(report.home_house, HOME);
+    // The cab sign's Go Home on the second lot asks for house -1, the
+    // family's house, and the shell returns to the trip's home. The lot
+    // booted with the shell's scripted answers, and the `[3]` left unused
+    // would answer the cab's dialog "No", so clear it first: the dialogs
+    // then wait, and `call_cab` answers them as a player would.
+    game.lot_mut()
+        .replay_dialogs(&[])
+        .expect("clear the scripted answers");
+    let mut asked_home = false;
+    call_cab(
+        &mut shell,
+        leader,
+        GO_HOME,
+        |shell| {
+            if let Some(trip) = shell.game().and_then(|g| g.trip_request()) {
+                assert_eq!(i32::from(trip.house), HOME as i32, "Go Home asks for home");
+                asked_home = true;
+            }
+        },
+        |shell| shell.active_lot_house() == Some(HOME),
+    );
+    assert!(asked_home, "the cab sign asked for the trip home");
     assert_eq!(shell.active_lot_house(), Some(HOME));
     assert!(shell.active_trip().is_none(), "the trip is over");
     assert_eq!(
