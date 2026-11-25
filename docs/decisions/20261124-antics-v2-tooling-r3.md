@@ -153,26 +153,27 @@ Not lifted: the rare raw `sleep` statements.
 
 | | main (b3758a7c) | this change |
 |---|---|---|
-| proven (identical + equivalent) | 2699 (367 + 2332)* | 1555 (218 + 1337) |
-| inconclusive / omitted / DIFFERENT | 22 / 1 / **0** | 1166 / 1 / **0** |
+| proven (identical + equivalent) | 2699 (367 + 2332)* | 799 (134 + 665) |
+| inconclusive / omitted / DIFFERENT | 22 / 1 / **0** | 1922 / 1 / **0** |
 | idiomatic trees | 870 | 891 |
 | raw statements inside idiomatic trees | 1119 | 768 (−31%) |
 | raw trees | 1851 | 1830 |
 | init/main written as plain trees | 101 | 0 |
 | lint warnings on the lifted files | 29 | 17 (`magic_guid_literal` 11 → 0) |
 
-\* Main's count is not sound. It does not check labels, callbacks, tree names or the semi-global link (see *Object-level checks*).
+\* Main's count is not sound. It does not check labels, callbacks, tree names, the semi-global link or what global trees see of their owner (see *Object-level checks*).
 
-The 1166 inconclusive trees, by the first reason reported:
+The 1922 inconclusive trees, by the first reason reported:
 
-- 371 callbacks the lifted object does not register (see above);
+- 859 trees that run a global or semi-global tree while the rebuilt object differs as its owner. In every base-game object the lift changes tree labels, definitions, callback tables and text tables;
 - 354 trees of the 36 objects with a semi-global file (the lift writes no `GLOB`);
-- 219 trees that call an unproven tree, directly, by name, by function or by creating an object;
+- 280 trees that call an unproven tree, directly, by name, by function, by creating an object or through a global tree;
+- 226 callbacks the lifted object does not register (see above);
 - 103 lifecycle trees whose label a block cannot keep;
-- 53 trees that create an object while the callback tables differ;
-- 23 trees looking a tree up by a name not known here (mostly the global file's table);
-- 18 Run Functional Tree callers whose callback differs;
-- 15 readers of definition words and 6 of callback tables that differ;
+- 49 trees that create an object while the callback tables differ;
+- 21 trees looking a tree up by a name not known here (mostly the global file's table);
+- 9 Run Functional Tree callers whose callback differs;
+- 11 readers of definition words and 6 of callback tables that differ;
 - 4 trees that read a `STR#` table the lift does not reproduce.
 
 Writing `STR#` 303 recovered 187 by-name trees and callers that the checks alone would also have left unproven.
@@ -193,7 +194,8 @@ Writing `STR#` 303 recovered 187 by-name trees and callers that the checks alone
 - A block call stays `raw` (see Decision 3.1).
 - 103 base-game lifecycle trees carry labels other than the compiler's block names (`main loop`, ...). They and their by-name callers stay inconclusive until v2 can label a block (Track 8 follow-up, e.g. `main "main loop" { }`).
 - Run Tree By Name from the global file's names table is checked conservatively. Resolving it would need the global file's `STR#` 303 in the lift options.
-- **Callbacks and the semi-global link** (most of the 1166 base-game trees, all 6 open-pack trees) need follow-ups:
+- **Global trees running with this object as owner** are checked conservatively: the lift has only the global and semi-global files' arities and names, not their code. With their code in the lift options, a caller could be checked against what those trees actually reach.
+- **Callbacks, definitions and the semi-global link** (most of the 1922 base-game trees, all 6 open-pack trees) need follow-ups:
   - lift `functional`, `load`/`reset`/`cleanup` and multi-tile definitions (Track 9);
   - a v2 way to fill any OBJD callback word with a labelled tree, and to write the `GLOB` link (Track 8).
 - `@slot(N) let x: T;` is exempt from `uninitialized_local_read` as a whole. A pinned slot exists so raw code or text can use it by number, and lint does not model raw writes by slot number.
