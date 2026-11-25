@@ -628,7 +628,7 @@ fn group_end(text: &str, open: usize) -> Option<usize> {
 fn apply_lint_spellings(text: &str, fixes: &[LintSpelling]) -> String {
     let mut out = text.to_owned();
     let mut sorted: Vec<&LintSpelling> = fixes.iter().collect();
-    sorted.sort_by(|a, b| b.start.cmp(&a.start));
+    sorted.sort_by_key(|f| std::cmp::Reverse(f.start));
     for f in sorted {
         out.replace_range(f.start..f.end, &f.text);
     }
