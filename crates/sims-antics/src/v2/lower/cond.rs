@@ -1053,7 +1053,7 @@ impl<'a> TreeLowerer<'a> {
         self.line(format!("if {test} {{"));
         self.em.indent();
         if let Some(saved) = &restore {
-            self.emit_restore_stack_obj(saved.as_deref());
+            self.emit_stack_restore(saved);
         }
         edge(self, true)?;
         self.em.dedent();
@@ -1065,7 +1065,7 @@ impl<'a> TreeLowerer<'a> {
             self.em.indent();
             let arm_at = self.em.mark();
             if let Some(saved) = &restore {
-                self.emit_restore_stack_obj(saved.as_deref());
+                self.emit_stack_restore(saved);
             }
             edge(self, false)?;
             self.em.dedent();
@@ -1076,7 +1076,7 @@ impl<'a> TreeLowerer<'a> {
             return Ok(());
         }
         if let Some(saved) = &restore {
-            self.emit_restore_stack_obj(saved.as_deref());
+            self.emit_stack_restore(saved);
         }
         edge(self, false)?;
         Ok(())
@@ -1153,11 +1153,11 @@ impl<'a> TreeLowerer<'a> {
                     let bang = if negated { "!" } else { "" };
                     self.line(format!("if {bang}{prim} {{"));
                     self.em.indent();
-                    self.emit_restore_stack_obj(saved_stack_obj.as_deref());
+                    self.emit_stack_restore(&saved_stack_obj);
                     self.line("return true;".to_owned());
                     self.em.dedent();
                     self.line("}".to_owned());
-                    self.emit_restore_stack_obj(saved_stack_obj.as_deref());
+                    self.emit_stack_restore(&saved_stack_obj);
                     self.line("return false;".to_owned());
                     return Ok(());
                 }

@@ -783,7 +783,7 @@ impl<'a> TreeLowerer<'a> {
                     let bang = if negated { "!" } else { "" };
                     self.line(format!("if {bang}{prim} {{"));
                     self.em.indent();
-                    self.emit_restore_stack_obj(saved_stack_obj.as_deref());
+                    self.emit_stack_restore(&saved_stack_obj);
                     self.push_scope(ScopeFrame::block());
                     let r1 = self.lower_stmts(then_body);
                     let p1 = self.pop_scope_and_run_cleanups();
@@ -792,7 +792,7 @@ impl<'a> TreeLowerer<'a> {
                     self.line("} else {".to_owned());
                     self.em.indent();
                     let restore_at = self.em.mark();
-                    self.emit_restore_stack_obj(saved_stack_obj.as_deref());
+                    self.emit_stack_restore(&saved_stack_obj);
                     let restored = self.em.mark() != restore_at;
                     self.push_scope(ScopeFrame::block());
                     let r2 = self.lower_stmts(else_body);
@@ -1402,7 +1402,7 @@ impl<'a> TreeLowerer<'a> {
             )?;
             let air_name = self.fresh(&format!("v_{name}"));
             self.line(format!("let {air_name} = temp[0];"));
-            self.emit_restore_stack_obj(saved_stack_obj.as_deref());
+            self.emit_stack_restore(&saved_stack_obj);
             self.bind_var(
                 name.to_owned(),
                 Binding::Local {

@@ -155,9 +155,9 @@ impl<'a> TreeLowerer<'a> {
         let saved_stack_obj = if staged_target != "stack_obj" {
             let saved = self.save_stack_obj_for_move();
             self.stack_op(mir::StackObjOp::Set(&staged_target));
-            saved
+            StackRestore::Moved(saved)
         } else {
-            None
+            StackRestore::Unmoved
         };
         let prim = if change_icon {
             format!("run_functional_tree({kind_name}, change_icon: true)")
@@ -197,7 +197,7 @@ impl<'a> TreeLowerer<'a> {
         } else {
             self.line(format!("{prim};"));
         }
-        self.emit_restore_stack_obj(saved_stack_obj.as_deref());
+        self.emit_stack_restore(&saved_stack_obj);
         Ok(())
     }
 
@@ -211,7 +211,7 @@ impl<'a> TreeLowerer<'a> {
         binding_name: &str,
         ty_ann: Option<&V2Type>,
         else_body: &[V2Stmt],
-    ) -> Result<(ValueType, Option<String>)> {
+    ) -> Result<(ValueType, StackRestore)> {
         if type_args.len() > 1 {
             return Err(Error::at(
                 span,
@@ -291,7 +291,7 @@ impl<'a> TreeLowerer<'a> {
 
         self.line(format!("if !{prim} {{"));
         self.em.indent();
-        self.emit_restore_stack_obj(saved_stack_obj.as_deref());
+        self.emit_stack_restore(&saved_stack_obj);
         self.push_scope(ScopeFrame::block());
         let r = self.lower_stmts(else_body);
         let p = self.pop_scope_and_run_cleanups();

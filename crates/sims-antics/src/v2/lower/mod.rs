@@ -558,7 +558,18 @@ struct PreparedFunctional {
     prim: String,
     sig: Option<ResolvedFunctionalSig>,
     kind_name: String,
-    saved_stack_obj: Option<String>,
+    saved_stack_obj: StackRestore,
+}
+
+/// What `stack_obj` needs after a `run_functional` call. The callee runs in its own frame, so the
+/// call itself never changes the caller's `stack_obj`; only moving it to the receiver does.
+#[derive(Clone)]
+enum StackRestore {
+    /// The receiver was `stack_obj` itself: nothing moved, nothing to restore (an entry restore
+    /// here would throw away a cursor the tree set, e.g. by Find Best Object).
+    Unmoved,
+    /// `stack_obj` was moved to the receiver: restore the saved value (or the entry object).
+    Moved(Option<String>),
 }
 
 #[derive(Clone)]

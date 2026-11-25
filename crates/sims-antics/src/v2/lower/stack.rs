@@ -50,6 +50,13 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// Restores `stack_obj` after a `run_functional` call (see [`StackRestore`]).
+    pub(super) fn emit_stack_restore(&mut self, restore: &StackRestore) {
+        if let StackRestore::Moved(saved) = restore {
+            self.emit_restore_stack_obj(saved.as_deref());
+        }
+    }
+
     pub(super) fn emit_entry_stack_restore(&mut self) {
         if self.has_self_obj_local {
             self.stack_op(mir::StackObjOp::Set(mir::SELF_OBJ));

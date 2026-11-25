@@ -725,3 +725,43 @@ fn local_extern_globals_merge_with_std() {
         "extern mod 'globals' calls tree 273 two ways",
     );
 }
+
+#[test]
+fn run_functional_on_stack_obj_keeps_a_found_cursor() {
+    // The callee runs in its own frame, so `stack_obj.run_functional(..)` leaves the tree's
+    // `stack_obj` alone: no entry restore may replace the object Find Best Object found.
+    let src = |call: &str| {
+        format!(
+            "object \"Syntax Probe\" {{
+    guid: 0x7F50_0001;
+    state n: i16;
+
+    #[bhav(id = 4100, label = \"clean one\")]
+    fn clean_one() -> bool {{
+        stack_obj = 0;
+        raw {{ if !find_best_object(clean, flags: 0) {{ return false; }} }}
+        {call}
+        stack_obj.data[25] = 50;
+        if self.n > 0 {{
+            return true;
+        }}
+        false
+    }}
+}}
+"
+        )
+    };
+    let (air, _, _) = build(&src("stack_obj.run_functional(clean);"));
+    assert!(!air.contains("__saved_stack_obj"), "{air}");
+    assert_same(
+        "statement",
+        &src("stack_obj.run_functional(clean);"),
+        &src("raw { run_functional_tree(clean); }"),
+    );
+    // (The raw form prints on one line; the trees are the same.)
+    assert!(
+        build(&src("if !stack_obj.run_functional(clean) { return false; }")).1
+            == build(&src("raw { if !run_functional_tree(clean) { return false; } }")).1,
+        "condition: IFF bytes differ"
+    );
+}
