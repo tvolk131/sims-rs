@@ -317,6 +317,7 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             file: &input.name,
             lines: input.source.lines().collect(),
             symbols: &symbols,
+            callables: file_callables(ast, &symbols),
             enums: file_enums(input, ast),
             states: file_states(ast),
             frames,
@@ -333,6 +334,7 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             raw_bodies: directives.raw_bodies.clone(),
             line_starts: directives.line_starts.clone(),
             sims: Vec::new(),
+            sim_bindings: BTreeSet::new(),
             object_me: false,
             me_bcon: symbols.bcon_names.contains("me"),
             bound: BTreeSet::new(),
@@ -930,6 +932,9 @@ struct Symbols {
     bcon_names: BTreeSet<String>,
     /// The templates the file set declares.
     template_names: BTreeSet<String>,
+    /// The functions and trees templates declare: an object that extends one, in any file,
+    /// calls them by their bare names.
+    template_fns: BTreeSet<String>,
     /// Literal `attr[N]` indices.
     attr_indices: BTreeSet<i64>,
     /// Identifier-like words in `raw { }` code (not its comments or strings), less the
@@ -1040,6 +1045,17 @@ impl Symbols {
                 V2Item::Object(o) => add_members(&o.members, self),
                 V2Item::Template(t) => {
                     self.template_names.insert(t.name.clone());
+                    for m in &t.members {
+                        match m {
+                            ObjectMember::Fn(f) => {
+                                self.template_fns.insert(f.name.clone());
+                            }
+                            ObjectMember::Tree(t) => {
+                                self.template_fns.insert(t.ident.clone());
+                            }
+                            _ => {}
+                        }
+                    }
                     add_members(&t.members, self);
                 }
                 _ => {}
@@ -1458,6 +1474,9 @@ struct FileLinter<'a> {
     file: &'a str,
     lines: Vec<&'a str>,
     symbols: &'a Symbols,
+    /// The bare names a call in this file may resolve to a user function or tree by (see
+    /// [`file_callables`]); `None` when a glob import may bring in any name.
+    callables: Option<BTreeSet<String>>,
     /// Enums this file can name (see `file_enums`).
     enums: BTreeMap<String, Option<Vec<String>>>,
     /// The file's object states by name, with their type (`None` when two disagree).
@@ -1495,6 +1514,9 @@ struct FileLinter<'a> {
     /// `me` where the frame's `me` is the Sim (an interaction, a functional, a tree with a
     /// Sim parameter or `context = inherit`).
     sims: Vec<String>,
+    /// The body's own Sim bindings (its Sim parameters or `|sim|` names), which shadow a
+    /// builtin name such as `param` or `me` like any other binding.
+    sim_bindings: BTreeSet<String>,
     /// The body being linted is an object's own tree (no Sim parameter, not `context =
     /// inherit`), where `me` is the object itself.
     object_me: bool,
@@ -1548,6 +1570,50 @@ struct TreeCx {
     /// `STR#` 301 entry past the file's own, an `action_label` of another table): their
     /// `$Local:N` tokens are unknown, so any of its locals may be read by one.
     unknown_strings: bool,
+}
+
+/// The bare names a call in `file` may resolve to a user function or tree by, which then
+/// takes the call over a builtin of the same name: the file's own functions and trees, the
+/// names it imports (by alias when it has one), and every template's members (an object may
+/// extend a template of another file). `None` when a glob import other than `std::*` may bring
+/// in any name. Another file's private methods are not visible here.
+fn file_callables(file: &V2File, symbols: &Symbols) -> Option<BTreeSet<String>> {
+    let mut out = symbols.template_fns.clone();
+    for u in &file.uses {
+        for item in &u.items {
+            if item.name == "*" {
+                if u.module_path.first().map(String::as_str) != Some("std") {
+                    return None;
+                }
+            } else {
+                out.insert(item.alias.clone().unwrap_or_else(|| item.name.clone()));
+            }
+        }
+    }
+    let add_members = |members: &[ObjectMember], out: &mut BTreeSet<String>| {
+        for m in members {
+            match m {
+                ObjectMember::Fn(f) => {
+                    out.insert(f.name.clone());
+                }
+                ObjectMember::Tree(t) => {
+                    out.insert(t.ident.clone());
+                }
+                _ => {}
+            }
+        }
+    };
+    for item in &file.items {
+        match item {
+            V2Item::Fn(f) => {
+                out.insert(f.name.clone());
+            }
+            V2Item::Object(o) => add_members(&o.members, &mut out),
+            V2Item::Template(t) => add_members(&t.members, &mut out),
+            _ => {}
+        }
+    }
+    Some(out)
 }
 
 /// A file's object and template states by name, with their type (`None` when two
@@ -2001,6 +2067,14 @@ struct BodyCx {
 }
 
 impl FileLinter<'_> {
+    /// Whether a bare call to `name` in this file may resolve to a user function or tree,
+    /// which takes it over a builtin of the same name.
+    fn user_fn(&self, name: &str) -> bool {
+        self.callables
+            .as_ref()
+            .is_none_or(|names| names.contains(name))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn emit(
         &mut self,
@@ -2125,6 +2199,7 @@ impl FileLinter<'_> {
         object_me: bool,
     ) {
         self.sims = sims.map(str::to_owned).collect();
+        self.sim_bindings = self.sims.iter().cloned().collect();
         if me_is_sim && !self.me_bcon {
             self.sims.push("me".to_owned());
         }
@@ -2138,6 +2213,7 @@ impl FileLinter<'_> {
 
     fn leave_context(&mut self) {
         self.sims.clear();
+        self.sim_bindings.clear();
         self.object_me = false;
         self.bound.clear();
     }
@@ -3104,9 +3180,18 @@ impl FileLinter<'_> {
                         V2Stmt::WithLock { .. } | V2Stmt::Defer { .. } | V2Stmt::Animate { .. }
                     );
                     self.in_block += usize::from(block);
+                    // An animation's event binding names the event in its handler.
+                    let before = self.bound.clone();
+                    if let V2Stmt::Animate {
+                        event: Some(event), ..
+                    } = other
+                    {
+                        self.bound.insert(event.clone());
+                    }
                     for b in stmt_blocks(other) {
                         self.lint_list(b, false, after || looped);
                     }
+                    self.bound = before;
                     self.in_block -= usize::from(block);
                 }
             }
@@ -3859,7 +3944,9 @@ impl FileLinter<'_> {
         let in_range =
             |v: &str, lo: i64, hi: i64| air_literal(v).is_some_and(|n| (lo..=hi).contains(&n));
         // A builtin, or a name the body has not rebound.
-        let free = |name: &str| !self.bound.contains(name) && !self.symbols.user_defined(name);
+        let free = |name: &str| {
+            !self.bound.contains(name) && !self.sim_bindings.contains(name) && !self.user_fn(name)
+        };
         let index = |cell: &str, base: &str| -> Option<i64> {
             let inner = cell
                 .strip_prefix(base)?
@@ -3886,9 +3973,9 @@ impl FileLinter<'_> {
                 let args = args()?;
                 let (target, opts) = args.split_first()?;
                 // `.air` reads `me` / `self` / `0` as the frame's object, as v2's `me` is.
-                let target = match *target {
-                    "me" | "self" | "0" if free("me") && !self.me_bcon => "me",
-                    "stack_obj" | "1" if free("stack_obj") => "stack_obj",
+                let target = match (*target, air_literal(target)) {
+                    ("me" | "self", _) | (_, Some(0)) if free("me") && !self.me_bcon => "me",
+                    ("stack_obj", _) | (_, Some(1)) if free("stack_obj") => "stack_obj",
                     _ => return None,
                 };
                 let mut flags = 0i64;
@@ -3928,7 +4015,11 @@ impl FileLinter<'_> {
                         Some((k, v)) => k.trim() == "flags" && in_range(v.trim(), 0, 255),
                         None => in_range(o, 0, 255),
                     });
-                ok.then(|| "`find_best_object(..)` as an `if` / `while` test".to_owned())
+                // Only where `self` is the object: in a Sim's body, v2 saves and restores the
+                // entry stack object around the search for a later `self`, which the raw
+                // block does not.
+                (ok && self.object_me)
+                    .then(|| "`find_best_object(..)` as an `if` / `while` test".to_owned())
             }
             "set_to_next" if free("set_to_next") => {
                 const MODES: &[&str] = &[
@@ -3975,10 +4066,10 @@ impl FileLinter<'_> {
                 let inner = src.strip_prefix("scope(")?.strip_suffix(')')?;
                 let (scope, n) = inner.split_once(',')?;
                 let n = air_literal(n)?;
-                match (scope, n) {
-                    ("21", 9) if free("stack_obj") => Some("stack_obj.object_type".to_owned()),
-                    ("21", 11) if free("stack_obj") => Some("stack_obj.sub_index".to_owned()),
-                    ("33", 0..=32767) if free("job_field") => Some(format!("job_field({n})")),
+                match (air_literal(scope)?, n) {
+                    (21, 9) if free("stack_obj") => Some("stack_obj.object_type".to_owned()),
+                    (21, 11) if free("stack_obj") => Some("stack_obj.sub_index".to_owned()),
+                    (33, 0..=32767) if free("job_field") => Some(format!("job_field({n})")),
                     _ => None,
                 }
             }
@@ -4091,17 +4182,33 @@ impl FileLinter<'_> {
                 {
                     continue;
                 }
-                // `animate(.., local: x)` only writes `x`.
-                if let V2Stmt::Animate { args, .. } = s
+                // `animate(.., local: x)` only writes `x`, unless its handler reads the
+                // event binding, which is the same frame word.
+                if let V2Stmt::Animate {
+                    args, event, body, ..
+                } = s
+                    && !self.user_fn("animate")
                     && args
                         .get(k)
                         .is_some_and(|a| a.name.as_deref() == Some("local"))
                     && is_ident(e, name)
                 {
+                    if let Some(event) = event {
+                        walk_stmts(body, &mut |t| {
+                            if let V2Stmt::RawAir { code, .. } = t {
+                                read |= code
+                                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                                    .any(|w| w == event);
+                            }
+                            for e in stmt_exprs(t) {
+                                read |= reads_ident(e, event, &|f| self.user_fn(f));
+                            }
+                        });
+                    }
                     continue;
                 }
                 // `set_to_next(.., dest: x)` reads `x`; `random_into(x, ..)` only writes it.
-                read |= reads_ident(e, name, &|f| self.symbols.user_defined(f));
+                read |= reads_ident(e, name, &|f| self.user_fn(f));
             }
         });
         if by_slot {
@@ -4123,9 +4230,7 @@ impl FileLinter<'_> {
         if !read {
             return;
         }
-        if uninit
-            && let Some(at) = first_unassigned_read(rest, name, &|f| self.symbols.user_defined(f))
-        {
+        if uninit && let Some(at) = first_unassigned_read(rest, name, &|f| self.user_fn(f)) {
             self.emit(
                 UNINITIALIZED_LOCAL_READ,
                 at,
@@ -4360,7 +4465,14 @@ fn first_unassigned_read(list: &[V2Stmt], name: &str, user: &dyn Fn(&str) -> boo
                 V2Stmt::Animate {
                     args, event, body, ..
                 } => {
-                    call_events("animate", args, name, user, out);
+                    if user("animate") {
+                        // A user tree named `animate` takes the call: its arguments are reads.
+                        for a in args {
+                            expr_events(&a.value, name, user, out);
+                        }
+                    } else {
+                        call_events("animate", args, name, user, out);
+                    }
                     // The handler's `|event|` binding shadows the name inside it.
                     if event.as_deref() != Some(name) {
                         stmt_events(body, name, user, out);
@@ -5137,14 +5249,25 @@ fn parse_air_frames(air: &str) -> Vec<AirFrame> {
             return None;
         }
         let label = rest.strip_prefix('"')?;
-        let end = label.find('"')?;
-        let args = label[end..].split_once("args:").and_then(|(_, r)| {
-            let r = r.trim_start();
-            r[..r.find(|c: char| !c.is_ascii_digit()).unwrap_or(r.len())]
-                .parse()
-                .ok()
-        });
-        Some((id, label[..end].to_owned(), args))
+        // The label's closing quote: a `\"` inside it is part of the label.
+        let bytes = label.as_bytes();
+        let mut end = 0;
+        while end < bytes.len() && bytes[end] != b'"' {
+            end += if bytes[end] == b'\\' { 2 } else { 1 };
+        }
+        if end >= bytes.len() {
+            return None;
+        }
+        let args = label
+            .get(end + 1..)?
+            .split_once("args:")
+            .and_then(|(_, r)| {
+                let r = r.trim_start();
+                r[..r.find(|c: char| !c.is_ascii_digit()).unwrap_or(r.len())]
+                    .parse()
+                    .ok()
+            });
+        Some((id, label.get(..end)?.to_owned(), args))
     }
     fn frame(id: u16, label: String, args: Option<usize>, body: &str) -> Option<AirFrame> {
         let code = strip_air_comments(body);

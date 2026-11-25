@@ -28,8 +28,8 @@ Two more rules were asked for:
 - **`unused_decl`** counts `dest: x` as a read.
   - It now also tells pure writes apart: a local that only `random_into(x, ..)`, `animate(.., local: x)` or `relationship(.., value: x)` writes, and nothing reads, is unused.
   - Before, any mention counted as a read.
-  - A write is only taken as a write where the lint knows it is one. A user tree named like the builtin (`fn random_into(..)`) takes the call, so its arguments are reads. `relationship` writes `value:` only without flag 4: with flags that are not a literal (a `const` name), the local counts as read.
-  - `animate(.., local: x) |e| { .. }` as a statement writes `x` the same way, so a local only that writes is unused.
+  - A write is only taken as a write where the lint knows it is one. A user function or tree named like the builtin (`fn random_into(..)`, `fn animate(..)`) takes the call, so its arguments are reads. The names a file can call that way are its own functions and trees, the names it imports (by alias), and every template's members. A glob import of a non-`std` module may bring in any name, so there every builtin counts as taken. Another file's private methods do not count. `relationship` writes `value:` only without flag 4: with flags that are not a literal (a `const` name), the local counts as read.
+  - `animate(.., local: x) |e| { .. }` as a statement writes `x` the same way, so a local only that writes is unused. A read of the event binding `e` in the handler reads the same frame word, so it counts as a read of `x`.
   - No open-pack or corpus file changes from this.
 - **`param[N]` and `temp[N]`** destinations are not locals. They get no `unused_decl` or `uninitialized_local_read` finding, and the step marks them written, like an assignment.
 
@@ -51,15 +51,17 @@ These statements are now spelled:
 | Raw `.air` statement | v2 | Left raw |
 | --- | --- | --- |
 | `remove_object(T)`, `T` = `me` / `self` / `0` / `stack_obj` / `1`, with `flags: 0..255`, `no_yield:`, `skip_resets:` | `remove_object(me)` / `remove_object(stack_obj, flags: N)`, the flags folded into one number | target `2`; any other option; out-of-range flags; `me` in a file whose `me` is a BCON name |
-| `find_best_object(kind)`, a searched function by name or number, with `flags:` (named or positional) | `find_best_object(..)` as an `if` / `while` test | `origin:`; never-searched functions (`stand`, `eat`, ...); `category4` |
+| `find_best_object(kind)`, a searched function by name or number, with `flags:` (named or positional), in an object's own tree | `find_best_object(..)` as an `if` / `while` test | `origin:`; never-searched functions (`stand`, `eat`, ...); `category4`; a Sim's body or an inherit tree, where v2 restores the entry stack object for a later `self` and the raw search does not |
 | `set_to_next(mode, dest: X)` / `into: X`, mode 0..12 except `beside` (9), with `guid: <literal>`; `X` = `temp[0..7]`, or `param[N]` below the tree's compiled argument count | `set_to_next(.., dest: ..)` | `temp[8]` and up; `param[N]` at or past the argument count; `stack_obj` or no `dest:`; `beside` / `local:`; any named destination; a GUID by name |
 | `temp[K] := scope(21, 9)` / `scope(21, 11)` / `scope(33, F)`, `K` in 0..7 | `stack_obj.object_type` / `.sub_index` / `job_field(F)` | other definition words; any other expression; `my.attr[..]`, `local[N]`, named targets; `scope(35, N)` (`has_function` is a `bool`, which no `temp` holds) |
 
 Notes on the table:
 
+- **Numbers.** Targets, scopes and flags are compared by value, so `0x0` and `0x15` match like `0` and `21`.
+
 - **Not covered.** A store into the stack object, and the scope cells inside tests (`if scope(21, 9) == 2 {`), are outside this rule. Its unit is a whole raw block of statements.
 - **No v2 locals.** Raw code names locals only by their compiled names (`__v_x_0`), never by their source names, so a named destination or target is never a v2 local and is left alone.
-- **Shadowing.** A suggestion is made only when its v2 spelling means the same thing in that tree. A local named `temp`, `param`, `me` or `stack_obj`, or a user tree named `remove_object`, `find_best_object`, `set_to_next` or `job_field`, would take the v2 spelling over the builtin, so the raw block stays.
+- **Shadowing.** A suggestion is made only when its v2 spelling means the same thing in that tree. A local, parameter, Sim binding or animation event binding named `temp`, `param`, `me` or `stack_obj`, or a user function the file can call (see Decision 1) named `remove_object`, `find_best_object`, `set_to_next` or `job_field`, would take the v2 spelling over the builtin, so the raw block stays.
 
 **Corpus:** `corpus-v2-behavioral` has 577 findings in 218 files: 541 are `raw { remove_object(N, flags: F); }` and 36 are `raw { temp[k] := scope(21, 11); }`.
 
@@ -136,6 +138,18 @@ It reports only the first unreachable statement of a block, and notes which stat
   - Stop writing `allow(unbounded_loop_without_yield)` above a loop whose body is a raw block. The lint does not report it (84 corpus files).
   - Lift `raw { remove_object(..); }` and `raw { temp[k] := scope(21, 11); }` to the v2 spellings.
 - **Review.** Sol round 1 found eight cases, all fixed: raw edges past a `return`, `param[N]` past the argument count, shadowed `temp`/`me` and user trees named like the builtins (both rules), relationship flags by `const`, the `animate` statement's local, and the raw local by source name (dropped). Each has a test in `v2_lint_wave2.rs`.
+- **Review round 2.** Sol found nine more. Seven are fixed, each with a test:
+  - `find_best_object` in a Sim's body;
+  - imported and other-file helpers named like the builtins;
+  - Sim parameters and event bindings as shadows;
+  - an escaped quote in a tree label read as `args:`;
+  - a user tree named `animate`;
+  - an event-binding read;
+  - hex operands.
+
+  Two false negatives stay:
+  - `relationship` with a `const` that is 4 (flag 4 reads `value:`) gets no `uninitialized_local_read`. A non-literal flag is still taken as a write-only call there.
+  - Lifecycle (`load`, `reset`, `cleanup`) and functional bodies get no `param[N]` suggestion, since the lint does not tie them to their frame.
 - **Not covered yet:**
   - `set_to_next(.., dest: stack_obj)` and plain `set_to_next(mode)` in raw. v2 spells both, but the earlier raw table left `set_to_next` out on purpose, and this wave keeps to the asked forms.
   - The definition cells inside raw tests.

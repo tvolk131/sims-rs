@@ -5,7 +5,9 @@
 //! Every fixture here is synthetic (GUIDs in the clean-room 0x7E00_xxxx range). Each item has
 //! positive and negative cases. See `docs/decisions/20261125-antics-v2-lint-wave2.md`.
 
-use sims_antics::v2::lint::{LINT_RULES, LintDiagnostic, Severity, lint_v2_source};
+use sims_antics::v2::lint::{
+    LINT_RULES, LintDiagnostic, LintInput, Severity, lint_v2_source, lint_v2_sources,
+};
 
 /// Wraps object members in a synthetic object.
 fn obj(members: &str) -> String {
@@ -256,6 +258,11 @@ fn raw_remove_object_has_a_builtin() {
         ),
         ("remove_object(0, flags: 0);", "use remove_object(me)"),
         ("remove_object(self);", "use remove_object(me)"),
+        ("remove_object(0x0);", "use remove_object(me)"),
+        (
+            "remove_object(0x1, flags: 0x2);",
+            "use remove_object(stack_obj, flags: 2)",
+        ),
         (
             "remove_object(me, no_yield: true, skip_resets: false);",
             "use remove_object(me, flags: 1)",
@@ -318,7 +325,13 @@ fn raw_find_best_object_has_a_builtin() {
         // Function 14 is `repair`.
         "find_best_object(14, flags: 0);",
     ] {
-        let help = raw_help(&format!("        raw {{ {stmt} }}"));
+        // In an object's own tree, where `self` is the object.
+        let help = one(
+            &tree(&format!("        raw {{ {stmt} }}")),
+            "manual_raw_has_builtin",
+        )
+        .help
+        .unwrap_or_default();
         assert_eq!(
             help, "use `find_best_object(..)` as an `if` / `while` test",
             "{stmt}"
@@ -334,8 +347,14 @@ fn raw_find_best_object_has_a_builtin() {
         "find_best_object(category4);",
         "find_best_object(cook) -> true: @a, false: false;",
     ] {
-        no_raw_builtin(&format!("        raw {{ {stmt} }}"));
+        none(
+            &tree(&format!("        raw {{ {stmt} }}")),
+            "manual_raw_has_builtin",
+        );
     }
+    // In a Sim's body, v2 puts the entry stack object back for a later `self`; the raw
+    // search leaves the found one there.
+    no_raw_builtin("        raw { find_best_object(prep); }\n        self.attr[0] = 42;");
 }
 
 /// A Sim-context tree with two parameters.
@@ -435,6 +454,7 @@ fn raw_definition_and_job_cells_have_names() {
         ("temp[0] := scope(21, 9);", "use stack_obj.object_type"),
         ("temp[7] := scope(21,11);", "use stack_obj.sub_index"),
         ("temp[1] := scope(33, 12);", "use job_field(12)"),
+        ("temp[1] := scope(0x15, 9);", "use stack_obj.object_type"),
     ] {
         let help = raw_help(&format!(
             "        raw {{ {stmt} }}\n        self.level = 1;"
@@ -766,4 +786,102 @@ fn raw_edges_may_reach_code_after_a_return() {
         ));
         none(&source, "unreachable_code");
     }
+}
+
+// --- review round 2 ------------------------------------------------------------------------
+
+#[test]
+fn sim_parameters_and_event_bindings_shadow_builtin_names() {
+    // A Sim parameter named `param` owns `param[0]`.
+    let source = obj(
+        "    #[bhav(label = \"Probe\", args = 2)] fn probe(param: Sim) {\n        self.level = 0;\n        self.mode = Mode::Off;\n        raw { set_to_next(person, dest: param[0]); }\n    }",
+    );
+    none(&source, "manual_raw_has_builtin");
+    // An animation's `|me|` / `|param|` event binding owns the name in its handler.
+    no_raw_builtin(
+        "        animate(clip: 1, table: 0, events: 2) |me| {\n            raw { remove_object(0); }\n        }",
+    );
+    let source = sim_tree_with_args(
+        "        animate(clip: 1, table: 0, events: 2) |param| {\n            raw { set_to_next(person, dest: param[0]); }\n        }",
+    );
+    none(&source, "manual_raw_has_builtin");
+    // Outside the handler, the builtin name is free again.
+    let source = sim_tree(
+        "        animate(clip: 1, table: 0, events: 2) |me| {\n            sim.person[1] = 1;\n        }\n        raw { remove_object(0); }",
+    );
+    one(&source, "manual_raw_has_builtin");
+}
+
+#[test]
+fn a_tree_label_cannot_supply_the_argument_count() {
+    let source = obj(
+        "    #[bhav(id = 4150, label = \"Before \\\"args: 2\\\"\")] fn probe() {\n        self.level = 0;\n        self.mode = Mode::Off;\n        raw { set_to_next(person, dest: param[0]); }\n    }",
+    );
+    none(&source, "manual_raw_has_builtin");
+}
+
+#[test]
+fn imported_helpers_take_a_builtin_name() {
+    let source = format!(
+        "use crate::shared::helpers::{{wipe as remove_object, draw as random_into}};\n{}",
+        obj(
+            "    init {\n        raw { remove_object(0); }\n        let x = 3;\n        random_into(x, 10);\n    }"
+        )
+    );
+    none(&source, "manual_raw_has_builtin");
+    assert!(
+        !of(&source, "unused_decl")
+            .iter()
+            .any(|d| d.message == "local `x` is never read")
+    );
+}
+
+#[test]
+fn another_files_methods_do_not_take_a_builtin_name() {
+    let input = |name: &str, source: String| LintInput {
+        name: name.to_owned(),
+        source,
+        path: None,
+        pack_dir: None,
+    };
+    let definer = "object \"Definer\" {\n    guid: 0x7E00_0121;\n    #[bhav(label = \"Gone\")] fn remove_object(which: i16) { temp[0] = which; }\n    #[bhav(label = \"Roll\")] fn random_into(a: i16, b: i16) { temp[2] = a + b; }\n    init { remove_object(7); random_into(3, 4); }\n}\n";
+    let caller = obj(
+        "    init {\n        raw { remove_object(0); }\n        let x = 3;\n        random_into(x, 10);\n    }",
+    );
+    let found = lint_v2_sources(&[
+        input("caller.antics", caller),
+        input("definer.antics", definer.to_owned()),
+    ])
+    .unwrap();
+    let rules: Vec<(&str, &str)> = found
+        .iter()
+        .filter(|d| d.file == "caller.antics")
+        .map(|d| (d.rule, d.message.as_str()))
+        .collect();
+    assert!(
+        rules.iter().any(|(r, _)| *r == "manual_raw_has_builtin")
+            && rules.contains(&("unused_decl", "local `x` is never read")),
+        "{found:#?}"
+    );
+}
+
+#[test]
+fn a_user_tree_named_animate_reads_its_arguments() {
+    let source = obj(
+        "    #[bhav(label = \"Anim\")] fn animate(local: i16) { self.level = local; }\n    init {\n        self.mode = Mode::Off;\n        let x = 2;\n        animate(local: x);\n    }",
+    );
+    none(&source, "unused_decl");
+    let source = obj(
+        "    #[bhav(label = \"Anim\")] fn animate(local: i16) { self.level = local; }\n    init {\n        self.mode = Mode::Off;\n        let x: i16;\n        animate(local: x);\n        self.level = x;\n    }",
+    );
+    one(&source, "uninitialized_local_read");
+}
+
+#[test]
+fn an_animation_event_read_reads_its_local() {
+    // `e` is the frame word `local: x` names.
+    let source = sim_tree(
+        "        let x = 0;\n        animate(clip: 1, table: 0, events: 2, local: x) |e| {\n            self.level = e;\n        }",
+    );
+    none(&source, "unused_decl");
 }
