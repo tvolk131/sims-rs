@@ -745,17 +745,27 @@ impl BuyCatalog {
                                 fallback_names.insert(guid, decode_text(&text.name));
                                 continue;
                             }
-                            // `buy_entries` leaves out a definition whose
-                            // catalog text it cannot read, so a damaged
-                            // CATS or CTSS would hide a buyable object.
-                            // List it by the native empty-name rule: `*`
-                            // and its OBJD label.
-                            Err(_) if listing.is_none() && any_sort != 0 => {
+                            // Unreadable text takes the native empty-name
+                            // rule: `*` and the OBJD label.
+                            Err(_) => {
                                 let mut name = b"*".to_vec();
                                 name.extend_from_slice(iff.label_bytes(chunk));
-                                (name, String::new())
+                                // `buy_entries` leaves out a definition whose
+                                // catalog text it cannot read, so a damaged
+                                // CATS or CTSS would hide a buyable object.
+                                // List one that has a sort word and graphics,
+                                // a master, or an interaction table, as the
+                                // earlier rule did; damaged text never lists
+                                // an object that would not be listed anyway.
+                                let buyable = definition.eligibility() == BuyEligibility::Listed
+                                    || definition.interactions > 0;
+                                if listing.is_none() && any_sort != 0 && buyable {
+                                    (name, String::new())
+                                } else {
+                                    fallback_names.insert(guid, decode_text(&name));
+                                    continue;
+                                }
                             }
-                            Err(_) => continue,
                         }
                     }
                 };

@@ -1080,16 +1080,29 @@ impl NeighborhoodShell {
     /// Aborts a crash-interrupted travel trip for `home_house` via
     /// [`vm_travel::abort_active_trip_with_cache`], restoring the frozen home lot bytes in
     /// REDB and refreshing the neighborhood view.
+    ///
+    /// Aborting opens no lot, so it does not need the install's lot assets:
+    /// when they fail to load, it aborts through the uncached
+    /// [`vm_travel::abort_active_trip`], and the trip can still be recovered.
     pub fn abort_active_trip(&mut self, home_house: u32) -> Result<u32, String> {
-        let install_assets = self.ensure_install_assets()?;
-        let restored = vm_travel::abort_active_trip_with_cache(
-            install_assets.vm_cache(),
-            &self.store,
-            &self.neighborhood_id,
-            home_house,
-            &self.answers,
-            self.frames.clone(),
-        )
+        let restored = match self.ensure_install_assets() {
+            Ok(install_assets) => vm_travel::abort_active_trip_with_cache(
+                install_assets.vm_cache(),
+                &self.store,
+                &self.neighborhood_id,
+                home_house,
+                &self.answers,
+                self.frames.clone(),
+            ),
+            Err(_) => vm_travel::abort_active_trip(
+                &self.install_root,
+                &self.store,
+                &self.neighborhood_id,
+                home_house,
+                &self.answers,
+                self.frames.clone(),
+            ),
+        }
         .map_err(|e| e.to_string())?;
         self.refresh_from_store()?;
         Ok(restored.report.home_house)

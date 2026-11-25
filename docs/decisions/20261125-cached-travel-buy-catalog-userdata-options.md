@@ -8,7 +8,7 @@
 ## Context
 
 - **Travel.** `NeighborhoodShell` called the uncached `sims_vm::travel` functions, so every departure, return, resume, abort and destination edit rebuilt the install-wide VM state that `enter_lot` already reused. Go Somewhere Else (tree 0x1016) on a destination was declined with "not supported yet", although `travel_on_from_request` exists.
-- **Buy catalog.** `sims-ui`'s `BuyCatalog::load` kept its own copy of the native Buy eligibility rule and the name and description lookup (CTSS, then CATS). `sims_content::Catalog::buy_entries` (#441) now owns both.
+- **Buy catalog.** `sims-ui`'s `BuyCatalog::load` kept its own copy of the native Buy eligibility rule and the name and description lookup (CATS, then CTSS). `sims_content::Catalog::buy_entries` (#441) now owns both.
 - **Options file.** The shell and the standalone binary saved Options as `saves.with_extension("options.iff")`. Two saves files differing only in extension (`saves.redb`, `saves.backup`) shared one Options file. #442 already keeps `Neighborhood.iff` in a `<saves file name>.userdata` folder.
 - **Duplication.** `Game::open_from_store_cached` and `Game::from_loaded_lot_cached` each spawned the same three asset workers. The two house openings each built an index and catalog the same way. `Mixer::open` and `Mixer::open_pack` each built the same four streamed players.
 
@@ -17,7 +17,7 @@
 ### Travel
 
 - **Every shell travel call uses the warm cache.** The calls are open-for-edit, depart, depart-from-request, travel-on, return-from-request, return, resume and abort. Each passes `InstallAssets::vm_cache()` to the `*_with_cache` variant, and the new lot is wrapped with `Game::from_loaded_lot_cached`.
-- **Travel needs the install assets.** If they fail to load, travel stops the load audio and fails with the error, the same as a VM error. `enter_lot` already did this.
+- **Travel needs the install assets.** If they fail to load, travel stops the load audio and fails with the error, the same as a VM error. `enter_lot` already did this. Aborting an interrupted trip is the exception: it opens no lot, so it falls back to the uncached VM call and the trip can still be recovered.
 - **Go Somewhere Else travels on.** `pump_trip_request` sends a request on a destination lot, for a house other than home, to `travel_on_from_request_with_cache`, as `Departure::Onward`.
 - **What it still refuses.** Co-op, an edited destination, a house that is not a travel destination, and any VM error each get a notice and a declined request. The VM error includes a party that would leave a traveler behind, such as a date whose companion has not arrived.
 - **Departure checks.** A plain departure while a trip is active, and a trip on with no active trip, are refused before the VM is called.
@@ -33,7 +33,7 @@
 - **Deleted:** its eligibility function, CTSS reader, OBJD field offsets and the matching unit test.
 - **Names change for some objects.** The native rule names an object with an empty catalog name `*` plus its OBJD label, and reads CATS as description first, then name. Some names therefore change. They now match the original.
 - **Unlisted objects** use the same `CatalogText::read` rule for their fallback names.
-- **Unreadable catalog text.** `buy_entries` leaves out a definition whose CATS or CTSS cannot be read. `BuyCatalog::load` still lists such an object when it has a catalog sort word, so a damaged string table cannot hide it. It is listed as `*` plus its OBJD label, with no description. On main it was listed with an empty name. No object on the reference install takes this path.
+- **Unreadable catalog text.** `buy_entries` leaves out a definition whose CATS or CTSS cannot be read. `BuyCatalog::load` still lists such an object when it has a catalog sort word, so a damaged string table cannot hide it. It is listed as `*` plus its OBJD label, with no description. On main it was listed with an empty name. The earlier listing rule still applies: the object needs graphics, a master, or an interaction table, so damaged text never puts an object on sale that would not be listed anyway. An unlisted object with unreadable text is named the same way where the game shows its name, for example when selling it. No object on the reference install takes this path.
 - **`BuyLabels` is not used.** Neither crate had its own category-label loading to replace.
 - `sims-game`'s three Buy catalog loads share `hud::load_buy_catalog`.
 
