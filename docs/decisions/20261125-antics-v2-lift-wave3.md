@@ -127,34 +127,36 @@ The corpus is all 1,191 lifted objects, at 10 workers. "Main" is main after #471
 
 | | behavioral, main | behavioral, wave 3 | strict, main | strict, wave 3 |
 | --- | ---: | ---: | ---: | ---: |
-| inline raw statements | 17,165 | 14,920 | 3,190 | 3,059 |
-| `raw {}` blocks | 12,563 | 10,820 | 19,538 | 19,436 |
-| lines inside inline raw | 88,507 | 80,800 | 6,265 | 5,918 |
-| total lines | 944,493 | 941,428 | 963,507 | 963,489 |
+| inline raw statements | 17,165 | 14,553 | 3,190 | 3,058 |
+| `raw {}` blocks | 12,563 | 10,493 | 19,538 | 19,435 |
+| lines inside inline raw | 88,507 | 78,913 | 6,265 | 5,915 |
+| total lines | 944,493 | 938,301 | 963,507 | 963,484 |
 | `untyped_engine_constant` | 12,789 | **0** | 1,291 | **0** |
 | `prefer_method_syntax` | 11,204 | **0** | 686 | **0** |
 | `prefer_question_mark` | 213 | **0** | 91 | **0** |
 | lint findings, all rules | 24,322 | 116 | 2,080 | 12 |
-| sweep time | 74.6 s | 73.5 s | 83.3 s | 88.1 s |
+| sweep time | 74.6 s | 64.6 s | 83.3 s | 82.0 s |
 
 - **What lint still reports** is unchanged from main: 116 behavioral (`manual_raw_has_builtin`
   64, `frame_headroom` 46, `negated_comparison` 3, `collapsible_if_chain` 2,
   `stale_lint_allow` 1) and 12 strict.
-- **Raw statements per file.** In four behavioral files the count rises by one: one raw block
-  splits in two around a newly lifted neighbor `if`, so the raw text there is shorter.
+- **Raw statements per file.** In seven behavioral files the count rises by one or two. In
+  each, a raw block splits around newly lifted code (a neighbor `if`, or an inherit tree's
+  `me.id.is_type` chain), so the raw text there is shorter.
 - **Sweep time.** The lint pass costs at least one extra build per file that has findings. The
   timings were taken on a loaded machine: across sweeps of this change, behavioral ranged
-  from 65 s to 81 s and strict from 87 s to 98 s.
+  from 65 s to 81 s and strict from 82 s to 98 s.
 - **Strict mode** writes most trees whole as raw, so the PR I-4 forms mostly help in
   behavioral mode. Padded calls that stay raw (about 2,500 `play_sound` and 640
-  `clear_motive_changes` in strict, 414 and 240 in behavioral) sit in raw-fallback trees, or
+  `clear_motive_changes` in strict, 398 and 236 in behavioral) sit in raw-fallback trees, or
   in trees that some other spelling already pushed below wave 2. An example: the spelled
   form builds there, but the tree has lost every extra.
 - **New spellings in behavioral output:**
-  - `padN:` options on 2,871 `play_sound` and 629 `clear_motive_changes` calls;
+  - `padN:` options on 2,903 `play_sound` and 631 `clear_motive_changes` calls;
   - 687 `sprite_flags[temp[k]]` and 504 `person[temp[k]]`, most of them in inherit trees;
   - 213 `advert.delta[m]`;
-  - 512 neighbor cells, most of them named;
+  - 507 neighbor cells, most of them named;
+  - 294 `me.id.is_type(..)` in inherit trees;
   - 112 `fame`;
   - 166 `reach(..)`, 196 `drop_onto` parameter slots and 13 `make_new_character(..)`.
 
