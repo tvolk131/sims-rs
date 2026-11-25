@@ -75,20 +75,27 @@ impl<'a> TreeLowerer<'a> {
     pub(super) fn finish(self) -> Result<String> {
         let formats_text = self.raw_formats_text || mir::body_formats_text(self.em.text());
         // The frame words the tree's text may read: none unless it formats text.
-        // A tree that may read global 34 keeps main's rule (every text tree reads): dropping
-        // the entry save removes an Expression, whose scratch-pointer write that read depends on.
-        // (The pinned slot's placeholder is not `.air` yet; it becomes word 0 below.)
+        // A tree of an object any of whose trees may read global 34 keeps main's rule (every
+        // text tree reads): dropping the entry save removes an Expression, whose scratch-pointer
+        // write that read depends on, and a call carries the pointer between trees. (The pinned
+        // slot's placeholder is not `.air` yet; it becomes word 0 below.)
         // So does a tree that may run as an object's bottom frame (an object-self tree with no
         // arguments, as an object's or a variant's `main` is, or the inherit check's Sim pass
         // over one): Create Object with flag 0x10 or 0x02 writes that frame's word 0, so which
         // local lives there is observable.
+        // A tree with a pinned `push_interaction` slot takes main's rules too, so it pins exactly
+        // where main does (`mir::finish_body`).
         let bottom_frame = (matches!(self.tree_ctx, TreeContext::ObjectSelf)
             || self.inherited_entry_save)
             && self.frame_args == 0;
-        let text_reads = if formats_text
-            && (bottom_frame
-                || mir::may_read_global_34(&replace_outside_strings(self.em.text(), PIN_SLOT, "0")))
-        {
+        let body_reads_global_34 =
+            mir::may_read_global_34(&replace_outside_strings(self.em.text(), PIN_SLOT, "0"));
+        if body_reads_global_34 {
+            self.env.saw_global_34.set(true);
+        }
+        let main_rules =
+            self.env.reads_global_34 || body_reads_global_34 || self.pin_span.is_some();
+        let text_reads = if formats_text && (bottom_frame || main_rules) {
             mir::TableLocals::Unknown
         } else if formats_text {
             self.env.text_reads.clone()
@@ -108,6 +115,7 @@ impl<'a> TreeLowerer<'a> {
             ));
         }
         let facts = mir::FrameFacts {
+            main_rules,
             fixed_frame: self.frame_locals.is_some() || self.frame_format.is_some(),
             text_reads,
             keep_layout: self.keep_layout,

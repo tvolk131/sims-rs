@@ -570,10 +570,55 @@ pub(crate) fn out_operand_write_with(
     Some((rest, exit))
 }
 
+/// The most locals a frame holds: the default format's (`0x8002`) limit, the largest there is.
+pub(crate) const MAX_FRAME_LOCALS: usize = 255;
+
+/// The frame locals `.air` allocates for a lowered tree body: one per `let` / `local` name,
+/// after every explicit local (`local[N]`, `scope(25, N)`). Read from the body's tokens, so
+/// comments and strings name nothing. It words the `animate(event_local:)` diagnostic and bounds
+/// declaration grouping ([`FrameFacts::fixed_frame`]); the `.air` compiler still rejects a tree
+/// whose locals outgrow its frame, so a slot it misses (a raw primitive's numeric local operand)
+/// is caught there.
+pub(crate) fn count_frame_locals(body: &str) -> usize {
+    use crate::lexer::{TokenKind as T, tokenize};
+    let Ok(tokens) = tokenize(body) else {
+        // `.air` rejects the body anyway.
+        return 0;
+    };
+    let kinds: Vec<&T> = tokens.iter().map(|t| &t.kind).collect();
+    let mut names = BTreeSet::new();
+    let mut explicit: Option<i64> = None;
+    for (i, k) in kinds.iter().enumerate() {
+        let next = |n: usize| kinds.get(i + n).copied();
+        match k {
+            T::Ident(w) if w == "let" || (w == "local" && matches!(next(1), Some(T::Ident(_)))) => {
+                if let Some(T::Ident(name)) = next(1) {
+                    names.insert(name.as_str());
+                }
+            }
+            T::Ident(w) if w == "local" => {
+                if let (Some(T::LBracket), Some(T::Int(n))) = (next(1), next(2)) {
+                    explicit = explicit.max(Some(*n));
+                }
+            }
+            T::Ident(w) if w == "scope" => {
+                if let (Some(T::LParen), Some(T::Int(25)), Some(T::Comma), Some(T::Int(n))) =
+                    (next(1), next(2), next(3), next(4))
+                {
+                    explicit = explicit.max(Some(*n));
+                }
+            }
+            _ => {}
+        }
+    }
+    let first_named = explicit.map_or(0, |m| usize::try_from(m).unwrap_or(0) + 1);
+    first_named + names.len()
+}
+
 /// Whether `body` may read global 34, whose value depends on the scratch pointer every
 /// Expression sets (`sims-vm` `primitives/expression.rs`): a `global[34]` operand or one whose
 /// index is not a literal, a `scope(6, ..)` or `scope(<non-literal>, ..)` cell, or a raw `op`
-/// (its opcode a number or a constant) whose bytes may name it.
+/// that may be an Expression naming it ([`raw_op_may_read_global_34`]).
 /// A body that does not lex counts as reading it.
 pub(crate) fn may_read_global_34(body: &str) -> bool {
     use crate::lexer::TokenKind as T;
@@ -591,9 +636,37 @@ pub(crate) fn may_read_global_34(body: &str) -> bool {
             matches!(kind(i + 1), Some(T::LParen))
                 && !matches!(kind(i + 2), Some(T::Int(n)) if *n != 6)
         }
-        T::Ident(id) if id == "op" => matches!(kind(i + 1), Some(T::Int(_) | T::Ident(_))),
+        T::Ident(id) if id == "op" => raw_op_may_read_global_34(&tokens[i + 1..]),
         _ => false,
     })
+}
+
+/// Whether a raw `op` (`tokens` follow the keyword) may read global 34 in the way that depends
+/// on the scratch pointer. Only Expression (opcode 2) does: its right operand is global 34 when
+/// operand byte 7 (the right scope) is 6 and the word at bytes 2..4 (the right index) is 34
+/// (`sims-vm` `primitives/expression.rs`). Any other literal opcode reads none: below 256 it is
+/// another primitive, and from 256 up it calls a tree, which `ObjectEnv::reads_global_34`
+/// covers for the object's own trees. An opcode or operand byte that is not a literal may be
+/// anything, so it counts as a read. A `op` not followed by an opcode is not a raw op.
+fn raw_op_may_read_global_34(tokens: &[crate::lexer::Token]) -> bool {
+    use crate::lexer::TokenKind as T;
+    match tokens.first().map(|t| &t.kind) {
+        Some(T::Ident(_)) => true,
+        Some(T::Int(2)) => {
+            let mut bytes = Vec::new();
+            for (n, t) in tokens.iter().skip(1).enumerate() {
+                match (&t.kind, n % 2) {
+                    (T::LParen, _) if n == 0 => {}
+                    (T::Int(b), 1) => bytes.push(*b),
+                    (T::Comma, 0) if n > 0 => {}
+                    (T::RParen, _) => break,
+                    _ => return true,
+                }
+            }
+            bytes.len() != 8 || (bytes[7] == 6 && bytes[2] | bytes[3] << 8 == 34)
+        }
+        _ => false,
+    }
 }
 
 /// Whether a Random Number range operand (`.air` text) may resolve to a word pointer, which

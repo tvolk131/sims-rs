@@ -700,6 +700,99 @@ fn a_raw_op_with_a_named_opcode_may_read_global_34() {
     assert!(!tree(&air, "a").contains(SAVE), "{air}");
 }
 
+/// Only an Expression (opcode 2) whose right operand is global 34 (scope byte 7 = 6, index bytes
+/// 2..4 = 34) reads it that way: a raw `op` with another literal opcode or operand reads none, so
+/// the object's other trees keep this branch's rules (here, an initializer an out-operand kills
+/// goes).
+#[test]
+fn only_a_raw_expression_naming_global_34_reads_it() {
+    let src = |raw: &str| {
+        obj(
+            "Plain",
+            &format!(
+                r#"    tree a {{
+        let n: i16 = 7;
+        if 0 == global[5] {{
+            temp[2] = 1;
+        }}
+        random_into(n, 1)?;
+        temp[1] = n;
+    }}
+    tree b {{
+        raw {{ {raw} }}
+    }}"#
+            ),
+        )
+    };
+    let air = expand(
+        "raw_global34_op.antics",
+        &src("op 2 (0, 0, 34, 0, 0, 3, 14, 6);"),
+    );
+    assert!(tree(&air, "a").contains("= 7;"), "{air}");
+    for raw in [
+        "op 2 (0, 0, 5, 0, 0, 3, 14, 6);",
+        "op 4 (0, 0, 0, 0, 0, 0, 0, 0);",
+    ] {
+        let air = expand("raw_other_op.antics", &src(raw));
+        assert!(!tree(&air, "a").contains("= 7;"), "{raw}:\n{air}");
+    }
+}
+
+/// A call carries the scratch pointer into the callee, so a tree whose callee may read global 34
+/// keeps the Expressions main keeps: every tree of an object any of whose trees may read it
+/// takes main's rules.
+#[test]
+fn a_callee_that_may_read_global_34_keeps_main_rules_in_its_caller() {
+    let src = |cell: &str| {
+        obj(
+            "Plain",
+            &format!(
+                r#"    @context(inherit) tree reader {{
+        raw {{ my.motive[0] := {cell}; temp[2] := my.motive[0]; }}
+        return true;
+    }}
+    tree witness (sim: Sim) {{
+        reader();
+        if temp[4] == 0 {{ return true; }}
+        set_to_next(all, dest: stack_obj);
+        dialog(kind: ok, title: title, message: msg);
+    }}"#
+            ),
+        )
+    };
+    let air = expand("callee_global34.antics", &src("global[34]"));
+    assert!(tree(&air, "witness").contains(SAVE), "{air}");
+    let air = expand("callee_global5.antics", &src("global[5]"));
+    assert!(!tree(&air, "witness").contains(SAVE), "{air}");
+}
+
+/// Declaration groups keep words main's coalescing shares, so a tree they would push to the
+/// largest frame (255 locals) coalesces as main does and still compiles.
+#[test]
+fn declaration_groups_never_overflow_the_largest_frame() {
+    let mut src = String::from("object \"Round Three\" {\n    guid: 0x7F40_0900;\n");
+    for i in 0..16 {
+        src.push_str(&format!(
+            "    fn h{i}() {{ let n{i}: i16 = me.attr[0]; random_into(n{i}, 4)?; temp[0] = n{i}; }}\n"
+        ));
+    }
+    src.push_str("    tree a {\n");
+    for i in 0..240 {
+        src.push_str(&format!("        let x{i}: i16;\n"));
+    }
+    for i in (0..240).step_by(2) {
+        src.push_str(&format!(
+            "        if x{i} != x{} {{ return false; }}\n",
+            i + 1
+        ));
+    }
+    for i in 0..16 {
+        src.push_str(&format!("        h{i}();\n"));
+    }
+    src.push_str("        return true;\n    }\n}\n");
+    expand("largest_frame.antics", &src);
+}
+
 /// Keeping an unread entry save is not always safe: it is an Expression, and a read of global
 /// 34 before any other Expression faults without one. A raw-layout tree that main drops the
 /// save of drops it too.
@@ -826,6 +919,13 @@ fn push_interaction_pins_only_where_main_pins() {
     );
     let a = tree(&air, "a");
     assert!(a.contains("local[0] := stack_obj;"), "pinned:\n{a}");
+    // An initialized local is defined before the draw, so main pins with a BCON range too, on
+    // the body its own rules give (which keep the initializer the draw overwrites).
+    let initialized = members("Limits.draw", "").replace("let n: i16;", "let n: i16 = 7;");
+    let air = expand("pin_initialized.antics", &obj("Plain", &initialized));
+    let a = tree(&air, "a");
+    assert!(a.contains("local[0] := stack_obj;"), "pinned:\n{a}");
+    assert!(a.contains("= 7;"), "the initializer stays:\n{a}");
 }
 
 /// Create Object with flag 0x10 writes word 0 of the new object's bottom frame (and faults when
@@ -880,17 +980,22 @@ fn a_tree_that_may_read_global_34_shares_out_operand_locals_as_main() {
         random_into(event, 4)?;
         temp[2] = event;
     }
-    @frame(locals: 1) tree a {
+    tree a {
         first();
         second();
         temp[3] = global[34];
     }
 }
 "#;
-    expand("global34_frame.antics", src);
+    assert_eq!(compiled(src, 4098).0, 1, "global 34: main's coalescing");
+    // Without the read, the two helpers' locals keep their own words.
+    let plain = src.replace("        temp[3] = global[34];\n", "");
+    assert_eq!(compiled(&plain, 4098).0, 2, "declaration groups");
     // So does a tree whose header fixes its frame size, by `locals:` or by a format.
-    let fixed = src.replace("        temp[3] = global[34];\n", "");
-    expand("fixed_frame.antics", &fixed);
+    expand(
+        "fixed_frame.antics",
+        &plain.replace("    tree a {", "    @frame(locals: 1) tree a {"),
+    );
 }
 
 /// `@frame(format: 0x8001)` holds four locals, so its tree shares inlined out-operand locals as

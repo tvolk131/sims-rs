@@ -24,7 +24,7 @@ use crate::v2::loader::{ModuleScope, ResolvedModule};
 use crate::v2::parser::snake_case_ident;
 use crate::v2::specialize;
 use crate::v2::{mir, raw_facts};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::rc::Rc;
@@ -301,6 +301,13 @@ struct ObjectEnv<'a> {
     /// ([`mir::text_reads`](mod@crate::v2::mir)): every tree is finished with the object's final
     /// fact (`lower_object` lowers again when a later tree's inline dialog literal adds to it).
     text_reads: mir::TableLocals,
+    /// Some tree of the object may read global 34 ([`mir::may_read_global_34`]), so every tree
+    /// is finished with main's rules: a call carries the scratch pointer into the callee and
+    /// back, so an Expression one tree keeps or drops can change what another tree reads.
+    /// `lower_object` lowers again when a finished tree sets `saw_global_34`.
+    reads_global_34: bool,
+    /// A finished tree's body may read global 34.
+    saw_global_34: Cell<bool>,
     local_fns: BTreeMap<String, (String, FnDecl)>,
     /// Object/template-local enums by short name -> canonical key.
     local_enums: BTreeMap<String, String>,

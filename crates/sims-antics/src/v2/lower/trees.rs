@@ -312,7 +312,7 @@ pub(super) fn write_framed_tree(
     };
     if let (Some((espan, slot)), Some(locals)) = (event_local, frame.locals) {
         // `.air` grows the frame to fit the named locals (after an explicit `local[0]` pin).
-        let used = count_frame_locals(&body);
+        let used = mir::count_frame_locals(&body);
         if used > usize::from(locals) || usize::from(slot) < used {
             return Err(Error::at(
                 espan,
@@ -334,47 +334,6 @@ pub(super) fn write_framed_tree(
     trees_air.push_str(&body);
     trees_air.push_str("}\n\n");
     Ok(())
-}
-
-/// The frame locals `.air` allocates for a lowered tree body: one per `let` / `local` name,
-/// after every explicit local (`local[N]`, `scope(25, N)`). Read from the body's tokens, so
-/// comments and strings name nothing. This only words the diagnostic: the `.air` compiler
-/// rejects a tree whose locals outgrow its `@frame(locals: K)`, and `K <= N` is checked when
-/// lowering, so a slot it misses (a raw primitive's numeric local operand) is still caught.
-pub(super) fn count_frame_locals(body: &str) -> usize {
-    use crate::lexer::{TokenKind as T, tokenize};
-    let Ok(tokens) = tokenize(body) else {
-        // `.air` rejects the body anyway.
-        return 0;
-    };
-    let kinds: Vec<&T> = tokens.iter().map(|t| &t.kind).collect();
-    let mut names = BTreeSet::new();
-    let mut explicit: Option<i64> = None;
-    for (i, k) in kinds.iter().enumerate() {
-        let next = |n: usize| kinds.get(i + n).copied();
-        match k {
-            T::Ident(w) if w == "let" || (w == "local" && matches!(next(1), Some(T::Ident(_)))) => {
-                if let Some(T::Ident(name)) = next(1) {
-                    names.insert(name.as_str());
-                }
-            }
-            T::Ident(w) if w == "local" => {
-                if let (Some(T::LBracket), Some(T::Int(n))) = (next(1), next(2)) {
-                    explicit = explicit.max(Some(*n));
-                }
-            }
-            T::Ident(w) if w == "scope" => {
-                if let (Some(T::LParen), Some(T::Int(25)), Some(T::Comma), Some(T::Int(n))) =
-                    (next(1), next(2), next(3), next(4))
-                {
-                    explicit = explicit.max(Some(*n));
-                }
-            }
-            _ => {}
-        }
-    }
-    let first_named = explicit.map_or(0, |m| usize::try_from(m).unwrap_or(0) + 1);
-    first_named + names.len()
 }
 
 pub(super) fn emit_guard_tree(

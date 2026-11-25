@@ -80,17 +80,24 @@ A tree that may run as an object's bottom frame takes `Unknown` when it formats 
 a read of global 34 depends on it (`sims-vm` `primitives/expression.rs`). So a tree whose `.air`
 may read global 34 (`may_read_global_34`) keeps or drops an Expression exactly where main does.
 Keeping one main drops is no safer than the reverse: a read of global 34 before any other
-Expression faults on main and succeeds after a kept save. So such a tree takes main's rules:
+Expression faults on main and succeeds after a kept save. A call carries the scratch pointer
+into the callee and back, so this holds for every tree of an object any of whose trees may read
+global 34 (`ObjectEnv::reads_global_34`; `lower_object` lowers the object again when a finished
+tree turns out to read it). Trees outside the object are not examined: the game's `Global.iff`
+(251 trees) reads global 34 nowhere. So such a tree takes main's rules (`FrameFacts::main_rules`):
 
 - such a read is a `global[34]` operand, a `global[..]` whose index is not a literal, a
-  `scope(6, ..)` cell, or a raw `op` (its opcode a number or a constant);
+  `scope(6, ..)` cell, or a raw `op` that may be an Expression naming it: opcode 2 with right
+  scope byte 7 = 6 and right index bytes 2..4 = 34, or an opcode or operand byte that is not a
+  literal. Only Expression reads global 34 that way, so another literal opcode reads none (one
+  from 256 up calls a tree, which the object rule covers for the object's own trees);
 - a text tree takes `Unknown`, which is main's rule;
 - out-operands are not definitions there (section 5), so they make no store dead;
 - a `random` defines its destination only with a literal range (`DrawRanges::Literal`, main's
   rule from section 2), wherever that decides whether the entry save goes;
 - the entry save goes where main drops it, in the optimizer (`drop_unread_entry_save_node`) and
   the raw-layout path, and the text checks keep it as main's text rule does;
-- the pinned slot pins as on main, as it does in every tree (section 5);
+- the pinned slot pins as on main, as every pinning tree does (section 5);
 - out-operand locals coalesce as on main (no `decl:` groups), so the tree fits the frame main
   fits it in.
 
@@ -166,7 +173,8 @@ declaration order, so generated names no longer matter.
     declaration, and never the cross-helper merge. A tree that may read global 34 (section 1)
     or bounds its frame, with `@frame(locals: K)` or with a `@frame(format: F)` (formats
     `0x8000`/`0x8001` hold four locals), coalesces them as main does, so it fits the frame main
-    fits it in.
+    fits it in. So does a tree the groups would leave within a word of the largest frame
+    (`MAX_FRAME_LOCALS`, 255 locals; the `idle` scratch word may take one more).
     - Lowering records each inlined local's declaration (`local_origins`: the helper and the
       innermost statement being lowered). That covers `let`, `let Some`, `for` and every other
       binding, so another helper's local of the same spelling is not a copy. The statement is
@@ -198,11 +206,13 @@ declaration order, so generated names no longer matter.
   handle live in word 0 and drops its copies, which moves every named local down a word and fills
   word 0 from the start. A primitive may read word 0 without naming it (`relationship` without
   `local:` reads the word-0 pair), and the pin scan does not see such reads, so filling word 0
-  early can change what one reads. The tree therefore pins exactly where main's literal-range
-  analysis pins (`DrawRanges::Literal`), never on section 2's wider range rule, whatever its text
-  reads. Before the body is final, the slot
+  early can change what one reads. The tree therefore pins exactly where main pins: it takes
+  main's rules (`FrameFacts::main_rules`), so its body is main's (with the initializers an
+  out-operand kills, which make a local defined before the draw), and the pin uses main's
+  literal-range analysis (`DrawRanges::Literal`), never section 2's wider range rule. A pinning
+  tree that formats text takes `Unknown`, as main's text rule. Before the body is final, the slot
   is a placeholder (`@pin@`) that the lexer does not read. Global 34 is checked on the body with
-  word 0 in its place, so a pinned text tree is no longer `Unknown` for that reason alone.
+  word 0 in its place, so the placeholder is never taken for a read of it.
 - **`push_interaction(object: <@slot(N) handle>)` (`lower/builtins.rs`).** It emits `object: N`
   with flag 0x02, so the VM reads the handle from its own pinned word. There is no copy into word 0
   and no pin, so it can share a tree with other `@slot` lets. An explicit flag 0x02 is refused, as
@@ -219,9 +229,10 @@ declaration order, so generated names no longer matter.
   the unread save of a tree that formats no text. The last result and scratch pointer such a
   fault leaves then differ from the unoptimized tree's. This branch applies the same rules to
   more trees, namely a store an out-operand kills (above), the save of a text tree that reads no
-  moved word (section 1). It adds no rule of its own
-  that removes an Expression. A tree that may read global 34 is the exception to applying them
-  more widely: there the branch keeps and drops exactly what main does (section 1).
+  moved word (section 1). It adds no rule of its own that removes an Expression. A tree of an
+  object any of whose trees may read global 34, and a pinning tree, are the exceptions to
+  applying them more widely: there the branch keeps and drops exactly what main does (section 1
+  and the pinned slot above).
 - **Bottom frames.** Create Object with flag 0x10 (or 0x02) writes word 0 of the new object's
   bottom frame, and faults when the frame has none. So in a tree that may run as one, which
   local lives in which word is observable: a local read before it is written reads the
@@ -248,8 +259,9 @@ declaration order, so generated names no longer matter.
     the `idle` scratch word), a later literal reaching earlier trees, read-first helper locals, an
     out-operand's unwritten exit, the kept `self` switch and `job_data` copy, raw blocks' own
     entry-object names (including discarded code and inherited trees), main's
-    choices in trees that may read global 34 or bound their frame by a format, and the pinned
-    slot pinning only where main pins.
+    choices in trees that may read global 34, whose callee may, or that bound their frame by a
+    format or come near the largest frame, raw `op` Expressions that name global 34, and the
+    pinned slot pinning only where main pins.
   - The `opt.rs` unit tests cover the pipeline's text veto.
 
 ## What would reopen this

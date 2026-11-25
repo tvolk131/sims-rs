@@ -7,6 +7,10 @@ use super::*;
 
 /// What the backend needs to know about a lowered tree besides its body text.
 pub(crate) struct FrameFacts<'a> {
+    /// The tree keeps main's rules: some tree of its object may read global 34
+    /// (`ObjectEnv::reads_global_34`), or it pins a `push_interaction` slot, which must pin
+    /// exactly where main's body lets it. Its text reads are then `Unknown` when it formats text.
+    pub(crate) main_rules: bool,
     /// The tree's header sets its frame size (`@frame(locals: K)`), which main's coalescing
     /// fits: out-operand locals share words as on main.
     pub(crate) fixed_frame: bool,
@@ -59,11 +63,11 @@ fn finish_frame(out: String, facts: &FrameFacts<'_>) -> String {
     let reads_text = reads_a_word(text_reads);
     let unmoved = |before: &str, after: &str| text_words_unmoved(before, after, facts);
     // A tree that may read global 34 keeps main's rules: the entry save and the pin's copies are
-    // Expressions, whose scratch-pointer writes that read may depend on, so the tree neither
-    // keeps nor drops one where main would not. Its text reads are `Unknown` when it formats
-    // text (`TreeLowerer::finish`), which keeps the save as main's text rule does.
-    let may_read_global_34 = may_read_global_34(&out);
-    let ranges = DrawRanges::for_tree(may_read_global_34);
+    // Expressions, whose scratch-pointer writes that read depends on, so the tree neither
+    // keeps nor drops one where main would not. So does every tree of its object, since a call
+    // carries the scratch pointer between trees, and a tree that pins (`FrameFacts::main_rules`).
+    let main_rules = facts.main_rules || may_read_global_34(&out);
+    let ranges = DrawRanges::for_tree(main_rules);
     if facts.keep_layout {
         if facts.has_self_obj_local
             && let Some(trimmed) = drop_unread_entry_save(&out, &unmoved, ranges)
@@ -73,16 +77,28 @@ fn finish_frame(out: String, facts: &FrameFacts<'_>) -> String {
             out
         }
     } else {
-        let out = crate::v2::opt::optimize_tree_body(
-            &out,
-            reads_text,
-            facts.local_origins,
-            !facts.fixed_frame,
-        );
+        let optimize = |decl_groups| {
+            crate::v2::opt::optimize_tree_body(
+                &out,
+                reads_text,
+                facts.local_origins,
+                decl_groups,
+                main_rules,
+            )
+        };
+        // Declaration groups keep some words main's coalescing shares, so a tree they leave
+        // within a word of the largest frame (`MAX_FRAME_LOCALS`; the `idle` scratch word may
+        // take one more) coalesces as main does.
+        let grouped = optimize(!facts.fixed_frame);
+        let out = if !facts.fixed_frame && count_frame_locals(&grouped) + 1 >= MAX_FRAME_LOCALS {
+            optimize(false)
+        } else {
+            grouped
+        };
         // Pinning moves every named local down a word and fills word 0 from the start, which a
         // primitive may read implicitly (`relationship` without `local:` reads the word-0 pair).
-        // The tree pins exactly where main's literal-range analysis pins, never on this branch's
-        // wider range rule.
+        // The tree pins exactly where main's literal-range analysis pins, on the body main's
+        // rules give (`FrameFacts::main_rules`), never on this branch's wider range rule.
         let out = if facts.pinned {
             pin_in_place(&out, DrawRanges::Literal)
         } else {

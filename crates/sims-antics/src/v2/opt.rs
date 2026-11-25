@@ -33,12 +33,14 @@ use super::mir::*;
 /// does not, a dialog or action string reads no local and the passes treat it like any other
 /// primitive. `origins` names the declaration each inlined helper local copies
 /// (`mir::FrameFacts::local_origins`). `decl_groups` lets out-operand locals share words only
-/// with copies of their own declaration; without it they coalesce as on main.
+/// with copies of their own declaration; without it they coalesce as on main. `main_rules`
+/// keeps main's rules (`mir::FrameFacts::main_rules`), as a body that may read global 34 does.
 pub(crate) fn optimize_tree_body(
     body: &str,
     text_reads: bool,
     origins: &BTreeMap<String, String>,
     decl_groups: bool,
+    main_rules: bool,
 ) -> String {
     let Some(mut nodes) = parse_body(body) else {
         return body.to_owned();
@@ -47,7 +49,7 @@ pub(crate) fn optimize_tree_body(
     // A tree that may read global 34 keeps main's rules (`out_defs` off, literal draw ranges):
     // the read depends on the scratch pointer an Expression sets, so the tree keeps or drops
     // an Expression exactly where main does.
-    let out_defs = !may_read_global_34(body);
+    let out_defs = !(main_rules || may_read_global_34(body));
     let ranges = DrawRanges::for_tree(!out_defs);
     for _ in 0..8 {
         let snapshot = nodes.clone();
@@ -683,7 +685,7 @@ mod tests {
     #[test]
     fn dead_stores_unread_self_obj_and_coalescing() {
         let body = "    let __self_obj = stack_obj;\n    let __a_1 = 0;\n    __a_1 := my.attr[0];\n    my.attr[1] := __a_1;\n    my.attr[4] := __a_1;\n    let __b_2 = my.attr[2];\n    my.attr[3] := __b_2;\n    my.attr[5] := __b_2;\n    stack_obj := __self_obj;\n    return true;\n";
-        let out = optimize_tree_body(body, true, &BTreeMap::new(), true);
+        let out = optimize_tree_body(body, true, &BTreeMap::new(), true, false);
         assert_eq!(
             out,
             "    let __a_1 = my.attr[0];\n    my.attr[1] := __a_1;\n    my.attr[4] := __a_1;\n    __a_1 := my.attr[2];\n    my.attr[3] := __a_1;\n    my.attr[5] := __a_1;\n    return true;\n"
@@ -694,19 +696,22 @@ mod tests {
     fn single_pass_loops_unwrap_and_dead_flags_drop() {
         let body = "    let __r_1;\n    let __ret_2 = 0;\n    while true {\n        __r_1 := my.attr[0];\n        __ret_2 := 1;\n        break;\n    }\n    my.attr[1] := __r_1;\n    return true;\n";
         assert_eq!(
-            optimize_tree_body(body, true, &BTreeMap::new(), true),
+            optimize_tree_body(body, true, &BTreeMap::new(), true, false),
             "    my.attr[1] := my.attr[0];\n    return true;\n"
         );
         // A second exit keeps the loop (its `break` has nowhere else to go).
         let body = "    while true {\n        if my.attr[0] == 1 {\n            break;\n        }\n        my.attr[1] := 2;\n        break;\n    }\n    return true;\n";
-        assert_eq!(optimize_tree_body(body, true, &BTreeMap::new(), true), body);
+        assert_eq!(
+            optimize_tree_body(body, true, &BTreeMap::new(), true, false),
+            body
+        );
     }
 
     #[test]
     fn copies_forward_only_when_the_temp_dies() {
         let body = "    let __t_1 = stack.attr[0];\n    my.attr[0] := __t_1;\n    my.attr[1] := __t_1;\n    let __u_2 = my.attr[2];\n    my.attr[3] := __u_2;\n    return true;\n";
         assert_eq!(
-            optimize_tree_body(body, true, &BTreeMap::new(), true),
+            optimize_tree_body(body, true, &BTreeMap::new(), true, false),
             "    let __t_1 = stack.attr[0];\n    my.attr[0] := __t_1;\n    my.attr[1] := __t_1;\n    my.attr[3] := my.attr[2];\n    return true;\n"
         );
     }
@@ -715,7 +720,10 @@ mod tests {
     fn stores_before_primitives_stay() {
         // `idle` may observe the previous node's result, so the dead store before it stays.
         let body = "    let __a_1 = my.attr[0];\n    idle(1);\n    return true;\n";
-        assert_eq!(optimize_tree_body(body, true, &BTreeMap::new(), true), body);
+        assert_eq!(
+            optimize_tree_body(body, true, &BTreeMap::new(), true, false),
+            body
+        );
     }
 
     #[test]
@@ -724,7 +732,10 @@ mod tests {
             "    let __a_1 = 0;\n    my.attr[0] := 1; call 256(temps);\n    return true;\n",
             "    let __a_1 = 0;\n    x:\n    return true;\n",
         ] {
-            assert_eq!(optimize_tree_body(body, true, &BTreeMap::new(), true), body);
+            assert_eq!(
+                optimize_tree_body(body, true, &BTreeMap::new(), true, false),
+                body
+            );
         }
     }
 
@@ -732,7 +743,7 @@ mod tests {
     fn duplicate_tails_and_unreachable() {
         let body = "    if my.attr[0] == 1 {\n        my.attr[1] := 2;\n        my.attr[2] := 3;\n    } else {\n        my.attr[2] := 3;\n    }\n    return true;\n    my.attr[3] := 4;\n";
         assert_eq!(
-            optimize_tree_body(body, true, &BTreeMap::new(), true),
+            optimize_tree_body(body, true, &BTreeMap::new(), true, false),
             "    if my.attr[0] == 1 {\n        my.attr[1] := 2;\n    }\n    my.attr[2] := 3;\n    return true;\n"
         );
     }
@@ -741,24 +752,27 @@ mod tests {
     fn loop_carried_locals_do_not_merge() {
         // `__a_1` is live around the loop back edge while `__b_2` is written in the body.
         let body = "    let __a_1 = 0;\n    while my.attr[0] < 5 {\n        let __b_2 = my.attr[1];\n        my.attr[2] := __b_2;\n        my.attr[4] := __b_2;\n        __a_1 += 1;\n    }\n    my.attr[3] := __a_1;\n    return true;\n";
-        assert_eq!(optimize_tree_body(body, true, &BTreeMap::new(), true), body);
+        assert_eq!(
+            optimize_tree_body(body, true, &BTreeMap::new(), true, false),
+            body
+        );
     }
 
     #[test]
     fn stack_obj_store_read_by_the_next_store_stays() {
         // The second store reads the first one's value through `stack.`.
         let body = "    stack_obj := __o_1;\n    stack_obj := stack.attr[0];\n    my.attr[0] := 1;\n    return true;\n";
-        let out = optimize_tree_body(body, true, &BTreeMap::new(), true);
+        let out = optimize_tree_body(body, true, &BTreeMap::new(), true, false);
         assert!(out.contains("stack_obj := __o_1;"), "{out}");
         // An independent second store does kill the first.
         let body = "    let __o_1 = my.id;\n    stack_obj := __o_1;\n    stack_obj := 7;\n    my.attr[0] := 1;\n    return true;\n";
-        assert!(!optimize_tree_body(body, true, &BTreeMap::new(), true).contains("__o_1"));
+        assert!(!optimize_tree_body(body, true, &BTreeMap::new(), true, false).contains("__o_1"));
     }
 
     #[test]
     fn compound_stack_obj_writes_forget_its_value() {
         let body = "    let __o_1 = my.id;\n    stack_obj := __o_1;\n    stack_obj += 1;\n    stack_obj := __o_1;\n    my.attr[0] := stack.attr[0];\n    return true;\n";
-        let out = optimize_tree_body(body, true, &BTreeMap::new(), true);
+        let out = optimize_tree_body(body, true, &BTreeMap::new(), true, false);
         assert_eq!(out.matches("stack_obj := __o_1;").count(), 2, "{out}");
     }
 
@@ -775,14 +789,14 @@ mod tests {
         ] {
             let body = format!("    let __a_1 = {operand};\n    return true;\n");
             assert_eq!(
-                optimize_tree_body(&body, true, &BTreeMap::new(), true),
+                optimize_tree_body(&body, true, &BTreeMap::new(), true, false),
                 body,
                 "{operand}"
             );
         }
         let body = "    let __a_1 = my.id;\n    let __b_2 = 5;\n    return true;\n";
         assert_eq!(
-            optimize_tree_body(body, true, &BTreeMap::new(), true),
+            optimize_tree_body(body, true, &BTreeMap::new(), true, false),
             "    return true;\n"
         );
     }
@@ -799,7 +813,7 @@ mod tests {
         ] {
             let body = format!("{dead}    {line}\n    return true;\n");
             assert_eq!(
-                optimize_tree_body(&body, true, &BTreeMap::new(), true),
+                optimize_tree_body(&body, true, &BTreeMap::new(), true, false),
                 body,
                 "{line}"
             );
@@ -812,7 +826,7 @@ mod tests {
         ] {
             let body = format!("{dead}    {line}\n    return true;\n");
             assert_ne!(
-                optimize_tree_body(&body, true, &BTreeMap::new(), true),
+                optimize_tree_body(&body, true, &BTreeMap::new(), true, false),
                 body,
                 "{line}"
             );
@@ -826,7 +840,7 @@ mod tests {
         let body =
             "    let __self_obj = stack_obj;\n    idle_for_input(param[0], 1);\n    return true;\n";
         assert_eq!(
-            optimize_tree_body(body, true, &BTreeMap::new(), true),
+            optimize_tree_body(body, true, &BTreeMap::new(), true, false),
             "    idle_for_input(param[0], 1);\n    return true;\n"
         );
         // Not when a local read before it is written would move to another frame word.
@@ -858,11 +872,15 @@ mod tests {
         );
         // Scope 27 (sprite flags) reads the stack object, so the switch before it stays.
         let body = "    stack_obj := my.id;\n    temp[0] := 0;\n    scope(27, 0) := 1;\n    return true;\n";
-        assert_eq!(optimize_tree_body(body, true, &BTreeMap::new(), true), body);
+        assert_eq!(
+            optimize_tree_body(body, true, &BTreeMap::new(), true, false),
+            body
+        );
         // A local-slot operand keeps naming the save.
         let body = "    let __self_obj = stack_obj;\n    push_interaction(menu: 0, object: 0, priority: 2, flags: 1, icon: __self_obj);\n    stack_obj := my.id;\n    return true;\n";
         assert!(
-            optimize_tree_body(body, true, &BTreeMap::new(), true).contains("icon: __self_obj")
+            optimize_tree_body(body, true, &BTreeMap::new(), true, false)
+                .contains("icon: __self_obj")
         );
         // Raw numeric targets keep the line-based save drop away.
         let body = "    let __self_obj = stack_obj;\n    stack_obj := my.id;\n    random(temp[0], 1) -> true: 3, false: 3;\n    return true;\n";
@@ -889,15 +907,21 @@ mod tests {
         // Nothing changes the stack object before the restore, which becomes a no-op.
         let body = "    let __self_obj = stack_obj;\n    my.attr[0] := stack.attr[1];\n    stack_obj := __self_obj;\n    my.attr[2] := 1;\n    return true;\n";
         assert_eq!(
-            optimize_tree_body(body, true, &BTreeMap::new(), true),
+            optimize_tree_body(body, true, &BTreeMap::new(), true, false),
             "    my.attr[0] := stack.attr[1];\n    my.attr[2] := 1;\n    return true;\n"
         );
         // After a write the restore is real, and so is the save.
         let body = "    let __self_obj = stack_obj;\n    stack_obj := my.id;\n    my.attr[0] := stack.attr[1];\n    stack_obj := __self_obj;\n    my.attr[1] := stack.attr[2];\n    return true;\n";
-        assert_eq!(optimize_tree_body(body, true, &BTreeMap::new(), true), body);
+        assert_eq!(
+            optimize_tree_body(body, true, &BTreeMap::new(), true, false),
+            body
+        );
         // A primitive may write it too.
         let body = "    let __self_obj = stack_obj;\n    set_to_next(all);\n    stack_obj := __self_obj;\n    my.attr[1] := stack.attr[2];\n    return true;\n";
-        assert_eq!(optimize_tree_body(body, true, &BTreeMap::new(), true), body);
+        assert_eq!(
+            optimize_tree_body(body, true, &BTreeMap::new(), true, false),
+            body
+        );
     }
 
     #[test]
@@ -905,7 +929,7 @@ mod tests {
         // Nothing reads the store before the frame returns.
         let body = "    let __o_1 = my.id;\n    stack_obj := __o_1;\n    my.attr[0] := 1;\n    return true;\n";
         assert_eq!(
-            optimize_tree_body(body, true, &BTreeMap::new(), true),
+            optimize_tree_body(body, true, &BTreeMap::new(), true, false),
             "    my.attr[0] := 1;\n    return true;\n"
         );
         // A read on one path keeps it; so does a loop.
@@ -914,7 +938,7 @@ mod tests {
             "    while my.attr[0] < 3 {\n        my.attr[0] += 1;\n    }\n    return true;\n",
         ] {
             let body = format!("    let __o_1 = my.id;\n    stack_obj := __o_1;\n{tail}");
-            let out = optimize_tree_body(&body, true, &BTreeMap::new(), true);
+            let out = optimize_tree_body(&body, true, &BTreeMap::new(), true, false);
             assert!(out.starts_with("    stack_obj := my.id;\n"), "{out}");
         }
     }
@@ -924,7 +948,7 @@ mod tests {
         // Multi-byte string contents keep byte offsets aligned, and a `.field` named like a
         // local is not renamed.
         let body = "    let __a_1 = 1;\n    my.attr[0] := __a_1;\n    let __b_2 = 2;\n    dialog(\"caf\u{e9} \u{2603}\", bcon.__b_2);\n    my.attr[1] := __b_2;\n    return true;\n";
-        let out = optimize_tree_body(body, true, &BTreeMap::new(), true);
+        let out = optimize_tree_body(body, true, &BTreeMap::new(), true, false);
         assert!(
             out.contains("dialog(\"caf\u{e9} \u{2603}\", bcon.__b_2);"),
             "{out}"
