@@ -4,7 +4,8 @@
 
 - **Status:** Accepted
 - **Scope:** `crates/sims-antics/src/v2/decompile.rs`, `crates/sims-antics/src/structure_lift.rs`
-  (one additive entry point), `crates/sims-antics/src/v2/lint.rs` (two thresholds made shared)
+  (one additive entry point), `crates/sims-antics/src/v2/lint.rs` (two thresholds made shared;
+  lifecycle findings mapped by pinned id)
 - **Track:** Track 9 (`lift --v2`)
 - **Follows:** `20261125-antics-v2-rust-like-syntax.md`
 
@@ -54,6 +55,11 @@ entry points are unchanged. It writes a two-way `if`/`else` with the branch whos
 lower first, negating the condition when that is the false branch. v2 numbers nodes in source
 order, so the recompiled tree keeps more of the original numbering.
 
+Node order is a heuristic, not a guarantee: the old (true-branch-first) order can be the one
+that matches. When a structured tree's two lifts differ, the model keeps both. Before an
+unproven tree drops a level, it is retried once at that level in the other order, so a tree
+proven by either order stays idiomatic. A retry never skips the proof.
+
 ## Decision 2: a standalone call keeps its false exit
 
 An AIR statement `call N(..);` exits the tree false when the call returns false. The
@@ -96,7 +102,9 @@ declarations type-check, so the call ABI and arity never change. The std table i
   `sim.container`, the handle-typed spellings v2 accepts.
 - **`frame_headroom`.** A tree whose original already has more nodes or locals than the lint's
   thresholds gets `// antics-lint: allow(frame_headroom)`. A faithful lift keeps the original's
-  size. The thresholds are now shared constants in `lint.rs`.
+  size. The thresholds are now shared constants in `lint.rs`. The comment goes after both
+  header forms (`#[bhav(..)]` and a lifecycle block's `#[id(N)]`). The lint now maps `init` and
+  `main` findings by their pinned id, as it already did for `fn` trees, so the allow applies.
 - **TTAB comments.** Identical interaction tables are written once. With several distinct tables,
   each gets a `TTAB <ids>:` header line.
 
@@ -117,10 +125,10 @@ declarations type-check, so the call ABI and arity never change. The std table i
 | Trees | 26,142 | 26,206 (the formerly timed-out file's 64) |
 | Identical / equivalent / inconclusive / omitted | 875 / 4,605 / 20,661 / 1 | 886 / 4,635 / 20,684 / 1 |
 | DIFFERENT | 0 | 0 |
-| Idiomatic trees | 7,698 (29.4%) | 8,471 (32.3%) |
-| Raw-fallback trees | 18,443 | 17,734 |
+| Idiomatic trees | 7,698 (29.4%) | 8,472 (32.3%) |
+| Raw-fallback trees | 18,443 | 17,733 |
 | Inline `raw {}` statements | 7,477 | 7,608 |
-| Lines | 981,310 | 978,875 |
+| Lines | 981,310 | 978,879 |
 | Files with `use std::globals::*;` / own `extern mod globals` | 0 / 1,112 | 1,101 / 12 (862 also keep `more_globals`) |
 | Interaction comment lines | 6,626 | 5,291 |
 | Lint findings | 268 | 7 |
@@ -130,17 +138,18 @@ On the same 1,190 files, excluding the newly lifted one:
 
 | Metric | Before | After |
 | --- | --- | --- |
-| Idiomatic trees | 7,698 (29.4%) | 8,458 (32.4%) |
-| Raw-fallback trees | 18,443 | 17,683 |
+| Idiomatic trees | 7,698 (29.4%) | 8,459 (32.4%) |
+| Raw-fallback trees | 18,443 | 17,682 |
 | Inline raw statements | 7,477 | 7,587 |
-| Lines | 981,310 | 976,648 |
+| Lines | 981,310 | 976,652 |
 | Proven trees (identical + equivalent) | 5,480 | 5,480 |
 
 The 7 remaining lint findings:
 
 - 4 `negated_comparison`. `!(a == b)` is the original's negated compare node; `a != b` is a
   different operator, and swapping the branches back would break node order.
-- 3 `frame_headroom`. The recompiled tree outgrew a below-threshold original.
+- 3 `frame_headroom`, on ordinary `fn` trees: each recompiles to 201 nodes from an original
+  below the 200-node threshold, so no allow is written.
 
 ## Follow-ups
 

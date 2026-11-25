@@ -3082,8 +3082,8 @@ impl FileLinter<'_> {
                 let (id, label, span) = match m {
                     ObjectMember::Tree(t) => (t.pinned_id, t.label.as_str(), t.span),
                     ObjectMember::Interaction(i) => (i.pinned_id, i.label.as_str(), i.span),
-                    ObjectMember::Init(b) => (None, "init", b.span),
-                    ObjectMember::Main(b) => (None, "main", b.span),
+                    ObjectMember::Init(b) => (b.pinned_id, "init", b.span),
+                    ObjectMember::Main(b) => (b.pinned_id, "main", b.span),
                     _ => continue,
                 };
                 if let Some(id) = id {

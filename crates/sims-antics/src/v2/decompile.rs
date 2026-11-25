@@ -21,6 +21,7 @@ use crate::ir::BhavChunk;
 use crate::lift::{format_bhav_labeled_air_with_arities, lift_bhav};
 use crate::structure_lift::{
     LiftOptions, StructuredLiftOutcome, lift_bhav_structured_in_node_order,
+    lift_bhav_structured_with_arities,
 };
 use crate::v2::ast::{is_reserved_type_name, object_type_ident};
 use crate::v2::fmt::format_v2_source;
@@ -239,9 +240,10 @@ pub fn decompile_iff_to_v2_report(
     }
 
     let mut cache: BTreeMap<(u16, String, String), TreeCheck> = BTreeMap::new();
-    // Every round lowers at least one tree or statement, so this bound is never reached by
+    // Every round lowers at least one tree or statement (or swaps a tree's branch order, at
+    // most once per tree and level), so this bound is never reached by
     // a run that converges; it only guards against a bug turning into a hang.
-    let max_rounds = 8 + model.trees.len() * 4 + model.statement_count() * 2;
+    let max_rounds = 8 + model.trees.len() * 8 + model.statement_count() * 2;
     for _ in 0..max_rounds {
         let generated = model.generate(&plan);
         match model.compile(&generated.text) {
@@ -303,7 +305,9 @@ pub fn decompile_iff_to_v2_report(
                 }
                 if !changed {
                     for &id in &unproven {
-                        changed |= plan.drop_extras(id, &generated) || plan.lower_tree(&model, id);
+                        changed |= plan.drop_extras(id, &generated)
+                            || plan.other_order(&mut model, id)
+                            || plan.lower_tree(&model, id);
                     }
                 }
                 if changed {
@@ -373,11 +377,50 @@ struct TreeModel {
     structured: bool,
     /// Parsed structured body (`None` for a labeled-CFG lift).
     body: Option<Vec<Stmt>>,
+    /// The structured lift with the other branch order (true branch first rather than the
+    /// lower-numbered one), when it differs: [`Plan::other_order`] swaps it in.
+    other_order: Option<Box<OrderedLift>>,
     /// Whether the idiomatic body runs as a Sim acting on this object (`(sim: Sim)`).
     sim_ctx: bool,
     lifecycle: Option<Lifecycle>,
     /// Why the tree cannot be written at all (unsupported header).
     omitted: Option<String>,
+}
+
+/// One structured lift of a tree: its lines, header and closing-brace indices, and
+/// parsed body.
+struct OrderedLift {
+    lifted: Vec<String>,
+    body_lines: (usize, usize),
+    body: Option<Vec<Stmt>>,
+}
+
+/// `text`'s tree as an [`OrderedLift`], or `None` when it holds no tree.
+fn ordered_lift(text: &str) -> Option<OrderedLift> {
+    let lifted: Vec<String> = text.lines().map(str::to_owned).collect();
+    let head = lifted
+        .iter()
+        .position(|l| l.starts_with("tree ") && l.trim_end().ends_with('{'))?;
+    let close = lifted
+        .iter()
+        .rposition(|l| l.trim_end() == "}")
+        .filter(|&i| i > head)
+        .unwrap_or(lifted.len());
+    let body = crate::parser::parse_module(text)
+        .ok()
+        .and_then(|m| {
+            m.items.into_iter().find_map(|item| match item {
+                crate::ast::Item::Tree(t) => Some(t.body),
+                _ => None,
+            })
+        })
+        // Labeled-CFG bodies (`@n0:` labels) are only ever written raw.
+        .filter(|b| !b.iter().any(|s| matches!(s, Stmt::Label { .. })));
+    Some(OrderedLift {
+        lifted,
+        body_lines: (head, close),
+        body,
+    })
 }
 
 /// One catalog variant (`variant "Name" { ... }`).
@@ -600,6 +643,7 @@ impl Model {
                 labeled: Vec::new(),
                 structured: false,
                 body: None,
+                other_order: None,
                 sim_ctx: false,
                 lifecycle: lifecycle.get(&c.id).copied(),
                 omitted: None,
@@ -640,36 +684,21 @@ impl Model {
                     }
                     _ => labeled,
                 };
-            tree.lifted = text.lines().map(str::to_owned).collect();
-            let Some(head) = tree
-                .lifted
-                .iter()
-                .position(|l| l.starts_with("tree ") && l.trim_end().ends_with('{'))
-            else {
+            let Some(lift) = ordered_lift(&text) else {
+                tree.lifted = text.lines().map(str::to_owned).collect();
                 tree.omitted = Some("the lifter produced no tree".to_owned());
                 trees.push(tree);
                 continue;
             };
-            let close = tree
-                .lifted
-                .iter()
-                .rposition(|l| l.trim_end() == "}")
-                .filter(|&i| i > head)
-                .unwrap_or(tree.lifted.len());
-            tree.body_lines = (head, close);
-            tree.body = crate::parser::parse_module(&text).ok().and_then(|m| {
-                m.items.into_iter().find_map(|item| match item {
-                    crate::ast::Item::Tree(t) => Some(t.body),
-                    _ => None,
-                })
-            });
-            // Labeled-CFG bodies (`@n0:` labels) are only ever written raw.
-            if tree
-                .body
-                .as_ref()
-                .is_some_and(|b| b.iter().any(|s| matches!(s, Stmt::Label { .. })))
+            tree.lifted = lift.lifted;
+            tree.body_lines = lift.body_lines;
+            tree.body = lift.body;
+            if tree.structured
+                && let StructuredLiftOutcome::Lifted(other) =
+                    lift_bhav_structured_with_arities(&tree.original, opts, Some(&lift_arities))
+                && other != text
             {
-                tree.body = None;
+                tree.other_order = ordered_lift(&other).map(Box::new);
             }
             // A variant runs its init/main tree as the object itself.
             let variant_tree = variants
@@ -920,6 +949,17 @@ impl Model {
 
     fn tree(&self, id: u16) -> Option<&TreeModel> {
         self.trees.iter().find(|t| t.id == id)
+    }
+
+    /// Swaps tree `id`'s structured lift for its other branch order.
+    fn swap_order(&mut self, id: u16) {
+        if let Some(t) = self.trees.iter_mut().find(|t| t.id == id)
+            && let Some(other) = t.other_order.as_mut()
+        {
+            std::mem::swap(&mut t.lifted, &mut other.lifted);
+            std::mem::swap(&mut t.body_lines, &mut other.body_lines);
+            std::mem::swap(&mut t.body, &mut other.body);
+        }
     }
 
     fn compile(&self, text: &str) -> std::result::Result<RecompiledFile, Failure> {
@@ -2922,6 +2962,9 @@ struct Plan {
     /// Trees some caller runs in the other context: written `#[context(inherit)]` (an extra
     /// idiom) so that either context may call them.
     inherit: BTreeSet<u16>,
+    /// Tree ID -> the level at which its branch order was last swapped (see
+    /// [`Plan::other_order`]).
+    swapped: BTreeMap<u16, Level>,
 }
 
 impl Plan {
@@ -2987,6 +3030,7 @@ impl Plan {
             strings_off: None,
             plain: BTreeSet::new(),
             inherit,
+            swapped: BTreeMap::new(),
         }
     }
 
@@ -3035,6 +3079,28 @@ impl Plan {
     }
 
     /// Moves tree `id` one style down. `false` when it is already at its last style.
+    /// Tries tree `id`'s other branch order at its current level, once per level: node
+    /// order usually keeps the original's node numbers, but a tree whose paths visit
+    /// nodes out of order can prove only in the other. The extra idioms and the statements
+    /// written raw start over, since the statements are numbered differently.
+    fn other_order(&mut self, model: &mut Model, id: u16) -> bool {
+        let Some(t) = model.tree(id) else {
+            return false;
+        };
+        let level = self.level(t);
+        if t.other_order.is_none()
+            || level == Level::RawLabeled
+            || self.swapped.get(&id) == Some(&level)
+        {
+            return false;
+        }
+        model.swap_order(id);
+        self.swapped.insert(id, level);
+        self.plain.remove(&id);
+        self.raw_stmts.remove(&id);
+        true
+    }
+
     fn lower_tree(&mut self, model: &Model, id: u16) -> bool {
         let Some(t) = model.tree(id) else {
             return false;
@@ -3051,6 +3117,7 @@ impl Plan {
                 // Start again as a plain tree, which keeps the header.
                 self.standalone.insert(id);
                 self.raw_stmts.remove(&id);
+                self.swapped.remove(&id);
                 if t.body.is_some() {
                     Level::Idiomatic
                 } else {
@@ -3366,6 +3433,7 @@ impl Model {
             match as_lifecycle {
                 Some(kind) if !plan.framed.contains(&t.id) => {
                     out.line(format!("#[id({})]", t.id));
+                    write_frame_allow(&mut out, &t.original);
                     out.line(format!("{} {{", kind.keyword()));
                 }
                 Some(kind) => {
@@ -5795,6 +5863,37 @@ object "Fable Lamp" {
     }
 
     #[test]
+    fn a_tree_that_proves_only_in_the_other_branch_order_keeps_it() {
+        // The true branch visits n4, n2, n3: written first, it keeps the primitive at n3;
+        // node order would put it at n4.
+        let lifted = lift_source(
+            r#"object "Fable Clock" {
+    guid: 0x7E00_0137;
+    #[bhav(id = 4300, label = "Pick", locals = 0)]
+    fn pick() {
+        raw {
+            @n0:
+            expr(my.data[3] == 1) -> true: @n4, false: @n1;
+            @n1:
+            expr(temp[0] := 5) -> true: true, false: error;
+            @n2:
+            expr(temp[1] := 2) -> true: @n3, false: error;
+            @n3:
+            play_sound(2) -> true: true, false: error;
+            @n4:
+            expr(temp[0] := 1) -> true: @n2, false: error;
+        }
+    }
+}"#,
+        );
+        has(
+            &lifted,
+            &["if self.data[3] == 1 {\n            temp[0] = 1;"],
+        );
+        assert!(!lifted.contains("@n"), "{lifted}");
+    }
+
+    #[test]
     fn identical_interaction_tables_are_written_once() {
         let line = |s: &str| vec![s.to_owned()];
         assert_eq!(
@@ -5810,6 +5909,22 @@ object "Fable Lamp" {
                 "b".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn an_oversized_lifecycle_tree_allows_the_frame_lint() {
+        let stores: String = (0..205)
+            .map(|i| format!("        temp[0] = {i};\n"))
+            .collect();
+        for header in [
+            "#[id(4096)]",
+            "#[bhav(id = 4096, args = 0, locals = 0, format = 0x8002, revision = 7)]",
+        ] {
+            let lifted = lift_source(&format!(
+                "object \"Fable Tower\" {{\n    guid: 0x7E00_0136;\n    {header}\n    init {{\n{stores}    }}\n}}"
+            ));
+            has(&lifted, &["// antics-lint: allow(frame_headroom)"]);
+        }
     }
 
     #[test]
