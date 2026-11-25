@@ -86,7 +86,12 @@ The code check compares a tree's frame and code. It does not compare the object 
   - a definition the lift drops.
 - **Run Functional Tree** runs the callback its function names, on the stack object. The action every definition has there must agree, and is a callee of the caller.
 - **Create Object Instance** runs the new object's callbacks (`init`, then a turn of `main`), with or without its from-record flag. The new object may be this one, so every callback table must agree, and every callback tree is a callee.
-- **Definition and callback reads.** An Expression reading scope 21 (the stack object's definition words) or scope 35 (whether its callback table names a tree) needs this file's definitions (the live ones, in resource order, byte for byte), or its callback tables, to agree.
+- **Definition and callback reads.** An Expression reading a definition through its operands needs this file's definitions (the live ones, in resource order, byte for byte) to agree:
+  - scope 21: the stack object's definition words;
+  - scopes 36 and 37: the type-attribute record that definition words 92 and 93 of me or the stack object may name;
+  - scope 38: a neighbor's linked definition.
+
+  One reading scope 35 (whether the stack object's callback table names a tree) needs the callback tables to agree.
 - **The semi-global link.** Semi-global calls and constants go through `GLOB`, and so does every global tree a tree calls, since it runs with this object as its owner. When the rebuilt object's link differs (an empty name links nothing), no tree of the object is proven.
 - **Non-private code of this file.** The lift writes only private trees (4096–8191) and private constant tables (4096–4159). A file holding other trees or constant tables (for example the global file, or a file other objects link as their semi-global) is a file whose trees reach them by number, by a name another file supplies, or through constant addresses. When the rebuilt file does not keep them, no tree of the object is proven. The tables are compared as the VM loads them: the last chunk of each ID, deleted ones included.
 - **Code outside this file's private trees.** An instruction may run code the lift does not see:
@@ -105,10 +110,23 @@ The code check compares a tree's frame and code. It does not compare the object 
 - the others: the live resources in resource order.
 
 The list covers:
-- `STR#`, `CTSS`, `TTAB`, `TTAs`, `SLOT`, `FCNS`, `GLOB`, `TPRP`, `OBJD` and `OBJf`;
+- `STR#`, `CTSS`, `CATS`, `CST`, `TTAB`, `TTAs`, `SLOT`, `FCNS`, `GLOB`, `TPRP`, `OBJD`, `OBJf` and the portrait `BMP_` 2002;
 - non-private BHAVs and BCONs.
 
-Some of these also have the per-tree checks above (`STR#` text and names, `OBJD`/`OBJf` callbacks and Expression reads, `GLOB`, non-private code). For those, the note is informational: a tree that depends on them in a way the checks see is already inconclusive. The rest are read only inside primitives (routing slots, interaction tables, Test Object Type, ...) or by trees of other objects reading this one, and the tree verdicts treat those reads as the same in both files. Chunk types outside the list (graphics and other assets) are neither listed nor compared: primitives that read them are treated as reading the same data in both files. The CLI's wording ("trees that read them are checked as code only") is in `src/bin/sims-antics.rs`, outside this track.
+### The verdict contract: code only
+
+A tree's verdict (Identical/Equivalent) is a **code-only** claim, as on main. The CLI's note says so: "trees that read them are checked as code only". What it covers:
+- the tree's code and frame;
+- every tree it can reach by number, by name, by callback or by function;
+- the object-level checks above.
+
+Reads of object data *inside a primitive* are not part of the claim: the code check treats them as reading the same data in both files. Examples are interactions (Push Interaction, Gosub Found Action), routing and container slots (Snap, Go To Routing Slot), callback lookups (Find Best Object for Function), definitions read through a primitive's own operands (Random Number), and animation or catalog names. Trees of other objects reading this one are outside the claim too. Every such resource the rebuilt object does not reproduce is listed in the per-object note.
+
+For a rebuilt object that reproduces every listed resource, the code-only claim is a whole-object claim.
+
+The lift does not yet reproduce interactions (`TTAB`/`TTAs`), slots (`SLOT`) or catalog strings (`CTSS`), and it changes one definition byte. A whole-object verdict would need an audited allowlist of primitives that read no object data. Measured with Expression alone allowlisted, it would prove 243/2722 base-game trees and 72/116 open-pack trees. The coordinator chose the code-only contract until the lift reproduces those resources (see *Follow-ups*).
+
+Some listed resources also have per-tree checks above (`STR#` text and names, `OBJD`/`OBJf` callbacks and Expression reads, `GLOB`, non-private code, and code outside the private trees). For those, the note is informational: a tree that depends on them in a way the checks see is already inconclusive. Chunk types outside the list (graphics and other assets) are neither listed nor compared.
 
 These gaps are settled: no other spelling of the tree closes them, so the tree is not lowered for them. A caller of an unproven tree stays unproven as before.
 
@@ -159,8 +177,8 @@ Not lifted: the rare raw `sleep` statements.
 
 | | main (b3758a7c) | this change |
 |---|---|---|
-| proven (identical + equivalent) | 2699 (367 + 2332)* | 718 (131 + 587) |
-| inconclusive / omitted / DIFFERENT | 22 / 1 / **0** | 2003 / 1 / **0** |
+| proven (identical + equivalent) | 2699 (367 + 2332)* | 695 (131 + 564) |
+| inconclusive / omitted / DIFFERENT | 22 / 1 / **0** | 2026 / 1 / **0** |
 | idiomatic trees | 870 | 891 |
 | raw statements inside idiomatic trees | 1119 | 768 (−31%) |
 | raw trees | 1851 | 1830 |
@@ -169,17 +187,17 @@ Not lifted: the rare raw `sleep` statements.
 
 \* Main's count is not sound. It does not check labels, callbacks, tree names, the semi-global link or what global trees see of their owner (see *Object-level checks*).
 
-The 2003 inconclusive trees, by the first reason reported:
+The 2026 inconclusive trees, by the first reason reported:
 
-- 971 trees that may run code outside the file's private trees (a global tree, a name, a callback, a created object) while the rebuilt object differs as its owner. Every object differs: the lift does not reproduce definitions, slots, interaction tables and catalog strings byte for byte, and in the base game it also changes tree labels, callback tables and text tables;
+- 969 trees that may run code outside the file's private trees (a global tree, a name, a callback, a created object) while the rebuilt object differs as its owner. Every object differs: the lift does not reproduce definitions, slots, interaction tables and catalog strings byte for byte, and in the base game it also changes tree labels, callback tables and text tables;
 - 354 trees of the 36 objects with a semi-global file (the lift writes no `GLOB`);
-- 261 trees that call an unproven tree, directly, by name, by function, by creating an object or through code outside the file;
+- 262 trees that call an unproven tree, directly, by name, by function, by creating an object or through code outside the file;
 - 222 callbacks the lifted object does not register (see above);
 - 103 lifecycle trees whose label a block cannot keep;
 - 45 trees that create an object while the callback tables differ;
 - 20 trees looking a tree up by a name not known here (mostly the global file's table);
 - 8 Run Functional Tree callers whose callback differs;
-- 9 readers of definition words and 6 of callback tables that differ;
+- 33 readers of definitions (scopes 21 and 36–38) and 6 of callback tables that differ;
 - 4 trees that read a `STR#` table the lift does not reproduce.
 
 Writing `STR#` 303 recovered 187 by-name trees and callers that the checks alone would also have left unproven.
@@ -202,7 +220,8 @@ Writing `STR#` 303 recovered 187 by-name trees and callers that the checks alone
 - 103 base-game lifecycle trees carry labels other than the compiler's block names (`main loop`, ...). They and their by-name callers stay inconclusive until v2 can label a block (Track 8 follow-up, e.g. `main "main loop" { }`).
 - Run Tree By Name from the global file's names table is checked conservatively. Resolving it would need the global file's `STR#` 303 in the lift options.
 - **Global trees running with this object as owner** are checked conservatively: the lift has only the global and semi-global files' arities and names, not their code. With their code in the lift options, a caller could be checked against what those trees actually reach.
-- **Callbacks, definitions and the semi-global link** (most of the 2003 base-game trees, all 7 open-pack trees) need follow-ups:
+- **Callbacks, definitions and the semi-global link** (most of the 2026 base-game trees, all 7 open-pack trees) need follow-ups:
   - lift `functional`, `load`/`reset`/`cleanup` and multi-tile definitions (Track 9);
   - a v2 way to fill any OBJD callback word with a labelled tree, and to write the `GLOB` link (Track 8).
+- **Code-only verdicts** (see *The verdict contract*). The follow-up is to lift `TTAB`/`TTAs`, `SLOT` and `CTSS`, and to keep `OBJD` byte for byte (Track 9). Once the rebuilt object reproduces every listed resource, verdicts can switch to whole-object, with an audited allowlist of primitives that read no object data for the rest.
 - `@slot(N) let x: T;` is exempt from `uninitialized_local_read` as a whole. A pinned slot exists so raw code or text can use it by number, and lint does not model raw writes by slot number.

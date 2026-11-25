@@ -80,10 +80,13 @@ const CREATE_OBJECT: u16 = 42;
 const CREATE_FROM_RECORD: u8 = 0x04;
 /// Run Functional Tree: the stack object runs the callback a function names.
 const RUN_FUNCTIONAL_TREE: u16 = 20;
-/// Expression, and the operand scopes through which it reads an object definition's
-/// words (21) and whether its callback table names a tree (35) (`sims-vm` `memory.rs`).
+/// Expression, and the operand scopes through which it reads object definitions
+/// (`sims-vm` `memory.rs`): the stack object's words (21), the type-attribute record
+/// that definition words 92 and 93 of me (36) or the stack object (37) may name, and
+/// a neighbor's linked definition (38); and whether the stack object's callback table
+/// names a tree (35).
 const EXPRESSION: u16 = 2;
-const DEFINITION_WORDS_SCOPE: u8 = 21;
+const DEFINITION_SCOPES: [u8; 4] = [21, 36, 37, 38];
 const CALLBACK_SCOPE: u8 = 35;
 /// When an OBJD has no OBJf table, the VM reads its callbacks from these OBJD byte
 /// offsets, in callback order (`sims-vm` `program.rs` `DEFINITION_CALLBACKS`).
@@ -1030,7 +1033,7 @@ impl Model {
         for i in &t.original.instructions {
             if i.opcode == EXPRESSION {
                 let scopes = [i.operands[6], i.operands[7]];
-                if scopes.contains(&DEFINITION_WORDS_SCOPE)
+                if scopes.iter().any(|s| DEFINITION_SCOPES.contains(s))
                     && (self.original_definitions.is_none()
                         || self.original_definitions != recompiled.definitions)
                 {
@@ -1692,12 +1695,15 @@ fn fwav_sounds(iff: &Iff) -> BTreeMap<u16, String> {
 ///   deleted ones included;
 /// - `STR#`: every chunk of the ID in file order (the VM keeps the last one that
 ///   parses, deleted or not; comparing them all is stricter);
-/// - the rest: each resource of that key in resource order (live chunks; every chunk
-///   of the tag in file order when the resource map does not parse).
+/// - the rest (`CTSS`, `CATS`, `CST`, `TTAs`, `GLOB`, `TPRP`, `OBJD`, `OBJf`, and
+///   `BMP_` 2002): each resource of that key in resource order (live chunks; every
+///   chunk of the tag in file order when the resource map does not parse).
 fn resource_chunks(iff: &Iff) -> BTreeMap<([u8; 4], u16), Vec<Vec<u8>>> {
     const LAST_CHUNK: [&[u8; 4]; 4] = [b"BCON", b"FCNS", b"TTAB", b"SLOT"];
     const EVERY_CHUNK: [&[u8; 4]; 1] = [b"STR#"];
-    const RESOURCE_ORDER: [&[u8; 4]; 6] = [b"CTSS", b"TTAs", b"GLOB", b"TPRP", b"OBJD", b"OBJf"];
+    const RESOURCE_ORDER: [&[u8; 4]; 8] = [
+        b"CTSS", b"CATS", b"\0CST", b"TTAs", b"GLOB", b"TPRP", b"OBJD", b"OBJf",
+    ];
     let mut out: BTreeMap<([u8; 4], u16), Vec<Vec<u8>>> = BTreeMap::new();
     for c in &iff.chunks {
         if LAST_CHUNK.contains(&&c.tag) {
@@ -1722,6 +1728,15 @@ fn resource_chunks(iff: &Iff) -> BTreeMap<([u8; 4], u16), Vec<Vec<u8>>> {
                 .push(iff.data(c).to_vec());
         }
     }
+    // The portrait bitmap the VM checks for (`load_library_with_pool`).
+    let bitmaps = iff
+        .resource_order(b"BMP_")
+        .unwrap_or_else(|_| iff.chunks.iter().filter(|c| &c.tag == b"BMP_").collect());
+    for c in bitmaps.into_iter().filter(|c| c.id == PORTRAIT_BITMAP) {
+        out.entry((c.tag, c.id))
+            .or_default()
+            .push(iff.data(c).to_vec());
+    }
     for c in vm_kept_bhavs(iff).chunks {
         if !PRIVATE_TREES.contains(&c.id) {
             out.insert((c.tag, c.id), vec![iff.data(c).to_vec()]);
@@ -1729,6 +1744,9 @@ fn resource_chunks(iff: &Iff) -> BTreeMap<([u8; 4], u16), Vec<Vec<u8>>> {
     }
     out
 }
+
+/// The portrait bitmap ID the VM loads (`sims-vm` `program.rs` `PORTRAIT_BITMAP`).
+const PORTRAIT_BITMAP: u16 = 2002;
 
 /// Whether a resource key is code the lift never writes: a tree outside the private
 /// range, or a constant table outside the private ones. This file's trees reach them

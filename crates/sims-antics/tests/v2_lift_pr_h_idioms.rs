@@ -800,6 +800,15 @@ fn reads_of_definitions_and_callbacks_need_the_same_tables() {
     @id(4302) @frame(locals: 0) tree slots "Slots" {
         raw { op 0x0002 (0, 0, 18, 0, 0, 5, 8, 35); }
     }
+    @id(4303) @frame(locals: 0) tree mine "Mine" {
+        raw { op 0x0002 (0, 0, 0, 0, 0, 5, 8, 36); }
+    }
+    @id(4304) @frame(locals: 0) tree theirs "Theirs" {
+        raw { op 0x0002 (0, 0, 0, 0, 0, 5, 8, 37); }
+    }
+    @id(4305) @frame(locals: 0) tree neighbor "Neighbor" {
+        raw { op 0x0002 (0, 0, 2, 0, 0, 5, 8, 38); }
+    }
 }"#;
     let iff = compile(source);
     let (init, main) = init_and_main(&iff);
@@ -839,11 +848,15 @@ fn reads_of_definitions_and_callbacks_need_the_same_tables() {
         "{:?}",
         report.resources_not_reproduced
     );
-    assert!(
-        matches!(check_of(&report, 4301), TreeCheck::Inconclusive(why) if why.contains("definition's words")),
-        "{:?}",
-        report.trees
-    );
+    // Scope 21 reads the words; 36 and 37 the type-attribute record words 92 and 93
+    // may name; 38 a neighbor's linked definition.
+    for id in [4301, 4303, 4304, 4305] {
+        assert!(
+            matches!(check_of(&report, id), TreeCheck::Inconclusive(why) if why.contains("definition's words")),
+            "{id}: {:?}",
+            report.trees
+        );
+    }
 }
 
 #[test]
@@ -1223,4 +1236,35 @@ fn a_global_call_waits_on_every_private_tree() {
         "{:?}",
         report.trees
     );
+}
+
+#[test]
+fn catalog_strings_and_the_portrait_are_owner_data() {
+    // The VM loads `CATS` presence and `BMP_` 2002 with the object; a global tree
+    // running with it as owner may see either. The lift writes neither.
+    let source = r#"object "Fable Bellows" {
+    guid: 0x7E00_0144;
+    @id(4301) @frame(locals: 0) tree caller "Caller" {
+        raw { op 0x0100 (0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff); }
+    }
+}"#;
+    let iff = compile(source);
+    assert!(proven(check_of(&report(&iff), 4301)));
+    for (tag, id) in [(*b"CATS", 300), (*b"BMP_", 2002)] {
+        let extra = ChunkData {
+            tag,
+            id,
+            flags: 0,
+            label: "Extra".to_owned(),
+            data: vec![0; 8],
+        };
+        let with = report(&rebuild(&iff, |_| {}, vec![extra]));
+        let name = format!("{} {id}", String::from_utf8_lossy(&tag));
+        assert!(
+            with.resources_not_reproduced.contains(&name),
+            "{name}: {:?}",
+            with.resources_not_reproduced
+        );
+        runs_outside(&with, 4301);
+    }
 }
