@@ -21,6 +21,7 @@ use crate::coop::default_player_name;
 use crate::game::{Game, InstallAssets, SpecialLotEntry};
 use crate::hud::{DIALOG_FADE_DURATION_MS, DialogKey};
 use crate::sound::{self, Input};
+use crate::user_files;
 use sims_audio::SoundEvent;
 use sims_audio::music::MusicMode;
 use sims_content::ui_graphics::UiGraphics;
@@ -566,7 +567,6 @@ pub struct NeighborhoodShell {
     autosave_worker: AutosaveWorker,
     migration_report: Option<StoreMigrationReport>,
     migration_error: Option<String>,
-    options_file: PathBuf,
     /// The neighborhood record ([`StoredNeighborhood::instance_id`] and
     /// [`StoredNeighborhood::revision`]) last written as `Neighborhood.iff`
     /// ([`NeighborhoodShell::neighborhood_iff_path`]), or the one opened.
@@ -719,19 +719,28 @@ mod rezone_and_import;
 mod shell_state;
 mod travel_shell;
 
-/// What a departure from the home lot carries out
+/// What a departure to a destination carries out
 /// ([`NeighborhoodShell::depart_to_destination`],
 /// [`NeighborhoodShell::pump_trip_request`]).
 enum Departure {
-    /// A trip the shell plans: it writes the travelers' tokens and charges
-    /// the fare ([`vm_travel::depart_to_destination`]).
+    /// A trip the shell plans from the home lot: it writes the travelers'
+    /// tokens and charges the fare
+    /// ([`vm_travel::depart_to_destination_with_cache`]).
     Request(TravelRequest),
-    /// The trip a script asked for with Generic Sims Call 17, to `house`,
-    /// whose tokens and fare the script already took care of
-    /// ([`vm_travel::depart_from_request_with`]). `transport` is the way the
-    /// lot picker showed: the arrival places the travelers by it, and it
-    /// picks the loading screen.
+    /// The trip a script on the home lot asked for with Generic Sims Call
+    /// 17, to `house`, whose tokens and fare the script already took care
+    /// of ([`vm_travel::depart_from_request_with_with_cache`]). `transport`
+    /// is the way the lot picker showed: the arrival places the travelers
+    /// by it, and it picks the loading screen.
     Trip {
+        house: u32,
+        transport: Option<vm_travel::TravelTransport>,
+    },
+    /// The trip on to another destination, `house`, that a script on the
+    /// open destination asked for with Generic Sims Call 17 (Go Somewhere
+    /// Else, tree 0x1016) ([`vm_travel::travel_on_from_request_with_cache`]).
+    /// The trip keeps its home; `transport` is as for [`Self::Trip`].
+    Onward {
         house: u32,
         transport: Option<vm_travel::TravelTransport>,
     },
@@ -1188,8 +1197,14 @@ fn splice_world_into_saved_bytes(
     Ok(rebuilt)
 }
 
+/// The `<saves stem>.caf-names.tsv` older builds kept household surnames
+/// in. Nothing writes it now; it is read once, by
+/// [`migrate_legacy_caf_sidecar_if_needed`], where those builds left it.
+/// Saves files whose names differ only in extension share it, but each row
+/// names its neighborhood and the store's instance ID, so it migrates only
+/// into the store that wrote it.
 fn caf_names_sidecar_path(saves_path: &Path) -> PathBuf {
-    saves_path.with_extension("caf-names.tsv")
+    user_files::legacy_sibling(saves_path, "caf-names.tsv")
 }
 
 /// One-time atomic read-only migration from any pre-v4 `<saves>.caf-names.tsv`

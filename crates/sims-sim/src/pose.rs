@@ -23,7 +23,7 @@
 //!   from `compose_bone_with_control` in the same file).
 //!
 //! Whether the whole matches the original is checked against the strides
-//! the original stored (see `crates/sims-vm/tests/resize.rs`).
+//! the original stored (see `crates/sims-vm/tests/integration/resize.rs`).
 
 use sims_core::{Ext, F32};
 

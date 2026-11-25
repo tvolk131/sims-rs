@@ -88,14 +88,15 @@ review remains necessary; passing checks is not legal clearance.
 ## CI and release scope
 
 CI runs on pull requests, pushes to `main` and manual dispatch. The check names
-are `Repository hygiene` and `Rust checks`. The Rust job pins toolchain 1.99.0,
-checks default-feature workspace library, binary and test targets, and runs the
-six core libraries' asset-free unit suites serially. It also executes the
-synthetic `avatar_codecs` integration target, the asset-free `inventory_operations`
-integration target, and the `sims-render` library tests as separate steps.
-These renderer tests do not qualify native GPU
-presentation or installed-asset loaders. Fixture-gated tests do not silently
-count as executed coverage. CI does not enable private fixtures or all features.
+are `Repository hygiene` and `Rust checks`. The Rust job runs on Ubuntu (x86_64)
+and macOS (aarch64), so the float-model tests double as a cross-architecture
+determinism check. It pins toolchain 1.99.0 and runs `cargo fmt --all --check`,
+`cargo clippy --locked --workspace --all-targets -- -D warnings` and
+`cargo test --locked --workspace`. CI has no installed game, so tests that need
+`SIMS_INSTALL` or another private capture skip themselves; a skipped test does
+not count as executed coverage. The renderer tests do not qualify native GPU
+presentation or installed-asset loaders. CI does not enable private fixtures or
+all features.
 
 Actions are pinned to exact commits. Repository-wide default workflow permissions
 are read-only and workflow approval of pull requests is disabled. The initial
@@ -455,29 +456,26 @@ read failures and parser modes. These checks do not qualify native latency.
 
 ## Avatar-codec test selectors
 
-The synthetic `sims-formats` targets `animation`, `avatar` and `avatar_index` are
-grouped in `avatar_codecs`. The three leaf files remain byte-identical in separate
-modules, preserving all nine tests. Cargo autodiscovery remains enabled; private
-fixtures remain opt-in and are not needed by this group.
+The synthetic `sims-formats` avatar tests are the `avatar_codecs` module of the
+crate's one integration test binary (`tests/integration/`), with the submodules
+`animation`, `avatar`, `avatar_index` and `catalog`. Private fixtures remain
+opt-in and are not needed by this group.
 
 Run the full group:
 
 ```sh
-cargo test --locked -p sims-formats --test avatar_codecs
+cargo test --locked -p sims-formats --test integration avatar_codecs::
 ```
 
-The old target selectors no longer exist. For one former `avatar` case, use:
+The old `--test avatar_codecs`, `--test animation`, `--test avatar` and
+`--test avatar_index` targets no longer exist. For one `avatar` case, use:
 
 ```sh
-cargo test --locked -p sims-formats --test avatar_codecs \
-  avatar::skeleton_hierarchy_and_truncations -- --exact
+cargo test --locked -p sims-formats --test integration \
+  avatar_codecs::avatar::skeleton_hierarchy_and_truncations -- --exact
 ```
 
-Former `animation` and `avatar_index` cases similarly gain `animation::` and
-`avatar_index::` prefixes. Require the expected positive test count: an obsolete
-`--exact` name can otherwise succeed after running zero tests. Substring filters
-containing a module name can select more cases than before.
-
-This removes two integration binaries, not tests or assertions. It does not
-change CI's separately executed library suites or establish a general build,
-runtime or gameplay improvement.
+The other cases take `avatar_codecs::animation::`,
+`avatar_codecs::avatar_index::` and `avatar_codecs::catalog::` prefixes. Require
+the expected positive test count: an obsolete `--exact` name can otherwise
+succeed after running zero tests.

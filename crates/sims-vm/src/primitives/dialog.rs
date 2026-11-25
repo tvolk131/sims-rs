@@ -1118,7 +1118,16 @@ impl Machine<'_, '_> {
             cells.keep(&interpreter, self.world, copy);
             return Ok(());
         };
-        let plan = built
+        // The put, its callbacks and the removal run the new person's
+        // scripts after the factory returned, one creation deeper, as
+        // Create New Object Instance's tail does
+        // ([`crate::MAX_CREATION_DEPTH`]).
+        let tail = crate::Interpreter {
+            creation_depth: interpreter.creation_depth.saturating_add(1),
+            ..interpreter
+        };
+        let plan = cells
+            .on(&tail)
             .portrait_put_plan(&mut copy, id, "a dialog's portrait")
             .map_err(|fault| fault.trap)?;
         let finish_at = |tile: Option<[i32; 2]>,
@@ -1126,7 +1135,7 @@ impl Machine<'_, '_> {
                          mut lot: sims_sim::World,
                          run_cells: crate::both_ways::Cells|
          -> Result<(sims_sim::World, crate::both_ways::Cells), Trap> {
-            let run = run_cells.on(&interpreter);
+            let run = run_cells.on(&tail);
             if let Some(pos) = tile {
                 run.put_person(&mut lot, id, pos, 1)?;
             }
@@ -1200,7 +1209,7 @@ impl Machine<'_, '_> {
                     let mut lot = copy.clone();
                     let run_cells = cells.copy();
                     let tile = run_cells
-                        .on(&interpreter)
+                        .on(&tail)
                         .search(
                             &mut lot,
                             id,

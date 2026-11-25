@@ -107,6 +107,7 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
+        let inner = self.creating(guid)?;
         let master = self
             .machine(world, 0, 0, false)
             .definition_words(guid)
@@ -140,8 +141,8 @@ impl Interpreter<'_> {
         self.update_offsets(world, lead)
             .map_err(|trap| fail(lead, trap))?;
         for &part in &parts {
-            self.init(world, part)?;
-            self.turn(world, part, TURN_BUDGET)?;
+            inner.init(world, part)?;
+            inner.turn(world, part, TURN_BUDGET)?;
             let mut machine = self.machine(world, part, 0, false);
             machine.end_turn().map_err(|trap| fail(part, trap))?;
             machine.refresh_flags().map_err(|trap| fail(part, trap))?;

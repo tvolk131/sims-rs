@@ -1410,3 +1410,111 @@ fn atomic_caf_commit_survives_concurrent_reimport_and_purges_album() {
         }
     }
 }
+
+/// `fam_bytes` with a FAMh for family `id` holding `history`, as the
+/// original's export writes one. The resource map, if any, is dropped so
+/// the chunks are found in file order.
+fn with_famh(fam_bytes: &[u8], id: u16, history: &[u8]) -> Vec<u8> {
+    let iff = Iff::parse(fam_bytes.to_vec()).unwrap();
+    let mut chunks: Vec<ChunkData> = iff
+        .chunks
+        .iter()
+        .filter(|chunk| &chunk.tag != b"rsmp")
+        .map(|chunk| ChunkData {
+            tag: chunk.tag,
+            id: chunk.id,
+            flags: chunk.flags,
+            label: chunk.label.clone(),
+            data: iff.data(chunk).to_vec(),
+        })
+        .collect();
+    chunks.push(ChunkData {
+        tag: *b"FAMh",
+        id,
+        flags: 0x10,
+        label: String::new(),
+        data: history.to_vec(),
+    });
+    write_iff(&chunks).unwrap()
+}
+
+/// The FAMh a save of `id` writes for `family`, read back from the file.
+fn saved_famh(store: &NeighborhoodStore, id: &str, family: u16) -> Option<Vec<u8>> {
+    let directory = std::env::temp_dir().join(format!(
+        "sims-vm-caf-famh-{}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let bytes = std::fs::read(store.save_neighborhood_iff(id, &directory).unwrap()).unwrap();
+    std::fs::remove_dir_all(&directory).unwrap();
+    let iff = Iff::parse(bytes).unwrap();
+    assert!(iff.get(b"FAMI", family).is_some(), "family {family} saved");
+    iff.get(b"FAMh", family)
+        .map(|chunk| iff.data(chunk).to_vec())
+}
+
+/// A family moving in from a `.FAM` file takes the file's FAMh (the import
+/// hands it the file, 0x4291e6, and the save copies its FAMh from it,
+/// 0x4107a8), under the ID it is given; a file without one leaves the
+/// family none, whatever an earlier holder of the ID left. The name read
+/// for the ID goes too, so FAMs is written from the stored name.
+#[test]
+fn a_fam_import_saves_the_files_famh_byte_for_byte() {
+    let db = TempDb::new("fam-famh");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .save_neighborhood("SyntheticNH", &empty_stored_neighborhood("SyntheticNH"))
+        .unwrap();
+    let ctx = CafContext::synthetic(
+        synthetic_template_iff(),
+        BTreeSet::from([TEMPLATE_PERSON_GUID]),
+        DEFAULT_STARTING_FUNDS,
+    );
+    let mut rng = CrtRng::from_state(2026_1125);
+    let spec = FamilySpec::new("Alice", "", vec![alice_sim_spec(None)]);
+    let created = commit_family_with_context(&ctx, &store, "SyntheticNH", &spec, &mut rng).unwrap();
+    assert_eq!(created.family_id, 1);
+    let stored = store.load_neighborhood("SyntheticNH").unwrap().unwrap();
+    let chars = store.load_character_files("SyntheticNH").unwrap();
+    let plain = export_family_fam(&stored, &chars, 1, "Alice", 1, true).unwrap();
+    assert_eq!(FamilyFile::parse(&plain).unwrap().history, None);
+    let history: Vec<u8> = (0..=255u8).chain([0, 0, 0x7f]).collect();
+    let with_history = with_famh(&plain, 1, &history);
+    assert_eq!(
+        FamilyFile::parse(&with_history).unwrap().history.as_deref(),
+        Some(&history[..])
+    );
+
+    // What earlier holders of IDs 2 and 3 left.
+    store
+        .update_save_inputs("SyntheticNH", |inputs| {
+            for family in [2, 3] {
+                inputs.histories.insert(family, vec![0xee; 4]);
+                inputs.family_names.insert(family, " Old ".to_owned());
+                inputs.uninitialized.family_names.insert(family, 0x5a);
+            }
+        })
+        .unwrap();
+
+    // ID 1 is taken, so the file's family becomes 2.
+    let imported =
+        import_family_fam(&ctx, &store, "SyntheticNH", &with_history, 1, &mut rng).unwrap();
+    assert_eq!(imported.family_id, 2);
+    let inputs = store.load_save_inputs("SyntheticNH").unwrap();
+    assert_eq!(inputs.histories.get(&2), Some(&history));
+    assert!(!inputs.family_names.contains_key(&2));
+    assert!(!inputs.uninitialized.family_names.contains_key(&2));
+    assert_eq!(inputs.histories.get(&3), Some(&vec![0xee; 4]));
+    assert_eq!(saved_famh(&store, "SyntheticNH", 2), Some(history.clone()));
+    assert_eq!(saved_famh(&store, "SyntheticNH", 1), None);
+
+    // A file without one: family 3 saves no FAMh.
+    let imported = import_family_fam(&ctx, &store, "SyntheticNH", &plain, 1, &mut rng).unwrap();
+    assert_eq!(imported.family_id, 3);
+    let inputs = store.load_save_inputs("SyntheticNH").unwrap();
+    assert!(!inputs.histories.contains_key(&3));
+    assert!(!inputs.family_names.contains_key(&3));
+    assert_eq!(saved_famh(&store, "SyntheticNH", 3), None);
+    assert_eq!(saved_famh(&store, "SyntheticNH", 2), Some(history));
+}

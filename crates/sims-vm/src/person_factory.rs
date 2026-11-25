@@ -124,6 +124,10 @@ impl Interpreter<'_> {
                 )),
             ));
         }
+        // The depth guard comes before the skeleton lookup, which can load
+        // `.ndx` catalogs and draw from the C runtime stream, so a refused
+        // creation changes nothing.
+        let inner = self.creating(guid)?;
         let skeleton = crate::people::resolve_skeleton(
             &self.program.people,
             world,
@@ -147,7 +151,7 @@ impl Interpreter<'_> {
                 )),
             ));
         }
-        self.construct_person(world, guid, skeleton)
+        self.construct_person(inner, world, guid, skeleton)
     }
 
     /// Reads body row 0 (skeleton name, `0x440d63` → `0x457f60` → `0x46ff01` →
@@ -239,6 +243,34 @@ impl Interpreter<'_> {
         {
             return Ok(None);
         }
+        let is_refused_pet = |skeleton: &sims_content::Skeleton| {
+            early_name.is_none()
+                && !pets_allowed(self.program.expansions)
+                && ["dog", "kat"]
+                    .iter()
+                    .any(|pet| skeleton.name.eq_ignore_ascii_case(pet))
+        };
+        // The depth guard comes before the skeleton lookup, which can load
+        // `.ndx` catalogs and draw from the C runtime stream, so a refused
+        // creation changes nothing. A pet the lookup's name refuses
+        // (below) is still refused at the limit, as the original refuses
+        // it after the lookup: the lookup runs on a copy first, and is
+        // kept only for such a pet.
+        let inner = match self.creating(guid) {
+            Ok(inner) => inner,
+            Err(fault) => {
+                if early_name.is_none() && !pets_allowed(self.program.expansions) {
+                    let mut probe = world.clone();
+                    if crate::people::resolve_skeleton(&self.program.people, &mut probe, guid, None)
+                        .is_ok_and(is_refused_pet)
+                    {
+                        *world = probe;
+                        return Ok(None);
+                    }
+                }
+                return Err(fault);
+            }
+        };
         // 0x58833c -> 0x5a0384 -> 0x5a280f resolves skeleton names with
         // byte-exact comparison and runtime-ordered lazy `.ndx` catalog loads.
         let skeleton = crate::people::resolve_skeleton(
@@ -248,19 +280,18 @@ impl Interpreter<'_> {
             early_name.as_deref(),
         )
         .map_err(|t| fail(0, t))?;
-        if early_name.is_none()
-            && !pets_allowed(self.program.expansions)
-            && ["dog", "kat"]
-                .iter()
-                .any(|pet| skeleton.name.eq_ignore_ascii_case(pet))
-        {
+        if is_refused_pet(skeleton) {
             return Ok(None);
         }
-        self.construct_person(world, guid, skeleton).map(Some)
+        self.construct_person(inner, world, guid, skeleton)
+            .map(Some)
     }
 
+    /// Constructs the person; `inner` is this interpreter one creation
+    /// deeper ([`Self::creating`]), on which the person's scripts run.
     fn construct_person(
         &self,
+        inner: Self,
         world: &mut World,
         guid: u32,
         skeleton: &sims_content::Skeleton,
@@ -275,7 +306,7 @@ impl Interpreter<'_> {
             .ok_or_else(|| fail(0, Trap::Unsupported("no unused object ID".into())))?;
         let factory = Interpreter {
             making_person: Some(id),
-            ..*self
+            ..inner
         };
         let words = factory
             .machine(world, id, 0, false)

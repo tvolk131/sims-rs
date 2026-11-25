@@ -632,9 +632,7 @@ impl NeighborhoodShell {
             self.frames.clone(),
             Some(&install_assets),
         )?;
-        if self.options_file.is_file() {
-            let _ = game.load_options(&self.options_file);
-        }
+        self.load_saved_options(&mut game);
         game.set_album_button_enabled(true);
         game.set_neighborhood_slot(self.slot);
         game.set_special_lot_catalog(self.build_special_lot_catalog());

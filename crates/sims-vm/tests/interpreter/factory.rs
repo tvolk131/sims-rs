@@ -2,7 +2,7 @@
 //! finishing touches.
 
 use crate::support::*;
-use sims_formats::behavior::{Interaction, InteractionTable};
+use sims_formats::behavior::{Behavior, Instruction, Interaction, InteractionTable};
 use sims_vm::Trap;
 
 pub const WIDGET: u32 = 0x3333;
@@ -381,3 +381,82 @@ fn a_type_needs_a_main_tree_that_takes_at_most_four_arguments() {
     let fault = create(&mut fx, WIDGET).unwrap_err();
     assert!(matches!(fault.trap, Trap::Unsupported(_)), "{fault}");
 }
+
+/// Create New Object Instance (opcode 42) of the widget, off the lot
+/// (mode 6).
+fn make_a_widget(on_true: u8) -> Instruction {
+    let [g0, g1, g2, g3] = WIDGET.to_le_bytes();
+    ins(42, on_true, RETURN_FALSE, [g0, g1, g2, g3, 6, 0, 0, 0])
+}
+
+/// The fault of a widget type that makes a widget in `tree`, with the
+/// objects it left: each creation faults once creations nest
+/// [`sims_vm::MAX_CREATION_DEPTH`] deep, before it registers
+/// anything, so this returns on the test thread's default stack.
+fn nested_creation(tree_id: u16, code: Behavior) -> (String, usize) {
+    let (mut fx, file) = widgets();
+    fx.add(file, tree_id, code);
+    let before = fx.world.objects.len();
+    let fault = create(&mut fx, WIDGET).unwrap_err();
+    (fault.to_string(), fx.world.objects.len() - before)
+}
+
+#[test]
+fn an_init_that_makes_its_own_type_faults_at_the_creation_depth_limit() {
+    let (fault, made) = nested_creation(INIT, tree(vec![make_a_widget(RETURN_TRUE)]));
+    let limit = usize::from(sims_vm::MAX_CREATION_DEPTH);
+    assert_eq!(made, limit);
+    assert!(
+        fault.contains(&format!("inside {limit} nested creations")),
+        "{fault}"
+    );
+    assert_eq!(
+        fault
+            .matches("creating an object of type 0x00003333")
+            .count(),
+        limit + 1
+    );
+}
+
+#[test]
+fn a_first_turn_that_makes_its_own_type_faults_at_the_creation_depth_limit() {
+    let sleep = ins(SLEEP, 0, ERROR, [20, 0, 0, 0, 0, 0, 0, 0]);
+    let (fault, made) = nested_creation(MAIN, tree(vec![make_a_widget(1), sleep]));
+    assert_eq!(made, usize::from(sims_vm::MAX_CREATION_DEPTH));
+    assert!(fault.contains("nested creations"), "{fault}");
+}
+
+#[test]
+fn creations_nested_below_the_limit_finish() {
+    // Each widget's Init makes another while global 36 (writable) counts down from
+    // one below the limit, so the deepest makes none.
+    let (mut fx, file) = widgets();
+    let limit = sims_vm::MAX_CREATION_DEPTH;
+    fx.world.globals[36] = (limit - 1) as i16;
+    fx.add(
+        file,
+        INIT,
+        tree(vec![
+            ins(
+                2,
+                1,
+                RETURN_TRUE,
+                expr(scope::GLOBAL, 36, op::GREATER, scope::LITERAL, 0),
+            ),
+            ins(
+                2,
+                2,
+                2,
+                expr(scope::GLOBAL, 36, SUBTRACT, scope::LITERAL, 1),
+            ),
+            make_a_widget(RETURN_TRUE),
+        ]),
+    );
+    let before = fx.world.objects.len();
+    create(&mut fx, WIDGET).unwrap();
+    assert_eq!(fx.world.objects.len() - before, usize::from(limit));
+    assert_eq!(fx.world.globals[36], 0);
+}
+
+/// The Expression operator `-=`.
+const SUBTRACT: u8 = 4;

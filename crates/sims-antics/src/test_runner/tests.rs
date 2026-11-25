@@ -2736,10 +2736,6 @@ expect = { error = "tree 0x012c is missing", attrs = { checked = 2 } }
     }
 
     #[test]
-    #[cfg_attr(
-        debug_assertions,
-        ignore = "nests 32,767 creations: about 140 s in a debug build"
-    )]
     fn a_main_that_makes_its_own_kind_fails_without_overflowing_the_stack() {
         let r = run_spec(
             "recursive-creation",
@@ -2755,12 +2751,20 @@ expect = { error = "tree 0x012c is missing", attrs = { checked = 2 } }
             )],
             "[subject]\nantics = \"recursive.antics\"\n\n[[test]]\nname = \"main\"\ntree = \"Main\"\n",
         );
+        // The factory refuses the creation nested `MAX_CREATION_DEPTH` deep, so the
+        // chain stops there, with one short line per level and nothing elided.
         let f = failures(&r, "main");
+        let limit = sims_vm::MAX_CREATION_DEPTH;
         assert!(
             f.len() == 1
                 && f[0].starts_with("setup: creating the subject: faulted: object 1,")
-                && f[0].contains(" characters elided ...] ")
-                && f[0].ends_with("no unused object ID")
+                && f[0].contains(&format!(
+                    "object {limit}, tree 0x1001 node 1: unsupported: creating an object of type \
+                     0x7E007E26: object 0: unsupported: creating an object of type 0x7E007E26 \
+                     inside {limit} nested creations"
+                ))
+                && f[0].ends_with("the original's limit is not modeled")
+                && !f[0].contains(" characters elided ")
                 && f[0].len() < 5000,
             "{f:?}"
         );

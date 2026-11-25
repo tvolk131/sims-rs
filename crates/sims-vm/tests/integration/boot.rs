@@ -5,7 +5,8 @@
 use sims_core::CrtRng;
 use sims_formats::behavior::ObjectDefinition;
 use sims_formats::iff::Iff;
-use sims_sim::{Headline, World};
+use sims_sim::neighborhood_save::SaveInputs;
+use sims_sim::{Headline, NeighborhoodStore, World};
 use sims_vm::Answer;
 use sims_vm::boot::{Frames, Handoff, Lot, StepError};
 use sims_vm::neighborhood_open::{LotTransition, PoolInput, PoolPerson, open_neighborhood};
@@ -667,6 +668,7 @@ fn an_opened_neighborhood_matches_the_originals_import() {
     {
         assert_eq!(ours, theirs, "pool record {}", 322 + slot);
     }
+    famh_of_the_save_after_the_import(&opened.save_inputs, &after, &output);
 
     let house = output.join("Houses/House69.iff");
     let frames = Frames::parse(RECORDED_FRAMES).unwrap();
@@ -716,6 +718,46 @@ fn an_opened_neighborhood_matches_the_originals_import() {
     .to_string();
     assert!(error.starts_with("0x4725ff: User00031 "), "{error}");
     std::fs::remove_dir_all(&lazy).unwrap();
+}
+
+/// The save after the import (0x4252cc) writes each imported family's
+/// FAMh from its `.FAM` file (0x4291e6, 0x4107a8): Kat_6, Burb_11,
+/// Goth Sr_12 and Charming_13 have one, Hick_10 and Strays_4000 none, and
+/// family 1 keeps the one `Neighborhood.iff` held. With the inputs the
+/// open gives, the recorded save is written again byte for byte.
+fn famh_of_the_save_after_the_import(ours: &SaveInputs, after: &Path, scratch: &Path) {
+    let recorded = std::fs::read(after.join("Neighborhood.iff")).unwrap();
+    let theirs = SaveInputs::from_saved(&recorded).unwrap();
+    assert_eq!(
+        ours.histories.keys().collect::<Vec<_>>(),
+        [&1, &6, &11, &12, &13]
+    );
+    assert!(
+        ours.histories == theirs.histories,
+        "the FAMh payloads differ"
+    );
+
+    let db = scratch.with_extension("redb");
+    let store = NeighborhoodStore::open(&db).unwrap();
+    store.import_directory("UD2", after, 0xff).unwrap();
+    store
+        .update_save_inputs("UD2", |inputs| {
+            inputs.histories.clone_from(&ours.histories);
+        })
+        .unwrap();
+    let saved = scratch.with_extension("saved");
+    std::fs::create_dir_all(&saved).unwrap();
+    let written = std::fs::read(store.save_neighborhood_iff("UD2", &saved).unwrap()).unwrap();
+    drop(store);
+    std::fs::remove_file(&db).unwrap();
+    std::fs::remove_dir_all(&saved).unwrap();
+    let first = written.iter().zip(&recorded).position(|(a, b)| a != b);
+    assert!(
+        written == recorded,
+        "{} bytes written, {} recorded, first difference at {first:?}",
+        written.len(),
+        recorded.len()
+    );
 }
 
 #[test]

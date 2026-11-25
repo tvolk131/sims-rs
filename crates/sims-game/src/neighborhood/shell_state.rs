@@ -644,15 +644,25 @@ impl NeighborhoodShell {
         }
     }
 
-    /// Persists user Options (`Optn` 128) if modified in the live lot.
+    /// Loads the user's saved Options ([`user_files::options_to_load`]) into
+    /// a lot the shell opens, if there are any.
+    pub(super) fn load_saved_options(&self, game: &mut Game) {
+        if let Some(path) = user_files::options_to_load(&self.saves_path) {
+            let _ = game.load_options(&path);
+        }
+    }
+
+    /// Persists user Options (`Optn` 128) to
+    /// [`user_files::options_path`] if modified in the live lot.
     pub fn persist_options(&mut self) {
         if let ActiveScreen::Lot(session) = &self.screen {
             let current = session.game.options().to_optn();
             if current != self.saved_optn {
                 self.options_state = *session.game.options();
-                match session.game.save_options(&self.options_file) {
+                let path = user_files::options_path(&self.saves_path);
+                match session.game.save_options(&path) {
                     Ok(()) => self.saved_optn = current,
-                    Err(e) => eprintln!("sims-game: {}: {e}", self.options_file.display()),
+                    Err(e) => eprintln!("sims-game: {}: {e}", path.display()),
                 }
             }
         }

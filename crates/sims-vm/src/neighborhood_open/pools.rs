@@ -77,6 +77,11 @@ pub struct OpenedPools {
     /// captures, whose `adult` and `child` were loaded before the pools.
     pub loaded_skeletons: BTreeMap<String, Option<String>>,
     pub skeleton_files: BTreeSet<String>,
+    /// Each family the Townie and tourist wrappers moved off a reserved
+    /// ID (0x42b05e to 0x42b09f), as its old and new ID, in order. The
+    /// family keeps its file and record in memory, so its save inputs go
+    /// with it ([`sims_sim::neighborhood_save::SaveInputs::renumber_family`]).
+    pub renumbered: Vec<(u16, u16)>,
 }
 
 const CELEBRITY_WORDS: &[usize] = &[10, 11, 12, 15, 17, 18, 80, 81, 82];
@@ -203,6 +208,7 @@ pub(super) fn fill<'a>(
         lazy: LazySkeletons::default(),
         files,
         made: Vec::new(),
+        renumbered: Vec::new(),
     };
     // What earlier work loaded registers the same way, without draws
     // here: they were made before the pool boundary `crt` starts at.
@@ -242,6 +248,7 @@ pub(super) fn fill<'a>(
         next_file: fills.next_file,
         loaded_skeletons: fills.lazy.loaded,
         skeleton_files: fills.lazy.files,
+        renumbered: fills.renumbered,
     };
     Ok(FilledPools {
         report,
@@ -259,6 +266,7 @@ struct Fills<'a, 'b> {
     lazy: LazySkeletons,
     files: BTreeSet<i32>,
     made: Vec<(i32, &'a Iff)>,
+    renumbered: Vec<(u16, u16)>,
 }
 
 impl<'a, 'b> Fills<'a, 'b> {
@@ -297,33 +305,7 @@ impl<'a, 'b> Fills<'a, 'b> {
     }
 
     fn free_reserved_ids(&mut self, pool: &Pool) -> Result<(), BootError> {
-        let families = &mut self.neighborhood.families;
-        for id in pool.families.clone() {
-            if !families.contains_key(&id) {
-                continue;
-            }
-            if pool.tests_done {
-                // These wrappers use the loop's terminal index on a hit.
-                return Err(format!(
-                    "{}: reserved family {id} sends the wrapper past the end of its family vector",
-                    pool.collision
-                )
-                .into());
-            }
-            // The Townie and tourist wrappers renumber the first match to
-            // the largest family ID plus one (0x42b05e to 0x42b09f).
-            let replacement = families.last_key_value().unwrap().0 + 1;
-            if replacement > i16::MAX as u16 {
-                return Err(format!(
-                    "{}: renumbered family {id} would exceed the signed FAMI ID range",
-                    pool.collision
-                )
-                .into());
-            }
-            let family = families.remove(&id).expect("reserved family");
-            families.insert(replacement, family);
-        }
-        Ok(())
+        free_reserved_ids(&mut self.neighborhood.families, pool, &mut self.renumbered)
     }
 
     fn fill_family(&mut self, pool: &Pool, id: u16) -> Result<(), BootError> {
@@ -815,9 +797,78 @@ fn read_profile(
     Ok(skeleton)
 }
 
+/// The Townie and tourist wrappers' collision step (0x42b05e to 0x42b09f):
+/// each family at one of `pool`'s reserved IDs moves to the largest ID
+/// plus one, noted in `renumbered`.
+fn free_reserved_ids(
+    families: &mut BTreeMap<u16, Family>,
+    pool: &Pool,
+    renumbered: &mut Vec<(u16, u16)>,
+) -> Result<(), BootError> {
+    for id in pool.families.clone() {
+        if !families.contains_key(&id) {
+            continue;
+        }
+        if pool.tests_done {
+            // These wrappers use the loop's terminal index on a hit.
+            return Err(format!(
+                "{}: reserved family {id} sends the wrapper past the end of its family vector",
+                pool.collision
+            )
+            .into());
+        }
+        // The Townie and tourist wrappers renumber the first match to
+        // the largest family ID plus one (0x42b05e to 0x42b09f).
+        let replacement = families.last_key_value().unwrap().0 + 1;
+        if replacement > i16::MAX as u16 {
+            return Err(format!(
+                "{}: renumbered family {id} would exceed the signed FAMI ID range",
+                pool.collision
+            )
+            .into());
+        }
+        let family = families.remove(&id).expect("reserved family");
+        families.insert(replacement, family);
+        renumbered.push((id, replacement));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn family(house: i32) -> Family {
+        Family {
+            version: 9,
+            house,
+            number: 0,
+            budget: 0,
+            architecture_value: 0,
+            friends: 0,
+            flags: 0,
+            members: Vec::new(),
+            tail: vec![0; 16],
+        }
+    }
+
+    #[test]
+    fn a_household_at_a_reserved_id_is_moved_and_noted() {
+        // The Townie wrapper moves family 2000 to the largest ID plus one,
+        // and notes the move so its save inputs follow it.
+        let mut families = BTreeMap::from([(5, family(1)), (2000, family(2)), (4001, family(3))]);
+        let mut renumbered = Vec::new();
+        free_reserved_ids(&mut families, &TOWNIES, &mut renumbered).unwrap();
+        assert_eq!(renumbered, [(2000, 4002)]);
+        assert_eq!(
+            families.keys().copied().collect::<Vec<_>>(),
+            [5, 4001, 4002]
+        );
+        assert_eq!(families[&4002].house, 2);
+        // With the reserved IDs free, nothing moves.
+        free_reserved_ids(&mut families, &TOURISTS, &mut renumbered).unwrap();
+        assert_eq!(renumbered, [(2000, 4002)]);
+    }
 
     #[test]
     fn the_first_seven_celebrities_are_women() {

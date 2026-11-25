@@ -403,6 +403,26 @@ impl Machine<'_, '_> {
             };
             id
         };
+        // What the operation runs on the new object after the factory
+        // (its "init visitor" tree, the placement's callbacks) runs one
+        // creation deeper, as its Init and first turn did, so a creation
+        // they make counts once more ([`crate::factory::MAX_CREATION_DEPTH`]).
+        let depth = self.creation_depth;
+        self.creation_depth = depth.saturating_add(1);
+        let result = self.finish_made(created, person, dst, mode, flags);
+        self.creation_depth = depth;
+        result
+    }
+
+    /// The tail after the factory (0x44e5d8 on) for `created`.
+    fn finish_made(
+        &mut self,
+        created: u16,
+        person: bool,
+        dst: Destination,
+        mode: u8,
+        flags: u8,
+    ) -> Result<bool, Trap> {
         if flags & FACE_AS_STACK_OBJECT != 0 {
             self.face_as_stack_object(created, person)?;
         }
