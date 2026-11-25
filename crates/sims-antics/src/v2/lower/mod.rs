@@ -223,6 +223,58 @@ enum CallContext {
     Extern,
 }
 
+/// What lowering saw of calls that involve `#[context(inherit)]` trees, keyed by the callee's
+/// display name (`tree 'x'`). An inherit tree may call a Sim tree by name with `me` as the Sim:
+/// the callee then runs on the inherit tree's runner and stack object, which is the Sim's
+/// context only when the inherit tree itself runs on a Sim. So such a tree, and every inherit
+/// tree that calls it, must not be called from an object's own tree
+/// ([`check_inherit_calls`]).
+#[derive(Default)]
+struct InheritCallFacts {
+    /// Inherit trees that call a Sim tree by name, with that call's span.
+    calls_sim: BTreeMap<String, Span>,
+    /// Calls to an inherit tree: the calling inherit tree (if the caller is one), whether the
+    /// caller is an object's own tree, the callee, and the call's span.
+    edges: Vec<(Option<String>, bool, String, Span)>,
+}
+
+/// Refuses a call from an object's own tree to an inherit tree that runs a Sim tree on its
+/// runner (directly, or through other inherit trees).
+fn check_inherit_calls(facts: &InheritCallFacts) -> Result<()> {
+    let mut sim_only: BTreeMap<&str, Span> = facts
+        .calls_sim
+        .iter()
+        .map(|(k, s)| (k.as_str(), *s))
+        .collect();
+    loop {
+        let mut grew = false;
+        for (caller, _, callee, span) in &facts.edges {
+            if let Some(caller) = caller
+                && sim_only.contains_key(callee.as_str())
+                && !sim_only.contains_key(caller.as_str())
+            {
+                sim_only.insert(caller, *span);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    for (_, from_object, callee, span) in &facts.edges {
+        if *from_object && sim_only.contains_key(callee.as_str()) {
+            return Err(Error::at(
+                *span,
+                format!(
+                    "{callee} is 'context = inherit' but runs a Sim tree on its runner, so it can \
+                     only be called from interactions, functionals, Sim trees, or other inherit trees"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Fully resolved call signature of an `extern mod` fn or a sibling standalone `#[bhav] fn`.
 #[derive(Debug, Clone)]
 struct CallableSig {
@@ -301,6 +353,9 @@ struct ObjectEnv<'a> {
     strings: BTreeMap<u16, StringsDecl>,
     string_names: BTreeMap<String, u16>,
     dialog_strings: RefCell<DialogStringTable>,
+    /// Calls among the object's trees that decide which `#[context(inherit)]` trees an
+    /// object-context tree may not call ([`InheritCallFacts`]).
+    inherit_calls: RefCell<InheritCallFacts>,
     /// The frame words any string of the object may make the formatter read
     /// ([`mir::text_reads`](mod@crate::v2::mir)): every tree is finished with the object's final
     /// fact (`lower_object` lowers again when a later tree's inline dialog literal adds to it).
@@ -805,6 +860,8 @@ struct TreeLowerer<'a> {
     /// The tree is `#[context(inherit)]`: its `me` may be a Sim in either pass, so it reads the
     /// Sim's typed fields like the Sim handle ([`TreeLowerer::is_my_ident`]).
     inherit_tree: bool,
+    /// The standalone tree being lowered (`tree 'x'`), for [`InheritCallFacts`].
+    tree_display: Option<String>,
     /// The compiler's entry-object locals that a raw block of the tree declares, with the
     /// block's span: an error when the tree's lowering declares the same name (`finish`).
     raw_reserved: Vec<(&'static str, Span)>,

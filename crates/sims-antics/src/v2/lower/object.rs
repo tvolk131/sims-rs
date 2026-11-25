@@ -979,6 +979,7 @@ fn lower_object_with(
         strings,
         string_names,
         dialog_strings,
+        inherit_calls: RefCell::default(),
         text_reads,
         text_reads_besides_me,
         reads_global_34,
@@ -1590,6 +1591,7 @@ fn lower_object_with(
     for t in &tree_members {
         emit_standalone_tree(&mut trees_air, &env, t)?;
     }
+    check_inherit_calls(&env.inherit_calls.borrow())?;
 
     // 8g. Assemble final `.air` output: header + BCON 4096 + STR# tables (including auto-interned 301) + trees.
     let mut air = String::new();

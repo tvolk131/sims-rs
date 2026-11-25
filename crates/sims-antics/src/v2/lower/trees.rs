@@ -152,6 +152,7 @@ pub(super) fn lower_standalone_tree(
     };
     let mut ctx = TreeLowerer::new(env, tree_ctx, &t.owner_module, needs_self_save);
     ctx.inherit_tree = t.decl.inherit_context;
+    ctx.tree_display = Some(format!("tree '{}'", d.ident));
     let explicit = ExplicitStackOps::default().in_stmts(&d.body, env, &t.owner_module, true);
     ctx.reassigns_stack_obj =
         ExplicitStackOps::for_tree().in_stmts(&d.body, env, &t.owner_module, true);

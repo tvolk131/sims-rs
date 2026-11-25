@@ -61,6 +61,7 @@ impl<'a> TreeLowerer<'a> {
             stmt_marks: Vec::new(),
             inherited_entry_save: false,
             inherit_tree: false,
+            tree_display: None,
             raw_reserved: Vec::new(),
         }
     }
