@@ -5,12 +5,13 @@ use sims_sim::NeighborhoodStore;
 use sims_vm::boot::Frames;
 use sims_vm::lifecycle::{enter_lot, evict, save_and_leave_lot};
 use sims_vm::travel::{
-    DOWNTOWN_FARE, HOTEL_KEY_TOKEN_GUID, HOTEL_KEY_TOKEN_KIND, MAGIC_BLIMP_FARE, MAGIC_HOLE_FARE,
-    OLD_TOWN_FARE, STUDIO_TOWN_FARE, TravelDestination, TravelError, TravelParty, TravelRequest,
-    TravelTransport, VACATION_FARE, VacationAccommodation, abort_active_trip, classify_destination,
-    depart_to_destination, inspect_active_trip, neighbor_token_count, open_destination_for_edit,
-    resume_active_trip, return_from_destination,
+    DOWNTOWN_FARE, HOTEL_KEY_TOKEN_GUID, HOTEL_KEY_TOKEN_KIND, MAGIC_BLIMP_FARE,
+    MAGIC_CAB_STOP_GUID, MAGIC_HOLE_FARE, OLD_TOWN_FARE, STUDIO_TOWN_FARE, TravelDestination,
+    TravelError, TravelParty, TravelRequest, TravelTransport, VACATION_FARE, VacationAccommodation,
+    abort_active_trip, classify_destination, depart_to_destination, inspect_active_trip,
+    neighbor_token_count, open_destination_for_edit, resume_active_trip, return_from_destination,
 };
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1170,4 +1171,217 @@ fn cached_travel_matches_uncached_bit_for_bit() {
     assert!(actual.home_saved_lot == expected.home_saved_lot);
     assert!(actual.destination_saved_lot == expected.destination_saved_lot);
     eprintln!("cache load {load:?}; uncached {cold:?}; cached {warm:?}");
+}
+
+/// A step of more than 24 units, or onto another level: the tick, and the
+/// position before and after.
+type Jump = (u32, [i32; 3], [i32; 3]);
+
+/// The steps of more than 24 units, or onto another level, each of `ids`
+/// makes over `ticks` play-mode ticks: (tick, from, to). Any script fault
+/// must be an unported trap, as in [`step_community`].
+fn jumps(
+    lot: &mut sims_vm::boot::Lot,
+    ids: &[u16],
+    ticks: u32,
+    label: &str,
+) -> BTreeMap<u16, Vec<Jump>> {
+    let mut last: BTreeMap<u16, [i32; 3]> = ids
+        .iter()
+        .map(|&id| (id, lot.world().objects[&id].position))
+        .collect();
+    let mut jumps: BTreeMap<u16, Vec<_>> = ids.iter().map(|&id| (id, Vec::new())).collect();
+    for i in 0..ticks {
+        let update = lot
+            .step_play()
+            .unwrap_or_else(|e| panic!("{label}: play step halted on tick {}: {e}", i + 1));
+        for err in &update.errors {
+            assert!(
+                err.fault.trap.unported(),
+                "{label}: unexpected fault on tick {} object {}: {}",
+                i + 1,
+                err.object,
+                err.fault
+            );
+        }
+        for &id in ids {
+            let now = lot.world().objects[&id].position;
+            let before = last.insert(id, now).unwrap();
+            let step = (now[0] - before[0]).abs().max((now[1] - before[1]).abs());
+            if step > 24 || now[2] != before[2] {
+                jumps.get_mut(&id).unwrap().push((i + 1, before, now));
+            }
+        }
+    }
+    jumps
+}
+
+/// A household group to a Magic Town community lot whose middle ped marker
+/// was sold (with `move_objects`) is put beside the portal, since nothing
+/// would place it, and stays on the lot.
+#[test]
+fn a_household_group_to_a_lot_without_its_marker_is_put_by_the_portal() {
+    let Some(root) = install() else {
+        return;
+    };
+    const MIDDLE_PED_MARKER_GUID: u32 = 0x12e8_4823;
+    let db = TempDb::new("magic-group-no-marker");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .import_directory("UserData", &root.join("UserData"), 0xff)
+        .unwrap();
+    let mut edit =
+        open_destination_for_edit(&root, &store, "UserData", 93, &[3], Frames::default()).unwrap();
+    let marker = edit
+        .world()
+        .objects
+        .values()
+        .find(|o| o.guid == MIDDLE_PED_MARKER_GUID)
+        .map(|o| o.id)
+        .expect("lot 93's middle ped marker");
+    edit.set_move_objects(true);
+    edit.set_mode(sims_vm::PanelMode::Buy).unwrap();
+    let cursor = edit
+        .buy_pick_up(marker)
+        .unwrap()
+        .expect("the marker picks up");
+    assert!(edit.buy_sell(&cursor).unwrap(), "the marker sells");
+    edit.set_mode(sims_vm::PanelMode::Live).unwrap();
+    save_and_leave_lot(&root, &store, "UserData", &mut edit).unwrap();
+
+    let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+    let goth = nh.family_in(5).unwrap().1.members.clone();
+    let mut home = enter_lot(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
+    step_strict(&mut home, 5, "home");
+    let request = TravelRequest::magic_town(
+        93,
+        TravelParty::HouseholdGroup {
+            leader_guid: goth[0],
+            member_guids: vec![goth[0], goth[2]],
+        },
+        TravelTransport::MagicHole,
+    );
+    let departure = depart_to_destination(&root, &store, "UserData", &mut home, &request).unwrap();
+    assert!(
+        !departure
+            .destination_lot
+            .world()
+            .objects
+            .values()
+            .any(|o| o.guid == MIDDLE_PED_MARKER_GUID && o.position[0] >= 0),
+        "the marker is still on lot 93"
+    );
+    watch_group_arrival(
+        departure.destination_lot,
+        &departure.session,
+        false,
+        "household group to house 93 without its marker",
+    );
+}
+
+/// Watches a household group arrive for 300 ticks. With a `marker`, each
+/// traveler starts off the lot and makes one jump, the marker's placement
+/// within 30 ticks; without one, each starts on the lot and never jumps.
+fn watch_group_arrival(
+    mut lot: sims_vm::boot::Lot,
+    session: &sims_vm::travel::TravelSession,
+    marker: bool,
+    label: &str,
+) -> sims_vm::boot::Lot {
+    let ids: Vec<u16> = session
+        .travelers
+        .iter()
+        .map(|t| t.destination_object_id)
+        .collect();
+    assert_eq!(ids.len(), 2, "{label}: travelers");
+    for &id in &ids {
+        let position = lot.world().objects[&id].position;
+        assert_eq!(
+            position[..2] == [-16, -16],
+            marker,
+            "{label}: traveler {id} starts at {position:?}"
+        );
+    }
+    // The marker puts each traveler beside the cab stop (Find Location for
+    // marker 0x13076784, mode 0).
+    let cab_stop = lot
+        .world()
+        .objects
+        .values()
+        .find(|o| o.guid == MAGIC_CAB_STOP_GUID)
+        .map(|o| o.position);
+    for (id, jumps) in jumps(&mut lot, &ids, 300, label) {
+        if marker {
+            let [(tick, from, to)] = jumps[..] else {
+                panic!("{label}: traveler {id} jumps {jumps:?}, not once");
+            };
+            assert_eq!(from[..2], [-16, -16], "{label}: traveler {id} jumps from");
+            let stop = cab_stop.expect("the lot's cab stop");
+            assert!(
+                to[0] >= 0
+                    && to[1] >= 0
+                    && tick <= 30
+                    && (to[0] - stop[0]).abs().max((to[1] - stop[1]).abs()) <= 48,
+                "{label}: traveler {id} is placed at {to:?} on tick {tick}, cab stop at {stop:?}"
+            );
+        } else {
+            assert!(jumps.is_empty(), "{label}: traveler {id} jumps {jumps:?}");
+        }
+    }
+    assert_on_lot(&lot, session, label);
+    lot
+}
+
+/// A household group (a Magic Town-only party of some of the family) to a
+/// community lot is left off the lot, and the middle ped marker places
+/// each traveler once: put beside the portal first, a traveler's walk took
+/// it back there after the marker's Find Location, and the marker's put of
+/// the first member was undone the same tick. On a residential lot (90–92),
+/// where no marker places anyone, the group stands beside the portal and
+/// never jumps. A resumed trip arrives the same way.
+#[test]
+fn a_magic_town_household_group_is_placed_once_by_the_marker() {
+    let Some(root) = install() else {
+        return;
+    };
+    for (house, marker) in [(93, true), (90, false)] {
+        let label = format!("household group to house {house}");
+        let db = TempDb::new(&format!("magic-group-{house}"));
+        let store = NeighborhoodStore::open(&db.0).unwrap();
+        store
+            .import_directory("UserData", &root.join("UserData"), 0xff)
+            .unwrap();
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let goth = nh.family_in(5).unwrap().1.members.clone();
+        let mut home = enter_lot(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
+        step_strict(&mut home, 5, &label);
+        let request = TravelRequest::magic_town(
+            house,
+            TravelParty::HouseholdGroup {
+                leader_guid: goth[0],
+                member_guids: vec![goth[0], goth[2]],
+            },
+            TravelTransport::MagicHole,
+        );
+        let departure =
+            depart_to_destination(&root, &store, "UserData", &mut home, &request).unwrap();
+        watch_group_arrival(
+            departure.destination_lot,
+            &departure.session,
+            marker,
+            &label,
+        );
+        // A resumed trip boots the lot again, and the travelers arrive as
+        // they did on departure.
+        let resumed =
+            resume_active_trip(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
+        let label = format!("{label}, resumed");
+        let session = resumed.session;
+        let mut lot = watch_group_arrival(resumed.destination_lot, &session, marker, &label);
+        let back =
+            return_from_destination(&root, &store, &session, &mut lot, &[3], Frames::default())
+                .unwrap();
+        let mut home = back.home_lot;
+        step_strict(&mut home, 30, &format!("{label}, home again"));
+    }
 }
