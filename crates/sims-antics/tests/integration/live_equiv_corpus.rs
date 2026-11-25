@@ -73,6 +73,7 @@ fn live_output_checker_is_sound_on_the_install() {
         eprintln!("live_equiv_corpus: skipped (SIMS_INSTALL empty)");
         return;
     }
+    let _install_sweep = crate::common::install_sweep_lock();
     let install = Install::detect(&PathBuf::from(&install_root))
         .expect("SIMS_INSTALL did not resolve to a valid Sims installation");
     let index = Index::build(&install).expect("failed to index SIMS_INSTALL");

@@ -1050,6 +1050,7 @@ fn install_trees_match_their_reversed_layout() {
         eprintln!("behavioral_equiv install sweep: skipped (SIMS_INSTALL unset)");
         return;
     };
+    let _install_sweep = crate::common::install_sweep_lock();
     let install = Install::detect(&PathBuf::from(root)).expect("SIMS_INSTALL is not an install");
     let index = Index::build(&install).expect("index SIMS_INSTALL");
     let pool = ArchivePool::new();
