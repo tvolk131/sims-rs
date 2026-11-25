@@ -485,8 +485,9 @@ fn a_destination_go_somewhere_else_travels_on_through_the_shell() {
     // The cab sign's Go Home on the second lot asks for house -1, the
     // family's house, and the shell returns to the trip's home. The lot
     // booted with the shell's scripted answers, and the `[3]` left unused
-    // would answer the cab's dialog "No", so clear it first: the dialogs
-    // then wait, and `call_cab` answers them as a player would.
+    // would answer the cab's dialog "No", so clear it first. With an empty
+    // replay every dialog waits, one-button notices included, and
+    // `call_cab` answers each with its first button as a player would.
     game.lot_mut()
         .replay_dialogs(&[])
         .expect("clear the scripted answers");

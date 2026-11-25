@@ -3603,9 +3603,6 @@ through their public interfaces only; the simulation never depends on it.
       builder (#441).
     - `sims-ui` takes its listing and text from `Catalog::buy_entries`
       (#452).
-    - `BuyCatalog::load` reads each object file once again
-      (`Catalog::buy_entries_visiting`, #454): about 171 ms → 93 ms,
-      below the load time before #452.
   - **The interface (Track 1):**
     - Wave 3 of the UI honesty audit (#405): native catalog order,
       rendered thumbnails, choice dialogs, the album, roof arrows and the
@@ -3673,7 +3670,9 @@ through their public interfaces only; the simulation never depends on it.
     - `caf::export_stored_family_fam` writes a family's FAMh into its
       Family Bin export (after FAMs, before CTSS #1000, as 0x410696
       does).
-  - **Buy catalog:** the single-pass load (#454, in Batch 16 above).
+  - **Buy catalog (#454):** `BuyCatalog::load` reads each object file
+    once again (`Catalog::buy_entries_visiting`). Load time falls from
+    about 171 ms to 93 ms, below what it was before #452.
   - **The `.antics` v2 language (Track 8):**
     - PR I-1 (#453): Rust-like syntax. It adds `#[bhav] fn` attributes,
       expression-oriented `if`/`match` with tail returns, typed
