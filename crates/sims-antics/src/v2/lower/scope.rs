@@ -137,11 +137,11 @@ impl<'a> TreeLowerer<'a> {
                 self.line("break;".to_owned());
                 self.em.dedent();
                 self.line("}".to_owned());
-                let at = self.em.mark();
-                self.line(format!("{var} {step} 1;"));
-                if var.starts_with("temp[") {
-                    let text = self.em.since(at).to_owned();
-                    self.temp_steps.push((at, text));
+                // A `#[temp(N)]` counter steps as `scope(8, N)`: the same operand, in a spelling
+                // only raw code could also write (see `check_temp_counter_untouched`).
+                match var.strip_prefix("temp[").and_then(|r| r.strip_suffix(']')) {
+                    Some(n) => self.line(format!("scope(8, {n}) {step} 1;")),
+                    None => self.line(format!("{var} {step} 1;")),
                 }
             }
         }

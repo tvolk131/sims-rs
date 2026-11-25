@@ -311,6 +311,9 @@ pub(super) fn loop_body_breaks(stmts: &[V2Stmt]) -> bool {
         V2Stmt::LetSome { else_body, .. } => loop_body_breaks(else_body),
         V2Stmt::ForEach { else_body, .. } => else_body.as_deref().is_some_and(loop_body_breaks),
         V2Stmt::Let { init, .. } => init_blocks(init).into_iter().any(loop_body_breaks),
+        V2Stmt::RawAir { code, .. } => {
+            super::raw_facts::raw_facts(code, None).exits_enclosing_loop()
+        }
         _ => false,
     })
 }

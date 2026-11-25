@@ -55,10 +55,12 @@ let v = if self.n > 3 { self.n - 3 } else { return false; };
 ```
 
 - Lowering writes the leaving branch where the statement form would.
-- A block branch that can fall through is an error: "must leave on every path".
+- A nested `else if` / `match` chain may leave on every branch; the enclosing chain supplies the value.
+- A leaving branch makes the lowering skip the single-pass `while true` it uses for `||` / `&&` and for match chains, so `break` / `continue` exit the user's loop.
+- A block branch that can fall through is an error: "must leave on every path". A `raw { .. }` block that can `break` counts as falling through.
 - So is a block branch outside a `let` initializer: "only be a branch of 'let x = if ..'".
 
-**Tail expressions.** In a function that returns a value, the last expression can omit its `;` and becomes `return <expr>;`. The tail can also sit in each branch of a final `if` / `match` (`if a > b { a } else { b }`). This covers:
+**Tail expressions.** In a function that returns a value, the last expression can omit its `;` and becomes `return <expr>;`. The tail can also sit in each branch of a final `if` / `match`, either braced or as a bare arm (`if a > b { a } else { b }`, `match a { 0 => 1, _ => 2 }`). A tail after `const X = if ..` ends every specialized copy. This covers:
 - `fn .. -> T`;
 - `#[bhav] fn` with a result;
 - guard blocks.
@@ -75,7 +77,7 @@ Named fields read and write the raw cells. Each name below was checked against s
 | `self.room_impact`, `self.wall_placement`, `self.broken` | object data `7, 13, 15` |
 | `sim.posture`, `sim.pets_outside`, `sim.job_type`, `sim.job_level`, `sim.family` | person data `0, 34, 56, 57, 61` |
 
-- `world` is reserved: it cannot name a binding, an `extern bcon` or a BCON table.
+- `world` is reserved: it cannot name a binding, an import, an `extern bcon` or a BCON table.
 - An unknown `world.x` is an error.
 - Fields whose meaning we could not confirm in sims-vm were left out: graphic, job performance, job day, animation events, and cheats (global 20 is the expansions mask).
 - `lift --v2` writes `world.<name>` for the named globals.
@@ -113,22 +115,32 @@ Notes:
 - the helper may not assign or borrow `k`.
 
 So a body that specializes on `k` (`const X = if k == 1 { .. } else { .. };`) can never fall back to a runtime test. Other rules:
+- a constant is a literal, a `const` item, an enum or bitflags value, or another `const` parameter;
+- a tunable `param` is a run-time BCON read, so it is refused;
+- the language has no constant arithmetic, so `1 + 2` is refused (as in `const X = 1 + 2`);
 - functionals cannot take `const` parameters;
 - the type must be i16, bool, or an enum or bitflags type.
 
 **`#[temp(N)] for i in a..b`.** A range loop whose counter is `temp[N]` itself, the way hand-written trees count (`temp[0] := 0; .. inc_lt`):
 - It lowers to the same nodes as the ordinary range loop, with stores to `temp[N]` where that loop declares a frame local. No frame local is used.
+- The loop's own steps are spelled `scope(8, N) += 1;`. That is the same operand as `temp[N]`, in a spelling that only raw code can produce.
 - The counter is a read-only operand. A helper it is passed to gets its own copy.
 - `#[temp]` on an object iterator is an error.
-- The compiler rejects a body whose `.air` writes `temp[N]`: an assignment, a compound assignment, `inc_lt` / `dec_gt` / `flag_set` / `flag_clear` / `sqrt` on it, or a nested `#[temp(N)]` loop. The loop's own continue steps are exempt. They are tracked by position and text, so a step that a trial lowering rewound over is not exempt.
-- **Limit.** Like `temp[N]` anywhere else, the counter is shared with the trees the body calls. A call that writes `temp[N]` (a `#[temp(N)]` argument or return of a global, or a primitive with a temp output) changes the loop. That is the point of a temp-backed counter, and it is documented rather than rejected.
+- The compiler rejects a body that contains `raw { .. }`, including raw code in a helper the body inlines.
+- The compiler then rejects a body whose final `.air` still writes `temp[N]`. This covers `defer` cleanups and inlined helpers. A write is any of these:
+  - an assignment or compound assignment;
+  - `inc_lt` / `dec_gt` / `flag_set` / `flag_clear` / `sqrt` on the cell;
+  - a `dest: temp[N]` output;
+  - a nested `#[temp(N)]` loop.
+- The check reads the text that is kept, so code a trial lowering discarded cannot hide or fake a step.
+- **Limit.** Like `temp[N]` anywhere else, the counter is shared with the trees the body calls. A call that writes `temp[N]` (a `#[temp(N)]` argument or return of a global, or a primitive that writes temps without naming them) changes the loop. That is the point of a temp-backed counter, and it is documented rather than rejected.
 
 **Compound assignment** into target cells already worked and is unchanged.
 
 ## Verification
 
-- **`tests/v2_rust_syntax.rs` (10 tests).** Every new spelling is paired with its long form, and each pair must give the same `.air`, the same IFF bytes and the same WAV bank. The error cases are pinned.
-- **Full suite.** `cargo test --release -p sims-antics`: 755 passed. `sims-antics test open-pack/tests crates/sims-antics/tests/test_runner`: 30/30, 0 ASSUME.
+- **`tests/v2_rust_syntax.rs` (12 tests).** Every new spelling is paired with its long form, and each pair must give the same `.air`, the same IFF bytes and the same WAV bank. The error cases are pinned, including the review's regression cases.
+- **Full suite.** `cargo test --release -p sims-antics`: 757 passed. `sims-antics test open-pack/tests crates/sims-antics/tests/test_runner`: 30/30, 0 ASSUME.
 - **open-pack.**
   - Builds byte-identical before and after its migration to tail expressions.
   - `lint`: 0 findings. The two `state reserved` slots carry an `allow(unused_decl)` that keeps the saved attribute layout.

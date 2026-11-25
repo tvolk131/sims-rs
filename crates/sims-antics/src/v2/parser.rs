@@ -61,6 +61,7 @@ pub fn parse_v2_file(source: &str) -> Result<V2File> {
         depth: 0,
         bound_vars: std::collections::BTreeSet::new(),
         tails: Vec::new(),
+        arm_tails: Vec::new(),
     };
     parser.parse_file()
 }
@@ -76,6 +77,9 @@ struct Parser {
     /// Expression statements written without `;` before a `}`: only a value-returning
     /// function body's last one is allowed (a tail expression, `return` of it).
     tails: Vec<Span>,
+    /// Bare match-arm expressions (`0 => f(),`): statements in general, but the value of a
+    /// value-returning function's final `match` (`match a { 0 => 1, _ => 2 }`).
+    arm_tails: Vec<Span>,
 }
 
 impl Parser {
@@ -418,44 +422,50 @@ impl Parser {
     fn parse_fn_body(&mut self, value: bool) -> Result<Vec<V2Stmt>> {
         let mut body = self.parse_block()?;
         if value {
-            self.tails_to_returns(&mut body);
+            // Spans are dropped from the tail lists only after the whole body is converted:
+            // `const` specialization copies the code after a `const X = if ..` into each
+            // branch, so one tail can end several copies.
+            let mut used = Vec::new();
+            self.tails_to_returns(&mut body, &mut used);
+            self.tails.retain(|t| !used.contains(t));
+            self.arm_tails.retain(|t| !used.contains(t));
         }
         Ok(body)
     }
 
     /// Turns the tail expression ending `body` into `return <expr>;`, looking through a final
-    /// `if` / `match` statement into each of its branches (`if a > b { a } else { b }`).
-    fn tails_to_returns(&mut self, body: &mut [V2Stmt]) {
+    /// `if` / `match` statement into each of its branches (`if a > b { a } else { b }`,
+    /// `match a { 0 => 1, _ => 2 }`). Each converted span is pushed to `used`.
+    fn tails_to_returns(&self, body: &mut [V2Stmt], used: &mut Vec<Span>) {
         match body.last_mut() {
             Some(last @ V2Stmt::Expr { .. }) => {
-                let V2Stmt::Expr { span, .. } = last else {
-                    unreachable!("matched above")
-                };
-                let Some(at) = self.tails.iter().position(|t| t == span) else {
-                    return;
-                };
-                self.tails.remove(at);
-                let span = *span;
-                let V2Stmt::Expr { expr, .. } = std::mem::replace(last, V2Stmt::Break { span })
-                else {
-                    unreachable!("matched above")
-                };
-                *last = V2Stmt::Return {
-                    span,
-                    value: Some(expr),
-                };
+                if let V2Stmt::Expr { span, .. } = last
+                    && self.tails.contains(span)
+                {
+                    used.push(*span);
+                    tail_to_return(last);
+                }
             }
             Some(V2Stmt::If {
                 then_body,
                 else_body,
                 ..
             }) => {
-                self.tails_to_returns(then_body);
-                self.tails_to_returns(else_body);
+                self.tails_to_returns(then_body, used);
+                self.tails_to_returns(else_body, used);
             }
             Some(V2Stmt::Match { arms, .. }) => {
                 for arm in arms {
-                    self.tails_to_returns(&mut arm.body);
+                    // A bare arm (`0 => 1,`) is the arm's value.
+                    if let [last @ V2Stmt::Expr { .. }] = arm.body.as_mut_slice()
+                        && let V2Stmt::Expr { span, .. } = last
+                        && self.arm_tails.contains(span)
+                    {
+                        used.push(*span);
+                        tail_to_return(last);
+                    } else {
+                        self.tails_to_returns(&mut arm.body, used);
+                    }
                 }
             }
             _ => {}
@@ -2799,7 +2809,8 @@ impl Parser {
         let span = self.span();
         if self.peek().kind == TokenKind::LBrace {
             // `{ value }` or a block of statements.
-            let (saved_pos, saved_depth, saved_tails) = (self.pos, self.depth, self.tails.len());
+            let (saved_pos, saved_depth, saved_tails, saved_arm_tails) =
+                (self.pos, self.depth, self.tails.len(), self.arm_tails.len());
             self.bump();
             let starts_stmt = matches!(
                 &self.peek().kind,
@@ -2814,6 +2825,7 @@ impl Parser {
             self.pos = saved_pos;
             self.depth = saved_depth;
             self.tails.truncate(saved_tails);
+            self.arm_tails.truncate(saved_arm_tails);
             return Ok(Arm::Diverge(self.parse_block()?));
         }
         if !in_match {
@@ -3382,12 +3394,14 @@ impl Parser {
     /// A match arm's body without braces: a statement (`return x;`), or an expression or
     /// assignment ended by `,` or by the match's closing `}` (`0 => f(),`, `1 => x = 2,`).
     fn parse_arm_stmt(&mut self) -> Result<V2Stmt> {
-        let (saved_pos, saved_depth, saved_tails) = (self.pos, self.depth, self.tails.len());
+        let (saved_pos, saved_depth, saved_tails, saved_arm_tails) =
+            (self.pos, self.depth, self.tails.len(), self.arm_tails.len());
         let stmt_err = match self.parse_stmt() {
             Ok(s) => {
                 // `_ => f() }`: the last arm's expression ends at the match's `}`.
                 if let V2Stmt::Expr { span, .. } = &s {
                     self.tails.retain(|t| t != span);
+                    self.arm_tails.push(*span);
                 }
                 let _ = self.eat(&TokenKind::Comma);
                 return Ok(s);
@@ -3397,6 +3411,7 @@ impl Parser {
         self.pos = saved_pos;
         self.depth = saved_depth;
         self.tails.truncate(saved_tails);
+        self.arm_tails.truncate(saved_arm_tails);
         let span = self.span();
         let short = (|| {
             let lhs = self.parse_expr()?;
@@ -3409,6 +3424,7 @@ impl Parser {
                     value,
                 }
             } else {
+                self.arm_tails.push(span);
                 V2Stmt::Expr { span, expr: lhs }
             };
             if self.eat(&TokenKind::Comma) || self.peek().kind == TokenKind::RBrace {
@@ -3588,13 +3604,16 @@ impl Parser {
     /// `{ value }`, or a diverging block `{ ..; return x; }` (a `V2Expr::Block`, which lowering
     /// accepts only in a `let` initializer and checks leaves on every path). A block that starts
     /// with a statement keyword is a block; otherwise a lone expression before `}` is a value.
+    /// Contextual keywords (`animate`, `with`, `defer`, `repeat`) can name a binding, so they are
+    /// a value when they alone fill the braces (`{ animate }`); a statement falls back below.
     fn parse_value_branch(&mut self) -> Result<V2Expr> {
         let span = self.span();
-        let (saved_pos, saved_depth, saved_tails) = (self.pos, self.depth, self.tails.len());
+        let (saved_pos, saved_depth, saved_tails, saved_arm_tails) =
+            (self.pos, self.depth, self.tails.len(), self.arm_tails.len());
         self.expect(&TokenKind::LBrace, "'{'")?;
         let starts_stmt = matches!(
             &self.peek().kind,
-            TokenKind::Ident(k) if matches!(k.as_str(), "break" | "continue" | "return" | "let" | "while" | "loop" | "for" | "repeat" | "with" | "defer" | "animate")
+            TokenKind::Ident(k) if matches!(k.as_str(), "break" | "continue" | "return" | "let" | "while" | "loop" | "for")
         ) || matches!(
             self.peek().kind,
             TokenKind::RawBlock(_) | TokenKind::HashBracket
@@ -3609,6 +3628,7 @@ impl Parser {
                     self.pos = saved_pos;
                     self.depth = saved_depth;
                     self.tails.truncate(saved_tails);
+                    self.arm_tails.truncate(saved_arm_tails);
                     return match self.parse_block() {
                         Ok(body) => self.diverging_block(span, body),
                         Err(_) => Err(e),
@@ -3619,6 +3639,7 @@ impl Parser {
         self.pos = saved_pos;
         self.depth = saved_depth;
         self.tails.truncate(saved_tails);
+        self.arm_tails.truncate(saved_arm_tails);
         let body = self.parse_block()?;
         self.diverging_block(span, body)
     }
@@ -4423,5 +4444,18 @@ fn values_arm(span: Span, value: V2Expr) -> Arm {
     match value {
         V2Expr::Tuple(_, items) => Arm::Values(span, items),
         v => Arm::Values(span, vec![v]),
+    }
+}
+
+/// An expression statement `expr` as `return expr;`.
+fn tail_to_return(stmt: &mut V2Stmt) {
+    let V2Stmt::Expr { span, .. } = *stmt else {
+        return;
+    };
+    if let V2Stmt::Expr { expr, .. } = std::mem::replace(stmt, V2Stmt::Break { span }) {
+        *stmt = V2Stmt::Return {
+            span,
+            value: Some(expr),
+        };
     }
 }

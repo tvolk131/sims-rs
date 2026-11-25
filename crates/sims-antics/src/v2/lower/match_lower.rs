@@ -46,6 +46,22 @@ impl<'a> TreeLowerer<'a> {
         dest: Option<&str>,
         may_diverge: bool,
     ) -> Result<(String, ValueType)> {
+        let (dest, ty) = self.lower_match_expr_opt(span, scrutinee, arms, dest, may_diverge)?;
+        let ty = ty
+            .ok_or_else(|| Error::at(span, "'match' expression has no value (every arm leaves)"))?;
+        Ok((dest, ty))
+    }
+
+    /// [`Self::lower_match_expr`], with no type when every arm leaves (see
+    /// [`Self::lower_if_expr_opt`]).
+    pub(super) fn lower_match_expr_opt(
+        &mut self,
+        span: Span,
+        scrutinee: &V2Expr,
+        arms: &[MatchExprArm],
+        dest: Option<&str>,
+        may_diverge: bool,
+    ) -> Result<(String, Option<ValueType>)> {
         let arms = arms
             .iter()
             .map(|a| Ok((a.span, &a.pattern, self.value_arm(&a.value, may_diverge)?)))
@@ -65,10 +81,7 @@ impl<'a> TreeLowerer<'a> {
             may_diverge,
         };
         self.lower_match_core(span, scrutinee, &arms, Some(&mut result))?;
-        let ty = result
-            .ty
-            .ok_or_else(|| Error::at(span, "'match' expression has no arms"))?;
-        Ok((dest, ty))
+        Ok((dest, result.ty))
     }
 
     /// A compile-time scrutinee (literal, `const`, constant parameter, enum variant), if any.
@@ -149,6 +162,8 @@ impl<'a> TreeLowerer<'a> {
                         ..
                     }
                 );
+                // A nested chain whose every branch leaves (only in a `let` initializer, where
+                // branches may diverge) gives no value: the enclosing chain's other arms do.
                 let ty = if is_bool_shape {
                     self.emit_bool_into_local(expr, &dest)?;
                     ValueType::Bool
@@ -160,24 +175,39 @@ impl<'a> TreeLowerer<'a> {
                     arms,
                 } = expr
                 {
-                    self.lower_match_expr(*span, scrutinee, arms, Some(&dest), result.may_diverge)?
+                    match self
+                        .lower_match_expr_opt(
+                            *span,
+                            scrutinee,
+                            arms,
+                            Some(&dest),
+                            result.may_diverge,
+                        )?
                         .1
+                    {
+                        Some(ty) => ty,
+                        None => return Ok(()),
+                    }
                 } else if let V2Expr::If {
-                    span,
                     cond,
                     then_value,
                     else_value,
+                    ..
                 } = expr
                 {
-                    self.lower_if_expr(
-                        *span,
-                        cond,
-                        then_value,
-                        else_value,
-                        Some(&dest),
-                        result.may_diverge,
-                    )?
-                    .1
+                    match self
+                        .lower_if_expr_opt(
+                            cond,
+                            then_value,
+                            else_value,
+                            Some(&dest),
+                            result.may_diverge,
+                        )?
+                        .1
+                    {
+                        Some(ty) => ty,
+                        None => return Ok(()),
+                    }
                 } else {
                     let (air, ty) = self.lower_value_expr(expr)?;
                     self.emit_store(&dest, ":=", &air);
@@ -635,12 +665,7 @@ impl<'a> TreeLowerer<'a> {
         cases: &[MatchCase<'_>],
         wildcard: Option<ArmBody<'_>>,
     ) -> bool {
-        let bodies: Vec<&[V2Stmt]> = cases
-            .iter()
-            .map(|c| c.body)
-            .chain(wildcard)
-            .map(arm_stmts)
-            .collect();
+        let bodies: Vec<ArmBody<'_>> = cases.iter().map(|c| c.body).chain(wildcard).collect();
         self.single_pass_loop_ok(&bodies)
     }
 

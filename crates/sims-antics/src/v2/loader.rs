@@ -682,6 +682,12 @@ impl<'a> ModuleLoader<'a> {
                         format!("cannot bind import to reserved built-in type name '{local_name}'"),
                     ));
                 }
+                if local_name == "world" {
+                    return Err(Error::at(
+                        item.span,
+                        "'world' names the engine globals ('world.hour') and cannot name an import",
+                    ));
+                }
                 let name_taken = functions.contains_key(local_name)
                     || templates.contains_key(local_name)
                     || enums.contains_key(local_name)

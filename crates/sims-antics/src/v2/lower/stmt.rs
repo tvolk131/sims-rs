@@ -1045,6 +1045,7 @@ impl<'a> TreeLowerer<'a> {
             }
             V2Stmt::Expr { span: _, expr } => self.lower_expr_stmt(expr),
             V2Stmt::RawAir { span, code } => {
+                self.raw_blocks += 1;
                 // Discarded code emits nothing, so only emitted raw blocks count.
                 if self.checking_discarded == 0 {
                     self.raw_span.get_or_insert(*span);
@@ -1283,19 +1284,8 @@ impl<'a> TreeLowerer<'a> {
             }
         };
         self.bind_var(binding.to_owned(), counter);
-        let body_mark = self.em.mark();
-        let res = self.lower_stmts(body).and_then(|()| {
-            if temp.is_some() && air_writes_cell(&self.body_text_without_steps(body_mark, &iter_var), &iter_var) {
-                Err(Error::at(
-                    start.span(),
-                    format!(
-                        "the body of this '#[temp]' loop writes its counter '{iter_var}' (directly or through a nested '#[temp]' loop)"
-                    ),
-                ))
-            } else {
-                Ok(())
-            }
-        });
+        let (body_mark, raw_before) = (self.em.mark(), self.raw_blocks);
+        let res = self.lower_stmts(body);
         let pop_res = self.pop_scope_and_run_cleanups();
         if let Some(step) = &edge_step {
             self.emit_continue_step(step);
@@ -1307,8 +1297,42 @@ impl<'a> TreeLowerer<'a> {
             self.line("}".to_owned());
         }
         res.and(pop_res)?;
+        if temp.is_some() {
+            self.check_temp_counter_untouched(start.span(), &iter_var, body_mark, raw_before)?;
+        }
         self.emit_inline_fn_return_propagation(false)?;
         self.emit_cancel_propagation(false)?;
+        Ok(())
+    }
+
+    /// A `#[temp(N)]` loop's body (its `defer` cleanups and the helpers it inlines included)
+    /// may not write the counter. The loop's own steps are spelled `scope(8, N)` (see
+    /// [`Self::emit_continue_step`]), which nothing else emits outside raw code, so every
+    /// `temp[N]` write left in the body text is the body's. Raw code, which could spell either,
+    /// is rejected.
+    fn check_temp_counter_untouched(
+        &self,
+        span: Span,
+        counter: &str,
+        body_mark: usize,
+        raw_before: usize,
+    ) -> Result<()> {
+        if self.raw_blocks > raw_before {
+            return Err(Error::at(
+                span,
+                format!(
+                    "the body of this '#[temp]' loop (or a helper it calls) contains 'raw {{ .. }}', which could write its counter '{counter}'; use an ordinary range loop"
+                ),
+            ));
+        }
+        if air_writes_cell(self.em.since(body_mark), counter) {
+            return Err(Error::at(
+                span,
+                format!(
+                    "the body of this '#[temp]' loop writes its counter '{counter}' (directly, in a 'defer', or through a nested '#[temp]' loop)"
+                ),
+            ));
+        }
         Ok(())
     }
 
@@ -2073,35 +2097,6 @@ impl<'a> TreeLowerer<'a> {
     }
 }
 
-impl TreeLowerer<'_> {
-    /// The text written since `mark`, without this `#[temp]` loop's own continue steps (each
-    /// still in place, unchanged: a step a trial lowering rewound over is not skipped).
-    fn body_text_without_steps(&self, mark: usize, counter: &str) -> String {
-        let text = self.em.text();
-        let mut steps: Vec<(usize, usize)> = self
-            .temp_steps
-            .iter()
-            .filter(|(at, step)| {
-                *at >= mark
-                    && text.get(*at..*at + step.len()) == Some(step.as_str())
-                    && step.trim_start().starts_with(&format!("{counter} "))
-            })
-            .map(|(at, step)| (*at, *at + step.len()))
-            .collect();
-        steps.sort_unstable();
-        let mut out = String::new();
-        let mut pos = mark;
-        for (start, end) in steps {
-            if start >= pos {
-                out.push_str(&text[pos..start]);
-                pos = end;
-            }
-        }
-        out.push_str(&text[pos..]);
-        out
-    }
-}
-
 /// Whether the `.air` text stores into `cell` (an assignment, compound assignment, or one of the
 /// in-place operators `inc_lt` / `dec_gt` / `flag_set` / `flag_clear` / `sqrt` with `cell` on the
 /// left). Calls and primitives that write temps as a side effect are not visible here.
@@ -2134,6 +2129,8 @@ fn air_writes_cell(air: &str, cell: &str) -> bool {
             .split_whitespace()
             .next()
             .unwrap_or("");
-        before_ok && WRITES.contains(&op)
+        // A primitive's output argument (`dest: temp[0]`) writes it too.
+        let is_dest = air[..at].trim_end().ends_with("dest:");
+        before_ok && (WRITES.contains(&op) || is_dest)
     })
 }

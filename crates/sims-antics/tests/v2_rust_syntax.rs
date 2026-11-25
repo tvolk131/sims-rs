@@ -106,6 +106,73 @@ fn diverging_let_arms_match_the_statement_form() {
 }
 
 #[test]
+fn diverging_branches_in_nested_chains() {
+    // A `break` in an `else if` value branch leaves the user's loop, not a loop the
+    // short-circuit `||` lowering adds.
+    assert_same(
+        "break in a nested chain",
+        &obj("    main {
+        loop {
+            let x = if self.n == 0 || self.n == 1 { 10 } else if self.n == 2 { break; } else { 20 };
+            self.n = x;
+        }
+        loop { sleep(1); }
+    }"),
+        &obj("    main {
+        loop {
+            let x: i16;
+            if self.n == 0 || self.n == 1 { x = 10; } else if self.n == 2 { break; } else { x = 20; }
+            self.n = x;
+        }
+        loop { sleep(1); }
+    }"),
+    );
+    // A nested chain whose every branch leaves is fine: the outer chain has the value.
+    assert_same(
+        "all-leaving else if",
+        &obj("    interaction \"Use\" {
+        run(sim) {
+            let x = if self.n == 0 { 20 } else if self.n == 1 { return true; } else { return false; };
+            self.n = x;
+        }
+    }"),
+        &obj("    interaction \"Use\" {
+        run(sim) {
+            let x: i16;
+            if self.n == 0 { x = 20; } else if self.n == 1 { return true; } else { return false; }
+            self.n = x;
+        }
+    }"),
+    );
+    // A raw `break` can leave an endless loop, so the branch may fall through.
+    expect_err(
+        &obj("    main {
+        let x = if self.n == 0 { loop { raw { break; } } } else { 20 };
+        self.n = x;
+        loop { sleep(1); }
+    }"),
+        "must leave on every path",
+    );
+    // A contextual keyword alone in the braces is a value.
+    assert_same(
+        "contextual keyword value",
+        &obj("    main {
+        let animate = self.n;
+        let x = if self.n == 0 { animate } else { 1 };
+        self.m = x;
+        loop { sleep(1); }
+    }"),
+        &obj("    main {
+        let animate = self.n;
+        let x: i16;
+        if self.n == 0 { x = animate; } else { x = 1; }
+        self.m = x;
+        loop { sleep(1); }
+    }"),
+    );
+}
+
+#[test]
 fn tail_expressions_are_returns() {
     assert_same(
         "tail",
@@ -139,6 +206,28 @@ fn tail_expressions_are_returns() {
             return is_big(self.n);
         }
     }"),
+    );
+    let pick = |body: &str| {
+        obj(&format!(
+            "    fn pick(a: i16) -> i16 {{
+        {body}
+    }}
+    main {{
+        self.n = pick(self.m);
+        loop {{ sleep(1); }}
+    }}"
+        ))
+    };
+    assert_same(
+        "match tail",
+        &pick("match a { 0 => 1, 1 => { 5 } _ => a + 2 }"),
+        &pick("match a { 0 => { return 1; } 1 => { return 5; } _ => { return a + 2; } }"),
+    );
+    // A tail after a `const X = if ..` ends each specialized copy.
+    assert_same(
+        "specialized tail",
+        &pick("const K = if self.n > 0 { 10 } else { 20 };\n        K + a"),
+        &pick("const K = if self.n > 0 { 10 } else { 20 };\n        return K + a;"),
     );
     expect_err(
         &obj("    main { self.n = 1; self.m loop { sleep(1); } }"),
@@ -202,6 +291,21 @@ fn std_globals_matches_a_copied_extern_block() {
         &format!("use std::nope::*;\n\n{body}"),
         "unknown built-in module",
     );
+}
+
+#[test]
+fn world_cannot_name_an_import() {
+    let mut cfg = PackResolverConfig::default();
+    cfg.virtual_modules.insert(
+        "crate::library".to_owned(),
+        "pub extern bcon Tuning {\n    #[addr(16521)] hour;\n}\n".to_owned(),
+    );
+    let src = "use crate::library::Tuning as world;\n\nobject \"Syntax Probe\" {\n    guid: 0x7F50_0001;\n    state n: i16;\n    main { self.n = world.hour; loop { sleep(1); } }\n}\n";
+    let err = v2::expand_v2_source_to_objects("case.antics", src, &cfg)
+        .err()
+        .unwrap_or_else(|| panic!("an import named 'world' must fail"))
+        .to_string();
+    assert!(err.contains("cannot name an import"), "{err}");
 }
 
 #[test]
@@ -308,6 +412,16 @@ fn const_params_specialize_and_require_constants() {
         &obj("    fn bad(const k: i16) { k = 2; }\n    main { bad(1); loop { sleep(1); } }"),
         "cannot be assigned or borrowed",
     );
+    // A tunable `param` is a run-time BCON read, not a constant.
+    expect_err(
+        &obj("    param k_tuning: i16 = 1;
+    fn pick(const k: i16) {
+        const X = if k == 1 { 10 } else { 20 };
+        self.n = X;
+    }
+    main { pick(k_tuning); loop { sleep(1); } }"),
+        "needs a compile-time constant argument",
+    );
 }
 
 #[test]
@@ -338,8 +452,10 @@ fn temp_range_loops_count_in_the_temp() {
         }
         loop { sleep(1); }
     }"));
-    // The same nodes, with the counters in temps instead of frame locals.
+    // The same nodes, with the counters in temps instead of frame locals (a step is spelled
+    // `scope(8, N)`, the same operand as `temp[N]`).
     let renamed = plain
+        .replace("__v_j_2 -= 1;", "scope(8, 1) -= 1;")
         .replace("let __v_i_0 = ", "temp[0] := ")
         .replace("__v_i_0", "temp[0]")
         .replace("__range_1", "__range_0")
@@ -360,6 +476,27 @@ fn temp_range_loops_count_in_the_temp() {
         &obj("    main { #[temp(0)] for o in lot.sims() { } loop { sleep(1); } }"),
         "applies to range loops",
     );
+    // A `defer` in the body, raw code (in either spelling of the cell), and a write that
+    // repeats the loop's own step text after a discarded `continue` are all writes.
+    for body in [
+        "defer { temp[0] = 0; } self.n += i;",
+        "raw { temp [ 0 ]:= 0; }",
+        "raw { scope(8, 0) := 0; }",
+        "if false { continue; } if i == 32767 { break; } temp[0] += 1;",
+    ] {
+        let src = obj(&format!(
+            "    main {{ #[temp(0)] for i in 0..=32767 {{ {body} }} loop {{ sleep(1); }} }}"
+        ));
+        let cfg = PackResolverConfig::default();
+        let err = v2::expand_v2_source_to_objects("case.antics", &src, &cfg)
+            .err()
+            .unwrap_or_else(|| panic!("must fail:\n{src}"))
+            .to_string();
+        assert!(
+            err.contains("writes its counter") || err.contains("contains 'raw"),
+            "{body}: {err}"
+        );
+    }
 }
 
 #[test]

@@ -829,6 +829,23 @@ impl<'a> TreeLowerer<'a> {
         dest: Option<&str>,
         may_diverge: bool,
     ) -> Result<(String, ValueType)> {
+        let (dest, ty) = self.lower_if_expr_opt(cond, then_value, else_value, dest, may_diverge)?;
+        let ty = ty
+            .ok_or_else(|| Error::at(span, "'if' expression has no value (every branch leaves)"))?;
+        Ok((dest, ty))
+    }
+
+    /// [`Self::lower_if_expr`], with no type when every branch leaves (a nested chain of a
+    /// `let` initializer, whose enclosing chain has the value: `else if c { return 1; } else
+    /// { return 2; }`).
+    pub(super) fn lower_if_expr_opt(
+        &mut self,
+        cond: &V2Expr,
+        then_value: &V2Expr,
+        else_value: &V2Expr,
+        dest: Option<&str>,
+        may_diverge: bool,
+    ) -> Result<(String, Option<ValueType>)> {
         let (then_b, else_b) = (
             self.value_arm(then_value, may_diverge)?,
             self.value_arm(else_value, may_diverge)?,
@@ -880,19 +897,16 @@ impl<'a> TreeLowerer<'a> {
             r2?;
             self.line("}".to_owned());
         }
-        let ty = result
-            .ty
-            .ok_or_else(|| Error::at(span, "'if' expression has no value (every branch leaves)"))?;
-        Ok((dest, ty))
+        Ok((dest, result.ty))
     }
 
     /// Whether `if` bodies may sit inside a condition-free single-pass loop: nothing in them,
     /// or in what lowering adds, may `break` / `continue` an enclosing loop.
-    pub(super) fn single_pass_loop_ok(&self, bodies: &[&[V2Stmt]]) -> bool {
+    pub(super) fn single_pass_loop_ok(&self, bodies: &[ArmBody<'_>]) -> bool {
         self.active_inline_fn.is_none()
             && !self.in_defer()
             && self.enclosing_cancel_flag().is_none()
-            && !bodies.iter().any(|b| stmts_exit_loop(b))
+            && !bodies.iter().any(|&b| arm_exits_loop(b))
     }
 
     /// `if` on a flat `a || b || ..` or `a && b && ..` of simple conditions, without a `__cond`
@@ -920,7 +934,7 @@ impl<'a> TreeLowerer<'a> {
         flatten_logic_chain(cond, op, &mut leaves);
         let has_else = !matches!(else_body, ArmBody::Stmts(s) if s.is_empty());
         let looped = op == V2BinOp::Or || has_else;
-        if looped && !self.single_pass_loop_ok(&[arm_stmts(then_body), arm_stmts(else_body)]) {
+        if looped && !self.single_pass_loop_ok(&[then_body, else_body]) {
             return Ok(false);
         }
         let (mark, indent) = (self.em.mark(), self.em.depth());

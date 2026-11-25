@@ -193,10 +193,11 @@ impl<'a> TreeLowerer<'a> {
             call_args,
         )?;
         match binding {
-            Binding::ConstI16 { .. }
-            | Binding::ConstBool(_)
-            | Binding::ConstEnum { .. }
-            | Binding::ConstBitflag { .. } => Ok(binding),
+            // A tunable `param` binds as its BCON read: still a run-time value.
+            Binding::ConstI16 { ref air, .. } if air.parse::<i16>().is_ok() => Ok(binding),
+            Binding::ConstBool(_) | Binding::ConstEnum { .. } | Binding::ConstBitflag { .. } => {
+                Ok(binding)
+            }
             _ => Err(Error::at(
                 arg_span,
                 format!(
