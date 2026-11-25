@@ -120,6 +120,16 @@ impl<'a> TreeLowerer<'a> {
                     }
                 }
             },
+            // A neighbor cell (`h.neighbor.x`, `h.neighbor.person[i]`) is a value with no word
+            // behind it (`sims-vm` `memory.rs` scopes 24 and 32).
+            V2Expr::Field { span, base, .. } | V2Expr::Index { span, base, .. }
+                if neighbor_place_root(base).is_some() =>
+            {
+                Err(Error::at(
+                    *span,
+                    "a neighbor cell is read-only (the engine hands back its value, not a word)",
+                ))
+            }
             V2Expr::Field { span, base, field } => {
                 if let Some(r) = self.bcon_field_ref(expr) {
                     r?;
@@ -461,6 +471,16 @@ impl<'a> TreeLowerer<'a> {
                             ty: ValueType::I16,
                         });
                     }
+                    // `sim.person[temp[k]]`: scope 30 reads the word whose number is in `temp[k]`.
+                    if is_my_cell
+                        && field == "person"
+                        && let Some(k) = self.temp_word_index(index)
+                    {
+                        return Ok(LValue::Direct {
+                            air: format!("scope(30, {k})"),
+                            ty: ValueType::I16,
+                        });
+                    }
                     if is_my_cell && matches!(field.as_str(), "slot" | "person" | "attr" | "data") {
                         let idx = self.eval_builtin_int(
                             index,
@@ -502,7 +522,7 @@ impl<'a> TreeLowerer<'a> {
                         return Ok(LValue::ForeignCell {
                             obj_air: obj_air.to_owned(),
                             cell,
-                            setup: Some(setup),
+                            setup,
                             ty: ValueType::I16,
                         });
                     }
@@ -521,7 +541,7 @@ impl<'a> TreeLowerer<'a> {
                             return Ok(LValue::ForeignCell {
                                 obj_air,
                                 cell,
-                                setup: Some(setup),
+                                setup,
                                 ty: ValueType::I16,
                             });
                         }
@@ -542,6 +562,10 @@ impl<'a> TreeLowerer<'a> {
                                 format!("stack.person[{}]", self.resolve_skill_expr(index)?),
                                 ValueType::I16,
                             ),
+                            // Scope 31 reads the word whose number is in `temp[k]`.
+                            "person" if let Some(k) = self.temp_word_index(index) => {
+                                (format!("scope(31, {k})"), ValueType::I16)
+                            }
                             other => {
                                 let idx = self.eval_builtin_int(
                                     index,
@@ -784,5 +808,21 @@ fn named_word_read(air: &str) -> String {
         Some((prefix @ ("my" | "stack"), "data[11]")) => format!("{prefix}.id"),
         Some((prefix @ ("my" | "stack"), "data[29]")) => format!("{prefix}.room"),
         _ => air.to_owned(),
+    }
+}
+
+/// The handle of `h.neighbor` or `h.neighbor.field`/`h.neighbor.person` (the base of a neighbor
+/// cell), if `e` is one.
+fn neighbor_place_root(e: &V2Expr) -> Option<&str> {
+    let V2Expr::Field { base, field, .. } = e else {
+        return None;
+    };
+    match base.as_ref() {
+        V2Expr::Ident(_, root) if field == "neighbor" => Some(root),
+        inner @ V2Expr::Field { .. } if neighbor_indexed_scope(field).is_some() => {
+            neighbor_place_root(inner)
+                .filter(|_| matches!(inner, V2Expr::Field { field, .. } if field == "neighbor"))
+        }
+        _ => None,
     }
 }

@@ -63,7 +63,9 @@ use self::object::*;
 use self::prim_table::*;
 use self::raw::*;
 use self::schema::*;
-use self::tree::{definition_field, object_data_word, sim_person_word};
+use self::tree::{
+    definition_field, neighbor_cell, neighbor_indexed_scope, object_data_word, sim_person_word,
+};
 use self::trees::*;
 
 const MAX_INLINE_DEPTH: usize = 16;
@@ -429,21 +431,35 @@ impl ValueType {
     }
 }
 
-/// Whether an `.air` operand reads the temps: a `temp[i]` cell, or job data (`scope(33, F)`,
-/// which reads the career and level in `temp[0]` and `temp[1]`). Staging that writes temps
-/// copies such an operand first.
+/// Whether an `.air` operand reads the temps: a `temp[i]` cell, job data (`scope(33, F)`,
+/// which reads the career and level in `temp[0]` and `temp[1]`), or a temp-indexed cell
+/// (`scope(27, k)`, `scope(30, k)`, `scope(31, k)`, which read the index in `temp[k]`).
+/// Staging that writes temps copies such an operand first.
 fn reads_temps(air: &str) -> bool {
-    air.contains("temp[") || air.contains("scope(33,")
+    air.contains("temp[")
+        || ["scope(27,", "scope(30,", "scope(31,", "scope(33,"]
+            .iter()
+            .any(|s| air.contains(s))
 }
 
 /// Whether a single operand reads a cell of the current stack object: `stack_obj` itself, a
-/// `stack.` cell, or its definition (`scope(21, ..)`, `scope(35, ..)`; `sims-vm` `memory.rs`).
+/// `stack.` cell, its definition (`scope(21, ..)`, `scope(35, ..)`), its sprite flags or
+/// temp-indexed person data (`scope(27, ..)`, `scope(31, ..)`), or the neighbor record it names
+/// (`scope(24, ..)`, `scope(32, ..)`; `sims-vm` `memory.rs`).
 /// Code that moves the cursor before reading such an operand copies it first.
 fn reads_stack_obj(air: &str) -> bool {
     air == "stack_obj"
         || air.starts_with("stack.")
-        || air.starts_with("scope(21,")
-        || air.starts_with("scope(35,")
+        || [
+            "scope(21,",
+            "scope(24,",
+            "scope(27,",
+            "scope(31,",
+            "scope(32,",
+            "scope(35,",
+        ]
+        .iter()
+        .any(|s| air.starts_with(s))
 }
 
 /// Whether bitflags `key` is an engine bit-field word: a `std::flags` type or `self.flags`'s

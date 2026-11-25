@@ -421,9 +421,30 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
+    /// `temp[k]` for a constant `k` in 0..8, when `temp` is the frame's own temps: the temp a
+    /// temp-indexed scope (27, 30, 31) names by number, so the cell needs no setup.
+    pub(super) fn temp_word_index(&self, index: &V2Expr) -> Option<i16> {
+        let V2Expr::Index { base, index, .. } = index else {
+            return None;
+        };
+        if !matches!(base.as_ref(), V2Expr::Ident(_, n) if n == "temp")
+            || self.lookup_var("temp").is_some()
+        {
+            return None;
+        }
+        self.eval_const_i16(index)
+            .ok()
+            .filter(|k| (0..8).contains(k))
+    }
+
     /// `obj.sprite_flags[i]`: scope 27 reads the stack object's dynamic-sprite flag whose index
-    /// is in `temp[0]`. Returns the setup line and the cell.
-    pub(super) fn sprite_flag_cell(&mut self, index: &V2Expr) -> Result<(String, String)> {
+    /// is in the temp the operand names. Returns the setup line, if any, and the cell:
+    /// `sprite_flags[temp[k]]` is `scope(27, k)` with no setup; any other index is set into
+    /// `temp[0]` first.
+    pub(super) fn sprite_flag_cell(&mut self, index: &V2Expr) -> Result<(Option<String>, String)> {
+        if let Some(k) = self.temp_word_index(index) {
+            return Ok((None, format!("scope(27, {k})")));
+        }
         let idx_air = if let Ok(v) = self.eval_const_i16(index) {
             v.to_string()
         } else if self.is_pure_single_operand(index) {
@@ -444,7 +465,10 @@ impl<'a> TreeLowerer<'a> {
                 "sprite_flags index must be a constant or a plain variable",
             ));
         };
-        Ok((format!("temp[0] := {idx_air};"), "scope(27, 0)".to_owned()))
+        Ok((
+            Some(format!("temp[0] := {idx_air};")),
+            "scope(27, 0)".to_owned(),
+        ))
     }
 
     pub(super) fn self_prefix(&self) -> &'static str {
@@ -711,6 +735,8 @@ const SIM_PERSON_WORDS: &[(&str, EngineWord)] = &[
     // A date's link: the companion's word names the leader, the leader's names the companion
     // negated, 0 none. A store queues the date indicator.
     ("date_partner", word(77, EngineWordTy::I16)),
+    // Fame, in half-stars.
+    ("fame", word(81, EngineWordTy::I16)),
 ];
 
 /// Read-only words of an object's definition, read through the stack object (`sims-vm`
@@ -722,6 +748,43 @@ pub(super) fn definition_field(name: &str) -> Option<u8> {
     match name {
         "object_type" => Some(9),
         "sub_index" => Some(11),
+        _ => None,
+    }
+}
+
+/// `h.neighbor.<name>`: a read-only cell of the neighborhood record the stack object names, as
+/// `set_to_next(neighbor)` leaves it (`sims-vm` `memory.rs`).
+///
+/// - Scope 24, the record's fields, each 0 when the stack object names no record:
+///   `person_on_lot` (0, the ID of the record's person on this lot, or 0), `in_selected_family`
+///   (1), `age` (2, the record's person word 58), `friend_count` (5), `family_house` (6, the
+///   house of the family that holds the record) and `family_friend_count` (9, the friend count
+///   of the family the record's word 61 names). Fields 3 and 4 read 0, and 7 and 8 read
+///   bits 0 and 1 of the family's flags; `neighbor.field[i]` reads any field.
+/// - Scope 32, the record's person data, by the names a Sim's person words have
+///   (`neighbor.family` is word 61) and as `neighbor.person[i]`. Naming no record is native
+///   error 0x37.
+pub(super) fn neighbor_cell(name: &str) -> Option<(String, ValueType)> {
+    let field = |i: u8, ty| Some((format!("scope(24, {i})"), ty));
+    match name {
+        "person_on_lot" => field(0, ValueType::ObjectId),
+        "in_selected_family" => field(1, ValueType::Bool),
+        "age" => field(2, ValueType::I16),
+        "friend_count" => field(5, ValueType::I16),
+        "family_house" => field(6, ValueType::I16),
+        "family_friend_count" => field(9, ValueType::I16),
+        other => {
+            sim_person_word(other).map(|w| (format!("scope(32, {})", w.index), w.value_type()))
+        }
+    }
+}
+
+/// `h.neighbor.field[i]` (scope 24, fields 0..=9) or `h.neighbor.person[i]` (scope 32, words
+/// 0..=255).
+pub(super) fn neighbor_indexed_scope(field: &str) -> Option<(u8, i64)> {
+    match field {
+        "field" => Some((24, 9)),
+        "person" => Some((32, 255)),
         _ => None,
     }
 }

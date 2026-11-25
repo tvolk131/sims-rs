@@ -67,6 +67,16 @@ impl<'a> TreeLowerer<'a> {
                         || self.is_bcon_table_ref(bname)
                         || bname == "stack_obj"
                 }
+                // A neighbor cell reads through the stack object, like a definition cell.
+                V2Expr::Field {
+                    base: root,
+                    field: middle,
+                    ..
+                } if middle == "neighbor" => {
+                    neighbor_cell(field).is_some()
+                        && matches!(root.as_ref(), V2Expr::Ident(_, r)
+                            if !self.handle_has_state(r, "neighbor") && self.definition_cell_in_place(r))
+                }
                 V2Expr::Field { base: root, .. } => {
                     matches!(root.as_ref(), V2Expr::Ident(_, rname) if self.is_my_ident(rname))
                 }
@@ -85,6 +95,15 @@ impl<'a> TreeLowerer<'a> {
                         base: root, field, ..
                     } if field == "has_function" => {
                         matches!(root.as_ref(), V2Expr::Ident(_, r) if self.definition_cell_in_place(r))
+                    }
+                    V2Expr::Field {
+                        base: mid, field, ..
+                    } if neighbor_indexed_scope(field).is_some()
+                        && matches!(mid.as_ref(), V2Expr::Field { field: m, .. } if m == "neighbor") =>
+                    {
+                        matches!(mid.as_ref(), V2Expr::Field { base: root, .. }
+                            if matches!(root.as_ref(), V2Expr::Ident(_, r)
+                                if !self.handle_has_state(r, "neighbor") && self.definition_cell_in_place(r)))
                     }
                     V2Expr::Field {
                         base: root, field, ..

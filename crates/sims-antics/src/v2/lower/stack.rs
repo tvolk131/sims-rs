@@ -187,6 +187,17 @@ impl<'a> TreeLowerer<'a> {
     pub(super) fn cursor_place_ok(&self, place: &V2Expr, cursor: &str) -> bool {
         match place {
             V2Expr::Field { field, .. } if field == "sprite_flags" => false,
+            // A neighbor cell reads the stack object, so only the cursor's own is in place.
+            V2Expr::Field { base, .. } if is_neighbor_place(base) => {
+                matches!(base.as_ref(), V2Expr::Field { base: root, .. }
+                    if matches!(root.as_ref(), V2Expr::Ident(_, r) if r == cursor))
+            }
+            V2Expr::Index { base, index, .. } if matches!(base.as_ref(), V2Expr::Field { base: mid, .. } if is_neighbor_place(mid)) => {
+                matches!(base.as_ref(), V2Expr::Field { base: mid, .. }
+                    if matches!(mid.as_ref(), V2Expr::Field { base: root, .. }
+                        if matches!(root.as_ref(), V2Expr::Ident(_, r) if r == cursor)))
+                    && self.cursor_expr_ok(index, cursor)
+            }
             // A definition cell reads the stack object, so only the cursor's own is in place.
             V2Expr::Field { base, field, .. }
                 if definition_field(field).is_some()
@@ -271,4 +282,10 @@ impl<'a> TreeLowerer<'a> {
             _ => false,
         }
     }
+}
+
+/// Whether `e` is `h.neighbor` (the base of a neighbor cell).
+fn is_neighbor_place(e: &V2Expr) -> bool {
+    matches!(e, V2Expr::Field { base, field, .. }
+        if field == "neighbor" && matches!(base.as_ref(), V2Expr::Ident(..)))
 }

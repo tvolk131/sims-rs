@@ -588,6 +588,27 @@ impl<'a> TreeLowerer<'a> {
                         }
                     }
                 }
+                // `h.neighbor.<name>`: the neighborhood record the handle names, read through
+                // the stack object.
+                if let V2Expr::Field {
+                    base: root,
+                    field: middle,
+                    ..
+                } = base.as_ref()
+                    && middle == "neighbor"
+                    && let V2Expr::Ident(_, rname) = root.as_ref()
+                    && !self.handle_has_state(rname, "neighbor")
+                {
+                    let Some((cell, ty)) = neighbor_cell(field) else {
+                        return Err(Error::at(
+                            *span,
+                            format!(
+                                "unknown neighbor field '{field}' (expected person_on_lot, in_selected_family, age, friend_count, family_house, family_friend_count, a named person word (family, gender_kind, job_type, fame, ...), field[i], or person[i])"
+                            ),
+                        ));
+                    };
+                    return self.read_neighbor_cell(rname, *span, &cell, ty);
+                }
                 if let V2Expr::Ident(_, bname) = base.as_ref()
                     && let Some(word) = definition_field(field)
                     && !self.handle_has_state(bname, field)
@@ -630,6 +651,35 @@ impl<'a> TreeLowerer<'a> {
                         ),
                     )),
                 }
+            }
+            // `h.neighbor.field[i]` and `h.neighbor.person[i]`.
+            V2Expr::Index { span, base, index }
+                if matches!(base.as_ref(), V2Expr::Field { base: mid, field, .. }
+                    if neighbor_indexed_scope(field).is_some()
+                        && matches!(mid.as_ref(), V2Expr::Field { base: root, field: m, .. }
+                            if m == "neighbor"
+                                && matches!(root.as_ref(), V2Expr::Ident(_, r) if !self.handle_has_state(r, "neighbor")))) =>
+            {
+                let V2Expr::Field {
+                    base: mid, field, ..
+                } = base.as_ref()
+                else {
+                    unreachable!("matched above");
+                };
+                let V2Expr::Field { base: root, .. } = mid.as_ref() else {
+                    unreachable!("matched above");
+                };
+                let V2Expr::Ident(_, rname) = root.as_ref() else {
+                    unreachable!("matched above");
+                };
+                let (scope, hi) = neighbor_indexed_scope(field).expect("matched above");
+                let i = self.eval_builtin_int(index, &format!("neighbor.{field} index"), 0, hi)?;
+                self.read_neighbor_cell(
+                    rname,
+                    *span,
+                    &format!("scope({scope}, {i})"),
+                    ValueType::I16,
+                )
             }
             V2Expr::Index { span, base, index }
                 if matches!(base.as_ref(), V2Expr::Ident(_, n) if n == "local")
@@ -1041,6 +1091,26 @@ impl<'a> TreeLowerer<'a> {
             return Ok(None);
         };
         self.read_lvalue(&lval).map(Some)
+    }
+
+    /// A neighbor cell (`scope(24, ..)`, `scope(32, ..)`), read through the stack object like a
+    /// definition cell.
+    fn read_neighbor_cell(
+        &mut self,
+        handle: &str,
+        span: Span,
+        cell: &str,
+        ty: ValueType,
+    ) -> Result<(String, ValueType)> {
+        self.read_stack_object_cell(handle, span, cell, ty)?
+            .ok_or_else(|| {
+                Error::at(
+                    span,
+                    format!(
+                        "'{handle}.neighbor' needs an object handle holding a neighbor ('stack_obj' after 'set_to_next(neighbor)', or an object variable)"
+                    ),
+                )
+            })
     }
 
     pub(super) fn lower_job_operand(&mut self, key: &str, arg: &CallArg) -> Result<String> {
