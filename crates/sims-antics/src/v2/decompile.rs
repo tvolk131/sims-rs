@@ -6500,12 +6500,11 @@ impl Translator<'_> {
                 let obj = self.rvalue(object)?;
                 let receiver = if self.sim && obj == "stack_obj" && !self.stack_moves {
                     "self".to_owned()
-                } else if let Some(base) = obj
-                    .strip_suffix(".data[11]")
-                    .filter(|b| *b == "self" || (self.sim && *b == "sim"))
-                {
+                } else if let Some(base) = obj.strip_suffix(".data[11]").filter(|b| {
+                    *b == "self" || (self.sim && *b == "sim") || (self.inherit && *b == "me")
+                }) {
                     // Object data word 11 is the object's id; `.is_type` needs it typed as a
-                    // handle, which only the `.id` spelling gives.
+                    // handle, which only the `.id` spelling gives (`me.id` in an inherit tree).
                     format!("{base}.id")
                 } else if let Some(base) = obj
                     .strip_suffix(".data[2]")

@@ -377,3 +377,39 @@ fn a_stack_object_cursor_loop_names_its_binding_s_cells() {
         lacks(&lifted, &["raw {", "set_to_next"]);
     }
 }
+
+#[test]
+fn an_inherit_tree_tests_its_runner_s_type_through_me_id() {
+    let source = r#"object "Fable Wave3 Kiosk" {
+    guid: 0x7E00_016C;
+    #[bhav(id = 4300, label = "Ask", locals = 0)]
+    fn ask() {
+        raw {
+            if call 4301(temps) {
+                temp[0] := 1;
+            }
+        }
+    }
+    #[bhav(id = 4301, label = "Kind", locals = 0)]
+    fn kind() {
+        raw {
+            temp[1] := scope(30, 3);
+            if test_object_type(0x7E00016C, my.data[11]) {
+                return true;
+            }
+        }
+        return false;
+    }
+}"#;
+    for lifted in lift_both(source) {
+        has(
+            &lifted,
+            &[
+                "context = inherit",
+                "temp[1] = me.person[temp[3]];",
+                "me.id.is_type(",
+            ],
+        );
+        lacks(&lifted, &["raw {", "data[11].is_type"]);
+    }
+}

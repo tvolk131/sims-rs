@@ -81,6 +81,10 @@ extras (`Plan::drop_wave3` runs first in every fallback chain).
 - Only a Sim tree can name `my.person[temp[k]]`: `self.person[temp[k]]` does not exist in
   an object tree. So scope 30 now counts toward choosing Sim context
   (`prefers_sim_context`).
+- A Sim-context tree called from an object tree is tried as an inherit tree. There, a type
+  test of the runner (`my.data[11]`) is written `me.id.is_type(..)`, as `self.id` and `sim.id`
+  already were. Before, `me.data[11].is_type(..)` did not compile: the receiver is `i16`. The
+  tree then fell back, and so did its caller's named call.
 
 ## Decision 3: PR I-4's options and primitive slots
 
@@ -173,3 +177,5 @@ The corpus is all 1,191 lifted objects, at 10 workers. "Main" is main after #471
     the lift spell such arms joined.
 - **Follow-up for Track 7:** `untyped_engine_field` does not know `fame` (person 81), so the
   lift names it itself.
+- **Not done:** `make_new_character` in an `init` or `main` block stays raw. The lift does
+  not pin locals in lifecycle blocks, and no corpus object has the call there.
