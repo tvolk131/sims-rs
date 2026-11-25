@@ -39,9 +39,16 @@ visit)`. It is `buy_entries` with a callback:
 `BuyCatalog::load` now reads everything from those visits:
 
 - **Which definitions.** It keeps the visits of each GUID's registered
-  definition (`Catalog::by_guid`), as its own pass did.
+  definition (`Catalog::by_guid`), as its own pass did. A definition
+  registered under more than one GUID is read once per GUID.
+  `Catalog::build` never registers one that way, but a hand-built
+  `Catalog` can.
 - **Unreadable files.** A file, `OBJD` chunk or definition that cannot be
-  read is visited by neither pass, so it is left out exactly as before.
+  read is left out, as before. One difference remains, and it only shows
+  if a read fails transiently, for example when the process runs out of
+  file handles. The old second pass could open again a file the first
+  pass had failed to read, and so still give its objects fallback names.
+  With one pass, the file's objects are left out for that load.
 - **Masters.** The old pass read files GUID by GUID, so where one file
   had two masters with the same ID, the greater GUID won. The single pass
   goes in registration order, so it keeps the greater GUID explicitly.

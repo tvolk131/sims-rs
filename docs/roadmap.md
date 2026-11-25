@@ -3649,7 +3649,8 @@ through their public interfaces only; the simulation never depends on it.
         where `sims-game` keeps `ratchet` and `ui_oracle_tour` as their
         own binaries; #448 also splits `game.rs` and `neighborhood.rs`
         into module folders;
-      - `sims-vm` (#449).
+      - `sims-vm` (#449), which keeps its asset-free `interpreter` tests
+        as a second binary.
       - Test filters are now `--test integration <module>::<test>`.
   - **Legacy:**
     - `legacy/crates/sims-formats` was removed (#441), and so were
