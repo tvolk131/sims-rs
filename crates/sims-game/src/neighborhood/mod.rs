@@ -719,19 +719,28 @@ mod rezone_and_import;
 mod shell_state;
 mod travel_shell;
 
-/// What a departure from the home lot carries out
+/// What a departure to a destination carries out
 /// ([`NeighborhoodShell::depart_to_destination`],
 /// [`NeighborhoodShell::pump_trip_request`]).
 enum Departure {
-    /// A trip the shell plans: it writes the travelers' tokens and charges
-    /// the fare ([`vm_travel::depart_to_destination`]).
+    /// A trip the shell plans from the home lot: it writes the travelers'
+    /// tokens and charges the fare
+    /// ([`vm_travel::depart_to_destination_with_cache`]).
     Request(TravelRequest),
-    /// The trip a script asked for with Generic Sims Call 17, to `house`,
-    /// whose tokens and fare the script already took care of
-    /// ([`vm_travel::depart_from_request_with`]). `transport` is the way the
-    /// lot picker showed: the arrival places the travelers by it, and it
-    /// picks the loading screen.
+    /// The trip a script on the home lot asked for with Generic Sims Call
+    /// 17, to `house`, whose tokens and fare the script already took care
+    /// of ([`vm_travel::depart_from_request_with_with_cache`]). `transport`
+    /// is the way the lot picker showed: the arrival places the travelers
+    /// by it, and it picks the loading screen.
     Trip {
+        house: u32,
+        transport: Option<vm_travel::TravelTransport>,
+    },
+    /// The trip on to another destination, `house`, that a script on the
+    /// open destination asked for with Generic Sims Call 17 (Go Somewhere
+    /// Else, tree 0x1016) ([`vm_travel::travel_on_from_request_with_cache`]).
+    /// The trip keeps its home; `transport` is as for [`Self::Trip`].
+    Onward {
         house: u32,
         transport: Option<vm_travel::TravelTransport>,
     },

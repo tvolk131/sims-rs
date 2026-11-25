@@ -5,9 +5,9 @@
 //! Else. Each runs Generic Sims Call 17. Go Home asks for house -1,
 //! which 0x45a22d turns into the family's house, so
 //! [`NeighborhoodShell::pump_trip_request`] returns the travelers with
-//! `travel::return_from_request`. Go Somewhere Else asks for another
-//! destination, which the port does not carry out: the shell shows a
-//! notice and the lot drops the request (`Lot::cancel_trip_request`).
+//! `travel::return_from_request_with_cache`. Go Somewhere Else asks for
+//! another destination, and the shell carries the trip on there with
+//! `travel::travel_on_from_request_with_cache`, keeping its home.
 //!
 //! The shell writes `Neighborhood.iff` (`NeighborhoodStore::
 //! save_neighborhood_iff`) after each commit that changes the
@@ -262,8 +262,8 @@ fn a_lot_save_writes_neighborhood_iff_beside_the_saves() {
 }
 
 /// A date Downtown and back: the file follows each move. On Downtown, Go
-/// Somewhere Else (a trip to another destination) is refused with a notice
-/// and dropped, the lot plays on, and Go Home returns the traveler.
+/// Somewhere Else before the date has arrived is refused with a notice and
+/// dropped, the lot plays on, and Go Home returns the traveler.
 #[test]
 fn a_destination_go_home_returns_through_the_shell() {
     let Some(root) = install_root() else {
@@ -295,40 +295,15 @@ fn a_destination_go_home_returns_through_the_shell() {
     // The arrival places the traveler before anyone calls a cab.
     assert_eq!(shell.game_mut().expect("Downtown").run(400), 400);
 
-    // Go Somewhere Else asks for lot 22 on the Downtown map. The shell
-    // refuses a trip between destinations and the lot drops it.
-    let mut refused = false;
-    call_cab(
-        &mut shell,
-        leader,
-        GO_SOMEWHERE_ELSE,
-        |shell| {
-            if shell
-                .game()
-                .is_some_and(|g| g.asking_special_panel().is_some())
-            {
-                shell.render();
-            }
-            let picker = shell
-                .game()
-                .and_then(|g| g.destination_picker())
-                .and_then(|p| p.hit_point_for_lot(SIZE, OTHER_DOWNTOWN_LOT));
-            if let Some(point) = picker {
-                let _ = shell.hover(point);
-                let _ = shell.press(point);
-                let _ = shell.release(point);
-            }
-        },
-        |shell| {
-            refused = shell.game().is_some_and(|g| {
-                g.note().is_some_and(|n| {
-                    n.contains("Return home before starting another destination trip")
-                })
-            });
-            refused
-        },
+    // Go Somewhere Else asks for lot 22 on the Downtown map. Downtown's
+    // middle ped marker has not brought the date in yet, and a trip on must
+    // take every traveler, so the VM refuses it: the shell shows a notice,
+    // the lot drops the request and plays on, and the trip stays.
+    let refusal = go_somewhere_else(&mut shell, leader).expect("the trip on is refused");
+    assert!(
+        refusal.contains("Could not travel to lot 22"),
+        "unexpected notice: {refusal}"
     );
-    assert!(refused);
     assert_eq!(shell.active_lot_house(), Some(DOWNTOWN_LOT));
     assert_eq!(shell.active_trip().map(|t| t.trip_id), Some(trip_id));
     let game = shell.game_mut().expect("the Downtown lot");
@@ -404,4 +379,120 @@ fn a_destination_go_home_returns_through_the_shell() {
         [],
         "the saved neighborhood kept the saved state"
     );
+}
+
+/// Picks Go Somewhere Else on a cab sign for the traveler and lot 22 on the
+/// map it shows, until the shell leaves for lot 22 (None) or refuses the
+/// trip (the notice).
+fn go_somewhere_else(shell: &mut NeighborhoodShell, leader: u32) -> Option<String> {
+    let onward = u32::from(OTHER_DOWNTOWN_LOT);
+    let mut refusal: Option<String> = None;
+    call_cab(
+        shell,
+        leader,
+        GO_SOMEWHERE_ELSE,
+        |shell| {
+            if shell
+                .game()
+                .is_some_and(|g| g.asking_special_panel().is_some())
+            {
+                shell.render();
+            }
+            let picker = shell
+                .game()
+                .and_then(|g| g.destination_picker())
+                .and_then(|p| p.hit_point_for_lot(SIZE, OTHER_DOWNTOWN_LOT));
+            if let Some(point) = picker {
+                let _ = shell.hover(point);
+                let _ = shell.press(point);
+                let _ = shell.release(point);
+            }
+        },
+        |shell| {
+            refusal = shell
+                .game()
+                .and_then(|g| g.note())
+                .filter(|n| n.contains("Could not travel"))
+                .map(str::to_owned);
+            refusal.is_some() || shell.active_lot_house() == Some(onward)
+        },
+    );
+    refusal
+}
+
+/// A trip Downtown alone, on to another Downtown lot, and home from there:
+/// Go Somewhere Else carries the trip on through the shell (a new trip ID,
+/// the same home, the file following), and the shell's Go Home from the
+/// second lot returns the traveler.
+#[test]
+fn a_destination_go_somewhere_else_travels_on_through_the_shell() {
+    let Some(root) = install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to run the Go Somewhere Else test");
+        return;
+    };
+    let dir = TempDir::new("go-somewhere-else");
+    let mut shell = open_shell(root, &dir.0);
+    shell.enter_lot(HOME).expect("enter the house");
+    let game = shell.game_mut().expect("the house");
+    assert_eq!(game.run(30), 30);
+    let (family, leader) = {
+        let world = game.lot().world();
+        let selected = world.selected().expect("a selected Sim");
+        (world.globals[9] as u16, world.objects[&selected].guid)
+    };
+    shell
+        .depart_to_destination(TravelRequest::downtown(DOWNTOWN_LOT, leader))
+        .expect("travel Downtown");
+    let trip_id = shell.active_trip().expect("the trip").trip_id;
+    // The arrival places the traveler before anyone calls a cab.
+    assert_eq!(shell.game_mut().expect("Downtown").run(400), 400);
+
+    let onward = u32::from(OTHER_DOWNTOWN_LOT);
+    assert_eq!(
+        go_somewhere_else(&mut shell, leader),
+        None,
+        "the trip on was refused"
+    );
+    assert_eq!(shell.active_lot_house(), Some(onward));
+    let trip = shell.active_trip().expect("the trip goes on");
+    assert_eq!(trip.home_house, HOME, "the trip keeps its home");
+    assert_eq!(trip.destination_house, onward);
+    assert_ne!(trip.trip_id, trip_id, "the trip on has a new trip ID");
+    let path = shell.neighborhood_iff_path();
+    assert_eq!(
+        houses_of(&read_back(&path, &dir.0), family),
+        (HOME as i32, onward as i32),
+        "the saved neighborhood has the family on the other lot"
+    );
+    let game = shell.game_mut().expect("the other Downtown lot");
+    assert!(game.trip_request().is_none(), "the trip on was carried out");
+    assert_eq!(game.run(400), 400, "the other lot plays on");
+    assert!(
+        game.lot()
+            .world()
+            .objects
+            .values()
+            .any(|o| o.guid == leader && o.person.is_some()),
+        "the traveler arrived"
+    );
+
+    // The shell's Go Home from the second lot returns to the trip's home.
+    let report = shell.return_from_destination().expect("return home");
+    assert_eq!(report.home_house, HOME);
+    assert_eq!(shell.active_lot_house(), Some(HOME));
+    assert!(shell.active_trip().is_none(), "the trip is over");
+    assert_eq!(
+        houses_of(shell.stored_neighborhood(), family),
+        (HOME as i32, 0)
+    );
+    let game = shell.game_mut().expect("the house");
+    assert!(
+        game.lot()
+            .world()
+            .objects
+            .values()
+            .any(|o| o.guid == leader && o.person.is_some()),
+        "the traveler is home"
+    );
+    assert_eq!(game.run(10), 10, "the house plays on");
 }
