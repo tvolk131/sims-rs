@@ -1325,11 +1325,20 @@ impl<'a> TreeLowerer<'a> {
                 ),
             ));
         }
-        if air_writes_cell(self.em.since(body_mark), counter) {
+        let body = self.em.since(body_mark);
+        if air_writes_cell(body, counter) {
             return Err(Error::at(
                 span,
                 format!(
                     "the body of this '#[temp]' loop writes its counter '{counter}' (directly, in a 'defer', or through a nested '#[temp]' loop)"
+                ),
+            ));
+        }
+        if !counter_only_read(body, counter) {
+            return Err(Error::at(
+                span,
+                format!(
+                    "the body of this '#[temp]' loop passes its counter '{counter}' to a primitive or call that may write it; copy it into a 'let' first"
                 ),
             ));
         }
@@ -2095,6 +2104,33 @@ impl<'a> TreeLowerer<'a> {
             self.emit_lvalue_assign(&lval, V2AssignOp::BitAnd, &inv)
         }
     }
+}
+
+/// Whether every use of `cell` in the `.air` text is a read: the right side of an assignment or
+/// an operator, a side of a comparison, or the input of `idle` / `random`. Anything else (a
+/// primitive's argument, which may be an output) may write it.
+fn counter_only_read(air: &str, cell: &str) -> bool {
+    const AFTER_READS: &[&str] = &["==", "!=", "<=", ">=", "<", ">", "flag_test"];
+    const BEFORE_READS: &[&str] = &[
+        "=",
+        "<",
+        ">",
+        "flag_test",
+        "inc_lt",
+        "dec_gt",
+        "flag_set",
+        "flag_clear",
+        "sqrt",
+    ];
+    air.match_indices(cell).all(|(at, _)| {
+        let before = air[..at].trim_end();
+        let after = air[at + cell.len()..].trim_start();
+        let line = before.rsplit('\n').next().unwrap_or("").trim_start();
+        BEFORE_READS.iter().any(|op| before.ends_with(op))
+            || (AFTER_READS.iter().any(|op| after.starts_with(op)) && !after.starts_with("<<="))
+            || (line == "idle(" && after.starts_with(')'))
+            || (line.starts_with("random(") && line.ends_with(',') && after.starts_with(')'))
+    })
 }
 
 /// Whether the `.air` text stores into `cell` (an assignment, compound assignment, or one of the

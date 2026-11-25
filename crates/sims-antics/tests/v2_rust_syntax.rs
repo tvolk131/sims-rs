@@ -144,32 +144,61 @@ fn diverging_branches_in_nested_chains() {
         }
     }"),
     );
-    // A raw `break` can leave an endless loop, so the branch may fall through.
-    expect_err(
-        &obj("    main {
-        let x = if self.n == 0 { loop { raw { break; } } } else { 20 };
+    // A raw `break` or label branch can leave an endless loop, so the branch may fall through;
+    // a raw `continue` keeps it looping.
+    for raw in [
+        "break;",
+        "random(temp[0], 2) -> true: @after, false: @after;",
+    ] {
+        expect_err(
+            &obj(&format!(
+                "    main {{
+        let x = if self.n == 0 {{ loop {{ raw {{ {raw} }} }} }} else {{ 20 }};
+        raw {{ @after: }}
+        self.n = x;
+        loop {{ sleep(1); }}
+    }}"
+            )),
+            "may jump out of it",
+        );
+    }
+    build(&obj("    main {
+        let x = if self.n == 0 { loop { raw { continue; } } } else { 20 };
         self.n = x;
         loop { sleep(1); }
-    }"),
-        "must leave on every path",
-    );
-    // A contextual keyword alone in the braces is a value.
-    assert_same(
-        "contextual keyword value",
+    }"));
+    // `const` bindings cannot take `world` either.
+    expect_err(
         &obj("    main {
-        let animate = self.n;
-        let x = if self.n == 0 { animate } else { 1 };
-        self.m = x;
+        const world = if self.n == 0 { 1 } else { 2 };
+        self.n = world;
         loop { sleep(1); }
     }"),
-        &obj("    main {
-        let animate = self.n;
+        "cannot be used as a const binding",
+    );
+    // A keyword that names a binding is a value when it alone fills the braces.
+    for name in ["animate", "loop"] {
+        assert_same(
+            "keyword-named value",
+            &obj(&format!(
+                "    main {{
+        let {name} = self.n;
+        let x = if self.n == 0 {{ {name} }} else {{ 1 }};
+        self.m = x;
+        loop {{ sleep(1); }}
+    }}"
+            )),
+            &obj(&format!(
+                "    main {{
+        let {name} = self.n;
         let x: i16;
-        if self.n == 0 { x = animate; } else { x = 1; }
+        if self.n == 0 {{ x = {name}; }} else {{ x = 1; }}
         self.m = x;
-        loop { sleep(1); }
-    }"),
-    );
+        loop {{ sleep(1); }}
+    }}"
+            )),
+        );
+    }
 }
 
 #[test]
@@ -222,6 +251,18 @@ fn tail_expressions_are_returns() {
         "match tail",
         &pick("match a { 0 => 1, 1 => { 5 } _ => a + 2 }"),
         &pick("match a { 0 => { return 1; } 1 => { return 5; } _ => { return a + 2; } }"),
+    );
+    // A match arm ended by ';' is a statement, not the value.
+    assert_same(
+        "statement arm",
+        &obj("    interaction \"Use\" {
+        guard(sim) { match self.n { 0 => { return false; } _ => sleep(1); } return true; }
+        run(sim) { return true; }
+    }"),
+        &obj("    interaction \"Use\" {
+        guard(sim) { match self.n { 0 => { return false; } _ => { sleep(1); } } return true; }
+        run(sim) { return true; }
+    }"),
     );
     // A tail after a `const X = if ..` ends each specialized copy.
     assert_same(
@@ -479,6 +520,8 @@ fn temp_range_loops_count_in_the_temp() {
     // A `defer` in the body, raw code (in either spelling of the cell), and a write that
     // repeats the loop's own step text after a discarded `continue` are all writes.
     for body in [
+        "relationship(column: 1, dir: 0, flags: 0, value: temp[0]);",
+        "self.n = distance_to(self, temp: 0);",
         "defer { temp[0] = 0; } self.n += i;",
         "raw { temp [ 0 ]:= 0; }",
         "raw { scope(8, 0) := 0; }",
@@ -493,7 +536,9 @@ fn temp_range_loops_count_in_the_temp() {
             .unwrap_or_else(|| panic!("must fail:\n{src}"))
             .to_string();
         assert!(
-            err.contains("writes its counter") || err.contains("contains 'raw"),
+            err.contains("writes its counter")
+                || err.contains("contains 'raw")
+                || err.contains("may write it"),
             "{body}: {err}"
         );
     }

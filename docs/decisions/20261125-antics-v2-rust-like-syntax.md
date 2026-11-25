@@ -57,10 +57,10 @@ let v = if self.n > 3 { self.n - 3 } else { return false; };
 - Lowering writes the leaving branch where the statement form would.
 - A nested `else if` / `match` chain may leave on every branch; the enclosing chain supplies the value.
 - A leaving branch makes the lowering skip the single-pass `while true` it uses for `||` / `&&` and for match chains, so `break` / `continue` exit the user's loop.
-- A block branch that can fall through is an error: "must leave on every path". A `raw { .. }` block that can `break` counts as falling through.
+- A block branch that can fall through is an error: "must leave on every path". A `raw { .. }` block that may jump out of it (a `break`, or a branch to a label or node number) is an error, because the leaving analysis cannot follow it. A raw `continue` is fine.
 - So is a block branch outside a `let` initializer: "only be a branch of 'let x = if ..'".
 
-**Tail expressions.** In a function that returns a value, the last expression can omit its `;` and becomes `return <expr>;`. The tail can also sit in each branch of a final `if` / `match`, either braced or as a bare arm (`if a > b { a } else { b }`, `match a { 0 => 1, _ => 2 }`). A tail after `const X = if ..` ends every specialized copy. This covers:
+**Tail expressions.** In a function that returns a value, the last expression can omit its `;` and becomes `return <expr>;`. The tail can also sit in each branch of a final `if` / `match`, either braced or as a bare arm without `;` (`if a > b { a } else { b }`, `match a { 0 => 1, _ => 2 }`). An arm ended by `;` is a statement. A tail after `const X = if ..` ends every specialized copy. This covers:
 - `fn .. -> T`;
 - `#[bhav] fn` with a result;
 - guard blocks.
@@ -77,7 +77,7 @@ Named fields read and write the raw cells. Each name below was checked against s
 | `self.room_impact`, `self.wall_placement`, `self.broken` | object data `7, 13, 15` |
 | `sim.posture`, `sim.pets_outside`, `sim.job_type`, `sim.job_level`, `sim.family` | person data `0, 34, 56, 57, 61` |
 
-- `world` is reserved: it cannot name a binding, an import, an `extern bcon` or a BCON table.
+- `world` is reserved: it cannot name a binding (`const` bindings included), an import, an `extern bcon` or a BCON table.
 - An unknown `world.x` is an error.
 - Fields whose meaning we could not confirm in sims-vm were left out: graphic, job performance, job day, animation events, and cheats (global 20 is the expansions mask).
 - `lift --v2` writes `world.<name>` for the named globals.
@@ -132,6 +132,7 @@ So a body that specializes on `k` (`const X = if k == 1 { .. } else { .. };`) ca
   - `inc_lt` / `dec_gt` / `flag_set` / `flag_clear` / `sqrt` on the cell;
   - a `dest: temp[N]` output;
   - a nested `#[temp(N)]` loop.
+- Every other use of `temp[N]` in the body must be a plain read: the right side of an assignment or operator, a side of a comparison, or the input of `idle` / `random`. A primitive argument may be an output (`relationship(value: ..)`, `distance_to(.., temp: N)`), so the counter cannot be passed as one. Copy it into a `let` first.
 - The check reads the text that is kept, so code a trial lowering discarded cannot hide or fake a step.
 - **Limit.** Like `temp[N]` anywhere else, the counter is shared with the trees the body calls. A call that writes `temp[N]` (a `#[temp(N)]` argument or return of a global, or a primitive that writes temps without naming them) changes the loop. That is the point of a temp-backed counter, and it is documented rather than rejected.
 

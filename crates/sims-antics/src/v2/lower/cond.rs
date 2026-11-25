@@ -807,6 +807,18 @@ impl<'a> TreeLowerer<'a> {
                 "a diverging '{ ..; return ..; }' branch can only be a branch of 'let x = if ..' or 'let x = match ..'",
             ));
         }
+        // Raw code that may jump out (a `break`, a branch to a label or node) could reach the
+        // join without a value, so the leaving analysis cannot vouch for it.
+        let raw_jumps = super::specialize::stmts_any(body, &|s| {
+            matches!(s, V2Stmt::RawAir { code, .. }
+                if super::raw_facts::raw_facts(code, None).may_jump_out())
+        });
+        if raw_jumps {
+            return Err(Error::at(
+                *span,
+                "this branch yields no value, and its 'raw { .. }' code may jump out of it ('break', or a branch to a label or node), so it cannot be checked to leave; write the branch without raw jumps",
+            ));
+        }
         if !stmts_unconditionally_diverge(body, self.env, &self.owner_module, self.in_object_scope)
         {
             return Err(Error::at(

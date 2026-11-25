@@ -2680,6 +2680,7 @@ impl Parser {
             let mut names = Vec::new();
             loop {
                 let (n, s) = self.expect_ident("bound name")?;
+                reject_world_binding(&n, s)?;
                 names.push((s, n));
                 if !self.eat(&TokenKind::Comma) {
                     break;
@@ -2698,6 +2699,7 @@ impl Parser {
             (names, true)
         } else {
             let (n, s) = self.expect_ident("bound name")?;
+            reject_world_binding(&n, s)?;
             (vec![(s, n)], false)
         };
         self.expect(&TokenKind::Assign, "'='")?;
@@ -3399,7 +3401,10 @@ impl Parser {
         let stmt_err = match self.parse_stmt() {
             Ok(s) => {
                 // `_ => f() }`: the last arm's expression ends at the match's `}`.
-                if let V2Stmt::Expr { span, .. } = &s {
+                // Only one without ';' is the arm's value (`_ => f() }`).
+                if let V2Stmt::Expr { span, .. } = &s
+                    && self.tails.contains(span)
+                {
                     self.tails.retain(|t| t != span);
                     self.arm_tails.push(*span);
                 }
@@ -3604,16 +3609,18 @@ impl Parser {
     /// `{ value }`, or a diverging block `{ ..; return x; }` (a `V2Expr::Block`, which lowering
     /// accepts only in a `let` initializer and checks leaves on every path). A block that starts
     /// with a statement keyword is a block; otherwise a lone expression before `}` is a value.
-    /// Contextual keywords (`animate`, `with`, `defer`, `repeat`) can name a binding, so they are
-    /// a value when they alone fill the braces (`{ animate }`); a statement falls back below.
+    /// Keywords that can name a binding (`loop`, `animate`, ..) are a value when they alone fill
+    /// the braces (`{ loop }`); a statement falls back to a block below.
     fn parse_value_branch(&mut self) -> Result<V2Expr> {
         let span = self.span();
         let (saved_pos, saved_depth, saved_tails, saved_arm_tails) =
             (self.pos, self.depth, self.tails.len(), self.arm_tails.len());
         self.expect(&TokenKind::LBrace, "'{'")?;
+        let alone = self.peek_at(1).kind == TokenKind::RBrace;
         let starts_stmt = matches!(
             &self.peek().kind,
-            TokenKind::Ident(k) if matches!(k.as_str(), "break" | "continue" | "return" | "let" | "while" | "loop" | "for")
+            TokenKind::Ident(k) if matches!(k.as_str(), "break" | "continue" | "return")
+                || (!alone && matches!(k.as_str(), "let" | "while" | "loop" | "for"))
         ) || matches!(
             self.peek().kind,
             TokenKind::RawBlock(_) | TokenKind::HashBracket
@@ -4458,4 +4465,15 @@ fn tail_to_return(stmt: &mut V2Stmt) {
             value: Some(expr),
         };
     }
+}
+
+/// `world` names the engine globals (`world.hour`), so no binding may take it.
+fn reject_world_binding(name: &str, span: Span) -> Result<()> {
+    if name == "world" {
+        return Err(Error::at(
+            span,
+            "'world' names the engine globals ('world.hour') and cannot be used as a const binding",
+        ));
+    }
+    Ok(())
 }
