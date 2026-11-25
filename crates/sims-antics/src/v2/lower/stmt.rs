@@ -222,7 +222,7 @@ impl<'a> TreeLowerer<'a> {
                 // Past the constant path, a flag operation takes a raw bit number: a runtime
                 // bitflags value is a mask, not a bit.
                 if matches!(op, V2AssignOp::FlagSet | V2AssignOp::FlagClear)
-                    && val_ty != ValueType::I16
+                    && !matches!(val_ty, ValueType::I16 | ValueType::ObjectId)
                 {
                     return Err(Error::at(
                         value.span(),

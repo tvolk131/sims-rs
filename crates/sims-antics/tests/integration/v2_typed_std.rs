@@ -531,3 +531,66 @@ object "Domains" {
     // A `std::engine` word may hold any value, so only the closed user enum is assumed.
     assert_eq!(names, ["c"], "{found:#?}");
 }
+
+#[test]
+fn casts_and_raw_conversions_stay_sound() {
+    // A declared callable of the same path wins over the conversion.
+    let air = expand(
+        "shadowed.antics",
+        &sim_tree(
+            "extern mod Height { #[id(280)] #[ret(temp = 0)] fn from_raw(i: i16) -> i16; }",
+            "if Height::from_raw(1) == 1 { temp[0] = 5; }",
+        ),
+    );
+    expect_lines("shadowed", &air, &["call 280(1)"]);
+    expect_err(
+        "bool_short_circuit.antics",
+        &sim_tree("", "refresh(target: (true || missing) as i16, mode: 0);"),
+        "must be a compile-time constant",
+    );
+    expect_err(
+        "runtime_bool.antics",
+        &sim_tree("", "temp[0] = stack_obj.is_visitor as i16;"),
+        "'as i16' converts only a constant bool",
+    );
+    expect_err(
+        "unrelated_order.antics",
+        &sim_tree(
+            "use std::flags::*;",
+            "if self.flags2 < self.buy_flags { temp[0] = 1; }",
+        ),
+        "ordering comparison is not supported between 'ObjectFlags2' and 'BuyFlags'",
+    );
+    let many = " as i16".repeat(40);
+    let air = expand(
+        "collapsed.antics",
+        &sim_tree("", &format!("temp[0] = (1{many}){many};")),
+    );
+    expect_lines("collapsed", &air, &["temp[0] := 1;"]);
+    let air = expand(
+        "const_casts.antics",
+        &sim_tree(
+            "use std::engine::Direction;",
+            "drop_onto(src: -32768 as i16, dst: 2); \
+             refresh(target: Direction::from_raw(1) as i16, mode: 0); \
+             temp[0] flag_set sim.id;",
+        ),
+    );
+    expect_lines(
+        "const_casts",
+        &air,
+        &[
+            "drop_onto(src: -32768, dst: 2);",
+            "refresh(target: 1, mode: 0);",
+            "temp[0] flag_set my.id;",
+        ],
+    );
+    // 382 keeps its `-> Result` signature, so a local declaration of it still merges.
+    expand(
+        "merge_382.antics",
+        &sim_tree(
+            "use std::globals::*;\nextern mod globals { #[id(382)] fn get_up() -> Result; }",
+            "globals::get_up()?;",
+        ),
+    );
+}

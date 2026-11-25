@@ -681,6 +681,14 @@ impl<'a> TreeLowerer<'a> {
                 V2UnaryOp::AsI16 => {
                     let (air, ty) = self.lower_value_expr(inner)?;
                     self.check_as_i16_source(*span, &ty)?;
+                    // A bool word may hold any nonzero value (a visitor's person word 32 is
+                    // 2 for some), so only a constant bool converts in place.
+                    if ty == ValueType::Bool && air != "0" && air != "1" {
+                        return Err(Error::at(
+                            *span,
+                            "'as i16' converts only a constant bool (a bool word may hold any nonzero value); write 'if b { 1 } else { 0 }'",
+                        ));
+                    }
                     Ok((air, ValueType::I16))
                 }
             },
@@ -1142,6 +1150,10 @@ impl<'a> TreeLowerer<'a> {
             return None;
         };
         if method != "from_raw" {
+            return None;
+        }
+        // A declared callable of that path (an `extern mod` named like the type) wins.
+        if matches!(self.resolve_callable(callee, callee.span()), Ok(Some(_))) {
             return None;
         }
         match self

@@ -3879,11 +3879,20 @@ impl Parser {
                     "expected 'i16' after 'as' (only 'as i16' casts are supported; use 'T::from_raw(..)' to build an enum or bitflags value)",
                 ));
             }
-            expr = V2Expr::Unary {
-                span,
-                op: V2UnaryOp::AsI16,
-                inner: Box::new(expr),
-            };
+            // `x as i16 as i16` is `x as i16`: a chain adds one node, however long.
+            if !matches!(
+                expr,
+                V2Expr::Unary {
+                    op: V2UnaryOp::AsI16,
+                    ..
+                }
+            ) {
+                expr = V2Expr::Unary {
+                    span,
+                    op: V2UnaryOp::AsI16,
+                    inner: Box::new(expr),
+                };
+            }
         }
         for _ in 0..casts {
             self.leave_nesting();

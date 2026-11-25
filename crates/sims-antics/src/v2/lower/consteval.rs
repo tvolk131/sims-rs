@@ -611,9 +611,9 @@ impl<'a> TreeLowerer<'a> {
             }
             // `Enum::Variant as i16`, `Flags::A | Flags::B as i16`, or an i16 constant.
             V2Expr::Unary {
-                span,
                 op: V2UnaryOp::AsI16,
                 inner,
+                ..
             } => {
                 if let Some((_, mask, _)) = self.try_eval_any_const_bitflag(inner)? {
                     return Ok(mask);
@@ -621,13 +621,22 @@ impl<'a> TreeLowerer<'a> {
                 if let Some(v) = self.try_eval_any_const_enum(inner)? {
                     return Ok(v);
                 }
-                let as_int = self.eval_const_i16(inner);
-                if as_int.is_err()
-                    && let Ok(b) = self.eval_const_bool_required(inner, *span)
-                {
-                    return Ok(i16::from(b));
+                match inner.as_ref() {
+                    V2Expr::Bool(_, b) => Ok(i16::from(*b)),
+                    // `T::from_raw(c) as i16` is `c`.
+                    V2Expr::Call {
+                        callee,
+                        type_args,
+                        args,
+                        ..
+                    } if type_args.is_empty()
+                        && matches!(args.as_slice(), [a] if a.name.is_none())
+                        && self.raw_conversion_target(callee).is_some() =>
+                    {
+                        self.eval_const_i16(&args[0].value)
+                    }
+                    _ => self.eval_const_i16(inner),
                 }
-                as_int
             }
             V2Expr::Ident(span, name) => {
                 if let Some(binding) = self.lookup_var(name) {

@@ -50,7 +50,9 @@ name (`parse_v2_std_file`).
 ## Decision 2: zero-cost conversions
 
 - **`expr as i16`** is a postfix unary (`V2UnaryOp::AsI16`).
-  - It accepts `i16`, `bool`, enums and bitflags.
+  - It accepts `i16`, enums, bitflags and constant `bool`s. A runtime `bool` is refused, because a
+    bool word may hold any nonzero value; write `if b { 1 } else { 0 }`.
+  - A chain `x as i16 as i16` is one node.
   - It rejects object handles, so `stack_obj as i16` is an error.
   - Const evaluation folds it.
   - Only `i16` is accepted as a target: `as u8` is a parse error.
@@ -60,12 +62,16 @@ name (`parse_v2_std_file`).
   - A user enum is refused: it is closed, and a word with no variant would match a listed arm.
 
 Neither adds a node, and a comparison reads either one in place, as it reads the value it converts.
+A constant primitive operand takes a cast of a constant: `-32768 as i16`, `Direction::from_raw(1) as i16`.
+A declared callable at the same path wins over `T::from_raw`, for example an `extern mod Height`
+with a `from_raw` fn.
 
 ## Decision 3: engine words are lenient; engine enums are open
 
 - **A `std::flags` type, or the untyped `self.flags` word, is an engine word.** It takes raw `i16`
   operands exactly as before:
   - `w = 5`, `n = w`, `w & 4`, `w > 0`, `w flag_set 3`, `w flag_test 2`.
+  - Two words of different typed kinds compare with neither `==` nor `<` until they are cast.
 
   This is what keeps about 2,000 numeric `self.wall_placement flag_set N` uses in the lift corpus
   compiling. **User bitflags stay strict.**
@@ -158,8 +164,10 @@ The rules for entries:
 
 Changes to the existing entries:
 
-- **382 `ensure_standing` is now `-> bool`.** No caller treats its false exit as an error, and 34
-  callers ignore it. With `-> Result`, those 34 statement calls could not be written.
+- **382 `ensure_standing` stays `-> Result`, though its false exit is an answer.** No original
+  caller treats that exit as an error, and 34 ignore it. Changing the declaration to `-> bool` would
+  refuse every file that declares 382 locally as `-> Result` next to `use std::globals::*;`. It is
+  left as a follow-up with the renames.
 - **286 keeps its parameter name `skill`**, so named calls still compile. Its comment says the
   parameter is a skill value (0..1000), not a skill index.
 

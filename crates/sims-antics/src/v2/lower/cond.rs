@@ -232,7 +232,13 @@ impl<'a> TreeLowerer<'a> {
                 let ordered = |t: &ValueType| {
                     matches!(t, ValueType::I16 | ValueType::ObjectId) || is_engine_flags(t)
                 };
-                if !ordered(&l_ty) || !ordered(&r_ty) {
+                // Two typed words compare only when they are one type (as `==` requires).
+                let same_kind = !matches!(
+                    (&l_ty, &r_ty),
+                    (ValueType::Bitflags(_), ValueType::Bitflags(_))
+                ) || types_compatible_for_assign(&l_ty, &r_ty)
+                    || types_compatible_for_assign(&r_ty, &l_ty);
+                if !ordered(&l_ty) || !ordered(&r_ty) || !same_kind {
                     return Err(Error::at(
                         span,
                         format!(
