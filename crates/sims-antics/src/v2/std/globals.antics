@@ -5,8 +5,8 @@
 // what each tree does; only the tree ids are engine facts.
 //
 // The signatures follow each tree's live code: the parameters it reads, and whether its false exit
-// is a real answer (`-> bool`) or never taken by a caller as an error (`-> bool` too) rather than a
-// failure to propagate (`-> Result`). A parameter that is a 0/1 switch is an `i16` holding 0 or 1.
+// is an answer callers branch on (`-> bool`) or a failure to propagate (`-> Result`). A parameter
+// that is a 0/1 switch is an `i16` holding 0 or 1.
 // Trees with no listed parameters ignore their header's argument. Many trees leave values in the
 // caller's temps; the comments name the ones a caller reads. Unless a comment says otherwise, a tree
 // that acts on "the stack object" needs the caller to set `stack_obj` first.

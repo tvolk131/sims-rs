@@ -582,8 +582,7 @@ impl<'a> TreeLowerer<'a> {
                                     .read_lvalue(&self.self_cell("id", ValueType::ObjectId));
                             }
                             "room" => {
-                                return self
-                                    .read_lvalue(&self.self_cell("room", ValueType::I16));
+                                return self.read_lvalue(&self.self_cell("room", ValueType::I16));
                             }
                             _ => {}
                         }
