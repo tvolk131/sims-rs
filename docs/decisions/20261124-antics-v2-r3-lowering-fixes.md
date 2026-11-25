@@ -75,15 +75,19 @@ if it does not:
 
 **Global 34.** Every Expression node, the save included, sets the object's scratch pointer, and
 a read of global 34 depends on it (`sims-vm` `primitives/expression.rs`). So a tree whose `.air`
-may read global 34 (`may_read_global_34`) keeps every Expression main keeps:
+may read global 34 (`may_read_global_34`) keeps or drops an Expression exactly where main does.
+Keeping one main drops is no safer than the reverse: a read of global 34 before any other
+Expression faults on main and succeeds after a kept save. So such a tree takes main's rules:
 
 - such a read is a `global[34]` operand, a `global[..]` whose index is not a literal, a
   `scope(6, ..)` cell, or a raw `op` (its opcode a number or a constant);
 - a text tree takes `Unknown`, which is main's rule;
 - out-operands are not definitions there (section 5), so they make no store dead;
-- no pass drops its entry save: neither the optimizer (`drop_unread_entry_save_node`, which main
-  runs in a tree that formats no text) nor the final checks in `finish_body` (the raw-layout path
-  and the text path).
+- a `random` defines its destination only with a literal range (`DrawRanges::Literal`, main's
+  rule from section 2), wherever that decides whether the entry save or a pin's copies go;
+- the entry save goes where main drops it, in the optimizer (`drop_unread_entry_save_node`) and
+  the raw-layout path, and the text checks keep it as main's text rule does;
+- the pinned slot pins as on main, without section 5's text guard.
 
 The rule is a permission, not an obligation. As on main, dead-store elimination drops an unread
 save whose next node ignores the last result. It does this whatever the text reads, because the
@@ -133,7 +137,10 @@ declaration order, so generated names no longer matter.
   field after a dot and the tree a raw `call x` or `subroutine(x)` names do not count. A raw
   block may read `__self_obj` or `__saved_stack_obj`. It may not declare a local, constant or
   label of either name in a tree whose lowering declares that name too
-  (`raw_reserved_declarations`, checked in `finish`). Elsewhere, as on main, it may. A source
+  (`raw_reserved_declarations`, checked in `finish`). Elsewhere, as on main, it may. Code a
+  constant condition discards declares nothing. A raw block's own local, constant or label named
+  `__self_obj` is not the entry object either, so an inherited tree with one gets no entry save
+  for it, as on main. A source
   constant named
   `__self_obj` is a constant to the raw blocks that read it, not the entry object, and so is a
   qualified constant such as `__self_obj.tuning`, which a raw block may declare.
@@ -174,8 +181,10 @@ declaration order, so generated names no longer matter.
     entry-save drop in non-text trees already ignores it.
   - A raw block in an inlined helper or under a cleanup may branch only to its own labels. That
     check now covers raw `loop` bodies too.
-  - A padded raw primitive (`… pad 0xNN`) counts as the primitive it wraps, both for moving the
-    cursor and for formatting text.
+  - A padded raw primitive (`… pad 0xNN`) is still not read as the primitive it wraps, as on
+    main, either for moving the cursor or for formatting text. Reading it that way changes which
+    trees get an entry save and so moves the frame words their text reads; it is left for a
+    change of its own.
 - **The pinned `push_interaction` slot (`mir/pipeline.rs`).** `pin_in_place` makes a pushed
   handle live in word 0 and drops its copies, which moves every named local down a word and fills
   word 0 from the start. Section 2 lets it apply to more trees (a `random` with a BCON range now
@@ -200,7 +209,8 @@ declaration order, so generated names no longer matter.
   fault leaves then differ from the unoptimized tree's. This branch applies the same rules to
   more trees, namely a store an out-operand kills (above), the save of a text tree that reads no
   moved word (section 1) and a pin enabled by a BCON range (above). It adds no rule of its own
-  that removes an Expression.
+  that removes an Expression. A tree that may read global 34 is the exception to applying them
+  more widely: there the branch keeps and drops exactly what main does (section 1).
 
 ## Verification
 
@@ -216,7 +226,8 @@ declaration order, so generated names no longer matter.
   - `tests/v2_r3_fixes.rs` (synthetic) covers each fix and its negative cases: kept saves (including
     the `idle` scratch word), a later literal reaching earlier trees, read-first helper locals, an
     out-operand's unwritten exit, the kept `self` switch and `job_data` copy, raw blocks' own
-    entry-object names, and the pinned slot under text.
+    entry-object names (including discarded code and inherited trees), main's
+    choices in trees that may read global 34, and the pinned slot under text.
   - The `opt.rs` unit tests cover the pipeline's text veto.
 
 ## What would reopen this

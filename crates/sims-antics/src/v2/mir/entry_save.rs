@@ -17,6 +17,7 @@ use super::*;
 pub(crate) fn drop_unread_entry_save(
     body: &str,
     text_unmoved: &dyn Fn(&str, &str) -> bool,
+    ranges: DrawRanges,
 ) -> Option<String> {
     const SAVE: &str = "let __self_obj = stack_obj;";
     // Deleting the node would shift numeric branch targets (`-> true: 3`), and deleting the
@@ -67,7 +68,7 @@ pub(crate) fn drop_unread_entry_save(
         .count()
         > 1;
     let defined = match parse_body(&split) {
-        Some(nodes) => locals_defined_before_reads(&nodes),
+        Some(nodes) => locals_defined_before_reads(&nodes, ranges),
         None => !moves_a_local,
     };
     if !defined {
@@ -186,13 +187,18 @@ pub(crate) fn forward_save_block(nodes: &mut [Stmt], map: &BTreeMap<String, Stri
 /// that moves down a frame word is read before it is written. `text_reads` says the tree's text
 /// may read a frame word (`FrameFacts::text_reads`): then a body that formats text keeps the
 /// save here, and the pipeline decides once the frame is final.
-pub(crate) fn drop_unread_entry_save_node(nodes: &mut Vec<Stmt>, text_reads: bool) {
+/// `ranges` says which Random Number ranges define their destination ([`DrawRanges`]).
+pub(crate) fn drop_unread_entry_save_node(
+    nodes: &mut Vec<Stmt>,
+    text_reads: bool,
+    ranges: DrawRanges,
+) {
     let Some(name) = entry_save(nodes) else {
         return;
     };
     if !mentions(&nodes[1..], name)
         && !(text_reads && nodes_format_text(&nodes[1..]))
-        && locals_defined_before_reads(&nodes[1..])
+        && locals_defined_before_reads(&nodes[1..], ranges)
     {
         nodes.remove(0);
     }

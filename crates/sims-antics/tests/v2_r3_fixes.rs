@@ -437,23 +437,6 @@ fn an_out_operand_keeps_the_old_value_on_the_exit_it_does_not_write() {
     assert!(a.contains("= 7;"), "the initial store stays:\n{a}");
 }
 
-/// A padded raw action string formats text like a plain one, so a string that may read a
-/// moved word keeps the save.
-#[test]
-fn a_padded_raw_text_primitive_keeps_the_save() {
-    let members = r#"    tree a (sim: Sim) {
-        if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
-            return false;
-        }
-        let n = sim.person[3];
-        stack_obj.attr[0] = n;
-        // The space before `(` keeps the plain text scan from seeing the primitive.
-        raw { action_string (table: 301, index: 2) pad 0xff; }
-    }"#;
-    let air = expand("raw_padded_text.antics", &obj("Was $Local:0", members));
-    assert!(tree(&air, "a").contains(SAVE), "{air}");
-}
-
 /// `@frame(locals: K)` sizes the frame with no `min_locals` floor, so an `@slot` word the body
 /// never names does not hold the named locals above it: dropping the save would move the
 /// `idle` scratch word that `$Local:1` reads.
@@ -476,8 +459,9 @@ fn frame_locals_sets_no_allocation_floor() {
 }
 
 /// The inherit check reads the entry object from `.air` tokens, so a comment naming it is not a
-/// read. A raw block may not declare a local, constant or label of a name its tree's lowering
-/// declares too, and may declare one otherwise.
+/// read, and neither is a raw block's own local, constant or label of that name: an inherited
+/// tree gets no entry save for them, as on main. A raw block may not declare a name its tree's
+/// lowering declares too, and may declare one otherwise. Discarded code declares nothing.
 #[test]
 fn inherit_check_ignores_comments_and_raw_blocks_declare_no_compiler_local() {
     let quiet = |raw: &str| {
@@ -492,14 +476,32 @@ fn inherit_check_ignores_comments_and_raw_blocks_declare_no_compiler_local() {
         "inherit_comment.antics",
         &quiet("raw {\n            // __self_obj\n            temp[0] := 1;\n        }"),
     );
-    for raw in [
+    let own = [
         "raw { let __self_obj = 1; temp[0] := __self_obj; }",
         "raw { const __self_obj = 7; temp[0] := __self_obj; }",
         "raw { @__self_obj: temp[0] := 1; }",
-    ] {
+    ];
+    for raw in own {
+        let air = expand("inherit_own.antics", &quiet(raw));
+        assert!(
+            !tree(&air, "quiet").contains("= stack_obj"),
+            "{raw}:\n{air}"
+        );
+    }
+    // A Sim tree whose lowering saves the entry object refuses a raw declaration of its name.
+    let saving = |raw: &str| {
+        obj(
+            "Plain",
+            &format!(
+                "    tree s (sim: Sim) {{\n        set_to_next(all, dest: stack_obj);\n        \
+                 stop_all_sounds(target: self);\n        {raw}\n    }}"
+            ),
+        )
+    };
+    for raw in own {
         let err = compile_v2_source(
-            "inherit_reserved.antics",
-            &quiet(raw),
+            "saving_reserved.antics",
+            &saving(raw),
             &PackResolverConfig::default(),
         )
         .expect_err(raw);
@@ -508,6 +510,12 @@ fn inherit_check_ignores_comments_and_raw_blocks_declare_no_compiler_local() {
             "{raw}: {err}"
         );
     }
+    // Code a constant condition discards emits nothing, so it declares nothing either.
+    let air = expand(
+        "discarded_reserved.antics",
+        &saving("if false {\n            raw { let __self_obj = 1; }\n        }"),
+    );
+    assert!(tree(&air, "s").contains(SAVE), "{air}");
     // A tree whose lowering declares no such local may declare one, as on main.
     expand(
         "inherit_saved_name.antics",
@@ -690,26 +698,48 @@ fn a_tree_that_may_read_global_34_keeps_stores_out_operands_kill() {
     assert!(!tree(&air, "a").contains("= 7;"), "{air}");
 }
 
-/// A raw `op` whose opcode is a named constant may be an Expression reading global 34 too.
+/// A raw `op` whose opcode is a named constant may be an Expression reading global 34 too, so
+/// a text tree with one keeps its unread entry save as on main, where text that reads no word
+/// would otherwise let it go.
 #[test]
 fn a_raw_op_with_a_named_opcode_may_read_global_34() {
+    let src = |raw: &str| {
+        obj(
+            "Plain",
+            &format!(
+                r#"    const EXPR = 2;
+    tree a (sim: Sim) {{
+        set_to_next(all, dest: stack_obj);
+        {raw}
+        dialog(kind: ok, title: title, message: msg);
+    }}"#
+            ),
+        )
+    };
+    let air = expand(
+        "raw_named_op.antics",
+        &src("raw { op EXPR (0, 0, 34, 0, 0, 3, 14, 6); }"),
+    );
+    assert!(tree(&air, "a").contains(SAVE), "{air}");
+    let air = expand("raw_plain_op.antics", &src("raw { temp[2] := 1; }"));
+    assert!(!tree(&air, "a").contains(SAVE), "{air}");
+}
+
+/// Keeping an unread entry save is not always safe: it is an Expression, and a read of global
+/// 34 before any other Expression faults without one. A raw-layout tree that main drops the
+/// save of drops it too.
+#[test]
+fn an_unread_entry_save_goes_before_a_global_34_read_as_on_main() {
     let src = obj(
         "Plain",
-        r#"    const EXPR = 2;
-    tree a (sim: Sim) {
-        let r: i16;
-        random_into(r, 1);
-        stop_all_sounds(target: self);
-        raw { op EXPR (0, 0, 34, 0, 0, 3, 14, 6); }
+        r#"    @frame(locals: 1) tree a (sim: Sim) {
+        raw { temp[2] := global[34]; }
         set_to_next(all, dest: stack_obj);
+        return true;
     }"#,
     );
-    let air = expand("raw_named_op.antics", &src);
-    let a = tree(&air, "a");
-    assert!(
-        a.contains("stack_obj := __self_obj;"),
-        "self is selected by a switch:\n{a}"
-    );
+    let air = expand("global34_first.antics", &src);
+    assert!(!tree(&air, "a").contains(SAVE), "{air}");
 }
 
 /// A raw block may declare a qualified constant whose first part is spelled like the entry
@@ -727,7 +757,10 @@ fn a_qualified_raw_constant_is_not_the_entry_object() {
     assert!(!tree(&air, "a").contains("= stack_obj"), "{air}");
 }
 
-/// The raw-layout path keeps the entry save of a tree that may read global 34.
+/// The raw-layout path keeps the entry save of a tree that may read global 34 where main does:
+/// there a `random` with a constant range does not define its destination (main's literal-range
+/// rule), so the local after the save is read before it is written. Elsewhere the range defines
+/// it and the unread save goes.
 #[test]
 fn a_raw_layout_tree_that_may_read_global_34_keeps_its_entry_save() {
     let src = obj(
@@ -743,6 +776,11 @@ fn a_raw_layout_tree_that_may_read_global_34_keeps_its_entry_save() {
     );
     let air = expand("raw_global34.antics", &src);
     assert!(tree(&air, "a").contains(SAVE), "{air}");
+    let air = expand(
+        "raw_global5.antics",
+        &src.replace("global[34]", "global[5]"),
+    );
+    assert!(!tree(&air, "a").contains(SAVE), "{air}");
 }
 
 /// A raw `call x` or `subroutine(x)` names a tree, not the entry object, even when the tree is

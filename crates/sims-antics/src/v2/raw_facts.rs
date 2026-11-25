@@ -175,12 +175,10 @@ fn note_target(t: &Target, facts: &mut RawFacts) {
 }
 
 fn prim_formats_text(prim: &PrimitiveCall) -> bool {
-    match prim {
-        PrimitiveCall::Dialog { .. } | PrimitiveCall::ActionString { .. } => true,
-        // A padded encoding runs the primitive it wraps.
-        PrimitiveCall::Padded { call, .. } => prim_formats_text(call),
-        _ => false,
-    }
+    matches!(
+        prim,
+        PrimitiveCall::Dialog { .. } | PrimitiveCall::ActionString { .. }
+    )
 }
 
 #[cfg(test)]
@@ -205,11 +203,6 @@ mod tests {
             None,
         );
         assert!(f.positional_target && f.defines_label && f.declares_local);
-        let f = raw_facts("action_string(table: 301, index: 2) pad 0xff;", None);
-        assert!(
-            f.formats_text,
-            "a padded primitive is the primitive it wraps"
-        );
         let f = raw_facts("temp[0] := K; animate(clip: K, table: 0, events: 0);", None);
         assert!(!f.positional_target, "a lenient parse reads constants as 0");
         assert!(

@@ -15,7 +15,9 @@ pub(crate) fn is_push_interaction(text: &str) -> bool {
 /// (`local[0] := s;` right before each `push_interaction(.., object: 0, ..)`), makes `s` live in
 /// `local[0]` itself and drops the copies. `.air` places named locals after `local[0]`, a pinned
 /// tree has no `raw`, and only the push reads the slot, so the slot and `s` always agree.
-pub(crate) fn pin_in_place(body: &str) -> String {
+///
+/// `ranges` says which Random Number ranges define their destination ([`DrawRanges`]).
+pub(crate) fn pin_in_place(body: &str, ranges: DrawRanges) -> String {
     const PIN: &str = "local[0]";
     let Some(mut nodes) = parse_body(body) else {
         return body.to_owned();
@@ -36,7 +38,7 @@ pub(crate) fn pin_in_place(body: &str) -> String {
         // read before it is written (frame words keep what an earlier frame left there).
         || !lets
             .iter()
-            .all(|name| defined_before_reads(&nodes, name, &mut false))
+            .all(|name| defined_before_reads(&nodes, name, &mut false, ranges))
     {
         return body.to_owned();
     }
@@ -295,10 +297,15 @@ pub(crate) fn check_pins(nodes: &[Stmt], copied: &mut BTreeSet<String>, ok: &mut
 /// says it is written on entry). A local read before any write reads whatever its frame word
 /// held, so moving it to another word would change the value read. Writes are plain stores and
 /// primitives' out-operands ([`out_operand_write`]) on the exits that write them.
-pub(crate) fn defined_before_reads(nodes: &[Stmt], name: &str, defined: &mut bool) -> bool {
+pub(crate) fn defined_before_reads(
+    nodes: &[Stmt],
+    name: &str,
+    defined: &mut bool,
+    ranges: DrawRanges,
+) -> bool {
     // A `break` outside any loop has no loop exit to reach; the parser never produces one.
     let mut breaks = None;
-    flow_defined(nodes, name, defined, &mut breaks)
+    flow_defined(nodes, name, defined, &mut breaks, ranges)
 }
 
 /// The `&&` of two path states where either may be absent (no path reaches the join that way).
@@ -321,6 +328,7 @@ pub(crate) fn flow_defined(
     name: &str,
     defined: &mut bool,
     breaks: &mut Option<bool>,
+    ranges: DrawRanges,
 ) -> bool {
     let reads = |text: &str| idents(text).contains(&name);
     for n in nodes {
@@ -349,7 +357,7 @@ pub(crate) fn flow_defined(
                     }
                     *defined = true;
                 }
-                _ => match out_operand_write(l, name) {
+                _ => match out_operand_write_with(l, name, ranges) {
                     // Both exits of a bare statement reach the next line, so it defines the
                     // cell only when every exit writes it.
                     Some((rest, exit)) => {
@@ -366,20 +374,20 @@ pub(crate) fn flow_defined(
                 },
             },
             Stmt::If { arms, else_body } => {
-                if !if_chain_defined(arms, else_body.as_deref(), name, defined, breaks) {
+                if !if_chain_defined(arms, else_body.as_deref(), name, defined, breaks, ranges) {
                     return false;
                 }
             }
             Stmt::While { cond, body } => {
                 let (mut d, exit) = match cond {
-                    Some(c) => match cond_defines(c, name, *defined) {
+                    Some(c) => match cond_defines(c, name, *defined, ranges) {
                         Some((on_true, on_false)) => (on_true, Some(on_false)),
                         None => return false,
                     },
                     None => (*defined, None),
                 };
                 let mut inner = None;
-                if !flow_defined(body, name, &mut d, &mut inner) {
+                if !flow_defined(body, name, &mut d, &mut inner, ranges) {
                     return false;
                 }
                 // A loop nothing leaves never falls through.
@@ -398,23 +406,24 @@ pub(crate) fn if_chain_defined(
     name: &str,
     defined: &mut bool,
     breaks: &mut Option<bool>,
+    ranges: DrawRanges,
 ) -> bool {
     let Some(((cond, body), rest)) = arms.split_first() else {
         return match else_body {
             // No `else`: control falls through with what the conditions defined.
             None => true,
-            Some(body) => flow_defined(body, name, defined, breaks),
+            Some(body) => flow_defined(body, name, defined, breaks, ranges),
         };
     };
-    let Some((on_true, on_false)) = cond_defines(cond, name, *defined) else {
+    let Some((on_true, on_false)) = cond_defines(cond, name, *defined, ranges) else {
         return false;
     };
     let mut d_then = on_true;
-    if !flow_defined(body, name, &mut d_then, breaks) {
+    if !flow_defined(body, name, &mut d_then, breaks, ranges) {
         return false;
     }
     let mut d_else = on_false;
-    if !if_chain_defined(rest, else_body, name, &mut d_else, breaks) {
+    if !if_chain_defined(rest, else_body, name, &mut d_else, breaks, ranges) {
         return false;
     }
     *defined = d_then && d_else;
@@ -423,13 +432,18 @@ pub(crate) fn if_chain_defined(
 
 /// What a branch condition leaves defined on its true and false exits, or `None` when it reads
 /// `name` before anything writes it.
-pub(crate) fn cond_defines(cond: &str, name: &str, defined: bool) -> Option<(bool, bool)> {
+pub(crate) fn cond_defines(
+    cond: &str,
+    name: &str,
+    defined: bool,
+    ranges: DrawRanges,
+) -> Option<(bool, bool)> {
     let reads = |text: &str| idents(text).contains(&name);
     let (negated, inner) = match cond.trim_start().strip_prefix('!') {
         Some(rest) => (true, rest),
         None => (false, cond),
     };
-    let Some((rest, exit)) = out_operand_write(inner, name) else {
+    let Some((rest, exit)) = out_operand_write_with(inner, name, ranges) else {
         return (defined || !reads(cond)).then_some((defined, defined));
     };
     if !defined && reads(&rest) {
@@ -465,6 +479,37 @@ pub(crate) enum WriteExit {
 ///   true exit; with flag 1 a missing number takes the false exit unwritten, and without it
 ///   the row is added, so the false exit never runs.
 pub(crate) fn out_operand_write(text: &str, name: &str) -> Option<(String, WriteExit)> {
+    out_operand_write_with(text, name, DrawRanges::NotGlobal)
+}
+
+/// Which Random Number ranges a pass counts as leaving the draw in the destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrawRanges {
+    /// Every range not spelled with a global ([`range_may_take_draw`]).
+    NotGlobal,
+    /// Literal ranges only: main's rule. A tree that may read global 34 keeps it, since a
+    /// range that defines the destination lets the entry save or a pin copy go, an Expression
+    /// whose scratch-pointer write that read may depend on.
+    Literal,
+}
+
+impl DrawRanges {
+    /// The rule for a tree that may (`true`) or may not read global 34.
+    pub(crate) fn for_tree(may_read_global_34: bool) -> Self {
+        if may_read_global_34 {
+            DrawRanges::Literal
+        } else {
+            DrawRanges::NotGlobal
+        }
+    }
+}
+
+/// [`out_operand_write`] with the Random Number range rule `ranges`.
+pub(crate) fn out_operand_write_with(
+    text: &str,
+    name: &str,
+    ranges: DrawRanges,
+) -> Option<(String, WriteExit)> {
     let t = text.trim();
     let t = t.strip_suffix(';').unwrap_or(t).trim_end();
     let open = t.find('(')?;
@@ -485,7 +530,11 @@ pub(crate) fn out_operand_write(text: &str, name: &str) -> Option<(String, Write
         "random" => {
             let first = args.first()?;
             let range = args.get(1)?.trim();
-            (first.trim() == name && !range_may_take_draw(range)).then_some((0, WriteExit::Both))?
+            let defines = match ranges {
+                DrawRanges::NotGlobal => !range_may_take_draw(range),
+                DrawRanges::Literal => parse_int(range).is_some(),
+            };
+            (first.trim() == name && defines).then_some((0, WriteExit::Both))?
         }
         "animate" => {
             let i = named("local")?;
@@ -580,11 +629,11 @@ pub(crate) fn drop_pins(nodes: &mut Vec<Stmt>) {
 }
 
 /// Whether every named local in `nodes` is written before anything reads it.
-pub(crate) fn locals_defined_before_reads(nodes: &[Stmt]) -> bool {
+pub(crate) fn locals_defined_before_reads(nodes: &[Stmt], ranges: DrawRanges) -> bool {
     let mut lets = Vec::new();
     collect_lets(nodes, &mut lets);
     lets.iter()
-        .all(|name| defined_before_reads(nodes, name, &mut false))
+        .all(|name| defined_before_reads(nodes, name, &mut false, ranges))
 }
 
 /// The coalescing class of a local, or `None` when it must keep its own slot.

@@ -92,8 +92,6 @@ pub(super) fn raw_primitive_clobbers_stack_obj(prim: &crate::ast::PrimitiveCall)
         P::ExprRaw { lhs, .. } => is_stack_obj_operand(lhs),
         P::Random { dst, .. } | P::GetDirectionTo { dst, .. } => is_stack_obj_operand(dst),
         P::Relationship { value, .. } => is_stack_obj_operand(value),
-        // A padded encoding runs the primitive it wraps.
-        P::Padded { call, .. } => raw_primitive_clobbers_stack_obj(call),
         _ => false,
     }
 }

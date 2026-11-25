@@ -119,10 +119,15 @@ impl<'a> TreeLowerer<'a> {
         };
         // The body reads the entry object when an `.air` token names it (a comment does not). A
         // source constant of that name, which a raw block reads as a constant, is not the entry
-        // object.
-        let mut declares_self_obj = self.has_self_obj_local;
+        // object, and neither is a raw block's own local or label of that name. The inherit
+        // check's Sim lowering emits no entry save of its own (`track_stack_obj`), only this one.
+        let mut declares_self_obj = self.has_self_obj_local && !self.inherited_entry_save;
         if self.inherited_entry_save
             && !self.raw_consts.contains_key(mir::SELF_OBJ)
+            && !self
+                .raw_reserved
+                .iter()
+                .any(|(name, _)| *name == mir::SELF_OBJ)
             && names_token(&out, mir::SELF_OBJ)
         {
             let save = mir::StackObjOp::Save(mir::SELF_OBJ).text();

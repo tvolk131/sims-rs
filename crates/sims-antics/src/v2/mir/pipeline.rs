@@ -36,13 +36,15 @@ pub(crate) struct FrameFacts<'a> {
 pub(crate) fn finish_body(out: String, facts: &FrameFacts<'_>) -> String {
     let reads_text = reads_a_word(&facts.text_reads);
     let unmoved = |before: &str, after: &str| text_words_unmoved(before, after, facts);
-    // A tree that may read global 34 keeps its entry save, an Expression whose scratch-pointer
-    // write that read may depend on. (Keeping an unread save is always correct.)
+    // A tree that may read global 34 keeps main's rules: the entry save and the pin's copies are
+    // Expressions, whose scratch-pointer writes that read may depend on, so the tree neither
+    // keeps nor drops one where main would not. Its text reads are `Unknown` when it formats
+    // text (`TreeLowerer::finish`), which keeps the save as main's text rule does.
     let may_read_global_34 = may_read_global_34(&out);
+    let ranges = DrawRanges::for_tree(may_read_global_34);
     let out = if facts.keep_layout {
         if facts.has_self_obj_local
-            && !may_read_global_34
-            && let Some(trimmed) = drop_unread_entry_save(&out, &unmoved)
+            && let Some(trimmed) = drop_unread_entry_save(&out, &unmoved, ranges)
         {
             trimmed
         } else {
@@ -52,14 +54,15 @@ pub(crate) fn finish_body(out: String, facts: &FrameFacts<'_>) -> String {
         let out = crate::v2::opt::optimize_tree_body(&out, reads_text, facts.local_origins);
         // Pinning moves every named local down a word and fills word 0 from the start, so a
         // tree whose text may read a frame word keeps its copies unless the text reads neither
-        // word 0 nor a word that changes hands.
+        // word 0 nor a word that changes hands. A tree that may read global 34 pins as on main.
         let out = if facts.pinned {
-            let pinned = pin_in_place(&out);
-            let text_ok = match &facts.text_reads {
-                TableLocals::Known(words) if words.is_empty() => true,
-                TableLocals::Known(words) => !words.contains(&0) && unmoved(&out, &pinned),
-                TableLocals::Unknown => false,
-            };
+            let pinned = pin_in_place(&out, ranges);
+            let text_ok = may_read_global_34
+                || match &facts.text_reads {
+                    TableLocals::Known(words) if words.is_empty() => true,
+                    TableLocals::Known(words) => !words.contains(&0) && unmoved(&out, &pinned),
+                    TableLocals::Unknown => false,
+                };
             if pinned == out || text_ok {
                 pinned
             } else {
@@ -73,8 +76,7 @@ pub(crate) fn finish_body(out: String, facts: &FrameFacts<'_>) -> String {
         // changes hands.
         if facts.has_self_obj_local
             && reads_text
-            && !may_read_global_34
-            && let Some(trimmed) = drop_unread_entry_save(&out, &unmoved)
+            && let Some(trimmed) = drop_unread_entry_save(&out, &unmoved, ranges)
         {
             trimmed
         } else {

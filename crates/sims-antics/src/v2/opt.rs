@@ -42,9 +42,11 @@ pub(crate) fn optimize_tree_body(
         return body.to_owned();
     };
     let before = nodes.clone();
-    // A tree that may read global 34 keeps every Expression main keeps (`out_defs` off) and
-    // its entry save: the read depends on the scratch pointer an Expression sets.
+    // A tree that may read global 34 keeps main's rules (`out_defs` off, literal draw ranges):
+    // the read depends on the scratch pointer an Expression sets, so the tree keeps or drops
+    // an Expression exactly where main does.
     let out_defs = !may_read_global_34(body);
+    let ranges = DrawRanges::for_tree(!out_defs);
     for _ in 0..8 {
         let snapshot = nodes.clone();
         drop_unreachable(&mut nodes);
@@ -57,9 +59,7 @@ pub(crate) fn optimize_tree_body(
         merge_duplicate_tails(&mut nodes);
         coalesce_locals(&mut nodes, text_reads, origins, out_defs);
         drop_unused_decls(&mut nodes, text_reads);
-        if out_defs {
-            drop_unread_entry_save_node(&mut nodes, text_reads);
-        }
+        drop_unread_entry_save_node(&mut nodes, text_reads, ranges);
         if nodes == snapshot {
             break;
         }
@@ -670,7 +670,7 @@ fn collect_out_written(nodes: &[Stmt], locals: &BTreeSet<String>, out: &mut BTre
 
 #[cfg(test)]
 mod tests {
-    use super::{drop_unread_entry_save, optimize_tree_body, parse_body, pin_in_place};
+    use super::{DrawRanges, drop_unread_entry_save, optimize_tree_body, parse_body, pin_in_place};
     use std::collections::BTreeMap;
 
     #[test]
@@ -824,7 +824,10 @@ mod tests {
         );
         // Not when a local read before it is written would move to another frame word.
         let body = "    let __self_obj = stack_obj;\n    let __v_x_0;\n    temp[0] := __v_x_0;\n    call 300(temps);\n    return true;\n";
-        assert_eq!(drop_unread_entry_save(body, &|_, _| true), None);
+        assert_eq!(
+            drop_unread_entry_save(body, &|_, _| true, DrawRanges::NotGlobal),
+            None
+        );
         // A raw line the structured pass cannot parse falls back to the declarations: written
         // where they come into scope, the save goes; declared without a value, it stays.
         let raw_line = "    if !call 281(0, 0) {\n    if push_interaction(menu: 2, object: 0, priority: 0, flags: 7) { return true; }\n    }\n";
@@ -833,13 +836,19 @@ mod tests {
         );
         assert!(parse_body(&body).is_none());
         assert_eq!(
-            drop_unread_entry_save(&body, &|_, _| true).as_deref(),
+            drop_unread_entry_save(&body, &|_, _| true, DrawRanges::NotGlobal).as_deref(),
             Some(&body["    let __self_obj = stack_obj;\n".len()..])
         );
         // The pipeline's text check vetoes the drop when a word the text reads changes hands.
-        assert_eq!(drop_unread_entry_save(&body, &|_, _| false), None);
+        assert_eq!(
+            drop_unread_entry_save(&body, &|_, _| false, DrawRanges::NotGlobal),
+            None
+        );
         let body = body.replace("let __v_x_0 = 1;", "let __v_x_0;");
-        assert_eq!(drop_unread_entry_save(&body, &|_, _| true), None);
+        assert_eq!(
+            drop_unread_entry_save(&body, &|_, _| true, DrawRanges::NotGlobal),
+            None
+        );
         // Scope 27 (sprite flags) reads the stack object, so the switch before it stays.
         let body = "    stack_obj := my.id;\n    temp[0] := 0;\n    scope(27, 0) := 1;\n    return true;\n";
         assert_eq!(optimize_tree_body(body, true, &BTreeMap::new()), body);
@@ -848,17 +857,20 @@ mod tests {
         assert!(optimize_tree_body(body, true, &BTreeMap::new()).contains("icon: __self_obj"));
         // Raw numeric targets keep the line-based save drop away.
         let body = "    let __self_obj = stack_obj;\n    stack_obj := my.id;\n    random(temp[0], 1) -> true: 3, false: 3;\n    return true;\n";
-        assert_eq!(drop_unread_entry_save(body, &|_, _| true), None);
+        assert_eq!(
+            drop_unread_entry_save(body, &|_, _| true, DrawRanges::NotGlobal),
+            None
+        );
         // A local read before any write is not moved into the pin slot.
         let body = "    let o;\n    local[0] := o;\n    push_interaction(menu: 0, object: 0, priority: 2, flags: 3, icon: 0);\n    return true;\n";
-        assert_eq!(pin_in_place(body), body);
+        assert_eq!(pin_in_place(body, DrawRanges::NotGlobal), body);
         // Nor when another local read before any write would move to a different word.
         let body = "    let __v_o_0 = stack_obj;\n    let __v_inherited_1;\n    temp[0] := __v_inherited_1;\n    local[0] := __v_o_0;\n    push_interaction(menu: 0, object: 0, priority: 2, flags: 3, icon: 0);\n    return true;\n";
-        assert_eq!(pin_in_place(body), body);
+        assert_eq!(pin_in_place(body, DrawRanges::NotGlobal), body);
         // With every local written first, the pin applies.
         let body = "    let __v_o_0 = stack_obj;\n    local[0] := __v_o_0;\n    push_interaction(menu: 0, object: 0, priority: 2, flags: 3, icon: 0);\n    return true;\n";
         assert_eq!(
-            pin_in_place(body),
+            pin_in_place(body, DrawRanges::NotGlobal),
             "    local[0] := stack_obj;\n    push_interaction(menu: 0, object: 0, priority: 2, flags: 3, icon: 0);\n    return true;\n"
         );
     }
