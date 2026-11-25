@@ -1059,8 +1059,12 @@ impl ExplicitStackOps {
                         .filter_map(|p| p.default.as_ref())
                         .any(|expr| self.in_expr(expr, env, &module, is_local)))
         } else {
-            // Make New Character puts the new neighbor in the stack object on success.
+            // Make New Character puts the new neighbor in the stack object on success. Find Best
+            // Interaction selects the object it found for `gosub_found_action`; it counts only
+            // as a reassignment, which keeps its pick across foreign reads without making the
+            // tree explicit.
             name == "find_best_object"
+                || (self.assignments && name == "find_best_interaction")
                 || name == "make_new_character"
                 || (name == "set_to_next" && set_to_next_steps_stack_obj(args))
                 || (name == "create_object" && has_create_dest(args))

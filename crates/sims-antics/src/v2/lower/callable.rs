@@ -104,16 +104,22 @@ impl<'a> TreeLowerer<'a> {
                     ));
                 }
                 // Discarded code emits no call.
-                if self.inherit_tree
-                    && self.checking_discarded == 0
-                    && let Some(caller) = &self.tree_display
-                {
-                    self.env
-                        .inherit_calls
-                        .borrow_mut()
-                        .calls_sim
-                        .entry(caller.clone())
-                        .or_insert(span);
+                if self.checking_discarded == 0 {
+                    let mut facts = self.env.inherit_calls.borrow_mut();
+                    if self.inherit_tree {
+                        if let Some(caller) = &self.tree_display {
+                            facts.calls_sim.entry(caller.clone()).or_insert(span);
+                        }
+                    } else {
+                        // A Sim tree reaching a Sim-only inherit tree passes the restriction on.
+                        facts.edges.push((
+                            self.tree_display.clone(),
+                            self.object_reachable,
+                            sig.display.clone(),
+                            false,
+                            span,
+                        ));
+                    }
                 }
                 args = &args[1..];
             }
@@ -127,16 +133,16 @@ impl<'a> TreeLowerer<'a> {
                 ));
             }
             CallContext::Inherit if self.checking_discarded == 0 => {
-                let caller = self
-                    .inherit_tree
-                    .then(|| self.tree_display.clone())
-                    .flatten();
+                let named =
+                    self.inherit_tree || matches!(self.tree_ctx, TreeContext::SimOnObject { .. });
+                let caller = named.then(|| self.tree_display.clone()).flatten();
                 let from_object = self.object_reachable
                     || (!self.inherit_tree && matches!(self.tree_ctx, TreeContext::ObjectSelf));
                 self.env.inherit_calls.borrow_mut().edges.push((
                     caller,
                     from_object,
                     sig.display.clone(),
+                    true,
                     span,
                 ));
             }

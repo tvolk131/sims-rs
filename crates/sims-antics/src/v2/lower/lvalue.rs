@@ -54,6 +54,17 @@ impl<'a> TreeLowerer<'a> {
 
     /// Resolves an assignable place. A foreign cell of `stack_obj` itself is the direct `stack.`
     /// cell: nothing is switched around it.
+    /// [`Self::resolve_lvalue`] for a place that is held while other code runs (a `&mut`
+    /// argument, the place `inc_lt`/`dec_gt` steps after evaluating its bound). Such a place
+    /// does not use a temp-indexed scope ([`Self::temp_word_index`]): that cell reads its index
+    /// from the temp at each use, and the code in between may rewrite it.
+    pub(super) fn resolve_borrowed_lvalue(&mut self, expr: &V2Expr) -> Result<LValue> {
+        let outer = std::mem::replace(&mut self.borrowing_place, true);
+        let lval = self.resolve_lvalue(expr);
+        self.borrowing_place = outer;
+        lval
+    }
+
     pub(super) fn resolve_lvalue(&mut self, expr: &V2Expr) -> Result<LValue> {
         Ok(match self.resolve_lvalue_inner(expr)? {
             LValue::ForeignAttr {

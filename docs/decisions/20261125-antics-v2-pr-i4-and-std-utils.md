@@ -89,6 +89,10 @@ semantics nothing checks.
   Sim).
 - A functional's action and guard count as object callers too: `run_functional` and Find Best
   Object run them on whichever object asks.
+- A Sim tree that calls such an inherit tree (or another Sim tree that does) passes the
+  restriction on, so a functional may not call it either. Without this, the new inherit→Sim
+  calls would open a typed path from an object-run functional, through a Sim tree, to a Sim
+  tree running on the object.
 - Calls from interactions, Sim trees and other inherit trees are allowed.
 - Code a literal condition discards emits no call, so it adds no fact.
 - A Sim tree reached this way follows PR D's rule: its `self` is the stack object, which may be
@@ -183,7 +187,10 @@ put back the entry object after the read, not `o`.
   inlined condition helper holding one, whose arms are captured before the helper is lowered,
   and a `run_functional` argument holding one counts as moving the cursor.
 - Make New Character counts as a cursor move: on success it leaves the new neighbor in the
-  stack object. A raw block after a loop does not change the loop (PR H's `for ..
+  stack object.
+- Find Best Interaction counts as a reassignment (not an explicit cursor move), so a foreign
+  read keeps its pick for `gosub_found_action`. Making it explicit would refuse
+  `refresh(target: sim)` in trees that compile on `main`. A raw block after a loop does not change the loop (PR H's `for ..
   else` shape is kept).
 - PR D's `self` rule is unchanged, and so is the explicit-tree classification.
 - `for` loops still restore the entry object on exit (PR H's rule, pinned by its tests).
@@ -204,9 +211,10 @@ put back the entry object after the read, not `o`.
   the object's count faults after the first write lands).
 - A temp-indexed destination (`scope(27|30|31, k)`) is always staged: its index may alias a
   cell the right side reads.
-- A `&mut` to a temp-indexed cell copies the index at the call and sets it into `temp[0]`
-  before each use (as a run-time sprite index already was), so a helper that rewrites the
-  index temp still writes the borrowed cell.
+- A held place (a `&mut` argument, or the place `inc_lt`/`dec_gt` steps after evaluating its
+  bound) does not use a temp-indexed scope, which would read its index again at each use
+  (`resolve_borrowed_lvalue`). A sprite flag keeps `main`'s setup form, which copies the index
+  at the call. A temp-indexed person word cannot be borrowed, as on `main`.
 - The in-place shape `temp[4] := 1; temp[4] += stack.attr[0];` is still emitted for a `self`
   read in a Sim tree that never moves the cursor. It relies on PR D's contract that a Sim
   tree is entered with the stack object on an object of this kind. That shape predates this
@@ -250,8 +258,7 @@ first. An operand read through a cell indexed by `temp[0]` (`scope(27|30|31, 0)`
     - the lift corpus effect of `from_raw` constant folding is unchecked.
 - Not done:
   - checking a raw `call N` to a Sim tree from an inherit tree;
-  - a functional calling a Sim tree (directly, or through one that reaches a Sim-only inherit
-    tree) when an object runs the functional. The language types a functional's runner as its
+  - a functional calling a Sim tree directly when an object runs the functional. The language types a functional's runner as its
     `sim` binding, and Sim trees called from functionals predate this PR. Closing the gap
     needs a functional-runner type rather than one more inherit fact;
   - a short-circuit condition with a constant leaf (`temp[0] == 1 && false`) can still leave the

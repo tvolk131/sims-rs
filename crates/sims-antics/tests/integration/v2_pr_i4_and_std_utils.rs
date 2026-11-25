@@ -1388,26 +1388,46 @@ object "Pr I4 Tail" {
             assert!(t.contains("= stack.attr[0];"), "{t}");
         }
 
-        /// A `&mut` to a temp-indexed cell names the cell chosen at the call, even when the
-        /// helper rewrites the index temp.
+        /// A held place (a `&mut` argument, `inc_lt`'s place) does not use a temp-indexed scope,
+        /// which would read its index again at each use: a sprite flag keeps the setup form,
+        /// which copies the index at the call, and a temp-indexed person word is refused.
         #[test]
-        fn temp_indexed_borrows_keep_their_cell() {
+        fn held_places_do_not_use_temp_indexed_scopes() {
+            let helper = "    fn overwrite(word: &mut i16) {\n        temp[0] = 1;\n        *word = 42;\n    }";
             let t = air_of(
                 "borrow.antics",
-                "    fn overwrite(word: &mut i16) {\n        temp[0] = 1;\n        *word = 42;\n    }\n    \
-                 #[bhav] fn t(sim: Sim) {\n        overwrite(&mut self.sprite_flags[temp[0]]);\n        \
-                 overwrite(&mut sim.person[temp[0]]);\n    }",
+                &format!(
+                    "{helper}\n    #[bhav] fn t(sim: Sim) {{ overwrite(&mut self.sprite_flags[temp[0]]); }}"
+                ),
                 "t",
             );
-            for scope in ["27", "30"] {
-                expect_seq(
-                    "borrow",
-                    &t,
-                    &[
-                        "temp[0] := 1;",
-                        "temp[0] := __ref_idx_word_0;",
-                        &format!("scope({scope}, 0) := 42;"),
-                    ],
+            let snap = t.find("= temp[0];").expect("index copied");
+            let rewrite = t.find("temp[0] := 1;").expect("helper body");
+            let store = t.find("scope(27, 0) := 42;").expect("store");
+            assert!(snap < rewrite && rewrite < store, "{t}");
+            for (name, members) in [
+                (
+                    "borrow_person",
+                    format!(
+                        "{helper}\n    #[bhav] fn t(sim: Sim) {{ overwrite(&mut sim.person[temp[0]]); }}"
+                    ),
+                ),
+                (
+                    "borrow_stack_person",
+                    format!(
+                        "{helper}\n    #[bhav] fn t(sim: Sim) {{ overwrite(&mut stack_obj.person[temp[1]]); }}"
+                    ),
+                ),
+                (
+                    "inc_lt_person",
+                    "    #[bhav] fn t(sim: Sim) { if inc_lt(&mut sim.person[temp[1]], 12) { temp[2] = 1; } }"
+                        .to_owned(),
+                ),
+            ] {
+                expect_err(
+                    &format!("{name}.antics"),
+                    &object(&members),
+                    "index must be a compile-time constant",
                 );
             }
         }
@@ -1471,6 +1491,53 @@ object "Pr I4 Tail" {
                 "t",
             );
             assert!(t.contains("__pre_stack_obj"), "{t}");
+        }
+    }
+
+    /// Regressions from the third review round.
+    mod review_round_3 {
+        use super::*;
+
+        fn object(members: &str) -> String {
+            format!("object \"Pr I4 R3\" {{\n    guid: 0x7F40_0265;\n{members}\n}}\n")
+        }
+
+        /// A Sim tree that reaches a Sim-only inherit tree passes the restriction to its
+        /// callers: a functional may not call it.
+        #[test]
+        fn sim_trees_pass_on_the_inherit_restriction() {
+            let members = "    #[bhav] fn needs_sim(sim: Sim) -> bool { sim.fame > 0 }\n    \
+                 #[bhav] #[context(inherit)] fn inherited() -> bool { needs_sim(me) }\n    \
+                 #[bhav] fn bridge(sim: Sim) -> bool { inherited() }\n";
+            expect_err(
+                "bridge_functional.antics",
+                &object(&format!(
+                    "{members}    functional cook {{ run(sim) {{ bridge(sim); }} }}"
+                )),
+                "tree 'bridge' reaches a 'context = inherit' tree that runs a Sim tree",
+            );
+            // An interaction may still call it.
+            expand(
+                "bridge_interaction.antics",
+                &object(&format!(
+                    "{members}    interaction \"Go\" {{ run(sim) {{ bridge(sim); }} }}"
+                )),
+            );
+        }
+
+        /// Find Best Interaction's pick survives a foreign read.
+        #[test]
+        fn find_best_interaction_keeps_its_pick() {
+            let air = expand(
+                "fbi.antics",
+                &object(
+                    "    #[bhav] fn t(p: ObjectId) {\n        if find_best_interaction() {\n            \
+                     temp[0] = p.attr[0];\n            gosub_found_action();\n        }\n    }",
+                ),
+            );
+            let t = tree(&air, "t");
+            assert!(t.contains("__pre_stack_obj"), "{t}");
+            assert!(!t.contains("__self_obj"), "{t}");
         }
     }
 }

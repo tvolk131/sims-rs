@@ -23,6 +23,7 @@ impl<'a> TreeLowerer<'a> {
             explicit_stack_obj: false,
             reassigns_stack_obj: false,
             raw_moves_cursor: false,
+            borrowing_place: false,
             sets_stack_obj: false,
             used_saved_stack_obj: false,
             value_return: None,
@@ -431,6 +432,9 @@ impl<'a> TreeLowerer<'a> {
         let V2Expr::Index { base, index, .. } = index else {
             return None;
         };
+        if self.borrowing_place {
+            return None;
+        }
         if !matches!(base.as_ref(), V2Expr::Ident(_, n) if n == "temp")
             || self.lookup_var("temp").is_some()
         {

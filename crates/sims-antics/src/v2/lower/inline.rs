@@ -386,7 +386,7 @@ impl<'a> TreeLowerer<'a> {
                 let mut lval = match arg_expr {
                     V2Expr::MutRef { inner: place, .. } => {
                         self.reject_read_only_sim_slot(place)?;
-                        self.resolve_lvalue(place)?
+                        self.resolve_borrowed_lvalue(place)?
                     }
                     V2Expr::Ident(_, pname) => match self.lookup_var(pname).cloned() {
                         Some(Binding::MutRef { target }) => target,
@@ -448,49 +448,6 @@ impl<'a> TreeLowerer<'a> {
                     let snap = self.fresh(&format!("ref_idx_{}", param.name));
                     self.emit_let(&snap, idx);
                     *setup = format!("temp[0] := {snap};");
-                }
-                // A temp-indexed cell (`scope(27|30|31, k)`) reads its index from `temp[k]` at
-                // each use. Copy the index now and set it into `temp[0]` before each use, the
-                // way a run-time sprite index is.
-                let temp_indexed = |air: &str| {
-                    let (scope, k) = air
-                        .strip_prefix("scope(")?
-                        .strip_suffix(')')?
-                        .split_once(", ")?;
-                    let k = k.parse::<u8>().ok().filter(|k| *k < 8)?;
-                    matches!(scope, "27" | "30" | "31").then(|| (scope.to_owned(), k))
-                };
-                let (cell_air, foreign_setup) = match &lval {
-                    LValue::Direct { air, .. } => (air.clone(), None),
-                    LValue::ForeignCell { cell, setup, .. } => {
-                        (cell.clone(), Some(setup.is_some()))
-                    }
-                    LValue::ForeignAttr { .. } => (String::new(), None),
-                };
-                if foreign_setup != Some(true)
-                    && let Some((scope, k)) = temp_indexed(&cell_air)
-                {
-                    let snap = self.fresh(&format!("ref_idx_{}", param.name));
-                    self.emit_let(&snap, &format!("temp[{k}]"));
-                    let setup = Some(format!("temp[0] := {snap};"));
-                    let cell = format!("scope({scope}, 0)");
-                    match &mut lval {
-                        LValue::ForeignCell {
-                            cell: c, setup: s, ..
-                        } => {
-                            *c = cell;
-                            *s = setup;
-                        }
-                        LValue::Direct { ty, .. } => {
-                            lval = LValue::ForeignCell {
-                                obj_air: "stack_obj".to_owned(),
-                                cell,
-                                setup,
-                                ty: ty.clone(),
-                            };
-                        }
-                        LValue::ForeignAttr { .. } => {}
-                    }
                 }
                 Binding::MutRef { target: lval }
             }

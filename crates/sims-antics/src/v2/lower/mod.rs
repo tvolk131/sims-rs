@@ -227,19 +227,21 @@ enum CallContext {
 /// display name (`tree 'x'`). An inherit tree may call a Sim tree by name with `me` as the Sim:
 /// the callee then runs on the inherit tree's runner and stack object, which is the Sim's
 /// context only when the inherit tree itself runs on a Sim. So such a tree, and every inherit
-/// tree that calls it, must not be called from an object's own tree
-/// ([`check_inherit_calls`]).
+/// or Sim tree that calls it, must not be called from an object's own tree or from a
+/// functional, which an object may run ([`check_inherit_calls`]).
 #[derive(Default)]
 struct InheritCallFacts {
     /// Inherit trees that call a Sim tree by name, with that call's span.
     calls_sim: BTreeMap<String, Span>,
-    /// Calls to an inherit tree: the calling inherit tree (if the caller is one), whether the
-    /// caller is an object's own tree, the callee, and the call's span.
-    edges: Vec<(Option<String>, bool, String, Span)>,
+    /// Calls to an inherit or Sim tree: the calling standalone inherit or Sim tree (if the
+    /// caller is one), whether an object may be the caller's runner, the callee, whether the
+    /// callee is an inherit tree, and the call's span.
+    edges: Vec<(Option<String>, bool, String, bool, Span)>,
 }
 
-/// Refuses a call from an object's own tree to an inherit tree that runs a Sim tree on its
-/// runner (directly, or through other inherit trees).
+/// Refuses a call from an object's own tree or a functional to an inherit tree that runs a Sim
+/// tree on its runner (directly, or through other inherit and Sim trees), or to a Sim tree that
+/// reaches one.
 fn check_inherit_calls(facts: &InheritCallFacts) -> Result<()> {
     let mut sim_only: BTreeMap<&str, Span> = facts
         .calls_sim
@@ -248,7 +250,7 @@ fn check_inherit_calls(facts: &InheritCallFacts) -> Result<()> {
         .collect();
     loop {
         let mut grew = false;
-        for (caller, _, callee, span) in &facts.edges {
+        for (caller, _, callee, _, span) in &facts.edges {
             if let Some(caller) = caller
                 && sim_only.contains_key(callee.as_str())
                 && !sim_only.contains_key(caller.as_str())
@@ -261,15 +263,22 @@ fn check_inherit_calls(facts: &InheritCallFacts) -> Result<()> {
             break;
         }
     }
-    for (_, from_object, callee, span) in &facts.edges {
+    for (_, from_object, callee, callee_inherit, span) in &facts.edges {
         if *from_object && sim_only.contains_key(callee.as_str()) {
             return Err(Error::at(
                 *span,
-                format!(
-                    "{callee} is 'context = inherit' but runs a Sim tree on its runner, so it can \
-                     only be called from interactions, Sim trees, or other inherit trees (an object \
-                     can run a functional)"
-                ),
+                if *callee_inherit {
+                    format!(
+                        "{callee} is 'context = inherit' but runs a Sim tree on its runner, so it \
+                         can only be called from interactions, Sim trees, or other inherit trees \
+                         (an object can run a functional)"
+                    )
+                } else {
+                    format!(
+                        "{callee} reaches a 'context = inherit' tree that runs a Sim tree on its \
+                         runner, so a functional (which an object can run) cannot call it"
+                    )
+                },
             ));
         }
     }
@@ -782,6 +791,8 @@ struct TreeLowerer<'a> {
     /// [`Self::reassigns_stack_obj`] from that point on. Set in lowering order, so a raw block
     /// after a loop does not change how the loop lowers.
     raw_moves_cursor: bool,
+    /// Resolving a held place ([`Self::resolve_borrowed_lvalue`]).
+    borrowing_place: bool,
     /// The source assigns `stack_obj` itself (`stack_obj = x;`), so the stack object the tree
     /// leaves at exit is the source's: no store of it is dropped as dead at the exit
     /// (`mir::FrameFacts::keeps_exit_stack_obj`).

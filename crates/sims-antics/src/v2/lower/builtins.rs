@@ -566,7 +566,7 @@ impl<'a> TreeLowerer<'a> {
                     ));
                 };
                 self.reject_read_only_sim_slot(inner)?;
-                let lval = self.resolve_lvalue(inner)?;
+                let lval = self.resolve_borrowed_lvalue(inner)?;
                 let LValue::Direct { air, ty } = lval else {
                     return Err(Error::at(
                         place.span,
