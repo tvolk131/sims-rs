@@ -1044,6 +1044,25 @@ fn update_save_inputs_in_txn(
     Ok(())
 }
 
+/// `id`'s character files as of `txn`, by file name.
+fn character_files_in(txn: &redb::ReadTransaction, id: &str) -> Result<BTreeMap<String, Vec<u8>>> {
+    let table = match txn.open_table(NEIGHBORHOOD_CHARACTERS) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(BTreeMap::new()),
+        Err(error) => return Err(store(error)),
+    };
+    let mut files = BTreeMap::new();
+    for entry in table.range((id, "")..).map_err(store)? {
+        let (key, value) = entry.map_err(store)?;
+        let (nh_key, name) = key.value();
+        if nh_key != id {
+            break;
+        }
+        files.insert(name.to_owned(), value.value().to_vec());
+    }
+    Ok(files)
+}
+
 /// `id`'s save inputs as of `txn`; none if there are none.
 fn save_inputs_in(txn: &redb::ReadTransaction, id: &str) -> Result<SaveInputs> {
     let table = match txn.open_table(NEIGHBORHOOD_SAVE_INPUTS) {
@@ -1149,6 +1168,16 @@ pub struct LotSnapshot {
     pub character_files: BTreeMap<String, Vec<u8>>,
     pub saved_lot: Option<Vec<u8>>,
     pub base_house: Option<Vec<u8>>,
+}
+
+/// A neighborhood with its character files and save inputs, read in one
+/// REDB read transaction ([`NeighborhoodStore::load_export_snapshot`]) so a
+/// Family Bin export never mixes two committed revisions.
+#[derive(Debug, Clone)]
+pub struct ExportSnapshot {
+    pub neighborhood: StoredNeighborhood,
+    pub character_files: BTreeMap<String, Vec<u8>>,
+    pub save_inputs: SaveInputs,
 }
 
 /// Summary returned by [`NeighborhoodStore::import_directory`].
@@ -2382,21 +2411,7 @@ impl NeighborhoodStore {
         };
         let neighborhood = StoredNeighborhood::decode(id, nh_value.value())?;
 
-        let mut character_files = BTreeMap::new();
-        match txn.open_table(NEIGHBORHOOD_CHARACTERS) {
-            Ok(table) => {
-                for entry in table.range((id, "")..).map_err(store)? {
-                    let (key, value) = entry.map_err(store)?;
-                    let (nh_key, name) = key.value();
-                    if nh_key != id {
-                        break;
-                    }
-                    character_files.insert(name.to_owned(), value.value().to_vec());
-                }
-            }
-            Err(redb::TableError::TableDoesNotExist(_)) => {}
-            Err(error) => return Err(store(error)),
-        }
+        let character_files = character_files_in(&txn, id)?;
 
         let saved_lot = match txn.open_table(NEIGHBORHOOD_LOTS) {
             Ok(table) => table
@@ -2519,21 +2534,31 @@ impl NeighborhoodStore {
     /// Loads all character `.iff` files stored for neighborhood `id`.
     pub fn load_character_files(&self, id: &str) -> Result<BTreeMap<String, Vec<u8>>> {
         let txn = self.db.begin_read().map_err(store)?;
-        let table = match txn.open_table(NEIGHBORHOOD_CHARACTERS) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(BTreeMap::new()),
+        character_files_in(&txn, id)
+    }
+
+    /// Loads neighborhood `id`, its character files and its save inputs
+    /// from one snapshot of the store, as a Family Bin export reads them;
+    /// `None` if there is no such neighborhood.
+    pub fn load_export_snapshot(&self, id: &str) -> Result<Option<ExportSnapshot>> {
+        let txn = self.db.begin_read().map_err(store)?;
+        let neighborhood = match txn.open_table(NEIGHBORHOODS) {
+            Ok(table) => table
+                .get(id)
+                .map_err(store)?
+                .map(|value| StoredNeighborhood::decode(id, value.value()))
+                .transpose()?,
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
             Err(error) => return Err(store(error)),
         };
-        let mut files = BTreeMap::new();
-        for entry in table.range((id, "")..).map_err(store)? {
-            let (key, value) = entry.map_err(store)?;
-            let (nh_key, name) = key.value();
-            if nh_key != id {
-                break;
-            }
-            files.insert(name.to_owned(), value.value().to_vec());
-        }
-        Ok(files)
+        let Some(neighborhood) = neighborhood else {
+            return Ok(None);
+        };
+        Ok(Some(ExportSnapshot {
+            neighborhood,
+            character_files: character_files_in(&txn, id)?,
+            save_inputs: save_inputs_in(&txn, id)?,
+        }))
     }
 
     /// Stores a character file under neighborhood `id`, bumping `id`'s

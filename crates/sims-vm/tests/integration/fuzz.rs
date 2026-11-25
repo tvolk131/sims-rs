@@ -8,11 +8,17 @@
 //! ([`Lot::apply_coop_tick_batch`]):
 //!
 //! - A seeded SplitMix64 stream picks each step from the live lot's
-//!   candidates (a pie-menu entry for a person on an object, a cancel of a
-//!   queued action, speed, pause, free will, selection, camera, a dialog's
-//!   answer, or nothing) by weight, with bounded draws by rejection
-//!   sampling. A dialog's answer is one of the buttons it offers, and a
-//!   special panel's is its cancel or dismissal. Each step is one tick's
+//!   candidates (a pie-menu entry for a person on an object not parked
+//!   off the lot, a cancel of a queued action, speed, pause, free will, selection,
+//!   camera, a dialog's answer, or nothing) by weight, with bounded draws
+//!   by rejection sampling. A dialog's answer is one of the buttons it
+//!   offers, and a special panel's is its cancel or dismissal. An object
+//!   parked off the lot at [-16, -16] (a factory's or a removal's: the
+//!   helpers of the lot's people and interactions, the off-lot people) is
+//!   never drawn, so no player can open its pie menu. Some of those menus'
+//!   scripts fault when run that way (a Scold whose stack object is 0).
+//!   Objects on the lot stay candidates, contents included (they keep
+//!   their holder's position), even one the lot hides. Each step is one tick's
 //!   batch and then up to a few empty ticks. The step is journaled before
 //!   it runs, so a step that panics or fails is still in the list that
 //!   reproduces it.
@@ -312,11 +318,23 @@ fn run_step(lot: &mut Lot, step: &Step) -> Result<Vec<Observation>, String> {
     Ok(trace)
 }
 
+/// Where an object off the lot is parked (`sims_vm` factory and removal).
+const PARKED: [i32; 2] = [-16, -16];
+
 /// The commands the live lot offers, one chosen by weight.
 fn draw_step(lot: &Lot, rng: &mut Rng) -> Step {
     let world = lot.world();
     let people: Vec<u16> = world.people.clone();
-    let objects: Vec<u16> = world.objects.keys().copied().collect();
+    // A player opens a pie menu by clicking an object the lot draws. An
+    // object parked off the lot (a factory's or a removal's [-16, -16]:
+    // the lot's people's and interactions' helpers, the off-lot people)
+    // is never drawn, so no player can pick from its menu.
+    let objects: Vec<u16> = world
+        .objects
+        .values()
+        .filter(|o| o.position[..2] != PARKED)
+        .map(|o| o.id)
+        .collect();
     let session = session(lot);
     let host = session.host_id;
     let answers = answers(lot);

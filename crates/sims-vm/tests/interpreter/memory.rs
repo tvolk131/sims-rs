@@ -73,7 +73,7 @@ fn object_data() {
     assert_eq!((fx.lamp().data[40], fx.sim().data[41]), (1, 2));
     assert_eq!(code(read(&mut fx, scope::MY_DATA, 72)), Some(7));
     assert_eq!(code(read(&mut fx, scope::STACK_DATA, -1)), Some(7));
-    // Word 11 (the object's ID) reads, but writes to it, and to the
+    // Word 11 (the object's ID) reads, but writes that change it, or the
     // container words 2 and 3, need native side effects.
     assert!(reads(&mut fx, scope::MY_DATA, 11, 22));
     for word in [2, 3, 11] {
@@ -81,7 +81,33 @@ fn object_data() {
             trap(write(&mut fx, scope::MY_DATA, word, 0)),
             Trap::Unsupported(_)
         ));
+        assert!(matches!(
+            trap(write(&mut fx, scope::STACK_DATA, word, 0)),
+            Trap::Unsupported(_)
+        ));
     }
+    // Storing the value a word already holds is a plain store that
+    // changes nothing, as when an object sets its own ID to itself. Each
+    // scope compares with its own object's word: the stack object's words
+    // differ from mine, and storing the other object's value is refused.
+    for word in [2, 3, 11] {
+        fx.sim_mut().data[word as usize] = 1000 + word;
+    }
+    let (lamp, sim) = (fx.lamp().data.clone(), fx.sim().data.clone());
+    for word in [2, 3, 11] {
+        let (mine, stack) = (2 * word, 1000 + word);
+        assert!(matches!(
+            trap(write(&mut fx, scope::MY_DATA, word, stack)),
+            Trap::Unsupported(_)
+        ));
+        assert!(matches!(
+            trap(write(&mut fx, scope::STACK_DATA, word, mine)),
+            Trap::Unsupported(_)
+        ));
+        assert_eq!(write(&mut fx, scope::MY_DATA, word, mine), Ok(true));
+        assert_eq!(write(&mut fx, scope::STACK_DATA, word, stack), Ok(true));
+    }
+    assert_eq!((&fx.lamp().data, &fx.sim().data), (&lamp, &sim));
     // Word 25 reads like any other; what resolving it does to a sleeping
     // object is in sleep.rs.
     assert!(reads(&mut fx, scope::STACK_DATA, 25, 50));
