@@ -404,3 +404,86 @@ fn a_block_mixing_forms_lists_each_spelling_once() {
     // One statement without a spelling keeps the whole block.
     stays_raw(sim_tree, "scope(27, 0) := 1; scope(12, 7) := local[1];");
 }
+
+// --- review round 1 -------------------------------------------------------------------------
+
+#[test]
+fn a_template_member_names_no_builtin_call() {
+    // An object in another file that extends the template may declare its own `reach`, which
+    // the call would then mean. Cells name no call, so they are still spelled.
+    let template = |raw: &str| {
+        format!(
+            "template Base {{\n    #[bhav(label = \"Probe\")] fn probe(a: i16) {{\n        raw {{ {raw} }}\n    }}\n}}\nobject \"Synth Probe\" from Base {{\n    guid: 0x7E00_0401;\n    price: 1;\n}}\n"
+        )
+    };
+    for raw in [
+        "reach(mode: 0, moves: false);",
+        "clear_motive_changes() pad(2: 0x05);",
+        "play_sound(0, stack_obj) pad(3: 0x01);",
+        "remove_object(stack_obj);",
+        "temp[0] := scope(33, 1);",
+        "refresh(target: 0, mode: 1);",
+    ] {
+        none(&template(raw), RAW_RULE);
+    }
+    let d = one(&template("scope(27, 0) := 1;"), RAW_RULE);
+    assert_eq!(
+        d.help.as_deref(),
+        Some("use stack_obj.sprite_flags[temp[..]]")
+    );
+}
+
+#[test]
+fn a_constant_named_like_the_spelling_keeps_the_raw_block() {
+    // Parsing substitutes a block constant for its name, so `advert.delta[0]` would index the
+    // constant.
+    for decl in [
+        "const advert = if a > 0 { 1 } else { 2 }; temp[0] = advert;",
+        "const me = if a > 0 { 1 } else { 2 }; temp[0] = me;",
+    ] {
+        let source = sim_tree(&format!(
+            "        {decl}\n        raw {{ scope(12, 0) := 1; scope(30, 0) := 1; }}"
+        ));
+        none(&source, RAW_RULE);
+    }
+}
+
+#[test]
+fn a_block_must_end_its_statement() {
+    // `.air` reads adjacent raw blocks as one stream: this is one padded primitive.
+    none(
+        &sim_tree("        raw { clear_motive_changes() } raw { pad(3: 0x05); }"),
+        RAW_RULE,
+    );
+    stays_raw(sim_tree, "clear_motive_changes()");
+    stays_raw(sim_tree, "remove_object(stack_obj)");
+    // Two tokens are not read as one.
+    for raw in [
+        "play_sound(1 2) pad(3: 0x01);",
+        "temp[0] := scope(1 2, 0);",
+        "scope(27, 0) := 1 2;",
+    ] {
+        stays_raw(sim_tree, raw);
+    }
+}
+
+#[test]
+fn pads_the_encoder_refuses_stay_raw() {
+    for raw in [
+        // Byte 3 of Clear Motive Changes already holds 1.
+        "clear_motive_changes() pad(3: 1);",
+        // Out of order.
+        "play_sound(5, stack_obj) pad(7: 0xff, 6: 0xff);",
+        // A byte that already holds the value.
+        "play_sound(5) pad(3: 0x00);",
+    ] {
+        stays_raw(sim_tree, raw);
+    }
+    // Byte 3 set to another value is still a pad of Clear Motive Changes' own byte.
+    same_as_raw(
+        sim_tree,
+        "clear_motive_changes() pad(5: 0x01);",
+        "clear_motive_changes(padN: 0xNN)",
+        "clear_motive_changes(pad5: 0x01);",
+    );
+}

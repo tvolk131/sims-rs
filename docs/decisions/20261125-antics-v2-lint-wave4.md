@@ -75,11 +75,23 @@ The scope cells of 12, 27, 30 and 31 count both as reads into `temp[0..7]` and a
 literal, `temp[J]` or a `param[J]` below the argument count. Compound operators, `local[N]`
 sources and other destinations stay raw.
 
-The usual guards apply:
+The usual guards apply, tightened after review:
 
-- Nothing is spelled when a local, parameter, Sim or event binding, or user function takes the
-  name the spelling uses (`temp`, `param`, `me`, `stack_obj`, `advert`, `reach`, `play_sound`,
-  `clear_motive_changes`).
+- Nothing is spelled when a local, parameter, Sim or event binding, user function, or `const`
+  anywhere in the file takes the name the spelling uses (`temp`, `param`, `me`, `stack_obj`,
+  `advert`, `reach`, `play_sound`, `clear_motive_changes`). Parsing substitutes a block constant
+  for its name before the linter sees the body, so constants are read from the tokens.
+- A template's member names no builtin call: it is built into objects in other files, and one
+  of those may declare a member of the builtin's name, which would then take the call. Cells
+  (`scope(..)`) name no call and are still spelled. This also applies to wave 1's
+  `RAW_BUILTINS` forms, which now defer to a user function of the builtin's name as well.
+- The block must end its last statement with `;`. `.air` reads adjacent raw blocks as one
+  stream, so `raw { clear_motive_changes() } raw { pad(3: 0x05); }` is one padded primitive.
+- Whitespace between two word tokens (`play_sound(1 2)`, `scope(1 2, 0)`) is never read as one
+  token.
+- Pads are checked by the encoder's own rule (`verify::apply_operand_pad`) against the call's
+  plain encoding: ascending, each once, a new value, and only bytes the VM ignores. Clear Motive
+  Changes encodes byte 3 as 1, so `pad(3: 1)` stays raw.
 - The line filter that skipped any raw statement mentioning `pad` now lets a `pad` through only on
   `play_sound` and `clear_motive_changes`. Every other padded primitive still keeps its block.
 
@@ -91,6 +103,8 @@ The usual guards apply:
 - **An unpadded `play_sound`.** Wave 1 left it raw on purpose, since v2 would rather name a
   declared `sound`, and `v2_lint.rs` pins that. Only the padded form, which has no other spelling
   than raw before #469, is new here.
+- **Mode 1 `reach` in a functional's body.** The lint knows a tree's compiled argument count
+  but not a functional's, so `reach(mode: 1)` there gets no hint (a false negative).
 - **Scopes 28 and 29** (`advert.personality`, `advert.minimum`) were spelled before #469 and are
   not in this PR's brief. They are the same shape as scope 12 and can follow.
 
@@ -128,6 +142,15 @@ The usual guards apply:
   - 168 files fail `check` on main before any edit, so they could not be compared. They were
     lifted before #468, and their local `extern mod globals` declares one of the 45 new
     `std::globals` trees with another ABI. A re-lift fixes them; this PR does not touch them.
+
+## Review
+
+GPT-6.2 Sol (high effort), correctness and soundness only.
+
+- **R1:** 5 findings. The 4 SHOULD-FIX are fixed, each with a regression test in
+  `v2_lint_wave4.rs`: template members, block constants, a block that does not end its
+  statement (and merged tokens), and pads the encoder refuses. The NOTE (functional frames) is a
+  false negative, documented above.
 
 ## Consequences
 
