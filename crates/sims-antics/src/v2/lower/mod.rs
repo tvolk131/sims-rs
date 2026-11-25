@@ -436,6 +436,16 @@ fn reads_temps(air: &str) -> bool {
     air.contains("temp[") || air.contains("scope(33,")
 }
 
+/// Whether a single operand reads a cell of the current stack object: `stack_obj` itself, a
+/// `stack.` cell, or its definition (`scope(21, ..)`, `scope(35, ..)`; `sims-vm` `memory.rs`).
+/// Code that moves the cursor before reading such an operand copies it first.
+fn reads_stack_obj(air: &str) -> bool {
+    air == "stack_obj"
+        || air.starts_with("stack.")
+        || air.starts_with("scope(21,")
+        || air.starts_with("scope(35,")
+}
+
 fn types_compatible_for_assign(target: &ValueType, value: &ValueType) -> bool {
     if target == value {
         return true;

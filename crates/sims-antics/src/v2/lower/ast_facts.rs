@@ -51,6 +51,7 @@ pub(super) const LOCAL_WRITING_BUILTINS: &[&str] = &[
     "relationship",
     "create_object",
     "find_location",
+    "set_to_next",
 ];
 
 pub(super) fn stmts_mutate_or_borrow_ident(stmts: &[V2Stmt], target_name: &str) -> bool {
@@ -182,6 +183,10 @@ pub(super) fn builtin_args_write_ident(
         "relationship" => args
             .iter()
             .any(|a| matches!(a.name.as_deref(), Some("value" | "local")) && is_target(&a.value)),
+        // Set To Next writes the next object into its destination.
+        "set_to_next" => args
+            .iter()
+            .any(|a| a.name.as_deref() == Some("dest") && is_target(&a.value)),
         _ => false,
     }
 }

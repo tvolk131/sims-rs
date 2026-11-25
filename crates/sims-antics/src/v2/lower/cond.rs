@@ -426,7 +426,12 @@ impl<'a> TreeLowerer<'a> {
                         // `stack_obj`, false leaves `stack_obj` as it was (`sims-vm`
                         // `primitives/find_best_object.rs`). The tree keeps its cursor through
                         // later builtins (`ExplicitStackOps`), like `set_to_next`.
-                        "find_best_object" => {
+                        "find_best_object"
+                            if self
+                                .env
+                                .lookup_fn(&self.owner_module, fname, self.in_object_scope)
+                                .is_none() =>
+                        {
                             return Ok(Some(
                                 self.parse_find_best_object(&[], args, *span)?.prim_air,
                             ));

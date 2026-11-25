@@ -58,6 +58,10 @@ A tree that uses it counts as one that steps its own cursor (`ExplicitStackOps`)
 `set_to_next`. So later builtins that move the stack object put back the found object, and a Sim
 tree's `self` stays the object the tree started on.
 
+The same holds in a `stack_obj.run_functional(..)` argument: the functional runs on the receiver,
+and the found object is selected again after it. A helper `fn find_best_object` still wins over
+the search, as it does in value position.
+
 `let Some(x) = find_best_object(..)` already restores the cursor itself and is unchanged. The
 typed `find_best_object::<T>()` binds a checked object, so as a condition it is refused, with a
 pointer to the `let Some` form.
@@ -75,8 +79,11 @@ destination is the stack object.
   - `temp[N]`.
 - **Refused destinations:**
   - an immutable parameter (the error names its `param[N]` word);
+  - `temp[8]` and up (the VM bounds-checks the destination: a Sim has 8 temps);
   - a typed handle (the next object need not be of its type);
   - a bool, an enum, or any field.
+- **A write:** the destination counts as a written local (`LOCAL_WRITING_BUILTINS`), so a
+  helper's by-value parameter used as one is copied, not aliased to the caller's local.
 - **The stack object:** stepping another cell leaves it alone (`set_to_next_steps_stack_obj`).
   Such a call is no cursor move, so a Sim tree keeps no entry save for it.
 - **Already supported, now tested:**
@@ -99,6 +106,8 @@ Each is verified in `sims-vm` `memory.rs`. All are read-only. A write is an erro
   - `stack_obj.<field>` (and `self.<field>` where `self` is the stack object) reads it in place;
   - any other object handle moves the stack object there and back, like any foreign read;
   - a state of the same name wins over the engine field;
+  - a store to another object's cell copies a definition-cell value first, as it does a
+    `stack.` cell (`reads_stack_obj`), since the store selects the other object;
   - a Sim handle (`sim`, or `me` in a Sim tree) is refused. It is read through `my.`, so a
     tree that never moves the cursor keeps no save to put it back with.
 - **`job_field(F)`** reads the temps as they are where it is read. It is a plain operand, so

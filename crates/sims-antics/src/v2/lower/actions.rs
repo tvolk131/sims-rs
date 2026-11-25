@@ -159,6 +159,9 @@ impl<'a> TreeLowerer<'a> {
         // save the cursor before it and select it again for the call (which leaves the caller's
         // frame's cursor as it was).
         let mut cursor_saved = false;
+        // A tree that steps its own cursor keeps the one its argument code left (a search's
+        // find), so the call puts it back after running on the receiver.
+        let mut args_cursor = None;
         if receiver_is_cursor && !self.em.since(args_at).is_empty() {
             let args_text = self.em.split_off(args_at);
             let staged = self.fresh("rf_obj");
@@ -166,13 +169,19 @@ impl<'a> TreeLowerer<'a> {
             self.em.append(&args_text);
             staged_target = staged;
             cursor_saved = true;
+            if self.explicit_stack_obj && args.iter().any(|a| self.arg_moves_cursor(&a.value)) {
+                args_cursor = self.save_stack_obj_for_move();
+            }
         }
         for (i, (val, _, _)) in staged_args.iter().enumerate() {
             self.line(format!("temp[{i}] := {val};"));
         }
         let saved_stack_obj = if cursor_saved {
             self.stack_op(mir::StackObjOp::Set(&staged_target));
-            StackRestore::Unmoved
+            match args_cursor {
+                Some(after) => StackRestore::Moved(Some(after)),
+                None => StackRestore::Unmoved,
+            }
         } else if staged_target != "stack_obj" {
             let saved = self.save_stack_obj_for_move();
             self.stack_op(mir::StackObjOp::Set(&staged_target));
@@ -858,6 +867,19 @@ impl<'a> TreeLowerer<'a> {
                     if matches!(b.as_str(), "param" | "temp") && self.lookup_var(b).is_none()) =>
             {
                 match self.resolve_lvalue(dest)? {
+                    // The VM bounds-checks the destination before it steps (`sims-vm`
+                    // `memory.rs`): a Sim has 8 temps.
+                    LValue::Direct { air, .. }
+                        if air
+                            .strip_prefix("temp[")
+                            .and_then(|r| r.strip_suffix(']'))
+                            .and_then(|n| n.trim().parse::<u32>().ok())
+                            .is_some_and(|n| n > 7) =>
+                    {
+                        Err(refuse(format!(
+                            "set_to_next(dest: {air}): there are 8 temps, 'temp[0]' to 'temp[7]'"
+                        )))
+                    }
                     LValue::Direct { air, .. } => Ok(air),
                     _ => Err(refuse(
                         "set_to_next(dest:) steps 'stack_obj', a local, 'param[N]', or 'temp[N]'"

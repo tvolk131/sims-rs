@@ -1058,7 +1058,7 @@ impl<'a> TreeLowerer<'a> {
         // `from` is read after `stack_obj` moves to the target: one that names the stack object
         // (`stack_obj`, or a `stack.` cell such as `stack.id`) is copied before the move.
         if moves && let Some(f) = from.take() {
-            let stack_relative = f == "stack_obj" || f.contains("stack.");
+            let stack_relative = f.contains("stack.") || reads_stack_obj(&f);
             from = Some(if stack_relative {
                 self.snapshot_operand(f, "dist_from")
             } else {

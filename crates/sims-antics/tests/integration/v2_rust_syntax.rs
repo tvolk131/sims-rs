@@ -1738,3 +1738,67 @@ object "Global Probe" {{
     assert!(!build(&src(5)).0.contains("__self_obj"));
     assert!(build(&src(34)).0.contains("let __self_obj = stack_obj;"));
 }
+
+#[test]
+fn pr_i3_review_round_1_regressions() {
+    // A helper named `find_best_object` is called, not the search.
+    let air = build(&obj("    fn find_best_object(x: i16) -> bool { x > 5 }
+    interaction \"Use\" {
+        run(sim) {
+            let cook = 0;
+            if find_best_object(cook) {
+                self.remove(no_yield: true);
+            }
+        }
+    }"))
+    .0;
+    assert!(!air.contains("find_best_object("), "{air}");
+    // `set_to_next(dest: c)` writes a helper's by-value parameter, so the call copies it.
+    let air = build(&obj(
+        "    fn advance(c: i16) { set_to_next(person, dest: c); }
+    #[bhav]
+    fn a() {
+        let c: i16 = 0;
+        advance(c);
+        self.n = c;
+    }",
+    ))
+    .0;
+    let body = tree_body(&air, "a");
+    assert!(
+        body.contains("let __arg_c_1 = __v_c_0;\n    set_to_next(1, dest: __arg_c_1);"),
+        "{body}"
+    );
+    // A definition cell is read before the store selects another object.
+    let air = build(&obj("    state f: bool;
+    #[bhav]
+    fn a(o: Self) {
+        o.n = stack_obj.object_type;
+        o.f = stack_obj.has_function[1];
+    }"))
+    .0;
+    let body = tree_body(&air, "a");
+    for want in [
+        "let __frhs_0 = scope(21, 9);\n    stack_obj := param[0];",
+        "__frhs_0 := scope(35, 1);\n    stack_obj := param[0];",
+    ] {
+        assert!(body.contains(want), "{want}:\n{body}");
+    }
+    // A search in a functional's arguments leaves its find selected after the call.
+    let air = build(&obj("    #[bhav]
+    fn a() {
+        stack_obj.run_functional(4, find_best_object(cook));
+        self.n = stack_obj.attr[0];
+    }"))
+    .0;
+    let body = tree_body(&air, "a");
+    assert!(
+        body.contains("run_functional_tree(4);\n    stack_obj := __pre_stack_obj_2;\n    my.attr[0] := stack.attr[0];"),
+        "{body}"
+    );
+    // A Sim has 8 temps.
+    expect_err(
+        &obj("    #[bhav] fn a() { set_to_next(all, dest: temp[8]); }"),
+        "there are 8 temps",
+    );
+}

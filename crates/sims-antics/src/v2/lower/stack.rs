@@ -34,6 +34,17 @@ impl<'a> TreeLowerer<'a> {
             explicit_stack_obj && matches!(self.tree_ctx, TreeContext::SimOnObject { .. });
     }
 
+    /// Whether evaluating `expr` steps the cursor on purpose (a search, `set_to_next`, a
+    /// `create_object` with a destination), as [`ExplicitStackOps`] counts it.
+    pub(super) fn arg_moves_cursor(&self, expr: &V2Expr) -> bool {
+        ExplicitStackOps::default().in_expr(
+            expr,
+            self.env,
+            &self.owner_module,
+            self.in_object_scope,
+        )
+    }
+
     pub(super) fn save_stack_obj_for_move(&mut self) -> Option<String> {
         self.explicit_stack_obj.then(|| {
             let saved = self.fresh("pre_stack_obj");
