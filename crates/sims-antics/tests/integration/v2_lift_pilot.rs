@@ -621,11 +621,11 @@ fn lifts_literal_drop_slots_and_supported_routing_modes() {
         "if route_to(0, flags: 1, source: 0) {",
         "snap(3, mode: 4);",
         "drop_onto(src: -1, dst: 2);",
-        "drop_onto(param[0], 2);",
+        "drop_onto(src: param[0], dst: 2);",
     ] {
         assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
     }
-    assert_eq!(lifted.matches("raw {").count(), 1, "{lifted}");
+    assert!(!lifted.contains("raw {"), "{lifted}");
 }
 
 #[test]
@@ -731,9 +731,9 @@ fn lifts_flagged_sound_and_keeps_the_reserved_flags_byte_raw() {
     );
     let lifted = round_trip(&iff, &DecompileV2Options::default());
     for spelling in [
-        "play_sound(fable_trill, stack_obj, flags: 5);",
+        "stack_obj.play_sound(fable_trill, flags: 5);",
         "play_sound(99, flags: 8);",
-        "stop_all_sounds(stack_obj);",
+        "stack_obj.stop_all_sounds();",
         "play_sound(6, flags: 255);",
     ] {
         assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
@@ -846,9 +846,9 @@ fn lifts_handle_flags_and_preserves_numeric_flag_operations() {
         "stack_obj.flags = self.flags;",
         "if stack_obj.flags.is_empty() {",
         "self.flags = stack_obj.flags;",
-        "stack_obj.flags flag_set 13;",
-        "stack_obj.flags flag_test 13",
-        "stack_obj.flags flag_clear 13;",
+        "stack_obj.flags flag_set ObjectFlags::FloatsOnWater;",
+        "stack_obj.flags flag_test ObjectFlags::FloatsOnWater",
+        "stack_obj.flags flag_clear ObjectFlags::FloatsOnWater;",
     ] {
         assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
     }

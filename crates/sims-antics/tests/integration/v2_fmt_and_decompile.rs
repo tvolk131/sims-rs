@@ -309,7 +309,7 @@ fn zero_local_loops_sounds_and_frame_kinds_round_trip() {
         "play_sound(sound_0);",
         "play_sound(sound_7);",
         // In an interaction the default target is the object, `sim` the other one.
-        "        play_sound(sound_0);\n        play_sound(sound_0, sim);\n",
+        "        play_sound(sound_0);\n        sim.play_sound(sound_0);\n",
     ] {
         assert!(source.contains(idiom), "missing `{idiom}` in:\n{source}");
     }
@@ -1296,9 +1296,9 @@ fn pr_e_idioms_round_trip() {
         "self.attr_3 = param[0];",
         "set_dynamic_sprite(index: 2, value: 1);",
         "self.attr_2 = self.slot[1];",
-        "push_interaction(menu: 2, object: self, priority: 50, flags: 0);",
-        "push_interaction(menu: 3, object: sim, priority: 40, flags: 4);",
-        "push_interaction(menu: 2, object: stack_obj, priority: 50, flags: 0);",
+        "self.push_interaction(menu: 2, priority: 50, flags: 0);",
+        "sim.push_interaction(menu: 3, priority: 40, flags: 4);",
+        "stack_obj.push_interaction(menu: 2, priority: 50, flags: 0);",
     ] {
         assert!(source.contains(idiom), "missing `{idiom}` in:\n{source}");
     }
