@@ -196,6 +196,40 @@ impl<'a> TreeLowerer<'a> {
         ))
     }
 
+    /// The index of the tree parameter `expr` names (a parameter variable, an inline helper
+    /// parameter bound to one, or `param[N]`), for a primitive that reads a parameter by index;
+    /// `None` when `expr` is no parameter.
+    pub(super) fn builtin_param_index(&mut self, expr: &V2Expr) -> Result<Option<i16>> {
+        let names_param = match expr {
+            V2Expr::Ident(_, n) => matches!(
+                self.lookup_var(n),
+                Some(Binding::BhavParam { .. } | Binding::Operand { .. })
+            ),
+            V2Expr::Index { base, .. } => matches!(
+                base.as_ref(),
+                V2Expr::Ident(_, b) if b == "param" && self.lookup_var("param").is_none()
+            ),
+            _ => false,
+        };
+        if !names_param {
+            return Ok(None);
+        }
+        let (air, ty) = self.lower_value_expr(expr)?;
+        if ty != ValueType::I16 {
+            return Err(Error::at(
+                expr.span(),
+                format!(
+                    "a slot parameter must be an i16, found '{}'",
+                    self.env.display_value_type(&ty)
+                ),
+            ));
+        }
+        Ok(air
+            .strip_prefix("param[")
+            .and_then(|r| r.strip_suffix(']'))
+            .and_then(|d| d.parse().ok()))
+    }
+
     /// Binds a builtin's arguments to its parameter names. Positional arguments fill
     /// `positional` in order; a named argument must name one of `positional` or `named_only`.
     /// Unknown names, a parameter given twice, too many positional arguments, and a
@@ -638,10 +672,32 @@ impl<'a> TreeLowerer<'a> {
         let named = self.builtin_named_args(fname, args, &allowed)?;
         let required: &[&str] = match fname {
             "relationship" => &["value"],
+            // An omitted local would encode as local slot 0, whichever variable lives there.
+            "make_new_character" => &["skin", "age", "sex"],
             _ => &[],
         };
         if let Some(missing) = required.iter().find(|k| !named.contains_key(**k)) {
             return Err(Error::at(span, format!("{fname}() requires '{missing}:'")));
+        }
+        // `reach(mode: 1, slot: p)` reads the slot from parameter `p`; other modes read no
+        // parameter, and an omitted `slot:` would encode as parameter 0.
+        if fname == "reach" {
+            let mode = match named.get("mode") {
+                Some(m) => self.eval_builtin_int(&m.value, "reach mode", -32768, 32767)?,
+                None => 0,
+            };
+            match (mode == 1, named.get("slot")) {
+                (true, None) => {
+                    return Err(Error::at(
+                        span,
+                        "reach(mode: 1) reads the slot from a parameter; name it with 'slot:'",
+                    ));
+                }
+                (false, Some(a)) => {
+                    return Err(Error::at(a.span, "reach reads 'slot:' only in mode 1"));
+                }
+                _ => {}
+            }
         }
         // `push_interaction(object: <#[slot(N)] handle>)`: the handle already lives in frame word
         // N, which `#[slot]` fixes, so the VM reads it from there (flag 0x02) with no copy.
@@ -778,6 +834,31 @@ impl<'a> TreeLowerer<'a> {
                     self.push_icon_local(&a.value, named.get("object").copied(), pinned_object)?
                 }
                 PrimArg::Local => self.builtin_local_arg(&a.value, &format!("{fname}({key}:)"))?,
+                PrimArg::SlotOrParam => match self.builtin_param_index(&a.value)? {
+                    Some(index) => format!("param[{index}]"),
+                    None => self
+                        .eval_builtin_int(&a.value, &what, -32768, 32767)
+                        .map_err(|_| {
+                            Error::at(
+                                a.span,
+                                format!(
+                                    "{fname}({key}:) expects a constant slot number or a tree parameter (the VM reads the slot from the operand or from a parameter)"
+                                ),
+                            )
+                        })?
+                        .to_string(),
+                },
+                PrimArg::ParamIndex => match self.builtin_param_index(&a.value)? {
+                    Some(index) => index.to_string(),
+                    None => {
+                        return Err(Error::at(
+                            a.span,
+                            format!(
+                                "{fname}({key}:) expects a tree parameter (a parameter variable or 'param[N]'); the VM reads it from the parameter"
+                            ),
+                        ));
+                    }
+                },
                 PrimArg::RelValue => {
                     let flags = match named.get("flags") {
                         Some(f) => self.eval_builtin_int(&f.value, "relationship flags", 0, 255)?,

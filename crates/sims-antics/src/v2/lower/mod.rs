@@ -356,6 +356,11 @@ enum PrimArg {
     /// local, a parameter, a cell); otherwise the VM writes the number into it, so a writable
     /// direct `i16` cell (a local, `temp[i]`, an attribute, a `&mut` parameter's cell).
     RelValue,
+    /// A slot number the VM reads from the operand or from a parameter: a constant `i16`, or a
+    /// tree parameter (a parameter variable or `param[N]`, spelled `param[N]`).
+    SlotOrParam,
+    /// A tree parameter the VM reads (a parameter variable or `param[N]`), spelled by its index.
+    ParamIndex,
 }
 
 /// A v2 builtin that lowers one-to-one onto a named-argument `.air` primitive.

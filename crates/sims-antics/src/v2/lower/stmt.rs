@@ -1841,13 +1841,16 @@ impl<'a> TreeLowerer<'a> {
                             return Ok(());
                         }
                         "clear_motive_changes" => {
-                            if !args.is_empty() {
+                            // Only `padN: 0xNN` bytes (the VM reads no operand byte).
+                            let (rest, pad) =
+                                self.split_pad_args("clear_motive_changes", args, &[])?;
+                            if let Some(a) = rest.first() {
                                 return Err(Error::at(
-                                    *span,
-                                    "clear_motive_changes() takes no arguments",
+                                    a.span,
+                                    "clear_motive_changes() takes no arguments besides 'padN: 0xNN' bytes",
                                 ));
                             }
-                            self.line("clear_motive_changes();".to_owned());
+                            self.line(format!("clear_motive_changes(){pad};"));
                             return Ok(());
                         }
                         "dialog" => {
