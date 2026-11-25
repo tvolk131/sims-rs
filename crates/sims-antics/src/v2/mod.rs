@@ -31,6 +31,7 @@ pub mod lexer;
 pub mod lint;
 pub mod loader;
 pub mod lower;
+mod mir;
 mod opt;
 pub mod parser;
 mod raw_facts;
