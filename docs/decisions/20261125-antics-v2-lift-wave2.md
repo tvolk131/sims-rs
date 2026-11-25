@@ -101,6 +101,15 @@ Each new spelling below is an extra idiom.
     than its header pins. Behavioral mode does not compare frame storage, so the header gains
     them when a round asks:
     - the count is read from v2's "requires at least N" message (`Plan::grow_locals`);
+    - the `.air` build stops at the first tree short of locals. So a round that fails on one
+      also builds the file once with every header's count left out (`Model::locals_needed`),
+      which finds every other tree that is short. Each takes its next step in that same
+      round, instead of costing one round each: it grows if it can, and otherwise steps
+      down the usual fallback chain (`Plan::air_fallback`). Leaving a tree out (`omit`)
+      still waits for the tree's own round, so it gets the build's own message.
+      - The full corpus is byte-identical to one tree per round.
+      - The slowest object went from about 250 compile rounds (36 s) to 30 (5.5 s), and
+        `main` takes 14 s on it;
     - it is capped at the larger of the original count and the `frame_headroom` lint
       threshold (12);
     - a tree with no arguments and no locals never grows. The behavioral checker compares
@@ -146,12 +155,20 @@ than it gained.
 Without the switch, a full-corpus review found 28 behavioral files and 9 strict files with
 more raw statements than `main`.
 
+Two more cases count as wave 2:
+- **Unwritten spellings.** A tree whose `#[slot]` pins include a local that only a wave 2
+  spelling names is marked, even when that spelling is not written. `drop_wave2` can then
+  remove the pin.
+- **Unblamed failures.** A failure blamed on no tree drops wave 2 in every tree
+  (`drop_all_wave2`) before every tree's extras.
+
 ## Round order
 
 Two fallback chains change.
 
 - **A round that does not compile**, blamed on a tree, tries in order:
-  1. `grow_locals` (an `.air` locals error only);
+  1. `grow_locals` (an `.air` locals error only; every other tree short of locals takes
+     its next step in the same round, see Decision 4);
   2. `add_frame`;
   3. `keep_temps_raw`;
   4. `unmerge`;
@@ -209,7 +226,8 @@ Two fallback chains change.
 | `negated_comparison` | 9 | 7 | 27 | 3 |
 | `collapsible_if_chain` | 0 | 0 | 3 | 3 |
 | `untyped_engine_field` | 0 | 0 | 0 | 0 |
-| Wall time, 10 workers | 108 s | 95 s | 70 s | 76 s |
+| Wall time, 10 workers | 108 s | 103 s | 70 s | 70 s |
+| Slowest object | 52 s | 35 s | 26 s | 11 s |
 
 - **Verdicts.** Every count is unchanged. Per file, no tree loses a proof.
 - **Idiomatic trees.** No file has fewer idiomatic trees in either mode.
@@ -218,12 +236,14 @@ Two fallback chains change.
     places.
   - Strict: four files each turn a whole raw tree idiomatic at the cost of two inline raw
     statements.
-  - Strict: one tree loses its inherit context and keeps two calls raw. It is proven, as
-    before.
+  - Strict: one tree's shared-tail merge proves it in the Sim context, where `main` fell
+    back to the object context. Its calls to object trees then cross contexts and stay raw
+    (+2). It is proven, as before.
 - **Remaining `if !..return error` in behavioral mode.** About 1,800 test a call. These sit
   inside an animation event handler or a raw block, or their tree dropped the new spellings
   or its extras. The rest test a comparison, not a call.
-- **Time.** The host's load average was between 25 and 150 during these runs.
+- **Time.** The host's load average was between 10 and 150 during these runs, and above
+  60 for the strict after run.
 
 ## Follow-ups
 

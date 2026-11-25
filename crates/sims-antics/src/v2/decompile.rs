@@ -268,7 +268,9 @@ pub fn decompile_iff_to_v2_report(
                 // An extra idiom is turned off before anything is lowered: it may be what
                 // clashes with the rest of the tree.
                 let unblamed = tree.is_none()
-                    && (plan.drop_all_extras(&generated) || plan.number_all_raw_bcons(&generated));
+                    && (plan.drop_all_wave2(&generated)
+                        || plan.drop_all_extras(&generated)
+                        || plan.number_all_raw_bcons(&generated));
                 if !unblamed
                     && !tree.is_some_and(|id| plan.add_frame(&model, id))
                     && !tree.is_some_and(|id| plan.keep_temps_raw(id, &generated))
@@ -288,20 +290,27 @@ pub fn decompile_iff_to_v2_report(
             Err(Failure::Air { tree, message }) => {
                 let handled = match tree {
                     Some(id) => {
-                        plan.grow_locals(&model, id, &message)
-                            || plan.add_frame(&model, id)
-                            || plan.keep_temps_raw(id, &generated)
-                            || plan.unmerge(id, &generated)
-                            || plan.drop_wave2(id, &generated)
-                            || plan.name_builtin_locals_only(id, &generated)
-                            || plan.drop_inherit(&model, id)
-                            || plan.drop_extras(id, &generated)
-                            || plan.number_raw_bcons(id, &generated)
-                            || plan.lower_tree(&model, id)
-                            || model.omit(id, &message)
+                        let handled = plan.air_fallback(&model, &generated, id, &message)
+                            || model.omit(id, &message);
+                        if handled && message.contains(LOCALS_SHORT) {
+                            // The build stops at the first tree short of locals: one build with
+                            // the counts left out finds every other one, so each takes its
+                            // next step now instead of a round of its own. One left out
+                            // (`omit`) still is, in its own round, with its own message.
+                            for (other, (declared, needed)) in model.locals_needed(&generated.text)
+                            {
+                                if other != id && needed > declared {
+                                    let message =
+                                        format!("tree declares {declared}{LOCALS_SHORT}{needed}");
+                                    plan.air_fallback(&model, &generated, other, &message);
+                                }
+                            }
+                        }
+                        handled
                     }
                     None => {
-                        plan.drop_all_extras(&generated)
+                        plan.drop_all_wave2(&generated)
+                            || plan.drop_all_extras(&generated)
                             || plan.number_all_raw_bcons(&generated)
                             || plan.lower_all(&model)
                     }
@@ -1115,6 +1124,32 @@ impl Model {
         if let Some(t) = self.trees.iter_mut().find(|t| t.id == id) {
             swap_lift(t);
         }
+    }
+
+    /// For each tree whose `.air` header in `text` declares its locals, the count it
+    /// declares and the count it requires, from one build with the headers' counts left out
+    /// (the build then gives each tree what it needs). Empty when that build fails.
+    fn locals_needed(&self, text: &str) -> BTreeMap<u16, (u16, u16)> {
+        let Ok(mut expanded) =
+            expand_v2_source_to_objects("decompiled.antics", text, &PackResolverConfig::default())
+        else {
+            return BTreeMap::new();
+        };
+        if expanded.len() != 1 {
+            return BTreeMap::new();
+        }
+        let mut expanded = expanded.remove(0);
+        let (air, declared) = without_locals(&expanded.air_source);
+        expanded.air_source = air;
+        let Ok(compiled) = compile_expanded_v2_object(expanded) else {
+            return BTreeMap::new();
+        };
+        declared
+            .into_iter()
+            .filter_map(|(id, declared)| {
+                Some((id, (declared, compiled.behaviors.get(&id)?.locals)))
+            })
+            .collect()
     }
 
     fn compile(&self, text: &str) -> std::result::Result<RecompiledFile, Failure> {
@@ -3503,26 +3538,27 @@ impl Plan {
         self.inherit.contains(&t.id) && !self.plain.contains(&t.id) && self.level(t).idiomatic()
     }
 
-    /// Turns off tree `id`'s extra idioms when the last round used them. `false` when it
-    /// did not, so the tree has to move down a style instead.
-    /// Writes lifecycle block `id` with its whole header as `#[frame(..)]` from now on, when
-    /// it is still written with the default one. Tried before anything else: the header is
-    /// the original's, so it only ever helps.
     /// In behavioral mode, declares the locals tree `id`'s idioms need when the compiler
     /// says the header has too few (`let` copies of call arguments, a builtin's saved
     /// cursor). Frame storage is not compared there; v2 needs the words. Not past the
     /// `frame_headroom` limit unless the original is already beyond it, and not for an
     /// argless tree without locals (the checker's frame-shape rule, `verify/live.rs`).
     fn grow_locals(&mut self, model: &Model, id: u16, message: &str) -> bool {
-        let Some(t) = model
-            .tree(id)
-            .filter(|_| model.behavioral && !self.fixed_locals.contains(&id))
+        let Some(needed) = message
+            .split_once(LOCALS_SHORT)
+            .and_then(|(_, n)| n.trim().parse::<u16>().ok())
         else {
             return false;
         };
-        let Some(needed) = message
-            .split_once(" locals but requires at least ")
-            .and_then(|(_, n)| n.trim().parse::<u16>().ok())
+        self.grow_locals_to(model, id, needed)
+    }
+
+    /// Gives tree `id`'s header `needed` locals, when that is more than it declares, within
+    /// the cap. `false` when it did not.
+    fn grow_locals_to(&mut self, model: &Model, id: u16, needed: u16) -> bool {
+        let Some(t) = model
+            .tree(id)
+            .filter(|_| model.behavioral && !self.fixed_locals.contains(&id))
         else {
             return false;
         };
@@ -3552,6 +3588,30 @@ impl Plan {
         self.locals.get(&t.id).copied().unwrap_or(t.original.locals)
     }
 
+    /// The next step for tree `id`, which a round's `.air` build failed on with `message`.
+    /// `false` when it has none left but being left out.
+    fn air_fallback(
+        &mut self,
+        model: &Model,
+        generated: &Generated,
+        id: u16,
+        message: &str,
+    ) -> bool {
+        self.grow_locals(model, id, message)
+            || self.add_frame(model, id)
+            || self.keep_temps_raw(id, generated)
+            || self.unmerge(id, generated)
+            || self.drop_wave2(id, generated)
+            || self.name_builtin_locals_only(id, generated)
+            || self.drop_inherit(model, id)
+            || self.drop_extras(id, generated)
+            || self.number_raw_bcons(id, generated)
+            || self.lower_tree(model, id)
+    }
+
+    /// Writes lifecycle block `id` with its whole header as `#[frame(..)]` from now on, when
+    /// it is still written with the default one. Tried before anything else: the header is
+    /// the original's, so it only ever helps.
     fn add_frame(&mut self, model: &Model, id: u16) -> bool {
         model.tree(id).is_some_and(|t| t.lifecycle.is_some())
             && !self.standalone.contains(&id)
@@ -3604,6 +3664,15 @@ impl Plan {
         changed
     }
 
+    /// [`Self::drop_wave2`] for every tree, for a failure no one tree is blamed for.
+    fn drop_all_wave2(&mut self, generated: &Generated) -> bool {
+        let mut changed = false;
+        for &id in &generated.wave2 {
+            changed |= self.drop_wave2(id, generated);
+        }
+        changed
+    }
+
     /// Names tree `id`'s locals only where builtins address them from now on, when the last
     /// round named others. `false` when it did not.
     fn name_builtin_locals_only(&mut self, id: u16, generated: &Generated) -> bool {
@@ -3624,6 +3693,8 @@ impl Plan {
         self.raw_bcons_numbered.len() != before
     }
 
+    /// Turns off tree `id`'s extra idioms when the last round used them. `false` when it
+    /// did not, so the tree has to move down a style instead.
     fn drop_extras(&mut self, id: u16, generated: &Generated) -> bool {
         generated.extras.contains(&id) && self.plain.insert(id)
     }
@@ -3786,6 +3857,10 @@ impl Plan {
     }
 }
 
+/// What the `.air` build says of a tree header with too few locals, between the count it
+/// declares and the count it requires.
+const LOCALS_SHORT: &str = " locals but requires at least ";
+
 fn no_compile(message: &str) -> Error {
     Error::new(format!(
         "decompiled source does not compile even with every tree in 'raw': {}",
@@ -3868,7 +3943,7 @@ impl Model {
         let mut named_other_locals = BTreeSet::new();
         let mut merged = BTreeSet::new();
         let mut temps_named = BTreeSet::new();
-        let mut wave2 = BTreeSet::new();
+        let mut wave2_trees = BTreeSet::new();
         let mut raw_bcons_named = BTreeSet::new();
         out.line("// Decompiled by `sims-antics lift --v2`.");
         if self.behavioral {
@@ -4111,7 +4186,13 @@ impl Model {
                         let mut builtin_locals = 0;
                         let wave2 = !plan.pre_wave2.contains(&t.id);
                         walk_stmts(body, &mut |s| {
-                            if let Some(index) = builtin_local(s, wave2)
+                            let local = builtin_local(s, wave2);
+                            // A local only a wave 2 spelling names is that spelling's, even
+                            // when the spelling is not written: `drop_wave2` drops the pin.
+                            if wave2 && local != builtin_local(s, false) {
+                                wave2_trees.insert(t.id);
+                            }
+                            if let Some(index) = local
                                 && index < t.original.locals
                             {
                                 builtin_locals = builtin_locals.max(index + 1);
@@ -4184,7 +4265,7 @@ impl Model {
                         temps_named.insert(t.id);
                     }
                     if tr.wave2_used.get() {
-                        wave2.insert(t.id);
+                        wave2_trees.insert(t.id);
                     }
                 }
                 _ => {
@@ -4268,7 +4349,7 @@ impl Model {
             named_other_locals,
             merged,
             temps_named,
-            wave2,
+            wave2: wave2_trees,
             raw_bcons_named,
             variant_lines,
             strings_lines,
@@ -4379,6 +4460,46 @@ fn write_raw_block(out: &mut Out, lines: &[String]) {
 /// Whether `text` is one call, `path(args)` (`globals::f(1)`, `sim.debit_funds(5)`), so
 /// that `text?` applies `?` to the call. A bitflags test (`x.is_empty()`) reads oddly with
 /// `?` and is left alone.
+/// `.air` text with the `locals:` count left out of every tree header
+/// (`tree ID "label" (.., locals: N, ..) {`), and the count each header declared.
+fn without_locals(air: &str) -> (String, BTreeMap<u16, u16>) {
+    let mut out = String::with_capacity(air.len());
+    let mut declared = BTreeMap::new();
+    for line in air.split_inclusive('\n') {
+        let header = line
+            .trim_start()
+            .strip_prefix("tree ")
+            .and_then(|rest| rest.split_once(' '))
+            .and_then(|(id, _)| id.parse::<u16>().ok())
+            .and_then(|id| Some((id, line.rfind(" (")?)))
+            .and_then(|(id, open)| {
+                let head = &line[open..];
+                let start = head.find("locals: ")?;
+                let digits = head[start + 8..]
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(head.len() - start - 8);
+                let end = start + 8 + digits;
+                declared.insert(id, head[start + 8..end].parse::<u16>().ok()?);
+                // The field with its separator: `, locals: N` or `locals: N, `.
+                let (cut_start, cut_end) = if head[..start].ends_with(", ") {
+                    (start - 2, end)
+                } else if head[end..].starts_with(", ") {
+                    (start, end + 2)
+                } else {
+                    (start, end)
+                };
+                Some(format!(
+                    "{}{}{}",
+                    &line[..open],
+                    &head[..cut_start],
+                    &head[cut_end..]
+                ))
+            });
+        out.push_str(header.as_deref().unwrap_or(line));
+    }
+    (out, declared)
+}
+
 fn is_call_text(text: &str) -> bool {
     let Some(open) = text.find('(') else {
         return false;
