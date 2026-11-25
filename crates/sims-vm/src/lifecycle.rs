@@ -1717,6 +1717,14 @@ fn move_in_inner(
 /// warm in memory. Each [`enter_lot_with_cache`] call only splices and links
 /// the neighborhood's `Characters` files instead of re-reading the entire
 /// install from disk.
+///
+/// The cache holds what it read when it was loaded (the install's detected
+/// expansions, archives, index, catalog and linked base program), plus
+/// what it reads once when first needed (the ordered wardrobe). Cached
+/// calls use those, and the `*_with_cache` travel transitions check
+/// expansions against them. Other files a call reads, such as a
+/// destination's description, still come from disk at the time. Load the
+/// cache again after the install changes.
 #[derive(Clone)]
 pub struct VmInstallCache {
     inner: Arc<VmInstallCacheInner>,
@@ -1740,6 +1748,22 @@ struct VmInstallCacheInner {
     surfaces: Surfaces,
     tuning: Option<NeighborhoodTuning>,
     default_character_name: String,
+    /// The appearance inputs a travel arrival refreshes outfits from
+    /// (`ImportWardrobe::load_lenient`), read at the first transition that
+    /// asks: a lot entry does not need them.
+    ordered_wardrobe: std::sync::OnceLock<Result<sims_content::ImportWardrobe, String>>,
+}
+
+/// What a REDB lot transition boots from, built from a [`VmInstallCache`]
+/// for [`crate::travel`]: the same values the travel module's uncached
+/// load reads from disk.
+pub(crate) struct CachedTransition {
+    pub(crate) install: Install,
+    pub(crate) index: Index,
+    pub(crate) catalog: Catalog,
+    pub(crate) program: Program,
+    pub(crate) surfaces: Surfaces,
+    pub(crate) stored: StoredNeighborhood,
 }
 
 impl fmt::Debug for VmInstallCache {
@@ -1890,8 +1914,37 @@ impl VmInstallCache {
                 surfaces,
                 tuning,
                 default_character_name,
+                ordered_wardrobe: std::sync::OnceLock::new(),
             }),
         })
+    }
+
+    /// The neighborhood's install, index, catalog, linked program and
+    /// surfaces for a REDB lot transition, spliced from the cache as
+    /// [`enter_lot_with_cache`] does. The program carries no travel-only
+    /// fields; [`crate::travel`] sets those.
+    pub(crate) fn transition(
+        &self,
+        stored: StoredNeighborhood,
+        character_files: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<CachedTransition, LifecycleError> {
+        let runtime = StoreRuntime::from_snapshot_with_cache(self, stored, character_files)?;
+        Ok(CachedTransition {
+            install: runtime.install,
+            index: runtime.index,
+            catalog: runtime.catalog,
+            program: runtime.program,
+            surfaces: runtime.surfaces,
+            stored: runtime.stored,
+        })
+    }
+
+    /// The install's ordered appearance inputs, read once.
+    pub(crate) fn ordered_wardrobe(&self) -> Result<sims_content::ImportWardrobe, String> {
+        self.inner
+            .ordered_wardrobe
+            .get_or_init(|| crate::travel::ordered_wardrobe(&self.inner.install))
+            .clone()
     }
 
     /// Root directory of the cached installation.

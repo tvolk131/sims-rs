@@ -193,8 +193,10 @@ fn assert_round_trip(name: &str, source: &str) -> String {
 fn synthetic_lamp_round_trips_with_idioms() {
     let source = assert_round_trip("synth-lamp.antics", LAMP);
     for idiom in [
+        // A lifecycle block takes `@frame` only when the default header does not do: `main`
+        // reads `param[0]`.
         "@id(4096) init {",
-        "@id(4097) main {",
+        "@id(4097) @frame(args: 1, locals: 0, format: 0x8002, revision: 0) main {",
         "loop {",
         "if self.attr_0 != 0 {",
         "animate(clip: 3, table: 1, flags: 0, events: 0) |event| {",
@@ -304,7 +306,15 @@ fn zero_local_loops_sounds_and_frame_kinds_round_trip() {
     assert!(!source.contains("set_to_next"), "{source}");
     // Trees without a kind keep the plain frame.
     assert!(
-        source.contains("@id(4302) @frame(args: 0, locals: 0, format: 0x8002, revision: 0) tree"),
+        source.contains("@id(4303) @frame(args: 0, locals: 0, format: 0x8002, revision: 0) tree"),
+        "{source}"
+    );
+    // `census` prefers the Sim context (it reads the stack object's attributes) but `main`
+    // calls it: it is written for either context.
+    assert!(
+        source.contains(
+            "@id(4302) @frame(args: 0, locals: 0, format: 0x8002, revision: 0) @context(inherit) tree"
+        ),
         "{source}"
     );
 }
@@ -703,6 +713,58 @@ fn formatter_keeps_empty_frames() {
     // Formatting keeps the 0-node trees.
     let iff = |s: &str| {
         compile_v2_source("empty.antics", s, &PackResolverConfig::default())
+            .expect("compile")
+            .iff_bytes
+    };
+    assert_eq!(iff(source), iff(&formatted));
+}
+
+#[test]
+fn formatter_handles_pr_h_attributes_and_constant_bindings() {
+    let source = r#"object "Synth PR H" {
+    guid: 0x7E00_0009; price: 1;
+    sprite: Sprite::procedural("floor_lamp", primary: #504030, accent: #A09080, trim: #201810);
+    state level @ 2: i16;
+    @id(4300)  @ context( inherit )
+    tree helper "Helper" { me.attr[2] = 1; }
+    @id(4301) @frame(args: 4) main { temp[0] = 1; }
+    @id(4302) tree probe "Probe" {
+        @ slot( 3 ) let x: i16;
+        const(A, B) = if temp[0] > 0 {(1, 2)}   else {  (3, 4) };
+        const C = if temp[1] > 0 { 5 } else { 6 };
+        const D = if temp[1] > 1 {
+            7
+        } else {
+            8
+        };
+        const E = if temp[1] > 2 { 9 } else { return false; };
+        temp[2] = A + B + C + D + E;
+        self.level = x;
+    }
+}
+"#;
+    let formatted = format_v2_source(source).expect("format");
+    assert!(is_v2_formatted(&formatted).expect("check"), "{formatted}");
+    assert_eq!(
+        format_v2_source(&formatted).expect("reformat"),
+        formatted,
+        "idempotent"
+    );
+    for expected in [
+        "    @id(4300) @context(inherit)\n    tree helper \"Helper\" {\n",
+        "        @slot(3) let x: i16;\n",
+        "        const (A, B) = if temp[0] > 0 { (1, 2) } else { (3, 4) };\n",
+        "        const C = if temp[1] > 0 { 5 } else { 6 };\n",
+        "        const D = if temp[1] > 1 {\n            7\n        } else {\n            8\n        };\n",
+        "        const E = if temp[1] > 2 {\n            9\n        } else {\n            return false;\n        };\n",
+    ] {
+        assert!(
+            formatted.contains(expected),
+            "missing {expected:?} in:\n{formatted}"
+        );
+    }
+    let iff = |s: &str| {
+        compile_v2_source("pr_h.antics", s, &PackResolverConfig::default())
             .expect("compile")
             .iff_bytes
     };

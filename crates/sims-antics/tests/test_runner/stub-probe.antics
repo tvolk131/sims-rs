@@ -1,0 +1,52 @@
+// Stub Probe — a synthetic fixture for `sims-antics test` (tests/antics_test_runner.rs): it
+// calls global trees the spec supplies as stubs, and pushes an interaction on a Sim
+// (`push_interaction` takes the primitive's priority code: 3 is priority 50).
+
+object "Stub Probe" {
+    guid: 0x7E00_7E01;
+    price: 1;
+    sprite: Sprite::procedural("floor_lamp", primary: #101010, accent: #202020, trim: #303030);
+
+    extern mod g {
+        @id(300) fn probe() -> bool;
+        @id(301) fn rate(a: i16) -> bool;
+    }
+
+    state hits: i16 = 0;
+    state misses: i16 = 0;
+
+    // A main that does not return, so the lot update has a thread to run between turns.
+    main {
+        loop {
+            sleep(1);
+        }
+    }
+
+    @id(4400) tree ask "Ask" {
+        if g::probe() {
+            self.hits += 1;
+            return true;
+        }
+        self.misses += 1;
+        return false;
+    }
+
+    @id(4401) tree rated "Rated" {
+        if g::rate(self.hits) {
+            return true;
+        }
+        return false;
+    }
+
+    @id(4402) tree nudge "Nudge" {
+        push_interaction(menu: 0, object: self, priority: 3, flags: 0);
+    }
+
+    interaction "Poke" {
+        run(sim) {
+            if g::probe() {
+                self.hits += 1;
+            }
+        }
+    }
+}

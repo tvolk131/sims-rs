@@ -1,0 +1,55 @@
+# Live sims-vm unit tests for the Open Street Mailbox: bills and the household budget.
+
+[subject]
+antics = "../objects/open-mailbox.antics"
+pack = ".."
+# Its Main returns at once (v2's default Main), which faults the game's lot update (error
+# 0x3e9): the interaction cases run with an idle loop in its place, an assumption every case
+# reports. Drop this once the object's Main loops.
+idle_main = true
+
+[sim]
+motives = { fun = 0 }
+
+[[test]]
+name = "a new mailbox holds one bill"
+tree = "Init"
+expect = { result = true, attrs = { unpaid_bills = 1, paid_bills = 0 } }
+
+[[test]]
+name = "bills cannot be paid without the money"
+guard = "Pay Bills"
+given = { funds = 50 }
+expect = { result = false }
+
+[[test]]
+name = "bills can be paid with the money"
+guard = "Pay Bills"
+given = { funds = 75 }
+expect = { result = true }
+
+# The action raises Room too, but the game's person tick sets Room from the room's score
+# after every turn of the Sim's thread; the runner runs the script only, so Room is not
+# asserted on an interaction run.
+[[test]]
+name = "paying a bill debits the budget"
+interaction = "Pay Bills"
+given = { funds = 500 }
+expect = { funds = 425, attrs = { unpaid_bills = 0, paid_bills = 1 }, sounds = ["open_mailbox_latch", "open_bills_paid"] }
+
+[[test]]
+name = "there is nothing to pay once the bills are paid"
+interaction = "Pay Bills"
+given = { funds = 500, attrs = { unpaid_bills = 0 } }
+expect = { result = "unavailable", funds = 500 }
+
+[[test]]
+name = "checking the mail brings a new bill"
+interaction = "Check Mail"
+given = { attrs = { unpaid_bills = 0 } }
+expect = { attrs = { unpaid_bills = 1 }, sim = { motives = { fun = 8 } }, sounds = ["open_mailbox_latch"] }
+
+[[test]]
+name = "the main loop returns at once"
+tree = "Main"
+expect = { result = true, turns = 0 }

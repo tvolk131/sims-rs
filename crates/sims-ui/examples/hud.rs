@@ -7,7 +7,7 @@
 //! with the strip closed (as after loading) and open (after pressing
 //! Live), on black.
 
-#[path = "../tests/common/mod.rs"]
+#[path = "../tests/integration/common/mod.rs"]
 mod common;
 
 use sims_ui::frame::Frame;

@@ -68,7 +68,7 @@ use crate::boot::{Finished, Frames, LoadReport, Lot, NeighborhoodOrigin, opening
 use crate::daily::value as object_value;
 use crate::factory::word;
 use crate::interpreter::{Interpreter, Stream};
-use crate::lifecycle::{LotPrices, architecture_value_and_built};
+use crate::lifecycle::{LotPrices, VmInstallCache, architecture_value_and_built};
 use crate::people;
 use crate::placement::{Place, Rules};
 use crate::play::Play;
@@ -1833,8 +1833,43 @@ pub fn depart_to_destination(
     home_lot: &mut Lot,
     request: &TravelRequest,
 ) -> Result<DepartureResult, TravelError> {
+    depart_to_destination_in(
+        Base::Root(install_root),
+        store,
+        neighborhood_id,
+        home_lot,
+        request,
+    )
+}
+
+/// [`depart_to_destination`] with the install read from `cache`, warm in memory, rather
+/// than from disk. Its result, lot and store are bit-identical to the
+/// uncached call on the install the cache was loaded from.
+pub fn depart_to_destination_with_cache(
+    cache: &VmInstallCache,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    home_lot: &mut Lot,
+    request: &TravelRequest,
+) -> Result<DepartureResult, TravelError> {
+    depart_to_destination_in(
+        Base::Cache(cache),
+        store,
+        neighborhood_id,
+        home_lot,
+        request,
+    )
+}
+
+fn depart_to_destination_in(
+    base: Base<'_>,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    home_lot: &mut Lot,
+    request: &TravelRequest,
+) -> Result<DepartureResult, TravelError> {
     depart(
-        install_root,
+        base,
         store,
         neighborhood_id,
         home_lot,
@@ -1903,8 +1938,29 @@ pub fn depart_from_request(
     neighborhood_id: &str,
     home_lot: &mut Lot,
 ) -> Result<DepartureResult, TravelError> {
-    depart_from_request_with(
-        install_root,
+    depart_from_request_in(Base::Root(install_root), store, neighborhood_id, home_lot)
+}
+
+/// [`depart_from_request`] with the install read from `cache`, warm in memory, rather
+/// than from disk. Its result, lot and store are bit-identical to the
+/// uncached call on the install the cache was loaded from.
+pub fn depart_from_request_with_cache(
+    cache: &VmInstallCache,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    home_lot: &mut Lot,
+) -> Result<DepartureResult, TravelError> {
+    depart_from_request_in(Base::Cache(cache), store, neighborhood_id, home_lot)
+}
+
+fn depart_from_request_in(
+    base: Base<'_>,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    home_lot: &mut Lot,
+) -> Result<DepartureResult, TravelError> {
+    depart_from_request_with_in(
+        base,
         store,
         neighborhood_id,
         home_lot,
@@ -1945,6 +2001,41 @@ pub fn depart_from_request_with(
     home_lot: &mut Lot,
     departure: &TripDeparture,
 ) -> Result<DepartureResult, TravelError> {
+    depart_from_request_with_in(
+        Base::Root(install_root),
+        store,
+        neighborhood_id,
+        home_lot,
+        departure,
+    )
+}
+
+/// [`depart_from_request_with`] with the install read from `cache`, warm in memory, rather
+/// than from disk. Its result, lot and store are bit-identical to the
+/// uncached call on the install the cache was loaded from.
+pub fn depart_from_request_with_with_cache(
+    cache: &VmInstallCache,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    home_lot: &mut Lot,
+    departure: &TripDeparture,
+) -> Result<DepartureResult, TravelError> {
+    depart_from_request_with_in(
+        Base::Cache(cache),
+        store,
+        neighborhood_id,
+        home_lot,
+        departure,
+    )
+}
+
+fn depart_from_request_with_in(
+    base: Base<'_>,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    home_lot: &mut Lot,
+    departure: &TripDeparture,
+) -> Result<DepartureResult, TravelError> {
     let trip = home_lot.world.trip_request.clone().ok_or_else(|| {
         TravelError::Lot("no trip was asked for (Generic Sims Call 17 has not run)".into())
     })?;
@@ -1956,7 +2047,7 @@ pub fn depart_from_request_with(
         ..travel_request_for_trip(&home_lot.world, &trip)?
     };
     let result = depart(
-        install_root,
+        base,
         store,
         neighborhood_id,
         home_lot,
@@ -2034,7 +2125,7 @@ pub fn travel_request_for_trip(
 }
 
 fn depart(
-    install_root: &Path,
+    base: Base<'_>,
     store: &NeighborhoodStore,
     neighborhood_id: &str,
     home_lot: &mut Lot,
@@ -2095,7 +2186,7 @@ fn depart(
         });
     }
 
-    let install = Install::detect(install_root).map_err(|e| TravelError::Lot(e.to_string()))?;
+    let install = base.install()?;
     let detected_expansions = u16::from(install.expansions.0);
     let effective_expansions = detected_expansions & home_lot.program.expansions;
 
@@ -2326,11 +2417,7 @@ fn depart(
 
     // Boot destination lot in memory BEFORE committing REDB, so any destination
     // boot/injection failure rolls back cleanly with zero REDB/home mutations.
-    let runtime = StoreRuntime::from_snapshot(
-        install_root,
-        staged_stored.clone(),
-        &dest_snapshot.character_files,
-    )?;
+    let runtime = StoreRuntime::load(base, staged_stored.clone(), &dest_snapshot.character_files)?;
     let (mut dest_lot, traveler_records) = boot_destination_lot(
         runtime,
         store.store_id(),
@@ -2488,7 +2575,46 @@ pub fn resume_active_trip(
     answers: &[u8],
     frames: Frames,
 ) -> Result<DepartureResult, TravelError> {
-    let install = Install::detect(install_root).map_err(|e| TravelError::Lot(e.to_string()))?;
+    resume_active_trip_in(
+        Base::Root(install_root),
+        store,
+        neighborhood_id,
+        home_house,
+        answers,
+        frames,
+    )
+}
+
+/// [`resume_active_trip`] with the install read from `cache`, warm in memory, rather
+/// than from disk. Its result, lot and store are bit-identical to the
+/// uncached call on the install the cache was loaded from.
+pub fn resume_active_trip_with_cache(
+    cache: &VmInstallCache,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    home_house: u32,
+    answers: &[u8],
+    frames: Frames,
+) -> Result<DepartureResult, TravelError> {
+    resume_active_trip_in(
+        Base::Cache(cache),
+        store,
+        neighborhood_id,
+        home_house,
+        answers,
+        frames,
+    )
+}
+
+fn resume_active_trip_in(
+    base: Base<'_>,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    home_house: u32,
+    answers: &[u8],
+    frames: Frames,
+) -> Result<DepartureResult, TravelError> {
+    let install = base.install()?;
     let detected_expansions = u16::from(install.expansions.0);
 
     let home_snapshot = store
@@ -2570,8 +2696,8 @@ pub fn resume_active_trip(
         .unwrap_or_default();
     let arrival = persisted.arrival_family(&household, &home_snapshot.neighborhood.zoning);
 
-    let runtime = StoreRuntime::from_snapshot(
-        install_root,
+    let runtime = StoreRuntime::load(
+        base,
         home_snapshot.neighborhood.clone(),
         &dest_snapshot.character_files,
     )?;
@@ -2663,6 +2789,45 @@ pub fn abort_active_trip(
     answers: &[u8],
     frames: Frames,
 ) -> Result<ReturnResult, TravelError> {
+    abort_active_trip_in(
+        Base::Root(install_root),
+        store,
+        neighborhood_id,
+        home_house,
+        answers,
+        frames,
+    )
+}
+
+/// [`abort_active_trip`] with the install read from `cache`, warm in memory, rather
+/// than from disk. Its result, lot and store are bit-identical to the
+/// uncached call on the install the cache was loaded from.
+pub fn abort_active_trip_with_cache(
+    cache: &VmInstallCache,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    home_house: u32,
+    answers: &[u8],
+    frames: Frames,
+) -> Result<ReturnResult, TravelError> {
+    abort_active_trip_in(
+        Base::Cache(cache),
+        store,
+        neighborhood_id,
+        home_house,
+        answers,
+        frames,
+    )
+}
+
+fn abort_active_trip_in(
+    base: Base<'_>,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    home_house: u32,
+    answers: &[u8],
+    frames: Frames,
+) -> Result<ReturnResult, TravelError> {
     let home_snapshot = store
         .load_lot_snapshot(neighborhood_id, home_house)?
         .ok_or_else(|| TravelError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
@@ -2737,11 +2902,8 @@ pub fn abort_active_trip(
         }
     }
 
-    let home_runtime = StoreRuntime::from_snapshot(
-        install_root,
-        updated_stored.clone(),
-        &home_snapshot.character_files,
-    )?;
+    let home_runtime =
+        StoreRuntime::load(base, updated_stored.clone(), &home_snapshot.character_files)?;
     let (mut resumed_home, returning_travelers) = reconcile_frozen_home_lot(
         home_runtime,
         store.store_id(),
@@ -3363,8 +3525,47 @@ pub fn return_from_destination(
     answers: &[u8],
     frames: Frames,
 ) -> Result<ReturnResult, TravelError> {
+    return_from_destination_in(
+        Base::Root(install_root),
+        store,
+        session,
+        destination_lot,
+        answers,
+        frames,
+    )
+}
+
+/// [`return_from_destination`] with the install read from `cache`, warm in memory, rather
+/// than from disk. Its result, lot and store are bit-identical to the
+/// uncached call on the install the cache was loaded from.
+pub fn return_from_destination_with_cache(
+    cache: &VmInstallCache,
+    store: &NeighborhoodStore,
+    session: &TravelSession,
+    destination_lot: &mut Lot,
+    answers: &[u8],
+    frames: Frames,
+) -> Result<ReturnResult, TravelError> {
+    return_from_destination_in(
+        Base::Cache(cache),
+        store,
+        session,
+        destination_lot,
+        answers,
+        frames,
+    )
+}
+
+fn return_from_destination_in(
+    base: Base<'_>,
+    store: &NeighborhoodStore,
+    session: &TravelSession,
+    destination_lot: &mut Lot,
+    answers: &[u8],
+    frames: Frames,
+) -> Result<ReturnResult, TravelError> {
     return_home(
-        install_root,
+        base,
         store,
         session,
         destination_lot,
@@ -3407,11 +3608,50 @@ pub fn return_from_request(
     answers: &[u8],
     frames: Frames,
 ) -> Result<ReturnResult, TravelError> {
+    return_from_request_in(
+        Base::Root(install_root),
+        store,
+        session,
+        destination_lot,
+        answers,
+        frames,
+    )
+}
+
+/// [`return_from_request`] with the install read from `cache`, warm in memory, rather
+/// than from disk. Its result, lot and store are bit-identical to the
+/// uncached call on the install the cache was loaded from.
+pub fn return_from_request_with_cache(
+    cache: &VmInstallCache,
+    store: &NeighborhoodStore,
+    session: &TravelSession,
+    destination_lot: &mut Lot,
+    answers: &[u8],
+    frames: Frames,
+) -> Result<ReturnResult, TravelError> {
+    return_from_request_in(
+        Base::Cache(cache),
+        store,
+        session,
+        destination_lot,
+        answers,
+        frames,
+    )
+}
+
+fn return_from_request_in(
+    base: Base<'_>,
+    store: &NeighborhoodStore,
+    session: &TravelSession,
+    destination_lot: &mut Lot,
+    answers: &[u8],
+    frames: Frames,
+) -> Result<ReturnResult, TravelError> {
     let trip = destination_lot.world.trip_request.clone().ok_or_else(|| {
         TravelError::Lot("no trip home was asked for (Generic Sims Call 17 has not run)".into())
     })?;
     let result = return_home(
-        install_root,
+        base,
         store,
         session,
         destination_lot,
@@ -3466,11 +3706,46 @@ pub fn travel_on_from_request(
     destination_lot: &mut Lot,
     departure: &TripDeparture,
 ) -> Result<DepartureResult, TravelError> {
+    travel_on_from_request_in(
+        Base::Root(install_root),
+        store,
+        session,
+        destination_lot,
+        departure,
+    )
+}
+
+/// [`travel_on_from_request`] with the install read from `cache`, warm in memory, rather
+/// than from disk. Its result, lot and store are bit-identical to the
+/// uncached call on the install the cache was loaded from.
+pub fn travel_on_from_request_with_cache(
+    cache: &VmInstallCache,
+    store: &NeighborhoodStore,
+    session: &TravelSession,
+    destination_lot: &mut Lot,
+    departure: &TripDeparture,
+) -> Result<DepartureResult, TravelError> {
+    travel_on_from_request_in(
+        Base::Cache(cache),
+        store,
+        session,
+        destination_lot,
+        departure,
+    )
+}
+
+fn travel_on_from_request_in(
+    base: Base<'_>,
+    store: &NeighborhoodStore,
+    session: &TravelSession,
+    destination_lot: &mut Lot,
+    departure: &TripDeparture,
+) -> Result<DepartureResult, TravelError> {
     let trip = destination_lot.world.trip_request.clone().ok_or_else(|| {
         TravelError::Lot("no trip was asked for (Generic Sims Call 17 has not run)".into())
     })?;
     let result = return_home(
-        install_root,
+        base,
         store,
         session,
         destination_lot,
@@ -3516,7 +3791,7 @@ impl Left {
 
 #[allow(clippy::too_many_arguments)]
 fn return_home(
-    install_root: &Path,
+    base: Base<'_>,
     store: &NeighborhoodStore,
     session: &TravelSession,
     destination_lot: &mut Lot,
@@ -3969,7 +4244,7 @@ fn return_home(
             )));
         }
         return travel_on(
-            install_root,
+            base,
             store,
             &persisted,
             (
@@ -3990,11 +4265,8 @@ fn return_home(
     //    REDB, leaving any Build/Buy community-lot snapshot in REDB untouched
     //    (matching `Sims.exe` 1.91: live away-from-home visits never overwrite
     //    the destination lot with transient visit NPCs/mess).
-    let home_runtime = StoreRuntime::from_snapshot(
-        install_root,
-        updated_stored.clone(),
-        &home_snapshot.character_files,
-    )?;
+    let home_runtime =
+        StoreRuntime::load(base, updated_stored.clone(), &home_snapshot.character_files)?;
     let (mut resumed_home, returning_travelers) = reconcile_frozen_home_lot(
         home_runtime,
         store.store_id(),
@@ -4214,7 +4486,7 @@ fn onward_request(
 /// revision `fence` names.
 #[allow(clippy::too_many_arguments)]
 fn travel_on(
-    install_root: &Path,
+    base: Base<'_>,
     store: &NeighborhoodStore,
     persisted: &PersistedTravelRecord,
     fence: (u128, u64),
@@ -4234,7 +4506,7 @@ fn travel_on(
     let Some(destination) = TravelDestination::classify(house, &stored.zoning) else {
         return Err(TravelError::NotTravelDestination { house, zoning });
     };
-    let install = Install::detect(install_root).map_err(|e| TravelError::Lot(e.to_string()))?;
+    let install = base.install()?;
     let installed = u16::from(install.expansions.0) & destination_lot.program.expansions;
     let required_bit = destination.expansion_bit();
     if installed & required_bit == 0 {
@@ -4322,8 +4594,7 @@ fn travel_on(
         house,
         session.home_family,
     );
-    let runtime =
-        StoreRuntime::from_snapshot(install_root, stored.clone(), &dest_snapshot.character_files)?;
+    let runtime = StoreRuntime::load(base, stored.clone(), &dest_snapshot.character_files)?;
     let (mut dest_lot, travelers) = boot_destination_lot(
         runtime,
         store.store_id(),
@@ -4525,6 +4796,45 @@ pub fn open_destination_for_edit(
     answers: &[u8],
     frames: Frames,
 ) -> Result<Lot, TravelError> {
+    open_destination_for_edit_in(
+        Base::Root(install_root),
+        store,
+        neighborhood_id,
+        destination_house,
+        answers,
+        frames,
+    )
+}
+
+/// [`open_destination_for_edit`] with the install read from `cache`, warm in memory, rather
+/// than from disk. Its result, lot and store are bit-identical to the
+/// uncached call on the install the cache was loaded from.
+pub fn open_destination_for_edit_with_cache(
+    cache: &VmInstallCache,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    destination_house: u32,
+    answers: &[u8],
+    frames: Frames,
+) -> Result<Lot, TravelError> {
+    open_destination_for_edit_in(
+        Base::Cache(cache),
+        store,
+        neighborhood_id,
+        destination_house,
+        answers,
+        frames,
+    )
+}
+
+fn open_destination_for_edit_in(
+    base: Base<'_>,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    destination_house: u32,
+    answers: &[u8],
+    frames: Frames,
+) -> Result<Lot, TravelError> {
     let dest_snapshot = store
         .load_lot_snapshot(neighborhood_id, destination_house)?
         .ok_or_else(|| TravelError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
@@ -4551,7 +4861,7 @@ pub fn open_destination_for_edit(
             house: destination_house,
         });
     }
-    let install = Install::detect(install_root).map_err(|e| TravelError::Lot(e.to_string()))?;
+    let install = base.install()?;
     let detected_expansions = u16::from(install.expansions.0);
     let required_bit = destination.expansion_bit();
     if detected_expansions & required_bit == 0 {
@@ -4561,8 +4871,8 @@ pub fn open_destination_for_edit(
             installed: detected_expansions,
         });
     }
-    let runtime = StoreRuntime::from_snapshot(
-        install_root,
+    let runtime = StoreRuntime::load(
+        base,
         dest_snapshot.neighborhood,
         &dest_snapshot.character_files,
     )?;
@@ -6568,6 +6878,43 @@ fn read_destination_lot_info(
     (name, desc)
 }
 
+/// Where a lot transition reads the install from: its folder on disk, or
+/// a [`VmInstallCache`] loaded from it. Both give the same lot.
+#[derive(Clone, Copy)]
+enum Base<'a> {
+    Root(&'a Path),
+    Cache(&'a VmInstallCache),
+}
+
+impl Base<'_> {
+    /// The install a transition checks expansions against: detected afresh
+    /// from the root, or the cache's own, so a cached transition validates
+    /// against the install it boots from. A cache built before an expansion
+    /// was installed doesn't know it; build the cache again after changing
+    /// the install.
+    fn install(&self) -> Result<std::borrow::Cow<'_, Install>, TravelError> {
+        match self {
+            Self::Root(root) => Install::detect(root)
+                .map(std::borrow::Cow::Owned)
+                .map_err(|e| TravelError::Lot(e.to_string())),
+            Self::Cache(cache) => Ok(std::borrow::Cow::Borrowed(cache.install())),
+        }
+    }
+}
+
+/// The install's ordered appearance inputs, which an arrival refreshes the
+/// travelers' outfits from; the first file that fails to read is the error.
+pub(crate) fn ordered_wardrobe(install: &Install) -> Result<sims_content::ImportWardrobe, String> {
+    match sims_content::ImportWardrobe::load_lenient(install) {
+        Ok((ordered, errors)) if errors.is_empty() => Ok(ordered),
+        Ok((_, errors)) => {
+            let (file, error) = errors.into_iter().next().unwrap();
+            Err(format!("{file} ({error})"))
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// Shared install + neighborhood resources loaded for a REDB lot transition.
 struct StoreRuntime {
     install: Install,
@@ -6579,6 +6926,48 @@ struct StoreRuntime {
 }
 
 impl StoreRuntime {
+    fn load(
+        base: Base<'_>,
+        stored: StoredNeighborhood,
+        character_files: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<Self, TravelError> {
+        match base {
+            Base::Root(root) => Self::from_snapshot(root, stored, character_files),
+            Base::Cache(cache) => Self::from_cache(cache, stored, character_files),
+        }
+    }
+
+    /// [`StoreRuntime::from_snapshot`] from the cache's base, spliced with
+    /// the neighborhood's characters as a cached lot entry does, then given
+    /// the fields only a transition sets: the install's own expansions and
+    /// the ordered wardrobe.
+    fn from_cache(
+        cache: &VmInstallCache,
+        stored: StoredNeighborhood,
+        character_files: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<Self, TravelError> {
+        let crate::lifecycle::CachedTransition {
+            install,
+            index,
+            catalog,
+            mut program,
+            surfaces,
+            stored,
+        } = cache
+            .transition(stored, character_files)
+            .map_err(|e| TravelError::Lot(e.to_string()))?;
+        program.expansions = u16::from(install.expansions.0);
+        program.ordered_wardrobe = Some(cache.ordered_wardrobe());
+        Ok(Self {
+            install,
+            index,
+            catalog,
+            program,
+            surfaces,
+            stored,
+        })
+    }
+
     fn from_snapshot(
         install_root: &Path,
         stored: StoredNeighborhood,
@@ -6622,15 +7011,7 @@ impl StoreRuntime {
             Ok(assets) => sims_content::Wardrobe::load(&assets),
             Err(error) => sims_content::Wardrobe::unread(error),
         });
-        program.ordered_wardrobe =
-            Some(match sims_content::ImportWardrobe::load_lenient(&install) {
-                Ok((ordered, errors)) if errors.is_empty() => Ok(ordered),
-                Ok((_, errors)) => {
-                    let (file, error) = errors.into_iter().next().unwrap();
-                    Err(format!("{file} ({error})"))
-                }
-                Err(error) => Err(error.to_string()),
-            });
+        program.ordered_wardrobe = Some(ordered_wardrobe(&install));
         if !character_files.is_empty() {
             program.character_files =
                 crate::program::character_files(&index, Path::new(Index::CHARACTERS));

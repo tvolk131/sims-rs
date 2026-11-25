@@ -405,6 +405,15 @@ impl FrozenDialogTick {
     }
 }
 
+/// A warm fork of a co-op lot ([`Lot::fork_coop`]), which only
+/// [`Lot::restore_coop_fork`] takes: the lot's in-memory save and its
+/// co-op context, taken together when the lot could be forked.
+#[derive(Clone)]
+pub struct CoopFork {
+    saved: Saved,
+    ctx: CoopVmContext,
+}
+
 /// Co-op multiplayer context attached to a [`Lot`] / [`Interpreter`].
 ///
 /// Always `None` in single-player so single-player execution stays 100%
@@ -3042,6 +3051,77 @@ impl Lot {
         expected_fingerprint: StateFingerprint,
     ) -> Result<(), SaveError> {
         self.restore_coop_snapshot_inner(bytes, session, Some(expected_fingerprint))
+    }
+
+    /// Why this lot can't be forked warm ([`Lot::fork_coop`]) now, if it
+    /// can't. A warm fork is an in-memory save, which keeps neither what
+    /// the lot waits on nor a Buy or Build cursor, so it needs a co-op lot
+    /// that is not halted, waits on no dialog or special panel (neither the
+    /// lot nor its context: a dialog answered while paused still holds the
+    /// interrupted tick until it runs), and has no active cursor.
+    pub fn coop_fork_blocker(&self) -> Option<&'static str> {
+        let Some(ctx) = self.coop.as_ref() else {
+            return Some("co-op is not attached");
+        };
+        if self.halted {
+            Some("the lot is halted")
+        } else if self.has_pending_dialog()
+            || ctx.active_dialog.is_some()
+            || ctx.active_special_panel.is_some()
+            || ctx.frozen_dialog.is_some()
+            || !ctx.session.open_dialogs.is_empty()
+        {
+            Some("the lot waits on a dialog or special panel")
+        } else if self.active_buy_cursor.is_some() || self.active_wall_cursor.is_some() {
+            Some("a Buy or Build cursor is active")
+        } else {
+            None
+        }
+    }
+
+    /// A warm fork of this co-op lot: its in-memory save and a clone of its
+    /// co-op context, for [`Lot::restore_coop_fork`]. Refused for the
+    /// reasons [`Lot::coop_fork_blocker`] gives.
+    pub fn fork_coop(&self) -> Result<CoopFork, SaveError> {
+        if let Some(why) = self.coop_fork_blocker() {
+            return Err(SaveError::Format(format!("a co-op fork is refused: {why}")));
+        }
+        Ok(CoopFork {
+            saved: self.save()?,
+            ctx: self.coop.clone().expect("co-op is attached"),
+        })
+    }
+
+    /// Goes on from `fork`, taken from a co-op lot loaded from the same
+    /// install and house, which then steps exactly as the lot it came from.
+    ///
+    /// Unlike [`Lot::attach_coop_context`], nothing in the context is
+    /// applied to the world again (the session's requested speed, its
+    /// selections), so a lot at the idle speed its residents left it at
+    /// stays there. Unlike [`Lot::restore_coop_snapshot`], nothing is
+    /// encoded. As with any restore, Buy and Build undo history is not
+    /// carried.
+    pub fn restore_coop_fork(&mut self, fork: CoopFork) -> Result<(), SaveError> {
+        let CoopFork { saved, ctx } = fork;
+        if saved
+            .world
+            .globals
+            .get(GLOBAL_TUTORIAL)
+            .copied()
+            .unwrap_or(0)
+            != 0
+        {
+            return Err(SaveError::Format(
+                "tutorial lots are single-player only and cannot be restored in co-op mode".into(),
+            ));
+        }
+        self.restore(saved)?;
+        self.disable_coop_tutorial_and_help();
+        self.wait_for_answers();
+        self.frames = ctx.frames.clone();
+        self.view_rotation = ctx.host_camera_rotation();
+        self.coop = Some(ctx);
+        Ok(())
     }
 
     fn restore_coop_snapshot_inner(

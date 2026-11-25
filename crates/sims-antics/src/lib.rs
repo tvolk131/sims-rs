@@ -28,6 +28,7 @@ pub mod manifest;
 pub mod parser;
 pub mod sim_pack;
 pub mod structure_lift;
+pub mod test_runner;
 pub mod v2;
 pub mod verify;
 

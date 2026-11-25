@@ -1,0 +1,50 @@
+# Live sims-vm unit tests for the Open Wall Phone: dialog answers, funds, and the fridge
+# it restocks.
+
+[subject]
+antics = "../objects/open-wall-phone.antics"
+pack = ".."
+# Its Main returns at once (v2's default Main), which faults the game's lot update (error
+# 0x3e9): the interaction cases run with an idle loop in its place, an assumption every case
+# reports. Drop this once the object's Main loops.
+idle_main = true
+
+[lot]
+# The fridge's Main returns at once too: the same assumption, reported with every case.
+also = [{ antics = "../objects/open-fridge.antics", pack = "..", idle_main = true }]
+
+[sim]
+motives = { social = 0, fun = 0, comfort = 0 }
+
+[[test]]
+name = "ordering groceries with enough money debits $40"
+interaction = "Order Groceries"
+answers = [1]
+given = { funds = 100, create = ["open-fridge"] }
+expect = { funds = 60, attrs = { last_outcome = 1, completed_calls = 1 }, dialogs = ["yes_no"], sounds = ["open_phone_dial", "open_phone_confirm"], sim = { motives = { comfort = 10 } } }
+
+[[test]]
+name = "ordering groceries without the money changes nothing"
+interaction = "Order Groceries"
+answers = [1]
+given = { funds = 10 }
+expect = { funds = 10, attrs = { last_outcome = 5, completed_calls = 0 }, sounds = ["open_phone_dial"] }
+
+[[test]]
+name = "cancelling the order"
+interaction = "Order Groceries"
+answers = [2]
+given = { funds = 100 }
+expect = { funds = 100, attrs = { last_outcome = 4 }, dialogs = ["yes_no"] }
+
+[[test]]
+name = "chatting with a neighbour"
+interaction = "Use Phone"
+answers = [2]
+expect = { attrs = { last_outcome = 2, completed_calls = 1, occupied = 0 }, dialogs = ["yes_no_cancel"], sim = { motives = { social = 35, fun = 15 } }, sounds = ["open_phone_ring", "open_phone_dial", "open_phone_confirm"] }
+
+[[test]]
+name = "community info shows an inform dialog"
+interaction = "Use Phone"
+answers = [3]
+expect = { attrs = { last_outcome = 3 }, dialogs = ["yes_no_cancel", "ok"], sim = { motives = { fun = 10 } } }

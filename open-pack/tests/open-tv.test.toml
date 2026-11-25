@@ -1,0 +1,48 @@
+# Live sims-vm unit tests for the Open Retro Television (`sims-antics test`).
+
+[subject]
+antics = "../objects/open-tv.antics"
+pack = ".."
+# Its Main returns at once (v2's default Main), which faults the game's lot update (error
+# 0x3e9): the interaction cases run with an idle loop in its place, an assumption every case
+# reports. Drop this once the object's Main loops.
+idle_main = true
+
+[sim]
+motives = { fun = 0 }
+
+[[test]]
+name = "Turn On is offered while the set is off"
+guard = "Turn On"
+given = { attrs = { power = 0 } }
+expect = { result = true }
+
+[[test]]
+name = "Turn On is not offered while the set is on"
+guard = "Turn On"
+given = { attrs = { power = 1 } }
+expect = { result = false }
+
+[[test]]
+name = "Turn Off is refused while someone watches"
+guard = "Turn Off"
+given = { attrs = { power = 1, occupied = 1 } }
+expect = { result = false }
+
+[[test]]
+name = "Turn On sets the power and clicks"
+action = "Turn On"
+given = { attrs = { power = 0 } }
+expect = { result = true, attrs = { power = 1 }, sounds = ["open_tv_click"] }
+
+[[test]]
+name = "Watch TV is refused to a Sim with plenty of fun"
+guard = "Watch TV"
+given = { sim = { motives = { fun = 95 } } }
+expect = { result = false }
+
+[[test]]
+name = "watching from the pie menu turns the set on and restores fun"
+interaction = "Watch TV"
+turns = 64
+expect = { attrs = { power = 1, watch_cycles = 4 }, sounds = ["open_tv_click", "open_tv_jingle"], sim = { motives = { fun = 96 } } }
