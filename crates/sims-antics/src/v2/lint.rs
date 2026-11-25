@@ -3078,12 +3078,23 @@ impl FileLinter<'_> {
                 by_id: BTreeMap::new(),
                 by_label: BTreeMap::new(),
             };
+            // Like the lowering, the last pinned `init` / `main` block's pin is the one the
+            // lifecycle tree takes; an earlier, superseded pin names no tree of its own.
+            let mut lifecycle_pins: [Option<(u16, Span)>; 2] = [None, None];
             for m in &o.members {
                 let (id, label, span) = match m {
                     ObjectMember::Tree(t) => (t.pinned_id, t.label.as_str(), t.span),
                     ObjectMember::Interaction(i) => (i.pinned_id, i.label.as_str(), i.span),
-                    ObjectMember::Init(b) => (b.pinned_id, "init", b.span),
-                    ObjectMember::Main(b) => (b.pinned_id, "main", b.span),
+                    ObjectMember::Init(b) | ObjectMember::Main(b) => {
+                        let (slot, label) = match m {
+                            ObjectMember::Init(_) => (0, "init"),
+                            _ => (1, "main"),
+                        };
+                        if let Some(id) = b.pinned_id {
+                            lifecycle_pins[slot] = Some((id, b.span));
+                        }
+                        (None, label, b.span)
+                    }
                     _ => continue,
                 };
                 if let Some(id) = id {
@@ -3094,6 +3105,9 @@ impl FileLinter<'_> {
                     .entry(label.to_owned())
                     .and_modify(|s| *s = None)
                     .or_insert(Some(span));
+            }
+            for (id, span) in lifecycle_pins.into_iter().flatten() {
+                spans.by_id.entry(id).or_insert(span);
             }
             sources.push(spans);
         }

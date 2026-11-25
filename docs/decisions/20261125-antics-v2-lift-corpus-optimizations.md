@@ -105,6 +105,8 @@ declarations type-check, so the call ABI and arity never change. The std table i
   size. The thresholds are now shared constants in `lint.rs`. The comment goes after both
   header forms (`#[bhav(..)]` and a lifecycle block's `#[id(N)]`). The lint now maps `init` and
   `main` findings by their pinned id, as it already did for `fn` trees, so the allow applies.
+  As in lowering, only the last pinned block of each kind counts, and a pin never takes a
+  `fn` or interaction tree's span.
 - **TTAB comments.** Identical interaction tables are written once. With several distinct tables,
   each gets a `TTAB <ids>:` header line.
 

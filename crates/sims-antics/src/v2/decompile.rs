@@ -5928,6 +5928,26 @@ object "Fable Lamp" {
     }
 
     #[test]
+    fn a_superseded_lifecycle_pin_does_not_take_a_trees_frame_finding() {
+        // The last pinned `init` names the lifecycle tree; the first pin (4300) is the
+        // oversized fn's, so its finding stays on the fn, not under the init's allow.
+        let stores: String = (0..205)
+            .map(|i| format!("        temp[0] = {i};\n"))
+            .collect();
+        let source = format!(
+            "object \"Fable Tower\" {{\n    guid: 0x7E00_0137;\n    #[bhav(id = 4300)]\n    fn big() {{\n{stores}    }}\n    #[id(4300)]\n    // antics-lint: allow(frame_headroom): test\n    init {{\n        temp[0] = 1;\n    }}\n    #[id(4301)]\n    init {{\n        temp[1] = 1;\n    }}\n}}\n"
+        );
+        let diags = crate::v2::lint::lint_v2_source(&source, "t.antics").expect("lint");
+        let frame: Vec<_> = diags
+            .iter()
+            .filter(|d| d.rule == crate::v2::lint::FRAME_HEADROOM)
+            .collect();
+        let fn_line = source.lines().position(|l| l.contains("fn big()")).unwrap() + 1;
+        assert_eq!(frame.len(), 1, "{diags:?}");
+        assert_eq!(frame[0].line, fn_line, "{diags:?}");
+    }
+
+    #[test]
     fn a_tree_already_past_the_frame_lint_allows_it() {
         let allow = |nodes: usize, locals: u16| {
             let mut t = tree(&vec![(2, 0xfe, 0xfd, [0; 8]); nodes]);
