@@ -2265,3 +2265,103 @@ fn me_cells_and_sim_context_me_fields_are_fine() {
         "object_tree_me_field",
     );
 }
+
+// --- review round 1 regressions ------------------------------------------------------------------
+
+#[test]
+fn local_bindings_named_me_or_self_are_not_the_engine_handles() {
+    // `me` bound by a local is that local, not the object.
+    none(
+        &tree("        let me: ObjectId = stack_obj;\n        self.level = me.room;"),
+        "object_tree_me_field",
+    );
+    // A Sim parameter named `self`: `self.data[N]` is the Sim's cell, not the object's.
+    none(
+        &obj(
+            "    #[bhav(label = \"Probe\")] fn probe(self: Sim) {\n        self.mode = Mode::Off;\n        self.level = self.data[29] + self.person[58];\n    }",
+        ),
+        "untyped_engine_field",
+    );
+    // A local `me` in a Sim tree is no Sim handle.
+    none(
+        &sim_tree("        let me = 3;\n        self.level = me + 1;"),
+        "untyped_engine_field",
+    );
+}
+
+#[test]
+fn a_bcon_table_named_me_is_not_the_object() {
+    // Declared on the object, or by a template the object uses: `me.entry` is the table.
+    none(
+        &obj(
+            "    extern bcon me { #[addr(16521)] probe; }\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.mode = Mode::Off;\n        self.level = me.probe;\n    }",
+        ),
+        "object_tree_me_field",
+    );
+}
+
+#[test]
+fn a_const_parameter_index_is_not_flagged() {
+    // `pick(29)` and `pick(0)` specialize `self.data[N]` to two cells: one name cannot fit.
+    let source = format!(
+        "#[inline]\nfn pick(const N: i16) -> i16 {{\n    return self.data[N];\n}}\n{}",
+        tree("        self.level = pick(29) + pick(0);")
+    );
+    none(&source, "untyped_engine_field");
+}
+
+#[test]
+fn raw_code_naming_extern_bcon_entries_and_its_own_entries_parses() {
+    let source = format!(
+        "extern bcon Tuning {{ #[addr(16521)] hour; }}\n{}",
+        tree(
+            "        raw {\n            temp[0] := Tuning.hour;\n            const Local.low = 3;\n            temp[1] := Local.low;\n        }"
+        )
+    );
+    none(&source, "raw_syntax");
+}
+
+#[test]
+fn raw_locals_are_tree_wide_and_not_constants() {
+    let source = format!(
+        "const COUNT = 4;\n{}",
+        tree("        raw { let COUNT = temp[0]; }\n        raw { COUNT := 1; }")
+    );
+    none(&source, "raw_syntax");
+}
+
+#[test]
+fn raw_names_from_other_modules_are_no_syntax_error_but_bad_syntax_is() {
+    // Constants and tables a `use` may bring in are not resolved here.
+    none(
+        &tree("        raw { my.attr[ELSEWHERE] := Other.entry; }"),
+        "raw_syntax",
+    );
+    // A stray identifier is still a syntax error.
+    let source = tree("        raw { temp[0] := 1 nonsense; }");
+    let d = one(&source, "raw_syntax");
+    assert!(d.message.contains("nonsense"), "{d:?}");
+}
+
+#[test]
+fn a_block_const_that_returns_is_control_flow_not_an_unused_constant() {
+    none(
+        &tree(
+            "        const GATE = if self.level == 1 { return; } else { 1 };\n        self.level = 2;",
+        ),
+        "unused_decl",
+    );
+}
+
+#[test]
+fn duplicate_std_global_help_names_the_std_parameters() {
+    let source = format!(
+        "extern mod globals {{\n    #[id(280)] fn wait_ticks(count: i16) -> Result;\n}}\n{}",
+        tree("        globals::wait_ticks(1)?;")
+    );
+    let d = one(&source, "duplicate_std_global");
+    assert!(
+        d.help.as_deref().unwrap_or("").contains("named `ticks`"),
+        "{d:?}"
+    );
+}

@@ -21,7 +21,12 @@ Separately, `check`, `equiv` and `fmt` used `is_v2_source`, which looked at the 
 
 ## Decision 1: one detector
 
-`is_v2_source` skips whitespace, `//` and nested `/* */` comments, and `#[...]` attributes (balanced brackets, strings skipped). It also skips `#` line comments, which only `.air` has. It then reads the first word: `.air` starts with `tree`, `interaction`, `bcon` or `str`, and v2 with anything else (`use`, `const`, `fn`, `object`, `extern`, `enum`, ...). A file with no word at all is not v2.
+`is_v2_source` reads the file's first word twice, after skipping whitespace and `//` and nested `/* */` comments:
+
+1. **As `.air`.** It also skips `#` lines, which `.air` reads as comments, including `#[..]` lines. If the first word is `tree`, `interaction`, `bcon` or `str`, the file is `.air`.
+2. **As v2.** It skips `#[...]` attributes instead (balanced brackets, strings skipped). If any word follows, the file is v2: `use`, `const`, `fn`, `object`, `extern`, `enum` and so on. A mistyped keyword then gets the v2 parser's diagnostic.
+
+A file with no word at all is not v2.
 
 `check`, `equiv`, `fmt` and `lint` all call it. `is_lintable_v2` is removed. `verify` and `expand` always compile as v2.
 
@@ -30,11 +35,11 @@ Separately, `check`, `equiv` and `fmt` used `is_v2_source`, which looked at the 
 | Rule | Severity | Fires on | Does not fire on |
 | --- | --- | --- | --- |
 | `shadowed_const` | warning | A block `const NAME = ..;` / `const (A, B) = ..;`, or a `const n: T` parameter, whose name is a file constant or a constant of the enclosing object or template. Also an object constant named like a file constant. | Names imported with `use` (not resolved here). |
-| `unused_decl` (constants) | warning | File, object and block constants no code names. | `pub` constants; template constants; `_` names; a name written anywhere in the file set other than as a `const` name (bodies, `guid:`, indices, other constants); a name a `raw` block uses. |
-| `duplicate_std_global` | warning | An `extern mod` function (top level, object or template) whose ID, parameter types and slots, and return ABI equal a `std::globals` function. Names are ignored. | The same ID with another ABI. |
-| `untyped_engine_field` | warning | A cell read or written by a literal index that has a typed name lowering maps to the same operand (tables below). | Indices with no name; anything in `raw { }`; `world.x` (it parses to `global[N]`, so the source text is checked). |
+| `unused_decl` (constants) | warning | File, object and block constants no code names. | `pub` constants; template constants; `_` names; a name written anywhere in the file set other than as a `const` name (bodies, `guid:`, indices, other constants); a name a `raw` block uses; a block binding whose selector returns, breaks or continues (it is control flow). |
+| `duplicate_std_global` | warning | An `extern mod` function (top level, object or template) whose ID, parameter types and slots, and return ABI equal a `std::globals` function. Names are ignored; the help lists the `std::globals` parameter names when they differ, since named arguments must change. | The same ID with another ABI. |
+| `untyped_engine_field` | warning | A cell read or written by an index written as a number, where the cell has a typed name lowering maps to the same operand (tables below). | Indices with no name; a constant index (a specialized `const` parameter may stand for several cells); anything in `raw { }`; `world.x` (it parses to `global[N]`, so the source text is checked); a handle name a parameter or local rebinds (`let me`, `self: Sim`). |
 | `raw_syntax` | error, cannot be allowed | A `raw { }` body that does not parse as `.air`. | See Decision 4. |
-| `object_tree_me_field` | error, cannot be allowed | `me.<field>` in an object's own tree (`init`, `main`, `load`, `reset`, `cleanup`, or a tree with no Sim parameter and no `context = inherit`). There `me` is the object, and lowering rejects every field. | `me.attr[N]` / `me.data[N]` and other indexed cells; Sim contexts; `context = inherit` trees; objects with a BCON table named `me`. |
+| `object_tree_me_field` | error, cannot be allowed | `me.<field>` in an object's own tree (`init`, `main`, `load`, `reset`, `cleanup`, or a tree with no Sim parameter and no `context = inherit`). There `me` is the object, and lowering rejects every field. | `me.attr[N]` / `me.data[N]` and other indexed cells; Sim contexts; `context = inherit` trees; a local or parameter named `me`; a file set with a BCON table (own, template or `extern bcon`) named `me`. |
 
 Block `const` bindings are specialized away by the parser, so both constant rules read them from the token stream. A `const` followed by `NAME =`, `( .. ) =` or `NAME :` is a binding unless it is a declaration the AST holds. Its scope is the last object, template or helper that starts before it.
 
@@ -61,7 +66,13 @@ Across corpus-v2, the rule reports 996 findings in 426 decompiled files. With ev
 
 ## Decision 4: `raw_syntax` parses like lowering, and does not resolve names
 
-The body is wrapped the way lowering validates it (`tree 4096 "__raw_check" { .. }`). It is preceded by the `const` lines lowering would declare for it: each file or object constant, and each BCON entry `TABLE.entry`, that the code names and does not declare itself. An error caused by an identifier the parser cannot resolve is not reported: it may be a constant from another module. That is a name error, not a syntax error.
+The body is wrapped the way lowering validates it (`tree 4096 "__raw_check" { .. }`). It is preceded by the `const` lines lowering would declare for it:
+
+- each file or object constant, and each BCON entry `TABLE.entry` of an own table or an `extern bcon`, that the code names;
+- less the constants the block declares itself (by full name, `K` or `T.e`);
+- less the `.air` locals (`let` / `local`) any raw block of the tree declares, since `.air` locals are tree-wide and win over constants.
+
+A constant brought in by `use` from another module is not resolved here. So when the parse stops at a name, or at the `.` of a `T.e`, that name is declared with a placeholder value and the body is parsed again (at most 32 names). Only an error that remains is reported. A stray word (`temp[0] := 1 nonsense;`) still fails at the same place, so it is still reported.
 
 ## Consequences
 

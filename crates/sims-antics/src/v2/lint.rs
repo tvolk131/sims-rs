@@ -318,7 +318,9 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             line_starts: directives.line_starts.clone(),
             sims: Vec::new(),
             object_me: false,
-            me_bcon: false,
+            me_bcon: symbols.bcon_names.contains("me"),
+            bound: BTreeSet::new(),
+            raw_declared: BTreeSet::new(),
             written: BTreeSet::new(),
             assigned: None,
             air_consts: BTreeMap::new(),
@@ -817,6 +819,8 @@ struct Symbols {
     returns: BTreeMap<String, Option<RetKind>>,
     /// Every identifier written right after a `.` (fields, methods, BCON entries).
     field_names: BTreeSet<String>,
+    /// The names of BCON tables (`bcon` labels, `extern bcon` names), anywhere in the set.
+    bcon_names: BTreeSet<String>,
     /// Literal `attr[N]` indices.
     attr_indices: BTreeSet<i64>,
     /// Identifier-like words in `raw { }` code (not its comments or strings), less the
@@ -881,6 +885,12 @@ impl Symbols {
         let add_members = |members: &[ObjectMember], this: &mut Self| {
             for m in members {
                 match m {
+                    ObjectMember::Bcon(b) => {
+                        this.bcon_names.insert(b.label.clone());
+                    }
+                    ObjectMember::ExternBcon(b) => {
+                        this.bcon_names.insert(b.name.clone());
+                    }
                     ObjectMember::Fn(f) => this.add_fn(f),
                     ObjectMember::Tree(t) => this.add_return(&t.ident, ret_kind(&t.ret)),
                     ObjectMember::ExternMod(m) => {
@@ -901,6 +911,9 @@ impl Symbols {
                     for f in &m.fns {
                         self.add_return(&format!("{}::{}", m.name, f.name), ret_kind(&f.ret));
                     }
+                }
+                V2Item::ExternBcon(b) => {
+                    self.bcon_names.insert(b.name.clone());
                 }
                 V2Item::Object(o) => add_members(&o.members, self),
                 V2Item::Template(t) => add_members(&t.members, self),
@@ -1356,8 +1369,14 @@ struct FileLinter<'a> {
     /// The body being linted is an object's own tree (no Sim parameter, not `context =
     /// inherit`), where `me` is the object itself.
     object_me: bool,
-    /// The linted object names a BCON table `me`, so `me.x` reads it.
+    /// A file of the set names a BCON table `me`, so `me.x` may read it.
     me_bcon: bool,
+    /// The names the body being linted binds itself (`let`s, `for` bindings, non-Sim
+    /// parameters): such a `me`, `self` or Sim name is not the frame's.
+    bound: BTreeSet<String>,
+    /// The names the body's `raw` blocks declare as `.air` locals (`let` / `local`), which
+    /// every raw block of the tree shares.
+    raw_declared: BTreeSet<String>,
     /// Addresses of the expressions the statement being linted writes (an assignment's
     /// target, a `&mut` operand, a builtin's out argument).
     written: BTreeSet<usize>,
@@ -1888,20 +1907,16 @@ impl FileLinter<'_> {
                             _ => None,
                         })
                         .collect();
-                    self.me_bcon = me_bcon(file, &o.members);
                     self.air_consts = air_consts(file, &o.members);
                     self.lint_members(&o.members, false);
-                    self.me_bcon = false;
                     self.object = None;
                     self.strings.clear();
                     self.dialog_strings.clear();
                     self.tables.clear();
                 }
                 V2Item::Template(t) => {
-                    self.me_bcon = me_bcon(file, &t.members);
                     self.air_consts = air_consts(file, &t.members);
                     self.lint_members(&t.members, true);
-                    self.me_bcon = false;
                 }
                 _ => {}
             }
@@ -1919,6 +1934,12 @@ impl FileLinter<'_> {
                 .map(|p| p.name.as_str()),
             false,
             false,
+        );
+        self.bind(
+            f.params
+                .iter()
+                .filter(|p| p.ty != V2Type::Sim)
+                .map(|p| p.name.as_str()),
         );
         self.lint_body(&f.body, BodyCx { sim });
         self.leave_context();
@@ -1939,9 +1960,15 @@ impl FileLinter<'_> {
         self.object_me = object_me && !self.me_bcon;
     }
 
+    /// Records names the body being linted binds itself.
+    fn bind<'n>(&mut self, names: impl Iterator<Item = &'n str>) {
+        self.bound.extend(names.map(str::to_owned));
+    }
+
     fn leave_context(&mut self) {
         self.sims.clear();
         self.object_me = false;
+        self.bound.clear();
     }
 
     fn lint_members(&mut self, members: &[ObjectMember], template: bool) {
@@ -1956,6 +1983,12 @@ impl FileLinter<'_> {
                         t.sim_binding.iter().map(String::as_str),
                         sim || t.inherit_context,
                         !sim && !t.inherit_context,
+                    );
+                    self.bind(
+                        t.params
+                            .iter()
+                            .filter(|p| p.ty != V2Type::Sim)
+                            .map(|p| p.name.as_str()),
                     );
                     self.lint_body(&t.body, BodyCx { sim });
                     self.leave_context();
@@ -1980,6 +2013,12 @@ impl FileLinter<'_> {
                 ObjectMember::Functional(f) => {
                     self.lint_guard(f.guard.as_ref());
                     self.enter_context(std::iter::once(f.sim_binding.as_str()), true, false);
+                    self.bind(
+                        f.params
+                            .iter()
+                            .filter(|p| p.ty != V2Type::Sim)
+                            .map(|p| p.name.as_str()),
+                    );
                     self.lint_body(&f.body, BodyCx { sim: true });
                     self.leave_context();
                 }
@@ -2066,9 +2105,16 @@ impl FileLinter<'_> {
         let V2Expr::Index { base, index, .. } = x else {
             return;
         };
-        let V2Expr::Int(_, n) = index.as_ref() else {
+        let V2Expr::Int(n_at, n) = index.as_ref() else {
             return;
         };
+        // A literal, not a constant (a specialized `const` may stand for several cells).
+        if !self
+            .text_at(*n_at)
+            .starts_with(|c: char| c.is_ascii_digit())
+        {
+            return;
+        }
         let n = *n;
         let (at, typed, field) = match base.as_ref() {
             // `world.hour` parses to `global[0]` too: only the spelled-out form counts.
@@ -2096,7 +2142,13 @@ impl FileLinter<'_> {
                 let V2Expr::Ident(at, root) = root.as_ref() else {
                     return;
                 };
+                if self.bound.contains(root) {
+                    return;
+                }
                 let table = if root == "self" {
+                    if self.sims.iter().any(|s| s == "self") {
+                        return;
+                    }
                     SELF_FIELDS
                 } else if self.sims.iter().any(|s| s == root) {
                     SIM_FIELDS
@@ -2154,7 +2206,7 @@ impl FileLinter<'_> {
         let V2Expr::Ident(at, name) = base.as_ref() else {
             return;
         };
-        if name != "me" {
+        if name != "me" || self.bound.contains("me") {
             return;
         }
         // `me.attr[N]`, `me.data[N]` and the like index the object's own cells.
@@ -2184,22 +2236,52 @@ impl FileLinter<'_> {
 
     /// `raw_syntax`: the body of the `raw` block at `span` does not parse as `.air`. It is
     /// parsed the way lowering validates it, after the constants lowering would declare for
-    /// it; a name the parser could not resolve (one of another module's constants) is not
-    /// reported.
+    /// it. A name the parser stops at is then declared as a constant too (it may be another
+    /// module's): only an error that stays where it was is reported.
     fn raw_syntax(&mut self, span: Span, code: &str) {
-        let prelude = self.raw_prelude(code);
-        let wrapped = format!("tree 4096 \"__raw_check\" {{\n{prelude}{code}\n}}\n");
-        let Err(e) = crate::parser::parse_module(&wrapped) else {
-            return;
+        use crate::lexer::TokenKind as K;
+        let tokens = crate::lexer::tokenize(code).unwrap_or_default();
+        let mut prelude = self.raw_prelude(code);
+        let mut guessed: BTreeSet<String> = BTreeSet::new();
+        let (e, first) = loop {
+            let wrapped = format!("tree 4096 \"__raw_check\" {{\n{prelude}{code}\n}}\n");
+            let Err(e) = crate::parser::parse_module(&wrapped) else {
+                return;
+            };
+            // The body's first line follows the wrapper's first line and the prelude.
+            let first = 2 + prelude.lines().count();
+            // The name the parser stopped at: an identifier where it wanted a number or an
+            // operand, or the table of a `T.e` it stopped at the `.` of.
+            let at = e.span.and_then(|s| {
+                let line = s.line.checked_sub(first)? + 1;
+                tokens
+                    .iter()
+                    .position(|t| t.span.line == line && t.span.column == s.column)
+            });
+            let name = match at.map(|k| (k, &tokens[k].kind)) {
+                Some((_, K::Ident(name))) => Some(name.as_str()),
+                Some((k, K::Dot)) if k > 0 => match &tokens[k - 1].kind {
+                    K::Ident(name) if k < 2 || tokens[k - 2].kind != K::Dot => Some(name.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(name) = name else {
+                break (e, first);
+            };
+            if crate::parser::is_reserved_ident(name)
+                || self.raw_declared.contains(name)
+                || guessed.len() >= 32
+                || !guessed.insert(name.to_owned())
+            {
+                break (e, first);
+            }
+            let more = guessed_consts(code, name);
+            if more.is_empty() {
+                break (e, first);
+            }
+            prelude.push_str(&more);
         };
-        if let Some(rest) = e.message.split("found Ident(\"").nth(1)
-            && let Some(name) = rest.split('"').next()
-            && !crate::parser::is_reserved_ident(name)
-        {
-            return;
-        }
-        // The body's first line follows the wrapper's first line and the prelude.
-        let first = 2 + prelude.lines().count();
         let pos = e.span.and_then(|s| {
             let line = s.line.checked_sub(first)?;
             let starts: Vec<usize> = std::iter::once(0)
@@ -2220,19 +2302,22 @@ impl FileLinter<'_> {
     }
 
     /// The `const` lines lowering puts before a `raw` block's code: each constant of the
-    /// object or file (`NAME`, `TABLE.entry`) the code names and does not declare itself.
+    /// object or file (`NAME`, `TABLE.entry`) the code names and does not declare itself,
+    /// less the `.air` locals the tree's raw blocks declare.
     fn raw_prelude(&self, code: &str) -> String {
         let Ok(tokens) = crate::lexer::tokenize(code) else {
             return String::new();
         };
         use crate::lexer::TokenKind as K;
         let kind = |i: usize| tokens.get(i).map(|t| &t.kind);
-        let own: BTreeSet<&str> = tokens
+        // The block's own constants by full name (`K`, `T.e`).
+        let own: BTreeSet<String> = tokens
             .iter()
             .enumerate()
             .filter(|(_, t)| matches!(&t.kind, K::Ident(k) if k == "const"))
-            .filter_map(|(i, _)| match kind(i + 1) {
-                Some(K::Ident(n)) => Some(n.as_str()),
+            .filter_map(|(i, _)| match (kind(i + 1), kind(i + 2), kind(i + 3)) {
+                (Some(K::Ident(n)), Some(K::Dot), Some(K::Ident(e))) => Some(format!("{n}.{e}")),
+                (Some(K::Ident(n)), _, _) => Some(n.clone()),
                 _ => None,
             })
             .collect();
@@ -2243,21 +2328,23 @@ impl FileLinter<'_> {
                 continue;
             };
             if (i > 0 && tokens[i - 1].kind == K::Dot)
-                || own.contains(word.as_str())
                 || crate::parser::is_reserved_ident(word)
+                || self.raw_declared.contains(word)
             {
                 continue;
             }
-            let name = match (kind(i + 1), kind(i + 2)) {
-                (Some(K::Dot), Some(K::Ident(entry))) => format!("{word}.{entry}"),
-                _ => word.clone(),
+            let dotted = match (kind(i + 1), kind(i + 2)) {
+                (Some(K::Dot), Some(K::Ident(entry))) => Some(format!("{word}.{entry}")),
+                _ => None,
             };
-            let (name, value) = match self.air_consts.get_key_value(&name) {
-                Some(found) => found,
-                None => match self.air_consts.get_key_value(word) {
-                    Some(found) => found,
-                    None => continue,
-                },
+            let found = match dotted {
+                Some(d) if own.contains(&d) => continue,
+                Some(d) if self.air_consts.contains_key(&d) => self.air_consts.get_key_value(&d),
+                _ if own.contains(word) => continue,
+                _ => self.air_consts.get_key_value(word),
+            };
+            let Some((name, value)) = found else {
+                continue;
             };
             if declared.insert(name.clone()) {
                 prelude.push_str(&format!("const {name} = {value};\n"));
@@ -2329,7 +2416,7 @@ impl FileLinter<'_> {
                     };
                     self.shadowed(at, name, what, outer);
                 }
-                if !b.param && !self.const_used(name) {
+                if !b.param && !b.diverges && !self.const_used(name) {
                     self.emit(
                         UNUSED_DECL,
                         at,
@@ -2389,8 +2476,20 @@ impl FileLinter<'_> {
                         m.name, f.name, f.id, std.name
                     ),
                     Some(format!(
-                        "drop it and call `globals::{}` after `use std::globals::*;`. A local `extern mod globals` hides all of `std::globals`: keep other globals in a module of another name",
-                        std.name
+                        "drop it and call `globals::{}` after `use std::globals::*;`{}. A local `extern mod globals` hides all of `std::globals`: keep other globals in a module of another name",
+                        std.name,
+                        if std.params.iter().zip(&f.params).any(|(a, b)| a.name != b.name) {
+                            format!(
+                                " (its parameters are named {}: rename named arguments)",
+                                std.params
+                                    .iter()
+                                    .map(|p| format!("`{}`", p.name))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        } else {
+                            String::new()
+                        }
                     )),
                     None,
                     None,
@@ -2404,6 +2503,7 @@ impl FileLinter<'_> {
             return;
         };
         self.enter_context(std::iter::once(g.sim_binding.as_str()), true, false);
+        self.bind(g.autonomous_binding.iter().map(String::as_str));
         match &g.kind {
             GuardBody::Expr(e) => self.lint_expr(e),
             GuardBody::Block(b) => self.lint_body(b, BodyCx { sim: true }),
@@ -2414,8 +2514,19 @@ impl FileLinter<'_> {
     fn lint_body(&mut self, body: &[V2Stmt], cx: BodyCx) {
         self.sim_body = cx.sim;
         self.body_has_defer = false;
+        self.raw_declared.clear();
         walk_stmts(body, &mut |s| {
-            self.body_has_defer |= matches!(s, V2Stmt::Defer { .. })
+            self.body_has_defer |= matches!(s, V2Stmt::Defer { .. });
+            match s {
+                V2Stmt::Let { name, .. }
+                | V2Stmt::LetSome { name, .. }
+                | V2Stmt::LetUninit { name, .. }
+                | V2Stmt::ForEach { binding: name, .. } => {
+                    self.bound.insert(name.clone());
+                }
+                V2Stmt::RawAir { code, .. } => self.raw_declared.extend(raw_locals(code)),
+                _ => {}
+            }
         });
         self.lint_list(body, false, false);
         if cx.sim {
@@ -3802,20 +3913,50 @@ fn addr(e: &V2Expr) -> usize {
     std::ptr::from_ref(e) as usize
 }
 
-/// Whether `members` (an object's or template's) or `file` name a BCON table `me`, which
-/// `me.x` then reads.
-fn me_bcon(file: &V2File, members: &[ObjectMember]) -> bool {
-    members
-        .iter()
-        .any(|m| matches!(m, ObjectMember::Bcon(b) if b.label == "me"))
-        || file
-            .items
-            .iter()
-            .any(|i| matches!(i, V2Item::ExternBcon(b) if b.name == "me"))
+/// The `.air` locals (`let NAME` / `local NAME`) a `raw` block declares.
+fn raw_locals(code: &str) -> Vec<String> {
+    use crate::lexer::TokenKind as K;
+    let Ok(tokens) = crate::lexer::tokenize(code) else {
+        return Vec::new();
+    };
+    tokens
+        .windows(2)
+        .filter_map(|w| match (&w[0].kind, &w[1].kind) {
+            (K::Ident(kw), K::Ident(name)) if kw == "let" || kw == "local" => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `const` lines declaring `name` (and each `name.entry` the code writes) with a
+/// placeholder value, for a name a raw block's parse stopped at.
+fn guessed_consts(code: &str, name: &str) -> String {
+    use crate::lexer::TokenKind as K;
+    let Ok(tokens) = crate::lexer::tokenize(code) else {
+        return String::new();
+    };
+    let mut out = BTreeSet::new();
+    for (i, t) in tokens.iter().enumerate() {
+        if !matches!(&t.kind, K::Ident(w) if w == name) {
+            continue;
+        }
+        if i > 0 && tokens[i - 1].kind == K::Dot {
+            continue;
+        }
+        match (
+            tokens.get(i + 1).map(|t| &t.kind),
+            tokens.get(i + 2).map(|t| &t.kind),
+        ) {
+            (Some(K::Dot), Some(K::Ident(entry))) => out.insert(format!("{name}.{entry}")),
+            _ => out.insert(name.to_owned()),
+        };
+    }
+    out.iter().map(|n| format!("const {n} = 1;\n")).collect()
 }
 
 /// The constants a `raw` block in an item with `members` may name: the file's and the
-/// members' `const`s, and the members' BCON entries (`TABLE.entry`).
+/// members' `const`s, and the BCON entries (`TABLE.entry`) of the members' tables and of
+/// the file's and members' `extern bcon`s.
 fn air_consts(file: &V2File, members: &[ObjectMember]) -> BTreeMap<String, String> {
     let value = |v: i64| {
         if i16::try_from(v).is_ok() {
@@ -3824,10 +3965,19 @@ fn air_consts(file: &V2File, members: &[ObjectMember]) -> BTreeMap<String, Strin
             format!("{v:#010x}")
         }
     };
+    let extern_bcon = |b: &crate::v2::ast::ExternBconDecl, out: &mut BTreeMap<String, String>| {
+        for e in &b.entries {
+            out.insert(format!("{}.{}", b.name, e.name), e.address.to_string());
+        }
+    };
     let mut out = BTreeMap::new();
     for item in &file.items {
-        if let V2Item::Const(c) = item {
-            out.insert(c.name.clone(), value(c.value));
+        match item {
+            V2Item::Const(c) => {
+                out.insert(c.name.clone(), value(c.value));
+            }
+            V2Item::ExternBcon(b) => extern_bcon(b, &mut out),
+            _ => {}
         }
     }
     for m in members {
@@ -3840,6 +3990,7 @@ fn air_consts(file: &V2File, members: &[ObjectMember]) -> BTreeMap<String, Strin
                     out.insert(format!("{}.{entry}", b.label), value(i64::from(*v)));
                 }
             }
+            ObjectMember::ExternBcon(b) => extern_bcon(b, &mut out),
             _ => {}
         }
     }
@@ -3855,6 +4006,26 @@ struct ConstBinding {
     /// A `const n: T` parameter, not a `const NAME = ..;` / `const (A, B) = ..;`
     /// declaration or binding.
     param: bool,
+    /// An arm of its selector returns, breaks or continues: the binding is control flow.
+    diverges: bool,
+}
+
+/// Whether the selector after the `=` at token `eq` (up to its `;`) holds a `return`,
+/// `break` or `continue`.
+fn selector_diverges(tokens: &[crate::v2::lexer::Token], eq: usize) -> bool {
+    let mut depth = 0i32;
+    for t in tokens.iter().skip(eq + 1) {
+        match &t.kind {
+            TokenKind::LBrace | TokenKind::LParen | TokenKind::LBracket => depth += 1,
+            TokenKind::RBrace | TokenKind::RParen | TokenKind::RBracket => depth -= 1,
+            TokenKind::Semicolon if depth <= 0 => return false,
+            TokenKind::Ident(w) if matches!(w.as_str(), "return" | "break" | "continue") => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Every `const` declaration, block binding and `const` parameter in `tokens`.
@@ -3873,6 +4044,7 @@ fn const_bindings(tokens: &[crate::v2::lexer::Token]) -> Vec<ConstBinding> {
                         at: t.span,
                         names: vec![(i + 1, name.clone())],
                         param,
+                        diverges: !param && selector_diverges(tokens, i + 2),
                     });
                 }
             }
@@ -3894,6 +4066,7 @@ fn const_bindings(tokens: &[crate::v2::lexer::Token]) -> Vec<ConstBinding> {
                         at: t.span,
                         names,
                         param: false,
+                        diverges: selector_diverges(tokens, j + 1),
                     });
                 }
             }

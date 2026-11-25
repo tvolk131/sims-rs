@@ -71,12 +71,24 @@ use std::path::{Path, PathBuf};
 /// and its diagnostics. A file with no keyword at all (empty, or only comments) is not
 /// v2.
 ///
-/// Comments are skipped as either language writes them: `//` and nested `/* */` in both,
-/// and an `.air` `#` line comment. A `#[` opens a v2 attribute (skipped to its matching
-/// `]`, past strings); `.air` reads the same text as a comment line, and the keyword after
-/// it decides the same way in both readings.
+/// The file is read both ways, and `.air` wins when its reading starts with an `.air`
+/// keyword. Both skip whitespace, `//` and nested `/* */` comments. `.air` skips a `#` line
+/// comment to the end of its line, even one starting `#[`. v2 skips a `#[..]` attribute
+/// (to its matching `]`, past strings), and the next keyword may follow on the same line.
 #[must_use]
 pub fn is_v2_source(source: &str) -> bool {
+    if matches!(
+        first_word(source, false),
+        Some("tree" | "interaction" | "bcon" | "str")
+    ) {
+        return false;
+    }
+    first_word(source, true).is_some()
+}
+
+/// The first word of `source` past whitespace, comments and, with `attributes`, v2
+/// `#[..]` attributes (without, every `#` starts an `.air` comment line).
+fn first_word(source: &str, attributes: bool) -> Option<&str> {
     let bytes = source.as_bytes();
     let mut pos = 0usize;
     loop {
@@ -88,10 +100,10 @@ pub fn is_v2_source(source: &str) -> bool {
             pos = line_end(bytes, pos);
         } else if rest.starts_with(b"/*") {
             pos = block_comment_end(bytes, pos);
-        } else if rest.starts_with(b"#[") {
+        } else if attributes && rest.starts_with(b"#[") {
             match attribute_end(bytes, pos) {
                 Some(end) => pos = end,
-                // An unclosed `[` is an `.air` comment line, or broken v2 either way.
+                // An unclosed `[` is broken v2.
                 None => pos = line_end(bytes, pos),
             }
         } else if rest.starts_with(b"#") {
@@ -104,10 +116,7 @@ pub fn is_v2_source(source: &str) -> bool {
     while pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
         pos += 1;
     }
-    if start == bytes.len() {
-        return false;
-    }
-    !matches!(&source[start..pos], "tree" | "interaction" | "bcon" | "str")
+    (start < bytes.len()).then(|| &source[start..pos])
 }
 
 /// The offset of the `\n` ending the line `at` is on (or the end of `bytes`).
@@ -632,6 +641,8 @@ mod tests {
             // `.air` reads `#[` as a comment line too; the keyword after it decides.
             "#[not an attribute\ntree 4096 \"main\" {}",
             "#[x]\nbcon 4096 \"T\" {}",
+            // A `#[..]` line `.air` reads as a comment, whatever follows on it.
+            "#[tag] generated source\ntree 4096 \"T\" { return true; }",
         ] {
             assert!(!is_v2_source(source), "{source:?} is .air");
         }
