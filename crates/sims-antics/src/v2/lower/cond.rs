@@ -37,7 +37,7 @@ impl<'a> TreeLowerer<'a> {
             V2Expr::Field { base, .. } => match base.as_ref() {
                 // `stack_obj.<field>` is the stack object's own cell (no switch).
                 V2Expr::Ident(_, bname) => {
-                    (self.is_self_ident(bname) && !self.self_switches_after_move())
+                    (self.is_self_ident(bname) && self.self_stack_target() == "stack_obj")
                         || self.is_sim_ident(bname)
                         || self.is_bcon_table_ref(bname)
                         || bname == "stack_obj"
@@ -65,7 +65,7 @@ impl<'a> TreeLowerer<'a> {
                                 // In a Sim tree that moves the cursor, `self.f[i]` switches to
                                 // the entry object first, like the named fields above.
                                 V2Expr::Ident(_, rname) if (self.is_self_ident(rname)
-                                        && !self.self_switches_after_move())
+                                        && self.self_stack_target() == "stack_obj")
                                     || self.is_sim_ident(rname)
                                     || self.is_frame_me(rname)
                                     || rname == "stack_obj"
@@ -146,20 +146,6 @@ impl<'a> TreeLowerer<'a> {
         }
     }
 
-    /// `self.<field>` or `self.attr[k]` / `self.data[k]`: one cell of the entry object.
-    fn is_self_cell(&self, expr: &V2Expr) -> bool {
-        let is_self = |e: &V2Expr| matches!(e, V2Expr::Ident(_, n) if self.is_self_ident(n));
-        match expr {
-            V2Expr::Field { base, field, .. } => is_self(base) && field != "sprite_flags",
-            V2Expr::Index { base, index, .. } => {
-                matches!(base.as_ref(), V2Expr::Field { base: root, field, .. }
-                    if is_self(root) && matches!(field.as_str(), "attr" | "data"))
-                    && self.eval_const_i16(index).is_ok()
-            }
-            _ => false,
-        }
-    }
-
     pub(super) fn lower_cmp_operands(
         &mut self,
         lhs: &V2Expr,
@@ -171,26 +157,19 @@ impl<'a> TreeLowerer<'a> {
         // right after its staging, so it needs no copy. The VM resolves the right operand
         // first, so `k` must be one that cannot fault (a temp or attribute can), or the
         // comparison would fault where the copy faulted on the career lookup.
-        // Dropping the copy is an in-place rewrite, which `finish` checks like the `self` prefix
-        // (it removes a node, an Expression and a local).
-        let rhs_const = self.eval_const_i16(rhs).is_ok();
+        // Dropping the copy is an in-place rewrite, which `finish` checks (it removes a node, an
+        // Expression and a local).
         let job_cell = match self.builtin_job_data_call(lhs)? {
-            Some(call) if rhs_const && !self.env.in_place_off => Some(call),
+            Some(call) if self.eval_const_i16(rhs).is_ok() && !self.env.in_place_off => Some(call),
             _ => None,
         };
-        // Before the first cursor move, a `self` cell compared with a constant is read in place:
-        // the constant cannot fault, so the node reads the cell exactly when the staged copy did.
-        let self_cell_vs_const = rhs_const && self.is_self_cell(lhs);
-        let in_place = std::mem::replace(&mut self.self_in_place, self_cell_vs_const);
-        let lowered_lhs = match job_cell {
+        let (l, l_ty) = match job_cell {
             Some((args, jspan)) => {
                 self.in_place_applied = true;
-                self.lower_job_data_cell(args, jspan)
+                self.lower_job_data_cell(args, jspan)?
             }
-            None => self.lower_value_expr(lhs),
+            None => self.lower_value_expr(lhs)?,
         };
-        self.self_in_place = in_place;
-        let (l, l_ty) = lowered_lhs?;
         if op == V2BinOp::FlagTest
             && let ValueType::Bitflags(ref key) = l_ty
         {

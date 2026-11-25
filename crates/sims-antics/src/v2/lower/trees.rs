@@ -209,7 +209,7 @@ pub(super) fn lower_standalone_tree(
             }
         }
     }
-    ctx.lower_tree_body(&d.body)?;
+    ctx.lower_stmts(&d.body)?;
     if !frame.empty && !stmts_always_return(&d.body, env, &t.owner_module, true) {
         ctx.emit_all_cleanups()?;
         ctx.line("return true;".to_owned());

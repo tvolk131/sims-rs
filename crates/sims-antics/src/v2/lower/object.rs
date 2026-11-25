@@ -34,7 +34,7 @@ fn object_text_reads(
 
 /// [`lower_object`], finishing every tree with `text_reads` as the object's text fact when it is
 /// given, and otherwise with the fact the strings known before any tree is lowered give; with
-/// `in_place_off`, no tree gets the in-place `self` prefix.
+/// `in_place_off`, no tree gets an in-place rewrite (a `job_data` comparison without its copy).
 fn lower_object_with(
     resolved: &ResolvedModule,
     obj: &ObjectDecl,
@@ -1296,7 +1296,7 @@ fn lower_object_with(
         for (pidx, fp) in func.decl.params.iter().enumerate() {
             ctx.bind_func_param(&fp.name, pidx, &fp.ty, fp.span)?;
         }
-        ctx.lower_tree_body(&func.decl.body)?;
+        ctx.lower_stmts(&func.decl.body)?;
         if !stmts_always_return(&func.decl.body, &env, &func.owner_module, true) {
             ctx.emit_all_cleanups()?;
             ctx.line("return true;".to_owned());
@@ -1458,7 +1458,7 @@ fn lower_object_with(
             &inter.owner_module,
             true,
         ));
-        ctx.lower_tree_body(&effective_run_body)?;
+        ctx.lower_stmts(&effective_run_body)?;
         if !stmts_always_return(&effective_run_body, &env, &inter.owner_module, true) {
             ctx.emit_all_cleanups()?;
             ctx.line("return true;".to_owned());
@@ -1556,11 +1556,11 @@ fn lower_object_with(
     // Every tree was finished with `env.text_reads`. A tree's inline dialog literal can add a
     // token that an earlier tree's text may then read, so lower the object again with the
     // final fact when it differs (the second lowering interns the same strings). Likewise
-    // when a tree's in-place `self` prefix turned out unsound: lower again without it.
+    // when a tree's in-place rewrite turned out unsound: lower again without it.
     let final_reads = object_text_reads(&env.strings, &env.dialog_strings.borrow(), &catalog);
-    let cursor_off = env.in_place_off || env.in_place_unsound.get();
-    if final_reads != env.text_reads || cursor_off != env.in_place_off {
-        return lower_object_with(resolved, obj, Some(final_reads), cursor_off);
+    let in_place_off = env.in_place_off || env.in_place_unsound.get();
+    if final_reads != env.text_reads || in_place_off != env.in_place_off {
+        return lower_object_with(resolved, obj, Some(final_reads), in_place_off);
     }
 
     // Emit STR# tables in deterministic ID order, merging any auto-interned STR# 301 dialog strings.

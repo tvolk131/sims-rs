@@ -323,78 +323,26 @@ fn out_operand_locals_read_first_do_not_share() {
     assert_eq!(body.matches("let __inline_v_ev_").count(), 2, "{body}");
 }
 
-/// In a Sim tree that moves the cursor with a search, `self` reads the stack object in place
-/// until the first statement that may move it; after that (and in a loop that moves it) it
-/// switches to the entry object.
+/// A Sim tree that moves the cursor selects `self` through the entry object everywhere, as on
+/// main, even before the first move: the switch is an Expression that leaves the last result
+/// true, which is what a faulting read after it leaves behind.
 #[test]
-fn self_reads_in_place_before_the_first_cursor_move() {
+fn self_is_switched_to_before_the_first_cursor_move() {
     let src = obj(
         "Plain",
-        r#"    tree a (sim: Sim) {
-        if self.value == 1 {
-            return true;
-        }
-        stack_obj = 0;
-        if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
-            return false;
-        }
-        stack_obj.attr[0] = self.value;
-    }
-    tree b (sim: Sim) {
-        loop {
-            if self.value == 1 {
-                break;
-            }
-            if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
-                return false;
-            }
-        }
-    }"#,
-    );
-    let air = expand("entry_cursor.antics", &src);
-    let a = tree(&air, "a");
-    assert!(a.contains(SAVE), "{a}");
-    let first_read = a.find("if stack.attr[0] == 1 {").expect("in-place read");
-    assert!(
-        !a[..first_read].contains("stack_obj :="),
-        "no switch before it:\n{a}"
-    );
-    assert!(
-        a[first_read..].contains("stack_obj := __self_obj;"),
-        "the later read switches:\n{a}"
-    );
-    let b = tree(&air, "b");
-    assert!(b.contains("stack_obj := __self_obj;"), "{b}");
-}
-
-/// Only a primitive's `self` target and a `self` cell compared with a constant are in place:
-/// a write, a read into an argument and a constant-folded flag test are staged as on main.
-#[test]
-fn the_in_place_prefix_covers_only_targets_and_constant_comparisons() {
-    let src = obj(
-        "Plain",
-        r#"    tree a (sim: Sim) {
-        stop_all_sounds(target: self);
-        if self.value == 1 {
-            temp[4] = 1;
-        }
-        self.value += 1;
+        r#"    @frame(locals: 3) tree a (sim: Sim) {
+        if temp[0] == 0 { return true; }
+        if self.data[10000] == 1 { return true; }
         set_to_next(all, dest: stack_obj);
+        raw { temp[2] := 7; }
     }"#,
     );
-    let air = expand("prefix_sites.antics", &src);
+    let air = expand("self_switch.antics", &src);
     let a = tree(&air, "a");
-    let cmp = a
-        .find("if stack.attr[0] == 1")
-        .expect("in-place comparison");
+    let read = a.find("stack.data[10000]").expect("the self read");
     assert!(
-        !a[..cmp].contains("stack_obj :="),
-        "the target is selected in place:\n{a}"
-    );
-    let write = a.find("stack.attr[0] +=").expect("the self write");
-    assert!(
-        a[cmp..write].contains("stack_obj := __self_obj;"),
-        "the write switches as on main:\n{a}"
+        a[..read].contains("stack_obj := __self_obj;"),
+        "the read switches first:\n{a}"
     );
 }
 
@@ -456,16 +404,16 @@ fn job_data_compares_without_a_copy() {
     assert!(b.contains("let __job_0 = scope(33, 22);"), "{b}");
 }
 
-/// A raw label before the first cursor move may be reached again from after it (a raw back
-/// edge), so source order is not control order: a tree whose raw blocks define a label reads
-/// `self` through the entry object everywhere.
+/// Dropping a `job_data` comparison's copy removes a node, an Expression and a local. A raw
+/// label may be reached from raw code that counts on them, so a tree whose raw blocks define a
+/// label keeps the copy.
 #[test]
-fn a_raw_label_disables_in_place_self() {
+fn a_raw_label_keeps_the_job_data_copy() {
     let src = obj(
         "Plain",
         r#"    tree a (sim: Sim) {
         raw { @again: temp[3] := 1; }
-        if self.value == 1 {
+        if job_data(1, 1, 0) == 1 {
             temp[4] = 1;
         }
         if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
@@ -476,10 +424,7 @@ fn a_raw_label_disables_in_place_self() {
     );
     let air = expand("raw_back_edge.antics", &src);
     let a = tree(&air, "a");
-    assert!(
-        !a.contains("stack.attr[0] == 1"),
-        "the self read is staged:\n{a}"
-    );
+    assert!(!a.contains("if scope(33, 0) == 1"), "the copy stays:\n{a}");
 }
 
 /// `.air` keeps `param[0]` in the word after the named locals around an `idle` when a tree uses
@@ -535,13 +480,15 @@ fn an_out_operand_keeps_the_old_value_on_the_exit_it_does_not_write() {
     assert!(a.contains("= 7;"), "the initial store stays:\n{a}");
 }
 
-/// A raw branch to a node by number may also jump back before the first move.
+/// A branch to a node by number counts the removed node, so a named primitive with one keeps
+/// the copy too. (The `mir` body parser does not read positional targets either, so the residue
+/// check also keeps it.)
 #[test]
-fn a_positional_raw_branch_disables_in_place_self() {
+fn a_positional_raw_branch_keeps_the_job_data_copy() {
     let src = obj(
         "Plain",
         r#"    tree a (sim: Sim) {
-        if self.value == 1 {
+        if job_data(1, 1, 0) == 1 {
             temp[4] = 1;
         }
         if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
@@ -552,34 +499,7 @@ fn a_positional_raw_branch_disables_in_place_self() {
     );
     let air = expand("raw_positional.antics", &src);
     let a = tree(&air, "a");
-    assert!(
-        !a.contains("stack.attr[0] == 1"),
-        "the self read is staged:\n{a}"
-    );
-}
-
-/// A padded raw primitive runs the primitive it wraps: a padded search moves the cursor, so
-/// it ends the in-place prefix.
-#[test]
-fn a_padded_raw_search_ends_the_in_place_prefix() {
-    let src = obj(
-        "Plain",
-        r#"    tree a (sim: Sim) {
-        raw { set_to_next(all) pad 0xA5; }
-        if self.value == 1 {
-            temp[4] = 1;
-        }
-        if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
-            return false;
-        }
-    }"#,
-    );
-    let air = expand("raw_padded_search.antics", &src);
-    let a = tree(&air, "a");
-    assert!(
-        !a.contains("stack.attr[0] == 1"),
-        "the self read is staged:\n{a}"
-    );
+    assert!(!a.contains("if scope(33, 0) == 1"), "the copy stays:\n{a}");
 }
 
 /// A padded raw action string formats text like a plain one, so a string that may read a
@@ -621,9 +541,9 @@ fn frame_locals_sets_no_allocation_floor() {
 }
 
 /// A raw block of the tree may branch to a label an inlined helper's raw block emits, so a
-/// helper's label also rules out in-place `self`.
+/// helper's label also keeps the copy.
 #[test]
-fn a_helper_raw_label_disables_in_place_self() {
+fn a_helper_raw_label_keeps_the_job_data_copy() {
     let src = obj(
         "Plain",
         r#"    fn checkpoint() {
@@ -631,7 +551,7 @@ fn a_helper_raw_label_disables_in_place_self() {
     }
     tree a (sim: Sim) {
         checkpoint();
-        if self.value == 1 {
+        if job_data(1, 1, 0) == 1 {
             temp[4] = 1;
         }
         if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
@@ -642,10 +562,7 @@ fn a_helper_raw_label_disables_in_place_self() {
     );
     let air = expand("raw_helper_label.antics", &src);
     let a = tree(&air, "a");
-    assert!(
-        !a.contains("stack.attr[0] == 1"),
-        "the self read is staged:\n{a}"
-    );
+    assert!(!a.contains("if scope(33, 0) == 1"), "the copy stays:\n{a}");
 }
 
 /// The inherit check reads the entry object from `.air` tokens, so a comment naming it is not a
@@ -717,11 +634,11 @@ fn same_spelled_out_operand_locals_of_different_helpers_do_not_share() {
 
 /// A raw label can reach the tree from routes the source does not show as a call: a parameter
 /// default that calls a helper, and a helper named like the `animate` statement. The emitted
-/// `.air` decides, so neither keeps the in-place `self` prefix.
+/// `.air` decides, so both keep the `job_data` copy.
 #[test]
-fn raw_labels_from_defaults_and_statement_named_helpers_disable_in_place_self() {
+fn raw_labels_from_defaults_and_statement_named_helpers_keep_the_job_data_copy() {
     let tail = r#"
-        if self.value == 1 {
+        if job_data(1, 1, 0) == 1 {
             temp[4] = 1;
         }
         if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
@@ -754,8 +671,8 @@ fn raw_labels_from_defaults_and_statement_named_helpers_disable_in_place_self() 
         let air = expand(name, &obj("Plain", &members));
         let a = tree(&air, "a");
         assert!(
-            !a.contains("stack.attr[0] == 1"),
-            "{name}: the self read is staged:\n{a}"
+            !a.contains("if scope(33, 0) == 1"),
+            "{name}: the copy stays:\n{a}"
         );
     }
 }
@@ -806,33 +723,29 @@ fn out_operand_groups_follow_declarations_through_let_some_and_specialization() 
 }
 
 /// Every Expression node sets the scratch pointer that a later read of global 34 depends on, so
-/// a tree that may read global 34 keeps the Expression that stages a `self` read, and keeps its
-/// dialog entry save, as on main.
+/// a tree that may read global 34 keeps the `job_data` copy, and keeps its dialog entry save, as
+/// on main.
 #[test]
 fn a_tree_that_may_read_global_34_keeps_its_expressions() {
     let src = obj(
         "Plain",
         r#"    tree a (sim: Sim) {
-        if self.value == 1 {
+        if job_data(1, 1, 0) == 1 {
             temp[2] = global[34];
         }
-        set_to_next(all, dest: stack_obj);
         return false;
     }"#,
     );
-    let air = expand("global34_self.antics", &src);
+    let air = expand("global34_job.antics", &src);
     let a = tree(&air, "a");
-    assert!(
-        !a.contains("stack.attr[0] == 1"),
-        "the self read is staged:\n{a}"
-    );
+    assert!(!a.contains("if scope(33, 0) == 1"), "the copy stays:\n{a}");
     // Another global leaves the comparison in place.
     let air = expand(
-        "global5_self.antics",
+        "global5_job.antics",
         &src.replace("global[34]", "global[5]"),
     );
     let a = tree(&air, "a");
-    assert!(a.contains("stack.attr[0] == 1"), "in place:\n{a}");
+    assert!(a.contains("if scope(33, 0) == 1"), "in place:\n{a}");
     let src = obj(
         "Plain",
         r#"    tree a (sim: Sim) {
@@ -940,14 +853,14 @@ fn a_raw_op_with_a_named_opcode_may_read_global_34() {
     );
 }
 
-/// Dropping the staging local of an in-place `self` read moves the named locals after it, so a
-/// tree whose text may read a frame word gets no prefix.
+/// Dropping the `job_data` copy's local moves the named locals after it, so a tree whose text
+/// may read a frame word keeps the copy.
 #[test]
-fn text_that_reads_frame_words_disables_in_place_self() {
+fn text_that_reads_frame_words_keeps_the_job_data_copy() {
     let src = obj(
         "Number $Local:2",
         r#"    tree a (sim: Sim) {
-        if self.value == 1 {
+        if job_data(1, 1, 0) == 1 {
             sim.person[4] = 1;
         }
         let n = sim.person[3];
@@ -959,42 +872,7 @@ fn text_that_reads_frame_words_disables_in_place_self() {
     );
     let air = expand("text_prefix.antics", &src);
     let a = tree(&air, "a");
-    assert!(
-        !a.contains("stack.attr[0] == 1"),
-        "the self read is staged:\n{a}"
-    );
-}
-
-/// The VM resolves a comparison's right operand first, so an in-place `self` read on the left
-/// is staged unless the right side is a constant: a faulting right operand must not fault
-/// before the `self` read does.
-#[test]
-fn an_in_place_self_comparison_keeps_its_operand_order() {
-    let src = |rhs: &str| {
-        obj(
-            "Plain",
-            &format!(
-                r#"    tree a (sim: Sim) {{
-        if self.value == {rhs} {{
-            return false;
-        }}
-        set_to_next(all, dest: stack_obj);
-    }}"#
-            ),
-        )
-    };
-    let air = expand("cmp_temp.antics", &src("temp[8]"));
-    let a = tree(&air, "a");
-    assert!(
-        a.contains("let __pre_stack_obj"),
-        "staged before a temp:\n{a}"
-    );
-    let air = expand("cmp_const.antics", &src("3"));
-    let a = tree(&air, "a");
-    assert!(
-        a.contains("if stack.attr[0] == 3"),
-        "in place against a constant:\n{a}"
-    );
+    assert!(!a.contains("if scope(33, 0) == 1"), "the copy stays:\n{a}");
 }
 
 /// A raw block may declare a qualified constant whose first part is spelled like the entry
@@ -1012,48 +890,20 @@ fn a_qualified_raw_constant_is_not_the_entry_object() {
     assert!(!tree(&air, "a").contains("= stack_obj"), "{air}");
 }
 
-/// An in-place `self` read is staged and ordered as main stages the switched one: a loop
-/// header reads it on every iteration, and the operand left of it is read first.
+/// A `job_data` comparison without its copy still reads its arguments in source order: the
+/// level before the career.
 #[test]
-fn an_in_place_self_read_keeps_main_staging_order() {
+fn a_job_data_comparison_reads_its_arguments_in_order() {
     let src = obj(
         "Plain",
-        r#"    tree a (sim: Sim) {
-        while self.value < sim.person[3] {
-            self.value += 1;
-        }
-        if !set_to_next(guid, 0x7F40_0903, dest: stack_obj) {
-            return false;
-        }
-    }
-    tree b (sim: Sim) {
-        if temp[8] == self.data[25] {
-            return false;
-        }
-        set_to_next(all, dest: stack_obj);
-    }
-    tree c (sim: Sim) {
+        r#"    tree c (sim: Sim) {
         if job_data(level: temp[8], career: self.data[25], field: 0) == 1 {
             return false;
         }
         set_to_next(all, dest: stack_obj);
     }"#,
     );
-    let air = expand("self_order.antics", &src);
-    let a = tree(&air, "a");
-    let header = a
-        .find("while true")
-        .expect("the loop reads self in its body");
-    assert!(
-        !a[..header].contains("stack.attr[0]"),
-        "no read before the loop:\n{a}"
-    );
-    let b = tree(&air, "b");
-    let (temp, data) = (
-        b.find("temp[8]").unwrap(),
-        b.find("stack.data[25]").unwrap(),
-    );
-    assert!(temp < data, "temp[8] is read first:\n{b}");
+    let air = expand("job_order.antics", &src);
     let c = tree(&air, "c");
     let (temp, data) = (
         c.find("temp[8]").unwrap(),
@@ -1080,29 +930,8 @@ fn a_raw_layout_tree_that_may_read_global_34_keeps_its_entry_save() {
     assert!(tree(&air, "a").contains(SAVE), "{air}");
 }
 
-/// Dropping a `job_data` comparison's copy removes a node, so a tree with a raw branch to a node
-/// by number keeps the copy: the number would count the removed node.
-#[test]
-fn a_positional_raw_branch_keeps_the_job_data_copy() {
-    let src = r#"object "Round Three" {
-    guid: 0x7F40_0900;
-    @frame(locals: 1) tree a {
-        raw { op 2 (0, 0, 0, 0, 0, 2, 7, 7) -> true: 6, false: 6; }
-        if job_data(1, 1, 0) == 1 {
-            temp[3] = 21;
-        }
-        raw { if 1 == 1 { return false; } }
-        temp[4] = 10;
-        return true;
-    }
-}
-"#;
-    let air = expand("job_positional.antics", src);
-    let a = tree(&air, "a");
-    assert!(!a.contains("if scope(33, 0) == 1"), "the copy stays:\n{a}");
-}
-
-/// A raw `call` names a tree, not the entry object, even when the tree is spelled like it.
+/// A raw `call x` or `subroutine(x)` names a tree, not the entry object, even when the tree is
+/// spelled like it.
 #[test]
 fn a_raw_call_to_a_tree_named_like_the_entry_object_is_not_a_read() {
     let src = r#"object "Round Three" {
@@ -1118,4 +947,52 @@ fn a_raw_call_to_a_tree_named_like_the_entry_object_is_not_a_read() {
 "#;
     let air = expand("raw_call_named.antics", src);
     assert!(!tree(&air, "a").contains("= stack_obj"), "{air}");
+    let src = src.replace("call __self_obj;", "subroutine(__self_obj);");
+    let air = expand("raw_subroutine_named.antics", &src);
+    assert!(!tree(&air, "a").contains("= stack_obj"), "{air}");
+}
+
+/// Pinning a `push_interaction` handle into word 0 moves the named locals after it down a word,
+/// so a tree whose text may read one of those words keeps the copy into word 0.
+#[test]
+fn text_that_reads_a_moved_word_keeps_the_push_interaction_copy() {
+    let members = r#"    tree a (sim: Sim) {
+        let h = stack_obj;
+        let n: i16;
+        random_into(n, Limits.draw)?;
+        temp[3] = n;
+        dialog(kind: ok, title: title, message: msg);
+        push_interaction(menu: 1, object: h, priority: 0);
+    }
+    bcon 4097 "Limits" { draw = 1 }"#;
+    let air = expand("pin_text.antics", &obj("Was $Local:1", members));
+    let a = tree(&air, "a");
+    assert!(
+        !a.contains("local[0] := stack_obj;"),
+        "the copy stays:\n{a}"
+    );
+    // Text that reads no frame word lets the handle live in word 0.
+    let air = expand("pin_plain.antics", &obj("Plain", members));
+    let a = tree(&air, "a");
+    assert!(a.contains("local[0] := stack_obj;"), "pinned:\n{a}");
+}
+
+/// Dropping the `job_data` copy's local moves the named locals after it down a word, so a tree
+/// that reads a local before writing it (what an earlier frame left in its word) keeps the copy.
+#[test]
+fn a_local_read_before_its_write_keeps_the_job_data_copy() {
+    let src = r#"object "Round Three" {
+    guid: 0x7F40_0900;
+    tree probe {
+        if job_data(1, 1, 0) == 1 {
+            temp[3] = 21;
+        }
+        let residue: i16;
+        temp[4] = residue;
+    }
+}
+"#;
+    let air = expand("job_residue.antics", src);
+    let a = tree(&air, "probe");
+    assert!(!a.contains("if scope(33, 0) == 1"), "the copy stays:\n{a}");
 }

@@ -50,8 +50,21 @@ pub(crate) fn finish_body(out: String, facts: &FrameFacts<'_>) -> String {
         }
     } else {
         let out = crate::v2::opt::optimize_tree_body(&out, reads_text, facts.local_origins);
+        // Pinning moves every named local down a word and fills word 0 from the start, so a
+        // tree whose text may read a frame word keeps its copies unless the text reads neither
+        // word 0 nor a word that changes hands.
         let out = if facts.pinned {
-            pin_in_place(&out)
+            let pinned = pin_in_place(&out);
+            let text_ok = match &facts.text_reads {
+                TableLocals::Known(words) if words.is_empty() => true,
+                TableLocals::Known(words) => !words.contains(&0) && unmoved(&out, &pinned),
+                TableLocals::Unknown => false,
+            };
+            if pinned == out || text_ok {
+                pinned
+            } else {
+                out
+            }
         } else {
             out
         };

@@ -57,8 +57,6 @@ impl<'a> TreeLowerer<'a> {
             sleep_span: None,
             stmt_marks: Vec::new(),
             inherited_entry_save: false,
-            entry_cursor: false,
-            self_in_place: false,
         }
     }
 
@@ -78,7 +76,10 @@ impl<'a> TreeLowerer<'a> {
         // The frame words the tree's text may read: none unless it formats text.
         // A tree that may read global 34 keeps main's rule (every text tree reads): dropping
         // the entry save removes an Expression, whose scratch-pointer write that read depends on.
-        let text_reads = if formats_text && mir::may_read_global_34(self.em.text()) {
+        // (The pinned slot's placeholder is not `.air` yet; it becomes word 0 below.)
+        let text_reads = if formats_text
+            && mir::may_read_global_34(&replace_outside_strings(self.em.text(), PIN_SLOT, "0"))
+        {
             mir::TableLocals::Unknown
         } else if formats_text {
             self.env.text_reads.clone()
@@ -132,19 +133,21 @@ impl<'a> TreeLowerer<'a> {
             // the named locals after it.
             out = replace_outside_strings(&out, PIN_SLOT, "0");
         }
-        // An in-place rewrite (the `self` prefix, a `job_data` comparison without its copy)
-        // removes a node, an Expression and a local that main emits. Lowering emits no label and
-        // no branch by node number, so one in the body comes from raw code (the tree's or an
-        // inlined helper's): it may jump back into the prefix after a cursor move, and a number
-        // counts the removed node. A later read of global 34 could see a scratch pointer no
-        // Expression has set yet. Text may read a frame word the named locals after the removed
-        // local move into. (A body that does not parse counts as having raw control flow.)
+        // An in-place rewrite (a `job_data` comparison without its copy) removes a node, an
+        // Expression and a local that main emits. Lowering emits no label and no branch by node
+        // number, so one in the body comes from raw code (the tree's or an inlined helper's),
+        // and a number counts the removed node. A later read of global 34 could see a scratch pointer no
+        // Expression has set yet. The named locals after the removed local move down a word, so
+        // text that may read a frame word, or a local read before it is written (which reads
+        // what an earlier frame left in its word), could see another value. (A body that does
+        // not parse counts as having raw control flow.)
         if self.in_place_applied {
             let raw = raw_facts::raw_facts(&out, None);
             if raw.defines_label
                 || raw.positional_target
                 || mir::may_read_global_34(&out)
                 || mir::reads_a_word(&facts.text_reads)
+                || mir::may_read_residue(&out)
             {
                 self.env.in_place_unsound.set(true);
             }
@@ -490,10 +493,18 @@ fn names_token(body: &str, name: &str) -> bool {
             i.and_then(|i| tokens.get(i))
                 .is_some_and(|t| matches!(t.kind, T::Dot))
         };
+        let ident = |i: Option<usize>, word: &str| {
+            i.and_then(|i| tokens.get(i))
+                .is_some_and(|t| matches!(&t.kind, T::Ident(k) if k == word))
+        };
+        // The tree `call x` or `subroutine(x ..)` names.
         let after_call = |i: usize| {
-            i.checked_sub(1)
-                .and_then(|i| tokens.get(i))
-                .is_some_and(|t| matches!(&t.kind, T::Ident(k) if k == "call"))
+            ident(i.checked_sub(1), "call")
+                || (i
+                    .checked_sub(1)
+                    .and_then(|i| tokens.get(i))
+                    .is_some_and(|t| matches!(t.kind, T::LParen))
+                    && ident(i.checked_sub(2), "subroutine"))
         };
         tokens.iter().enumerate().any(|(i, t)| {
             matches!(&t.kind, T::Ident(n) if n == name)

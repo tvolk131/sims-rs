@@ -25,7 +25,7 @@ The Round 3 pilots (13 objects, Batches 1–4 plus Fridges) found these lowering
   - disjoint inlined helper copies did not share a word when `animate(local:)` or `random_into`
     wrote their local (Batch 2 Piano 4110 R3-2);
   - a Sim tree staged `self.*` reads through a `__pre_stack_obj` local even before its first
-    cursor move (Batch 1 Stoves 4110 R3-6);
+    cursor move (Batch 1 Stoves 4110 R3-6; kept, see section 5);
   - `push_interaction(object: <@slot let>)` was refused (CashRegisters 4098 gap 3);
   - `job_data(..) == k` went through a fresh `__job` local (Dressers 4117 bug 3).
 
@@ -129,7 +129,7 @@ declaration order, so generated names no longer matter.
 
 - The Sim pass declares its implicit entry object (`__self_obj`) when the body reads it, as the
   object pass declares `__saved_stack_obj`. A read is an `.air` token naming it, so a comment, a
-  field after a dot and the tree a raw `call` names do not count. A raw block may read `__self_obj` or `__saved_stack_obj` but may not declare a local,
+  field after a dot and the tree a raw `call x` or `subroutine(x)` names do not count. A raw block may read `__self_obj` or `__saved_stack_obj` but may not declare a local,
   constant or label of either name (`check_raw_reserved_names`). A source constant named
   `__self_obj` is a constant to the raw blocks that read it, not the entry object, and so is a
   qualified constant such as `__self_obj.tuning`, which a raw block may declare.
@@ -156,35 +156,15 @@ declaration order, so generated names no longer matter.
       written. A specialization that drops the write from one copy keeps them one group.
     Bookcases 4107 shows why: Maxis keeps a helper's `event` and `pick` in separate words, and
     merging them made the verifier's cut-point mode compare unequal slots.
-- **`self` before the first cursor move (`lower/stmt.rs` `lower_tree_body`).** In a Sim tree, the
-  leading top-level statements before the first one that may move the cursor run with `stack_obj`
-  still the entry object (`stmts_may_clobber_stack_obj`, which looks through called helpers). There
-  two `self` sites use the stack object in place, with no switch and no staging local: a
-  primitive's `self` target (`emit_on_self`), and a `self` cell compared with a compile-time
-  constant (`self.<field>`, `self.attr[k]`, `self.data[k]`). Every other `self` read and every
-  write is staged as on main. Both sites are marked by `self_in_place` while they lower.
-  - Source order is control order only when no raw code defines a label or branches to a node by
-    number. Otherwise a branch from after a move may jump back before it. Lowering itself emits
-    neither, so the check reads the tree's finished `.air` (`raw_facts`). That covers raw code from
-    every route: the tree's own blocks, helpers it calls, parameter defaults, and helpers named like
-    statements. When a tree that used the prefix has such code, the object is lowered again with no
-    prefix in any tree (`ObjectEnv::in_place_off`), as for the text fact.
-  - The prefix also drops the Expression that staged a `self` read and its local. The `job_data`
-    comparison below drops a copy the same way, so it is an in-place rewrite too: it sets the same
-    flag (`in_place_applied`) and is off under `in_place_off`. So the same
-    fallback applies when the finished `.air` may read global 34 (section 1), whose value depends
-    on the scratch pointer that Expression set. It also applies when the tree's text may read a
-    frame word, because the named locals after the dropped local move down a word.
-  - An in-place read is staged and ordered exactly as main stages the switched one. The purity
-    checks (which operands are staged and in what order, and whether a loop header is one node)
-    ask whether `self` switches after a move (`self_switches_after_move`), not where it reads now.
-    So the read stays inside a loop whose header reads it, and the operands main reads before it
-    stay first. The prefix saves only the switch and the staging local where the read is the last
-    operand read.
-  - The VM resolves a comparison's right operand before its left. So a `self` read on the left of
-    a comparison is staged first, as after a move, unless the right side is a compile-time
-    constant (as for `job_data`). Otherwise a faulting right operand would fault before the `self`
-    read.
+- **`self` before the first cursor move: not changed (Stoves 4110 R3-6).** A Sim tree that moves
+  the cursor still selects `self` through `__self_obj`, with main's staging, even before the first
+  move. An in-place read was tried and dropped. The staging is a pair of Expressions, and each
+  leaves the last result true. A read or primitive that faults after them (an index out of range,
+  a missing object) leaves that true behind, and an in-place one leaves the previous result.
+  `verify-equiv` observes the last result at a fault by default: play-mode recovery keeps it in
+  the rebuilt frame and copies it into a reset person's last-action flags. No safe subset was
+  found: every stack-object read faults when the object is missing. The 13 pilots are EQUIVALENT
+  without it, so the shape costs no verdict.
   - The scratch pointer a tree leaves for its callees and callers is part of its lowered shape,
     which `verify-equiv` observes at every call and exit. It is not a rule of the source: main's
     entry-save drop in non-text trees already ignores it.
@@ -192,6 +172,13 @@ declaration order, so generated names no longer matter.
     check now covers raw `loop` bodies too.
   - A padded raw primitive (`… pad 0xNN`) counts as the primitive it wraps, both for moving the
     cursor and for formatting text.
+- **The pinned `push_interaction` slot (`mir/pipeline.rs`).** `pin_in_place` makes a pushed
+  handle live in word 0 and drops its copies, which moves every named local down a word and fills
+  word 0 from the start. Section 2 lets it apply to more trees (a `random` with a BCON range now
+  defines its destination), so a tree whose text may read a frame word keeps the copies unless
+  the text reads neither word 0 nor a word that changes hands. Before the body is final, the slot
+  is a placeholder (`@pin@`) that the lexer does not read. Global 34 is checked on the body with
+  word 0 in its place, so a pinned text tree is no longer `Unknown` for that reason alone.
 - **`push_interaction(object: <@slot(N) handle>)` (`lower/builtins.rs`).** It emits `object: N`
   with flag 0x02, so the VM reads the handle from its own pinned word. There is no copy into word 0
   and no pin, so it can share a tree with other `@slot` lets. An explicit flag 0x02 is refused, as
@@ -201,9 +188,21 @@ declaration order, so generated names no longer matter.
   - The VM resolves the right operand first. So an operand that can fault, such as a temp or an
     attribute, would fault where the copy faulted on the career lookup.
   - Any other right side is still copied to a local.
-  - Dropping the copy drops an Expression and a local, so the tree is checked after lowering like
-    the `self` prefix (section 5), and the object is lowered again with the copy when the check
-    fails.
+  - Dropping the copy removes a node, an Expression and a local that main emits, so it is an
+    in-place rewrite (`in_place_applied`). The tree's finished `.air` is checked after lowering,
+    and the object is lowered again with every copy (`ObjectEnv::in_place_off`) when any of
+    these holds:
+    - raw code defines a label or branches to a node by number. Lowering emits neither, so the
+      check reads the finished `.air` (`raw_facts`), which covers raw code from every route: the
+      tree's own blocks, helpers it calls, parameter defaults, and helpers named like
+      statements. A number counts the removed node, and a label may be reached from raw code
+      that counts on it;
+    - the `.air` may read global 34 (section 1), whose value depends on the scratch pointer the
+      removed Expression set;
+    - the tree's text may read a frame word, or a local may be read before it is written
+      (`may_read_residue`): the named locals after the removed local move down a word, so
+      either would read a different word. The body parser does not read raw positional targets,
+      so a body with one counts as a residue read too.
 
 ## Verification
 
@@ -218,8 +217,9 @@ declaration order, so generated names no longer matter.
 - **Tests.**
   - `tests/v2_r3_fixes.rs` (synthetic) covers each fix and its negative cases: kept saves (including
     the `idle` scratch word), a later literal reaching earlier trees, read-first helper locals, an
-    out-operand's unwritten exit, loops and raw back edges that move the cursor, and a faulting
-    `job_data` comparand.
+    out-operand's unwritten exit, the `job_data` copy's fallbacks (raw labels and positional
+    targets from every route, global 34, text, residue reads), a faulting `job_data` comparand,
+    and the pinned slot under text.
   - The `opt.rs` unit tests cover the pipeline's text veto.
 
 ## What would reopen this
