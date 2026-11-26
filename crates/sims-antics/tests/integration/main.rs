@@ -38,6 +38,7 @@ mod v2_3_lift_strict_leap;
 mod v2_3_step2_node_order_and_tails;
 mod v2_4_compiler_upgrades;
 mod v2_4_dead_false;
+mod v2_4_lift_finale;
 mod v2_compiler;
 mod v2_fmt_and_decompile;
 mod v2_lift_panic_and_discard;
