@@ -352,6 +352,37 @@ fn an_inner_condition_with_braces_is_left_alone() {
     );
 }
 
+#[test]
+fn a_file_naming_a_local_else_is_left_alone() {
+    // Sol R1: `else` may name a local. Collapsed, the inner `if` would take the next
+    // statement's `else` as its own (`.. else if a == 2 { .. } else = 3;` does not parse).
+    // The same holds two blocks out, when nested findings are applied together.
+    for body in [
+        "        let else = 0;
+        if a == 1 { temp[0] = 1; } else { if a == 2 { temp[0] = 2; } }
+        else = 3;
+        temp[1] = else;",
+        "        let else = 0;
+        if a == 1 {
+            temp[0] = 1;
+        } else {
+            if a == 2 {
+                temp[0] = 2;
+            } else {
+                if a == 3 {
+                    temp[0] = 3;
+                }
+            }
+        }
+        else = 3;
+        temp[1] = else;",
+    ] {
+        let source = tree(body);
+        iff(&source);
+        none(&source, RULE);
+    }
+}
+
 // --- suppression and the open pack ------------------------------------------------------
 
 #[test]

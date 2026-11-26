@@ -3556,6 +3556,17 @@ impl FileLinter<'_> {
     /// `{` and `if`, or between the chain's last `}` and the block's `}`).
     fn collapsible_else_if(&mut self, inner: Span) {
         let toks = self.tokens;
+        // `else` may name a local (`let else = 0;`). The collapse moves the inner chain's
+        // end next to whatever follows the block, and a statement `else = 3;` there would be
+        // read as the chain's `else`. So the rule is off in a file where an `else` is not
+        // the keyword: the keyword is always followed by `{` or `if`.
+        if toks.windows(2).any(|w| {
+            is_kw(Some(&w[0]), "else")
+                && w[1].kind != TokenKind::LBrace
+                && !is_kw(Some(&w[1]), "if")
+        }) {
+            return;
+        }
         let at =
             toks.partition_point(|t| (t.span.line, t.span.column) < (inner.line, inner.column));
         if at < 2 || !is_kw(toks.get(at), "if") {

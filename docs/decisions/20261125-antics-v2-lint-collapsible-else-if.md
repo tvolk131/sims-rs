@@ -37,6 +37,12 @@ tell the two apart, so the rule reads the tokens around the inner `if`:
    holds a brace inside brackets, or an `if` / `match` (whose braces the walk could misread),
    the `if` is skipped. This leaves a false negative, never a misread.
 
+`else` is not reserved: it may name a local (`let else = 0;`). Collapsed, the inner chain's
+end meets whatever follows the block. A statement `else = 3;` there would be read as the
+chain's `else`, and the file would no longer parse. This happens two blocks out too, when
+nested findings are applied together. So the rule is off in any file where an `else` token is
+followed by anything but `{` or `if`. The keyword always is.
+
 A `raw { }` body is one opaque token, so `.air` text that looks like v2 is never read, and an
 `else` holding a raw block is no `if`. The parser takes `for .. else { .. }` and
 `let Some(..) = .. else { .. }` as blocks only (`else if` does not parse there), so the rule
@@ -74,6 +80,17 @@ before `} else {` instead.
   `} else { if !(..) { return true; } }`, which this rule reports. `decompile.rs` is Track 9's
   file, so it is not edited here: the lift should write `else if` for an `else` arm that holds
   only an `if`.
+
+## Review
+
+GPT-6.2 Sol (high effort), correctness and soundness only.
+
+- **R1:** 2 findings.
+  - The SHOULD-FIX (a local named `else`, above) is fixed, with a regression test covering
+    both the direct case and the nested one.
+  - The NOTE is older than this rule: the CLI draws a finding's caret by byte, not by
+    character, so a non-ASCII string earlier on the line shifts it left. The reported line
+    and column are right.
 
 ## Consequences
 
