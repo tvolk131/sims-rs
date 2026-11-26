@@ -17,16 +17,16 @@
 //!   foreground layer's priority raised (+0x1a0). No blend layer is made
 //!   here (`animator.rs`), so this does nothing.
 //! - "sound", "selectedsound", "deselectedsound" and "footstep": a sound
-//!   is picked (from the person's view, its selection, or the floor under
-//!   it, 0x432595, 0x45e50e, 0x58900f) and played through the sound
-//!   events (0x57a54c). Neither the pick nor the play is ported yet
-//!   ([`crate::sounds`]), except that in a person's animator refresh at
-//!   its taking itself off the lot such an event fails (`timed_event`).
-//!   None of 0x57a54c, 0x58900f,
-//!   0x432595 and 0x45e50e calls the C runtime's random function
-//!   (0x636c74) directly or through direct calls five deep; that nothing
-//!   else the simulation keeps changes is **unverified**. "sound" also
-//!   writes a line to the game's log when its byte 0x5b is set.
+//!   is picked (from where the person stands, its selection, or the floor
+//!   under it, 0x432595, 0x45e50e, 0x58900f; [`crate::footsteps`]) and
+//!   played through the sound events (0x57a54c, [`crate::sounds`]).
+//!   Neither the pick nor the play writes the world or calls the C
+//!   runtime's random function (0x636c74): none of 0x57a54c, 0x58900f,
+//!   0x5890a8, 0x432595 and 0x45e50e calls it directly or through direct
+//!   calls five deep. In a person's animator refresh at its taking itself
+//!   off the lot such an event fails (`timed_event`). "sound" also writes
+//!   a line to the game's log when its byte 0x5b is set, which is not
+//!   modeled.
 //! - "anchor" (0x5913a6): the event's bone becomes, or stops being, the
 //!   anchor of the layer (+0x6c, +0x70 cleared) and, for the foreground
 //!   layer, of the animator (+0x28, with +0x24 cleared when it changes).
@@ -47,6 +47,7 @@
 //! Any other key does nothing.
 
 use crate::fault::Trap;
+use crate::footsteps;
 use crate::interpreter::Interpreter;
 use crate::primitives::change_suit::{put_on, undress_person};
 use sims_content::People;
@@ -100,15 +101,7 @@ impl Interpreter<'_> {
                         .map(|e| (e.time, !e.properties.is_empty()))
                         .collect();
                     for due in layer.due(track, &times).map_err(Trap::Unsupported)? {
-                        timed_event(
-                            world,
-                            &self.program.people,
-                            id,
-                            a,
-                            layer,
-                            &motion.events[due].properties,
-                            self.take_off_refresh,
-                        )?;
+                        self.timed_event(world, id, a, layer, &motion.events[due].properties)?;
                     }
                 }
             }
@@ -116,73 +109,86 @@ impl Interpreter<'_> {
         layer.commit();
         Ok(())
     }
-}
 
-/// One timed event's properties (0x5912fd; the module documentation).
-///
-/// In a person's animator refresh at its taking itself off the lot
-/// (`refresh`; `Interpreter::refresh_at_take_off`), a sound key fails: the
-/// refresh is made only if the house view drew the person, which is not
-/// kept, and the sound it would play (for a selected person
-/// "selectedsound" reaches 0x57a54c through 0x59158c and 0x59175e) is not
-/// one the animator's tick alone plays. When the original plays nothing
-/// there is not worked out.
-fn timed_event(
-    world: &mut World,
-    people: &People,
-    id: u16,
-    a: &mut Animator,
-    layer: &mut Layer,
-    properties: &[(String, String)],
-    refresh: bool,
-) -> Result<(), Trap> {
-    for (key, value) in properties {
-        let number = atoi(value);
-        let word = match key.as_str() {
-            "xevt" => {
-                a.events.push(number);
-                continue;
-            }
-            "interruptable" | "interruptible" => {
-                layer.interruptible = number;
-                continue;
-            }
-            "lefthand" => LEFT_HAND,
-            "righthand" => RIGHT_HAND,
-            "censor" => CENSOR,
-            "sound" | "selectedsound" | "deselectedsound" | "footstep" if refresh => {
-                return Err(Trap::Unsupported(format!(
-                    "the clip {:?} has a timed event {key:?} (0x5912fd) due in person {id}'s \
+    /// One timed event's properties (0x5912fd; the module documentation).
+    ///
+    /// In a person's animator refresh at its taking itself off the lot
+    /// (`refresh`; `Interpreter::refresh_at_take_off`), a sound key fails: the
+    /// refresh is made only if the house view drew the person, which is not
+    /// kept, and the sound it would play (for a selected person
+    /// "selectedsound" reaches 0x57a54c through 0x59158c and 0x59175e) is not
+    /// one the animator's tick alone plays. When the original plays nothing
+    /// there is not worked out.
+    ///
+    /// Otherwise a sound key's pick ([`footsteps::pick`]) goes to the sound
+    /// events, if they are noted ([`Interpreter::sounds`]).
+    fn timed_event(
+        &self,
+        world: &mut World,
+        id: u16,
+        a: &mut Animator,
+        layer: &mut Layer,
+        properties: &[(String, String)],
+    ) -> Result<(), Trap> {
+        let people: &People = &self.program.people;
+        let refresh = self.take_off_refresh;
+        for (key, value) in properties {
+            let number = atoi(value);
+            let word = match key.as_str() {
+                "xevt" => {
+                    a.events.push(number);
+                    continue;
+                }
+                "interruptable" | "interruptible" => {
+                    layer.interruptible = number;
+                    continue;
+                }
+                "lefthand" => LEFT_HAND,
+                "righthand" => RIGHT_HAND,
+                "censor" => CENSOR,
+                "sound" | "selectedsound" | "deselectedsound" | "footstep" if refresh => {
+                    return Err(Trap::Unsupported(format!(
+                        "the clip {:?} has a timed event {key:?} (0x5912fd) due in person {id}'s \
                      animator refresh at its taking itself off the lot (0x58da12), which plays \
                      a sound only if the house view drew the person; that is not kept",
-                    layer.clip
-                )));
-            }
-            "dress" | "undress" => {
-                if key == "dress" {
-                    put_on(people, world, id, value.clone())?;
-                } else {
-                    undress_person(world, id, value)?;
+                        layer.clip
+                    )));
                 }
-                continue;
-            }
-            // "discontinuity" finds no blend layer; the anchor is not
-            // kept; the sounds are not modeled; other keys do nothing.
-            _ => continue,
-        };
-        let data = &mut world
-            .objects
-            .get_mut(&id)
-            .and_then(|o| o.person.as_mut())
-            .ok_or_else(|| Trap::native(0x1c, "object is not a person"))?
-            .data;
-        *data
-            .get_mut(word)
-            .ok_or_else(|| Trap::Invalid(format!("person data has no word {word}")))? =
-            number as i16;
-        world.routing.unknown_words.remove(&(id, word));
+                "sound" | "selectedsound" | "deselectedsound" | "footstep" => {
+                    let floors = self.floor_categories();
+                    if let Some(event) = footsteps::pick(world, id, a, layer, key, value, floors)?
+                        && let Some(sink) = self.sounds
+                    {
+                        sink.borrow_mut().push(event);
+                    }
+                    continue;
+                }
+                "dress" | "undress" => {
+                    if key == "dress" {
+                        put_on(people, world, id, value.clone())?;
+                    } else {
+                        undress_person(world, id, value)?;
+                    }
+                    continue;
+                }
+                // "discontinuity" finds no blend layer; the anchor is not
+                // kept; other keys do nothing.
+                _ => continue,
+            };
+            let data = &mut world
+                .objects
+                .get_mut(&id)
+                .and_then(|o| o.person.as_mut())
+                .ok_or_else(|| Trap::native(0x1c, "object is not a person"))?
+                .data;
+            *data
+                .get_mut(word)
+                .ok_or_else(|| Trap::Invalid(format!("person data has no word {word}")))? =
+                number as i16;
+            world.routing.unknown_words.remove(&(id, word));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// The C runtime's atoi (0x636029, through atol): spaces and tabs and the

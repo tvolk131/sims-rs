@@ -293,6 +293,64 @@ fn the_goth_house_steps_to_tick_33() {
 }
 
 #[test]
+fn the_goths_footsteps_sound_of_what_they_walk_on() {
+    // A clip's "footstep" events play a sound picked from the surface
+    // under the walker (0x5915e1, `footsteps.rs`), and noting them leaves
+    // the lot where TICK_33 has it.
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    let mut steps = std::collections::BTreeMap::<String, usize>::new();
+    for tick in 1..=400 {
+        let update = lot.step().unwrap();
+        if tick == 33 {
+            assert_eq!(lot.world().hash_hex(), TICK_33);
+        }
+        for sound in update.sounds {
+            if let sims_vm::SoundEvent::Play { name, .. } = sound
+                && name.starts_with("footstep_")
+            {
+                *steps.entry(name).or_default() += 1;
+            }
+        }
+    }
+    // Our own count, pinned (no capture of the original's sounds).
+    let pinned = [
+        ("footstep_hard", 10),
+        ("footstep_medium", 6),
+        ("footstep_soft", 14),
+        ("footstep_terrain", 33),
+    ];
+    assert_eq!(
+        steps,
+        pinned.map(|(n, c)| (n.to_owned(), c)).into_iter().collect()
+    );
+    let known = [
+        "hard",
+        "medium",
+        "soft",
+        "terrain",
+        "plant",
+        "trash",
+        "ash",
+        "roach",
+        "puddle",
+        "pool_swim_stroke",
+        "snow",
+    ];
+    for name in steps.keys() {
+        let word = name
+            .trim_start_matches("footstep_")
+            .trim_end_matches("_noshoe");
+        assert!(known.contains(&word), "{name}");
+    }
+}
+
+#[test]
 fn an_old_town_home_loads_through_its_guid_table_and_steps() {
     // House 69 of the first neighborhood was saved under its family's
     // exported GUIDs; its GUID table (0x43a6fb) names the imported types.
