@@ -805,3 +805,198 @@ fn a_state_named_light_keeps_data_word_51_unnamed() {
     iff(&source);
     none(&source, "untyped_engine_field");
 }
+
+// --- v2.4: `prefer_if_let` ----------------------------------------------------------------
+// See `docs/decisions/20261126-antics-v2-4-runner-grid-and-if-let-lint.md`.
+
+/// Asserts that `source` has one `prefer_if_let` finding, at `at`, suggesting `want`, and that
+/// `fixed` (the rewrite written out) builds the same bytes and has no finding.
+fn if_let_rewrite(source: &str, at: &str, want: &str, fixed: &str) {
+    iff(source);
+    let d = one(source, "prefer_if_let");
+    assert_eq!(d.suggestion.as_deref(), Some(want), "{d:#?}");
+    assert_eq!((d.line, d.column), position(source, at), "{d:#?}");
+    assert_eq!(
+        iff(source),
+        iff(fixed),
+        "rewrite builds other bytes:\n{fixed}"
+    );
+    none(fixed, "prefer_if_let");
+}
+
+#[test]
+fn an_option_value_read_by_its_temp_takes_if_let() {
+    // The `then` block reads the value `pick` leaves in `temp[2]`.
+    let source = if_let_tree(
+        "",
+        "        if pick() {\n            stack_obj = temp[2];\n            self.level = 1;\n        }",
+    );
+    let fixed = if_let_tree(
+        "",
+        "        if let Some(value) = pick() {\n            stack_obj = value;\n            self.level = 1;\n        }",
+    );
+    if_let_rewrite(
+        &source,
+        "if pick()",
+        "if let Some(value) = pick() {",
+        &fixed,
+    );
+    let d = one(&source, "prefer_if_let");
+    assert_eq!(
+        d.message,
+        "`pick` returns `Option`, and this code reads its value as `temp[2]`"
+    );
+    // An `if !f() { return ..; }` reads it in the rest of the block: `let .. else`.
+    let source = if_let_tree(
+        "",
+        "        if !pick() {\n            return;\n        }\n        stack_obj = temp[2];\n        self.level = 1;",
+    );
+    let fixed = if_let_tree(
+        "",
+        "        let Some(value) = pick() else {\n            return;\n        };\n        stack_obj = value;\n        self.level = 1;",
+    );
+    if_let_rewrite(
+        &source,
+        "if !pick()",
+        "let Some(value) = pick() else { .. };",
+        &fixed,
+    );
+}
+
+#[test]
+fn a_std_globals_option_names_its_value_after_the_callee() {
+    let source = tree(
+        "use std::globals::*;\n",
+        "",
+        "        if globals::find_companion() {\n            stack_obj = temp[0];\n        }",
+    );
+    let fixed = tree(
+        "use std::globals::*;\n",
+        "",
+        "        if let Some(companion) = globals::find_companion() {\n            stack_obj = companion;\n        }",
+    );
+    if_let_rewrite(
+        &source,
+        "if globals::",
+        "if let Some(companion) = globals::find_companion() {",
+        &fixed,
+    );
+    // A name the block already uses is not taken.
+    let source = tree(
+        "use std::globals::*;\n",
+        "",
+        "        let companion = 3;\n        if globals::find_companion() {\n            stack_obj = temp[0];\n            self.level = companion;\n        }",
+    );
+    let d = one(&source, "prefer_if_let");
+    assert_eq!(
+        d.suggestion.as_deref(),
+        Some("if let Some(companion_2) = globals::find_companion() {"),
+        "{d:#?}"
+    );
+}
+
+#[test]
+fn prefer_if_let_needs_a_read_the_binding_builds_the_same() {
+    for body in [
+        // Nothing reads the value.
+        "        if pick() {\n            self.level = 1;\n        }",
+        // Another temp.
+        "        if pick() {\n            stack_obj = temp[1];\n        }",
+        // A call may change the temp before the read.
+        "        if pick() {\n            self.level = 1;\n            halve(3);\n            stack_obj = temp[2];\n        }",
+        // The `if !` block does not always leave.
+        "        if !pick() {\n            self.level = 1;\n        }\n        stack_obj = temp[2];",
+        // `if !` with an `else`.
+        "        if !pick() {\n            return;\n        } else {\n            self.level = 1;\n        }\n        stack_obj = temp[2];",
+        // The binding takes a frame word the temp read did not: other bytes.
+        "        if halve(self.level) {\n            self.level += temp[2];\n            self.level += temp[2];\n        }",
+    ] {
+        let source = if_let_tree("", body);
+        iff(&source);
+        none(&source, "prefer_if_let");
+    }
+    // A `-> bool` tree leaves no value.
+    let source = obj(
+        "",
+        "    #[bhav] fn test_it() -> bool {\n        self.level > 2\n    }\n    #[bhav(label = \"Probe\")] fn probe() {\n        if test_it() {\n            stack_obj = temp[2];\n        }\n    }",
+    );
+    iff(&source);
+    none(&source, "prefer_if_let");
+}
+
+#[test]
+fn prefer_if_let_names_the_reads_it_renames() {
+    // A write to the temp ends the renamed reads: the help says which read takes the name.
+    let source = if_let_tree(
+        "",
+        "        if !pick() {\n            return;\n        }\n        self.level = temp[2];\n        temp[2] = 3;\n        self.level = temp[2];",
+    );
+    let d = one(&source, "prefer_if_let");
+    // The first read, on the first `self.level = temp[2];` line.
+    let (line, column) = position(&source, "self.level = temp[2];");
+    let column = column + "self.level = ".len();
+    assert_eq!(
+        d.help.as_deref(),
+        Some(
+            format!(
+                "write `let Some(value) = pick() else {{ .. }};`; `value` is the value for the rest of the block; rename `temp[2]` to `value` at {line}:{column} only (a later `temp[2]` may hold another value)"
+            )
+            .as_str()
+        ),
+        "{d:#?}"
+    );
+    let fixed = if_let_tree(
+        "",
+        "        let Some(value) = pick() else {\n            return;\n        };\n        self.level = value;\n        temp[2] = 3;\n        self.level = temp[2];",
+    );
+    assert_eq!(iff(&source), iff(&fixed));
+    none(&fixed, "prefer_if_let");
+}
+
+#[test]
+fn prefer_if_let_skips_names_the_region_declares_and_keeps_comments() {
+    // An inner `let value` would hide the binding: the next free name is taken.
+    let source = if_let_tree(
+        "",
+        "        if pick() {\n            stack_obj = temp[2];\n            let value = 3;\n            self.level = value;\n        }",
+    );
+    let fixed = if_let_tree(
+        "",
+        "        if let Some(value_2) = pick() {\n            stack_obj = value_2;\n            let value = 3;\n            self.level = value;\n        }",
+    );
+    if_let_rewrite(
+        &source,
+        "if pick()",
+        "if let Some(value_2) = pick() {",
+        &fixed,
+    );
+    // A comment in the leaving block stays where it is, a nested one holding a brace too.
+    let source = if_let_tree(
+        "",
+        "        if !pick() {\n            /* outer /* inner */ { */\n            return;\n        }\n        stack_obj = temp[2];",
+    );
+    let fixed = if_let_tree(
+        "",
+        "        let Some(value) = pick() else {\n            /* outer /* inner */ { */\n            return;\n        };\n        stack_obj = value;",
+    );
+    if_let_rewrite(
+        &source,
+        "if !pick()",
+        "let Some(value) = pick() else { .. };",
+        &fixed,
+    );
+    let source = if_let_tree(
+        "",
+        "        if !pick() {\n            // nothing to pick\n            return;\n        }\n        stack_obj = temp[2];",
+    );
+    let fixed = if_let_tree(
+        "",
+        "        let Some(value) = pick() else {\n            // nothing to pick\n            return;\n        };\n        stack_obj = value;",
+    );
+    if_let_rewrite(
+        &source,
+        "if !pick()",
+        "let Some(value) = pick() else { .. };",
+        &fixed,
+    );
+}

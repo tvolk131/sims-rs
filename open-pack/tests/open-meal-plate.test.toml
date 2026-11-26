@@ -91,3 +91,8 @@ name = "cleaning up an empty plate"
 interaction = "Clean Up"
 given = { attrs = { is_full = 0 } }
 expect = { sim = { motives = { hunger = 0 } }, sounds = ["open_plate_dispose"] }
+
+[[test]]
+name = "an eaten plate leaves the lot"
+interaction = "Eat Meal"
+expect = { objects = { open-meal-plate = 0 } }

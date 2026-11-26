@@ -1,12 +1,16 @@
 # Live sims-vm unit tests for the Open Dining Table: setting and tidying flip `is_set`, each
 # offered only in the matching state, and a set table raises its room's score.
 #
-# The room score adds the object's room impact (data word 7) for the room it stands in. The
-# runner's objects stand in no room, so the specs check the word; the score is `sims-sim`'s.
+# The room score adds the object's room impact (data word 7) for the room it stands in. Most
+# cases check the word; the last ones stand the table in the runner's counted room (`room =
+# true`) and check the room's impact and score, counted again after the table marks its room.
 
 [subject]
 antics = "../objects/open-dining-table.antics"
 pack = ".."
+
+[lot]
+also = ["../objects/open-trash-can.antics"]
 
 [sim]
 
@@ -54,3 +58,23 @@ name = "a set table cannot be set again"
 interaction = "Set Table"
 given = { attrs = { is_set = 1 }, data = { 7 = 3 } }
 expect = { result = "unavailable", data = { 7 = 3 }, sounds = [] }
+
+[[test]]
+name = "setting a placed table raises its room's score"
+interaction = "Set Table"
+room = true
+expect = { attrs = { is_set = 1 }, room = { impact = 3, objects = 1, score = -29.333332 } }
+
+[[test]]
+name = "tidying a placed table drops its room's score"
+interaction = "Tidy Table"
+room = true
+given = { attrs = { is_set = 1 }, data = { 7 = 3 } }
+expect = { attrs = { is_set = 0 }, room = { impact = 0, objects = 1, score = -30 } }
+
+[[test]]
+name = "a placed table counts with the objects beside it"
+interaction = "Set Table"
+room = true
+given = { create = [{ object = "open-trash-can", place = [5, 4] }] }
+expect = { room = { impact = 2, objects = 2, score = -29.555557 } }

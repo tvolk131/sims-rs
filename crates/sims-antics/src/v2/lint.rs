@@ -121,6 +121,7 @@ pub const STALE_LINT_ALLOW: &str = "stale_lint_allow";
 pub const UNREACHABLE_CODE: &str = "unreachable_code";
 pub const UNTYPED_ENGINE_CONSTANT: &str = "untyped_engine_constant";
 pub const PREFER_QUESTION_MARK: &str = "prefer_question_mark";
+pub const PREFER_IF_LET: &str = "prefer_if_let";
 pub const PREFER_METHOD_SYNTAX: &str = "prefer_method_syntax";
 
 /// Every rule `lint` knows.
@@ -212,6 +213,10 @@ pub const LINT_RULES: &[LintRule] = &[
     warn(
         PREFER_QUESTION_MARK,
         "`if !f(..) { panic!(); }` on a `Result` call instead of `f(..)?;`",
+    ),
+    warn(
+        PREFER_IF_LET,
+        "`if f(..) { .. temp[N] .. }` or `if !f(..) { return ..; } .. temp[N] ..` on an `Option` call instead of `if let Some(v) = f(..)` / `let Some(v) = f(..) else { .. };`",
     ),
     warn(
         PREFER_METHOD_SYNTAX,
@@ -997,6 +1002,9 @@ enum RetKind {
 struct Symbols {
     /// Callee (`name` or `module::name`) -> return kind (`None` when definitions disagree).
     returns: BTreeMap<String, Option<RetKind>>,
+    /// Callee -> the temp an `#[ret(temp = N)] -> Option<T>` definition leaves its value in
+    /// (`None` when a definition is no such tree, or definitions disagree).
+    option_temps: BTreeMap<String, Option<u8>>,
     /// Every identifier written right after a `.` (fields, methods, BCON entries).
     field_names: BTreeSet<String>,
     /// Every two-segment path `A::b` that may read a BCON entry, as `(body, A, b)` with
@@ -1106,11 +1114,11 @@ impl Symbols {
                         this.bcon_names.insert(b.name.clone());
                     }
                     ObjectMember::Fn(f) => this.add_fn(f),
-                    ObjectMember::Tree(t) => this.add_return(&t.ident, ret_kind(&t.ret)),
+                    ObjectMember::Tree(t) => this.add_tree(&t.ident, &t.ret),
                     ObjectMember::ExternMod(m) => {
                         this.bcon_by_number = true;
                         for f in &m.fns {
-                            this.add_return(&format!("{}::{}", m.name, f.name), ret_kind(&f.ret));
+                            this.add_tree(&format!("{}::{}", m.name, f.name), &f.ret);
                         }
                     }
                     _ => {}
@@ -1123,7 +1131,7 @@ impl Symbols {
                 V2Item::ExternMod(m) => {
                     self.bcon_by_number = true;
                     for f in &m.fns {
-                        self.add_return(&format!("{}::{}", m.name, f.name), ret_kind(&f.ret));
+                        self.add_tree(&format!("{}::{}", m.name, f.name), &f.ret);
                     }
                 }
                 V2Item::ExternBcon(b) => {
@@ -1156,6 +1164,24 @@ impl Symbols {
             _ => RetKind::Other,
         };
         self.add_return(&f.name, kind);
+        self.add_option(&f.name, None);
+    }
+
+    /// A tree or `extern` function and its return ABI.
+    fn add_tree(&mut self, name: &str, ret: &ReturnAbi) {
+        self.add_return(name, ret_kind(ret));
+        self.add_option(name, option_temp(ret));
+    }
+
+    fn add_option(&mut self, name: &str, temp: Option<u8>) {
+        self.option_temps
+            .entry(name.to_owned())
+            .and_modify(|t| {
+                if *t != temp {
+                    *t = None;
+                }
+            })
+            .or_insert(temp);
     }
 
     fn add_return(&mut self, name: &str, kind: RetKind) {
@@ -1188,6 +1214,131 @@ impl Symbols {
             "can_afford" => Some((name, RetKind::Bool)),
             _ => None,
         }
+    }
+}
+
+/// Whether `word` (the last word of a callee's name) can name its value: an identifier that
+/// is no keyword or builtin word.
+fn fresh_word(word: &str) -> bool {
+    const TAKEN: &[&str] = &[
+        "as",
+        "attr",
+        "break",
+        "const",
+        "continue",
+        "data",
+        "else",
+        "enum",
+        "false",
+        "fn",
+        "for",
+        "global",
+        "if",
+        "in",
+        "let",
+        "local",
+        "loop",
+        "match",
+        "me",
+        "mod",
+        "my",
+        "param",
+        "return",
+        "self",
+        "stack_obj",
+        "state",
+        "temp",
+        "true",
+        "use",
+        "while",
+    ];
+    word.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        && word
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && !TAKEN.contains(&word)
+}
+
+/// Whether `list` (nested statements included) declares a binding named `name`.
+fn declares(list: &[V2Stmt], name: &str) -> bool {
+    let mut found = false;
+    walk_stmts(list, &mut |s| {
+        found |= match s {
+            V2Stmt::Let { name: n, .. }
+            | V2Stmt::LetSome { name: n, .. }
+            | V2Stmt::IfLetSome { name: n, .. }
+            | V2Stmt::LetUninit { name: n, .. }
+            | V2Stmt::ForEach { binding: n, .. } => n == name,
+            V2Stmt::Animate { event: Some(n), .. } => n == name,
+            _ => false,
+        };
+    });
+    found
+}
+
+/// Whether `e` reads `temp[N]`.
+fn is_temp_read(e: &V2Expr, temp: u8) -> bool {
+    matches!(e, V2Expr::Index { base, index, .. }
+        if is_ident(base, "temp") && matches!(index.as_ref(), V2Expr::Int(_, n) if *n == i64::from(temp)))
+}
+
+/// The `temp[N]` reads in `list` that still read what a call before the list left there:
+/// those of the statements before the first that may change a temp (a call, a `raw` block,
+/// a loop or block statement, a `let Some`, a write naming `temp`, a `&mut`, a `?`).
+fn value_reads(list: &[V2Stmt], temp: u8) -> Vec<&V2Expr> {
+    let mut reads = Vec::new();
+    for s in list {
+        let one = std::slice::from_ref(s);
+        let mut keeps = true;
+        walk_stmts(one, &mut |st| {
+            keeps &= match st {
+                V2Stmt::RawAir { .. }
+                | V2Stmt::While { .. }
+                | V2Stmt::Repeat { .. }
+                | V2Stmt::ForEach { .. }
+                | V2Stmt::Animate { .. }
+                | V2Stmt::WithLock { .. }
+                | V2Stmt::Defer { .. }
+                | V2Stmt::LetSome { .. }
+                | V2Stmt::IfLetSome { .. }
+                | V2Stmt::LetUninit { .. } => false,
+                V2Stmt::Assign { target, .. } => mentions_ident(target, "temp").is_none(),
+                _ => true,
+            };
+        });
+        let calls = any_expr(one, &mut |e| {
+            matches!(
+                e,
+                V2Expr::Call { .. }
+                    | V2Expr::MethodCall { .. }
+                    | V2Expr::MutRef { .. }
+                    | V2Expr::Try { .. }
+                    | V2Expr::Block { .. }
+            )
+        });
+        if !keeps || calls {
+            break;
+        }
+        walk_stmts(one, &mut |st| {
+            for e in stmt_exprs(st) {
+                walk_expr(e, &mut |x| {
+                    if is_temp_read(x, temp) {
+                        reads.push(x);
+                    }
+                });
+            }
+        });
+    }
+    reads
+}
+
+/// The temp a `#[ret(temp = N)] -> Option<T>` tree leaves its value in.
+fn option_temp(r: &ReturnAbi) -> Option<u8> {
+    match r {
+        ReturnAbi::Value {
+            temp, option: true, ..
+        } => Some(*temp),
+        _ => None,
     }
 }
 
@@ -3737,6 +3888,7 @@ impl FileLinter<'_> {
             self.lint_stmt(s);
             self.redundant_bool_return(list, i);
             self.negated_comparison(list, i);
+            self.prefer_if_let(list, i);
             let after = i + 1 < list.len() || follows;
             if let V2Stmt::RawAir { span, code } = s
                 && after
@@ -6689,6 +6841,231 @@ impl FileLinter<'_> {
             format!("write `{text}`; `?` returns the error the same way"),
             text.clone(),
             vec![Fix { start, end, text }],
+            None,
+        );
+    }
+
+    /// The name of `callee` and the temp it leaves its value in, when it surely is an
+    /// `#[ret(temp = N)] -> Option<T>` tree: of the file set, or a `std::globals` tree the
+    /// file imports.
+    fn option_callee(&self, callee: &V2Expr) -> Option<(String, u8)> {
+        let name = match callee {
+            V2Expr::Ident(_, n) => n.clone(),
+            V2Expr::Path(_, segs) => segs.join("::"),
+            _ => return None,
+        };
+        if self.symbols.returns.contains_key(&name) {
+            let temp = self.symbols.option_temps.get(&name).copied().flatten()?;
+            return Some((name, temp));
+        }
+        let V2Expr::Path(_, segs) = callee else {
+            return None;
+        };
+        let [module, short] = segs.as_slice() else {
+            return None;
+        };
+        if module != "globals" || !self.std_globals {
+            return None;
+        }
+        std_globals()
+            .iter()
+            .find(|f| &f.name == short)
+            .and_then(|f| option_temp(&f.ret))
+            .map(|temp| (name, temp))
+    }
+
+    /// One past the `}` closing the block whose `{` is at byte `open`, by the lexer's tokens:
+    /// comments (nested ones too), strings and `raw` blocks hold no brace that counts.
+    fn block_end(&self, open: usize) -> Option<usize> {
+        let first = self
+            .tokens
+            .iter()
+            .position(|t| t.kind == TokenKind::LBrace && self.offset(t.span) == Some(open))?;
+        let mut depth = 0usize;
+        for t in &self.tokens[first..] {
+            match t.kind {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return self.offset(t.span).map(|at| at + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// `prefer_if_let`: `if f(..) { .. temp[N] .. }`, or `if !f(..) { return ..; }` followed
+    /// by `.. temp[N] ..`, on an `#[ret(temp = N)] -> Option<T>` call: the code reads the
+    /// call's value by its temp, where `if let Some(v) = f(..)` (or
+    /// `let Some(v) = f(..) else { .. };`) names it. Only the reads before anything that
+    /// may change the temp are renamed; the trial build keeps a rewrite only when it builds
+    /// the same bytes.
+    fn prefer_if_let(&mut self, list: &[V2Stmt], i: usize) {
+        let V2Stmt::If {
+            span,
+            cond,
+            then_body,
+            else_body,
+        } = &list[i]
+        else {
+            return;
+        };
+        let (call, negated) = match cond {
+            V2Expr::Unary {
+                op: V2UnaryOp::Not,
+                inner,
+                ..
+            } => (inner.as_ref(), true),
+            c => (c, false),
+        };
+        let V2Expr::Call {
+            span: open, callee, ..
+        } = call
+        else {
+            return;
+        };
+        let Some((callee_name, temp)) = self.option_callee(callee) else {
+            return;
+        };
+        let region: &[V2Stmt] = if negated {
+            // `let .. else` takes an `else` block that always leaves, and binds the name
+            // for the rest of the list.
+            if !else_body.is_empty() || !then_body.last().is_some_and(stmt_leaves) {
+                return;
+            }
+            &list[i + 1..]
+        } else {
+            then_body
+        };
+        let reads = value_reads(region, temp);
+        if reads.is_empty() {
+            return;
+        }
+        let src = self.source;
+        let (Some(start), Some(call_start), Some(open)) = (
+            self.offset(*span),
+            self.offset(expr_start(call)),
+            self.offset(*open),
+        ) else {
+            return;
+        };
+        if !src[start..].starts_with("if") || call_start < start + 2 {
+            return;
+        }
+        // `if f(..)`, or `if !f(..)` that is no `else if` (`else let` is no statement).
+        let head = &src[start + 2..call_start];
+        let head_ok = if negated {
+            head.trim() == "!" && !src[..start].trim_end().ends_with("else")
+        } else {
+            !head.is_empty() && head.trim().is_empty()
+        };
+        if !head_ok {
+            return;
+        }
+        let Some(call_end) = group_end(src, open) else {
+            return;
+        };
+        let short = callee_name.rsplit("::").next().unwrap_or(&callee_name);
+        // `find_companion` -> `companion`; a one-word callee names no value.
+        let word = short.rsplit('_').next().unwrap_or(short);
+        let base = if word != short && fresh_word(word) {
+            word
+        } else {
+            "value"
+        };
+        let taken = |n: &str| {
+            self.bound.contains(n)
+                || self.symbols.user_defined(n)
+                || names_anywhere(list, n)
+                || declares(list, n)
+        };
+        let Some(name) = std::iter::once(base.to_owned())
+            .chain((2..10).map(|n| format!("{base}_{n}")))
+            .find(|n| !taken(n))
+        else {
+            return;
+        };
+        let call_text = &src[call_start..call_end];
+        let binding = format!("let Some({name}) = ");
+        let mut fixes = Vec::new();
+        let (suggestion, help) = if negated {
+            let at = skip_ws(src, call_end);
+            if !src[at..].starts_with('{') {
+                return;
+            }
+            // The block may hold comments: the fixes go around it, not through it.
+            let Some(end) = self.block_end(at) else {
+                return;
+            };
+            fixes.push(Fix {
+                start,
+                end: call_start,
+                text: binding.clone(),
+            });
+            fixes.push(Fix {
+                start: call_end,
+                end: call_end,
+                text: " else".to_owned(),
+            });
+            fixes.push(Fix {
+                start: end,
+                end,
+                text: ";".to_owned(),
+            });
+            let text = format!("{binding}{call_text} else {{ .. }};");
+            let help = format!("write `{text}`; `{name}` is the value for the rest of the block");
+            (text, help)
+        } else {
+            fixes.push(Fix {
+                start: call_start,
+                end: call_start,
+                text: binding.clone(),
+            });
+            let text = format!("if {binding}{call_text} {{");
+            let help = format!("write `{text}`; `{name}` is the value in the block");
+            (text, help)
+        };
+        // The reads the rewrite renames, by place: later ones may read another value.
+        let places: Vec<String> = reads
+            .iter()
+            .map(|r| {
+                let at = expr_start(r);
+                format!("{}:{}", at.line, at.column)
+            })
+            .collect();
+        let help = format!(
+            "{help}; rename `temp[{temp}]` to `{name}` at {} only (a later `temp[{temp}]` may \
+             hold another value)",
+            places.join(", ")
+        );
+        for r in reads {
+            let (Some(a), Some(b)) = (self.offset(expr_start(r)), self.offset(r.span())) else {
+                return;
+            };
+            if !src[b..].starts_with('[') {
+                return;
+            }
+            let Some(e) = group_end(src, b) else {
+                return;
+            };
+            fixes.push(Fix {
+                start: a,
+                end: e,
+                text: name.clone(),
+            });
+        }
+        self.propose(
+            PREFER_IF_LET,
+            *span,
+            format!(
+                "`{callee_name}` returns `Option`, and this code reads its value as `temp[{temp}]`"
+            ),
+            help,
+            suggestion,
+            fixes,
             None,
         );
     }

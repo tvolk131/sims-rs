@@ -68,8 +68,21 @@ pub struct TestFile {
     pub stubs: Vec<Stub>,
     /// The file-wide Sim, which every case gets (and may change with `given.sim`).
     pub sim: Option<SimState>,
+    /// `[lot] room = true`: the lot's room 1 is a counted room of [`ROOM_TILES`] tiles, and
+    /// the subject and every `given.create` object stand on a tile of it ([`TestCase::tiles`]).
+    /// The room is counted before the run and after each lot update, as the game counts a
+    /// marked room before it draws a frame. Off, every object is made off the tile grid and
+    /// no room is counted. A case's own `room` key overrides it ([`TestCase::in_room`]).
+    pub room: bool,
+    /// `[subject] place = [x, y]`: the subject's tile in the room (with `room`).
+    pub subject_place: Option<[u8; 2]>,
     pub cases: Vec<TestCase>,
 }
+
+/// The tiles of the room `[lot] room = true` gives the lot, each coordinate in this range:
+/// an 8 by 8 room on level 1, inside the test lot's 16 tiles. Its one wall, a covered west
+/// wall on the first tile, gives its score a finite value.
+pub const ROOM_TILES: std::ops::Range<u8> = 4..12;
 
 /// Where an object comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,14 +241,52 @@ pub struct Given {
     pub funds: Option<i32>,
     pub sim: Option<SimState>,
     /// Objects to create after the subject, by slug of a loaded source or by GUID.
-    pub create: Vec<CreateRef>,
+    pub create: Vec<Create>,
 }
 
-/// An object `given.create` makes.
+/// An object `given.create` makes: `"open-fridge"`, a GUID, or
+/// `{ object = "open-fridge", place = [7, 6] }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Create {
+    pub object: CreateRef,
+    /// Its tile in the room (with `[lot] room = true`); the next free one when left out.
+    pub place: Option<[u8; 2]>,
+}
+
+/// Which object `given.create` makes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateRef {
     Slug(String),
     Guid(u32),
+}
+
+/// `expect.objects.<slug>`: the objects of a loaded source on the lot after the run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectsExpect {
+    /// How many there are. Left out, at least one; a bare number is a count alone.
+    pub count: Option<u16>,
+    /// What every one of them holds.
+    pub attrs: BTreeMap<AttrKey, i16>,
+    pub temps: BTreeMap<u16, i16>,
+    pub data: BTreeMap<u16, i16>,
+}
+
+/// `expect.room`: the counted room 1 (`[lot] room = true`) after the run, as
+/// `sims_sim::rooms::Room` holds it. Every field left out is not checked.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RoomExpect {
+    /// The room's score, -100 to 100, compared exactly.
+    pub score: Option<f32>,
+    /// The room's light, 0 to 1, compared exactly.
+    pub light: Option<f32>,
+    /// The sum of data word 51 (`light`) of its light sources that are not windows.
+    pub lamp_light: Option<i32>,
+    /// Its light sources (data word 40 flag 0x400) that stand on the lot and are not windows.
+    pub light_sources: Option<i32>,
+    /// The sum of its objects' data word 7 (`room_impact`).
+    pub impact: Option<i32>,
+    /// The objects counted in it.
+    pub objects: Option<i32>,
 }
 
 /// How a run ended.
@@ -304,6 +355,10 @@ pub struct Expect {
     pub queue: Option<Vec<QueueExpect>>,
     /// The turns the run took.
     pub turns: Option<u32>,
+    /// Objects on the lot after the run, by slug of a loaded source.
+    pub objects: BTreeMap<String, ObjectsExpect>,
+    /// The counted room after the run (needs `[lot] room = true`).
+    pub room: Option<RoomExpect>,
 }
 
 /// One `[[test]]` case.
@@ -321,6 +376,8 @@ pub struct TestCase {
     pub budget: usize,
     /// Dialog buttons (1 to 3), answered in order as dialogs wait for an answer.
     pub answers: Vec<u8>,
+    /// `room = true` or `false`: the case's own choice of `[lot] room` ([`TestCase::in_room`]).
+    pub room: Option<bool>,
     pub given: Given,
     pub expect: Expect,
 }
@@ -340,6 +397,66 @@ impl TestCase {
             (Some(s), None) | (None, Some(s)) => Some(s.clone()),
             (Some(base), Some(over)) => Some(over.merged_over(base)),
         }
+    }
+
+    /// Whether the case runs in the counted room: its own `room`, or else the file's
+    /// `[lot] room`.
+    #[must_use]
+    pub fn in_room(&self, file: &TestFile) -> bool {
+        self.room.unwrap_or(file.room)
+    }
+
+    /// The tiles the subject (first) and each `given.create` object stand on in the room
+    /// ([`TestCase::in_room`]): each its `place`, or else the next tile of the room no object
+    /// claims, in reading order (row by row from `[4, 4]`, column by column within a row).
+    /// Refuses a place outside the room, two objects on one tile, and more objects than tiles.
+    pub fn tiles(&self, file: &TestFile) -> Result<Vec<[u8; 2]>> {
+        let what = format!("test '{}'", self.name);
+        let places: Vec<Option<[u8; 2]>> = std::iter::once(file.subject_place)
+            .chain(self.given.create.iter().map(|c| c.place))
+            .collect();
+        let label = |i: usize| {
+            if i == 0 {
+                "the subject".to_owned()
+            } else {
+                format!("given.create[{}]", i - 1)
+            }
+        };
+        let mut taken: BTreeMap<[u8; 2], usize> = BTreeMap::new();
+        for (i, place) in places.iter().enumerate() {
+            let Some(tile) = *place else { continue };
+            if !tile.iter().all(|c| ROOM_TILES.contains(c)) {
+                return Err(Error::new(format!(
+                    "{what}: {} is placed at {tile:?}, outside the room (each coordinate {} \
+                     to {})",
+                    label(i),
+                    ROOM_TILES.start,
+                    ROOM_TILES.end - 1
+                )));
+            }
+            if let Some(prev) = taken.insert(tile, i) {
+                return Err(Error::new(format!(
+                    "{what}: {} and {} are both placed at {tile:?}",
+                    label(prev),
+                    label(i)
+                )));
+            }
+        }
+        let mut free = ROOM_TILES
+            .flat_map(|y| ROOM_TILES.map(move |x| [x, y]))
+            .filter(|t| !taken.contains_key(t));
+        places
+            .iter()
+            .enumerate()
+            .map(|(i, place)| {
+                place.or_else(|| free.next()).ok_or_else(|| {
+                    Error::new(format!(
+                        "{what}: the room has no free tile left for {}",
+                        label(i)
+                    ))
+                })
+            })
+            .collect()
     }
 }
 
@@ -752,21 +869,150 @@ fn given(v: &TomlValue, what: &str) -> Result<Given> {
         for (i, item) in array(v, &format!("{what}.create"))?.iter().enumerate() {
             let w = format!("{what}.create[{i}]");
             g.create.push(match item {
-                TomlValue::String(s) => CreateRef::Slug(s.clone()),
-                TomlValue::Int(n) => CreateRef::Guid(
-                    u32::try_from(*n)
-                        .map_err(|_| Error::new(format!("{w}: GUID {n} is out of range")))?,
-                ),
-                other => {
-                    return Err(Error::new(format!(
-                        "{w} must be an object slug or a GUID, not {}",
-                        kind_of(other)
-                    )));
+                TomlValue::Table(t) => {
+                    check_keys(t, &["object", "place"], &w)?;
+                    Create {
+                        object: create_ref(
+                            t.get("object").ok_or_else(|| {
+                                Error::new(format!("{w}: give 'object', a slug or a GUID"))
+                            })?,
+                            &format!("{w}.object"),
+                        )?,
+                        place: t
+                            .get("place")
+                            .map(|v| tile(v, &format!("{w}.place")))
+                            .transpose()?,
+                    }
                 }
+                _ => Create {
+                    object: create_ref(item, &w)?,
+                    place: None,
+                },
             });
         }
     }
     Ok(g)
+}
+
+fn create_ref(v: &TomlValue, what: &str) -> Result<CreateRef> {
+    match v {
+        TomlValue::String(s) => Ok(CreateRef::Slug(s.clone())),
+        TomlValue::Int(n) => {
+            Ok(CreateRef::Guid(u32::try_from(*n).map_err(|_| {
+                Error::new(format!("{what}: GUID {n} is out of range"))
+            })?))
+        }
+        other => Err(Error::new(format!(
+            "{what} must be an object slug or a GUID, not {}",
+            kind_of(other)
+        ))),
+    }
+}
+
+/// `[x, y]`: a tile, column and row. Whether it is in the room is checked with the case
+/// ([`TestCase::tiles`]).
+fn tile(v: &TomlValue, what: &str) -> Result<[u8; 2]> {
+    let items = array(v, what)?;
+    let [x, y] = items else {
+        return Err(Error::new(format!(
+            "{what} must be a tile [x, y], not {} values",
+            items.len()
+        )));
+    };
+    let coord = |v: &TomlValue, axis: &str| -> Result<u8> {
+        let n = as_int(v, &format!("{what}.{axis}"))?;
+        u8::try_from(n).map_err(|_| Error::new(format!("{what}: {axis} = {n} is not a tile")))
+    };
+    Ok([coord(x, "x")?, coord(y, "y")?])
+}
+
+/// `expect.objects`: `{ open-meal-plate = 1 }` or
+/// `{ open-meal-plate = { count = 1, attrs = { servings = 3 } } }`.
+fn objects_expect(v: &TomlValue, what: &str) -> Result<BTreeMap<String, ObjectsExpect>> {
+    let mut out = BTreeMap::new();
+    for (slug, v) in as_table(v, what)? {
+        let w = format!("{what}.{slug}");
+        let want = match v {
+            TomlValue::Int(_) => ObjectsExpect {
+                count: Some(as_u16(v, &w)?),
+                ..ObjectsExpect::default()
+            },
+            _ => {
+                let t = as_table(v, &w)?;
+                check_keys(t, &["count", "attrs", "temps", "data"], &w)?;
+                let want = ObjectsExpect {
+                    count: t
+                        .get("count")
+                        .map(|v| as_u16(v, &format!("{w}.count")))
+                        .transpose()?,
+                    attrs: t
+                        .get("attrs")
+                        .map(|v| attr_map(v, &format!("{w}.attrs")))
+                        .transpose()?
+                        .unwrap_or_default(),
+                    temps: t
+                        .get("temps")
+                        .map(|v| word_map(v, &format!("{w}.temps")))
+                        .transpose()?
+                        .unwrap_or_default(),
+                    data: t
+                        .get("data")
+                        .map(|v| word_map(v, &format!("{w}.data")))
+                        .transpose()?
+                        .unwrap_or_default(),
+                };
+                if want.count == Some(0)
+                    && !(want.attrs.is_empty() && want.temps.is_empty() && want.data.is_empty())
+                {
+                    return Err(Error::new(format!(
+                        "{w}: count = 0 leaves no object for attrs, temps or data to check"
+                    )));
+                }
+                want
+            }
+        };
+        out.insert(slug.clone(), want);
+    }
+    Ok(out)
+}
+
+/// `expect.room`: `{ score = 12.5, lamp_light = 50, light_sources = 1 }`.
+fn room_expect(v: &TomlValue, what: &str) -> Result<RoomExpect> {
+    let t = as_table(v, what)?;
+    check_keys(
+        t,
+        &[
+            "score",
+            "light",
+            "lamp_light",
+            "light_sources",
+            "impact",
+            "objects",
+        ],
+        what,
+    )?;
+    let float = |k: &str| {
+        t.get(k)
+            .map(|v| as_f32(v, &format!("{what}.{k}")))
+            .transpose()
+    };
+    let int = |k: &str| {
+        t.get(k)
+            .map(|v| {
+                let n = as_int(v, &format!("{what}.{k}"))?;
+                i32::try_from(n)
+                    .map_err(|_| Error::new(format!("{what}.{k} = {n} is out of the 32-bit range")))
+            })
+            .transpose()
+    };
+    Ok(RoomExpect {
+        score: float("score")?,
+        light: float("light")?,
+        lamp_light: int("lamp_light")?,
+        light_sources: int("light_sources")?,
+        impact: int("impact")?,
+        objects: int("objects")?,
+    })
 }
 
 fn funds(v: &TomlValue, what: &str) -> Result<i32> {
@@ -798,6 +1044,8 @@ fn expect(v: &TomlValue, what: &str) -> Result<Expect> {
             "dialogs",
             "queue",
             "turns",
+            "objects",
+            "room",
         ],
         what,
     )?;
@@ -893,6 +1141,12 @@ fn expect(v: &TomlValue, what: &str) -> Result<Expect> {
                 .ok_or_else(|| Error::new(format!("{what}.turns = {n} is out of range")))?,
         );
     }
+    if let Some(v) = t.get("objects") {
+        e.objects = objects_expect(v, &format!("{what}.objects"))?;
+    }
+    if let Some(v) = t.get("room") {
+        e.room = Some(room_expect(v, &format!("{what}.room"))?);
+    }
     Ok(e)
 }
 
@@ -927,11 +1181,22 @@ fn case(t: &Table, index: usize) -> Result<TestCase> {
             "turns",
             "budget",
             "answers",
+            "room",
             "given",
             "expect",
         ],
         &what,
     )?;
+    let room = match t.get("room") {
+        None => None,
+        Some(TomlValue::Bool(b)) => Some(*b),
+        Some(other) => {
+            return Err(Error::new(format!(
+                "{what}: room must be a boolean, not {}",
+                kind_of(other)
+            )));
+        }
+    };
     let mut targets = Vec::new();
     if let Some(v) = t.get("tree") {
         targets.push(Target::Tree(tree_ref(v, &format!("{what}: tree"))?));
@@ -1070,6 +1335,7 @@ fn case(t: &Table, index: usize) -> Result<TestCase> {
         turns,
         budget,
         answers,
+        room,
         given,
         expect,
     })
@@ -1244,13 +1510,28 @@ impl TestFile {
                 .ok_or_else(|| Error::new("the test file needs a [subject] table"))?,
             "[subject]",
         )?;
-        let subject = self::source(subject_table, base, "[subject]", &["idle_main"])?;
+        let subject = self::source(subject_table, base, "[subject]", &["idle_main", "place"])?;
         let idle_main = idle_main_key(subject_table, "[subject]")?;
+        let subject_place = subject_table
+            .get("place")
+            .map(|v| tile(v, "[subject].place"))
+            .transpose()?;
         let mut also = Vec::new();
         let mut also_idle_main = BTreeSet::new();
+        let mut room = false;
         if let Some(lot) = root.get("lot") {
             let t = as_table(lot, "[lot]")?;
-            check_keys(t, &["also"], "[lot]")?;
+            check_keys(t, &["also", "room"], "[lot]")?;
+            match t.get("room") {
+                None => {}
+                Some(TomlValue::Bool(b)) => room = *b,
+                Some(other) => {
+                    return Err(Error::new(format!(
+                        "[lot].room must be a boolean, not {}",
+                        kind_of(other)
+                    )));
+                }
+            }
             if let Some(v) = t.get("also") {
                 for (i, item) in array(v, "[lot].also")?.iter().enumerate() {
                     let w = format!("[lot].also[{i}]");
@@ -1337,10 +1618,31 @@ impl TestFile {
             also_idle_main,
             stubs,
             sim,
+            room,
+            subject_place,
             cases,
         };
+        if file.subject_place.is_some() && !file.cases.iter().any(|c| c.in_room(&file)) {
+            return Err(Error::new(
+                "[subject].place needs a room to stand in ([lot] room = true, or room = true \
+                 on a case)",
+            ));
+        }
         for c in &file.cases {
             let what = format!("test '{}'", c.name);
+            if c.in_room(&file) {
+                c.tiles(&file)?;
+            } else if let Some(i) = c.given.create.iter().position(|c| c.place.is_some()) {
+                return Err(Error::new(format!(
+                    "{what}: given.create[{i}].place needs a room to stand in ([lot] room = \
+                     true, or room = true on the case)"
+                )));
+            } else if c.expect.room.is_some() {
+                return Err(Error::new(format!(
+                    "{what}: expect.room needs a counted room ([lot] room = true, or room = \
+                     true on the case)"
+                )));
+            }
             let has_sim = c.has_sim(&file);
             if matches!(c.target, Target::Interaction(_)) && !has_sim {
                 return Err(Error::new(format!(

@@ -4,8 +4,9 @@
 # A lit lamp raises Room the way the room score does it: through the object's room impact (data
 # word 7), which every room update adds to the score of the room the lamp stands in. It is a light
 # source (`flags2` `LightSource`, data word 40 bit 0x400), so the room count also adds its light
-# (`self.light`, data word 51) to the room's lamp light. The runner's objects stand in no room, so
-# the specs check the words; the room score and light themselves are `sims-sim`'s.
+# (`self.light`, data word 51) to the room's lamp light. The last cases stand the lamp in the
+# runner's counted room (`room = true`) and check the room itself: its light sources, lamp light,
+# impact, light and score, counted again after the switch marks the room.
 
 [subject]
 antics = "../objects/open-floor-lamp.antics"
@@ -50,3 +51,22 @@ expect = { attrs = { power = 1 }, data = { 0 = 0, 7 = 5, 40 = 1024, 51 = 50 }, s
 name = "a lit lamp cannot be turned on again"
 interaction = "Turn On Light"
 expect = { result = "unavailable", data = { 7 = 5, 51 = 50 }, sounds = [] }
+
+[[test]]
+name = "a new lamp lights the room it stands in"
+room = true
+tree = "Init"
+expect = { result = true, room = { light_sources = 1, lamp_light = 50, impact = 5, objects = 1, light = 0.234375, score = -19.51389 } }
+
+[[test]]
+name = "turning the light off darkens the room"
+room = true
+interaction = "Turn Off Light"
+expect = { room = { light_sources = 1, lamp_light = 0, impact = 0, objects = 1, light = 0, score = -30 } }
+
+[[test]]
+name = "turning the light on lights the room again"
+room = true
+interaction = "Turn On Light"
+given = { attrs = { power = 0 }, data = { 0 = 1, 7 = 0, 51 = 0 } }
+expect = { attrs = { power = 1 }, room = { light_sources = 1, lamp_light = 50, impact = 5, light = 0.234375, score = -19.51389 } }
