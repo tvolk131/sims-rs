@@ -801,6 +801,73 @@ fn a_state_named_light_keeps_data_word_51_unnamed() {
     none(&source, "untyped_engine_field");
 }
 
+#[test]
+fn data_word_16_is_named_light_mode() {
+    for cell in ["self", "stack_obj"] {
+        let untyped = format!("{cell}.data[16]");
+        let typed = format!("{cell}.light_mode");
+        let read = tree("", "", &format!("        temp[0] = {untyped};"));
+        rewrites(&read, "untyped_engine_field", &untyped, &typed);
+        let write = tree("", "", &format!("        {untyped} = 1;"));
+        rewrites(&write, "untyped_engine_field", &untyped, &typed);
+    }
+    // A Sim handle and a `lot.objects()` handle name it too: every object has the word.
+    let source = tree("", "sim: Sim", "        temp[0] = sim.data[16];");
+    rewrites(
+        &source,
+        "untyped_engine_field",
+        "sim.data[16]",
+        "sim.light_mode",
+    );
+    let source = tree(
+        "",
+        "",
+        "        for o in lot.objects() {\n            if o.data[16] == 1 {\n                self.level += 1;\n            }\n        }",
+    );
+    rewrites(
+        &source,
+        "untyped_engine_field",
+        "o.data[16]",
+        "o.light_mode",
+    );
+}
+
+#[test]
+fn a_state_named_light_mode_keeps_data_word_16_unnamed() {
+    let source = tree("", "", "        self.data[16] = 1;").replace(
+        "#[slot(2)] state level: i16;",
+        "#[slot(2)] state level: i16;\n    #[slot(3)] state light_mode: i16;",
+    );
+    assert!(source.contains("state light_mode"), "{source}");
+    iff(&source);
+    none(&source, "untyped_engine_field");
+    // `stack_obj` has no states: its `light_mode` is the engine word whatever this object's
+    // states are called.
+    let source = tree("", "", "        temp[0] = stack_obj.data[16];").replace(
+        "#[slot(2)] state level: i16;",
+        "#[slot(2)] state level: i16;\n    #[slot(3)] state light_mode: i16;",
+    );
+    rewrites(
+        &source,
+        "untyped_engine_field",
+        "stack_obj.data[16]",
+        "stack_obj.light_mode",
+    );
+    // A typed handle names its object's states: `h.light_mode` would be the state. In code the
+    // build folds away, the trial cannot tell, so the name check must.
+    let source = tree(
+        "",
+        "h: Self",
+        "        if false {\n            temp[0] = h.data[16];\n        }",
+    )
+    .replace(
+        "#[slot(2)] state level: i16;",
+        "#[slot(2)] state level: i16;\n    #[slot(3)] state light_mode: i16;",
+    );
+    iff(&source);
+    none(&source, "untyped_engine_field");
+}
+
 // --- v2.4: `prefer_if_let` ----------------------------------------------------------------
 // See `docs/decisions/20261126-antics-v2-4-runner-grid-and-if-let-lint.md`.
 
