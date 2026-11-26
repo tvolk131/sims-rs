@@ -41,6 +41,7 @@ impl<'a> TreeLowerer<'a> {
                         format!("extern mod '{}' has no fn '{}'", segs[0], segs[1]),
                     )
                 })?;
+                self.env.check_extern_library(decl, span)?;
                 self.env
                     .resolve_callable_sig(
                         format!("{}::{}", segs[0], segs[1]),
@@ -313,9 +314,11 @@ impl<'a> TreeLowerer<'a> {
                         if self.env.frame_is_narrow(sig.id) {
                             self.narrow_callees.insert(sig.id);
                         } else if self.checking_discarded == 0 && self.wide_call.is_none() {
-                            let why = if sig.id >= 8192 {
+                            let why = if sig.id >= 8192 && !self.env.library_declares(sig.id) {
                                 "a semi-global tree, whose library (and frame) depends on the \
-                                 object that runs the call"
+                                 object that runs the call (its 'semi_global: \"Name\";' \
+                                 link), and no 'extern \"Name\" mod' of that library declares \
+                                 it"
                             } else {
                                 "whose tree id another declaration gives a wider frame"
                             };
@@ -350,6 +353,22 @@ impl<'a> TreeLowerer<'a> {
     /// `kind` (an indexed tree is entered at a numbered node).
     pub(super) fn copy_staging(&self) -> bool {
         self.env.copy_staging || self.env.reads_global_34 || self.temp_loops > 0 || self.fixed_entry
+    }
+
+    /// Records an option binding's copy of its temp for [`crate::v2::mir::alias_option_temps`],
+    /// which drops the copy and so, like an in-place staging, changes the tree's nodes and
+    /// frame words: only where those are not observable ([`Self::copy_staging`]). `finish`
+    /// treats an applied alias as a staging, so the object is lowered again without it where
+    /// the result turns out observable. Nor in an object whose text may name frame words
+    /// (`$Local:N`): a tree that formats it may read a word this tree's frame left behind.
+    pub(super) fn record_option_alias(&mut self, air_name: &str) {
+        // A discarded check's trial lowering leaves no code, and its names may come again.
+        if self.checking_discarded == 0
+            && !self.copy_staging()
+            && !mir::reads_a_word(&self.env.text_reads)
+        {
+            self.option_aliases.insert(air_name.to_owned());
+        }
     }
 
     /// Whether `arg` can be staged in place: a literal, or a bare `temp[k]` (`k < 8`). Neither

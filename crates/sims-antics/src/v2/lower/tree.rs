@@ -57,6 +57,7 @@ impl<'a> TreeLowerer<'a> {
             dup_decl: None,
             keep_layout: false,
             narrow_callees: BTreeSet::new(),
+            option_aliases: BTreeSet::new(),
             wide_call: None,
             staged_in_place: false,
             temp_loops: 0,
@@ -86,7 +87,7 @@ impl<'a> TreeLowerer<'a> {
         self.current_defer_id.is_some()
     }
 
-    pub(super) fn finish(self) -> Result<String> {
+    pub(super) fn finish(mut self) -> Result<String> {
         let formats_text = self.raw_formats_text || mir::body_formats_text(self.em.text());
         // The frame words the tree's text may read: none unless it formats text.
         // A tree of an object any of whose trees may read global 34 keeps main's rule (every
@@ -143,6 +144,12 @@ impl<'a> TreeLowerer<'a> {
                 ),
             ));
         }
+        // A call this tree passes inline arguments to without a proven narrow frame may read
+        // the nodes after it (`wide_call`), so no option copy goes.
+        if self.wide_call.is_some() {
+            self.option_aliases.clear();
+        }
+        let aliased = std::cell::Cell::new(false);
         let facts = mir::FrameFacts {
             main_rules,
             fixed_frame: self.frame_locals.is_some() || self.frame_format.is_some(),
@@ -158,6 +165,8 @@ impl<'a> TreeLowerer<'a> {
             pinned_locals: &self.pinned_locals,
             local_origins: &self.local_origins,
             min_locals: self.frame_floor().unwrap_or(0),
+            option_aliases: &self.option_aliases,
+            aliased: &aliased,
         };
         let body = self.em.into_text();
         let mut out = if self.used_saved_stack_obj {
@@ -206,12 +215,15 @@ impl<'a> TreeLowerer<'a> {
             out = replace_outside_strings(&out, PIN_SLOT, "0");
         }
         let finished = mir::finish_body(out, &facts);
+        // An option binding read in place dropped its copy, which changes nodes and frame
+        // words as a staging in place does (the pass reports whether it read any in place).
+        let aliased = aliased.get();
         // A call staged in place has fewer nodes and frame words than the copying form. Where
         // either is observable, the object is lowered again with the copying form: a kept
         // layout (numbered raw branches), main's rules (global 34, a bottom frame read before
         // it is written, a pin), text that may name frame words (`$Local:N`), and a bottom
         // frame left with no word at all (Create Object with flag 0x10 writes word 0).
-        if self.staged_in_place {
+        if self.staged_in_place || aliased {
             self.env.saw_in_place.set(true);
             let empty_bottom = bottom_frame
                 && self.frame_locals.is_none()
@@ -753,6 +765,14 @@ const OBJECT_DATA_WORDS: &[(&str, EngineWord)] = &[
     ),
     // Broken (a broken object sells for half).
     ("broken", word(15, EngineWordTy::I16)),
+    // How a light source lights the lot: 1 casts a local light, which the room count marks on
+    // the tiles around the object (its floor pools) and turns into a light that falls on the
+    // people in its room; picking the object up clears those marks. The original's light
+    // sources set it to 1 in their init and never change it (switching a lamp off sets `light`
+    // to 0). The engine compares it with 1 and hands it to its light-map services as their
+    // mode (sims-render `lot.rs` `gives_light`; legacy `lot_environment/objects.rs`,
+    // `lot_placement.rs`).
+    ("light_mode", word(16, EngineWordTy::I16)),
     // Weight, and the weight a container may hold.
     ("weight", word(27, EngineWordTy::I16)),
     ("support_strength", word(28, EngineWordTy::I16)),

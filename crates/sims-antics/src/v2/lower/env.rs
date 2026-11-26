@@ -295,19 +295,27 @@ impl<'a> ObjectEnv<'a> {
     }
 
     /// Whether tree `id`'s frame holds at most four arguments, by every declaration of it the
-    /// object can see from anywhere: a sibling tree's frame, or an `extern` fn's positional
+    /// object can see from anywhere: a sibling tree's frame, an `extern` fn's positional
     /// parameters in any module or in the object (an `extern` is trusted to declare its whole
-    /// frame). The question ignores scope, since one tree has one frame: an inlined helper
-    /// sees its module's declarations, but the object's own may disagree. `false` when none
-    /// names it or two disagree.
+    /// frame), or, for a global tree, `std::globals` whether or not anything imports it (its
+    /// frames are checked against the original's). The question ignores scope, since one tree
+    /// has one frame: an inlined helper sees its module's declarations, but the object's own
+    /// may disagree. `false` when none names it or two disagree.
     ///
-    /// Always `false` for a semi-global ID (`8192..`): which library holds it depends on the
-    /// object that runs the call (its `GLOB` link), so a declaration made for one library says
-    /// nothing about another's tree.
+    /// A semi-global ID (`8192..`) names a tree of the library the running object links
+    /// (`semi_global: "Name";`), so only an `extern "Name" mod` declaration of that library
+    /// proves it narrow; one made for another library describes another tree and is not
+    /// consulted, while one with no library might describe this tree and must agree. `false`
+    /// for an object with no link.
     pub(super) fn frame_is_narrow(&self, id: u16) -> bool {
-        if id >= 8192 {
-            return false;
-        }
+        let link = if id >= 8192 {
+            match &self.semi_global {
+                Some(link) => Some(link.clone()),
+                None => return false,
+            }
+        } else {
+            None
+        };
         let positional = |f: &crate::v2::ast::ExternFnDecl| {
             f.params
                 .iter()
@@ -325,15 +333,74 @@ impl<'a> ObjectEnv<'a> {
             .module_scopes
             .values()
             .flat_map(|s| s.extern_mods.values());
+        let mut library_declares = false;
         for (_, decl) in scoped.chain(self.local_extern_mods.values()) {
+            let declares = decl.fns.iter().filter(|f| f.id == id);
+            match (&decl.library, &link) {
+                (Some(_), None) => continue,
+                (Some(lib), Some(link)) if !lib.eq_ignore_ascii_case(link) => continue,
+                (Some(_), Some(_)) => library_declares |= decl.fns.iter().any(|f| f.id == id),
+                (None, _) => {}
+            }
+            frames.extend(declares.map(|f| Some(positional(f))));
+        }
+        if link.is_some() && !library_declares {
+            return false;
+        }
+        if (256..=4095).contains(&id) {
             frames.extend(
-                decl.fns
+                std_global_fns()
                     .iter()
                     .filter(|f| f.id == id)
                     .map(|f| Some(positional(f))),
             );
         }
         !frames.is_empty() && frames.iter().all(|n| n.is_some_and(|n| n <= 4))
+    }
+
+    /// Whether a block of the object's library (`extern "Lib" mod`, `Lib` its link) declares
+    /// semi-global `id`.
+    pub(super) fn library_declares(&self, id: u16) -> bool {
+        let Some(link) = &self.semi_global else {
+            return false;
+        };
+        self.resolved
+            .module_scopes
+            .values()
+            .flat_map(|s| s.extern_mods.values())
+            .chain(self.local_extern_mods.values())
+            .any(|(_, decl)| {
+                decl.library
+                    .as_ref()
+                    .is_some_and(|lib| lib.eq_ignore_ascii_case(link))
+                    && decl.fns.iter().any(|f| f.id == id)
+            })
+    }
+
+    /// Refuses a call through `extern "Lib" mod` from an object that does not link `Lib`: its
+    /// semi-global IDs would name another library's trees.
+    pub(super) fn check_extern_library(&self, decl: &ExternModDecl, span: Span) -> Result<()> {
+        let Some(lib) = &decl.library else {
+            return Ok(());
+        };
+        match &self.semi_global {
+            Some(link) if link.eq_ignore_ascii_case(lib) => Ok(()),
+            link => Err(Error::at(
+                span,
+                format!(
+                    "extern mod '{}' declares trees of semi-global library \"{lib}\", but this object {}: its semi-global IDs name {}",
+                    decl.name,
+                    match link {
+                        Some(l) => format!("links \"{l}\" ('semi_global: \"{l}\";')"),
+                        None => "links no library (add 'semi_global: \"Name\";')".to_owned(),
+                    },
+                    match link {
+                        Some(_) => "that library's trees",
+                        None => "no tree",
+                    }
+                ),
+            )),
+        }
     }
 
     pub(super) fn lookup_extern_bcon(
@@ -531,4 +598,22 @@ impl<'a> ObjectEnv<'a> {
                 .map_or_else(|| k.clone(), |o| o.display_name.clone()),
         }
     }
+}
+
+/// The `extern fn`s `std::globals` declares, parsed once.
+fn std_global_fns() -> &'static [crate::v2::ast::ExternFnDecl] {
+    static FNS: std::sync::OnceLock<Vec<crate::v2::ast::ExternFnDecl>> = std::sync::OnceLock::new();
+    FNS.get_or_init(|| {
+        let source = crate::v2::loader::std_module_source(&["globals".to_owned()])
+            .expect("std::globals is built in");
+        let file = crate::v2::parser::parse_v2_file(source).expect("std::globals parses");
+        file.items
+            .into_iter()
+            .filter_map(|item| match item {
+                crate::v2::ast::V2Item::ExternMod(m) => Some(m.fns),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    })
 }

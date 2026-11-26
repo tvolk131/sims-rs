@@ -1932,20 +1932,6 @@ object \"Probe\" {
                 "run_functional_tree(4);\n    stack_obj := __pre_stack_obj_6;\n    my.attr[0] := stack.attr[0];",
             ],
         ),
-        // A loop binding named `self` is that binding, not the running object.
-        (
-            "object \"Probe\" {
-    guid: 0x7F500001;
-    #[bhav] fn a() {
-        let self: ObjectId = 0;
-        for self in lot.objects() {
-            temp[0] = self;
-            self.remove();
-        }
-    }
-}",
-            &["temp[0] := stack_obj;\n        remove_object(stack_obj);"],
-        ),
         // `&mut stack_obj` handed to a helper moves the cursor.
         (
             "object \"Probe\" {

@@ -2273,13 +2273,7 @@ fn local_bindings_named_me_or_self_are_not_the_engine_handles() {
         &tree("        let me: ObjectId = stack_obj;\n        self.level = me.room;"),
         "object_tree_me_field",
     );
-    // A Sim parameter named `self`: `self.data[N]` is the Sim's cell, not the object's.
-    none(
-        &obj(
-            "    #[bhav(label = \"Probe\")] fn probe(self: Sim) {\n        self.mode = Mode::Off;\n        self.level = self.data[29] + self.person[58];\n    }",
-        ),
-        "untyped_engine_field",
-    );
+    // (A Sim parameter named `self` no longer parses: `self` cannot be bound, v2.4.)
     // A local `me` in a Sim tree is no Sim handle.
     none(
         &sim_tree("        let me = 3;\n        self.level = me + 1;"),

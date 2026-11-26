@@ -79,6 +79,7 @@ fn lower_object_with(
     let mut master_id: Option<u16> = None;
     let mut interaction_group: i16 = 0;
     let mut data_58: i16 = 0;
+    let mut semi_global: Option<String> = None;
     let mut explicit_attributes: Option<u16> = None;
     let mut sprite: Option<SpriteDecl> = None;
     let mut graphics: Vec<SpriteDecl> = Vec::new();
@@ -194,6 +195,7 @@ fn lower_object_with(
                     MetaFieldKind::MasterId(v) => master_id = Some(*v),
                     MetaFieldKind::InteractionGroup(v) => interaction_group = *v,
                     MetaFieldKind::Data58(v) => data_58 = *v,
+                    MetaFieldKind::SemiGlobal(name) => semi_global = Some(name.clone()),
                     MetaFieldKind::Attributes(v) => explicit_attributes = Some(*v),
                     MetaFieldKind::Sprite(sp) => sprite = Some(sp.clone()),
                     MetaFieldKind::Graphics(list) => {
@@ -1000,6 +1002,7 @@ fn lower_object_with(
         self_object_key,
         local_extern_mods,
         local_extern_bcons,
+        semi_global,
         local_consts,
         bcon_tables,
         trees: BTreeMap::new(),
@@ -1782,6 +1785,7 @@ fn lower_object_with(
         attributes: num_attributes,
         interaction_group,
         data_58,
+        semi_global: env.semi_global.clone(),
         init: Some(TreeRef::Id(init_id)),
         main: Some(TreeRef::Id(main_id)),
         scripts: Vec::new(),

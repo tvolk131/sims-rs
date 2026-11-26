@@ -1690,6 +1690,7 @@ impl<'a> TreeLowerer<'a> {
         self.push_scope(ScopeFrame::block());
         let air_name = self.fresh(&format!("v_{name}"));
         self.emit_let(&air_name, &format!("temp[{temp}]"));
+        self.record_option_alias(&air_name);
         self.bind_var(
             name.to_owned(),
             Binding::Local {
@@ -1795,6 +1796,7 @@ impl<'a> TreeLowerer<'a> {
             r.and(p)?;
             let air_name = self.fresh(&format!("v_{name}"));
             self.emit_let(&air_name, &format!("temp[{temp}]"));
+            self.record_option_alias(&air_name);
             self.bind_var(
                 name.to_owned(),
                 Binding::Local {

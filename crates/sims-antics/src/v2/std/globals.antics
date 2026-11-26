@@ -14,6 +14,11 @@
 // that acts on "the stack object" needs the caller to set `stack_obj` first.
 //
 // Each entry stays on one line: the lift reads this file line by line to name the calls it finds.
+//
+// The compiler also reads this file to learn which global trees have narrow frames, for every
+// object whether it imports `std::globals` or not: every tree declared here has a frame of at
+// most four arguments (a tree may read fewer than its frame holds, as listed). Declare a tree
+// with a wider frame elsewhere, never here.
 
 pub extern mod globals {
     // Object set-up and tear-down.
@@ -53,6 +58,13 @@ pub extern mod globals {
     #[id(366)] fn wait_hours(hours: i16) -> Result;
     // Writes temp[0..1].
     #[id(370)] fn animated_idle_for(ticks: i16) -> Result;
+    // Runs the global trees that entries 34 and 36 of string table 303 name. With `amount` 0 or
+    // less: each once, then idles a tick. Otherwise: repeats entry 34 (waiting for a notify
+    // after each run, up to 10 ticks when the run fails) until interrupted or my.person[27],
+    // zeroed first, reaches `amount`; then entry 36 and a tick's idle. Restores my.person[25],
+    // [27] and [28]. Sets `stack_obj` to the Sim itself; writes temp[0..1]. An error when the
+    // last idle fails.
+    #[id(425)] fn run_named_trees_until(amount: i16) -> Result;
 
     // Motive gates.
     // True when a fun object is worth using now (fun below `max_fun`, other needs fine).
@@ -103,6 +115,13 @@ pub extern mod globals {
     #[id(320)] fn is_downtown_lot() -> bool;
     #[id(321)] fn is_residential_lot() -> bool;
     #[id(424)] fn is_vacation_lot() -> bool;
+    // True at once on a residential lot. Otherwise it charges `amount` when the Sim is global[3]
+    // (doubled when its person word 77 is negative), when global[3]'s person word 77 names the
+    // Sim (doubled), or when global[3] is in the Sim's family on a vacation lot: it checks that
+    // the budget covers the charge and, unless `check_only` is 1, takes it (writing
+    // my.person[1] and playing sound 300). False when the budget cannot cover it; true without
+    // a charge for anyone else. May set `stack_obj` to global[3].
+    #[id(334)] fn charge_off_home_lot(amount: i16, check_only: i16) -> bool;
     #[id(363)] fn am_i_a_child() -> bool;
     #[id(467)] fn sim_is_dog() -> bool;
     #[id(468)] fn sim_is_cat() -> bool;

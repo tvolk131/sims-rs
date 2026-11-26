@@ -44,6 +44,7 @@
 //! - [`frame`]: frame allocation (pinned slot, `#[slot(N)]` placement, local renaming);
 //! - [`entry_save`](mod@entry_save): the Sim-tree `stack_obj` entry save;
 //! - [`emit`]: the emitter lowering writes a body through;
+//! - [`option_alias`]: option bindings read from their temp in place;
 //! - [`pipeline`]: the per-tree backend pipeline from a lowered body to final `.air`;
 //! - [`text_reads`]: which frame words an object's text may read.
 //!
@@ -58,6 +59,7 @@ mod entry_save;
 mod frame;
 mod inst;
 mod liveness;
+mod option_alias;
 mod pipeline;
 #[cfg(test)]
 mod tests;
@@ -71,6 +73,7 @@ pub(crate) use self::entry_save::*;
 pub(crate) use self::frame::*;
 pub(crate) use self::inst::*;
 pub(crate) use self::liveness::*;
+pub(crate) use self::option_alias::*;
 pub(crate) use self::pipeline::*;
 pub(crate) use self::text::*;
 pub(crate) use self::text_reads::*;
