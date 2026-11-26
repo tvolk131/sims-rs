@@ -93,7 +93,7 @@ The corpus of 1,191 objects and 26,206 trees, lifted in both modes. The base is 
 
 | Item | Behavioral before → after | Strict before → after |
 |---|---|---|
-| Functions named with `_{id}` (of 25,617) | 25,617 → 1,793 | 25,617 → 1,778 |
+| Functions named with `_{id}` (of 25,617) | 25,617 → 1,797 | 25,617 → 1,782 |
 | `else { if .. }` that could be `else if` | 630 → 0 | 7 → 0 |
 | `else if` | 13,293 → 13,923 | 349 → 356 |
 | `.motive[N]` with a named motive | 4,420 → 0 (4,420 `Motive::`) | 536 → 0 (536 `Motive::`) |
@@ -120,7 +120,7 @@ The corpus of 1,191 objects and 26,206 trees, lifted in both modes. The base is 
   | Strict | 91.1 s → 90.0 s | +2.5% |
 
   The added CPU time is the rename and polish builds and the behavioral re-check.
-- **Why some functions keep `_{id}`.** In behavioral mode 1,793 do. Most are keywords or
+- **Why some functions keep `_{id}`.** In behavioral mode 1,797 do (after #475 reserved its new words). Most are keywords or
   reserved words: `main` (705), `init` (159), `load` (114), `break`, `sleep`. Others
   clash with a library tree the file declares under the same name (`clean`, `load_tree`,
   `semi_global`). 154 are generic `tree_{id}`. The rest share a label or clash with a
