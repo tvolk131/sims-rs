@@ -8,7 +8,7 @@ use crate::ast::{
 use crate::error::{Error, Result, Span};
 use crate::ir::{BconChunk, BhavChunk, StringEntry, StringFormat, StringTableChunk};
 use crate::node_order::{Edge, WideNode, apply_node_order, check_node_order, narrow, share_tails};
-use crate::verify::apply_operand_pad;
+use crate::verify::{apply_operand_pad, is_always_true_instruction};
 use sims_formats::behavior::Instruction;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -570,6 +570,8 @@ struct TreeBuilder<'a> {
     is_verbatim_explicit: bool,
     /// `share_tails`: the tree may hold more than [`MAX_BHAV_NODES`] nodes before they merge.
     wide: bool,
+    /// `dead_false: error` ([`crate::ast::TreeHeader::dead_false_error`]).
+    dead_false_error: bool,
 }
 
 impl<'a> TreeBuilder<'a> {
@@ -596,6 +598,7 @@ impl<'a> TreeBuilder<'a> {
             max_allowed_locals,
             is_verbatim_explicit,
             wide: false,
+            dead_false_error: false,
         }
     }
 
@@ -747,6 +750,30 @@ impl<'a> TreeBuilder<'a> {
             on_false,
         });
         Ok(idx)
+    }
+
+    /// Emits a statement node: it runs `opcode` and goes on to `next`. Its false branch is
+    /// `next` too, or `false: error` under `dead_false: error` when the instruction always
+    /// branches true, so that branch is never taken.
+    fn emit_stmt(
+        &mut self,
+        span: Span,
+        opcode: u16,
+        operands: [u8; 8],
+        next: PendingTarget,
+    ) -> Result<usize> {
+        let always_true = is_always_true_instruction(&Instruction {
+            opcode,
+            on_true: 0,
+            on_false: 0,
+            operands,
+        });
+        let on_false = if self.dead_false_error && always_true {
+            PendingTarget::Resolved(TARGET_ERROR)
+        } else {
+            next.clone()
+        };
+        self.emit(span, opcode, operands, next, on_false)
     }
 
     fn emit_return_node(&mut self, span: Span, ret: PendingTarget) -> Result<usize> {
@@ -1502,13 +1529,7 @@ impl<'a> TreeBuilder<'a> {
                     opcode,
                     operands,
                 } => {
-                    self.emit(
-                        *span,
-                        *opcode,
-                        *operands,
-                        fallthrough.clone(),
-                        fallthrough.clone(),
-                    )?;
+                    self.emit_stmt(*span, *opcode, *operands, fallthrough.clone())?;
                 }
                 Stmt::Return { span, target } => {
                     // Emit a concrete terminating node so any preceding label points to
@@ -1526,14 +1547,16 @@ impl<'a> TreeBuilder<'a> {
                     branches,
                 } => {
                     let (opcode, operands) = self.encode_primitive(prim, *span)?;
-                    let (on_true, on_false) = match branches {
-                        Some(b) => (
-                            self.target_from_ast(&b.on_true, *span),
-                            self.target_from_ast(&b.on_false, *span),
-                        ),
-                        None => (fallthrough.clone(), fallthrough.clone()),
-                    };
-                    self.emit(*span, opcode, operands, on_true, on_false)?;
+                    match branches {
+                        Some(b) => {
+                            let on_true = self.target_from_ast(&b.on_true, *span);
+                            let on_false = self.target_from_ast(&b.on_false, *span);
+                            self.emit(*span, opcode, operands, on_true, on_false)?;
+                        }
+                        None => {
+                            self.emit_stmt(*span, opcode, operands, fallthrough.clone())?;
+                        }
+                    }
                 }
                 Stmt::Call {
                     span,
@@ -1725,7 +1748,7 @@ impl<'a> TreeBuilder<'a> {
                 let lhs = self.resolve_operand(&OperandRef::NamedLocal(name.clone()), *span)?;
                 let rhs = self.resolve_operand(rhs, *span)?;
                 let operands = encode_expr_operands(lhs, AssignOp::Set.code(), rhs);
-                let idx = self.emit(*span, 2, operands, next_target.clone(), next_target)?;
+                let idx = self.emit_stmt(*span, 2, operands, next_target)?;
                 Ok(PendingTarget::Node {
                     index: idx,
                     span: *span,
@@ -1736,7 +1759,7 @@ impl<'a> TreeBuilder<'a> {
                 let lhs = self.resolve_operand(lhs, *span)?;
                 let rhs = self.resolve_operand(rhs, *span)?;
                 let operands = encode_expr_operands(lhs, op.code(), rhs);
-                let idx = self.emit(*span, 2, operands, next_target.clone(), next_target)?;
+                let idx = self.emit_stmt(*span, 2, operands, next_target)?;
                 Ok(PendingTarget::Node {
                     index: idx,
                     span: *span,
@@ -1768,10 +1791,10 @@ impl<'a> TreeBuilder<'a> {
                         index: restore_idx,
                         span: *span,
                     };
-                    self.emit(*span, 2, save_ops, to_set.clone(), to_set)?;
-                    self.emit(*span, 2, set_ops, to_sleep.clone(), to_sleep)?;
-                    self.emit(*span, 0, [0; 8], to_restore.clone(), to_restore)?;
-                    self.emit(*span, 2, restore_ops, next_target.clone(), next_target)?;
+                    self.emit_stmt(*span, 2, save_ops, to_set)?;
+                    self.emit_stmt(*span, 2, set_ops, to_sleep)?;
+                    self.emit_stmt(*span, 0, [0; 8], to_restore)?;
+                    self.emit_stmt(*span, 2, restore_ops, next_target)?;
                     Ok(PendingTarget::Node {
                         index: save_idx,
                         span: *span,
@@ -1782,14 +1805,8 @@ impl<'a> TreeBuilder<'a> {
                         span: *span,
                     };
                     let set_ops = encode_expr_operands(Operand::new(9, 0), 5, ticks);
-                    let first = self.emit(
-                        *span,
-                        2,
-                        set_ops,
-                        sleep_idx_placeholder.clone(),
-                        sleep_idx_placeholder,
-                    )?;
-                    self.emit(*span, 0, [0; 8], next_target.clone(), next_target)?;
+                    let first = self.emit_stmt(*span, 2, set_ops, sleep_idx_placeholder)?;
+                    self.emit_stmt(*span, 0, [0; 8], next_target)?;
                     Ok(PendingTarget::Node {
                         index: first,
                         span: *span,
@@ -1802,14 +1819,14 @@ impl<'a> TreeBuilder<'a> {
                 branches,
             } => {
                 let (opcode, operands) = self.encode_primitive(prim, *span)?;
-                let (on_true, on_false) = match branches {
-                    Some(b) => (
-                        self.target_from_ast(&b.on_true, *span),
-                        self.target_from_ast(&b.on_false, *span),
-                    ),
-                    None => (next_target.clone(), next_target),
+                let idx = match branches {
+                    Some(b) => {
+                        let on_true = self.target_from_ast(&b.on_true, *span);
+                        let on_false = self.target_from_ast(&b.on_false, *span);
+                        self.emit(*span, opcode, operands, on_true, on_false)?
+                    }
+                    None => self.emit_stmt(*span, opcode, operands, next_target)?,
                 };
-                let idx = self.emit(*span, opcode, operands, on_true, on_false)?;
                 Ok(PendingTarget::Node {
                     index: idx,
                     span: *span,
@@ -1923,7 +1940,7 @@ impl<'a> TreeBuilder<'a> {
                 opcode,
                 operands,
             } => {
-                let idx = self.emit(*span, *opcode, *operands, next_target.clone(), next_target)?;
+                let idx = self.emit_stmt(*span, *opcode, *operands, next_target)?;
                 Ok(PendingTarget::Node {
                     index: idx,
                     span: *span,
@@ -2121,7 +2138,7 @@ fn check_sibling_frames(calls: &[SiblingCall], behaviors: &BTreeMap<u16, BhavChu
                 format!(
                     "tree '{}': node {} calls tree {} with inline arguments, and its frame holds \
                      {args} arguments: it reads those past the fourth from the nodes after the \
-                     call, which 'share_tails' and 'node_order' move",
+                     call, which 'share_tails' and 'node_order' move and 'dead_false' rewrites",
                     call.tree, call.node, call.callee
                 ),
             ));
@@ -2139,20 +2156,18 @@ struct SiblingCall {
     span: Span,
 }
 
-/// The instructions of a tree whose header asks for `share_tails` or a `node_order`
-/// ([`crate::node_order`]): the assembled nodes, merged, then renumbered. Inline calls to trees
-/// of `module_trees` are pushed to `sibling_calls`.
-fn rewrite_nodes(
+/// Checks the inline calls of a tree whose header asks for `share_tails`, a `node_order` or
+/// `dead_false: error`. A call with inline arguments (opcode 256 and up, operands other than
+/// the `temps` sentinel) to a callee whose frame holds more than four arguments reads the rest
+/// from the bytes of the nodes after the call, which merging and renumbering move and
+/// `dead_false` rewrites. A tree of this module is checked by the frame it compiles to (pushed
+/// to `sibling_calls`); any other callee must be listed in `narrow_callees`.
+fn check_inline_calls(
     tree: &TreeDecl,
     builder: &TreeBuilder<'_>,
     module_trees: &BTreeSet<u16>,
     sibling_calls: &mut Vec<SiblingCall>,
-) -> Result<Vec<Instruction>> {
-    let count = builder.nodes.len();
-    // A call with inline arguments (opcode 256 and up, operands other than the `temps`
-    // sentinel) to a callee whose frame holds more than four arguments reads the rest from the
-    // nodes after the call, which merging or renumbering moves. A tree of this module is checked
-    // by the frame it compiles to; any other callee must be listed.
+) -> Result<()> {
     for (i, node) in builder.nodes.iter().enumerate() {
         if node.opcode < 256 || node.operands == [0xFF; 8] {
             continue;
@@ -2170,13 +2185,20 @@ fn rewrite_nodes(
                 format!(
                     "tree '{}': node {i} calls tree {} with inline arguments; a callee whose \
                      frame holds more than four arguments reads the rest from the nodes after the \
-                     call, which 'share_tails' and 'node_order' move. List {} in \
-                     'narrow_callees' when its frame holds at most four",
+                     call, which 'share_tails' and 'node_order' move and 'dead_false' rewrites. \
+                     List {} in 'narrow_callees' when its frame holds at most four",
                     tree.label, node.opcode, node.opcode
                 ),
             ));
         }
     }
+    Ok(())
+}
+
+/// The instructions of a tree whose header asks for `share_tails` or a `node_order`
+/// ([`crate::node_order`]): the assembled nodes, merged, then renumbered.
+fn rewrite_nodes(tree: &TreeDecl, builder: &TreeBuilder<'_>) -> Result<Vec<Instruction>> {
+    let count = builder.nodes.len();
     let mut nodes = Vec::with_capacity(count);
     for node in &builder.nodes {
         nodes.push(WideNode {
@@ -2328,6 +2350,7 @@ fn lower_tree(
     };
 
     let rewrites = tree.header.share_tails || tree.header.node_order.is_some();
+    let checks_calls = rewrites || tree.header.dead_false_error;
     let mut builder = TreeBuilder::new(
         symbols,
         named_locals,
@@ -2338,6 +2361,7 @@ fn lower_tree(
         usage.is_verbatim_explicit,
     );
     builder.wide = tree.header.share_tails;
+    builder.dead_false_error = tree.header.dead_false_error;
     let entry = builder.lower_block(&tree.body, PendingTarget::Resolved(TARGET_TRUE))?;
 
     // If a high-level tree consisted solely of `return true/false/error`, emit a
@@ -2352,8 +2376,11 @@ fn lower_tree(
     }
 
     let count = builder.nodes.len();
+    if checks_calls {
+        check_inline_calls(tree, &builder, module_trees, sibling_calls)?;
+    }
     let instructions = if rewrites {
-        rewrite_nodes(tree, &builder, module_trees, sibling_calls)?
+        rewrite_nodes(tree, &builder)?
     } else {
         let mut instructions = Vec::with_capacity(count);
         for node in &builder.nodes {

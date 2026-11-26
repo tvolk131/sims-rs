@@ -7,11 +7,14 @@
 //! - `node_order` renumbers the nodes: entry `i` names the compiled node that becomes node `i`.
 //!
 //! [`match_node_order`] finds the order that turns one tree into another with the same nodes,
-//! for a decompiler that pins a lifted tree's node numbers to the original's.
+//! for a decompiler that pins a lifted tree's node numbers to the original's. [`match_tree_pin`]
+//! finds the whole pin, `dead_false = error` included
+//! (`docs/decisions/20261126-antics-v2-4-dead-false-error.md`).
 
 use sims_formats::behavior::Instruction;
 
 use crate::lower::{MAX_BHAV_NODES, TARGET_ERROR};
+use crate::verify::is_always_true_instruction;
 
 /// A branch of a node before the tree is numbered: another node, or a return
 /// (`TARGET_ERROR`, `TARGET_TRUE` or `TARGET_FALSE`).
@@ -237,6 +240,202 @@ pub fn match_node_order(compiled: &[Instruction], original: &[Instruction]) -> O
         .iter()
         .map(|&c| (c != usize::MAX).then_some(c as u16))
         .collect()
+}
+
+/// Whether `original` is a tree the original compiler wrote with its dead false branches as
+/// `false: error`: it has a node whose instruction always branches true
+/// ([`is_always_true_instruction`]), and every such node's false branch is `error` (0xFD).
+/// A tree with `#[bhav(.., dead_false = error)]` compiles its statements so.
+#[must_use]
+pub fn wants_dead_false_error(original: &[Instruction]) -> bool {
+    let mut dead = original
+        .iter()
+        .filter(|i| is_always_true_instruction(i))
+        .peekable();
+    dead.peek().is_some() && dead.all(|i| i.on_false == TARGET_ERROR)
+}
+
+/// `compiled`, a tree built without `dead_false`, as `dead_false = error` builds it: each node
+/// whose instruction always branches true and whose false branch goes where its true branch
+/// does (a statement's `false: next`) gets `false: error`. A raw node written out with both
+/// branches to one place, which the compiler leaves alone, is the one case this changes too.
+#[must_use]
+pub fn with_dead_false_error(compiled: &[Instruction]) -> Vec<Instruction> {
+    compiled
+        .iter()
+        .map(|i| {
+            let mut i = i.clone();
+            if i.on_false == i.on_true && is_always_true_instruction(&i) {
+                i.on_false = TARGET_ERROR;
+            }
+            i
+        })
+        .collect()
+}
+
+/// The `#[bhav(..)]` header fields that make a tree compile to another tree's nodes exactly
+/// ([`match_tree_pin`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreePin {
+    /// `dead_false = error`.
+    pub dead_false_error: bool,
+    /// `share_tails`.
+    pub share_tails: bool,
+    /// `node_order = [..]`; `None` when the nodes keep their order.
+    pub order: Option<Vec<u16>>,
+}
+
+impl TreePin {
+    /// The fields as written in `#[bhav(..)]`, each after `, `.
+    #[must_use]
+    pub fn bhav_fields(&self) -> String {
+        let mut out = String::new();
+        if self.dead_false_error {
+            out.push_str(", dead_false = error");
+        }
+        if self.share_tails {
+            out.push_str(", share_tails");
+        }
+        if let Some(order) = &self.order {
+            let order: Vec<String> = order.iter().map(u16::to_string).collect();
+            out.push_str(&format!(", node_order = [{}]", order.join(", ")));
+        }
+        out
+    }
+}
+
+/// `compiled` as [`with_dead_false_error`] builds it, except that a node keeps its branches when
+/// `original` has a node of the same instruction that always branches true and whose false
+/// branch is not `error`: the shape a source gives such a node by writing it out in a `raw`
+/// block, which `dead_false` leaves alone.
+fn with_dead_false_error_keeping(
+    compiled: &[Instruction],
+    original: &[Instruction],
+) -> Vec<Instruction> {
+    let kept: Vec<(u16, [u8; 8])> = original
+        .iter()
+        .filter(|i| i.on_false != TARGET_ERROR && is_always_true_instruction(i))
+        .map(|i| (i.opcode, i.operands))
+        .collect();
+    compiled
+        .iter()
+        .map(|i| {
+            let mut i = i.clone();
+            if i.on_false == i.on_true
+                && is_always_true_instruction(&i)
+                && !kept.contains(&(i.opcode, i.operands))
+            {
+                i.on_false = TARGET_ERROR;
+            }
+            i
+        })
+        .collect()
+}
+
+/// Whether two trees hold the same nodes in the same order.
+fn same_nodes(a: &[Instruction], b: &[Instruction]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| {
+            (a.opcode, a.on_true, a.on_false, a.operands)
+                == (b.opcode, b.on_true, b.on_false, b.operands)
+        })
+}
+
+/// The pin that should make `compiled` (a tree built with none of the pin's fields) compile to
+/// `original`'s nodes exactly, in the compiler's order: `dead_false = error` when `original`
+/// writes any dead false branch `error`, then `share_tails` when the nodes do not match without
+/// it, then a `node_order` when they match in another order. `None` when the nodes already
+/// match or no pin makes them; the fewest fields win.
+///
+/// The pin is a prediction from the bytes, so a caller compiles the tree with it and keeps it
+/// only when the nodes come out identical. The bytes cannot tell a statement from a `raw` node
+/// written with both branches to one place, which `dead_false` leaves alone, so the flag is
+/// tried two ways: every such node flipped ([`with_dead_false_error`]), then the nodes whose
+/// instruction `original` leaves with a live false branch kept, which holds when the source
+/// writes those out raw. A caller that can compile the source with the flag gets an exact
+/// answer from [`match_tree_pin_compiled`].
+#[must_use]
+pub fn match_tree_pin(compiled: &[Instruction], original: &[Instruction]) -> Option<TreePin> {
+    let mut flagged = Vec::new();
+    if original
+        .iter()
+        .any(|i| i.on_false == TARGET_ERROR && is_always_true_instruction(i))
+    {
+        let flipped = with_dead_false_error(compiled);
+        let kept = with_dead_false_error_keeping(compiled, original);
+        let differs = !same_nodes(&kept, &flipped);
+        flagged.push(flipped);
+        if differs {
+            flagged.push(kept);
+        }
+    }
+    match_bases(compiled, &flagged, original)
+}
+
+/// [`match_tree_pin`] given `flagged`, the same source compiled with `dead_false = error`
+/// (and none of the other pin fields): no prediction, so the pin it returns compiles to
+/// `original` exactly.
+#[must_use]
+pub fn match_tree_pin_compiled(
+    compiled: &[Instruction],
+    flagged: &[Instruction],
+    original: &[Instruction],
+) -> Option<TreePin> {
+    let flagged = if same_nodes(compiled, flagged) {
+        Vec::new()
+    } else {
+        vec![flagged.to_vec()]
+    };
+    match_bases(compiled, &flagged, original)
+}
+
+/// The first pin that turns `compiled`, or one of `flagged` (with `dead_false = error`), into
+/// `original`: as it stands, then renumbered, then with `share_tails` (as it stands or
+/// renumbered).
+fn match_bases(
+    compiled: &[Instruction],
+    flagged: &[Vec<Instruction>],
+    original: &[Instruction],
+) -> Option<TreePin> {
+    if same_nodes(compiled, original) {
+        return None;
+    }
+    let bases = std::iter::once((false, compiled)).chain(flagged.iter().map(|f| (true, &f[..])));
+    for (dead_false_error, base) in bases {
+        let pin = |share_tails, order: Vec<u16>| TreePin {
+            dead_false_error,
+            share_tails,
+            order: (!order.iter().enumerate().all(|(i, &n)| usize::from(n) == i)).then_some(order),
+        };
+        // A tree with a node no branch reaches matches only as it stands.
+        if same_nodes(base, original) {
+            return Some(pin(false, Vec::new()));
+        }
+        if let Some(order) = match_node_order(base, original) {
+            let pin = pin(false, order);
+            // The plain tree in its own order is the same nodes, which `None` covers above.
+            if pin.dead_false_error || pin.order.is_some() {
+                return Some(pin);
+            }
+            continue;
+        }
+        let Some(wide) = widen(base) else {
+            continue;
+        };
+        let Ok(shared) = share_tails(&wide, MAX_BHAV_NODES) else {
+            continue;
+        };
+        if shared.len() < wide.len() {
+            let shared = narrow(&shared);
+            if same_nodes(&shared, original) {
+                return Some(pin(true, Vec::new()));
+            }
+            if let Some(order) = match_node_order(&shared, original) {
+                return Some(pin(true, order));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

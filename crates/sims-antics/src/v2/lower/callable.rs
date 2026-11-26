@@ -349,24 +349,27 @@ impl<'a> TreeLowerer<'a> {
     /// scratch pointer that read depends on, and a call carries the pointer into the callee),
     /// in an object with a tree that keeps its layout (`ObjectEnv::copy_staging`: numbered raw
     /// branch targets count nodes, or where `finish` finds frame words observable), inside a
-    /// `#[temp]` loop, whose counter check reads the stores, and in a tree with an explicit
-    /// `kind` (an indexed tree is entered at a numbered node).
+    /// `#[temp]` loop, whose counter check reads the stores, in a tree with an explicit
+    /// `kind` (an indexed tree is entered at a numbered node), and in an object one of whose
+    /// trees formats text that may name frame words (`$Local:N` and the other frame-word
+    /// tokens): that tree reads its own frame, whose words an earlier frame may have left
+    /// behind, so any tree's frame words are observable. A string no tree formats reads none.
     pub(super) fn copy_staging(&self) -> bool {
-        self.env.copy_staging || self.env.reads_global_34 || self.temp_loops > 0 || self.fixed_entry
+        self.env.copy_staging
+            || self.env.reads_global_34
+            || self.temp_loops > 0
+            || self.fixed_entry
+            || (self.env.text_trees && mir::reads_a_word(&self.env.text_reads))
     }
 
     /// Records an option binding's copy of its temp for [`crate::v2::mir::alias_option_temps`],
     /// which drops the copy and so, like an in-place staging, changes the tree's nodes and
     /// frame words: only where those are not observable ([`Self::copy_staging`]). `finish`
     /// treats an applied alias as a staging, so the object is lowered again without it where
-    /// the result turns out observable. Nor in an object whose text may name frame words
-    /// (`$Local:N`): a tree that formats it may read a word this tree's frame left behind.
+    /// the result turns out observable.
     pub(super) fn record_option_alias(&mut self, air_name: &str) {
         // A discarded check's trial lowering leaves no code, and its names may come again.
-        if self.checking_discarded == 0
-            && !self.copy_staging()
-            && !mir::reads_a_word(&self.env.text_reads)
-        {
+        if self.checking_discarded == 0 && !self.copy_staging() {
             self.option_aliases.insert(air_name.to_owned());
         }
     }

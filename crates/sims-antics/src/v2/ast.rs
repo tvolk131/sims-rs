@@ -177,6 +177,10 @@ pub struct TreeFrame {
     /// `#[bhav(node_order = [..])]`: entry `i` names the compiled node that becomes node `i`
     /// (`.air` `node_order: [..]`, [`crate::node_order`]).
     pub node_order: Option<Vec<u16>>,
+    /// `#[bhav(dead_false = error)]`: a statement whose instruction always branches true gets
+    /// `false: error` in place of `false: next`, as the original compiler writes it (`.air`
+    /// `dead_false: error`).
+    pub dead_false_error: bool,
 }
 
 /// Zero-cost integer enum declaration (`[pub] enum Name { VariantA, VariantB = 2 }`).

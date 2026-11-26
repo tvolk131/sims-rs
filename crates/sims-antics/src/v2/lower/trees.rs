@@ -308,21 +308,26 @@ pub(super) fn write_framed_tree(
     if frame.share_tails {
         header.push("share_tails: true".to_owned());
     }
+    if frame.dead_false_error {
+        header.push("dead_false: error".to_owned());
+    }
     if let Some(order) = &frame.node_order {
         let order: Vec<String> = order.iter().map(u16::to_string).collect();
         header.push(format!("node_order: [{}]", order.join(", ")));
     }
-    if frame.share_tails || frame.node_order.is_some() {
+    if frame.share_tails || frame.node_order.is_some() || frame.dead_false_error {
         if let Some((span, callee)) = &ctx.wide_call {
-            let option = if frame.share_tails {
-                "share_tails"
+            let (option, effect) = if frame.share_tails {
+                ("share_tails", "moves nodes")
+            } else if frame.node_order.is_some() {
+                ("node_order", "moves nodes")
             } else {
-                "node_order"
+                ("dead_false", "rewrites false branches")
             };
             return Err(Error::at(
                 *span,
                 format!(
-                    "fn '{name}' has '{option}', which moves nodes, but this call passes its \
+                    "fn '{name}' has '{option}', which {effect}, but this call passes its \
                      arguments inline {callee}: the callee reads those past the fourth from the \
                      nodes after the call"
                 ),

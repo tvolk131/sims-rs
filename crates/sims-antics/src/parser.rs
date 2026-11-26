@@ -464,6 +464,20 @@ impl Parser {
                     "node_order" => {
                         header.node_order = Some(self.parse_u16_list("node_order entry")?);
                     }
+                    "dead_false" => {
+                        if header.dead_false_error {
+                            return Err(Error::at(kspan, "duplicate header field 'dead_false'"));
+                        }
+                        if !matches!(&self.peek().kind, TokenKind::Ident(v) if v == "error") {
+                            return Err(Error::at(
+                                self.peek().span,
+                                "expected 'error' after 'dead_false:' (without it, a statement's \
+                                 dead false branch goes to the next node)",
+                            ));
+                        }
+                        self.bump();
+                        header.dead_false_error = true;
+                    }
                     "narrow_callees" => {
                         header.narrow_callees = self.parse_u16_list("narrow_callees entry")?;
                     }

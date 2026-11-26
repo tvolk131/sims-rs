@@ -281,25 +281,41 @@ pub(super) fn validate_raw_air_stmts(
 ///
 /// Such a block's text is one the lowering could have produced, so whatever the optimizer
 /// proves of lowered text holds for it. Anything else keeps the whole tree's layout.
-/// The trees a raw block calls with inline arguments: `call N(..)` other than `call N(temps)`,
-/// and `op N (..)` for an opcode of 256 and up. Empty when the block does not tokenize (the
-/// `.air` compiler then reports it).
+/// The trees a raw block calls with inline arguments: `call N(..)` and `subroutine N(..)` other
+/// than `(temps)`, `subroutine(N, ..)` other than `subroutine(N, temps)`, and `op N (..)` for an
+/// opcode of 256 and up. Empty when the block does not tokenize (the `.air` compiler then
+/// reports it).
 pub(super) fn raw_inline_callees(code: &str) -> Vec<u16> {
     use crate::lexer::TokenKind as T;
     let Ok(tokens) = crate::lexer::tokenize(code) else {
         return Vec::new();
     };
     let kind = |i: usize| tokens.get(i).map(|t| &t.kind);
+    let is_temps = |i: usize| matches!(kind(i), Some(T::Ident(t)) if t == "temps");
     let mut ids = Vec::new();
     for i in 0..tokens.len() {
-        let (Some(T::Ident(w)), Some(&T::Int(n))) = (kind(i), kind(i + 1)) else {
+        let Some(T::Ident(w)) = kind(i) else {
+            continue;
+        };
+        // `subroutine(N, ..)`: its arguments follow the id after a comma.
+        if w == "subroutine"
+            && kind(i + 1) == Some(&T::LParen)
+            && let Some(&T::Int(n)) = kind(i + 2)
+            && let Ok(id) = u16::try_from(n)
+        {
+            if !(kind(i + 3) == Some(&T::Comma) && is_temps(i + 4)) {
+                ids.push(id);
+            }
+            continue;
+        }
+        let Some(&T::Int(n)) = kind(i + 1) else {
             continue;
         };
         let Ok(id) = u16::try_from(n) else {
             continue;
         };
-        let temps = matches!(kind(i + 3), Some(T::Ident(t)) if t == "temps");
-        if (w == "call" && !temps) || (w == "op" && id >= 256) {
+        let temps = is_temps(i + 3);
+        if ((w == "call" || w == "subroutine") && !temps) || (w == "op" && id >= 256) {
             ids.push(id);
         }
     }
