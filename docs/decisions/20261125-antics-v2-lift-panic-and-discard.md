@@ -52,7 +52,36 @@ The lift still wrote the old forms:
 
 ## Results
 
-RESULTS
+The corpus of 1,191 objects and 26,206 trees, lifted in both modes. The base is `main`
+after #476.
+
+| Item | Behavioral before → after | Strict before → after |
+|---|---|---|
+| `return error;` in v2 code | 5,584 → 0 | 592 → 0 |
+| `panic!();` | 0 → 5,584 | 0 → 592 |
+| `return error;` inside `raw { }` (`.air`, kept) | 6,567 → 6,567 | 569 → 569 |
+| `if f(..) {}` on a call | 1,470 → 0 | 32 → 0 |
+| `let _ = f(..);` | 0 → 1,470 | 0 → 32 |
+| Other empty `if`s (comparisons, kept) | 655 → 655 | 32 → 32 |
+
+- **Every candidate call kept its bytes.** The byte gate turned none back.
+- **Why the estimates were higher.** The coordinator's estimate of 12,151 error exits counts
+  both `return error;` rows. About 2,400 empty `if`s counts the comparisons as well.
+- **Verdicts are unchanged.**
+  - Behavioral: 870 identical, 4,651 equivalent, 20,684 inconclusive.
+  - Strict: 884, 4,637 and 20,684.
+  - There are 0 DIFFERENT, 0 errors or timeouts, and 0 fmt-dirty files.
+- **No tree got worse.** No tree lost its proof or its idiomatic form, and no file gained
+  raw code.
+- **Lint totals are unchanged.** Behavioral 263, strict 6, with all style rules at 0.
+- **Runtime.** Each pair below ran back to back with 10 workers.
+
+  | Mode | Wall time, base → this change | CPU time |
+  |---|---|---|
+  | Behavioral | 71.1 s → 69.7 s | +0.2% |
+  | Strict | 84.1 s → 92.3 s | +1.5% |
+
+  CPU time barely changes, so the wall-time swing is run-to-run noise.
 
 ## Consequences
 
