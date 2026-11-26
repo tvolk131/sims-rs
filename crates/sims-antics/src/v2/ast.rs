@@ -154,7 +154,9 @@ pub struct TreeMemberDecl {
     pub params: Vec<AbiParam>,
     pub ret: ReturnAbi,
     pub body: Vec<V2Stmt>,
-    /// `#[frame(args = N, locals = M, format = F, revision = R, kind = K)]` header pins (all optional).
+    /// Header pins from `#[bhav(..)]` / `#[frame(..)]`, all optional: `args`, `locals`, `format`,
+    /// `revision`, `kind`, `empty`, `node_order`, `share_tails`, `dead_false` (see
+    /// [`TreeFrame`]).
     pub frame: Option<TreeFrame>,
 }
 
