@@ -517,6 +517,16 @@ impl<'a> TreeLowerer<'a> {
             } => (*span, name.as_str()),
             _ => return,
         };
+        // `let _ = ..` declares only when it falls back to a hidden local
+        // (`lower_hidden_discard`).
+        if matches!(stmt, V2Stmt::Let { .. }) && name == "_" {
+            return;
+        }
+        self.note_decl_named(span, name);
+    }
+
+    /// Records a declaration at `span` (see [`Self::note_decl`]).
+    pub(super) fn note_decl_named(&mut self, span: Span, name: &str) {
         if self.checking_discarded > 0 || self.dup_decl.is_some() {
             return;
         }
