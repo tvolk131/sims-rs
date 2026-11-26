@@ -81,8 +81,11 @@ it.
   - the file calls it: each caller would have to pass the arguments;
   - a name `pK` is already taken by a word of the file.
 
-  `sleep` and `idle` count down in argument 0 too, but the build saves and restores it
-  around them whenever the tree reads it, so they do not block naming.
+  - the function sleeps (`sleep`, `idle`, raw `idle(`, or a `std::motives` loop that sleeps,
+    inlined) and does not read argument 0. Sleep counts down in argument 0, and the build
+    saves and restores it only for a tree that reads it. Such a tree lifts with the
+    restore written out (`param[0] = ..`), which keeps its numbers anyway. A unit test
+    keeps the list of sleeping `std::motives` loops in step with `std`.
 - **Checked per tree.** Unpinned locals let the optimizer fold copies, and lint
   `unused_let` exempts only pinned lets. So both byte gates and lint gates apply.
   - Each pass applies every function's change at once, builds once and lints once.

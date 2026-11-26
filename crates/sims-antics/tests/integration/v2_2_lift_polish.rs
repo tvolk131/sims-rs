@@ -321,3 +321,33 @@ fn behavioral_arguments_a_primitive_writes_keep_their_numbers() {
     lacks(&lifted, &["p0: i16", "= p0;"]);
     has(&lifted, &["temp[0] = param[0];"]);
 }
+
+#[test]
+fn behavioral_sleeping_trees_keep_their_argument_numbers() {
+    // Sleep counts down in argument 0. The build restores it only for a tree that reads it,
+    // and that tree lifts with the restore written out (`param[0] = slot_0;`).
+    let source = r#"object "Fable Polish Sleepers" {
+    guid: 0x7E00_017F;
+    #[bhav(id = 4300, label = "Probe", args = 2, locals = 1)]
+    fn probe(sim: Sim) {
+        sleep(3);
+        temp[0] = param[1];
+    }
+    #[bhav(id = 4301, label = "Nap", args = 2, locals = 1)]
+    fn nap(sim: Sim) {
+        sleep(3);
+        temp[0] = param[0];
+        temp[1] = param[1];
+    }
+}"#;
+    let lifted = lift(source, true);
+    has(
+        &lifted,
+        &[
+            "temp[0] = param[1];",
+            "param[0] = slot_0;",
+            "temp[1] = param[1];",
+        ],
+    );
+    lacks(&lifted, &["p0: i16", "p1: i16"]);
+}

@@ -1519,8 +1519,19 @@ fn unpinned_locals(text: &str) -> Vec<FrameGroup> {
 /// - one the file calls (each caller would have to pass the arguments);
 /// - one where a name is taken.
 ///
-/// `sleep`/`idle` count down in argument 0 too, but the build saves and restores it around
-/// them when the tree reads it.
+/// `sleep`/`idle` (and the `std::motives` loops, inlined, that sleep) count down in argument
+/// 0 too; the build saves and restores it around them only when the tree reads it, so a
+/// sleeping tree that does not read argument 0 keeps the numbers.
+/// The calls that sleep in the caller's tree: the builtins, and the `std::motives` loops
+/// (inlined at the call site).
+const SLEEPING_CALLS: [&str; 5] = [
+    "sleep",
+    "idle",
+    "restore_motive_tracked",
+    "restore_two_motives_tracked",
+    "repair_by_progress",
+];
+
 fn named_params(text: &str) -> Vec<FrameGroup> {
     use crate::v2::lexer::{TokenKind as K, tokenize};
     let Ok(tokens) = tokenize(text) else {
@@ -1601,8 +1612,13 @@ fn named_params(text: &str) -> Vec<FrameGroup> {
         let end = close[&body];
         let mut reads: BTreeMap<i64, Vec<std::ops::Range<usize>>> = BTreeMap::new();
         let mut ok = true;
+        let mut sleeps = false;
         for j in body..end {
             match &tokens[j].kind {
+                // Sleep counts down in argument 0 (`.air`'s `idle`); the build restores it
+                // only for a tree that reads it.
+                K::RawBlock(b) if b.contains("idle(") => sleeps = true,
+                K::Ident(w) if SLEEPING_CALLS.contains(&w.as_str()) => sleeps = true,
                 // Raw code that names an argument in any form (`param[k]`, a `param:`
                 // operand such as Old Relationship's destination, the `scope(9, k)` cell),
                 // animates, or runs a primitive by its bytes may write one.
@@ -1649,7 +1665,7 @@ fn named_params(text: &str) -> Vec<FrameGroup> {
         let Some(&last) = reads.keys().next_back() else {
             continue;
         };
-        if !ok {
+        if !ok || (sleeps && !reads.contains_key(&0)) {
             continue;
         }
         let names: Vec<String> = (0..=last)
@@ -8975,6 +8991,21 @@ mod tests {
                 "if after_raw() {} => let _ = after_raw();"
             ]
         );
+    }
+
+    /// Every `std::motives` function that sleeps is in [`SLEEPING_CALLS`].
+    #[test]
+    fn sleeping_calls_cover_the_std_motive_loops() {
+        let std = include_str!("std/motives.antics");
+        for part in std.split("pub fn ").skip(1) {
+            let name = part.split('(').next().expect("a name").trim();
+            let body = part.split("\npub fn ").next().expect("a body");
+            assert_eq!(
+                body.contains("sleep(") || body.contains("idle("),
+                SLEEPING_CALLS.contains(&name),
+                "{name}"
+            );
+        }
     }
 
     #[test]
