@@ -74,7 +74,10 @@ it.
     precedes it;
   - the function runs an `animate`, in code or in `raw { }`: its events land in argument
     0 unless a local is named for them, and the build does not restore it;
-  - its `raw { }` code reads `param[`;
+  - it names an argument other than as `param[k]`, such as a `param:` operand;
+  - its `raw { }` code names an argument in any form (`param[k]`, Old Relationship's
+    `param:` destination, the `scope(9, k)` cell), or runs a primitive by its bytes
+    (`op 0x..`), either of which may write one;
   - the file calls it: each caller would have to pass the arguments;
   - a name `pK` is already taken by a word of the file.
 
@@ -115,8 +118,8 @@ at `611795a30`, after #478. Counts are over v2 code, not inside `raw { }`.
 | `.set(..)` / `.clear(..)` / `.contains(..)` | 0 → 1,769 / 1,507 / 696 | 0 → 45 / 39 / 121 |
 | Bit-number flag operators (kept) | 3,392 → 3,392 | 162 → 162 |
 | `#[slot(N)] let` | 19,087 → 14,127 (−4,960) | 951 → 951 |
-| Functions with named arguments | 0 → 959 (1,157 arguments) | 0 → 0 |
-| `param[k]` reads | 11,589 → 9,733 | 961 → 961 |
+| Functions with named arguments | 0 → 953 (1,150 arguments) | 0 → 0 |
+| `param[k]` reads | 11,589 → 9,741 | 961 → 961 |
 | `Table.eN` in v2 code | 0 → 0 | 0 → 0 |
 
 - **Typed flag operations left.** The 2,795 behavioral and 248 strict operations that keep

@@ -290,3 +290,34 @@ fn raw_code_keeps_its_own_syntax() {
         );
     }
 }
+
+#[test]
+fn behavioral_arguments_a_primitive_writes_keep_their_numbers() {
+    // Old Relationship stores the value in its `param:` argument; `random_into` writes its
+    // first argument; animation events land in argument 0.
+    let source = r#"object "Fable Polish Writers" {
+    guid: 0x7E00_017E;
+    #[bhav(id = 4300, label = "Review", args = 1, locals = 0)]
+    fn review(sim: Sim) {
+        raw {
+            if test_sim_interacting_with() {
+                old_relationship(write: false, column: 0, param: 0, dir: 0, flags: 0);
+            }
+            temp[0] := param[0];
+        }
+    }
+    #[bhav(id = 4301, label = "Roll", args = 1, locals = 0)]
+    fn roll() {
+        random_into(param[0], 10);
+        temp[0] = param[0];
+    }
+    #[bhav(id = 4302, label = "Wave", args = 1, locals = 0)]
+    fn wave(sim: Sim) {
+        animate(clip: 3, table: 1, flags: 0, events: 2);
+        temp[0] = param[0];
+    }
+}"#;
+    let lifted = lift(source, true);
+    lacks(&lifted, &["p0: i16", "= p0;"]);
+    has(&lifted, &["temp[0] = param[0];"]);
+}

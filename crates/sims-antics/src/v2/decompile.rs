@@ -1509,11 +1509,18 @@ fn unpinned_locals(text: &str) -> Vec<FrameGroup> {
 /// Each tree function (`#[bhav(.., args = N, ..)] fn f()` or `fn f(sim: Sim)`) whose body
 /// only reads its arguments by number (`param[k]`), with them named in its signature: `fn
 /// f(sim: Sim, p0: i16, _p1: i16, p2: i16)`, each read written `pK`, one group per
-/// function. A function that writes an argument (`param[k] = ..`, `&mut param[k]`, or an
-/// `animate`, whose events may land in argument 0), indexes one by a value, or whose
-/// `raw { }` code reads one keeps the numbers, as does one the file calls (each caller would
-/// have to pass the arguments) or one where a name is taken. (`sleep`/`idle` count down in
-/// argument 0 too, but the build saves and restores it around them when the tree reads it.)
+/// function. These keep the numbers:
+/// - a function that writes an argument (`param[k] = ..`, `&mut param[k]`) or animates
+///   (the events may land in argument 0);
+/// - one that names an argument other than as `param[k]` (a `param:` operand) or indexes
+///   one by a value;
+/// - one whose `raw { }` code names an argument in any form, animates, or runs a primitive
+///   by its bytes;
+/// - one the file calls (each caller would have to pass the arguments);
+/// - one where a name is taken.
+///
+/// `sleep`/`idle` count down in argument 0 too, but the build saves and restores it around
+/// them when the tree reads it.
 fn named_params(text: &str) -> Vec<FrameGroup> {
     use crate::v2::lexer::{TokenKind as K, tokenize};
     let Ok(tokens) = tokenize(text) else {
@@ -1596,7 +1603,16 @@ fn named_params(text: &str) -> Vec<FrameGroup> {
         let mut ok = true;
         for j in body..end {
             match &tokens[j].kind {
-                K::RawBlock(b) if b.contains("param[") || b.contains("animate") => ok = false,
+                // Raw code that names an argument in any form (`param[k]`, a `param:`
+                // operand such as Old Relationship's destination, the `scope(9, k)` cell),
+                // animates, or runs a primitive by its bytes may write one.
+                K::RawBlock(b)
+                    if ["param", "animate", "scope(9,", "op 0x"]
+                        .iter()
+                        .any(|w| b.contains(w)) =>
+                {
+                    ok = false
+                }
                 // Animation events land in argument 0 unless a local is named for them.
                 K::Ident(w) if w == "animate" => ok = false,
                 K::Ident(w) if w == "param" && tokens[j - 1].kind != K::Dot => {
