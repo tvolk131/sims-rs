@@ -44,7 +44,10 @@ people and the objects that hold someone, as `0x4b3510` does (`0x4b017b`,
   sprites. We assume (unverified) that the mesh does not write the software
   depth buffer `0x4ac301` reads. If it did, a person's front would hide
   their own mosaic, which the original does not show. A plate held in
-  front of a censored Sim keeps its pixels out of the mosaic. As in the original, the row asked about is the clipped top plus
+  front of a censored Sim keeps its pixels out of the mosaic: while
+  anyone is censored, each Sim's held objects are drawn a second time into
+  a scratch canvas that holds only the lot's depth, and the test reads
+  that canvas's depth. As in the original, the row asked about is the clipped top plus
   the row within the block, for every block row (`0x4ac4c8`, `0x4ac649`).
 - **Blocks.** Blocks are 2, 4 or 8 pixels by zoom. Pixels are read in the
   original's 5-6-5 unpacking: channels zero-filled, not widened. Each
@@ -86,6 +89,9 @@ calls `sims_render::draw_held_by`:
 - The walk stops at people.
 - What an earlier person's draw drew is left out. Slot lists that
   disagree could otherwise draw an object twice.
+- An object in two people's slots goes to the person its holder word
+  (data word 2) names. If that word names neither, the first to draw it
+  takes it.
 - `holds_person` also takes in each person's own slot tree. When a
   holder's link words reach the person but its slot list does not, the
   lot pass would otherwise draw the person's plate as well.
@@ -149,12 +155,14 @@ Boundaries:
   then by ID, as before.
 - **Slot contents.** Each object is followed by what its slots hold, slot
   by slot, at every depth, as the holder's walk draws them (`0x437c56`).
-- **Holder outside the pass.** A holder not in the pass (hidden, or a
-  person) keeps its place in the walk: under its own holder at its slot,
-  or, held by nothing in the pass, as a root at its first object's key.
-  What it holds stays together in slot order.
-- **Loops.** Holders that hold each other, which no root reaches, are
-  broken at their lowest-keyed object, which joins the roots.
+- **Holder outside the pass.** A hidden holder keeps its place in the
+  walk, under its own holder at its slot. A person, or a holder held by
+  nothing in the pass, is a root at its first object's key. A person's
+  own holder is not followed: people are not in the lot cache's key. What
+  such a holder holds stays together in slot order.
+- **Loops.** Holders that hold each other, which no root reaches, are cut
+  at the lowest-keyed holder on the loop. That holder joins the roots, so
+  what the loop holds still follows its holder.
 
 The presenter's own order was tried and is **not** used. It sorts by each
 object's view tile key `(x + y, x - y)` with the original's sort (legacy

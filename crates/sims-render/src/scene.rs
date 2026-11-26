@@ -420,7 +420,9 @@ pub fn draw_held_except(
 
 /// What `person` holds, as the person's own draw draws it (`0x459dc0`):
 /// the objects in the person's slots, and what those hold, at every
-/// depth, but no person and nothing a person in it holds. As in
+/// depth, but no person and nothing a person in it holds. An object also
+/// in the slots of the other person its holder word (data word 2) names
+/// is left to that person. As in
 /// [`holds_person`], a slot list's first entry links to the next object on
 /// the tile and is not a slot.
 pub fn held_by(world: &World, person: u16) -> BTreeSet<u16> {
@@ -446,8 +448,16 @@ fn held_by_in(
             .into_iter()
             .flat_map(|o| o.slots.iter().skip(1).filter_map(|s| registered(s.object)))
     };
+    // Whether `id` is also in the slots of the other person its holder
+    // word names: that person's draw takes it.
+    let claimed_elsewhere = |id: u16| {
+        let other = objects
+            .get(&id)
+            .and_then(|o| u16::try_from(o.data.get(CONTAINER).copied()?).ok());
+        other.is_some_and(|c| c != person && is_person(c) && slots(c).any(|s| s == id))
+    };
     let mut tree = BTreeSet::new();
-    let mut stack: Vec<u16> = slots(person).collect();
+    let mut stack: Vec<u16> = slots(person).filter(|&id| !claimed_elsewhere(id)).collect();
     while let Some(id) = stack.pop() {
         if id == person || is_person(id) || !tree.insert(id) {
             continue;
@@ -4275,12 +4285,12 @@ fn wall_corner(m: u8) -> (bool, bool) {
 /// followed by what its slots hold, slot by slot and at every depth, as
 /// the holder's draw walks them (`0x437c56`).
 ///
-/// A holder outside `list` (hidden, or a person, whose draw puts what it
-/// holds down slot by slot, `0x459e25`..`0x45a027`) still takes its place
-/// in the walk: under its own holder (in `objects`) at its slot, or, held
-/// by nothing in the list, as a root at its first object's key. Holders
-/// that hold each other, which no root reaches, are broken at their
-/// lowest-keyed object, which joins the roots.
+/// A holder outside `list` still takes its place in the walk. A hidden
+/// one goes under its own holder (in `objects`) at its slot. A person
+/// (whose draw puts what it holds down slot by slot,
+/// `0x459e25`..`0x45a027`), or one held by nothing, is a root at its first
+/// object's key. Holders that hold each other, which no root reaches, are
+/// cut at the lowest-keyed holder on their loop, which joins the roots.
 ///
 /// The original's presenter sorts by each object's view tile key,
 /// `(x + y, x - y)`, with its own sort (legacy `rebuild_order`). That
@@ -4329,7 +4339,13 @@ fn object_order<T: Copy, K: Ord>(
         .collect();
     let mut seen: BTreeSet<u16> = absent.iter().copied().collect();
     while let Some(h) = absent.pop() {
-        match objects.get(&h).and_then(|o| container(h, o)) {
+        // A person's own holder is not followed: people are not in the
+        // lot cache's key, and their draw puts down what they hold.
+        let up = objects
+            .get(&h)
+            .filter(|o| o.person.is_none())
+            .and_then(|o| container(h, o));
+        match up {
             Some((up, slot)) => {
                 children
                     .entry(up)
@@ -4364,22 +4380,6 @@ fn object_order<T: Copy, K: Ord>(
             }
         }
     };
-    // Loops no root reaches: root each at its lowest-keyed object.
-    let mut visited = BTreeSet::new();
-    let mut reached = Vec::new();
-    for &n in &top {
-        walk(n, &mut visited, &mut reached);
-    }
-    let mut stranded: Vec<usize> = (0..list.len())
-        .filter(|&i| !visited.contains(&Node::Item(i)))
-        .collect();
-    stranded.sort_by_key(|&i| of(&list[i]).2);
-    for i in stranded {
-        if !visited.contains(&Node::Item(i)) {
-            walk(Node::Item(i), &mut visited, &mut reached);
-            top.push(Node::Item(i));
-        }
-    }
     // A root's key: its own, or for a holder outside the list, its first
     // object's in walk order.
     let key = |n: Node| match n {
@@ -4390,6 +4390,46 @@ fn object_order<T: Copy, K: Ord>(
             first.first().map(|&i| of(&list[i]).2)
         }
     };
+    // Each node's holder in the walk.
+    let mut parent = BTreeMap::new();
+    for (&h, held) in &children {
+        let up = ids.get(&h).map_or(Node::Absent(h), |&i| Node::Item(i));
+        for &(_, _, c) in held {
+            parent.insert(c, up);
+        }
+    }
+    // Loops no root reaches: climb from each stranded object to its loop
+    // and cut the loop at its lowest-keyed holder.
+    let mut visited = BTreeSet::new();
+    let mut reached = Vec::new();
+    for &n in &top {
+        walk(n, &mut visited, &mut reached);
+    }
+    let mut stranded: Vec<usize> = (0..list.len())
+        .filter(|&i| !visited.contains(&Node::Item(i)))
+        .collect();
+    stranded.sort_by_key(|&i| of(&list[i]).2);
+    for i in stranded {
+        if visited.contains(&Node::Item(i)) {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut on = BTreeSet::new();
+        let mut at = Node::Item(i);
+        while on.insert(at) {
+            path.push(at);
+            match parent.get(&at) {
+                Some(&up) => at = up,
+                None => break,
+            }
+        }
+        let start = path.iter().position(|&n| n == at).unwrap_or(0);
+        let Some(root) = path[start..].iter().copied().min_by_key(|&n| key(n)) else {
+            continue;
+        };
+        walk(root, &mut visited, &mut reached);
+        top.push(root);
+    }
     top.sort_by_cached_key(|&n| key(n));
     let mut order = Vec::with_capacity(list.len());
     let mut visited = BTreeSet::new();
@@ -5253,6 +5293,18 @@ mod tests {
         assert_eq!(held_by_in(&objects, 7, is_person), BTreeSet::new());
         // The bench's tree, as a person's, stops at the person it holds.
         assert_eq!(held_by_in(&objects, 1, is_person), BTreeSet::from([3]));
+        // A drink in two people's slots goes to the one its holder word
+        // names, or, naming neither, to both (the frame draws it once).
+        entry(&mut objects, 2, 2, 9);
+        objects.get_mut(&9).unwrap().data[CONTAINER] = 8;
+        assert_eq!(held_by_in(&objects, 2, is_person), BTreeSet::from([4]));
+        assert_eq!(held_by_in(&objects, 8, is_person), BTreeSet::from([9]));
+        objects.get_mut(&9).unwrap().data[CONTAINER] = 2;
+        assert_eq!(held_by_in(&objects, 2, is_person), BTreeSet::from([4, 9]));
+        assert_eq!(held_by_in(&objects, 8, is_person), BTreeSet::new());
+        objects.get_mut(&9).unwrap().data[CONTAINER] = 0;
+        assert_eq!(held_by_in(&objects, 2, is_person), BTreeSet::from([4, 9]));
+        entry(&mut objects, 2, 2, 0);
         // Nor is an object that follows a person on their tile.
         entry(&mut objects, 1, 0, 0);
         follow(&mut objects, 10, 8);
@@ -6032,6 +6084,47 @@ mod tests {
         object_order(&mut list, &CowMap::new(), |o| (o.id, *o, key(o)));
         let ids: Vec<u16> = list.iter().map(|o| o.id).collect();
         assert_eq!(ids, vec![1, 3, 4, 5]);
+    }
+
+    #[test]
+    fn a_loop_is_cut_at_its_holder_not_at_what_it_holds() {
+        // 1 and 2 hold each other; 1 also holds a cup (3), keyed lowest; a
+        // lamp (4) is keyed between the cup and the loop.
+        let objects = [
+            object(1, 1, [0, 0, 1], &[(CONTAINER, 2), (CONTAINER_SLOT, 0)]),
+            object(2, 2, [0, 0, 1], &[(CONTAINER, 1), (CONTAINER_SLOT, 0)]),
+            object(3, 3, [0, 0, 1], &[(CONTAINER, 1), (CONTAINER_SLOT, 1)]),
+            object(4, 4, [0, 0, 1], &[]),
+        ];
+        let all = objects.iter().map(|o| (o.id, o.clone())).collect();
+        let mut list: Vec<&Object> = objects.iter().collect();
+        let key = |o: &Object| [0, 5, 6, 0, 3][usize::from(o.id)];
+        object_order(&mut list, &all, |o| (o.id, *o, key(o)));
+        let ids: Vec<u16> = list.iter().map(|o| o.id).collect();
+        assert_eq!(ids, vec![4, 1, 2, 3]);
+    }
+
+    #[test]
+    fn a_persons_own_holder_is_not_followed() {
+        // A person (9, not in the list) holds a cup (3); the person's
+        // holder word names a table (1). A lamp (2) is keyed between.
+        let mut person = person_object(9, [0, 0, 1]);
+        person.data[CONTAINER] = 1;
+        let objects = [
+            object(1, 1, [0, 0, 1], &[]),
+            object(2, 2, [0, 0, 1], &[]),
+            object(3, 3, [0, 0, 1], &[(CONTAINER, 9), (CONTAINER_SLOT, 0)]),
+        ];
+        let all: CowMap<u16, Object> = objects
+            .iter()
+            .cloned()
+            .chain([person])
+            .map(|o| (o.id, o))
+            .collect();
+        let mut list: Vec<&Object> = objects.iter().collect();
+        object_order(&mut list, &all, |o| (o.id, *o, o.id));
+        let ids: Vec<u16> = list.iter().map(|o| o.id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 
     #[test]
