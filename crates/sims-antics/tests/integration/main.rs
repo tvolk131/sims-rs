@@ -34,6 +34,7 @@ mod v2_2_lint_polish;
 mod v2_2_step2_lint;
 mod v2_2_temps_and_flags;
 mod v2_3_if_let_and_fixes;
+mod v2_3_lift_strict_leap;
 mod v2_3_step2_node_order_and_tails;
 mod v2_compiler;
 mod v2_fmt_and_decompile;

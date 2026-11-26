@@ -271,6 +271,7 @@ pub fn decompile_iff_to_v2_report(
                     && (plan.drop_all_wave3(&generated)
                         || plan.drop_all_wave2(&generated)
                         || plan.drop_all_extras(&generated)
+                        || plan.unname_all_locals(&generated)
                         || plan.number_all_raw_bcons(&generated));
                 if !unblamed
                     && !tree.is_some_and(|id| plan.drop_pin(id, &generated))
@@ -282,6 +283,7 @@ pub fn decompile_iff_to_v2_report(
                     && !tree.is_some_and(|id| plan.name_builtin_locals_only(id, &generated))
                     && !tree.is_some_and(|id| plan.drop_inherit(&model, id))
                     && !tree.is_some_and(|id| plan.drop_extras(id, &generated))
+                    && !tree.is_some_and(|id| plan.unname_locals(id, &generated))
                     && !tree.is_some_and(|id| plan.number_raw_bcons(id, &generated))
                     && !plan.lower_at_line(&model, &generated, line)
                     // A tree that fails at its lowest level is left out.
@@ -315,6 +317,7 @@ pub fn decompile_iff_to_v2_report(
                         plan.drop_all_wave3(&generated)
                             || plan.drop_all_wave2(&generated)
                             || plan.drop_all_extras(&generated)
+                            || plan.unname_all_locals(&generated)
                             || plan.number_all_raw_bcons(&generated)
                             || plan.lower_all(&model)
                     }
@@ -342,6 +345,7 @@ pub fn decompile_iff_to_v2_report(
                             || plan.name_builtin_locals_only(id, &generated)
                             || plan.drop_inherit(&model, id)
                             || plan.drop_extras(id, &generated)
+                            || plan.unname_locals(id, &generated)
                             || plan.other_order(&mut model, id)
                             || plan.lower_tree(&model, id)
                             || plan.number_raw_bcons(id, &generated);
@@ -5456,6 +5460,9 @@ struct Plan {
     /// out for, and the pin: `None` once it was tried and none is kept (see
     /// [`Plan::pin_nodes`]). A pin applies only while the tree is written as that text.
     pins: BTreeMap<u16, (String, Option<NodePin>)>,
+    /// Lifecycle blocks and trees without the extra idioms that leave their locals by number,
+    /// after a round that named them was not proven or did not compile.
+    unnamed_locals: BTreeSet<u16>,
 }
 
 /// `share_tails` and a `node_order` written in a tree's `#[bhav(..)]` header, which
@@ -5596,6 +5603,7 @@ impl Plan {
             pre_wave3: BTreeSet::new(),
             fixed_locals: BTreeSet::new(),
             pins: BTreeMap::new(),
+            unnamed_locals: BTreeSet::new(),
         }
     }
 
@@ -5673,6 +5681,7 @@ impl Plan {
             || self.name_builtin_locals_only(id, generated)
             || self.drop_inherit(model, id)
             || self.drop_extras(id, generated)
+            || self.unname_locals(id, generated)
             || self.number_raw_bcons(id, generated)
             || self.lower_tree(model, id)
     }
@@ -5870,6 +5879,21 @@ impl Plan {
     /// did not, so the tree has to move down a style instead.
     fn drop_extras(&mut self, id: u16, generated: &Generated) -> bool {
         generated.extras.contains(&id) && self.plain.insert(id)
+    }
+
+    /// Leaves lifecycle block or plain tree `id`'s locals by number from now on, when the
+    /// last round named them. Tried after [`Self::drop_extras`]: names are no extra idiom,
+    /// but each pins its frame word.
+    fn unname_locals(&mut self, id: u16, generated: &Generated) -> bool {
+        generated.named_plain.contains(&id) && self.unnamed_locals.insert(id)
+    }
+
+    /// [`Self::unname_locals`] for every tree, for a failure no one tree is blamed for.
+    fn unname_all_locals(&mut self, generated: &Generated) -> bool {
+        let before = self.unnamed_locals.len();
+        self.unnamed_locals
+            .extend(generated.named_plain.iter().copied());
+        self.unnamed_locals.len() != before
     }
 
     /// [`Self::drop_extras`] for every tree, for a failure no one tree is blamed for.
@@ -6086,6 +6110,8 @@ struct Generated {
     tree_texts: BTreeMap<u16, String>,
     /// Trees written with a pin.
     pinned: BTreeSet<u16>,
+    /// Lifecycle blocks and trees without the extra idioms that named their locals.
+    named_plain: BTreeSet<u16>,
     /// 0-based lines holding the `variant` members.
     variant_lines: std::ops::Range<usize>,
     /// 0-based lines holding the `strings` members.
@@ -6127,6 +6153,7 @@ impl Model {
         let mut raw_bcons_named = BTreeSet::new();
         let mut tree_texts = BTreeMap::new();
         let mut pinned = BTreeSet::new();
+        let mut named_plain = BTreeSet::new();
         out.line("// Decompiled by `sims-antics lift --v2`.");
         if self.behavioral {
             for line in BEHAVIORAL_HEADER {
@@ -6396,6 +6423,27 @@ impl Model {
                             named_other_locals.insert(t.id);
                         }
                     }
+                    // A lifecycle block, or a tree written without the extra idioms, still
+                    // names every local it reads or writes: a pinned `#[slot]` word is the
+                    // frame word the number names (see [`Plan::unname_locals`]).
+                    let plain_names = (as_lifecycle.is_some() || plan.plain.contains(&t.id))
+                        && !plan.unnamed_locals.contains(&t.id);
+                    if plain_names {
+                        walk_stmts(body, &mut |s| {
+                            for op in stmt_operands(s) {
+                                if let OperandRef::Direct(o) = op
+                                    && o.scope == 25
+                                    && let Ok(index) = u16::try_from(o.index)
+                                    && index < t.original.locals
+                                {
+                                    named_locals = named_locals.max(index + 1);
+                                }
+                            }
+                        });
+                        if named_locals > 0 {
+                            named_plain.insert(t.id);
+                        }
+                    }
                     let mut tr = Translator {
                         model: self,
                         plan,
@@ -6412,6 +6460,7 @@ impl Model {
                         sims_loop: None,
                         cursor: None,
                         named_locals,
+                        plain_names,
                         extras: std::cell::Cell::new(false),
                         merged: false,
                         temps_named: std::cell::Cell::new(false),
@@ -6419,7 +6468,7 @@ impl Model {
                         wave3_used: std::cell::Cell::new(false),
                         stack_moves: sim && assigns_stack_obj(body),
                     };
-                    if named_locals > 0 && tr.extra() {
+                    if named_locals > 0 && (plain_names || tr.extra()) {
                         // `#[slot]` pins each word the builtins address by number; the
                         // build keeps a pinned word in the frame even when nothing names it.
                         for i in 0..named_locals {
@@ -6554,6 +6603,7 @@ impl Model {
             raw_bcons_named,
             tree_texts,
             pinned,
+            named_plain,
             variant_lines,
             strings_lines,
         }
@@ -6807,6 +6857,9 @@ struct Translator<'a> {
     cursor: Option<String>,
     /// Number of leading frame slots declared for builtins with named local operands.
     named_locals: u16,
+    /// The tree names its locals although it is written without the extra idioms (see
+    /// [`Plan::unname_locals`]).
+    plain_names: bool,
     /// Whether an extra idiom was written (see [`Translator::extra`]).
     extras: std::cell::Cell<bool>,
     /// Whether `if` arms were merged (see [`Translator::merge_arms`]).
@@ -8961,7 +9014,8 @@ impl Translator<'_> {
     }
 
     fn local_name(&self, slot: u16) -> Option<String> {
-        (slot < self.named_locals && self.extra()).then(|| format!("slot_{slot}"))
+        (slot < self.named_locals && (self.plain_names || self.extra()))
+            .then(|| format!("slot_{slot}"))
     }
 
     fn rvalue(&self, r: &OperandRef) -> Option<String> {
