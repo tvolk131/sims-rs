@@ -2874,6 +2874,13 @@ impl Parser {
         if self.peek().kind == TokenKind::HashBracket {
             return self.parse_attr_stmt(span);
         }
+        if let Some(stmt) = self.parse_panic_macro()? {
+            // `panic!();`, or `{ .. panic!() }` as a block's last statement (Rust's tail form).
+            if self.peek().kind != TokenKind::RBrace {
+                self.expect(&TokenKind::Semicolon, "';'")?;
+            }
+            return Ok(stmt);
+        }
         if let TokenKind::Ident(kw) = &self.peek().kind {
             match kw.as_str() {
                 "let" => return self.parse_let_stmt(span),
@@ -2924,6 +2931,7 @@ impl Parser {
                         return Ok(V2Stmt::ReturnError {
                             span,
                             from_try: false,
+                            panic: false,
                         });
                     }
                     let expr = self.parse_expr()?;
@@ -3047,7 +3055,45 @@ impl Parser {
             });
         }
 
-        let _is_mut = self.eat_ident("mut");
+        let is_mut = self.eat_ident("mut");
+        if self.is_ident("_") {
+            // `let _ = expr;`: evaluate and discard; `_` binds nothing.
+            let wild = self.span();
+            self.bump();
+            if is_mut {
+                return Err(Error::at(
+                    wild,
+                    "'let mut _' has nothing to mutate: '_' binds no variable (write 'let _ = expr;')",
+                ));
+            }
+            if self.peek().kind == TokenKind::Colon {
+                return Err(Error::at(
+                    self.span(),
+                    "'let _' takes no type: '_' binds no variable (write 'let _ = expr;')",
+                ));
+            }
+            if self.peek().kind != TokenKind::Assign {
+                return Err(Error::at(
+                    self.span(),
+                    "'let _' needs a value to discard ('let _ = expr;')",
+                ));
+            }
+            self.bump();
+            // `let _ = animate(..);` is the statement `animate(..);` (which waits for the
+            // clip), as `let _ = f();` is `f();`; a parenthesized `(animate(..))` stays a value.
+            if self.is_ident("animate") && self.peek_at(1).kind == TokenKind::LParen {
+                return self.parse_animate_stmt(span);
+            }
+            let init = self.parse_expr()?;
+            self.expect(&TokenKind::Semicolon, "';'")?;
+            return Ok(V2Stmt::Let {
+                span,
+                name: "_".to_owned(),
+                ty: None,
+                init,
+                slot: None,
+            });
+        }
         let (name, _) = self.expect_binding_ident("variable name")?;
         let ty = if self.eat(&TokenKind::Colon) {
             Some(self.parse_type()?)
@@ -3127,6 +3173,10 @@ impl Parser {
         }
         let let_span = self.span();
         match self.parse_let_stmt(let_span)? {
+            V2Stmt::Let { name, .. } if name == "_" => Err(Error::at(
+                slot_span,
+                "'let _' binds no variable, so it has no slot to place",
+            )),
             V2Stmt::Let {
                 span: _,
                 name,
@@ -3456,7 +3506,11 @@ impl Parser {
         let ends_arm =
             |p: &mut Self| p.eat(&TokenKind::Comma) || p.peek().kind == TokenKind::RBrace;
         // A bare exit must end the arm; otherwise the keyword is a binding's name.
-        if self.is_ident("break") || self.is_ident("continue") || self.is_ident("return") {
+        if self.is_ident("break")
+            || self.is_ident("continue")
+            || self.is_ident("return")
+            || self.is_ident("panic")
+        {
             if let Ok(Some(exit)) = self.parse_bare_exit()
                 && ends_arm(self)
             {
@@ -3707,10 +3761,37 @@ impl Parser {
         Ok(V2Expr::Block { span, body })
     }
 
+    /// `panic!()`: the SimAntics error exit (253), the same statement as `return error;` but
+    /// never a binding named `error`. The exit carries no message, so arguments are refused.
+    fn parse_panic_macro(&mut self) -> Result<Option<V2Stmt>> {
+        if !(self.is_ident("panic") && self.peek_at(1).kind == TokenKind::Bang) {
+            return Ok(None);
+        }
+        let span = self.span();
+        self.bump(); // 'panic'
+        self.bump(); // '!'
+        self.expect(&TokenKind::LParen, "'(' after 'panic!'")?;
+        if self.peek().kind != TokenKind::RParen {
+            return Err(Error::at(
+                self.span(),
+                "'panic!()' takes no arguments: the SimAntics error exit (253) carries no message",
+            ));
+        }
+        self.bump(); // ')'
+        Ok(Some(V2Stmt::ReturnError {
+            span,
+            from_try: false,
+            panic: true,
+        }))
+    }
+
     /// A bare `break`, `continue`, `return`, `return error` or `return value` as a `match` arm
     /// (`_ => return false,`), ending before the arm's `,` / `}`.
     fn parse_bare_exit(&mut self) -> Result<Option<V2Stmt>> {
         let span = self.span();
+        if let Some(stmt) = self.parse_panic_macro()? {
+            return Ok(Some(stmt));
+        }
         Ok(Some(if self.eat_ident("break") {
             V2Stmt::Break { span }
         } else if self.eat_ident("continue") {
@@ -3725,6 +3806,7 @@ impl Parser {
                 V2Stmt::ReturnError {
                     span,
                     from_try: false,
+                    panic: false,
                 }
             } else {
                 V2Stmt::Return {
@@ -4171,6 +4253,14 @@ impl Parser {
                 match s.as_str() {
                     "true" => Ok(V2Expr::Bool(tok.span, true)),
                     "false" => Ok(V2Expr::Bool(tok.span, false)),
+                    "_" => Err(Error::at(
+                        tok.span,
+                        "'_' is not a value: it only discards one ('let _ = expr;')",
+                    )),
+                    "panic" if self.peek().kind == TokenKind::Bang => Err(Error::at(
+                        tok.span,
+                        "'panic!()' is not a value: it is a statement ('panic!();') or a diverging branch ('else { panic!() }', '_ => panic!(),')",
+                    )),
                     "match" => self.parse_match_expr(tok.span),
                     "if" => self.parse_if_expr(tok.span),
                     _ => {

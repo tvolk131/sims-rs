@@ -1152,6 +1152,18 @@ impl<'a> Printer<'a> {
         if self.a.attr_at[p] {
             return Sep::None;
         }
+        // Macro bang `panic!()`.
+        if n_punct
+            && nt == "!"
+            && self.toks[p].class == Class::Ident
+            && !is_space_keyword(pt)
+            && self
+                .toks
+                .get(i + 1)
+                .is_some_and(|t| t.class == Class::Punct && t.text == "(")
+        {
+            return Sep::None;
+        }
         // Tight punctuation.
         if n_punct && matches!(nt, "," | ";" | "." | "?" | ":" | "::" | ".." | "..=") {
             return Sep::None;

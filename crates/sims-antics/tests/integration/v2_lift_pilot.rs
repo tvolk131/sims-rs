@@ -154,11 +154,11 @@ object "Fable Calculator" {
     };
     let lifted = round_trip(&iff, &opts);
     for spelling in [
-        "compute_4300(1, 0, 0, 0)",
+        "compute(1, 0, 0, 0)",
         "globals::pick_a_dial(-2, 3)",
         "globals::pick_a_dial_306()",
         "globals::global_307()",
-        "return compute_4300(2, 0, 0, 0);",
+        "return compute(2, 0, 0, 0);",
         "if !call 4300(temps) { return false; }",
     ] {
         assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
@@ -213,10 +213,10 @@ fn bcon_and_sound_identifiers_follow_resource_labels() {
     );
     let lifted = round_trip(&iff, &DecompileV2Options::default());
     for spelling in [
-        "temp[0] = Dial.tuning_speed;",
-        "temp[1] = Dial.e1;",
-        "temp[2] = Dial.e2;",
-        "temp[3] = Range.upper_band;",
+        "temp[0] = Dial::tuning_speed;",
+        "temp[1] = Dial::e1;",
+        "temp[2] = Dial::e2;",
+        "temp[3] = Range::upper_band;",
         "sound fable_ping = fwav(6, wav: \"Fable-Ping\");",
         "sound fable_ping_8 = fwav(8, wav: \"Fable_Ping\");",
         "play_sound(fable_ping);",
@@ -567,7 +567,7 @@ fn zero_node_trees_lift_as_frame_empty() {
     );
     let lifted = round_trip(&iff, &DecompileV2Options::default());
     assert!(
-        lifted.contains("revision = 0, empty)]\n    fn start_fire_4300() {}"),
+        lifted.contains("revision = 0, empty)]\n    fn start_fire() {}"),
         "{lifted}"
     );
 }
