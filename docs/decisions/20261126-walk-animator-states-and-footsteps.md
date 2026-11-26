@@ -130,10 +130,12 @@ comes from the first byte of the label of the pattern's `SPR2` (0x49fd95): 'C' 3
 - `sims_content::SurfaceCatalog` does not keep the label, and this track does not own
   sims-content.
 - So `LotPrices::load` reads the categories of `GameData/floors.iff`, keys 1 to 29, which is
-  one extra file at load. A missing sprite gets 2, the catalog's not-found answer.
+  one extra file at load. A key with no sprite is still in the original's catalog, made with category 0 (0x4a0722, inserted at 0x4a029a).
 - A footstep on a plug-in pattern has no category here and plays nothing. Silence is the
   honest answer; a guessed sound would not be.
-- `Interpreter::floor_categories` overrides the table for tests.
+- Every interpreter a booted `Lot` makes carries the table (`floor_categories`, or through
+  `architecture_prices`), so a refresh outside the tick (selecting a Sim) hears the same
+  floors. `Interpreter::floor_categories` also overrides the table for tests.
 
 ## Decision 4: sounds never touch the simulation
 
@@ -146,7 +148,11 @@ comes from the first byte of the label of the pattern's `SPR2` (0x49fd95): 'C' 3
   that word alone. This keeps the sound sink out of the hash. It differs from the original
   only on a lot already in that inconsistent state.
 - A lot without the pool array gets no pool surface. 0x478f76 tests for the array; 0x478fa3
-  does not. A tile off an array, or a level with no floor array, traps.
+  does not.
+- A pick that cannot be made plays nothing and never fails the event. Examples are a tile
+  off an array (x 1023.5 rounds to tile 64), where the original reads whatever memory lies
+  there, or a level with no floor array. A trap there would reach play mode's reset and
+  change the lot.
 
 ## Evidence
 

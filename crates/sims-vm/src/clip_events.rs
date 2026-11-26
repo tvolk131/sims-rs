@@ -121,7 +121,8 @@ impl Interpreter<'_> {
     /// there is not worked out.
     ///
     /// Otherwise a sound key's pick ([`footsteps::pick`]) goes to the sound
-    /// events, if they are noted ([`Interpreter::sounds`]).
+    /// events, if they are noted ([`Interpreter::sounds`]). A pick that
+    /// fails plays nothing; it never fails the event.
     fn timed_event(
         &self,
         world: &mut World,
@@ -155,8 +156,13 @@ impl Interpreter<'_> {
                     )));
                 }
                 "sound" | "selectedsound" | "deselectedsound" | "footstep" => {
+                    // A pick that cannot be made (a tile off the lot's
+                    // arrays, where the original reads whatever memory
+                    // lies there) plays nothing and never stops the tick:
+                    // a sound must not change what the lot does.
                     let floors = self.floor_categories();
-                    if let Some(event) = footsteps::pick(world, id, a, layer, key, value, floors)?
+                    if let Ok(Some(event)) =
+                        footsteps::pick(world, id, a, layer, key, value, floors)
                         && let Some(sink) = self.sounds
                     {
                         sink.borrow_mut().push(event);

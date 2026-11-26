@@ -508,8 +508,9 @@ impl LotPrices {
 
 /// The categories of the base game's own floor patterns, keys 1 to 29
 /// (each the `SPR2` of that ID in `GameData/floors.iff`). A key without
-/// its sprite is not in the original's catalog, which answers 2 for it
-/// (0x4a148c). None of them when the file cannot be read.
+/// its sprite is still listed, with the category its entry is made with
+/// (0x4a0722 clears +0x2c; 0x4a029a inserts it either way): 0. None of
+/// them when the file cannot be read.
 fn builtin_floor_categories(install: &Install) -> BTreeMap<u16, u8> {
     let Some(iff) = install
         .file("GameData/floors.iff")
@@ -520,7 +521,7 @@ fn builtin_floor_categories(install: &Install) -> BTreeMap<u16, u8> {
     };
     (1u16..=29)
         .map(|key| {
-            let category = iff.get(b"SPR2", key).map_or(2, |chunk| {
+            let category = iff.get(b"SPR2", key).map_or(0, |chunk| {
                 crate::footsteps::floor_category(iff.label_bytes(chunk))
             });
             (key, category)

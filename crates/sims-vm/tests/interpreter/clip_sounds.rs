@@ -331,6 +331,10 @@ fn a_footstep_needs_the_animator_on_the_lots_arrays() {
         ([-0.5, 200.0], false),
         ([100.0, -1.0], false),
         ([-0.0, 0.0], true),
+        // Off the arrays' far side (1023.5 + 0.5 is tile 64): the
+        // original reads past its array; nothing plays, nothing fails.
+        ([1023.5, 200.0], false),
+        ([100.0, 1023.5], false),
         ([100.0, 200.0], true),
     ] {
         let mut fx = footstep("1", 0);
