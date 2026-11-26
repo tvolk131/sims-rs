@@ -1127,7 +1127,8 @@ struct Flip {
 fn token_trees(tokens: &[crate::v2::lexer::Token]) -> Vec<Option<u16>> {
     use crate::v2::lexer::TokenKind as K;
     let kind = |k: usize| tokens.get(k).map(|t| &t.kind);
-    let mut depth = 0usize;
+    // Braces and parentheses deep: members sit at one brace and no parenthesis.
+    let (mut depth, mut parens) = (0usize, 0usize);
     let (mut pending, mut tree) = (None, None);
     let mut trees = Vec::with_capacity(tokens.len());
     let mut k = 0;
@@ -1152,14 +1153,21 @@ fn token_trees(tokens: &[crate::v2::lexer::Token]) -> Vec<Option<u16>> {
                     Some(K::Int(n)) => u16::try_from(*n).ok(),
                     _ => None,
                 };
-                if word(0, "bhav") {
-                    pending = (1..attr.len()).find_map(|j| {
+                // Only a member's own attribute counts (not a parameter's, nor one inside
+                // an `extern mod`); one without an ID (`#[bhav]`) keeps the pending one.
+                let id = if word(0, "bhav") {
+                    (1..attr.len()).find_map(|j| {
                         (word(j, "id") && attr.get(j + 1).map(|t| &t.kind) == Some(&K::Assign))
                             .then(|| int(j + 2))
                             .flatten()
-                    });
+                    })
                 } else if word(0, "id") {
-                    pending = int(2);
+                    int(2)
+                } else {
+                    None
+                };
+                if depth == 1 && parens == 0 && id.is_some() {
+                    pending = id;
                 }
                 for _ in k..=end.min(tokens.len() - 1) {
                     trees.push(tree);
@@ -1169,7 +1177,9 @@ fn token_trees(tokens: &[crate::v2::lexer::Token]) -> Vec<Option<u16>> {
             }
             K::LBrace => depth += 1,
             K::RBrace => depth = depth.saturating_sub(1),
-            K::Ident(w) if depth == 1 => {
+            K::LParen => parens += 1,
+            K::RParen => parens = parens.saturating_sub(1),
+            K::Ident(w) if depth == 1 && parens == 0 => {
                 // A member starts after `{`, `}`, `;`, an attribute's `]` or `pub`.
                 let starts = k == 0
                     || matches!(
@@ -8299,6 +8309,11 @@ mod tests {
             .map(|f| f.tree)
             .collect();
         assert_eq!(trees, [4300, 0x10CD, 4096]);
+        // A parameter's attribute is no member; a bare `#[bhav]` keeps the ID before it; an
+        // `extern mod`'s attributes pin nothing after it.
+        let text = "object \"O\" {\n#[bhav(id = 4300)]\nfn a(#[temp(0)] x: i16) {\n    if !(x > 1) {\n    }\n}\n#[id(4301)]\n#[bhav]\nfn b() {\n    if !(temp[0] > 2) {\n    }\n}\nextern mod m {\n    #[id(300)]\n    fn probe() -> bool;\n}\npub fn helper() {\n    if !(temp[0] > 3) {\n    }\n}\n}\n";
+        let trees: Vec<u16> = negated_comparisons(text).iter().map(|f| f.tree).collect();
+        assert_eq!(trees, [4300, 4301]);
         // A line with a multibyte character gets no offsets, so nothing on it is flipped.
         let text = "object \"O\" {\n#[bhav(id = 4300, label = \"é\")] fn a() { if !(temp[0] > 1) {\n    }\n}\n}\n";
         assert!(negated_comparisons(text).is_empty());
