@@ -388,7 +388,119 @@ pub fn draw_held_with_attach(
     attach: &BTreeMap<u16, PersonAttach>,
     canvas: &mut Canvas,
 ) -> Stats {
-    let held = holds_person(world);
+    draw_held_except(
+        world,
+        lot,
+        assets,
+        camera,
+        options,
+        attach,
+        &BTreeSet::new(),
+        canvas,
+    )
+}
+
+/// Like [`draw_held_with_attach`], leaving out `drawn`: what the people's
+/// own draws already drew ([`draw_held_by`]).
+#[allow(clippy::too_many_arguments)]
+pub fn draw_held_except(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    options: RenderOptions,
+    attach: &BTreeMap<u16, PersonAttach>,
+    drawn: &BTreeSet<u16>,
+    canvas: &mut Canvas,
+) -> Stats {
+    let mut held = holds_person(world);
+    held.retain(|id| !drawn.contains(id));
+    draw_set(world, lot, assets, camera, options, attach, held, canvas)
+}
+
+/// What `person` holds, as the person's own draw draws it (`0x459dc0`):
+/// the objects in the person's slots, and what those hold, at every
+/// depth, but no person and nothing a person in it holds. As in
+/// [`holds_person`], a slot list's first entry links to the next object on
+/// the tile and is not a slot.
+pub fn held_by(world: &World, person: u16) -> BTreeSet<u16> {
+    held_by_in(&world.objects, person, |id| {
+        world.objects.get(&id).is_some_and(|o| o.person.is_some())
+    })
+}
+
+/// [`held_by`] for `objects`, `is_person` telling the people.
+fn held_by_in(
+    objects: &CowMap<u16, Object>,
+    person: u16,
+    is_person: impl Fn(u16) -> bool,
+) -> BTreeSet<u16> {
+    let registered = |w: i16| {
+        u16::try_from(w)
+            .ok()
+            .filter(|&id| id != 0 && objects.contains_key(&id))
+    };
+    let slots = |id: u16| {
+        objects
+            .get(&id)
+            .into_iter()
+            .flat_map(|o| o.slots.iter().skip(1).filter_map(|s| registered(s.object)))
+    };
+    let mut tree = BTreeSet::new();
+    let mut stack: Vec<u16> = slots(person).collect();
+    while let Some(id) = stack.pop() {
+        if id == person || is_person(id) || !tree.insert(id) {
+            continue;
+        }
+        stack.extend(slots(id));
+    }
+    tree
+}
+
+/// Draws what `person` holds ([`held_by`]) at the person's attach points
+/// `attach`, as the person's own draw does just before it draws the person
+/// (`0x459e45`..`0x45a027`, then the person at `0x45a131`). Returns what it
+/// drew, for [`draw_held_except`] to leave out.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_held_by(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    options: RenderOptions,
+    person: u16,
+    attach: PersonAttach,
+    canvas: &mut Canvas,
+) -> BTreeSet<u16> {
+    let held = held_by(world, person);
+    if !held.is_empty() {
+        let attach = BTreeMap::from([(person, attach)]);
+        draw_set(
+            world,
+            lot,
+            assets,
+            camera,
+            options,
+            &attach,
+            held.clone(),
+            canvas,
+        );
+    }
+    held
+}
+
+/// The held pass over the objects `held`.
+#[allow(clippy::too_many_arguments)]
+fn draw_set(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    options: RenderOptions,
+    attach: &BTreeMap<u16, PersonAttach>,
+    held: BTreeSet<u16>,
+    canvas: &mut Canvas,
+) -> Stats {
     if held.is_empty() {
         return Stats::default();
     }
@@ -713,6 +825,24 @@ fn held_trees(objects: &CowMap<u16, Object>, people: &BTreeSet<u16>) -> BTreeSet
     }
     tree.retain(|id| !people.contains(id));
     tree
+}
+
+/// Whether the ground is drawn under level 1's tile `[x, y]` (`0x4af029`):
+/// unless the tile and its four neighbours all have a floor and all four
+/// neighbours are water (`Arry 10` not `0xff`, `0x478f4a`). A split tile's
+/// floor counts as a floor, as the original's does.
+fn ground_shows(lot: &Lot, [x, y]: [i32; 2]) -> bool {
+    let last = lot.size as i32;
+    let at = |[x, y]: [i32; 2]| Lot::cell(x as usize, y as usize);
+    let floored = |p| lot.levels[0].floors.get(at(p)).is_some_and(|&f| f != 0);
+    let water = |p| lot.water.get(at(p)).is_some_and(|&w| w != 0xff);
+    let around = [
+        [(x - 1).max(0), y],
+        [(x + 1).min(last), y],
+        [x, (y - 1).max(0)],
+        [x, (y + 1).min(last)],
+    ];
+    !(floored([x, y]) && around.iter().all(|&p| floored(p) && water(p)))
 }
 
 /// Which walls of a level are cut down, and which objects hide with them.
@@ -1864,7 +1994,9 @@ impl<'a> Painter<'a> {
             let inner = 1..self.lot.size as i32 - 1;
             for x in inner.clone() {
                 for y in inner.clone() {
-                    self.terrain([x, y]);
+                    if ground_shows(self.lot, [x, y]) {
+                        self.terrain([x, y]);
+                    }
                 }
             }
             // Buy (`2`) and Build (`1`) modes draw the dotted black lot
@@ -2464,32 +2596,11 @@ impl<'a> Painter<'a> {
     ) {
         let index = (level - 1) as usize;
         let zoom = self.camera.zoom.index();
-        // Sort individual wall segments back-to-front by their normalized
-        // rotated endpoints `(lo, hi)` in `(vx + vy, vx - vy)` order,
-        // approximating the original's view-sorted run traversal (`0x54045b` →
-        // `0x540809` → `0x54088d` → `0x44054c`) so that on depth ties
-        // (`d <= dst + 1` at `0x4c49f2`), front walls overwrite back walls on
-        // rotated views. (Whole-run completion across crossing runs and
-        // mid-run trim/cap interleaving at `0x53e335`/`0x53e3c0` remain
-        // separate passes.)
-        let mut ordered = Vec::new();
-        for x in 0..self.lot.size as i32 {
-            for y in 0..self.lot.size as i32 {
-                let wall = self.lot.levels[index].walls[Lot::cell(x as usize, y as usize)];
-                if wall.segments == 0 {
-                    continue;
-                }
-                for s in segments(x, y) {
-                    if wall.segments & s.bit == 0 {
-                        continue;
-                    }
-                    let (lo, hi) = wall_draw_key(self.camera, s.from, s.to);
-                    ordered.push((lo, hi, x, y, wall, s));
-                }
-            }
-        }
-        ordered.sort_by_key(|&(lo, hi, x, y, _, ref s)| (lo, hi, x, y, s.bit));
-        for (_, _, x, y, wall, s) in ordered {
+        // The original draws the walls run by run, in its wall graph's
+        // order ([`wall_order`]).
+        let ordered = wall_order(self.camera, self.lot, index);
+        for (x, y, s) in ordered {
+            let wall = self.lot.levels[index].walls[Lot::cell(x as usize, y as usize)];
             let style = if s.bit == lot::WEST {
                 wall.styles[0]
             } else {
@@ -3210,8 +3321,7 @@ impl<'a> Painter<'a> {
             };
             list.push((anchor, screen, id, o, pose, [x, y], preview_at.is_some()));
         }
-        // Far objects first, so soft edges blend over what is behind them.
-        list.sort_by_key(|&(a, _, id, ..)| (std::cmp::Reverse(a.depth), id));
+        object_order(&mut list, self.camera, |item| (item.2, item.3, item.5));
         for &(base_anchor, base_screen, id, o, pose, pos, blocked_preview) in &list {
             let Some(definition) = self.assets.definition_ref(o.guid) else {
                 self.stats.missing_objects += 1;
@@ -3973,6 +4083,252 @@ fn shadow_origin(
     ]
 }
 
+/// The wall segments of level `index + 1`, in the order the original
+/// draws them: by its wall graph (`0x540619`).
+///
+/// - **Corners.** Each lot corner gets a mask of the eight segments that
+///   meet it (bits 0 to 7: the west wall above it, the north wall to its
+///   left, the west and north walls of its own tile, the ascending
+///   diagonal from the tile above-left, the descending diagonal of the
+///   tile to its left, its tile's ascending diagonal, and the descending
+///   diagonal of the tile above it). A valid corner where runs meet or
+///   turn is a junction; one with a single segment is an end
+///   ([`wall_corner`]).
+/// - **Runs.** From each junction or end, in the order of their keys,
+///   a run starts down each of its two forward slots: south (the west
+///   wall, else the ascending diagonal) and east (the north wall, else the
+///   descending diagonal), and follows straight on through plain corners
+///   (`0x53cfa7`). Each is inserted before the runs with an equal start key
+///   (`0x5409ab`, a lower bound).
+/// - **View.** For the camera's rotation, each run's corners are turned
+///   and its ends swapped when the far end now has the smaller key, which
+///   reverses its segments (`0x5404b5`); then the runs are sorted by their
+///   start keys with the original's sort (`0x540809`, `0x541389`).
+///
+/// The key of a corner is `(x + y, x - y)` in view coordinates. The
+/// original turns the graph by each rotation's difference and sorts again
+/// each time (`0x479360`), so the order of runs with equal keys follows
+/// the rotations the view went through; this builds the graph at rotation
+/// 0 and turns it to the camera's rotation in one step. Segments no run
+/// covers (corners the original holds invalid, such as a wall and a
+/// diagonal leaving one corner on the same side) go last, nearest first by
+/// their corners' keys.
+fn wall_order(camera: &Camera, lot: &Lot, index: usize) -> Vec<(i32, i32, Segment)> {
+    let size = lot.size as i32;
+    let walls = &lot.levels[index].walls;
+    let has = |x: i32, y: i32, bit: u8| {
+        (0..size).contains(&x)
+            && (0..size).contains(&y)
+            && walls[Lot::cell(x as usize, y as usize)].segments & bit != 0
+    };
+    let mask = |[x, y]: [i32; 2]| -> u8 {
+        [
+            has(x, y - 1, lot::WEST),
+            has(x - 1, y, lot::NORTH),
+            has(x, y, lot::WEST),
+            has(x, y, lot::NORTH),
+            has(x - 1, y - 1, lot::ASCENDING),
+            has(x - 1, y, lot::DESCENDING),
+            has(x, y, lot::ASCENDING),
+            has(x, y - 1, lot::DESCENDING),
+        ]
+        .iter()
+        .enumerate()
+        .fold(0, |m, (i, &b)| m | (u8::from(b) << i))
+    };
+    let stops = |c: [i32; 2]| {
+        let (junction, end) = wall_corner(mask(c));
+        junction || end
+    };
+    let key = |[x, y]: [i32; 2]| (x + y, x - y);
+    // A step from corner `c` down a forward slot: its direction, and the
+    // segment's tile and bit.
+    let step = |c: [i32; 2], m: u8, slot: u8| -> Option<([i32; 2], [i32; 2], u8)> {
+        let [x, y] = c;
+        match slot {
+            0x44 if m & 0x04 != 0 => Some(([0, 1], c, lot::WEST)),
+            0x44 if m & 0x40 != 0 => Some(([1, 1], c, lot::ASCENDING)),
+            0x88 if m & 0x08 != 0 => Some(([1, 0], c, lot::NORTH)),
+            0x88 if m & 0x80 != 0 => Some(([1, -1], [x, y - 1], lot::DESCENDING)),
+            _ => None,
+        }
+    };
+    let mut corners = Vec::new();
+    for y in 0..=size {
+        for x in 0..=size {
+            if stops([x, y]) {
+                corners.push([x, y]);
+            }
+        }
+    }
+    corners.sort_by_key(|&c| key(c));
+    // Each run: its two ends, and its segments from the first end.
+    let mut runs: Vec<([i32; 2], [i32; 2], Vec<[i32; 3]>)> = Vec::new();
+    let mut covered = BTreeSet::new();
+    for &start in &corners {
+        let m = mask(start);
+        for slot in [0x44, 0x88] {
+            let Some((dir, tile, bit)) = step(start, m, slot) else {
+                continue;
+            };
+            if !has(tile[0], tile[1], bit) {
+                continue;
+            }
+            let mut segments = vec![[tile[0], tile[1], i32::from(bit)]];
+            let mut at = [start[0] + dir[0], start[1] + dir[1]];
+            while !stops(at) && mask(at) != 0 {
+                let Some((d, tile, bit)) = step(at, mask(at), slot) else {
+                    break;
+                };
+                if d != dir || !has(tile[0], tile[1], bit) || segments.len() > 4 * lot::FULL {
+                    break;
+                }
+                segments.push([tile[0], tile[1], i32::from(bit)]);
+                at = [at[0] + dir[0], at[1] + dir[1]];
+            }
+            covered.extend(segments.iter().copied());
+            let k = key(start);
+            let i = runs.partition_point(|r| key(r.0) < k);
+            runs.insert(i, (start, at, segments));
+        }
+    }
+    let m = lot::FULL as i32;
+    let turn = |[x, y]: [i32; 2]| match camera.rotation & 3 {
+        1 => [m - y, x],
+        2 => [m - x, m - y],
+        3 => [y, m - x],
+        _ => [x, y],
+    };
+    let mut view: Vec<((i32, i32), usize, bool)> = runs
+        .iter()
+        .enumerate()
+        .map(|(i, (a, b, _))| {
+            let (a, b) = (key(turn(*a)), key(turn(*b)));
+            if b < a { (b, i, true) } else { (a, i, false) }
+        })
+        .collect();
+    sims_core::sort::sort_by(&mut view, |a, b| a.0 < b.0);
+    let segment = |[x, y, bit]: [i32; 3]| {
+        segments(x, y)
+            .into_iter()
+            .find(|s| i32::from(s.bit) == bit)
+            .map(|s| (x, y, s))
+    };
+    let mut ordered = Vec::new();
+    for (_, i, reversed) in view {
+        let run = &runs[i].2;
+        if reversed {
+            ordered.extend(run.iter().rev().filter_map(|&s| segment(s)));
+        } else {
+            ordered.extend(run.iter().filter_map(|&s| segment(s)));
+        }
+    }
+    let mut rest = Vec::new();
+    for x in 0..size {
+        for y in 0..size {
+            for s in segments(x, y) {
+                if has(x, y, s.bit) && !covered.contains(&[x, y, i32::from(s.bit)]) {
+                    let (lo, hi) = wall_draw_key(camera, s.from, s.to);
+                    rest.push((lo, hi, x, y, s));
+                }
+            }
+        }
+    }
+    rest.sort_by_key(|&(lo, hi, x, y, ref s)| (lo, hi, x, y, s.bit));
+    ordered.extend(rest.into_iter().map(|(_, _, x, y, s)| (x, y, s)));
+    ordered
+}
+
+/// Whether a wall corner with segment mask `m` ([`wall_order`]) is a
+/// junction, where runs meet or turn, and whether it is a run's end (one
+/// segment). A corner where a straight wall and a diagonal leave on the
+/// same side is invalid, and neither (`0x540619`).
+fn wall_corner(m: u8) -> (bool, bool) {
+    let valid = !(m & 0x10 != 0 && m & 0x03 != 0
+        || m & 0x20 != 0 && m & 0x06 != 0
+        || m & 0x40 != 0 && m & 0x04 != 0
+        || m & 0x80 != 0 && m & 0x09 != 0);
+    let junction = m & 0x01 != 0 && m & 0xfa != 0
+        || m & 0x02 != 0 && m & 0xf5 != 0
+        || m & 0x08 != 0 && m & 0xf5 != 0
+        || m & 0x10 != 0 && m & 0xaf != 0
+        || m & 0x40 != 0 && m & 0xaf != 0
+        || m & 0x80 != 0 && m & 0x5f != 0
+        || m & 0x20 != 0 && m & 0x5f != 0;
+    (valid && junction, valid && m.count_ones() == 1)
+}
+
+/// Puts a level's objects in the order the original draws them
+/// (`0x4aa1d7`'s list, kept by the presenter): the objects not in another's
+/// slot sorted by their tiles' view keys, `(x + y, x - y)` with the tile
+/// turned to the view (`63 - y, x` and so on), with the original's sort,
+/// from object ID order; each followed by what its slots hold, slot by
+/// slot and at every depth, as the holder's draw walks them (`0x437c56`).
+/// An object whose holder is not in `list` (a person, or one the pass
+/// leaves out) is sorted as one in no slot.
+///
+/// The original sorts its registry, whose order this does not track; it
+/// matters only for objects on the same tile key. It also leaves out
+/// objects on the lot's outermost tiles, which are still drawn here.
+fn object_order<T: Copy>(
+    list: &mut Vec<T>,
+    camera: &Camera,
+    of: impl Fn(&T) -> (u16, &Object, [i32; 2]),
+) {
+    let ids: BTreeMap<u16, usize> = list.iter().enumerate().map(|(i, t)| (of(t).0, i)).collect();
+    let holder = |t: &T| {
+        let o = of(t).1;
+        u16::try_from(o.data.get(CONTAINER).copied().unwrap_or(0))
+            .ok()
+            .filter(|&c| c != 0 && c != of(t).0)
+            .and_then(|c| ids.get(&c).copied())
+    };
+    let mut children: BTreeMap<usize, Vec<(i16, u16, usize)>> = BTreeMap::new();
+    let mut top = Vec::new();
+    for (i, t) in list.iter().enumerate() {
+        let (id, o, _) = of(t);
+        match holder(t) {
+            Some(h) => {
+                let slot = o.data.get(CONTAINER_SLOT).copied().unwrap_or(-1);
+                children.entry(h).or_default().push((slot, id, i));
+            }
+            None => top.push(i),
+        }
+    }
+    let key = |i: &usize| {
+        let [x, y] = of(&list[*i]).2.map(|n| n >> 4);
+        let [vx, vy] = match camera.rotation & 3 {
+            1 => [63 - y, x],
+            2 => [63 - x, 63 - y],
+            3 => [y, 63 - x],
+            _ => [x, y],
+        };
+        (vx + vy, vx - vy)
+    };
+    sims_core::sort::sort_by(&mut top, |a, b| key(a) < key(b));
+    for v in children.values_mut() {
+        v.sort();
+    }
+    let mut order = Vec::with_capacity(list.len());
+    let mut placed = vec![false; list.len()];
+    for root in top {
+        let mut stack = vec![root];
+        while let Some(i) = stack.pop() {
+            if std::mem::replace(&mut placed[i], true) {
+                continue;
+            }
+            order.push(i);
+            if let Some(held) = children.get(&i) {
+                stack.extend(held.iter().rev().map(|&(_, _, c)| c));
+            }
+        }
+    }
+    // Holders that hold each other, which no root reaches.
+    order.extend((0..list.len()).filter(|&i| !placed[i]));
+    let sorted: Vec<T> = order.into_iter().map(|i| list[i]).collect();
+    *list = sorted;
+}
+
 /// Back-to-front view sort key for a wall segment (`0x54045b` → `0x540809` →
 /// `0x54088d` → `0x44054c`), ordering its two rotated corners by
 /// `(vx + vy, vx - vy)` ascending.
@@ -4013,7 +4369,7 @@ fn place_base(
 /// sloped terrain at `fine` (`0x4a9dc7` with no altitude override), lifts by
 /// `((total_z - ground_here) * (2 << zoom) + 0.5).trunc()`, and anchors
 /// depth from the resulting screen row and `total_z`.
-fn place_moved(
+pub(crate) fn place_moved(
     depth: &Depth,
     camera: &Camera,
     lot: &Lot,
@@ -4818,6 +5174,14 @@ mod tests {
         follow(&mut objects, 10, 1);
         let people = BTreeSet::from([2, 7, 8]);
         assert_eq!(held_trees(&objects, &people), BTreeSet::from([1, 3, 4, 9]));
+        // What each person's own draw draws: not the bench they sit on,
+        // nor its book.
+        let is_person = |id| people.contains(&id);
+        assert_eq!(held_by_in(&objects, 2, is_person), BTreeSet::from([4]));
+        assert_eq!(held_by_in(&objects, 8, is_person), BTreeSet::from([9]));
+        assert_eq!(held_by_in(&objects, 7, is_person), BTreeSet::new());
+        // The bench's tree, as a person's, stops at the person it holds.
+        assert_eq!(held_by_in(&objects, 1, is_person), BTreeSet::from([3]));
         // Nor is an object that follows a person on their tile.
         entry(&mut objects, 1, 0, 0);
         follow(&mut objects, 10, 8);
@@ -4900,6 +5264,7 @@ mod tests {
             room_fractions: BTreeMap::new(),
             outdoor_light: None,
             time_of_day: 0,
+            house: 0,
             halves: BTreeMap::new(),
             lamps: [
                 vec![Default::default(); full],
@@ -5374,6 +5739,171 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn walled(lot: &mut Lot, walls: &[(i32, i32, u8)]) {
+        for &(x, y, bit) in walls {
+            lot.levels[0].walls[Lot::cell(x as usize, y as usize)].segments |= bit;
+        }
+    }
+
+    fn order(lot: &Lot, rotation: u8) -> Vec<(i32, i32, u8)> {
+        wall_order(&camera(rotation), lot, 0)
+            .into_iter()
+            .map(|(x, y, s)| (x, y, s.bit))
+            .collect()
+    }
+
+    #[test]
+    fn wall_corners_are_junctions_ends_or_plain() {
+        // One segment: an end.
+        assert_eq!(wall_corner(0x04), (false, true));
+        // Straight on, either way: plain.
+        assert_eq!(wall_corner(0x05), (false, false));
+        assert_eq!(wall_corner(0x0a), (false, false));
+        assert_eq!(wall_corner(0x50), (false, false));
+        assert_eq!(wall_corner(0xa0), (false, false));
+        // A turn or a tee: a junction.
+        assert_eq!(wall_corner(0x09), (true, false));
+        assert_eq!(wall_corner(0x0d), (true, false));
+        // A wall and a diagonal leaving on the same side: invalid.
+        assert_eq!(wall_corner(0x44), (false, false));
+        assert_eq!(wall_corner(0x00), (false, false));
+    }
+
+    #[test]
+    fn walls_are_drawn_run_by_run_in_view_order() {
+        let mut lot = flat_lot(0);
+        // A room's north wall from (10, 10) to (13, 10), its west wall
+        // from (10, 10) to (10, 12), and a lone diagonal.
+        walled(
+            &mut lot,
+            &[
+                (10, 10, lot::NORTH),
+                (11, 10, lot::NORTH),
+                (12, 10, lot::NORTH),
+                (10, 10, lot::WEST),
+                (10, 11, lot::WEST),
+                (20, 20, lot::ASCENDING),
+            ],
+        );
+        // Both runs start at the room's corner; the east one was inserted
+        // before the south one, and the sort keeps them so.
+        assert_eq!(
+            order(&lot, 0),
+            vec![
+                (10, 10, lot::NORTH),
+                (11, 10, lot::NORTH),
+                (12, 10, lot::NORTH),
+                (10, 10, lot::WEST),
+                (10, 11, lot::WEST),
+                (20, 20, lot::ASCENDING),
+            ]
+        );
+        // Half a turn: each run starts from its other end, and its
+        // segments go backwards. The north run's far end, (13, 10), turns
+        // to key (105, -3), before the west run's (10, 12) at (106, 2).
+        assert_eq!(
+            order(&lot, 2),
+            vec![
+                (20, 20, lot::ASCENDING),
+                (12, 10, lot::NORTH),
+                (11, 10, lot::NORTH),
+                (10, 10, lot::NORTH),
+                (10, 11, lot::WEST),
+                (10, 10, lot::WEST),
+            ]
+        );
+        for rotation in 0..4 {
+            let mut got = order(&lot, rotation);
+            got.sort();
+            let mut want = order(&lot, 0);
+            want.sort();
+            assert_eq!(got, want, "rotation {rotation}");
+        }
+    }
+
+    #[test]
+    fn segments_no_run_covers_are_drawn_last() {
+        let mut lot = flat_lot(0);
+        // A wall and a diagonal leave (5, 5) southwards: the corner is
+        // invalid, so neither starts a run there.
+        walled(
+            &mut lot,
+            &[
+                (5, 5, lot::WEST),
+                (5, 5, lot::ASCENDING),
+                (2, 2, lot::NORTH),
+            ],
+        );
+        assert_eq!(
+            order(&lot, 0),
+            vec![
+                (2, 2, lot::NORTH),
+                (5, 5, lot::WEST),
+                (5, 5, lot::ASCENDING)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_ground_is_left_out_only_under_floors_ringed_by_floored_water() {
+        let mut lot = flat_lot(0);
+        let at = |x: usize, y: usize| Lot::cell(x, y);
+        assert!(ground_shows(&lot, [5, 5]));
+        for [x, y] in [[5, 5], [4, 5], [6, 5], [5, 4], [5, 6]] {
+            lot.levels[0].floors[at(x, y)] = 1;
+        }
+        // Floored all round, but no water: the ground shows.
+        assert!(ground_shows(&lot, [5, 5]));
+        for [x, y] in [[4, 5], [6, 5], [5, 4], [5, 6]] {
+            lot.water[at(x, y)] = 0;
+        }
+        assert!(!ground_shows(&lot, [5, 5]));
+        // One neighbour without water, or without a floor, shows it.
+        lot.water[at(5, 6)] = 0xff;
+        assert!(ground_shows(&lot, [5, 5]));
+        lot.water[at(5, 6)] = 0;
+        lot.levels[0].floors[at(4, 5)] = 0;
+        assert!(ground_shows(&lot, [5, 5]));
+        // The tile's own floor counts too.
+        lot.levels[0].floors[at(4, 5)] = 1;
+        lot.levels[0].floors[at(5, 5)] = 0;
+        assert!(ground_shows(&lot, [5, 5]));
+    }
+
+    #[test]
+    fn objects_go_by_tile_key_each_followed_by_what_it_holds() {
+        // A table (1) at tile (3, 3) holds a plate (2) in slot 1 and a cup
+        // (3) in slot 0; a chair (4) is at tile (2, 2); a lamp (5) at
+        // (3, 2).
+        let objects = [
+            object(1, 1, [3 * 16, 3 * 16, 1], &[]),
+            object(
+                2,
+                2,
+                [3 * 16, 3 * 16, 1],
+                &[(CONTAINER, 1), (CONTAINER_SLOT, 1)],
+            ),
+            object(
+                3,
+                3,
+                [3 * 16, 3 * 16, 1],
+                &[(CONTAINER, 1), (CONTAINER_SLOT, 0)],
+            ),
+            object(4, 4, [2 * 16, 2 * 16, 1], &[]),
+            object(5, 5, [3 * 16, 2 * 16, 1], &[]),
+        ];
+        let ids = |rotation: u8| {
+            let mut list: Vec<&Object> = objects.iter().collect();
+            object_order(&mut list, &camera(rotation), |o| {
+                (o.id, *o, [o.position[0], o.position[1]])
+            });
+            list.iter().map(|o| o.id).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(0), vec![4, 5, 1, 3, 2]);
+        // Half a turn: the table's tile is now the back one.
+        assert_eq!(ids(2), vec![1, 3, 2, 5, 4]);
     }
 
     #[test]

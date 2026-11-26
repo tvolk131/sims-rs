@@ -99,7 +99,7 @@
 //! bit-replication").
 
 use crate::animation::{Clip, Library};
-use crate::appearance::{Body, Outfit};
+use crate::appearance::{Body, Outfit, Part};
 use crate::assets::Assets;
 use crate::attach::{self, Attach};
 use crate::bob::{self, Bob};
@@ -892,6 +892,120 @@ fn draw_lot_part<T: Target + ?Sized>(
     );
 }
 
+/// `points` in the lot renderer's units ([`View::lot_point`]).
+fn person_attach(view: &View, points: &Attach) -> sims_render::PersonAttach {
+    let at = |p: Option<Vec3>| p.map(|p| view.lot_point(p));
+    sims_render::PersonAttach {
+        palm: at(points.palm),
+        head_top: at(points.head_top),
+        pelvis: at(points.pelvis),
+    }
+}
+
+/// The censor boxes of the skeleton `skeleton`: the parts of its
+/// `<skeleton>-needs` appearance, boxes bound to its bones, each with the
+/// censor bits that choose it. The original adds this appearance to every
+/// person and never draws it; the censor reads where its boxes are.
+fn censor_boxes(
+    assets: &Assets,
+    skeleton: &sims_formats::avatar::Skeleton,
+) -> Result<Vec<Part>, String> {
+    let name = format!("{}-needs", skeleton.name);
+    let appearance = crate::appearance::load_appearance(assets, &name)?;
+    let mut parts = Vec::new();
+    for binding in &appearance.bindings {
+        let bone = rig::bone(skeleton, &binding.bone).ok_or_else(|| {
+            format!(
+                "a censor box binds to a bone the skeleton {:?} lacks",
+                skeleton.name
+            )
+        })?;
+        let mesh = crate::appearance::load_mesh(assets, &binding.mesh)?;
+        let bones = mesh
+            .bones
+            .iter()
+            .map(|b| {
+                rig::bone(skeleton, b).ok_or_else(|| {
+                    format!(
+                        "a censor box names a bone the skeleton {:?} lacks",
+                        skeleton.name
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        parts.push(Part {
+            appearance: name.clone(),
+            bone,
+            bones,
+            mesh,
+            texture_name: None,
+            texture: crate::texture::Texture::solid([0, 0, 0, 255]),
+            censor: binding.censor,
+        });
+    }
+    Ok(parts)
+}
+
+/// Which censor boxes a censor word chooses: the boxes whose censor bits
+/// meet it, or every box (bits 0 to 6) when the word has bit 7.
+fn censor_mask(word: i16) -> u32 {
+    if word & 0x80 != 0 {
+        0x7f
+    } else {
+        u32::from(word as u16)
+    }
+}
+
+/// `person_id`, posed as `cached`, as the censor sees them: None unless
+/// their censor word (person data word 30, `+0x5c8`) is set. The bounds
+/// are those of the chosen boxes' posed vertices on the screen
+/// (`0x591248`), and the position is the skeleton root's
+/// ([`View::lot_point`]).
+#[allow(clippy::too_many_arguments)]
+fn censored(
+    world: &World,
+    assets: &Assets,
+    boxes: &mut BTreeMap<String, Result<Vec<Part>, String>>,
+    view: &View,
+    person_id: u16,
+    level: i32,
+    body: &Body,
+    cached: &CachedPose,
+    skinned: &mut Skinned,
+) -> Option<sims_render::Censored> {
+    let word = world
+        .objects
+        .get(&person_id)?
+        .person
+        .as_ref()?
+        .data
+        .get(30)
+        .copied()
+        .filter(|&w| w != 0)?;
+    let mask = censor_mask(word);
+    let parts = boxes
+        .entry(body.skeleton.name.clone())
+        .or_insert_with(|| censor_boxes(assets, &body.skeleton));
+    let mut bounds: Option<[f32; 4]> = None;
+    if let Ok(parts) = parts {
+        for part in parts.iter().filter(|p| p.censor & mask != 0) {
+            skin_into(part, &cached.bones, skinned);
+            for &p in &skinned.positions {
+                let (fine, elevation) = view.place_on(p, level);
+                let [x, y] = view.screen(fine, elevation, level);
+                let b = bounds.get_or_insert([x, y, x, y]);
+                *b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+            }
+        }
+    }
+    Some(sims_render::Censored {
+        id: person_id,
+        bounds,
+        position: view.lot_point(cached.root.translation),
+        level,
+    })
+}
+
 /// Projects a world point for lot rasterization: [`View::place_on`] and
 /// [`View::screen`], shifted by `(+0.5, +0.5)` so [`crate::raster`]'s
 /// half-integer pixel-centre sampler matches Direct3D 6's integer pixel
@@ -1200,6 +1314,11 @@ pub struct People {
     /// Each person the last draw drew, with their attach points
     /// ([`crate::attach`]).
     drawn_attach: BTreeMap<u16, Attach>,
+    /// Each skeleton's censor boxes ([`censor_boxes`]), by skeleton name:
+    /// loaded the first time a person with that skeleton is censored.
+    censor_boxes: BTreeMap<String, Result<Vec<Part>, String>>,
+    /// The censored people the last draw drew, by ID ([`People::censored`]).
+    drawn_censor: Vec<sims_render::Censored>,
 }
 
 impl People {
@@ -1224,6 +1343,8 @@ impl People {
             clock: 0,
             scratch: PeopleScratch::default(),
             drawn_attach: BTreeMap::new(),
+            censor_boxes: BTreeMap::new(),
+            drawn_censor: Vec::new(),
         }
     }
 
@@ -1241,18 +1362,15 @@ impl People {
         let view = View::new(camera);
         self.drawn_attach
             .iter()
-            .map(|(&id, points)| {
-                let at = |p: Option<Vec3>| p.map(|p| view.lot_point(p));
-                (
-                    id,
-                    sims_render::PersonAttach {
-                        palm: at(points.palm),
-                        head_top: at(points.head_top),
-                        pelvis: at(points.pelvis),
-                    },
-                )
-            })
+            .map(|(&id, points)| (id, person_attach(&view, points)))
             .collect()
+    }
+
+    /// The people the last draw drew whose censor word (person data word
+    /// 30) is set, in ID order, with the screen bounds of their censor
+    /// boxes, for `sims_render::draw_censor`.
+    pub fn censored(&self) -> &[sims_render::Censored] {
+        &self.drawn_censor
     }
 
     /// Follows `world`: loads the body of each person who appeared or
@@ -1559,6 +1677,38 @@ impl People {
         drawn
     }
 
+    /// Like [`People::draw_on_lot_in_viewport_tracked`], calling `held`
+    /// with each person's ID, attach points ([`People::held_attach`]) and
+    /// the canvas just before drawing the person, as the original's person
+    /// draw draws what the person holds first (`0x459e45`, then the person
+    /// at `0x45a131`). A person whose body strings could not be read has
+    /// no points and no call.
+    pub fn draw_on_lot_in_viewport_tracked_holding(
+        &mut self,
+        world: &World,
+        camera: &Camera,
+        viewport: (u32, u32),
+        canvas: &mut sims_render::Canvas,
+        written_rects: &mut Vec<sims_render::canvas::Rect>,
+        mut held: impl FnMut(u16, sims_render::PersonAttach, &mut sims_render::Canvas),
+    ) -> Drawn {
+        let depth = Depth::new(camera);
+        let view = View::new(camera);
+        let mut tracked = TrackedLotCanvas::new(canvas, written_rects);
+        let drawn = self.draw_in_viewport_holding(
+            world,
+            camera,
+            viewport,
+            &mut tracked,
+            |fine, elevation, level| depth.point(fine, elevation, level),
+            &mut |id, points, target: &mut TrackedLotCanvas| {
+                held(id, person_attach(&view, points), target.canvas);
+            },
+        );
+        tracked.flush();
+        drawn
+    }
+
     /// Draws every placed person on the camera's levels into `target`,
     /// far to near. `depth` gives the target's depth for a point: its fine
     /// view position, elevation above its level in near-zoom pixels, and
@@ -1586,6 +1736,20 @@ impl People {
         target: &mut T,
         depth: impl Fn([f32; 2], f32, i32) -> f32,
     ) -> Drawn {
+        self.draw_in_viewport_holding(world, camera, viewport, target, depth, &mut |_, _, _| {})
+    }
+
+    /// [`People::draw_in_viewport`], calling `held` with each person's ID
+    /// and attach points just before drawing them.
+    fn draw_in_viewport_holding<T: Target + ?Sized>(
+        &mut self,
+        world: &World,
+        camera: &Camera,
+        viewport: (u32, u32),
+        target: &mut T,
+        depth: impl Fn([f32; 2], f32, i32) -> f32,
+        held: &mut dyn FnMut(u16, &Attach, &mut T),
+    ) -> Drawn {
         let view = View::new(camera);
         let light = view.light();
         let eye = view.eye(viewport);
@@ -1598,13 +1762,17 @@ impl People {
         let bob_light = bob::light(camera.rotation);
         let mut problems = self.refresh_poses(world, camera.level, true);
         let People {
+            assets,
             people: loaded_people,
             scratch,
             drawn_attach,
             cast,
+            censor_boxes: boxes,
+            drawn_censor,
             ..
         } = self;
         drawn_attach.clear();
+        drawn_censor.clear();
         // Far to near by the root's depth, then by ID, so nearer soft
         // edges blend over farther people.
         scratch.draw_order.clear();
@@ -1644,10 +1812,24 @@ impl People {
                 .get(&person_id)
                 .and_then(|o| cast.body_strings(o.guid).ok())
             {
-                drawn_attach.insert(
-                    person_id,
-                    attach::attach(&body.skeleton, &cached.bones, &rows),
-                );
+                let points = attach::attach(&body.skeleton, &cached.bones, &rows);
+                // What they hold goes first (`0x459e45`..`0x45a027`).
+                target.set_id(None);
+                held(person_id, &points, target);
+                drawn_attach.insert(person_id, points);
+            }
+            if let Some(censored) = censored(
+                world,
+                assets,
+                boxes,
+                &view,
+                person_id,
+                person_level,
+                body,
+                cached,
+                &mut scratch.bob_skinned,
+            ) {
+                drawn_censor.push(censored);
             }
             let project = |p| project_lot_vertex(&view, p, person_level, &depth);
             // Each pixel the person draws names them, for a click.
@@ -1746,6 +1928,7 @@ impl People {
             }
         }
         target.set_id(None);
+        drawn_censor.sort_by_key(|c| c.id);
         self.bob = bob;
         Drawn {
             people: drawn_count,

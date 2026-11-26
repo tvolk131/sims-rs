@@ -954,6 +954,7 @@ mod tests {
             room_fractions: Default::default(),
             outdoor_light: None,
             time_of_day: 0,
+            house: 0,
             halves: Default::default(),
             lamps: Default::default(),
             floor_rotation: 0,

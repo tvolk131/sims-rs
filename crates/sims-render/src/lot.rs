@@ -96,6 +96,9 @@ pub struct Lot {
     /// sets the brightest a lit tile is drawn ([`Lot::brightest`]) and
     /// where the sun stands over the grass ([`crate::grass`]).
     pub time_of_day: i16,
+    /// The house number (global 10), which the camera's zoom reads
+    /// ([`crate::Zoom::zoom_out_on`]).
+    pub house: i16,
     /// The two triangles of each tile a diagonal wall splits, by level (1
     /// or 2), column and row: which triangle (by the corner it holds: 1
     /// south-west, 2 south-east, 3 north-east, 4 north-west) and its room.
@@ -289,6 +292,7 @@ impl Lot {
             room_fractions,
             outdoor_light,
             time_of_day: world.globals.get(4).copied().unwrap_or(0),
+            house: world.globals.get(10).copied().unwrap_or(0),
             halves,
             lamps,
             floor_rotation: 0,

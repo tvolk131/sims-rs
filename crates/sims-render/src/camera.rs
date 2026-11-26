@@ -75,6 +75,14 @@ impl Zoom {
             _ => Zoom::Far,
         }
     }
+
+    /// [`Zoom::zoom_out`] on house `house` (global 10): the original zooms
+    /// out only while the zoom is above 1, or above 2 on house 99, the
+    /// neighborhood's own lot (`0x4cedc0`, `0x4ce9f8`).
+    pub fn zoom_out_on(self, house: i16) -> Self {
+        let farthest = if house == 99 { Zoom::Medium } else { Zoom::Far };
+        self.zoom_out().max(farthest).min(self)
+    }
 }
 
 /// How walls are drawn, as the original's three wall buttons choose.
@@ -238,6 +246,17 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn house_99_zooms_out_no_farther_than_medium() {
+        assert_eq!(Zoom::Near.zoom_out_on(5), Zoom::Medium);
+        assert_eq!(Zoom::Medium.zoom_out_on(5), Zoom::Far);
+        assert_eq!(Zoom::Far.zoom_out_on(5), Zoom::Far);
+        assert_eq!(Zoom::Near.zoom_out_on(99), Zoom::Medium);
+        assert_eq!(Zoom::Medium.zoom_out_on(99), Zoom::Medium);
+        // Already farther (a camera loaded so): it stays.
+        assert_eq!(Zoom::Far.zoom_out_on(99), Zoom::Far);
+    }
 
     fn camera(rotation: u8) -> Camera {
         Camera {
