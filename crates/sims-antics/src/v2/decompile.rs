@@ -19,6 +19,7 @@ use crate::ast::{
 use crate::error::{Error, Result};
 use crate::ir::BhavChunk;
 use crate::lift::{format_bhav_labeled_air_with_arities, lift_bhav};
+use crate::node_order::{TreePin, match_tree_pin};
 use crate::structure_lift::{
     LiftOptions, StructuredLiftOutcome, lift_bhav_structured_copying_tails,
     lift_bhav_structured_in_node_order, lift_bhav_structured_with_arities,
@@ -365,6 +366,10 @@ pub fn decompile_iff_to_v2_report(
                 );
                 let text = model.lint_spellings(text, &recompiled);
                 let (text, raw_spelled) = model.polish(text, &recompiled);
+                // Polish may write what wave 3 spells (a raw sound as a call with a method
+                // form), and changes what a self-loop's `allow` covers.
+                let text = model.lint_spellings(text, &recompiled);
+                let text = loop_allows(text);
                 let (text, recompiled, mut checks) =
                     model.flip_negations(text, (recompiled, checks), &mut cache);
                 let text = model.allow_kept_negations(text);
@@ -743,6 +748,54 @@ const POLISH_CELL_BUILDS: usize = 8;
 /// v2 builtins with the same bytes ([`raw_builtin_spellings`]).
 const POLISH_RAW_BUILDS: usize = 24;
 
+/// The lifter's self-loop note, as an `allow` and as a plain comment.
+const LOOP_ALLOW: &str = "// antics-lint: allow(unbounded_loop_without_yield): the original's";
+const LOOP_NOTE: &str = "// The original's";
+
+/// `text` with each self-loop's note matching what lint sees: the `allow` the lifter
+/// writes over `loop { f(); }` stays a plain comment where it would suppress nothing (lint
+/// does not look inside a raw body, and a loop that destroys the object ends), and a plain
+/// note becomes the `allow` once polish takes the loop's body out of `raw { }`. Comments
+/// build no bytes, and each note keeps its line.
+fn loop_allows(text: String) -> String {
+    use crate::v2::lint::{STALE_LINT_ALLOW, UNBOUNDED_LOOP_WITHOUT_YIELD, lint_v2_source};
+    let Ok(found) = lint_v2_source(&text, "decompiled.antics") else {
+        return text;
+    };
+    let mut lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
+    let mut changed = false;
+    for d in found {
+        // The note's line: the allow's own, or the one above the loop lint points at.
+        let (at, from, to) = match d.rule {
+            STALE_LINT_ALLOW => (d.line.checked_sub(1), LOOP_ALLOW, LOOP_NOTE),
+            UNBOUNDED_LOOP_WITHOUT_YIELD => (d.line.checked_sub(2), LOOP_NOTE, LOOP_ALLOW),
+            _ => continue,
+        };
+        let Some(line) = at.and_then(|at| lines.get_mut(at)) else {
+            continue;
+        };
+        let note = line.trim_start();
+        if note.starts_with(from) && note.ends_with("loops on itself") {
+            *line = line.replacen(from, to, 1);
+            changed = true;
+        }
+    }
+    if changed { lines.join("\n") } else { text }
+}
+
+/// The untagged block [`Model::semi_global_module`] declares the linked library's trees in
+/// when their frames may be wider than four argument words.
+const SEMI_GLOBALS_WIDE: &str = "semi_globals_wide";
+
+/// The most `match` passes [`Model::polish`] takes: one per level of chains nested in
+/// another chain's arms.
+const MATCH_SPELLING_PASSES: usize = 3;
+
+/// The most builds [`Model::polish`] may take to find the `if let` / `let .. else`
+/// statements it can write with the same bytes ([`if_let_spellings`]): one statement per
+/// group, and a tree's frame may refuse any of them.
+const POLISH_IF_LET_BUILDS: usize = 24;
+
 /// How many diagnostics of each rule, line and message a text lints with.
 type LintCounts = BTreeMap<(&'static str, usize, String), usize>;
 
@@ -946,6 +999,152 @@ fn apply_renames(text: &str, renames: &[(String, String)]) -> String {
         if let Some(start) = word_start.take() {
             flush(&mut out, &line[start..]);
         }
+    }
+    out
+}
+
+/// Every outermost `if x == a { } else if x == b { } else if x == c { } [else { }]` chain of
+/// three or more distinct values (integer literals or constant paths) against one operand,
+/// as `match x { a => { } b => { } c => { } [_ => { }] }`, the spelling lint
+/// `collapsible_if_chain` asks for. v2 lowers a `match` to that same chain; the caller keeps
+/// a rewrite only if the file builds the same bytes. The lifter writes `match` itself in
+/// trees that keep the extra idioms ([`Translator::match_chain`]); this reaches the trees
+/// written without them. Lines are read as the lifter writes them (one statement or brace
+/// per line, four spaces per level), and `raw { }` blocks are skipped whole. A chain whose
+/// text is in `rejected` (a rewrite the byte gate refused) is not proposed again; the chains
+/// in its arms are, as if it were not a chain.
+fn match_spellings(text: &str, rejected: &BTreeSet<String>) -> Vec<Rewrite> {
+    let mut starts = Vec::new();
+    let mut at = 0;
+    for l in text.split_inclusive('\n') {
+        starts.push(at);
+        at += l.len();
+    }
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let indent_of = |l: &str| l.len() - l.trim_start_matches(' ').len();
+    let value_ok = |v: &str| {
+        let digits = v.strip_prefix('-').unwrap_or(v);
+        let literal = match digits.strip_prefix("0x") {
+            Some(hex) => !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()),
+            None => !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()),
+        };
+        let path = v.split("::").count() >= 2
+            && v.split("::")
+                .all(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        literal || path
+    };
+    // `if x == v {` / `} else if x == v {` as `(x, v)`.
+    let test = |s: &str| -> Option<(String, String)> {
+        let cond = s.strip_prefix("if ")?.strip_suffix(" {")?;
+        let (x, v) = cond.split_once(" == ")?;
+        let ok = !x.is_empty() && !x.contains("==") && !x.contains(['{', '}', '!']);
+        (ok && value_ok(v)).then(|| (x.to_owned(), v.to_owned()))
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim_end_matches('\n');
+        let indent = indent_of(line);
+        let s = line.trim_start();
+        if s == "raw {" {
+            let close = format!("{}}}", " ".repeat(indent));
+            i += 1;
+            while i < lines.len() && lines[i].trim_end_matches('\n') != close {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        let Some((x, first)) = test(s) else {
+            i += 1;
+            continue;
+        };
+        // (value, first body line, end line) per arm, then the `else` body.
+        let mut arms: Vec<(String, usize, usize)> = Vec::new();
+        let mut fallback: Option<(usize, usize)> = None;
+        let mut value = first;
+        let mut body = i + 1;
+        let mut j = i + 1;
+        let end = loop {
+            let Some(l) = lines.get(j).map(|l| l.trim_end_matches('\n')) else {
+                break None;
+            };
+            if l.trim().is_empty() || indent_of(l) > indent {
+                j += 1;
+                continue;
+            }
+            if indent_of(l) != indent {
+                break None;
+            }
+            let s = l.trim_start();
+            if let Some(rest) = s.strip_prefix("} else ") {
+                if fallback.is_some() {
+                    break None;
+                }
+                arms.push((std::mem::take(&mut value), body, j));
+                if rest == "{" {
+                    fallback = Some((j + 1, 0));
+                } else {
+                    match test(rest) {
+                        Some((y, v)) if y == x => value = v,
+                        _ => break None,
+                    }
+                }
+                body = j + 1;
+                j += 1;
+                continue;
+            }
+            if s == "}" {
+                match &mut fallback {
+                    Some(f) => f.1 = j,
+                    None => arms.push((std::mem::take(&mut value), body, j)),
+                }
+                break Some(j);
+            }
+            break None;
+        };
+        let Some(end) = end else {
+            i += 1;
+            continue;
+        };
+        let mut values: Vec<&str> = arms.iter().map(|(v, ..)| v.as_str()).collect();
+        values.sort_unstable();
+        values.dedup();
+        if arms.len() < 3 || values.len() != arms.len() {
+            i += 1;
+            continue;
+        }
+        let close_end = starts[end] + lines[end].trim_end_matches('\n').len();
+        if rejected.contains(&text[starts[i]..close_end]) {
+            i += 1;
+            continue;
+        }
+        let pad = " ".repeat(indent);
+        let deeper = |from: usize, to: usize, buf: &mut String| {
+            for l in &lines[from..to] {
+                if !l.trim().is_empty() {
+                    buf.push_str("    ");
+                }
+                buf.push_str(l);
+            }
+        };
+        let mut rewritten = format!("{pad}match {x} {{\n");
+        for (v, from, to) in &arms {
+            rewritten.push_str(&format!("{pad}    {v} => {{\n"));
+            deeper(*from, *to, &mut rewritten);
+            rewritten.push_str(&format!("{pad}    }}\n"));
+        }
+        if let Some((from, to)) = fallback {
+            rewritten.push_str(&format!("{pad}    _ => {{\n"));
+            deeper(from, to, &mut rewritten);
+            rewritten.push_str(&format!("{pad}    }}\n"));
+        }
+        rewritten.push_str(&format!("{pad}}}"));
+        out.push(Rewrite {
+            range: starts[i]..close_end,
+            text: rewritten,
+        });
+        i = end + 1;
     }
     out
 }
@@ -1284,6 +1483,31 @@ fn matching_braces(tokens: &[crate::v2::lexer::Token]) -> Option<BTreeMap<usize,
     open.is_empty().then_some(out)
 }
 
+/// The stack object's neighborhood record cell `scope(24 | 32, index)` read through
+/// `handle`: a field (24) or its person's word (32), by the `i16` names PR I-4 gives (the
+/// `ObjectId`, `bool` and enum ones would type their uses differently), else by number.
+fn neighbor_cell(handle: &str, scope: u8, index: i16) -> String {
+    let name = match (scope, index) {
+        (24, 2) => Some("age"),
+        (24, 5) => Some("friend_count"),
+        (24, 6) => Some("family_house"),
+        (24, 9) => Some("family_friend_count"),
+        (32, 0) => Some("posture"),
+        (32, 34) => Some("pets_outside"),
+        (32, 56) => Some("job_type"),
+        (32, 57) => Some("job_level"),
+        (32, 61) => Some("family"),
+        (32, 77) => Some("date_partner"),
+        (32, FAME) => Some("fame"),
+        _ => None,
+    };
+    match name {
+        Some(name) => format!("{handle}.neighbor.{name}"),
+        None if scope == 24 => format!("{handle}.neighbor.field[{index}]"),
+        None => format!("{handle}.neighbor.person[{index}]"),
+    }
+}
+
 /// Every `raw { }` block whose statements v2 all spells as builtins (what lint
 /// `manual_raw_has_builtin` asks for), as those statements, one rewrite per block:
 /// - `scope(27, N) := v` and `temp[K] := scope(27, N)`, for `N` and `K` in `0..=7` and `v`
@@ -1294,7 +1518,11 @@ fn matching_braces(tokens: &[crate::v2::lexer::Token]) -> Option<BTreeMap<usize,
 ///   `stack_obj.remove(..)`, with `no_yield: true` / `skip_resets: true` for flags 1 and 2
 ///   (`flags: F` for any other bit);
 /// - `clear_motive_changes()` with an optional `pad(I: 0xNN, ..)`, as
-///   `clear_motive_changes(padI: 0xNN, ..)`.
+///   `clear_motive_changes(padI: 0xNN, ..)`;
+/// - `temp[K] := scope(24, N)` (`N` in `0..=9`) and `temp[K] := scope(32, N)`, the stack
+///   object's neighborhood record ([`neighbor_cell`]);
+/// - `play_sound(S [, stack_obj | true | false]) pad(I: 0xNN, ..)` with a literal sound and
+///   no pad of bytes 0, 1 or 4, as `play_sound(S, stack_obj | false, padI: 0xNN, ..)`.
 ///
 /// The lifter writes these itself only in trees that keep the wave 2 and 3 idioms; the
 /// caller keeps a rewrite only if the file builds the same bytes. Each rewrite comes with
@@ -1379,15 +1607,24 @@ fn raw_builtin_body(body: &str) -> Option<Vec<String>> {
             .strip_prefix('[')?;
         small(i.strip_suffix(']')?)
     };
-    let sprite = |v: &str| {
+    let scope = |v: &str| -> Option<(u8, i16)> {
         let inner = v
             .trim()
             .strip_prefix("scope")?
             .trim_start()
             .strip_prefix('(')?;
         let (scope, n) = inner.strip_suffix(')')?.split_once(',')?;
-        (scope.trim() == "27").then_some(())?;
-        small(n)
+        Some((scope.trim().parse().ok()?, n.trim().parse().ok()?))
+    };
+    let sprite = |v: &str| match scope(v)? {
+        (27, n) => small(&n.to_string()),
+        _ => None,
+    };
+    // The read-only neighborhood record cells.
+    let neighbor = |v: &str| match scope(v)? {
+        (24, n @ 0..=9) => Some(neighbor_cell("stack_obj", 24, n)),
+        (32, n @ 0..=255) => Some(neighbor_cell("stack_obj", 32, n)),
+        _ => None,
     };
     let mut out = Vec::new();
     for stmt in body.split(';') {
@@ -1404,9 +1641,44 @@ fn raw_builtin_body(body: &str) -> Option<Vec<String>> {
                 format!("stack_obj.sprite_flags[temp[{n}]] = {value};")
             } else {
                 let k = temp(dst)?;
-                let n = sprite(src)?;
-                format!("temp[{k}] = stack_obj.sprite_flags[temp[{n}]];")
+                let cell = match sprite(src) {
+                    Some(n) => format!("stack_obj.sprite_flags[temp[{n}]]"),
+                    None => neighbor(src)?,
+                };
+                format!("temp[{k}] = {cell};")
             }
+        } else if let Some(rest) = stmt.strip_prefix("play_sound") {
+            // `play_sound(N [, stack_obj | true | false]) pad(I: 0xNN, ..)`: the bytes past
+            // the sound and the flags (0, 1 and 4) as PR I-4's `padI:`. Unpadded, v2 would
+            // rather name a declared sound, which the lifter does in place.
+            let (args, pad) = rest.trim().strip_prefix('(')?.split_once(')')?;
+            let mut args = args.split(',').map(str::trim);
+            let sound = args.next()?.parse::<u16>().ok()?;
+            let target = match args.next() {
+                None | Some("false") => "false",
+                Some("true" | "stack_obj") => "stack_obj",
+                Some(_) => return None,
+            };
+            if args.next().is_some() {
+                return None;
+            }
+            let bytes = pad
+                .trim()
+                .strip_prefix("pad")?
+                .trim_start()
+                .strip_prefix('(')?
+                .strip_suffix(')')?;
+            let mut pads = Vec::new();
+            for b in bytes.split(',') {
+                let (i, v) = b.split_once(':')?;
+                let i = i
+                    .trim()
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|i| !matches!(i, 0 | 1 | 4))?;
+                pads.push(format!("pad{i}: {}", number(v)?));
+            }
+            format!("play_sound({sound}, {target}, {});", pads.join(", "))
         } else if let Some(rest) = stmt.strip_prefix("remove_object") {
             let inner = rest.trim().strip_prefix('(')?.strip_suffix(')')?;
             let mut args = inner.split(',').map(str::trim);
@@ -3268,6 +3540,19 @@ impl Model {
         };
         let mut text = text;
         let mut raw_spelled: BTreeMap<u16, usize> = BTreeMap::new();
+        // Engine cells lint `untyped_engine_field` names only once lint wave 3 typed what they
+        // are used with (a flag test against an `ObjectFlags` constant), where the name keeps
+        // the bytes.
+        let fields = engine_field_fixes(&text);
+        if !fields.is_empty() {
+            let base = text.clone();
+            let ok =
+                |f: &[EngineFieldFix]| apply_engine_field_fixes(&base, f).is_some_and(|t| same(&t));
+            let kept = keep_joint(&fields, &ok, POLISH_CELL_BUILDS);
+            if let Some(typed) = apply_engine_field_fixes(&text, &kept) {
+                text = typed;
+            }
+        }
         let renames = self.tree_renames(&text);
         if !renames.is_empty() {
             let base = text.clone();
@@ -3350,7 +3635,7 @@ impl Model {
         if !if_lets.is_empty() {
             let base = text.clone();
             let ok = |g: &[Vec<Rewrite>]| same(&apply_groups(&base, g));
-            let kept = keep_joint(&if_lets, &ok, POLISH_CELL_BUILDS);
+            let kept = keep_joint(&if_lets, &ok, POLISH_IF_LET_BUILDS);
             text = apply_groups(&text, &kept);
         }
         // Behavioral mode: locals without `#[slot]`, then arguments by name. Every function's
@@ -3374,6 +3659,24 @@ impl Model {
         }
         if let Some(joined) = collapse_else_if(&text).filter(|t| same(t)) {
             text = joined;
+        }
+        // `if` chains on one operand as `match`, outermost first, then the ones inside (also
+        // inside a chain whose rewrite the gate refused).
+        let mut refused = BTreeSet::new();
+        for _ in 0..MATCH_SPELLING_PASSES {
+            let chains = match_spellings(&text, &refused);
+            if chains.is_empty() {
+                break;
+            }
+            let base = text.clone();
+            let ok = |c: &[Rewrite]| same(&apply_rewrites(&base, c));
+            let kept = keep_joint(&chains, &ok, POLISH_RAW_BUILDS);
+            for c in &chains {
+                if !kept.iter().any(|k| k.range == c.range) {
+                    refused.insert(text[c.range.clone()].to_owned());
+                }
+            }
+            text = apply_rewrites(&text, &kept);
         }
         let grouped = group_imports(&text);
         if grouped != text && same(&grouped) {
@@ -3823,9 +4126,15 @@ impl Model {
     /// Whether the rebuilt object gives code running with it as owner
     /// ([`Self::runs_shared_code`]) the same environment: every resource as the VM
     /// loads it, tree labels and `GLOB` link, text tables, sounds, definitions and
-    /// callback tables.
+    /// callback tables. The `GLOB` chunk is compared by the name it links (in
+    /// `original_lookup`), as the catalog reads it: its NUL-terminated and length-prefixed
+    /// forms link the same file, and no primitive reads its bytes.
     fn same_owner_environment(&self, recompiled: &RecompiledFile) -> bool {
-        self.original_resources == recompiled.resources
+        let not_glob = |((tag, _), _): &(&([u8; 4], u16), &Vec<Vec<u8>>)| tag != b"GLOB";
+        self.original_resources
+            .iter()
+            .filter(not_glob)
+            .eq(recompiled.resources.iter().filter(not_glob))
             && self.original_lookup == recompiled.lookup
             && self.original_strings == recompiled.strings
             && self.original_sounds == recompiled.sounds
@@ -5746,52 +6055,10 @@ struct Plan {
     /// Tree ID -> the text of the tree (written without a pin) that a node pin was worked
     /// out for, and the pin: `None` once it was tried and none is kept (see
     /// [`Plan::pin_nodes`]). A pin applies only while the tree is written as that text.
-    pins: BTreeMap<u16, (String, Option<NodePin>)>,
+    pins: BTreeMap<u16, (String, Option<TreePin>)>,
     /// Lifecycle blocks and trees without the extra idioms that leave their locals by number,
     /// after a round that named them was not proven or did not compile.
     unnamed_locals: BTreeSet<u16>,
-}
-
-/// `share_tails` and a `node_order` written in a tree's `#[bhav(..)]` header, which
-/// renumber the nodes it compiles to ([`crate::node_order`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct NodePin {
-    share_tails: bool,
-    /// `None` when the nodes keep their order.
-    order: Option<Vec<u16>>,
-}
-
-impl NodePin {
-    /// The header fields, each after `, `.
-    fn fields(&self) -> String {
-        let mut out = String::new();
-        if self.share_tails {
-            out.push_str(", share_tails");
-        }
-        if let Some(order) = &self.order {
-            let order: Vec<String> = order.iter().map(u16::to_string).collect();
-            out.push_str(&format!(", node_order = [{}]", order.join(", ")));
-        }
-        out
-    }
-
-    /// The pin that makes `compiled` (a tree built without one) compile to `original`'s
-    /// nodes exactly: a `node_order` alone, or `share_tails` with or without one. `None` when
-    /// the nodes already match or no pin makes them.
-    fn matching(compiled: &[Instruction], original: &[Instruction]) -> Option<Self> {
-        if let Some(order) = crate::node_order::match_node_order(compiled, original) {
-            return (!is_identity(&order)).then_some(Self {
-                share_tails: false,
-                order: Some(order),
-            });
-        }
-        let shared = shared_tails(compiled)?;
-        let order = crate::node_order::match_node_order(&shared, original)?;
-        Some(Self {
-            share_tails: true,
-            order: (!is_identity(&order)).then_some(order),
-        })
-    }
 }
 
 /// `compiled` with the nodes that run alike merged (`share_tails`), or `None` when nothing
@@ -5975,9 +6242,11 @@ impl Plan {
             || self.lower_tree(model, id)
     }
 
-    /// Pins tree `id`'s nodes (see [`NodePin::matching`]) when the round wrote it without a
-    /// pin, it is not proven, and a pin makes it compile to the original's nodes exactly. A
-    /// pinned tree that is still not proven loses its pin. Each text is tried once.
+    /// Pins tree `id`'s nodes ([`match_tree_pin`]: `dead_false = error`, `share_tails`, a
+    /// `node_order`) when the round wrote it without a pin, it is not proven, and a pin
+    /// should make it compile to the original's nodes exactly. The pin is a prediction from
+    /// the bytes: a pinned tree that is still not proven loses its pin. Each text is tried
+    /// once.
     /// - The node numbers are what strict mode compares, so a structured tree that runs the
     ///   original's nodes in another order is proven with its order pinned.
     /// - An indexed tree (kind 4) enters at the node its first argument names: none may move.
@@ -6006,7 +6275,7 @@ impl Plan {
             return false;
         }
         let pin = (t.original.kind != 4)
-            .then(|| NodePin::matching(&b.instructions, &t.original.instructions))
+            .then(|| match_tree_pin(&b.instructions, &t.original.instructions))
             .flatten();
         let found = pin.is_some();
         self.pins.insert(id, (text.clone(), pin));
@@ -6053,7 +6322,8 @@ impl Plan {
             {
                 continue;
             }
-            let pin = shared_tails(&b.instructions).map(|shared| NodePin {
+            let pin = shared_tails(&b.instructions).map(|shared| TreePin {
+                dead_false_error: false,
                 share_tails: true,
                 order: crate::node_order::match_node_order(&shared, &t.original.instructions)
                     .filter(|order| !is_identity(order)),
@@ -6451,6 +6721,33 @@ impl Out {
 }
 
 impl Model {
+    /// The semi-global library the original links (its `GLOB` chunk), when `semi_global:`
+    /// can name it: the rebuilt object then links the same file, and its semi-global calls
+    /// name the same trees.
+    fn semi_global_link(&self) -> Option<&str> {
+        match &self.original_lookup.glob {
+            Ok(Some(name)) if crate::compile::check_semi_global_name(name).is_ok() => {
+                Some(name.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// The module semi-global tree `id` is declared in. A block of the linked library
+    /// (`extern "Name" mod`) is trusted to declare a tree's whole frame, so it proves a
+    /// call to it narrow (four argument words or fewer); a tree whose frame the lift does
+    /// not know to be that narrow (no literal call of it, and no catalog arity of 4 or
+    /// fewer) goes in an untagged block, `SEMI_GLOBALS_WIDE`, which proves nothing.
+    fn semi_global_module(&self, id: u16) -> &'static str {
+        let narrow = self.literal_calls.contains_key(&id)
+            || self.library_arities.get(&id).is_some_and(|&n| n <= 4);
+        if narrow || self.semi_global_link().is_none() {
+            "semi_globals"
+        } else {
+            SEMI_GLOBALS_WIDE
+        }
+    }
+
     fn generate(&self, plan: &Plan) -> Generated {
         let mut out = Out {
             lines: Vec::new(),
@@ -6485,8 +6782,11 @@ impl Model {
 
         let mut lib_globals: Vec<u16> = Vec::new();
         let mut lib_semis: Vec<u16> = Vec::new();
+        let mut wide_semis: Vec<u16> = Vec::new();
         for &id in self.extern_calls.keys() {
-            if id >= 8192 {
+            if id >= 8192 && self.semi_global_module(id) == SEMI_GLOBALS_WIDE {
+                wide_semis.push(id);
+            } else if id >= 8192 {
                 lib_semis.push(id);
             } else if id >= 256 && !self.std_globals.contains(&id) {
                 lib_globals.push(id);
@@ -6496,14 +6796,21 @@ impl Model {
             out.line("use std::globals::*;");
             out.line("");
         }
-        for (module, ids) in [
-            (self.globals_module(), &lib_globals),
-            ("semi_globals", &lib_semis),
+        // The semi-global library the object links (`semi_global: "Name";`) is the one its
+        // semi-global trees belong to.
+        let link = self.semi_global_link();
+        for (module, ids, lib) in [
+            (self.globals_module(), &lib_globals, None),
+            ("semi_globals", &lib_semis, link),
+            (SEMI_GLOBALS_WIDE, &wide_semis, None),
         ] {
             if ids.is_empty() {
                 continue;
             }
-            out.line(format!("extern mod {module} {{"));
+            match lib {
+                Some(lib) => out.line(format!("extern \"{lib}\" mod {module} {{")),
+                None => out.line(format!("extern mod {module} {{")),
+            }
             out.indent += 1;
             for id in ids {
                 let (params, comment) =
@@ -6545,6 +6852,9 @@ impl Model {
         out.line(format!("price: {};", self.price));
         if let Some(n) = self.attributes {
             out.line(format!("attributes: {n};"));
+        }
+        if let Some(lib) = link {
+            out.line(format!("semi_global: \"{lib}\";"));
         }
         out.line("");
         if !self.interactions.is_empty() {
@@ -6855,7 +7165,7 @@ impl Model {
                     line.trim_start().to_owned()
                 };
                 let header = header.strip_suffix(")]").unwrap_or(&header);
-                *line = format!("{}{header}{})]", &line[..indent], pin.fields());
+                *line = format!("{}{header}{})]", &line[..indent], pin.bhav_fields());
                 pinned.insert(t.id);
             }
             tree_texts.insert(t.id, text);
@@ -8635,7 +8945,7 @@ impl Translator<'_> {
         } else {
             let ident = self.model.extern_calls.get(&id)?;
             let module = if id >= 8192 {
-                "semi_globals"
+                self.model.semi_global_module(id)
             } else if self.model.std_globals.contains(&id) {
                 "globals"
             } else {
@@ -9389,27 +9699,7 @@ impl Translator<'_> {
                     && self.wave3() =>
             {
                 let handle = self.neighbor_handle()?;
-                // The `i16` cells PR I-4 names (the `ObjectId`, `bool` and enum ones would
-                // type their uses differently).
-                let name = match (o.scope, o.index) {
-                    (24, 2) => Some("age"),
-                    (24, 5) => Some("friend_count"),
-                    (24, 6) => Some("family_house"),
-                    (24, 9) => Some("family_friend_count"),
-                    (32, 0) => Some("posture"),
-                    (32, 34) => Some("pets_outside"),
-                    (32, 56) => Some("job_type"),
-                    (32, 57) => Some("job_level"),
-                    (32, 61) => Some("family"),
-                    (32, 77) => Some("date_partner"),
-                    (32, FAME) => Some("fame"),
-                    _ => None,
-                };
-                Some(match name {
-                    Some(name) => format!("{handle}.neighbor.{name}"),
-                    None if o.scope == 24 => format!("{handle}.neighbor.field[{}]", o.index),
-                    None => format!("{handle}.neighbor.person[{}]", o.index),
-                })
+                Some(neighbor_cell(handle, o.scope, o.index))
             }
             _ => self.lvalue(r),
         }
@@ -9695,6 +9985,95 @@ mod tests {
         ] {
             assert_eq!(raw_builtin_body(body), None, "{body}");
         }
+    }
+
+    #[test]
+    fn raw_neighbor_reads_and_padded_sounds_are_spelled_as_builtins() {
+        for (body, spelled) in [
+            (
+                "temp[0] := scope(24, 9);",
+                "temp[0] = stack_obj.neighbor.family_friend_count;",
+            ),
+            (
+                "temp[1] := scope(24, 3);",
+                "temp[1] = stack_obj.neighbor.field[3];",
+            ),
+            (
+                "temp[2] := scope(32, 61);",
+                "temp[2] = stack_obj.neighbor.family;",
+            ),
+            (
+                "temp[2] := scope(32, 200);",
+                "temp[2] = stack_obj.neighbor.person[200];",
+            ),
+            (
+                "play_sound(20, stack_obj) pad(3: 0x01);",
+                "play_sound(20, stack_obj, pad3: 0x01);",
+            ),
+            (
+                "play_sound(10) pad(3: 0x01, 5: 2);",
+                "play_sound(10, false, pad3: 0x01, pad5: 2);",
+            ),
+            (
+                "play_sound(7, true) pad(2: 0x10);",
+                "play_sound(7, stack_obj, pad2: 0x10);",
+            ),
+        ] {
+            assert_eq!(
+                raw_builtin_body(body),
+                Some(vec![spelled.to_owned()]),
+                "{body}"
+            );
+        }
+        for body in [
+            // Neighborhood cells are read-only, and field 10 has no v2 spelling.
+            "scope(24, 1) := 0;",
+            "temp[0] := scope(24, 10);",
+            "temp[0] := scope(32, 256);",
+            // An unpadded sound, a pad of a byte the call spells, a target the call does not take.
+            "play_sound(5);",
+            "play_sound(5) pad(4: 0x01);",
+            "play_sound(5, 2) pad(3: 0x01);",
+            "play_sound(x) pad(3: 0x01);",
+        ] {
+            assert_eq!(raw_builtin_body(body), None, "{body}");
+        }
+    }
+
+    #[test]
+    fn literal_if_chains_on_one_operand_are_spelled_as_match() {
+        let text = "fn t() {\n    if temp[0] == 0 {\n        a();\n    } else if temp[0] == Kind::B {\n        raw {\n            if x == 1 {\n            } else if x == 2 {\n            } else if x == 3 {\n            }\n        }\n    } else if temp[0] == -2 {\n        if temp[1] == 1 {\n            c();\n        } else if temp[1] == 2 {\n        } else if temp[1] == 3 {\n        }\n    } else {\n        d();\n    }\n    if temp[0] == 0 {\n    } else if temp[0] == 1 {\n    }\n}\n";
+        let none = BTreeSet::new();
+        let chains = match_spellings(text, &none);
+        // The outer chain only: the inner one is the next pass's, the raw one is `.air`, the
+        // two-arm one no chain.
+        assert_eq!(chains.len(), 1);
+        let once = apply_rewrites(text, &chains);
+        assert_eq!(
+            once,
+            "fn t() {\n    match temp[0] {\n        0 => {\n            a();\n        }\n        Kind::B => {\n            raw {\n                if x == 1 {\n                } else if x == 2 {\n                } else if x == 3 {\n                }\n            }\n        }\n        -2 => {\n            if temp[1] == 1 {\n                c();\n            } else if temp[1] == 2 {\n            } else if temp[1] == 3 {\n            }\n        }\n        _ => {\n            d();\n        }\n    }\n    if temp[0] == 0 {\n    } else if temp[0] == 1 {\n    }\n}\n"
+        );
+        let twice = apply_rewrites(&once, &match_spellings(&once, &none));
+        assert!(!twice.contains("match x"), "{twice}");
+        assert!(twice.contains("            match temp[1] {\n                1 => {\n                    c();\n                }\n                2 => {\n                }\n                3 => {\n                }\n            }\n"));
+        for chain in [
+            // A repeated value, another operand, a test that is not `==`, a call as a value.
+            "if x == 1 {\n} else if x == 2 {\n} else if x == 1 {\n}\n",
+            "if x == 1 {\n} else if y == 2 {\n} else if x == 3 {\n}\n",
+            "if x == 1 {\n} else if x != 2 {\n} else if x == 3 {\n}\n",
+            "if x == 1 {\n} else if x == f() {\n} else if x == 3 {\n}\n",
+        ] {
+            assert!(match_spellings(chain, &none).is_empty(), "{chain}");
+        }
+        // A refused outer chain: the chain in its arm is proposed instead.
+        let refused: BTreeSet<String> = [text[chains[0].range.clone()].to_owned()].into();
+        let inner = match_spellings(text, &refused);
+        assert_eq!(inner.len(), 1);
+        assert!(
+            text[inner[0].range.clone()]
+                .trim_start()
+                .starts_with("if temp[1] == 1 {")
+        );
     }
 
     #[test]

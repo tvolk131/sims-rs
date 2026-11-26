@@ -717,7 +717,8 @@ fn a_functional_call_is_proven_only_with_the_callback_it_runs() {
 fn a_semi_global_link_is_kept_or_no_tree_is_proven() {
     // Semi-global calls and constants resolve through `GLOB`, and so do the global trees
     // a tree calls (they run with this object as their owner): with another link, no
-    // tree of the object is proven, whatever it calls.
+    // tree of the object is proven, whatever it calls. Since v2.4 the lift writes the link
+    // as `semi_global: "Name";` when v2 can spell the name.
     let source = r#"object "Fable Bellows" {
     guid: 0x7E00_0135;
     #[bhav(id = 4301, label = "Caller", locals = 0)]
@@ -734,20 +735,48 @@ fn a_semi_global_link_is_kept_or_no_tree_is_proven() {
         label: String::new(),
         data: data.to_vec(),
     };
-    let original = rebuild(&compile(source), |_| {}, vec![glob(b"FableGlobals\0")]);
-    let linked = report(&original);
-    // The lift writes no `GLOB`, so 8192 resolves nowhere in the rebuilt object.
-    let link = |iff: &Iff| iff.all(b"GLOB").next().map(|c| iff.data(c).to_vec());
-    assert_ne!(link(&rebuilt(&linked)), link(&original));
+    let link = |iff: &Iff| {
+        iff.all(b"GLOB")
+            .next()
+            .map(|c| sims_formats::execution::global_link(iff.data(c)).expect("GLOB name"))
+    };
+    // Terminated, as v2 writes it, and length-prefixed, as most shipped files do: the
+    // rebuilt object links the same name either way.
+    for data in [&b"FableGlobals\0"[..], &b"\x0cFableGlobals"[..]] {
+        let original = rebuild(&compile(source), |_| {}, vec![glob(data)]);
+        let linked = report(&original);
+        assert!(
+            linked
+                .source
+                .contains("    semi_global: \"FableGlobals\";\n"),
+            "{}",
+            linked.source
+        );
+        assert_eq!(link(&rebuilt(&linked)), link(&original));
+        // The caller too: the owner environment compares the link, not the chunk's bytes.
+        for id in [4301, 4302] {
+            assert!(proven(check_of(&linked, id)), "{id}: {:?}", linked.trees);
+        }
+    }
+    // A name v2 cannot write is left out, so 8192 resolves nowhere in the rebuilt object.
+    let original = rebuild(&compile(source), |_| {}, vec![glob(b"Fable/Globals\0")]);
+    let unlinked = report(&original);
+    assert!(
+        !unlinked.source.contains("semi_global:"),
+        "{}",
+        unlinked.source
+    );
+    assert_ne!(link(&rebuilt(&unlinked)), link(&original));
     for id in [4301, 4302] {
         assert!(
-            matches!(check_of(&linked, id), TreeCheck::Inconclusive(why) if why.contains("semi-global")),
+            matches!(check_of(&unlinked, id), TreeCheck::Inconclusive(why) if why.contains("semi-global")),
             "{id}: {:?}",
-            linked.trees
+            unlinked.trees
         );
     }
     // An empty name links nothing, like no `GLOB` at all.
     let empty = report(&rebuild(&compile(source), |_| {}, vec![glob(b"\0")]));
+    assert!(!empty.source.contains("semi_global:"), "{}", empty.source);
     assert!(proven(check_of(&empty, 4302)), "{:?}", empty.trees);
 }
 
