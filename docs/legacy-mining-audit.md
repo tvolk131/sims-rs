@@ -74,7 +74,7 @@ cited reason.
 
 **sims-app**
 1. Tutorial highlight marker (`0x5de13f`, `TutHigh.bmp`, placed at `y = ty − 53`) [also sims-content #10].
-2. Non-modal, anchored and large dialogs: dismiss box, hidden title for the tutorial controller, 1.2 aspect ratio, `BMP_` 5000–5024 picture icons.
+2. ~~Non-modal, anchored and large dialogs: dismiss box, hidden title for the tutorial controller, 1.2 aspect ratio, `BMP_` 5000–5024 picture icons.~~ Ported (#484): `sims_ui::dialog::Presentation` and the `MinimizeBox` dismiss box ([ADR](decisions/20261126-ui-buy-labels-family-export-dialog-presentation-currency.md)). Still open: the 40-second auto-answer timer (`widget_setting`), and the anchored placement is unverified against a capture.
 3. Tutorial lesson table, for the tutorial port.
 4. Magic Starter Kit collection: offers, package attributes, and the contents GUIDs.
 5. Downgrade or port the two remaining PORT verdicts: `owned_worker.rs` and `bin/inspector.rs`.
@@ -84,7 +84,7 @@ cited reason.
 2. ~~Catalog-name fallback (`0x457d3b`, `*` + OBJD label).~~ Ported there too; the legacy CATS order and language fallback were wrong.
 3. ~~Buy category labels (STR# 150, 200–207 and 210; catalog-6 remap; column order).~~ Ported there too.
 4. Built-in avatar materials (`0x5d41db`).
-5. Footstep floor material (`0x5890a8`) [also sims-sim #2].
+5. ~~Footstep floor material (`0x5890a8`) [also sims-sim #2].~~ Ported (#485): `crates/sims-vm/src/footsteps.rs`, with floor categories from `floors.iff` in `LotPrices` ([ADR](decisions/20261126-walk-animator-states-and-footsteps.md)).
 6. Censor appearance (`<profile>-needs` in `adult.cmx.bcf`, person word 30) [also sims-render #1].
 7. Object graphic selection. It conflicts with the renderer today: out-of-range selectors wrap to 0, the DGRP view is picked by direction bitmask, and SPR# wins.
 8. Notification text colours (`0x4ff31a`).
@@ -95,7 +95,7 @@ cited reason.
 13. Re-express the `tests/frame_strings.rs` test.
 
 **sims-render**
-1. Censor mosaic (`0x4ac301`: block sizes, strict depth, global-RNG jitter, 555/565/556 packing).
+1. ~~Censor mosaic (`0x4ac301`: block sizes, strict depth, global-RNG jitter, 555/565/556 packing).~~ Ported (#486): `crates/sims-render/src/censor.rs`, its rectangle from the posed `-needs` censor boxes, its draws from a per-tick copy of the global RNG ([ADR](decisions/20261126-render-censor-held-order-walls-glide.md)).
 2. Smooth zoom and high-DPI design reference (`Camera::sprite_zoom`), or an ADR dropping it.
 3. Object-preview fitting edge rules (signed facing division, measured-union centring).
 4. Dialog object picture (120×120 preview or 45×45 icon). Check against an original screenshot.
@@ -105,24 +105,24 @@ cited reason.
 1. ~~Community-lot RNG reseed on load (`0x46d09c..0x46d0e8`), with timer readings recorded as seeded inputs.~~ Ported: `sims_vm::boot::read_simulator`, `World::seed_from_host_clock`.
 2. ~~Date indicator and indicator-notification queues (`0x4448a6`, `0x444962`, `0x4464db`, `0x4472a2`, `0x4477fb`).~~ Ported: `World::indicator_queues`, `selection.rs` `refresh_indicators`. One departure: a deleted person leaves every queue entry (`IndicatorQueues::forget`), where the original erases only the first and keeps a dangling pointer. The star pools are kept as the original keeps them (`IndicatorQueues::available_stars`, `stars_in_use`). Verified in the disassembly: made stars are appended in the order made (0x4464c9); a star let go from a head moves from in-use to the end of the available pool only if it was in use (0x4481eb: 0x4483bd); a refresh, an arrival and a deselection take the available pool's last star (0x447012, 0x447b63, 0x446ed9); a refresh and an arrival take it before the border-tile check, so a famous Sim on a border tile loses it (in neither pool), while a deselection checks first (0x446d17) and loses none; a star being removed leaves both pools before it is taken off the lot (0x44126f → 0x447d8b → 0x448097), so a fault in its holder's callback cannot leave it in use; the lot clear deletes the in-use pool, then the available pool (0x44602d). The arrival on a put runs when the old position was off the active lot by its size (0x433366) and the x word moved (0x4335a5). Saves from before format 11, and `WorldSnapshot` slots saved before the queues were kept, take their pools from where their stars stand (`queues_saved_before_kept`). Their order is an approximation: it follows the stars' registration order, while the original's pools follow the order the stars were let go, which can differ (a fourth star let go before the third). A `WorldSnapshot` save payload carries the pending refreshes after the world's encoding (`World::encode_snapshot`). Open: the Downtown Date arrival marker, since the port's travel writes the date link itself and the original's arrival sequence is unread; a star lost because the head slot's flags lack bit 2 (0x4470a8), since the port keeps no slot flags. Also open: the pools start empty on a house-file load, as the original's interface starts with empty pools, so any star marker such a file holds is in neither pool; whether the original's house file holds star markers is unread.
 3. ~~Dialog icon mode 4, named icons (`0x530a7b`, `0x4368b6`).~~ Ported, all six categories: `sims_ui::dialog::named_icon`. `rel` takes the relationship panel's first person, whose last tie the original breaks by the place in its table of person types (0x4ea035, `Acquaintances::portrait_place`). Types made in play take places in the order made (0x4265fd → 0x4e8a3a); `Characters::made` keeps that order (`MadeTypes`). The stores that carry it have new versions that an older build refuses rather than saving the types back by GUID: the neighborhood store (format 5), the save records (format 3), the named snapshot records (record format 33) and the trip envelope (`TRVL` version 3). Older versions read back in GUID order. Open: a `rel` Sim with no portrait strip, which the original renders (0x4e94a4 → 0x4e8c5d); the port shows no icon.
-4. The original sort with its exact tie order, used for object and wall draw order [also sims-sim #7]. **The sort is ported** (`sims_core::sort`). Using it for draw order is left to the renderer, which needs the original's input orders.
+4. The original sort with its exact tie order, used for object and wall draw order [also sims-sim #7]. **The sort is ported** (`sims_core::sort`). The wall draw order uses it (#486). Objects keep the depth order with holder→slot grouping (`0x437c56`): the legacy `rebuild_order` tile key was tried and not adopted, as it drew 6 ratchet pixels unlike the original ([ADR](decisions/20261126-render-censor-held-order-walls-glide.md)).
 5. ~~Career text extras (alternate titles, per-level secondary strings).~~ Ported: the job panel (0x53074c) and `$Job` (0x44ca89) show the `STR#` ID + 1000 titles (0x4033d2); a list box of people (0x52ff7e) shows the first table's (0x4033a4). Both are kept.
 6. ~~`cAverageHistory` (`0x4cb4a5`–`0x4cb635`).~~ Ported: `sims_ui::needs_history`. The consumer is identified, but the Needs bars' trend is not drawn yet.
 7. Terrain-preparation gates (`0x49cf02..0x49d237`). Stays with the terrain presets (see below).
 8. Parked for reference: `commander` and the scheduler storage, registry and visit model.
 
 **sims-sim**
-1. Walk animator states 5, 7, 8 and 12, and the short sidestep.
-2. Footstep and clip-sound selection.
+1. ~~Walk animator states 5, 7, 8 and 12, and the short sidestep.~~ Ported (#485, [ADR](decisions/20261126-walk-animator-states-and-footsteps.md)).
+2. ~~Footstep and clip-sound selection.~~ Ported (#485): `crates/sims-vm/src/footsteps.rs`, `clip_events.rs`.
 3. Route-cache invalidation on house refresh (`0x444805`/`0x46387c`) and the resume states.
 4. "Go Here" ground click (`0x48cbec`, marker `0x7c4`).
 5. Layer masking when posing.
 6. The house's architecture value on the day turn: the load path computes it (`crates/sims-vm/src/lifecycle.rs:524-680`), but `daily.rs` leaves it stale, and the walls-only global-22 case (`0x4795c5`) fails. Also body scale from word 85 (`0x5a0932`).
-7. The original wall draw order (`0x5404b5`, `0x5409ab`, `0x53f1db`).
-8. Linear camera glide (`0x4c9a27`).
+7. ~~The original wall draw order (`0x5404b5`, `0x5409ab`, `0x53f1db`).~~ Ported (#486): run by run in the graph order (`0x540619`).
+8. ~~Linear camera glide (`0x4c9a27`).~~ Ported (#486): 250 ms, single-precision slope, rounding half away from zero.
 9. Floating text over a person (lifetime, styles, `sting_char_winner`).
-10. Currency formatter for negatives (`0x6007df`).
-11. Zoom-out stops at 2 on house 99, and the ground-under-tile rule (`0x4af029`).
+10. ~~Currency formatter for negatives (`0x6007df`).~~ Ported (#484): `sims_ui::currency`, with the grouping table for every language.
+11. ~~Zoom-out stops at 2 on house 99, and the ground-under-tile rule (`0x4af029`).~~ Ported (#486): `Zoom::zoom_out_on`; the ground under a level-1 floor is hidden only when the tile and its four neighbours are floored and all four neighbours are water (`0x4af029`). The legacy wording ("a neighbour is water" draws it) inverted the water test. The global enable byte `0x6c724a` is not ported.
 12. The `move_objects` cheat at `0x6e4ad4`, refusal codes 0x25/0x26/0x27, and child visit order.
 13. Calendar arithmetic (`0x473574`, `0x43520d`).
 14. Build-tool classification (tool mode = group + 3).
@@ -296,7 +296,7 @@ Most of what the crate knows has been ported, and in most places the new code go
 
 Four pieces of original-game presentation and behavior are still unported, and nothing else in the repo records them:
 1. The tutorial highlight marker's sprite and the `0x5de13f` placement formula. The new code draws a placeholder outline and marks it "unverified".
-2. How non-modal, anchored and "large" message dialogs are presented. The new `sims-ui` centers every dialog as a modal one with a 2.0 aspect target.
+2. How non-modal, anchored and "large" message dialogs are presented. *Ported* (#484): `sims_ui::dialog::Presentation` and the dismiss box. The 40-second auto-answer timer is still open, and the anchored placement is unverified (backlog 2).
 3. The tutorial lesson table: the order of lessons and what triggers each one. The tutorial itself is "not ported yet".
 4. The Magic Starter Kit collection table, including GUIDs that appear nowhere in `crates/` or `docs/`.
 
@@ -317,7 +317,7 @@ Everything else is one of:
 | `src/tutorial_font.rs` | FFN metrics (60b97f), coverage ×17 (60c446), 607d9e font choice | ported | `crates/sims-ui/src/font.rs:1-17` (cites legacy file) |
 | `src/tutorial_dialog.rs` | Message-box skin (PopupInfoTiles 3008 9-slice, WinBtn 65×33) and line fit 60b620 | ported | `crates/sims-ui/src/dialog.rs:41-60`; `font.rs:204-260` |
 | `src/tutorial_dialog.rs` | Width search 523fe3/524257 and the exclusion-band rounding 5351cc/534fe5 | ported | `dialog.rs:1410-1660` |
-| `src/tutorial_dialog.rs` | Non-modal dismiss widget, `large` aspect target 1.2, picture-dialog extent, text colour | **still to mine** | see backlog 2 |
+| `src/tutorial_dialog.rs` | Non-modal dismiss widget, `large` aspect target 1.2, picture-dialog extent, text colour | ported (#484), except the 40-second timer | `crates/sims-ui/src/dialog.rs` (`Presentation`, `MinimizeBox`); see backlog 2 |
 | `src/tutorial_highlight.rs` (+ `original_viewer.rs:4447`, `ui_publication/view.rs:600-630`) | 0x5de13f marker origin; TutHigh 50 px frame; target table | **still to mine** | `crates/sims-game/src/game.rs:13045-13110` draws a 2 px yellow outline instead; `docs/decisions/20261121-ui-effect.md:15` says "unverified". See backlog 1 |
 | `src/dialog_view.rs` | HUD bitmap loading, cell counts and magenta key | ported | `crates/sims-ui/src/art.rs` |
 | `src/dialog_view.rs` | Placement of tutorial/anchored dialogs (observed top-right) and non-modal dialogs | **still to mine** | see backlog 2 |
@@ -347,14 +347,14 @@ Everything else is one of:
    - **Target table:** `ui_publication/view.rs:604-616`, which includes 4500 for the needs panel.
    - **Destination:** `sims-ui` hud (highlight item) and `sims-game::draw_ui_effect_highlights`, replacing the placeholder outline.
 
-2. **Non-modal, anchored and large message-dialog presentation** (`tutorial_dialog.rs:87-106,284-395,511-545`; `dialog_view.rs:463-500`; also `legacy/crates/sims-vm/src/dialog/presentation.rs`):
+2. **Non-modal, anchored and large message-dialog presentation** (`tutorial_dialog.rs:87-106,284-395,511-545`; `dialog_view.rs:463-500`; also `legacy/crates/sims-vm/src/dialog/presentation.rs`). *Ported* (#484) into `sims_ui::dialog::Presentation` and the dismiss box, including `presentation.rs`'s `capture` and `choose_width` with the 1.2 target ([ADR](decisions/20261126-ui-buy-labels-family-export-dialog-presentation-currency.md)). Not mined: `widget_setting`, the 40-second auto-answer timer. The anchored placement is the legacy one, unverified against a capture:
    - **Dismiss widget:** a non-modal dialog shows a `Shared/Sys/MinimizeBox.bmp` widget (48×11, four 12×11 cells) at (w−bw−5, 5) instead of the bottom button.
    - **Modal extent:** `inset + body + 18 + 33 + 9 + 12`.
    - **Placement:** anchored dialogs (caller == owner) sit at the top right.
    - **Hidden title:** the title is hidden when the caller GUID is 0xc3249a1d (the tutorial controller).
    - **Large flag:** the `large` flag (`mode & 0x80`) uses an aspect target of 1.2 and a minimum width of max(image width, 130 when modal, 100 otherwise).
    - **Picture icons:** `BMP_` 5000–5024 flow text around image + 18.
-   - **Destination:** `crates/sims-ui/src/dialog.rs` (currently centered and always modal), plus `sims-game` input routing.
+   - **Destination:** `crates/sims-ui/src/dialog.rs` (`Presentation` since #484), plus `sims-game` input routing.
 
 3. **Tutorial lesson table** (`exploration/startup_play/host_journey/tutorial_camera.rs:18-200`; Bob object 105 / neighbor 48 in `go_here.rs`):
    - **Order:** Zoom → Medium → Edge → Right → Rotate → Live → Bob → GoHere, then object interaction.
@@ -449,7 +449,7 @@ Until these are ported, or written into `docs/`, the crate stays. The `legacy-fi
 | `clothing_catalog.rs`, `clothing_profile.rs` | Clothing enumeration; career outfit (0x45ee5f); pajamas (0x45f034); migrations (0x409315) | ported | `crates/sims-vm/src/outfits.rs:1-11,603-775`; `crates/sims-people/src/suit.rs:2-35,337-379`; `crates/sims-content/src/wardrobe.rs`, `import_wardrobe.rs` |
 | `character_appearance.rs`, `character_model.rs`, `character_portrait.rs`, `character_geometry.rs` | Appearance re-read (0x5888d3); posture clip tables; portrait draw | ported / infra | `crates/sims-vm/src/frame.rs:43-53`, `animator.rs:1211-1260`; `crates/sims-people/src/caf_preview.rs`, `pie_head.rs`. The FPU word 0x037f/0x003f for skinning is a presentation detail (§3 item 11) |
 | `character_initialization.rs`, `character_censor.rs` | Censor appearance `<profile>-needs` inside `adult.cmx.bcf` | **still to mine** | §3 item 6 |
-| `character_loading.rs`, `character_loading/` (incl. `floors.rs`, `live/`) | Footstep floor material (0x5890a8 / 0x49fd95); live person construction services | **floors: still to mine**; rest infra | §3 item 5; `crates/sims-vm/src/sounds.rs:27-30` says it is not ported |
+| `character_loading.rs`, `character_loading/` (incl. `floors.rs`, `live/`) | Footstep floor material (0x5890a8 / 0x49fd95); live person construction services | floors: ported (#485); rest infra | §3 item 5; `crates/sims-vm/src/footsteps.rs` |
 | `graphic_{initialization,loading,materials,profiles,retirement,update}.rs` (+dirs) | Ordinary 3D animator services (plumb bob) | dropped (infra) | salvage-audit: sims-content DROP `graphic_*`. Bob in `crates/sims-people/src/bob.rs`; own-graphics CRT draws in `crates/sims-vm/src/factory.rs:398-410` |
 | `object_graphics.rs` | Graphic selector wrap (0x438954); DGRP view by direction-bit and exact zoom (0x407847); SPR# before SPR2 (0x4c8e0d); id interval (0x45768a) | **still to mine (conflicts with current code)** | §3 item 7 |
 | `object_resources.rs` (+`overlay`, `owner/`) | Mounted IFF resource owner | dropped (infra) | salvage-audit DROP list |
@@ -490,7 +490,7 @@ Items 1-8 and 13 exist only in this crate (some also have a kernel in legacy `si
    - Exact f32 bits for diffuse and ambient; specular and emissive 0; power 5; payload word 0 = 80.
    - Source: `legacy/crates/sims-content/src/avatar_material.rs:13-68`.
    - Destination: `sims-people` (`appearance.rs`/texture lookup) and `sims-render`.
-5. **Footstep floor material (0x5890a8, 0x49fd95).**
+5. **Footstep floor material (0x5890a8, 0x49fd95).** *Ported* (#485) to `crates/sims-vm/src/footsteps.rs` ([ADR](decisions/20261126-walk-animator-states-and-footsteps.md)). Open: plug-in floors, since sims-content keeps no category for floor patterns past `floors.iff`.
    - Water → 10.
    - Objects underfoot by GUID:
      - 0x96e3398d, 0xa2daa08c, 0xc02b406a, 0x65274a4f → 6;
@@ -518,7 +518,7 @@ Items 1-8 and 13 exist only in this crate (some also have a kernel in legacy `si
 8. **Person notification text colours (0x4ff31a).**
    - default [0x000052, 0x00ca39], yellow [0xffcb17, 0x000000], magenta [0xff00ff, 0x000000].
    - Source: `legacy/crates/sims-content/src/notifications.rs:175-183`.
-   - Two related rules live in legacy `sims-sim/person_notification/`, not this crate: removal at age 100 (0x437e9c) and locale currency `-$5` (0x6007df), which would settle `crates/sims-ui/src/household.rs:771`.
+   - Two related rules live in legacy `sims-sim/person_notification/`, not this crate: removal at age 100 (0x437e9c) and locale currency `-$5` (0x6007df). The currency rule is ported (#484, `sims_ui::currency`).
    - Destination: `sims-ui`.
 9. **Numbered catalog open order.**
    - Rule: for an enumerated `_17_Clothes.bcf`, the game first opens plain `Clothes.bcf`, and opens the numbered file only if that fails. Identity 0x80000000 means no prefix.
@@ -564,11 +564,10 @@ previews live in `sims-ui`, and picking lives in `sims-game`.
 `camera_device/`, `dialog/`, the portrait jobs, `frozen_house` and the
 examples are native-device shims or diagnostics. The vision drops those.
 
-One piece of real game behavior has not been ported: the **censor mosaic
-arithmetic** in `censor.rs` (0x4ac301, with the row quirk at
-0x4ac4c8/0x4ac649). The roadmap confirms the original draws it (it
-explains the global RNG bursts at updates 4155 to 4365), and nothing in
-`crates/` draws it.
+The one piece of real game behavior this audit found unported, the
+**censor mosaic arithmetic** in `censor.rs` (0x4ac301, with the row quirk
+at 0x4ac4c8/0x4ac649), is now ported (#486,
+`crates/sims-render/src/censor.rs`).
 
 Three smaller items are also open:
 - the smooth-zoom and high-DPI composition design, which the vision
@@ -611,7 +610,7 @@ Address sweep:
 | `camera.rs` (`from_native`, quarter-pixel fit to 0x49b0de) | Adapter from float camera to native camera | Superseded (the current camera is native) | `crates/sims-render/src/camera.rs` |
 | `gpu.rs`, `world.wgsl`, `depth_range.rs`, `software.rs` (+`raster_context_tests`), `texture_tests.rs`, `decoded_sprites/` | wgpu composition with per-texel depth `z + (1-byte/255)*scale`, depth range refit, CPU reference raster, decode cache keyed by document bytes | Superseded: drawing moved to an exact CPU canvas (ADR `20261114-drawing-lot-starts-own-crate-cpu.md`). The GPU design is reference material for item 2 only | `crates/sims-render/src/canvas.rs`, `cache.rs`; salvage-audit "PORT gpu.rs/world.wgsl/software.rs" was overtaken by that ADR |
 | `sprite_depth.rs` (0x4ca62e/0x4ca78f/0x49a5d3: `base + T[byte]`, `<=` wins, byte 255 skipped, flip, clip, rows with decoder AL≠1 skipped, depth scratch reset to 255 including clipped pixels) | Native sprite blit | Ported except the decoder row-skip detail | `crates/sims-render/src/depth.rs:20-35,379-430`; `canvas.rs:1312-1374` (`<=`); row-skip: backlog item 5 |
-| `censor.rs` (0x4ac301/0x4ac707: blocks of 2/4/8 px by zoom, strict `z < depth`, per-block average + `(rand&15)-8` drawn R, G, B, 3 draws per block drawn, threshold row = clipped top + row-in-block (0x4ac4c8/0x4ac649), 555/565/556 `pack`/`unpack`) | Censor mosaic | **Still to mine** | Only `docs/decisions/20261118-goth-day-global-draws-are-censor-mosaic.md` and `docs/roadmap.md:468-475` describe it; `crates/` draws nothing (censored parts are just skipped, `crates/sims-people/src/raster.rs:213`). Legacy `Region::projected` padding (4 px / 12 px shift, seed `tick^id`) is **not** native: use the ADR's reading (person rect +0x230, pad 1/2/4, global stream) |
+| `censor.rs` (0x4ac301/0x4ac707: blocks of 2/4/8 px by zoom, strict `z < depth`, per-block average + `(rand&15)-8` drawn R, G, B, 3 draws per block drawn, threshold row = clipped top + row-in-block (0x4ac4c8/0x4ac649), 555/565/556 `pack`/`unpack`) | Censor mosaic | ported (#486) | `crates/sims-render/src/censor.rs`; ADR `20261126-render-censor-held-order-walls-glide.md`. Legacy `Region::projected` padding (4 px / 12 px shift, seed `tick^id`) is **not** native: use the ADR's reading (person rect +0x230, pad 1/2/4, global stream) |
 | `floors.rs` (global 23 lot size, drawn cells `1..size-1` 0x49cecc, split floor 255 to `styles[0]`/`patterns[0]` halves, background gray 112, edge-padding hack) | Floors | Ported (the padding hack and gray are GPU-only and dropped) | `crates/sims-vm/src/travel.rs:153,3505`; `crates/sims-render/src/scene.rs:1773,2239`; `lot.rs:45-50` |
 | `floors/road.rs` (0x4a7dfe: 10↔11 swap on odd turns from the saved HOUS 0 phase, level 1 only) | Road dashes | Ported, test re-expressed | `scene.rs:4174-4192`, test `scene.rs:4997` |
 | `floors/pool.rs` (0x4ad8ac 16 diamonds plus rim 12; 0x4614d6 nibble rotate; 0x461e39 corner table at 0x6e52a0; SPR2 1024+16z, 1072+4z) | Pools | Ported | `scene.rs:2001,3738-3760,5111`; `crates/sims-render/src/pools.rs`, `shadows.rs:116` |
@@ -632,7 +631,7 @@ Address sweep:
 
 ### 3. Still-to-mine backlog
 
-1. **Censor mosaic.**
+1. **Censor mosaic.** *Ported* (#486, [ADR](decisions/20261126-render-censor-held-order-walls-glide.md)).
    - Source: `legacy/crates/sims-render/src/censor.rs`, functions `apply`,
      `pack` and `unpack`. Port these.
    - Destination: `crates/sims-render` as a post-pass over the
@@ -712,7 +711,7 @@ Audited at `36fdb157` (origin/main). Read-only: grep and reading only, nothing b
 
 The interpreter core and its pure kernels have been mined thoroughly. That covers rng, numeric, memory/expression/Random/scopes, motives, autonomy (CRT qsort and top-N), `call()` argument semantics, the action queue, find-best, relationship, the person factory and reset, the loaders, multitile, removal, headline, look, reach, dialog text, and Generic Sims Call. The current `crates/sims-vm` (87k lines) cites the legacy crate in ~64 places and covers more than it did. Every primitive opcode 0–37 and 41–51 now has an arm in `crates/sims-vm/src/primitives.rs:129-177`, including the ones the salvage audit listed as missing: 15, 19, 21 and 33. Generic Sims Call implements 2, 6, 10, 11, 12, 14, 15, 18, 26, 28, 35 and 43. That is a superset of legacy, which had only 2, 6, 10, 11, 12, 14, 15, 28 and 43, so legacy has no further Generic subfunctions to mine.
 
-Some knowledge was still unported when this audit was written: a few pieces of real game behavior and some exact ordering rules. Examples were community-lot RNG reseeding, the date indicator with its notification queues, dialog named icons (icon mode 4), and the MSVC `std::sort` tie order used for draw order. Most of these are now ported (backlog below); the draw-order use of the sort and the terrain gates remain, and two more areas are parked. The crate therefore **STAYS**.
+Some knowledge was still unported when this audit was written: a few pieces of real game behavior and some exact ordering rules. Examples were community-lot RNG reseeding, the date indicator with its notification queues, dialog named icons (icon mode 4), and the MSVC `std::sort` tie order used for draw order. Most of these are now ported (backlog below), including the sort's use for the wall draw order (#486); the terrain gates remain, and two more areas are parked. The crate therefore **STAYS**.
 
 Mechanical check. Of the 231 addresses in the uncited-address list, ~175 sit in the DROP-listed native drawing and interface machinery: `scheduler/clock/draw/targets/**` (blit/unlock), `draw/background`, `draw/context/placement` stage cuts, `interface/view_control` query call sites, and profiler timestamps. The remaining ~55 resolve to the backlog items below, or to behavior already ported under other addresses. I also extended the check to bare-hex addresses (`445449` without `0x`), per file, in `scratchpad/vm-file-addr-coverage.txt`. Sim modules are 80–100% cited. The uncited residue is concentrated in `presenter.rs`, `nearby_houses.rs`, `indicator_refresh.rs`, `selection_indicators.rs`, `dialog.rs` (0x4368b6) and `career_text.rs` (0x403d64).
 
@@ -778,7 +777,7 @@ Mechanical check. Of the 231 addresses in the uncited-address list, ~175 sit in 
    - `GlobalBitmap` `gz`/`gzi` (0x4368b6).
 
    Test: `legacy/crates/sims-vm/tests/dialog_named_icons.rs`. Destination: `sims-ui/src/dialog.rs`, mode-4 branch.
-4. **MSVC `std::sort` with exact tie order, and the original draw order.** *The sort is ported* to `sims_core::sort`; the draw-order use is still to do. Sources:
+4. **MSVC `std::sort` with exact tie order, and the original draw order.** *The sort is ported* to `sims_core::sort`, and the wall draw order uses it (#486). The object `Order` cache's tile key (legacy `rebuild_order`) was tried and **not adopted**: it drew 6 ratchet pixels unlike the original, which the depth order matched (see the #486 ADR's table). Sources:
    - `legacy/crates/sims-vm/src/nearby_houses.rs:20-120`: introsort, partition and heap tie choices, insertion pass.
    - `presenter.rs:15-176`: `sort_wall_records` (0x540809/0x541346/0x541389, comparator 0x44054c), the object `Order` cache (0x449cbc), `draw_key` and `outside` (0x433087).
 
@@ -827,13 +826,13 @@ Across the 135 legacy modules I matched every 6-hex native address, written with
 
 About 19 concrete game rules are still unported, listed in §3. Among them:
 
-- the walk animator's states 5, 7, 8 and 12;
-- footstep and clip-sound selection;
+- the walk animator's states 5, 7, 8 and 12 (ported since, #485);
+- footstep and clip-sound selection (ported since, #485);
 - route-cache invalidation on house refresh;
 - the "Go Here" ground click;
 - the architecture value;
-- the original wall draw order;
-- the linear camera glide.
+- the original wall draw order (ported since, #486);
+- the linear camera glide (ported since, #486).
 
 The crate therefore stays. After the §3 items are ported it should be DELETE-SAFE: everything else is ported, or dropped under `docs/vision.md:22-25` (no Win32 emulation, no matching of internal layout or call order) and `docs/salvage-audit.md:187-193`.
 
@@ -880,18 +879,18 @@ Status key: **ported**, **dropped** (vision or salvage-audit), **to-mine** (see 
 | `object_catalog/move_tool(+/)` | commit 0x486ada, sell 0x487e18, teardown, feedback; tool fields; hover 0x486d95 | commit, sell and feedback ported. Tool classification (**#14**) and hover flags (**#15**) are to-mine | `buy.rs:1752`, `boot.rs:2653`, `sims-ui/src/build.rs:804` |
 | `object_catalog/iff/write.rs`, `{access,directory,composite,sprite_pool}` | IFFResFile3 writeback (0x41cf32 quirk); Win32 streams | dropped (vision:26 says no original save format; Win32) | `crates/sims-formats/src/iff_write.rs` holds the ResFile2 writer |
 | `object_scan(+/)` | 0x43c609 phase order, skip `*.dir` | ported | `crates/sims-content/src/install.rs:113`, `index.rs:537` |
-| `person_notification(+/)` | 0x4a69aa word-1 dispatch; display cache (`now - cached < 100`, 0x437e9c), colours, sting_char_winner; currency formatter 0x6007df | state ported; display, sound and "-$n" negative formatting are **to-mine (#9, #10)** | `crates/sims-vm/src/tick.rs:931-939,1126`; `sims-ui/src/household.rs:770-789` |
+| `person_notification(+/)` | 0x4a69aa word-1 dispatch; display cache (`now - cached < 100`, 0x437e9c), colours, sting_char_winner; currency formatter 0x6007df | state and "-$n" negative formatting ported (#484, `sims_ui::currency`); display and sound are **to-mine (#9)** | `crates/sims-vm/src/tick.rs:931-939,1126`; `sims-ui/src/household.rs:770-789` |
 | `pose/movement(+/path,steering,projection,route,calibration)` | walk step under PC=24 (0x58ede3), heading, steering, snap 0x48313e, states 0-4, 6, 9-11 | ported | `crates/sims-vm/src/animator.rs:617-654,968-1090,1879,2491,2653` |
-| `pose/movement.rs` states 5, 7, 8, 12 | sidestep, stop while walking, flag state, wait for an interruptible clip; constants 0x6d07b0/0x6d07bc/0x6d07e0 | **to-mine (#1)** | `animator.rs:791-794` traps at 0x58faa2; `:961` traps at 0x58df1e; `docs/roadmap.md:578` |
+| `pose/movement.rs` states 5, 7, 8, 12 | sidestep, stop while walking, flag state, wait for an interruptible clip; constants 0x6d07b0/0x6d07bc/0x6d07e0 | ported (#485) | `crates/sims-vm/src/animator.rs`; ADR `20261126-walk-animator-states-and-footsteps.md` |
 | `pose/{clock,update,layer,events,posture,ordinary,animator,command,accessory}`, `carry.rs` | layer clock and fade 0x597c4c, event window, posture 0x590430, carry clip 0x26, Animate Sim 0x58950b, dress 0x58d88f | ported | `crates/sims-sim/src/animator.rs:565-790`; `sims-vm/src/animator.rs:14-37`, `primitives/animate.rs`, `change_suit.rs` |
-| `pose/properties.rs` sound/footstep, `properties/surface.rs` | footstep gating, surface precedence (0x5890a8), names, selected/deselected sound | **to-mine (#2)** | `crates/sims-vm/src/sounds.rs:27-31` says "not ported" |
+| `pose/properties.rs` sound/footstep, `properties/surface.rs` | footstep gating, surface precedence (0x5890a8), names, selected/deselected sound | ported (#485) | `crates/sims-vm/src/footsteps.rs`, `clip_events.rs` |
 | `pose/sampling.rs` masking, `layer.rs:208` | bone-priority and translation-policy masking, blend marker 0x595947, layer order 0x5991fd | **to-mine, render (#5)** | `crates/sims-people/src/person.rs:257-272` applies layers unmasked |
 | `pose.rs`, `pose/{transform,sampling(frame),skeleton}`, `head_look(+/rig)`, `turn.rs`, `native_turn.rs`, `reach.rs`, `lot_reach(+/)`, `portrait_person.rs`, `person_update.rs`, `character_profile.rs` | quaternion blend, model matrix 0x592132, head look 0x590768/0x5904d2, Look Towards 0x45a98e, Reach 0x45c9ba, portrait owner 0x4e9652, person tick 0x45cc8c | ported. Two small items to mine: wiggle noise values (#18) and body scale (#6) | `crates/sims-sim/src/{pose,head}.rs`; `sims-vm/src/{head.rs,primitives/reach.rs,primitives/look_towards.rs,tick.rs:900-940}` |
 | `pose/portrait(+/)`, `pose/clothing(+/)`, `appearance_*` | head crop and border; clothing patterns, outfit selection 0x58a178; avatar search paths | ported, with residue: portrait light (#17), path-normalization residue (#19) | `crates/sims-people/src/{caf_preview,suit,appearance}.rs`, `sims-vm/src/outfits.rs`, `sims-content/src/people.rs` |
 | `pose/{mesh,vertices,geometry,model_*,graphic_*,live,refresh,initialize,construction,destruction,reset}`, `character*.rs`, `animation.rs`, `locomotion.rs` | D3D mesh and material lifetimes, graphic owners, resumable character services; the prototype's made-up 30 fps cursors | dropped (render infrastructure, continuations, not native) | salvage-audit:186 (pose subset only); vision:22-25 |
 | `lot_presenter` projection, depth, cutaway, walls, sprites, lights, grass, scroll, centering | 0x4a955d/0x4a9dc7 projection, 0x4ca5af depth table, 0x468203 room masks, wall caps 0x53d2fc, blitters, light pools 0x4a3813, grass 0x49dacd | ported | `crates/sims-render/src/{camera,cutaway,depth,caps,canvas,pools,light,shadows,grass}.rs`; `sims-game/src/game.rs:13266-13393` |
-| `lot_presenter/walls/rotation.rs`, `level_geometry` (wall order) | 0x5404b5 re-sort, 0x5409ab lower_bound insert, 0x53f1db heading | **to-mine (#7)** | `crates/sims-render/src/scene.rs:2376-2383` says it is "approximating" |
-| `lot_presenter/motion.rs`, `camera_command.rs` setters, `ground.rs` | linear glide 0x4c9a27; zoom-out floor 2 on house 99; 0x4af029 ground-under-tile rule | **to-mine (#8, #11)** | `sims-game/src/game.rs:172-205` uses a cubic ease; `sims-render/src/camera.rs:65-78`; `scene.rs:1767-1776` |
+| `lot_presenter/walls/rotation.rs`, `level_geometry` (wall order) | 0x5404b5 re-sort, 0x5409ab lower_bound insert, 0x53f1db heading | ported (#486) | `crates/sims-render` wall runs in graph order (`0x540619`) |
+| `lot_presenter/motion.rs`, `camera_command.rs` setters, `ground.rs` | linear glide 0x4c9a27; zoom-out floor 2 on house 99; 0x4af029 ground-under-tile rule | ported (#486) | `Zoom::zoom_out_on`; the ground rule hides ground only under floored water neighbours (§3 item 11) |
 | `lot_presenter` plumbing (viewport, redraw, open, lifecycle, person_refresh, physical_next, row_tail stages, motion/frame) | dirty rectangles, F6 ownership, native resume points (66 unmatched addresses) | dropped | salvage-audit:189-191 |
 | `lot_rooms.rs`, `lot_flags.rs`, `lot_walls.rs`, `lot_geometry.rs`, `architecture.rs`, `geometry.rs` | 0x479d9a partition, exterior and build-support flags, 0x476dbc wall collision | ported (the prototype's fixture topology is dropped) | `crates/sims-sim/src/rooms.rs:1-24,67`, `load.rs:249-350` |
 | `lot_environment(+/)` | 0x4665d1/0x467980 room scores, light byte, lamp pairs 0x4b5037, cap of 6 lamps | ported (the 0x4b51ae removal order is recomputed each frame) | `crates/sims-sim/src/rooms.rs:979`, `sims-render/src/lot.rs:115-126,531` |
@@ -910,14 +909,14 @@ Items are ordered by gameplay impact. Line numbers refer to the legacy files.
 
 **Simulation (`sims-vm` / `sims-sim`)**
 
-1. **Walk animator states 5, 7, 8 and 12, and the short step.**
+1. **Walk animator states 5, 7, 8 and 12, and the short step.** *Ported* (#485, [ADR](decisions/20261126-walk-animator-states-and-footsteps.md)).
    - Source: `legacy/crates/sims-sim/src/pose/movement.rs:420-470, 501-537, 572-652, 720-745` and `pose/movement/path.rs` (`prepare_stop`).
    - What it covers:
      - State 7 stops while walking: clip 19, heading and position eased by phase, and the reason mapped to −1/2/3.
      - The sidestep octant table is [15,13,11,12,14,16,18,17], used within 0.5 to 3.1 of the target. Pets scale distances by 1/12 and 0.2.
      - Constants 0x6d07b0, 0x6d07bc and 0x6d07e0.
-   - Destination: `crates/sims-vm/src/animator.rs`, which today traps at 0x58faa2 and 0x58df1e.
-2. **Footstep and clip-sound selection.**
+   - Destination: `crates/sims-vm/src/animator.rs`, which ran these states through the 0x58faa2 jump table since #485 (it trapped at 0x58faa2 and 0x58df1e before).
+2. **Footstep and clip-sound selection.** *Ported* (#485): `crates/sims-vm/src/footsteps.rs` and `clip_events.rs`.
    - Source: `pose/properties.rs:154-236, 264-286` and `pose/properties/surface.rs`.
    - What it covers:
      - Gating: x ≠ −999, the event's ±1/±2 sign matched to the clip's direction, and person flags 84&1, 68&1 and 74&8 all clear.
@@ -956,11 +955,11 @@ Items are ordered by gameplay impact. Line numbers refer to the legacy files.
 
 **Presentation (`sims-render` / `sims-game` / `sims-ui`)**
 
-7. **Original wall draw order.**
+7. **Original wall draw order.** *Ported* (#486, [ADR](decisions/20261126-render-censor-held-order-walls-glide.md)).
    - Source: `lot_presenter/walls/rotation.rs:25-40,166-179`, `lot_presenter/walls/construction.rs:232-237` and `lot_presenter/level_geometry.rs`.
    - Rule: records sorted on (x+y, x−y) with the original's unstable sort; 0x5409ab lower_bound insert; the vectors are re-sorted even at rotation 0; heading from 0x53f1db.
    - Destination: `crates/sims-render/src/scene.rs:2376`.
-8. **Linear camera glide.**
+8. **Linear camera glide.** *Ported* (#486): 250 ms, `target - slope * remaining` in single precision, rounded half away from zero.
    - Source: `lot_presenter/motion.rs:32-135` and `centering.rs:15-20,203`.
    - Rule (0x4c9a27): target − slope·remaining, rounded. Duration is the value from 0x6c7788 or distance/speed + 0.5. Style 0 jumps.
    - Destination: `crates/sims-game/src/game.rs:172-205`, replacing the cubic ease.
@@ -968,13 +967,13 @@ Items are ordered by gameplay impact. Line numbers refer to the legacy files.
    - Source: `person_notification/display.rs:305` and `person_notification.rs:24-28,100-125`.
    - What it covers: lifetime `now − cached < 100`; yellow (255,203,23) and magenta (255,0,255) styles; the `sting_char_winner` sound; the 0x4a698d label path.
    - Destination: `crates/sims-vm/src/tick.rs:1126` and `sounds.rs`, plus render and game.
-10. **Currency formatter.**
+10. **Currency formatter.** *Ported* (#484, `sims_ui::currency`, [ADR](decisions/20261126-ui-buy-labels-family-export-dialog-presentation-currency.md)).
     - Source: `person_notification/currency.rs`.
     - Rule (0x6007df): negatives format as "-$n" in language 1, which settles the "unverified" note at `sims-ui/src/household.rs:771`. The per-language separator and symbol table is needed only for localisation.
     - Destination: one shared formatter in `crates/sims-ui`.
-11. **Small camera and ground rules.**
+11. **Small camera and ground rules.** *Ported* (#486).
     - Zoom-out stops at 2 on house 99. Source: `lot_presenter/camera_command.rs:100-107`. Destination: `crates/sims-render/src/camera.rs:65-78`.
-    - Draw ground under a tile only if it is uncovered, a neighbour is uncovered, or a neighbour is water; neighbour clamps use the active size. Source: `lot_presenter/ground.rs:3-45` (0x4af029). Destination: `crates/sims-render/src/scene.rs:1767`.
+    - The ground under a level-1 floor is hidden only when the tile and its four neighbours are floored and all four neighbours are water; neighbour clamps use the active size. (This entry used to say the ground is drawn when "a neighbour is water", which inverts the water test, #486.) The global enable byte `0x6c724a` is not ported, so the rule is always on. Source: `lot_presenter/ground.rs:3-45` (0x4af029). Destination: `crates/sims-render/src/scene.rs:1767`.
 
 **Buy/Build and catalog (`sims-vm` / `sims-content`)**
 

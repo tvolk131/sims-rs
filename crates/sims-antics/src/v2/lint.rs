@@ -358,6 +358,7 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             frames,
             object: None,
             object_template: None,
+            foreign_template: false,
             strings: BTreeMap::new(),
             dialog_strings: Vec::new(),
             tables: BTreeMap::new(),
@@ -374,6 +375,7 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             object_me: false,
             me_bcon: symbols.bcon_names.contains("me"),
             bound: BTreeSet::new(),
+            loop_handles: BTreeSet::new(),
             raw_declared: BTreeSet::new(),
             raw_blocks: Vec::new(),
             raw_edges: false,
@@ -1021,6 +1023,12 @@ struct Symbols {
     /// `bcon[N]`, or an `extern` tree (globals and semi-globals can read an object's
     /// private tables).
     bcon_by_number: bool,
+    /// The literal indices `raw` blocks read as `bcon[N]` or `const[N]` (an `extern bcon`
+    /// entry's address, read by number).
+    raw_bcon_numbers: BTreeSet<i64>,
+    /// Whether a `raw` block reads `bcon[..]` or `const[..]` at an index that is not a
+    /// literal number.
+    raw_bcon_dynamic: bool,
 }
 
 impl Symbols {
@@ -1060,7 +1068,13 @@ impl Symbols {
                 }
                 TokenKind::RawBlock(code) => {
                     // `.air` reads a BCON entry as `bcon[N]` or `const[N]`.
-                    self.bcon_by_number |= raw_indexes(code, "bcon") || raw_indexes(code, "const");
+                    let (numbers, dynamic) = raw_bcon_reads(code);
+                    self.bcon_by_number |= raw_indexes(code, "bcon")
+                        || raw_indexes(code, "const")
+                        || !numbers.is_empty()
+                        || dynamic;
+                    self.raw_bcon_numbers.extend(numbers);
+                    self.raw_bcon_dynamic |= dynamic;
                     // Names and indices in `.air` code, not in its comments or strings
                     // (a quoted tree label may read `attr[7]`).
                     let outside = air_code_only(code);
@@ -1311,6 +1325,24 @@ fn any_expr(list: &[V2Stmt], pred: &mut dyn FnMut(&V2Expr) -> bool) -> bool {
 
 fn is_ident(e: &V2Expr, name: &str) -> bool {
     matches!(e, V2Expr::Ident(_, n) if n == name)
+}
+
+/// Whether `.air` code names the v2 binding `name`: by its own name, or by the frame word
+/// it lowers to (`__v_<name>_<n>`, which a raw block may read).
+fn raw_names(code: &str, name: &str) -> bool {
+    code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|w| w == name || let_source_name(w) == Some(name))
+}
+
+/// Whether `list` names `name` anywhere: in an expression or in raw code.
+fn names_anywhere(list: &[V2Stmt], name: &str) -> bool {
+    let mut raw = false;
+    walk_stmts(list, &mut |s| {
+        if let V2Stmt::RawAir { code, .. } = s {
+            raw |= raw_names(code, name);
+        }
+    });
+    raw || any_expr(list, &mut |x| is_ident(x, name))
 }
 
 fn mentions_ident(e: &V2Expr, name: &str) -> Option<Span> {
@@ -1585,6 +1617,8 @@ struct FileLinter<'a> {
     object: Option<String>,
     /// The template it is built `from`, if any.
     object_template: Option<String>,
+    /// Whether that template is declared outside the object's file ([`foreign_template`]).
+    foreign_template: bool,
     /// The linted object's `strings` entries: name -> text.
     strings: BTreeMap<String, String>,
     /// Its dialog strings (`STR#` 301), in order: a dialog's numeric string is 1-based.
@@ -1624,6 +1658,9 @@ struct FileLinter<'a> {
     /// The names the body being linted binds itself (`let`s, `for` bindings, non-Sim
     /// parameters): such a `me`, `self` or Sim name is not the frame's.
     bound: BTreeSet<String>,
+    /// Those of `bound` that are `for o in lot.objects()` handles here: an untyped object
+    /// whose flag words lowering names as engine words, as on `stack_obj`.
+    loop_handles: BTreeSet<String>,
     /// The names the body's `raw` blocks declare as `.air` locals (`let` / `local`), which
     /// every raw block of the tree shares.
     raw_declared: BTreeSet<String>,
@@ -1705,6 +1742,18 @@ struct TreeCx {
     /// `STR#` 301 entry past the file's own, an `action_label` of another table): their
     /// `$Local:N` tokens are unknown, so any of its locals may be read by one.
     unknown_strings: bool,
+}
+
+/// Whether `o` is built `from` a template its own file does not declare. A template of the
+/// same name elsewhere in the file set may not be the one its `use` imports, so only the
+/// file's own template is known.
+fn foreign_template(file: &V2File, o: &ObjectDecl) -> bool {
+    o.from_template.as_ref().is_some_and(|(t, _)| {
+        !file
+            .items
+            .iter()
+            .any(|i| matches!(i, V2Item::Template(d) if &d.name == t))
+    })
 }
 
 /// The bare names a call in `file` may resolve to a user function or tree by, which then
@@ -2288,7 +2337,110 @@ fn strip_air_comments(code: &str) -> String {
     out
 }
 
+/// `.air` text (comments already stripped) with each string literal's contents blanked, so
+/// a label such as `"bcon[INDEX]"` reads no BCON.
+fn blank_air_strings(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    let mut chars = code.chars();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == '"' {
+            let mut escaped = false;
+            for s in chars.by_ref() {
+                if escaped {
+                    escaped = false;
+                } else if s == '\\' {
+                    escaped = true;
+                } else if s == '"' {
+                    out.push(s);
+                    break;
+                }
+                out.push(' ');
+            }
+        }
+    }
+    out
+}
+
 /// Whether `.air` text indexes `word` by number (`word[`, spaces allowed before the `[`).
+/// The BCON addresses `.air` code reads by number: `bcon[N]` / `const[N]`, the table-and-entry
+/// forms `bcon[T:E]` / `bcon[T,E]` (address `(T << 7) | E`), and `scope(26, N)`; and whether
+/// it reads one at an index it does not write as a number (then any address may be read).
+fn raw_bcon_reads(code: &str) -> (BTreeSet<i64>, bool) {
+    let code = &blank_air_strings(&strip_air_comments(code));
+    let mut numbers = BTreeSet::new();
+    let mut dynamic = false;
+    let word_at = |at: usize| {
+        !code[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    };
+    for word in ["bcon", "const"] {
+        for (at, _) in code.match_indices(word) {
+            if !word_at(at) {
+                continue;
+            }
+            // `bcon.Name` is read by name; `const NAME = ..` declares a block constant.
+            let Some(rest) = code[at + word.len()..].trim_start().strip_prefix('[') else {
+                continue;
+            };
+            let index = rest.split(']').next().unwrap_or("");
+            let parts: Vec<Option<i64>> = index.split([':', ',']).map(air_int).collect();
+            match parts.as_slice() {
+                [Some(n)] => {
+                    numbers.insert(*n);
+                }
+                [Some(table), Some(entry)] => {
+                    numbers.insert((table << 7) | entry);
+                }
+                _ => dynamic = true,
+            }
+        }
+    }
+    for (at, _) in code.match_indices("scope") {
+        if !word_at(at) {
+            continue;
+        }
+        let Some(rest) = code[at + "scope".len()..].trim_start().strip_prefix('(') else {
+            continue;
+        };
+        let args: Vec<&str> = rest.split(')').next().unwrap_or("").split(',').collect();
+        match args.as_slice() {
+            [s, i] if air_int(s) == Some(26) => match air_int(i) {
+                Some(n) => {
+                    numbers.insert(n);
+                }
+                None => dynamic = true,
+            },
+            [s, _] if air_int(s).is_some() => {}
+            _ => dynamic = true,
+        }
+    }
+    (numbers, dynamic)
+}
+
+/// An `.air` integer literal: decimal or `0x` hex, with an optional `-`. A word that does
+/// not start with a digit (`_16896`) is a name, not a literal.
+fn air_int(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let (neg, digits) = match text.strip_prefix('-') {
+        Some(d) => (true, d.trim_start()),
+        None => (false, text),
+    };
+    if !digits.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let n = match digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        Some(hex) => i64::from_str_radix(&hex.replace('_', ""), 16).ok()?,
+        None => digits.replace('_', "").parse().ok()?,
+    };
+    Some(if neg { -n } else { n })
+}
+
 fn raw_indexes(code: &str, word: &str) -> bool {
     let code = &strip_air_comments(code);
     code.match_indices(word).any(|(at, _)| {
@@ -2375,9 +2527,19 @@ impl FileLinter<'_> {
             match item {
                 V2Item::Fn(f) => self.lint_fn(f),
                 V2Item::Const(c) if !c.is_pub => self.unused_const(c),
+                // A template from another file may read the entry too.
+                V2Item::ExternBcon(b)
+                    if !b.is_pub
+                        && !file.items.iter().any(
+                            |i| matches!(i, V2Item::Object(o) if foreign_template(file, o)),
+                        ) =>
+                {
+                    self.unused_extern_bcon(b);
+                }
                 V2Item::Object(o) => {
                     self.object = Some(o.name.clone());
                     self.object_template = o.from_template.as_ref().map(|(t, _)| t.clone());
+                    self.foreign_template = foreign_template(file, o);
                     self.body_scope = body_scope(file, o);
                     // A template from another module may declare a BCON table `me`.
                     self.me_bcon |= o
@@ -2419,6 +2581,7 @@ impl FileLinter<'_> {
                     self.lint_members(&o.members, false);
                     self.object = None;
                     self.object_template = None;
+                    self.foreign_template = false;
                     self.body_scope = None;
                     self.strings.clear();
                     self.dialog_strings.clear();
@@ -2475,7 +2638,40 @@ impl FileLinter<'_> {
 
     /// Records names the body being linted binds itself.
     fn bind<'n>(&mut self, names: impl Iterator<Item = &'n str>) {
-        self.bound.extend(names.map(str::to_owned));
+        for name in names {
+            self.bind_name(name, false);
+        }
+    }
+
+    /// Binds `name` from here to the end of its scope: a `lot.objects()` loop handle or
+    /// not (a new binding of a handle's name hides it).
+    fn bind_name(&mut self, name: &str, loop_handle: bool) {
+        self.bound.insert(name.to_owned());
+        if loop_handle {
+            self.loop_handles.insert(name.to_owned());
+        } else {
+            self.loop_handles.remove(name);
+        }
+    }
+
+    /// The names in scope, to restore when a scope ends.
+    fn scope(&self) -> (BTreeSet<String>, BTreeSet<String>) {
+        (self.bound.clone(), self.loop_handles.clone())
+    }
+
+    fn restore_scope(&mut self, (bound, loop_handles): (BTreeSet<String>, BTreeSet<String>)) {
+        self.bound = bound;
+        self.loop_handles = loop_handles;
+    }
+
+    /// Whether `root` names an object whose flag words read as engine words: `stack_obj`,
+    /// or a `lot.objects()` loop handle (a handle of a typed object may have a state of
+    /// the name, which this file does not show).
+    fn engine_flag_root(&self, root: &str) -> bool {
+        !self.bound.contains(root)
+            || root == "stack_obj"
+            // A BCON table of the name takes `o.entry` from the handle.
+            || (self.loop_handles.contains(root) && !self.symbols.bcon_names.contains(root))
     }
 
     fn leave_context(&mut self) {
@@ -2483,6 +2679,7 @@ impl FileLinter<'_> {
         self.sim_bindings.clear();
         self.object_me = false;
         self.bound.clear();
+        self.loop_handles.clear();
     }
 
     fn lint_members(&mut self, members: &[ObjectMember], template: bool) {
@@ -2554,6 +2751,10 @@ impl FileLinter<'_> {
                     self.leave_context();
                 }
                 ObjectMember::Const(c) if !template && !c.is_pub => self.unused_const(c),
+                // A template from another file may read the entry.
+                ObjectMember::ExternBcon(b) if !template && !b.is_pub && !self.foreign_template => {
+                    self.unused_extern_bcon(b);
+                }
                 ObjectMember::State(s) if !template => {
                     let used = self.symbols.field_names.contains(&s.name)
                         || s.slot.is_some_and(|(_, n)| {
@@ -2619,6 +2820,46 @@ impl FileLinter<'_> {
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// `unused_decl` on an `extern bcon` entry nothing reads. An entry is read by name (a
+    /// path or member read in the file set, through any table name, since a `use` may
+    /// rename the table; or a word of `raw` code) or by number (a `raw` `bcon[N]` or
+    /// `const[N]` at its address, which lifted files declare a name for; or at an index
+    /// that is not a literal). Each entry stands alone: unlike a private table's, it is the
+    /// library's, so another tree reading the library's constant by index does not read
+    /// this name.
+    fn unused_extern_bcon(&mut self, b: &crate::v2::ast::ExternBconDecl) {
+        if self.symbols.raw_bcon_dynamic {
+            return;
+        }
+        for e in &b.entries {
+            let read = e.name.starts_with('_')
+                || self.symbols.field_names.contains(&e.name)
+                || self.symbols.raw_words.contains(&e.name)
+                || self
+                    .symbols
+                    .bcon_paths
+                    .iter()
+                    .any(|(_, _, entry)| *entry == e.name)
+                || self
+                    .symbols
+                    .raw_bcon_numbers
+                    .contains(&i64::from(e.address));
+            if !read {
+                self.emit(
+                    UNUSED_DECL,
+                    e.span,
+                    format!(
+                        "`extern bcon` entry `{}` of `{}` is never read",
+                        e.name, b.name
+                    ),
+                    Some("remove it".to_owned()),
+                    None,
+                    None,
+                );
             }
         }
     }
@@ -3224,6 +3465,7 @@ impl FileLinter<'_> {
             match s {
                 V2Stmt::Let { name, .. }
                 | V2Stmt::LetSome { name, .. }
+                | V2Stmt::IfLetSome { name, .. }
                 | V2Stmt::LetUninit { name, .. } => {
                     lets.insert(name.clone());
                 }
@@ -3486,7 +3728,7 @@ impl FileLinter<'_> {
     /// is nested in a list that goes on, or is a loop body).
     fn lint_list(&mut self, list: &[V2Stmt], elif: bool, follows: bool) {
         // Names a statement binds are in scope from the next statement to the list's end.
-        let outer = self.bound.clone();
+        let outer = self.scope();
         self.unreachable_code(list);
         for (i, s) in list.iter().enumerate() {
             if !(elif && i == 0) {
@@ -3509,19 +3751,40 @@ impl FileLinter<'_> {
                     ..
                 } => {
                     self.lint_list(then_body, false, after);
-                    let is_elif = matches!(else_body.as_slice(), [V2Stmt::If { .. }]);
+                    let is_elif = matches!(
+                        else_body.as_slice(),
+                        [V2Stmt::If { .. } | V2Stmt::IfLetSome { .. }]
+                    );
+                    self.lint_list(else_body, is_elif, after);
+                }
+                // `if let Some(v) = f()` binds `v` in its `then` block alone.
+                V2Stmt::IfLetSome {
+                    name,
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    let before = self.scope();
+                    self.bind_name(name, false);
+                    self.lint_list(then_body, false, after);
+                    self.restore_scope(before);
+                    let is_elif = matches!(
+                        else_body.as_slice(),
+                        [V2Stmt::If { .. } | V2Stmt::IfLetSome { .. }]
+                    );
                     self.lint_list(else_body, is_elif, after);
                 }
                 V2Stmt::ForEach {
                     binding,
+                    iter,
                     body,
                     else_body,
                     ..
                 } => {
-                    let before = self.bound.clone();
-                    self.bound.insert(binding.clone());
+                    let before = self.scope();
+                    self.bind_name(binding, matches!(iter, ForEachIter::LotObjects));
                     self.lint_list(body, false, true);
-                    self.bound = before;
+                    self.restore_scope(before);
                     if let Some(else_body) = else_body {
                         self.lint_list(else_body, false, after);
                     }
@@ -3538,17 +3801,17 @@ impl FileLinter<'_> {
                     );
                     self.in_block += usize::from(block);
                     // An animation's event binding names the event in its handler.
-                    let before = self.bound.clone();
+                    let before = self.scope();
                     if let V2Stmt::Animate {
                         event: Some(event), ..
                     } = other
                     {
-                        self.bound.insert(event.clone());
+                        self.bind_name(event, false);
                     }
                     for b in stmt_blocks(other) {
                         self.lint_list(b, false, after || looped);
                     }
-                    self.bound = before;
+                    self.restore_scope(before);
                     self.in_block -= usize::from(block);
                 }
             }
@@ -3556,10 +3819,10 @@ impl FileLinter<'_> {
             | V2Stmt::LetSome { name, .. }
             | V2Stmt::LetUninit { name, .. } = s
             {
-                self.bound.insert(name.clone());
+                self.bind_name(name, false);
             }
         }
-        self.bound = outer;
+        self.restore_scope(outer);
     }
 
     fn lint_stmt(&mut self, s: &V2Stmt) {
@@ -3568,6 +3831,7 @@ impl FileLinter<'_> {
             s,
             V2Stmt::Let { .. }
                 | V2Stmt::LetSome { .. }
+                | V2Stmt::IfLetSome { .. }
                 | V2Stmt::ForEach { .. }
                 | V2Stmt::Match { .. }
         );
@@ -3598,8 +3862,8 @@ impl FileLinter<'_> {
         self.written.clear();
         self.assigned = None;
         self.prefer_question_mark(s);
-        if let V2Stmt::If { else_body, .. } = s
-            && let [V2Stmt::If { span, .. }] = else_body.as_slice()
+        if let V2Stmt::If { else_body, .. } | V2Stmt::IfLetSome { else_body, .. } = s
+            && let [V2Stmt::If { span, .. } | V2Stmt::IfLetSome { span, .. }] = else_body.as_slice()
         {
             self.collapsible_else_if(*span);
         }
@@ -4048,8 +4312,31 @@ impl FileLinter<'_> {
                 clobbered = Some(stmt_span(s));
             }
             let mut inner_ended = false;
-            for b in stmt_blocks(s) {
-                inner_ended |= self.clobber_walk(b, clobbered);
+            if let V2Stmt::IfLetSome {
+                name,
+                then_body,
+                else_body,
+                ..
+            } = s
+            {
+                // `if let Some(x)` binds a new `x` in its `then` block alone: an outer `x`
+                // holding this object's handle is hidden there, and back after it.
+                let held = self.self_handles.remove(name);
+                // What `self` means where a binding takes the name is an open language
+                // question (#489): such a block is not judged.
+                if name != "self" {
+                    inner_ended |= self.clobber_walk(then_body, clobbered);
+                }
+                if held {
+                    self.self_handles.insert(name.clone());
+                } else {
+                    self.self_handles.remove(name);
+                }
+                inner_ended |= self.clobber_walk(else_body, clobbered);
+            } else {
+                for b in stmt_blocks(s) {
+                    inner_ended |= self.clobber_walk(b, clobbered);
+                }
             }
             if inner_ended {
                 clobbered = None;
@@ -4798,6 +5085,7 @@ impl FileLinter<'_> {
             V2Stmt::Break { .. } => "`break`",
             V2Stmt::Continue { .. } => "`continue`",
             V2Stmt::If { .. } => "every branch of the `if`",
+            V2Stmt::IfLetSome { .. } => "every branch of the `if let`",
             _ => "every arm of the `match`",
         };
         let at = stmt_span(&list[i]);
@@ -4820,9 +5108,9 @@ impl FileLinter<'_> {
     /// `let` bindings never read, and `let x: T;` read before any assignment.
     fn unused_let(&mut self, list: &[V2Stmt], i: usize) {
         let (span, name, uninit) = match &list[i] {
-            V2Stmt::Let { span, name, .. } | V2Stmt::LetSome { span, name, .. } => {
-                (*span, name, None)
-            }
+            V2Stmt::Let { span, name, .. }
+            | V2Stmt::LetSome { span, name, .. }
+            | V2Stmt::IfLetSome { span, name, .. } => (*span, name, None),
             V2Stmt::LetUninit { span, name, ty, .. } => (*span, name, Some(ty)),
             _ => return,
         };
@@ -4837,16 +5125,19 @@ impl FileLinter<'_> {
         {
             return;
         }
-        let rest = &list[i + 1..];
+        // `if let Some(v)` binds `v` in its `then` block alone.
+        let if_let = matches!(&list[i], V2Stmt::IfLetSome { .. });
+        let rest = match &list[i] {
+            V2Stmt::IfLetSome { then_body, .. } => then_body.as_slice(),
+            _ => &list[i + 1..],
+        };
         let mut read = false;
         // A raw block that addresses `local[N]` may be reading or writing this binding's
         // slot, which the source does not say.
         let mut by_slot = false;
         walk_stmts(rest, &mut |s| {
             if let V2Stmt::RawAir { code, .. } = s {
-                read |= code
-                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                    .any(|w| w == name);
+                read |= raw_names(code, name);
                 by_slot |= raw_indexes(code, "local");
             }
             for (k, e) in stmt_exprs(s).into_iter().enumerate() {
@@ -4877,9 +5168,7 @@ impl FileLinter<'_> {
                     if let Some(event) = event {
                         walk_stmts(body, &mut |t| {
                             if let V2Stmt::RawAir { code, .. } = t {
-                                read |= code
-                                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                                    .any(|w| w == event);
+                                read |= raw_names(code, event);
                             }
                             for e in stmt_exprs(t) {
                                 read |= reads_ident(e, event, &|f| self.user_fn(f));
@@ -4898,11 +5187,21 @@ impl FileLinter<'_> {
         // `else` bodies of `let Some` cannot see the binding; its own uses are in `rest`.
         if !read && !self.read_by_string_token(name) {
             let note = self.string_token_note(name);
+            let help = if if_let {
+                // A name the block already uses (an outer `_v` it reads) would be captured.
+                let fresh = std::iter::once(format!("_{name}"))
+                    .chain((2..).map(|n| format!("_{name}{n}")))
+                    .find(|n| !names_anywhere(rest, n))
+                    .unwrap_or_default();
+                format!("name it `{fresh}`")
+            } else {
+                format!("remove it, or name it `_{name}`")
+            };
             self.emit(
                 UNUSED_DECL,
                 span,
                 format!("local `{name}` is never read"),
-                Some(format!("remove it, or name it `_{name}`")),
+                Some(help),
                 None,
                 note,
             );
@@ -6073,7 +6372,7 @@ impl FileLinter<'_> {
                 if (root == "self" || root == "me") && self.states.contains_key(field) {
                     return None;
                 }
-                if self.bound.contains(root) && root != "stack_obj" {
+                if !self.engine_flag_root(root) {
                     return None;
                 }
                 field_flags(field)
@@ -6129,7 +6428,8 @@ impl FileLinter<'_> {
     /// `place.set(T::F)`, `flag_clear` is `.clear(..)`, `flag_test` is `.contains(..)`.
     ///
     /// Only in an object's body, for a named object flag word (`self.flags`,
-    /// `stack_obj.wall_placement`; not `self.data[8]`, which lowering types `i16`) or
+    /// `stack_obj.wall_placement`, `o.flags` on a `for o in lot.objects()` handle; not
+    /// `self.data[8]`, which lowering types `i16`) or
     /// `world.expansions` (not `global[20]` written out), whose `std::flags` type `T` the
     /// operand names: a raw bit
     /// (`flag_set 8`) or another constant has no method form. `op` is the operator's
@@ -6158,7 +6458,7 @@ impl FileLinter<'_> {
                 {
                     return;
                 }
-                if self.bound.contains(root) && root != "stack_obj" {
+                if !self.engine_flag_root(root) {
                     return;
                 }
                 let Some(ty) = field_flags(field) else {
@@ -6629,6 +6929,17 @@ fn first_unassigned_read(list: &[V2Stmt], name: &str, user: &dyn Fn(&str) -> boo
                     out.push(Event::Write);
                 }
                 V2Stmt::LetUninit { name: n, .. } if n == name => out.push(Event::Write),
+                // `if let Some(x)` binds a new `x` in its `then` block alone: its test and
+                // its `else` block see this one.
+                V2Stmt::IfLetSome {
+                    name: n,
+                    init,
+                    else_body,
+                    ..
+                } if n == name => {
+                    expr_events(init, name, user, out);
+                    stmt_events(else_body, name, user, out);
+                }
                 // A `defer` body runs when the tree leaves, after everything that follows it
                 // here: its reads are not ordered against them, so it is not scanned.
                 V2Stmt::Defer { .. } => {}
@@ -6700,6 +7011,11 @@ fn stmt_leaves(s: &V2Stmt) -> bool {
         | V2Stmt::Break { .. }
         | V2Stmt::Continue { .. } => true,
         V2Stmt::If {
+            then_body,
+            else_body,
+            ..
+        }
+        | V2Stmt::IfLetSome {
             then_body,
             else_body,
             ..

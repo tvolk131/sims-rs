@@ -576,8 +576,9 @@ events, and what it asks for after them) come first.
   `docs/decisions/`). The walk tests person word 64 as it was when the
   animator's tick began (0x58dcaf, #237). This finishes the remaining
   work from #188, which closed as superseded by #233. The pool
-  stop-under-way clip (state 7, clip 0x13, 0x58f010) and the walk's
-  `+0x290` flag (set at 0x58edec, read at 0x58ef8e) remain open. A
+  stop-under-way clip (state 7, clip 0x13, 0x58f010) is ported (#485).
+  The walk's `+0x290` flag (set at 0x58edec, read at 0x58ef8e) remains
+  open: `walking` stands in for it, with a trap for pets at 0x58ef8e. A
   track 2 House09 recording may show word 64 changing during placement
   in a walk. Next: the bare lot's room map at load step 8 needs evidence from the original (a harness trace or a recording of a
   community lot), and whether those lots are resized is unknown.
@@ -3832,16 +3833,117 @@ through their public interfaces only; the simulation never depends on it.
     locals (19,087 → 14,127 `#[slot(N)] let`) and named arguments (953
     functions). Typed flag operators fall from 6,767 to 2,795
     (behavioral), with 0 DIFFERENT.
+  - **Follow-ups:** all closed in Batch 21. #489 lowered flag methods on
+    a `lot.objects()` loop handle through the direct cursor and added
+    `if let Some(v) = f()`; the v2.3 Step 2 lint walks `if let` and
+    suggests the loop-handle methods. Track 9
+    re-measured the corpus after #482.
+- **Done (Batch 21 — Gameplay & Visuals wave, `.antics` v2.3 Step 1 and
+  open-pack, #484–#489):**
+  - **Interface (Track C, #484,
+    `docs/decisions/20261126-ui-buy-labels-family-export-dialog-presentation-currency.md`):**
+    - The Buy catalog shows its native tooltips from `BuyLabels`, and
+      commercial root rows hide the columns `BuyLabels::shown` drops.
+    - Family Bin Export: a 5th Family Bin button writes
+      `<saves>.userdata/<neighborhood>/Export/<Name>_<id>.FAM` atomically
+      through `export_stored_family_fam`. The Import picker scans the
+      export folder too, so an export imports back.
+    - Dialogs: `dialog::Presentation { modal, anchored, hide_title, large }`
+      from the Dialog operands. Non-modal dialogs get a `MinimizeBox`
+      dismiss box and route their own presses; anchored ones sit in the
+      top-right corner; large ones aim at a 1.2 aspect ratio; the tutorial
+      controller's title is hidden.
+    - `sims_ui::currency` ports `cTSLocale` (`0x6007df`) for every
+      language; the household and neighborhood panels use it.
+  - **Walking and sound (Track B, #485,
+    `docs/decisions/20261126-walk-animator-states-and-footsteps.md`):**
+    - Walk animator states 5, 7, 8 and 12, the stand state's turn / snap /
+      sidestep choice, the sidestep (`0x58f321`, eight sectors) and the
+      special stop (`0x58ef8e`). The pool stop-under-way clip is ported.
+    - Clip sounds (`sound`, `selectedsound`, `deselectedsound`,
+      `footstep`). Footsteps pick their surface from uncontained objects
+      on the tile, the pool, then the floor's category (`0x5890a8`,
+      `0x49fd95`), with `_noshoe`, snow and soft variants. Picking a
+      sound writes nothing: the world hash and every strict pin are
+      unchanged.
+    - `sims-game` sign-extends sound emitter IDs (`movsx`).
+    - #487: the Goth sound test allows the three event names the install's
+      sound files lack (`voxdog_sit_beg_start`, `voxdog_cower_breathe`,
+      `footstep_terrain_noshoe`). The original asks for them too and
+      plays nothing.
+  - **Rendering (Track A, #486,
+    `docs/decisions/20261126-render-censor-held-order-walls-glide.md`):**
+    - The censor mosaic (`0x4ac707` → `0x4ac301`, `sims-render/src/censor.rs`),
+      with its random draws taken from a per-tick copy of the world's RNG,
+      so drawing never changes the world.
+    - Held objects are drawn just before their Sim (#442 follow-up).
+    - Walls are drawn run by run in the original's graph order
+      (`0x540619`); objects keep the depth order, with holder→slot
+      grouping (`0x437c56`). The presenter's tile-key order was tried and
+      dropped: it drew 6 ratchet pixels unlike the original.
+    - House 99 zooms out no farther than zoom 2. The ground under a
+      level-1 floor is hidden only when the tile and its four neighbours
+      are floored and all four neighbours are water (`0x4af029`).
+    - The camera glides linearly over 250 ms (`0x4c9a27`), not a 350 ms
+      cubic ease. No ratchet floor changed.
+  - **open-pack (Track 7, #488):** behavioral specs for all 20 objects
+    (148 cases, 0 ASSUME lines). Fixes: room effects go through
+    `room_impact` and a room recount (the old Room motive writes were
+    overwritten every tick); meals are cancel-safe and lock the plate; the
+    stove holds itself while cooking; skill gains stop at 1000.
+  - **The `.antics` v2 language (Track 8, #489,
+    `docs/decisions/20261126-antics-v2-3-step1-if-let-and-469-fixes.md`):**
+    - `if let Some(v) = f() { .. } else { .. }` (with `else if let`
+      chains) on `#[ret(temp = N)] -> Option<T>` trees, at the cost of
+      `let Some(v) = f() else { .. }`.
+    - Flag methods on `for o in lot.objects()` handles take the direct
+      cursor lowering, so they build the operator's bytes.
+    - Three #469 fixes: a constant leaf of a returned `&&` / `||` sets the
+      last result; a functional may not call a Sim tree; a raw `if` whose
+      arms may end alike keeps its layout.
+  - **Lint (Track 7, v2.3 Step 2,
+    `docs/decisions/20261126-antics-v2-3-step2-lint.md`):**
+    - Every binding and flow rule reads `if let Some(v)`: its binding is
+      scoped to the `then` block (`unused_decl`, `uninitialized_local_read`,
+      the saved-`self` handles of `stack_obj_clobber_after_self`, the names
+      that hide engine words), an `if let` whose branches all leave makes
+      what follows `unreachable_code`, and `collapsible_else_if` collapses
+      `else { if let .. }` and an `if let`'s `else { if .. }`.
+    - `prefer_method_syntax` and `untyped_engine_constant` reach the flag
+      words of a `for o in lot.objects()` handle, byte-checked as always.
+    - `unused_decl` reports an `extern bcon` entry nothing reads. A raw
+      `bcon[N]` at the entry's address counts as a read, as the lift names
+      every entry it reads by number: 0 findings on both 1,191-object
+      lift corpora (735 files declare 2,315 entries), and no other finding
+      changed there.
+  - **Lift (Track 9, final v2.2 corpus re-measure after #482, no PR):**
+    typed flag operators on `wall_placement` and `world.expansions` went
+    from 2,795 to 225 (behavioral) and from 248 to 0 (strict), with 0
+    DIFFERENT and all five style lints at 0.
   - **Follow-ups:**
-    - Track 8: a flag method on the loop handle of a `for o in lot.objects()`
-      (`o.flags2.set(..)`, now `o.wall_placement.set(..)` too) skips the
-      direct cursor lowering (`cursor_stmt_ok`), so its bytes differ from
-      the operator's; lint and lift write the operator there. A method on
-      any other receiver in the loop (`world.expansions`, `self.flags`) is
-      not affected. Also `if let` for `Option<T>` answers, once the lint
-      walker supports it.
-    - Track 9: re-measure the 1,191-object corpus after #482, which lifts
-      `wall_placement` and `world.expansions` operators as methods.
+    - Interface: sims-vm still answers non-modal dialogs at once (Track B
+      to stop that, with `Game::has_dialog` and an answer path treating a
+      non-modal `Lot::asking` as non-blocking); the native 40-second
+      auto-answer timer; the anchored placement is unverified against a
+      capture; the Buy popup price should use `sims_ui::currency`; the HUD
+      zoom-out button should use `Zoom::zoom_out_on(lot.house)`.
+    - Walking and sound: sims-content should keep each floor pattern's
+      category (footsteps on plug-in floors) and each motion's frame count
+      (removing the `0x596b60` trap); co-op commands drop their sound
+      buffers; travel, arrival and eviction run without a sound sink; the
+      `+0x290` walking flag needs a pin rebaseline.
+    - Rendering: slot-1 animated objects and the pet's own draw; the
+      ground rule's global enable byte `0x6c724a`; the presenter's tile
+      key for the 6 pixels; the original leaves out objects on the lot's
+      outermost tiles; walls are turned once from rotation 0, not through
+      each view change.
+    - open-pack: the test runner should place `given.create` objects on
+      the tile grid (or add `expect.objects`); a v2 name for object data
+      word 51 (light amount) so the lamp can be a light source; a real
+      daily bill gate for the mailbox, if wanted.
+    - `.antics`: a lint rule suggesting `if let`; the lift writing `if f() { .. temp[N] .. }` as `if let`
+      (Track 9); a language decision on what `self.x` means when `self`
+      is rebound.
 - **Next (in flight, in order of player impact):**
   - **Travel follow-ups:**
     - A hop that leaves travelers behind (Go Somewhere Else for one
@@ -3858,16 +3960,14 @@ through their public interfaces only; the simulation never depends on it.
       rows to the neighborhood (#430).
     - The lot shift (0x444991) should forget routes, and 0x467436 at
       go-live is not modeled (#443).
-  - **Drawing what a Sim holds:**
-    - the held draw order (objects before their Sim, `0x459e45` →
-      `0x45a131`);
-    - slot-1 animated objects;
-    - pets (#442).
-  - **Saves:** the shell has no Family Bin Export button yet. One
-    should call `export_stored_family_fam` (#458).
+  - **Drawing what a Sim holds:** slot-1 animated objects, and pets
+    (#442; the held draw order is done, #486).
+  - **Dialogs:** sims-vm answers non-modal dialogs at once, so #484's
+    presentation and input routing wait on it; the 40-second auto-answer
+    timer (#484).
   - **Buy catalog:**
-    - `BuyLabels` (the category button text) is not used by `sims-ui`
-      yet.
+    - The Buy popup price is still formatted `${}`, not with
+      `sims_ui::currency` (#484).
     - Untraced: whether the CATS/CTSS lookup also searches the
       semi-global (#441).
   - **Co-op:**
@@ -3883,13 +3983,9 @@ through their public interfaces only; the simulation never depends on it.
       form for them.
     - Strict temps calls: a lowering rule that passes the temps without
       copies, so strict mode can name them too (#471).
-    - Raw-block `if` tails: #469 hoists a shared tail out of a raw
-      block's `if` arms, which leaves 2 strict alarm trees non-idiomatic.
-      Lowering should keep the arms as written, or the lift should spell
-      joined arms (#473).
-    - `extern bcon` entries have no unread-entry check. Path reads of
-      them are recorded, so one can be added once lifted files are
-      checked against it.
+    - Raw-block `if` tails: a raw `if` whose arms may end alike now
+      keeps its layout (#489). The 2 strict alarm trees #473 left
+      non-idiomatic need a re-lift to confirm.
     - Readable locals: about 9,000 one-statement raw blocks are
       local-slot moves. This changes strict output, so it needs its own
       PR (#460).
@@ -3900,20 +3996,16 @@ through their public interfaces only; the simulation never depends on it.
         the original labels renamed;
       - a typed `bool + value` ABI for 282 and 333, with `#[temp(N)]`
         parameters.
-    - Open from #469 (both predate it):
-      - a short-circuit constant leaf can leave the previous node's
-        result;
-      - a functional can call a Sim tree directly while an object runs
-        it, which needs a type for a functional's runner.
+    - What `self.x` means when a binding named `self` is in scope is a
+      language decision (#489).
   - **Legacy mining backlog:** see
     `docs/legacy-mining-audit.md#porting-backlog`.
-    - Parity-relevant items still open:
-      - walk animator states 5/7/8/12;
-      - footstep and clip sounds;
-      - the original wall draw order;
-      - the camera glide;
-      - the censor mosaic;
-      - non-modal and anchored dialogs.
+    - Parity-relevant items still open: the dialogs' 40-second
+      auto-answer timer (legacy `widget_setting`).
+    - Ported in Batch 21: walk animator states 5/7/8/12 and footstep and
+      clip sounds (#485); the wall draw order, the camera glide and the
+      censor mosaic (#486); non-modal and anchored dialogs and the
+      currency formatter (#484).
     - Ported since Batch 15: route-cache invalidation (#443), catalog
       eligibility and naming (#441, #452), and the determinism fuzzer
       (#441, #449).
