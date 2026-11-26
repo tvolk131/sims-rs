@@ -1509,9 +1509,11 @@ fn unpinned_locals(text: &str) -> Vec<FrameGroup> {
 /// Each tree function (`#[bhav(.., args = N, ..)] fn f()` or `fn f(sim: Sim)`) whose body
 /// only reads its arguments by number (`param[k]`), with them named in its signature: `fn
 /// f(sim: Sim, p0: i16, _p1: i16, p2: i16)`, each read written `pK`, one group per
-/// function. A function that writes an argument (`param[k] = ..`, `&mut param[k]`), indexes
-/// one by a value, or whose `raw { }` code reads one keeps the numbers, as does one the file
-/// calls (each caller would have to pass the arguments) or one where a name is taken.
+/// function. A function that writes an argument (`param[k] = ..`, `&mut param[k]`, or an
+/// `animate`, whose events may land in argument 0), indexes one by a value, or whose
+/// `raw { }` code reads one keeps the numbers, as does one the file calls (each caller would
+/// have to pass the arguments) or one where a name is taken. (`sleep`/`idle` count down in
+/// argument 0 too, but the build saves and restores it around them when the tree reads it.)
 fn named_params(text: &str) -> Vec<FrameGroup> {
     use crate::v2::lexer::{TokenKind as K, tokenize};
     let Ok(tokens) = tokenize(text) else {
@@ -1594,7 +1596,9 @@ fn named_params(text: &str) -> Vec<FrameGroup> {
         let mut ok = true;
         for j in body..end {
             match &tokens[j].kind {
-                K::RawBlock(b) if b.contains("param[") => ok = false,
+                K::RawBlock(b) if b.contains("param[") || b.contains("animate") => ok = false,
+                // Animation events land in argument 0 unless a local is named for them.
+                K::Ident(w) if w == "animate" => ok = false,
                 K::Ident(w) if w == "param" && tokens[j - 1].kind != K::Dot => {
                     let written = matches!(
                         kind(j + 4),

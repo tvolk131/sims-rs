@@ -304,15 +304,16 @@ fn slot_parameter_0_lifts_inside_an_animation_handler() {
         }
     }
 }"#;
-    for (lifted, p) in lift_both(source).iter().zip(["param[0]", "p0"]) {
+    for lifted in lift_both(source) {
+        // Behavioral mode keeps the number too: the animation's events land in argument 0.
         has(
-            lifted,
+            &lifted,
             &[
-                &format!("reach(mode: 1, moves: true, slot: {p});"),
-                &format!("drop_onto(src: {p}, dst: 3);"),
+                "reach(mode: 1, moves: true, slot: param[0]);",
+                "drop_onto(src: param[0], dst: 3);",
             ],
         );
-        lacks(lifted, &["raw {"]);
+        lacks(&lifted, &["raw {", "p0: i16"]);
     }
 }
 
