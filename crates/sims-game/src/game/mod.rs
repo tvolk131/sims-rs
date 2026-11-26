@@ -200,24 +200,26 @@ impl CameraPan {
             return (self.target_origin, true);
         }
         let remaining = (end - now) as f32;
-        let axis = |from: i32, to: i32| -> i32 {
-            let slope = to.wrapping_sub(from) as f32 / duration as f32;
-            let value = f64::from(to) - f64::from(slope) * f64::from(remaining);
+        // In 64 bits, so no origin overflows; the result lies between the
+        // two ends.
+        let axis = |from: i64, to: i64| -> i64 {
+            let slope = (to - from) as f32 / duration as f32;
+            let value = to as f64 - f64::from(slope) * f64::from(remaining);
             let rounded = if value >= 0.0 {
                 value + 0.5
             } else {
                 value - 0.5
             };
-            rounded as i32
+            (rounded as i64).clamp(from.min(to), from.max(to))
         };
-        let column = crate::pick::ORIGIN_COLUMN;
+        let column = i64::from(crate::pick::ORIGIN_COLUMN);
+        let [sx, sy] = self.start_origin.map(i64::from);
+        let [tx, ty] = self.target_origin.map(i64::from);
+        let clamp = |v: i64| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
         (
             [
-                axis(
-                    self.start_origin[0] + column,
-                    self.target_origin[0] + column,
-                ) - column,
-                axis(self.start_origin[1], self.target_origin[1]),
+                clamp(axis(sx + column, tx + column) - column),
+                clamp(axis(sy, ty)),
             ],
             false,
         )
@@ -251,6 +253,15 @@ mod camera_pan_tests {
         assert!(!p.sample(1_249_999).1);
         assert_eq!(p.sample(1_250_000), ([99, -125], true));
         assert_eq!(p.sample(9_000_000), ([99, -125], true));
+    }
+
+    #[test]
+    fn extreme_origins_stay_between_the_ends() {
+        let p = pan([i32::MAX, i32::MAX], [i32::MIN, i32::MIN]);
+        assert_eq!(p.sample(1_000_000).0, [i32::MAX, i32::MAX]);
+        let (mid, _) = p.sample(1_125_000);
+        assert!(mid[0].abs() < 1 << 10 && mid[1].abs() < 1 << 10, "{mid:?}");
+        assert_eq!(p.sample(1_250_000), ([i32::MIN, i32::MIN], true));
     }
 
     #[test]

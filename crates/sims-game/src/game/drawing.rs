@@ -171,7 +171,7 @@ impl Game {
                 &mut self.canvas,
                 &mut self.people_rects,
                 |person, attach, canvas| {
-                    held_by_people.extend(sims_render::draw_held_by(
+                    let drawn = sims_render::draw_held_by(
                         world,
                         draw_shape,
                         assets,
@@ -179,8 +179,10 @@ impl Game {
                         render_options,
                         person,
                         attach,
+                        &held_by_people,
                         canvas,
-                    ));
+                    );
+                    held_by_people.extend(drawn);
                 },
             );
         }
@@ -198,13 +200,21 @@ impl Game {
         // after the people and before the objects that hold someone, as
         // the original's frame does (0x4b3510: 0x4b017b, 0x4ac707, then
         // 0x4aa1d7). Open-pack Sims have no censor boxes.
+        // Its depth test reads the lot's depth from before the people.
         let mut censor_rects = Vec::new();
         if !self.open_pack_mode {
+            let pixels = self.canvas.width.saturating_mul(self.canvas.height);
+            let lot_depth = self
+                .lot_cache
+                .last_lot_depth()
+                .filter(|d| self.lot_depth_from_cache && d.len() == pixels)
+                .unwrap_or(&self.lot_depth);
             self.people.draw_censor(
                 world,
                 draw_shape,
                 &self.view.camera,
                 viewport,
+                lot_depth,
                 &mut self.canvas,
                 &mut censor_rects,
             );

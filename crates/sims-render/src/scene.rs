@@ -459,8 +459,10 @@ fn held_by_in(
 
 /// Draws what `person` holds ([`held_by`]) at the person's attach points
 /// `attach`, as the person's own draw does just before it draws the person
-/// (`0x459e45`..`0x45a027`, then the person at `0x45a131`). Returns what it
-/// drew, for [`draw_held_except`] to leave out.
+/// (`0x459e45`..`0x45a027`, then the person at `0x45a131`), leaving out
+/// `drawn`, what earlier people's draws drew (slot lists that disagree
+/// could name one object in two people's slots). Returns what it drew,
+/// for [`draw_held_except`] to leave out.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_held_by(
     world: &World,
@@ -470,9 +472,11 @@ pub fn draw_held_by(
     options: RenderOptions,
     person: u16,
     attach: PersonAttach,
+    drawn: &BTreeSet<u16>,
     canvas: &mut Canvas,
 ) -> BTreeSet<u16> {
-    let held = held_by(world, person);
+    let mut held = held_by(world, person);
+    held.retain(|id| !drawn.contains(id));
     if !held.is_empty() {
         let attach = BTreeMap::from([(person, attach)]);
         draw_set(
@@ -4266,8 +4270,9 @@ fn wall_corner(m: u8) -> (bool, bool) {
 /// turned to the view (`63 - y, x` and so on), with the original's sort,
 /// from object ID order; each followed by what its slots hold, slot by
 /// slot and at every depth, as the holder's draw walks them (`0x437c56`).
-/// An object whose holder is not in `list` (a person, or one the pass
-/// leaves out) is sorted as one in no slot.
+/// What a holder outside `list` holds (a person's, whose draw puts it
+/// down slot by slot, `0x459e25`..`0x45a027`) stays together in slot
+/// order, sorted by the key of the first.
 ///
 /// The original sorts its registry, whose order this does not track; it
 /// matters only for objects on the same tile key. It also leaves out
@@ -4277,28 +4282,41 @@ fn object_order<T: Copy>(
     camera: &Camera,
     of: impl Fn(&T) -> (u16, &Object, [i32; 2]),
 ) {
+    #[derive(Clone, Copy)]
+    enum Root {
+        /// An object in no slot.
+        Item(usize),
+        /// What a holder outside the list holds, by the holder's ID.
+        Absent(u16),
+    }
     let ids: BTreeMap<u16, usize> = list.iter().enumerate().map(|(i, t)| (of(t).0, i)).collect();
-    let holder = |t: &T| {
-        let o = of(t).1;
-        u16::try_from(o.data.get(CONTAINER).copied().unwrap_or(0))
-            .ok()
-            .filter(|&c| c != 0 && c != of(t).0)
-            .and_then(|c| ids.get(&c).copied())
-    };
-    let mut children: BTreeMap<usize, Vec<(i16, u16, usize)>> = BTreeMap::new();
+    // Each holder's contents by slot, then ID.
+    let mut children: BTreeMap<u16, Vec<(i16, u16, usize)>> = BTreeMap::new();
     let mut top = Vec::new();
     for (i, t) in list.iter().enumerate() {
         let (id, o, _) = of(t);
-        match holder(t) {
+        let container = u16::try_from(o.data.get(CONTAINER).copied().unwrap_or(0))
+            .ok()
+            .filter(|&c| c != 0 && c != id);
+        match container {
             Some(h) => {
                 let slot = o.data.get(CONTAINER_SLOT).copied().unwrap_or(-1);
                 children.entry(h).or_default().push((slot, id, i));
             }
-            None => top.push(i),
+            None => top.push(Root::Item(i)),
         }
     }
-    let key = |i: &usize| {
-        let [x, y] = of(&list[*i]).2.map(|n| n >> 4);
+    for v in children.values_mut() {
+        v.sort();
+    }
+    top.extend(
+        children
+            .keys()
+            .filter(|h| !ids.contains_key(h))
+            .map(|&h| Root::Absent(h)),
+    );
+    let tile_key = |i: usize| {
+        let [x, y] = of(&list[i]).2.map(|n| n >> 4);
         let [vx, vy] = match camera.rotation & 3 {
             1 => [63 - y, x],
             2 => [63 - x, 63 - y],
@@ -4307,20 +4325,24 @@ fn object_order<T: Copy>(
         };
         (vx + vy, vx - vy)
     };
+    let key = |r: &Root| match *r {
+        Root::Item(i) => tile_key(i),
+        Root::Absent(h) => tile_key(children[&h][0].2),
+    };
     sims_core::sort::sort_by(&mut top, |a, b| key(a) < key(b));
-    for v in children.values_mut() {
-        v.sort();
-    }
     let mut order = Vec::with_capacity(list.len());
     let mut placed = vec![false; list.len()];
     for root in top {
-        let mut stack = vec![root];
+        let mut stack = match root {
+            Root::Item(i) => vec![i],
+            Root::Absent(h) => children[&h].iter().rev().map(|&(_, _, c)| c).collect(),
+        };
         while let Some(i) = stack.pop() {
             if std::mem::replace(&mut placed[i], true) {
                 continue;
             }
             order.push(i);
-            if let Some(held) = children.get(&i) {
+            if let Some(held) = children.get(&of(&list[i]).0) {
                 stack.extend(held.iter().rev().map(|&(_, _, c)| c));
             }
         }
@@ -5906,6 +5928,35 @@ mod tests {
         assert_eq!(ids(0), vec![4, 5, 1, 3, 2]);
         // Half a turn: the table's tile is now the back one.
         assert_eq!(ids(2), vec![1, 3, 2, 5, 4]);
+    }
+
+    #[test]
+    fn what_a_holder_outside_the_list_holds_stays_in_slot_order() {
+        // A person (9, not in the list) holds a drink (20) in slot 0 and a
+        // book (10) in slot 4; a lamp (5) shares their tile.
+        let objects = [
+            object(5, 5, [3 * 16, 3 * 16, 1], &[]),
+            object(
+                10,
+                10,
+                [3 * 16, 3 * 16, 1],
+                &[(CONTAINER, 9), (CONTAINER_SLOT, 4)],
+            ),
+            object(
+                20,
+                20,
+                [3 * 16, 3 * 16, 1],
+                &[(CONTAINER, 9), (CONTAINER_SLOT, 0)],
+            ),
+        ];
+        let mut list: Vec<&Object> = objects.iter().collect();
+        object_order(&mut list, &camera(0), |o| {
+            (o.id, *o, [o.position[0], o.position[1]])
+        });
+        let ids: Vec<u16> = list.iter().map(|o| o.id).collect();
+        let at = |id| ids.iter().position(|&i| i == id).unwrap();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(at(10), at(20) + 1);
     }
 
     #[test]

@@ -264,24 +264,25 @@ pub struct People {
 /// The censor mosaic's random draws. The original takes them from the
 /// global stream (`0x46f457`), which the simulation also draws from. The
 /// presentation must never change the world, so the mosaic draws from a
-/// copy of the world's global stream instead: taken again whenever the
-/// world's stream has moved, and advanced only by the mosaic in between.
-/// While the lot runs, every frame after a tick starts from the world's
-/// state, as the original's first censored frame after a tick does; the
-/// original's later draws would also move the simulation's stream, which
-/// this copy does not.
+/// copy of the world's global stream instead: taken again after every
+/// tick (or whenever the stream or the tick count otherwise changes), and
+/// advanced only by the mosaic in between. So the first frame after a
+/// tick draws as the original's first censored frame after it does, and
+/// frames while paused keep drawing on. The original's draws would also
+/// move the simulation's later draws; this copy's do not.
 #[derive(Debug, Default, Clone, Copy)]
 struct CensorRandom {
-    /// The world's state the copy was taken from, and the copy.
-    copy: Option<(u32, sims_core::rng::GameRng)>,
+    /// The world's tick count and stream state the copy was taken from,
+    /// and the copy.
+    copy: Option<((u32, u32), sims_core::rng::GameRng)>,
 }
 
 impl CensorRandom {
     fn follow(&mut self, world: &World) -> &mut sims_core::rng::GameRng {
-        let state = world.global_rng.state();
-        let (seen, copy) = self.copy.get_or_insert((state, world.global_rng));
-        if *seen != state {
-            *seen = state;
+        let at = (world.ticks, world.global_rng.state());
+        let (seen, copy) = self.copy.get_or_insert((at, world.global_rng));
+        if *seen != at {
+            *seen = at;
             *copy = world.global_rng;
         }
         copy
@@ -452,14 +453,17 @@ impl People {
 
     /// Draws the censor mosaic over the people the last draw drew whose
     /// censor word is set (`sims_render::draw_censor`), into `canvas`,
-    /// which holds the lot `lot` and those people drawn with `camera`.
-    /// Pushes the rectangles it changed onto `rects`.
+    /// which holds the lot `lot` and those people drawn with `camera`;
+    /// `lot_depth` is the lot's depth from before the people. Pushes the
+    /// rectangles it changed onto `rects`.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_censor(
         &mut self,
         world: &World,
         lot: &sims_render::Lot,
         camera: &Camera,
         viewport: (u32, u32),
+        lot_depth: &[u16],
         canvas: &mut Canvas,
         rects: &mut Vec<sims_render::canvas::Rect>,
     ) {
@@ -473,6 +477,7 @@ impl People {
             camera,
             viewport,
             censored,
+            lot_depth,
             || random.next_u32(),
             canvas,
             rects,

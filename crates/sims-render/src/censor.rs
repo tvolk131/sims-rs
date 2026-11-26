@@ -99,13 +99,14 @@ pub fn rect(bounds: [f32; 4], zoom: Zoom) -> Option<[i32; 4]> {
 }
 
 /// Mosaics `rect` (`[left, top, right, bottom]`, cut to `clip`) of `canvas`
-/// at `zoom` (`0x4ac301`). A pixel takes part when its depth is greater
-/// (farther) than `threshold(row)`. As the original, the row it asks about
+/// at `zoom` (`0x4ac301`). A pixel takes part when its depth in `depth`
+/// (one per canvas pixel) is greater (farther) than `threshold(row)`. As the original, the row it asks about
 /// is the clipped rectangle's top plus the row within the block, for every
 /// block row (`0x4ac4c8`, `0x4ac649`). Each block with a pixel that takes
 /// part draws three numbers from `random`. Returns the pixels written.
 pub fn mosaic(
     canvas: &mut Canvas,
+    depth: &[u16],
     rect: [i32; 4],
     clip: [i32; 4],
     zoom: Zoom,
@@ -118,19 +119,21 @@ pub fn mosaic(
     let top = rect[1].max(clip[1]).max(0);
     let right = rect[2].min(clip[2]).min(width);
     let bottom = rect[3].min(clip[3]).min(height);
-    if left >= right || top >= bottom {
+    if left >= right || top >= bottom || depth.len() != canvas.color.len() {
         return 0;
     }
     let (left, top, right, bottom) = (left as usize, top as usize, right as usize, bottom as usize);
     let cell = block(zoom);
-    let rows: Vec<i32> = (0..cell).map(|dy| threshold((top + dy) as i32)).collect();
+    let rows: Vec<i32> = (0..cell.min(bottom - top))
+        .map(|dy| threshold((top + dy) as i32))
+        .collect();
     let mut written = 0;
     for by in (top..bottom).step_by(cell) {
         for bx in (left..right).step_by(cell) {
             let (bw, bh) = (cell.min(right - bx), cell.min(bottom - by));
             let takes_part = |canvas: &Canvas, dx: usize, dy: usize| -> Option<usize> {
                 let i = (by + dy) * canvas.width + bx + dx;
-                (rows[dy] < i32::from(canvas.depth[i])).then_some(i)
+                (rows[dy] < i32::from(depth[i])).then_some(i)
             };
             let mut sum = [0i32; 3];
             let mut count = 0;
@@ -166,20 +169,26 @@ pub fn mosaic(
 
 /// Draws the censor mosaic over each of `people` that `camera` shows, in
 /// their order, into `canvas`, which holds the lot and the people as drawn
-/// with `camera`, cut to the house view's `viewport`. `random` draws from
+/// with `camera`, cut to the house view's `viewport`. The depth test reads
+/// `depth`, the lot's depth from before the people were drawn: the
+/// original draws a person's mesh through Direct3D, which (unverified)
+/// does not write the software depth buffer `0x4ac301` reads, so a person
+/// cannot hide their own mosaic. `random` draws from
 /// the stream the original draws from (`0x46f457`, the global stream).
 /// Returns the pixels written, and pushes onto `rects` each mosaicked
 /// rectangle (`[x0, y0, x1, y1)`, clipped) that changed a pixel.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_censor(
     lot: &Lot,
     camera: &Camera,
     viewport: (u32, u32),
     people: &[Censored],
+    depth: &[u16],
     mut random: impl FnMut() -> u32,
     canvas: &mut Canvas,
     rects: &mut Vec<crate::canvas::Rect>,
 ) -> usize {
-    let depth = Depth::new(camera);
+    let tables = Depth::new(camera);
     let clip = [
         0,
         0,
@@ -195,20 +204,27 @@ pub fn draw_censor(
             continue;
         };
         let [x, y, altitude] = person.position;
-        if !(x.is_finite() && y.is_finite() && altitude.is_finite()) {
+        // A position off any lot (malformed) is not placed: the
+        // projection's integer arithmetic would overflow.
+        let limit = (crate::camera::ARRAY_SIZE * 16 * 4) as f32;
+        if ![x, y, altitude]
+            .iter()
+            .all(|v| v.is_finite() && v.abs() <= limit)
+        {
             continue;
         }
         // 0x4b966b → 0x4b9991: the person's position placed as a moved
         // object, whose upright plane is the threshold.
         let fine = [(x + 0.5).trunc() as i32, (y + 0.5).trunc() as i32];
         let (_, anchor) =
-            crate::scene::place_moved(&depth, camera, lot, fine, person.level, altitude);
+            crate::scene::place_moved(&tables, camera, lot, fine, person.level, altitude);
         let changed = mosaic(
             canvas,
+            depth,
             rect,
             clip,
             camera.zoom,
-            |row| depth.stand(anchor, row),
+            |row| tables.stand(anchor, row),
             &mut random,
         );
         if changed > 0 {
@@ -274,8 +290,10 @@ mod tests {
         c.depth[5] = 10;
         let kept = c.pixel_rgb(1, 1);
         let mut draws = vec![8u32, 8, 8 + 16].into_iter();
+        let depth = c.depth.clone();
         let written = mosaic(
             &mut c,
+            &depth,
             [0, 0, 4, 4],
             [0, 0, 4, 4],
             Zoom::Medium,
@@ -308,8 +326,10 @@ mod tests {
             }
         }
         let mut n = 0;
+        let depth = c.depth.clone();
         let written = mosaic(
             &mut c,
+            &depth,
             [0, 0, 8, 4],
             [0, 0, 8, 4],
             Zoom::Medium,
@@ -326,8 +346,10 @@ mod tests {
     fn the_threshold_row_restarts_at_the_clipped_top_for_every_block_row() {
         let mut c = canvas(2, 6);
         let asked = std::cell::RefCell::new(vec![]);
+        let depth = c.depth.clone();
         mosaic(
             &mut c,
+            &depth,
             [0, -1, 2, 6],
             [0, 0, 2, 6],
             Zoom::Far,
@@ -352,8 +374,10 @@ mod tests {
             c.depth[i] = 9;
         }
         let mut draws = vec![0u32, 15, 0xfff3].into_iter();
+        let depth = c.depth.clone();
         mosaic(
             &mut c,
+            &depth,
             [0, 0, 2, 2],
             [0, 0, 2, 2],
             Zoom::Far,
@@ -362,5 +386,45 @@ mod tests {
         );
         // -8 clamps to 0; +7; 3 - 8 clamps to 0.
         assert_eq!(c.pixel_rgb(0, 0), quantize565([0, 4, 0]));
+    }
+
+    #[test]
+    fn only_the_clipped_rows_are_asked_about() {
+        let mut c = canvas(8, 8);
+        let depth = c.depth.clone();
+        let asked = std::cell::RefCell::new(vec![]);
+        let threshold = |row| {
+            asked.borrow_mut().push(row);
+            0
+        };
+        mosaic(
+            &mut c,
+            &depth,
+            [0, 0, 8, 8],
+            [0, 3, 8, 4],
+            Zoom::Near,
+            threshold,
+            || 8,
+        );
+        assert_eq!(*asked.borrow(), vec![3]);
+    }
+
+    #[test]
+    fn the_depth_test_reads_the_depth_it_is_given() {
+        // The canvas says everything is in front; the lot's depth says
+        // behind, so all of it is mosaicked.
+        let mut c = canvas(2, 2);
+        c.depth.fill(0);
+        let depth = vec![1000; 4];
+        let n = mosaic(
+            &mut c,
+            &depth,
+            [0, 0, 2, 2],
+            [0, 0, 2, 2],
+            Zoom::Far,
+            |_| 500,
+            || 8,
+        );
+        assert_eq!(n, 4);
     }
 }
