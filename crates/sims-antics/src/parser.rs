@@ -448,6 +448,25 @@ impl Parser {
                         }
                         header.trailing = bytes;
                     }
+                    "share_tails" => {
+                        header.share_tails = match &self.peek().kind {
+                            TokenKind::Ident(v) if v == "true" => true,
+                            TokenKind::Ident(v) if v == "false" => false,
+                            _ => {
+                                return Err(Error::at(
+                                    self.peek().span,
+                                    "expected 'true' or 'false' after 'share_tails:'",
+                                ));
+                            }
+                        };
+                        self.bump();
+                    }
+                    "node_order" => {
+                        header.node_order = Some(self.parse_u16_list("node_order entry")?);
+                    }
+                    "narrow_callees" => {
+                        header.narrow_callees = self.parse_u16_list("narrow_callees entry")?;
+                    }
                     "id" => {
                         let explicit = self.expect_u16("BHAV id")?;
                         if explicit != id {
@@ -719,6 +738,20 @@ impl Parser {
         };
         self.expect(&TokenKind::Semicolon, "';'")?;
         Ok(Stmt::Let { span, name, init })
+    }
+
+    /// `[n, n, ..]`, a trailing comma allowed.
+    fn parse_u16_list(&mut self, what: &str) -> Result<Vec<u16>> {
+        self.expect(&TokenKind::LBracket, "'['")?;
+        let mut list = Vec::new();
+        while !self.eat(&TokenKind::RBracket) {
+            list.push(self.expect_u16(what)?);
+            if !self.eat(&TokenKind::Comma) {
+                self.expect(&TokenKind::RBracket, "']'")?;
+                break;
+            }
+        }
+        Ok(list)
     }
 
     fn parse_raw_op_head(&mut self) -> Result<(Span, u16, [u8; 8])> {

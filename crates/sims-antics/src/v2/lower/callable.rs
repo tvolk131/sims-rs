@@ -307,8 +307,32 @@ impl<'a> TreeLowerer<'a> {
             Some(l) => {
                 // A callee frame wider than the call's four operand words reads the rest from
                 // the instructions after the call, so the tree's layout must stay as lowered.
-                if sig.frame_args.is_none_or(|n| n > 4) {
-                    self.keep_layout = true;
+                match sig.frame_args {
+                    Some(n) if n <= 4 => {
+                        // Listed only when no other declaration of the id disagrees.
+                        if self.env.frame_is_narrow(sig.id) {
+                            self.narrow_callees.insert(sig.id);
+                        } else if self.checking_discarded == 0 && self.wide_call.is_none() {
+                            let why = if sig.id >= 8192 {
+                                "a semi-global tree, whose library (and frame) depends on the \
+                                 object that runs the call"
+                            } else {
+                                "whose tree id another declaration gives a wider frame"
+                            };
+                            self.wide_call = Some((span, format!("to {}, {why}", sig.display)));
+                        }
+                    }
+                    frame => {
+                        self.keep_layout = true;
+                        if self.checking_discarded == 0 && self.wide_call.is_none() {
+                            let words =
+                                frame.map_or("an unknown number of".to_owned(), |n| n.to_string());
+                            self.wide_call = Some((
+                                span,
+                                format!("to {}, whose frame holds {words} arguments", sig.display),
+                            ));
+                        }
+                    }
                 }
                 let parts: Vec<String> = l.iter().map(i16::to_string).collect();
                 format!("call {}({})", sig.id, parts.join(", "))

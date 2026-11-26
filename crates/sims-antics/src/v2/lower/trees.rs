@@ -109,7 +109,7 @@ pub(super) fn lower_standalone_tree(
 ) -> Result<String> {
     let d = &t.decl;
     let sig = &env.trees[&d.ident];
-    let frame = d.frame.unwrap_or_default();
+    let frame = d.frame.clone().unwrap_or_default();
     if frame.empty && !d.body.is_empty() {
         return Err(Error::at(
             frame.span,
@@ -162,10 +162,10 @@ pub(super) fn lower_standalone_tree(
     } else {
         ctx.begin_body(explicit);
     }
-    ctx.frame_locals = d.frame.and_then(|f| f.locals);
-    ctx.frame_format = d.frame.and_then(|f| f.format);
-    ctx.fixed_entry = d.frame.and_then(|f| f.kind).is_some();
-    ctx.frame_args = d.frame.and_then(|f| f.args).map_or_else(
+    ctx.frame_locals = d.frame.as_ref().and_then(|f| f.locals);
+    ctx.frame_format = d.frame.as_ref().and_then(|f| f.format);
+    ctx.fixed_entry = d.frame.as_ref().and_then(|f| f.kind).is_some();
+    ctx.frame_args = d.frame.as_ref().and_then(|f| f.args).map_or_else(
         || {
             sig.params
                 .iter()
@@ -304,6 +304,34 @@ pub(super) fn write_framed_tree(
     }
     if let Some(kind) = frame.kind {
         header.push(format!("kind: {kind}"));
+    }
+    if frame.share_tails {
+        header.push("share_tails: true".to_owned());
+    }
+    if let Some(order) = &frame.node_order {
+        let order: Vec<String> = order.iter().map(u16::to_string).collect();
+        header.push(format!("node_order: [{}]", order.join(", ")));
+    }
+    if frame.share_tails || frame.node_order.is_some() {
+        if let Some((span, callee)) = &ctx.wide_call {
+            let option = if frame.share_tails {
+                "share_tails"
+            } else {
+                "node_order"
+            };
+            return Err(Error::at(
+                *span,
+                format!(
+                    "fn '{name}' has '{option}', which moves nodes, but this call passes its \
+                     arguments inline {callee}: the callee reads those past the fourth from the \
+                     nodes after the call"
+                ),
+            ));
+        }
+        if !ctx.narrow_callees.is_empty() {
+            let ids: Vec<String> = ctx.narrow_callees.iter().map(u16::to_string).collect();
+            header.push(format!("narrow_callees: [{}]", ids.join(", ")));
+        }
     }
     let event_local = ctx.event_local;
     if let (Some((espan, _)), Some(sleep)) = (event_local, ctx.sleep_span) {

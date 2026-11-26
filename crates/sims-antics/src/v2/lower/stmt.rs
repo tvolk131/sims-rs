@@ -1052,6 +1052,14 @@ impl<'a> TreeLowerer<'a> {
                 // Discarded code emits nothing, so only emitted raw blocks count.
                 if self.checking_discarded == 0 {
                     self.raw_span.get_or_insert(*span);
+                    // A raw inline call to a callee whose signature gives it a narrow frame
+                    // reads no node after the call (`narrow_callees`, for `share_tails` and
+                    // `node_order`); the `.air` compiler refuses any other.
+                    for id in raw_inline_callees(code) {
+                        if self.env.frame_is_narrow(id) {
+                            self.narrow_callees.insert(id);
+                        }
+                    }
                     let moves_cursor = raw_air_may_clobber_stack_obj(code);
                     self.raw_moves_cursor |= moves_cursor;
                     if !layout_free {

@@ -281,6 +281,31 @@ pub(super) fn validate_raw_air_stmts(
 ///
 /// Such a block's text is one the lowering could have produced, so whatever the optimizer
 /// proves of lowered text holds for it. Anything else keeps the whole tree's layout.
+/// The trees a raw block calls with inline arguments: `call N(..)` other than `call N(temps)`,
+/// and `op N (..)` for an opcode of 256 and up. Empty when the block does not tokenize (the
+/// `.air` compiler then reports it).
+pub(super) fn raw_inline_callees(code: &str) -> Vec<u16> {
+    use crate::lexer::TokenKind as T;
+    let Ok(tokens) = crate::lexer::tokenize(code) else {
+        return Vec::new();
+    };
+    let kind = |i: usize| tokens.get(i).map(|t| &t.kind);
+    let mut ids = Vec::new();
+    for i in 0..tokens.len() {
+        let (Some(T::Ident(w)), Some(&T::Int(n))) = (kind(i), kind(i + 1)) else {
+            continue;
+        };
+        let Ok(id) = u16::try_from(n) else {
+            continue;
+        };
+        let temps = matches!(kind(i + 3), Some(T::Ident(t)) if t == "temps");
+        if (w == "call" && !temps) || (w == "op" && id >= 256) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
 pub(super) fn raw_block_is_layout_free(code: &str) -> bool {
     use crate::lexer::TokenKind as T;
     const WORDS: &[&str] = &[
