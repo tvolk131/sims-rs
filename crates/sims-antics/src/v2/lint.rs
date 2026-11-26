@@ -376,6 +376,7 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             air_consts: BTreeMap::new(),
             source: &input.source,
             tokens,
+            else_named: else_named(tokens),
             uses: &ast.uses,
             item_names: ast
                 .items
@@ -1612,6 +1613,8 @@ struct FileLinter<'a> {
     source: &'a str,
     /// Its tokens (comments are not tokens; a `raw { }` body is one).
     tokens: &'a [crate::v2::lexer::Token],
+    /// Whether some `else` in the file is a name, not the keyword (see [`else_named`]).
+    else_named: bool,
     /// Its `use` declarations.
     uses: &'a [crate::v2::ast::UseDecl],
     /// The names of its top-level items.
@@ -3556,15 +3559,7 @@ impl FileLinter<'_> {
     /// `{` and `if`, or between the chain's last `}` and the block's `}`).
     fn collapsible_else_if(&mut self, inner: Span) {
         let toks = self.tokens;
-        // `else` may name a local (`let else = 0;`). The collapse moves the inner chain's
-        // end next to whatever follows the block, and a statement `else = 3;` there would be
-        // read as the chain's `else`. So the rule is off in a file where an `else` is not
-        // the keyword: the keyword is always followed by `{` or `if`.
-        if toks.windows(2).any(|w| {
-            is_kw(Some(&w[0]), "else")
-                && w[1].kind != TokenKind::LBrace
-                && !is_kw(Some(&w[1]), "if")
-        }) {
+        if self.else_named {
             return;
         }
         let at =
@@ -5230,6 +5225,16 @@ fn split_args(src: &str, from: usize, to: usize) -> Option<Vec<&str>> {
 fn skip_ws(src: &str, at: usize) -> usize {
     src.get(at..)
         .map_or(at, |rest| at + rest.len() - rest.trim_start().len())
+}
+
+/// Whether some `else` in `toks` names something (`let else = 0;`) instead of being the
+/// keyword, which is always followed by `{` or `if`. `collapsible_else_if` is off in such a
+/// file: the collapse moves the inner chain's end next to whatever follows the block, and a
+/// statement `else = 3;` there would be read as the chain's `else`.
+fn else_named(toks: &[crate::v2::lexer::Token]) -> bool {
+    toks.windows(2).any(|w| {
+        is_kw(Some(&w[0]), "else") && w[1].kind != TokenKind::LBrace && !is_kw(Some(&w[1]), "if")
+    })
 }
 
 /// Whether `t` is the keyword (identifier token) `kw`.

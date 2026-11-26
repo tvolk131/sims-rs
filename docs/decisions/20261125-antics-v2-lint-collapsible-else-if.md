@@ -91,6 +91,13 @@ GPT-6.2 Sol (high effort), correctness and soundness only.
   - The NOTE is older than this rule: the CLI draws a finding's caret by byte, not by
     character, so a non-ASCII string earlier on the line shifts it left. The reported line
     and column are right.
+- **R2:** 2 findings, and none of the reported collapses tried changed a parse or dropped a
+  comment, whether applied one at a time or together.
+  - The SHOULD-FIX is fixed: the `else`-as-a-name check ran over the whole file once per
+    candidate, which made lint time quadratic (5 s on 16,000 candidates). It now runs once
+    per file.
+  - The NOTE is a false negative: an `if` expression in a parameter default
+    (`x: i16 = if .. else { if .. }`) is not reported, as no rule reads parameter defaults.
 
 ## Consequences
 
