@@ -24,12 +24,13 @@
 //!   0x57a6fb). So a deleted object's sounds are stopped twice. A
 //!   person's reset (0x45e791) does not call it.
 //!
-//! Not noted yet: the sounds a clip's events play ("sound", "selectedsound",
-//! "deselectedsound" and "footstep", 0x59175e and nearby; see
-//! `clip_events.rs`), which pick their sound from the person's state and
-//! the floor in code that is not ported. Play Sound Event's interface
-//! branch (0x4a698d, when [0x6e48bc]+0x5b is set and I am a person) is
-//! interface, not sound, and is not modeled.
+//! - A clip's timed events "sound", "selectedsound", "deselectedsound"
+//!   and "footstep" (0x591505 to 0x59175e) play the sound they pick from
+//!   where the person stands, its selection, or the floor under it
+//!   ([`crate::footsteps`]; `clip_events.rs`).
+//!
+//! Play Sound Event's interface branch (0x4a698d, when [0x6e48bc]+0x5b is
+//! set and I am a person) is interface, not sound, and is not modeled.
 //!
 //! [`Interpreter::sounds`]: crate::Interpreter::sounds
 

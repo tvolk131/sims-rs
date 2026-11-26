@@ -178,9 +178,14 @@ impl Cells {
 
     /// Whether two runs left the same in every cell, floats bit for bit.
     pub(crate) fn same(&self, other: &Self) -> bool {
+        alike(&self.sounds, &other.sounds, PartialEq::eq) && self.same_but_sounds(other)
+    }
+
+    /// [`Self::same`], but for the sounds played, which nothing in the lot
+    /// reads.
+    pub(crate) fn same_but_sounds(&self, other: &Self) -> bool {
         alike(&self.asked, &other.asked, PartialEq::eq)
             && alike(&self.deleted, &other.deleted, PartialEq::eq)
-            && alike(&self.sounds, &other.sounds, PartialEq::eq)
             && alike(&self.ui_effects, &other.ui_effects, PartialEq::eq)
             && self.masks_rebuilt.as_ref().map(Cell::get)
                 == other.masks_rebuilt.as_ref().map(Cell::get)

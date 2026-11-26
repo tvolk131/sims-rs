@@ -135,22 +135,33 @@ pub struct FamilyBinView<'a> {
     pub families: &'a [FamilyEntry],
 }
 
-/// Bottom action buttons on the Family Bin screen (`0x563755..0x5637a2`).
+/// Bottom action buttons on the Family Bin screen (`0x563755..0x5637a2`),
+/// and the shell's own Export button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FamilyBinButton {
     Cancel,
     CreateNewFamily,
     DeleteFamily,
     MoveInFamily,
+    /// Writes the selected family's `.FAM` export. The original's Family
+    /// Bin has no such button (it exports through 0x428a17 elsewhere):
+    /// this one is the shell's, drawn as the Cancel button is, right of
+    /// Move In.
+    ExportFamily,
 }
 
 impl FamilyBinButton {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Cancel,
         Self::CreateNewFamily,
         Self::DeleteFamily,
         Self::MoveInFamily,
+        Self::ExportFamily,
     ];
+
+    /// The Export button's text (the shell's own, not a `UIText.iff`
+    /// string).
+    pub const EXPORT_LABEL: &str = "Export";
 
     /// Native 800×600 button rectangle (`0x5632b3..0x5632f9` + `0x563cf9..0x563e16`).
     pub const fn native_rect(self) -> Rect {
@@ -161,6 +172,9 @@ impl FamilyBinButton {
             Self::CreateNewFamily => Rect::new(322, 530, 92, 62),
             Self::DeleteFamily => Rect::new(414, 530, 92, 62),
             Self::MoveInFamily => Rect::new(506, 530, 164, 62),
+            // The shell's: right of Move In, in the space the background
+            // leaves before the screen's edge.
+            Self::ExportFamily => Rect::new(676, 530, 100, 62),
         }
     }
 
@@ -170,13 +184,14 @@ impl FamilyBinButton {
             Self::CreateNewFamily => art_id::BTN_CREATE,
             Self::DeleteFamily => art_id::BTN_DELETE,
             Self::MoveInFamily => art_id::BTN_MOVE_IN,
+            Self::ExportFamily => art_id::BTN_DEFAULT,
         }
     }
 
     pub const fn is_enabled(self, has_selection: bool) -> bool {
         match self {
             Self::Cancel | Self::CreateNewFamily => true,
-            Self::DeleteFamily | Self::MoveInFamily => has_selection,
+            Self::DeleteFamily | Self::MoveInFamily | Self::ExportFamily => has_selection,
         }
     }
 }
@@ -200,6 +215,8 @@ pub enum FamilyBinCommand {
     MoveInFamily(u32),
     /// Activated the delete-family button (`STR# 128` index 4) for the selected household.
     DeleteFamily(u32),
+    /// Activated the shell's Export button for the selected household.
+    ExportFamily(u32),
     /// Cancelled and returned to the neighborhood screen.
     Cancel,
 }
@@ -261,6 +278,7 @@ impl FamilyBinStrings {
             FamilyBinButton::CreateNewFamily => self.get(2).or_else(|| self.get(16)),
             FamilyBinButton::MoveInFamily => self.get(3),
             FamilyBinButton::DeleteFamily => self.get(4),
+            FamilyBinButton::ExportFamily => None,
         }
     }
 
@@ -298,8 +316,9 @@ pub struct FamilyBinLayout {
     pub scrollbar: Option<ScrollbarLayout>,
     /// Column header tooltip hit zones.
     pub headers: Vec<(ColumnHeader, Rect)>,
-    /// Bottom action button rectangles (length == 4, pairwise disjoint).
-    pub buttons: [(FamilyBinButton, Rect); 4],
+    /// Bottom action button rectangles (one per [`FamilyBinButton::ALL`],
+    /// pairwise disjoint).
+    pub buttons: [(FamilyBinButton, Rect); 5],
 }
 
 impl FamilyBinLayout {
@@ -313,12 +332,7 @@ impl FamilyBinLayout {
     ) -> Self {
         let w = i32::try_from(width).unwrap_or(i32::MAX).max(0);
         let h = i32::try_from(height).unwrap_or(i32::MAX).max(0);
-        let empty_buttons = [
-            (FamilyBinButton::Cancel, Rect::default()),
-            (FamilyBinButton::CreateNewFamily, Rect::default()),
-            (FamilyBinButton::DeleteFamily, Rect::default()),
-            (FamilyBinButton::MoveInFamily, Rect::default()),
-        ];
+        let empty_buttons = FamilyBinButton::ALL.map(|b| (b, Rect::default()));
         if w == 0 || h == 0 {
             return Self {
                 frame_size: [w, h],
@@ -382,26 +396,7 @@ impl FamilyBinLayout {
                 ));
             }
 
-            let buttons = [
-                (
-                    FamilyBinButton::Cancel,
-                    FamilyBinButton::Cancel.native_rect().offset(ox, oy),
-                ),
-                (
-                    FamilyBinButton::CreateNewFamily,
-                    FamilyBinButton::CreateNewFamily
-                        .native_rect()
-                        .offset(ox, oy),
-                ),
-                (
-                    FamilyBinButton::DeleteFamily,
-                    FamilyBinButton::DeleteFamily.native_rect().offset(ox, oy),
-                ),
-                (
-                    FamilyBinButton::MoveInFamily,
-                    FamilyBinButton::MoveInFamily.native_rect().offset(ox, oy),
-                ),
-            ];
+            let buttons = FamilyBinButton::ALL.map(|b| (b, b.native_rect().offset(ox, oy)));
 
             return Self {
                 frame_size: [w, h],
@@ -483,16 +478,16 @@ impl FamilyBinLayout {
             }
         }
 
-        // Distribute the 4 bottom buttons evenly with 6 px gaps.
+        // Distribute the 5 bottom buttons by their native widths with 6 px gaps.
         let gap = 6;
-        let usable_w = (w - margin_x * 2 - gap * 3).max(40);
-        let weights = [120i64, 92, 92, 164];
+        let usable_w = (w - margin_x * 2 - gap * 4).max(40);
+        let weights = [120i64, 92, 92, 164, 100];
         let total_weight: i64 = weights.iter().sum();
         let btn_y = (h - btn_h - bottom_pad).max(list_bottom + 2);
         let mut bx = margin_x;
-        let mut btn_rects = [Rect::default(); 4];
+        let mut btn_rects = [Rect::default(); 5];
         for (i, &wt) in weights.iter().enumerate() {
-            let bw = if i == 3 {
+            let bw = if i == weights.len() - 1 {
                 (w - margin_x - bx).max(10)
             } else {
                 ((i64::from(usable_w) * wt) / total_weight).max(10) as i32
@@ -506,6 +501,7 @@ impl FamilyBinLayout {
             (FamilyBinButton::CreateNewFamily, btn_rects[1]),
             (FamilyBinButton::DeleteFamily, btn_rects[2]),
             (FamilyBinButton::MoveInFamily, btn_rects[3]),
+            (FamilyBinButton::ExportFamily, btn_rects[4]),
         ];
 
         Self {
@@ -821,6 +817,9 @@ impl FamilyBin {
             FamilyBinButton::MoveInFamily => self
                 .selected_family(view.families)
                 .map(|f| FamilyBinCommand::MoveInFamily(f.id)),
+            FamilyBinButton::ExportFamily => self
+                .selected_family(view.families)
+                .map(|f| FamilyBinCommand::ExportFamily(f.id)),
         }
     }
 
@@ -918,7 +917,7 @@ impl FamilyBin {
             draw_scrollbar(frame, art, sb, self.dragging_thumb);
         }
 
-        // 5. Four bottom action buttons.
+        // 5. The bottom action buttons (the native four and Export).
         for &(btn, rect) in &layout.buttons {
             let enabled = btn.is_enabled(has_selection);
             let cell = if !enabled {
@@ -932,6 +931,8 @@ impl FamilyBin {
             };
             if btn == FamilyBinButton::Cancel {
                 draw_cancel_button(frame, art, strings.cancel_label(), cell, rect);
+            } else if btn == FamilyBinButton::ExportFamily {
+                draw_cancel_button(frame, art, FamilyBinButton::EXPORT_LABEL, cell, rect);
             } else {
                 draw_four_cell_button(frame, art, btn.art_id(), cell, rect);
             }

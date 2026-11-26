@@ -281,6 +281,12 @@ impl NeighborhoodShell {
                 .to_owned();
             dirs.push((extra.clone(), label));
         }
+        // The shell's own exports ([`Self::family_export_dir`]) can be
+        // imported again, as the original's `Export` folder's can.
+        let exports = self.family_export_dir();
+        if exports.is_dir() && !dirs.iter().any(|(d, _)| d == &exports) {
+            dirs.push((exports, "Exported".to_owned()));
+        }
         if let Ok(user_dir) = resolve_user_dir(&self.install, self.slot) {
             if let Some(imp) = resolve_dir_case_insensitive(&user_dir, "Import") {
                 dirs.push((imp, format!("{}/Import", self.neighborhood_id)));
@@ -331,18 +337,29 @@ impl NeighborhoodShell {
                     continue;
                 };
                 // Skip system NPC/stray households (`Strays_4000.FAM`).
-                if parsed.export_info.family_id >= 4000 {
+                // Ids past i16::MAX are refused by the importer itself.
+                let id = parsed.export_info.family_id;
+                if sims_vm::caf::is_reserved_pool_family(id) || id > i16::MAX as u16 {
                     continue;
                 }
-                let member_count = parsed
+                let members: Vec<u16> = parsed
                     .export_info
                     .member_ids
                     .into_iter()
                     .take_while(|&id| id != 0)
-                    .count();
-                if member_count == 0 {
+                    .collect();
+                // The importer's member checks (`import_family_fam`): one
+                // to eight, ids up to i16::MAX, none twice.
+                let mut seen = BTreeSet::new();
+                if members.is_empty()
+                    || members.len() > sims_vm::caf::MAX_HOUSEHOLD_MEMBERS
+                    || !members
+                        .iter()
+                        .all(|&id| id <= i16::MAX as u16 && seen.insert(id))
+                {
                     continue;
                 }
+                let member_count = members.len();
                 let family_name = parsed
                     .iff
                     .get(b"CTSS", 1000)
@@ -377,6 +394,15 @@ impl NeighborhoodShell {
             }
         }
         out
+    }
+
+    /// The `.FAM` files the Import picker would offer, in the order it
+    /// lists them.
+    pub fn importable_family_paths(&self) -> Vec<PathBuf> {
+        self.scan_importable_families()
+            .into_iter()
+            .map(|f| f.path)
+            .collect()
     }
 
     /// Rescans configured `Import/` and `Export/` folders for `.FAM` archives
@@ -511,6 +537,71 @@ impl NeighborhoodShell {
                 ShellOutcome::redraw()
             }
         }
+    }
+
+    /// Where the Family Bin's Export button writes `.FAM` files:
+    /// `<saves file name>.userdata/<neighborhood id>/Export/`, beside the
+    /// saves file and never in the install, as the shell's
+    /// `Neighborhood.iff` is ([`Self::neighborhood_iff_path`]). The
+    /// original writes its exports to its `UserData*/Export` folder.
+    pub fn family_export_dir(&self) -> PathBuf {
+        self.neighborhood_iff_dir().join("Export")
+    }
+
+    /// Exports family `family_id` from the Family Bin as a `.FAM` file in
+    /// [`Self::family_export_dir`], with the family's `FAMh` if its save
+    /// inputs hold one ([`sims_vm::caf::export_stored_family_fam`], the
+    /// routine 0x428a17 calls, with `FINV` as the original's exports have).
+    /// The file is named `<family name>_<family id>.FAM`, as the original
+    /// names its exports, and replaces an earlier export of the same
+    /// family. It is written to a temporary file first and renamed, so a
+    /// failed write never leaves half a file under the final name.
+    /// Returns the file written.
+    pub fn export_family(&mut self, family_id: u16) -> Result<PathBuf, String> {
+        if !self.stored.families.contains_key(&family_id) {
+            return Err(format!("family {family_id} is not in this neighborhood"));
+        }
+        let name = self
+            .family_names
+            .get(&family_id)
+            .cloned()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| format!("Family {family_id}"));
+        let bytes = sims_vm::caf::export_stored_family_fam(
+            &self.store,
+            &self.neighborhood_id,
+            family_id,
+            &name,
+            US_ENGLISH,
+            true,
+        )
+        .map_err(|e| e.to_string())?;
+        let dir = self.family_export_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let path = dir.join(export_file_name(&name, family_id));
+        write_replacing(&path, &bytes)?;
+        self.refresh_importable_families();
+        Ok(path)
+    }
+
+    /// Exports family `family_id` ([`Self::export_family`]) and tells the
+    /// player where the file went, or why it could not be written.
+    pub(super) fn export_family_with_notice(&mut self, family_id: u16) {
+        let name = self
+            .family_names
+            .get(&family_id)
+            .cloned()
+            .unwrap_or_else(|| format!("Family {family_id}"));
+        let title = "Export Family".to_owned();
+        let body = match self.export_family(family_id) {
+            Ok(path) => format!("{name} was exported to {}.", path.display()),
+            Err(e) => format!("Could not export {name}: {e}"),
+        };
+        self.note = Some(body.clone());
+        self.open_dialog(
+            ShellDialogKind::Notice,
+            Message::notice(title, body, self.dialogs.ok()).with_frame(FrameStyle::Generic),
+        );
     }
 
     pub(super) fn execute_import_family(
@@ -701,5 +792,168 @@ impl NeighborhoodShell {
                 object: None,
             });
         }
+    }
+}
+
+/// Writes `bytes` to `path`, replacing it whole or not at all: they go to a
+/// new file beside it, made for this write alone (never one already there,
+/// nor a link), which is closed and then renamed over `path`. The new
+/// file is removed if any step fails.
+fn write_replacing(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let shown = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    let (partial, mut file) = loop {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Short, whatever the final name's length.
+        let partial = path.with_file_name(format!(".export.{}.{n}.partial", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
+        {
+            Ok(file) => break (partial, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(shown(&partial, e)),
+        }
+    };
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    let result = written
+        .map_err(|e| shown(&partial, e))
+        .and_then(|()| std::fs::rename(&partial, path).map_err(|e| shown(path, e)));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    result
+}
+
+/// The file name the original gives a family export, `<family name>_<id>.FAM`
+/// (`Export/<name>_<id>.FAM`). Characters a file name cannot hold on every
+/// platform the game runs on become `_`; an empty name becomes `Family`.
+pub(super) fn export_file_name(name: &str, family_id: u16) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(['.', ' ']);
+    let stem = if cleaned.is_empty() {
+        "Family"
+    } else {
+        cleaned
+    };
+    // Windows takes a name whose part before the first dot is a device
+    // (`NUL.backup`, `COM¹`) as that device: such a name gets a leading `_`.
+    let device: Vec<char> = stem
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .chars()
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    let reserved = match device.as_slice() {
+        ['C', 'O', 'N'] | ['P', 'R', 'N'] | ['A', 'U', 'X'] | ['N', 'U', 'L'] => true,
+        ['C', 'O', 'M', n] | ['L', 'P', 'T', n] => matches!(n, '1'..='9' | '¹' | '²' | '³'),
+        _ => false,
+    };
+    let prefix = if reserved { "_" } else { "" };
+    let tail = format!("_{family_id}.FAM");
+    // A file name is at most 255 bytes on the file systems the game runs
+    // on: a longer family name is cut, at a character, to fit. The family
+    // keeps its whole name inside the file.
+    let room = FILE_NAME_MOST - prefix.len() - tail.len();
+    let mut cut = stem.len().min(room);
+    while !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let stem = stem[..cut].trim_end_matches(['.', ' ']);
+    let stem = if stem.is_empty() { "Family" } else { stem };
+    format!("{prefix}{stem}{tail}")
+}
+
+/// The longest file name, in bytes, the export writes.
+const FILE_NAME_MOST: usize = 255;
+
+#[cfg(test)]
+mod export_name_tests {
+    use super::{export_file_name, write_replacing};
+
+    #[test]
+    fn an_export_replaces_the_file_whole_and_leaves_nothing_else() {
+        let dir =
+            std::env::temp_dir().join(format!("sims-game-export-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Newbie_7.FAM");
+        write_replacing(&path, b"first").unwrap();
+        write_replacing(&path, b"second, longer").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second, longer");
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["Newbie_7.FAM"], "no partial file is left");
+        // A name as long as a file name can be still writes: the temporary
+        // file's name is short.
+        let long = dir.join(export_file_name(&"a".repeat(248), 7));
+        write_replacing(&long, b"long").unwrap();
+        assert_eq!(std::fs::read(&long).unwrap(), b"long");
+        std::fs::remove_file(&long).unwrap();
+        // A folder that is not there: an error, and nothing made.
+        let missing = dir.join("gone").join("x.FAM");
+        assert!(write_replacing(&missing, b"x").is_err());
+        assert!(!dir.join("gone").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_names_follow_name_underscore_id_and_stay_portable() {
+        assert_eq!(export_file_name("Newbie", 7), "Newbie_7.FAM");
+        assert_eq!(export_file_name("  Two Words ", 12), "Two Words_12.FAM");
+        assert_eq!(export_file_name("a/b\\c:d*e?f", 3), "a_b_c_d_e_f_3.FAM");
+        assert_eq!(export_file_name("", 4), "Family_4.FAM");
+        assert_eq!(export_file_name("..", 4), "Family_4.FAM");
+        assert_eq!(export_file_name("x\u{0}y", 5), "x_y_5.FAM");
+        // Device names, alone or before a dot, in any case.
+        assert_eq!(export_file_name("NUL.backup", 7), "_NUL.backup_7.FAM");
+        assert_eq!(export_file_name("con", 7), "_con_7.FAM");
+        assert_eq!(export_file_name("Com1", 7), "_Com1_7.FAM");
+        assert_eq!(export_file_name("lpt9.x", 7), "_lpt9.x_7.FAM");
+        assert_eq!(export_file_name("COM0", 7), "COM0_7.FAM");
+        assert_eq!(export_file_name("Console", 7), "Console_7.FAM");
+        assert_eq!(export_file_name("Nullson", 7), "Nullson_7.FAM");
+        // A long name still writes: the temporary name is short.
+        assert_eq!(export_file_name(&"a".repeat(248), 7).len(), 254);
+        // Superscript device digits.
+        assert_eq!(
+            export_file_name("COM\u{b9}.backup", 7),
+            "_COM\u{b9}.backup_7.FAM"
+        );
+        assert_eq!(export_file_name("lpt\u{b3}", 7), "_lpt\u{b3}_7.FAM");
+        // Too long for a file name: cut at a character to 255 bytes.
+        for name in [
+            "\u{20ac}".repeat(100),
+            "a".repeat(300),
+            "NUL".to_owned() + &"x".repeat(300),
+        ] {
+            let file = export_file_name(&name, 32767);
+            assert!(file.len() <= 255, "{} bytes", file.len());
+            assert!(file.ends_with("_32767.FAM"));
+        }
+        assert_eq!(
+            export_file_name(&"\u{20ac}".repeat(100), 7),
+            "\u{20ac}".repeat(83) + "_7.FAM",
+            "249 / 3 whole characters"
+        );
     }
 }

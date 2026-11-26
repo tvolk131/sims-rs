@@ -1955,6 +1955,7 @@ impl Lot {
         self.ready()?;
         let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
             character_names: Some(&character_names),
@@ -1982,6 +1983,7 @@ impl Lot {
         let sounds = RefCell::new(Vec::new());
         let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -2016,6 +2018,7 @@ impl Lot {
         let sounds = RefCell::new(Vec::new());
         let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -2050,6 +2053,7 @@ impl Lot {
         self.ready()?;
         let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
             character_names: Some(&character_names),
@@ -2074,6 +2078,7 @@ impl Lot {
         let sounds = RefCell::new(Vec::new());
         let character_names = RefCell::new(self.character_names.clone());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -2109,6 +2114,7 @@ impl Lot {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -2306,6 +2312,7 @@ impl Lot {
         let clearing = previous != PanelMode::Live && mode != previous;
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -2442,6 +2449,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -2481,6 +2489,7 @@ impl Lot {
     pub fn can_pick_up(&self, id: u16) -> Result<bool, OrderError> {
         self.ready()?;
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
             move_objects: self.move_objects,
@@ -2496,6 +2505,7 @@ impl Lot {
     pub fn can_delete(&self, id: u16) -> Result<bool, OrderError> {
         self.ready()?;
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
             move_objects: self.move_objects,
@@ -2511,6 +2521,7 @@ impl Lot {
     pub fn resale_value(&self, id: u16) -> Result<i32, OrderError> {
         self.ready()?;
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
@@ -2530,6 +2541,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -2602,6 +2614,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -2683,6 +2696,7 @@ impl Lot {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -2741,6 +2755,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -2772,6 +2787,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -2803,6 +2819,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -2832,6 +2849,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -2861,6 +2879,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -2895,6 +2914,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -2933,6 +2953,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -2985,6 +3006,7 @@ impl Lot {
     fn purge_buy_history(&mut self, dropped: &[crate::BuyPurchase], keep: &BTreeSet<u16>) {
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -3024,6 +3046,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -3113,6 +3136,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -3213,6 +3237,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -3261,6 +3286,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -3296,6 +3322,7 @@ impl Lot {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -3332,6 +3359,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -3358,6 +3386,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -3383,6 +3412,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -3417,6 +3447,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -3470,6 +3501,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -3519,6 +3551,7 @@ impl Lot {
         }
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            floor_categories: Some(self.architecture_prices.floor_categories()),
             fast: Some(&self.fast),
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
@@ -3584,6 +3617,7 @@ impl Lot {
                 }
                 let sounds = RefCell::new(Vec::new());
                 let interpreter = Interpreter {
+                    floor_categories: Some(self.architecture_prices.floor_categories()),
                     sounds: Some(&sounds),
                     view_rotation: self.view_rotation,
                     view_centre: self.view_centre,
@@ -3667,6 +3701,7 @@ impl Lot {
                 }
                 let sounds = RefCell::new(Vec::new());
                 let interpreter = Interpreter {
+                    floor_categories: Some(self.architecture_prices.floor_categories()),
                     sounds: Some(&sounds),
                     view_rotation: self.view_rotation,
                     view_centre: self.view_centre,

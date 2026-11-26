@@ -12,9 +12,9 @@ use sims_vm::{Interpreter, Status, Trap};
 
 /// The clip every test plays: 100 ms over 4 frames, one motion, no
 /// events.
-const CLIP: &str = "test-clip";
-const SKILL: &str = "test-skill";
-const HUNDRED: u32 = 0x42c8_0000;
+pub(crate) const CLIP: &str = "test-clip";
+pub(crate) const SKILL: &str = "test-skill";
+pub(crate) const HUNDRED: u32 = 0x42c8_0000;
 /// The lot tick count the tests start at: the animator's clock reads
 /// 50 per tick.
 const TICKS: u32 = 10;
@@ -857,7 +857,7 @@ fn a_walking_animator_makes_the_thread_wait() {
     assert!(!fx.world.animators[&SIM].playing);
 }
 
-fn tuning() -> Tuning {
+pub(crate) fn tuning() -> Tuning {
     let rates = || Rates::from_lookup(0, |_| None);
     let curve = |motive| Curve::parse(motive, "(-100;1)(100;1)", 8);
     Tuning {
@@ -869,7 +869,7 @@ fn tuning() -> Tuning {
 
 /// The Sim stands on the lot, sleeping, with nothing in its hands; its
 /// motives do not decay and it is a visitor, so no lot service is asked.
-fn standing() -> Fixture {
+pub(crate) fn standing() -> Fixture {
     let mut fx = sim_animates(animate(1, 3, 0, 0, 0));
     fx.add(SIM_FILE, 4097, sleeper());
     fx.thread(SIM, 4097, &[100]);
@@ -890,7 +890,7 @@ fn standing() -> Fixture {
     fx
 }
 
-fn tick(fx: &mut Fixture) -> Result<bool, sims_vm::Fault> {
+pub(crate) fn tick(fx: &mut Fixture) -> Result<bool, sims_vm::Fault> {
     let tuning = tuning();
     let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     let ticks = fx.world.ticks as i32;
@@ -1087,7 +1087,7 @@ fn a_clip_that_follows_the_speed_takes_it() {
 }
 
 /// One motion's timed events: (time, properties).
-fn track(events: &[(i32, &[(&str, &str)])]) -> Track {
+pub(crate) fn track(events: &[(i32, &[(&str, &str)])]) -> Track {
     Track {
         bone: "ROOT".into(),
         events: events
@@ -1127,7 +1127,7 @@ fn with_events(tracks: Vec<Track>) -> Fixture {
 fn a_clips_timed_events_are_handled_as_it_plays() {
     // 0x5912fd: "xevt" queues its number (read as atoi does), the hands
     // and censor go to person words 22, 23 and 30, "interruptible" to the
-    // layer; the anchor is not kept, and sounds and other keys do nothing. An event before 0 is
+    // layer; the anchor is not kept, a sound off the lot of a person plays nothing, and other keys do nothing. An event before 0 is
     // passed over.
     let mut fx = with_events(vec![
         track(&[
@@ -1530,7 +1530,8 @@ fn what_the_animator_tick_does_not_port_fails_loudly() {
         .target_heading = F32::from_f32(1.0);
     tick(&mut fx).unwrap();
     assert_eq!(fx.world.animators[&SIM].head.turn.to_bits(), 0xbe4c_cccd);
-    // A destination elsewhere, and a state not ported.
+    // A destination elsewhere is walked to with a clip this Sim's tables
+    // do not name (see `walk_states.rs`).
     let mut fx = standing();
     let mut animator = LOADED;
     animator.position = [F32::ZERO; 3];
@@ -1540,19 +1541,20 @@ fn what_the_animator_tick_does_not_port_fails_loudly() {
         tick(&mut fx)
             .unwrap_err()
             .to_string()
-            .contains("walks to its destination")
+            .contains("has no name for its clip 10")
     );
+    // State 7 with no clip ends its stop through a null pointer.
     let mut fx = standing();
     fx.world
         .animators
         .insert(SIM, sims_sim::animator::Animator { state: 7, ..LOADED });
-    assert!(tick(&mut fx).unwrap_err().to_string().contains("state 7"));
+    assert!(tick(&mut fx).unwrap_err().to_string().contains("0x58e2c2"));
 }
 
 /// Names the posture's clip `selection` in the global table 150, which
 /// grows to hold it, and adds a clip of that name moving `distance`
 /// (float bits; 0 moves nothing) per cycle of 100 milliseconds.
-fn name_clip(fx: &mut Fixture, selection: usize, name: &str, distance: u32) {
+pub(crate) fn name_clip(fx: &mut Fixture, selection: usize, name: &str, distance: u32) {
     let names = fx
         .program
         .libraries
@@ -1588,7 +1590,7 @@ fn name_clip(fx: &mut Fixture, selection: usize, name: &str, distance: u32) {
 /// along the first coordinate. Global clip table 150 names the walk
 /// (clip 0x14, whose distance sets the look-ahead), the stop from a walk
 /// (clip 0x13) and the half turn (clip 5).
-fn routed() -> Fixture {
+pub(crate) fn routed() -> Fixture {
     let mut fx = standing();
     fx.sim_mut().data[1] = 6;
     // Data word 17 clear: the person walks (state 9), and looks ahead by
@@ -1892,14 +1894,16 @@ fn what_the_route_follow_does_not_port_fails_loudly() {
     fx.world.routing.routes.get_mut(&SIM).unwrap().path.pop();
     fx.sim_mut().data[9] = 0;
     assert!(tick(&mut fx).unwrap_err().to_string().contains("0x588df8"));
-    // Stopping at the end of a path for a person whose word 64 is set
-    // (0x58e83b).
+    // Stopping at the end of a path for a person of kind above 1 whose
+    // word 64 is set (0x58e83b to 0x58ef8e): +0x290 is not kept.
     let mut fx = routed();
     fx.world.routing.routes.get_mut(&SIM).unwrap().path.pop();
     fx.sim_mut().data[9] = 1;
-    fx.sim_mut().person.as_mut().unwrap().data[64] = 1;
+    let person = fx.sim_mut().person.as_mut().unwrap();
+    person.data[64] = 1;
+    person.data[65] = 2;
     fx.world.animators.get_mut(&SIM).unwrap().motion.near_end = 1;
-    assert!(tick(&mut fx).unwrap_err().to_string().contains("0x58e83b"));
+    assert!(tick(&mut fx).unwrap_err().to_string().contains("0x58ef8e"));
     // No walk clip to set the look-ahead.
     let mut fx = routed();
     fx.program
@@ -2647,20 +2651,54 @@ fn a_refresh_whose_event_writes_a_hand_fails_at_the_take_off() {
 }
 
 #[test]
-fn a_refresh_whose_event_plays_a_sound_fails_at_the_take_off() {
+fn a_refresh_whose_event_plays_a_sound_takes_itself_off_quietly() {
     // For a selected person, "selectedsound" plays (0x59158c, 0x59175e,
-    // 0x57a54c); the sounds of timed events are not modeled, so in the
-    // refresh any sound key fails. The tick alone passes over it.
+    // 0x57a54c); whether the refresh's sounds play is not kept, and a
+    // sound writes nothing the lot reads, so in the refresh any sound key
+    // plays nothing and the take-off goes on. The tick alone plays it
+    // (`clip_sounds.rs`).
+    //
+    // The refresh takes the event past, so the tick after it plays
+    // nothing either; the sounds alone differ, and the tick alone's are
+    // kept: with the sounds noted, the deselected Sim's sound plays once.
     for key in ["sound", "selectedsound", "deselectedsound", "footstep"] {
         let mut fx = taking_itself_off(sleep());
         playing_an_event(&mut fx, key, "x");
-        let fault = tick(&mut fx).unwrap_err().to_string();
-        assert!(
-            fault.contains("0x58da12") && fault.contains(&format!("{key:?}")),
-            "{fault}"
-        );
+        tick(&mut fx).unwrap_or_else(|f| panic!("{key}: {f}"));
+        let mut fx = taking_itself_off(sleep());
+        playing_an_event(&mut fx, key, "x");
+        let sink = std::cell::RefCell::new(Vec::new());
+        let mut interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter.sounds = Some(&sink);
+        let ticks = fx.world.ticks as i32;
+        interpreter
+            .tick_person(&mut fx.world, SIM, ticks, &tuning())
+            .unwrap_or_else(|f| panic!("{key} with the sounds noted: {f}"));
+        let sounds = sink.into_inner();
+        if key == "deselectedsound" {
+            assert_eq!(
+                sounds,
+                vec![sims_vm::SoundEvent::Play {
+                    object: SIM as i16,
+                    name: "x".into(),
+                }],
+                "{key}"
+            );
+        }
         let mut alone = standing();
         playing_an_event(&mut alone, key, "x");
+        // A footstep reads the floor under the Sim (no pattern there).
+        alone.world.size = 64;
+        alone.world.arrays.insert(
+            1,
+            sims_formats::lot::Array {
+                width: 64,
+                height: 64,
+                stride: 2,
+                encoding: 0,
+                data: vec![0; 64 * 64 * 2],
+            },
+        );
         tick(&mut alone).unwrap();
     }
 }
@@ -2711,7 +2749,7 @@ fn a_refresh_that_would_count_the_head_down_fails_loudly() {
 
 /// The routed Sim facing along its path (direction 2), so that its first
 /// tick walks a step (to [150, 200, 1]).
-fn facing_along() -> Fixture {
+pub(crate) fn facing_along() -> Fixture {
     let mut fx = routed();
     fx.sim_mut().data[1] = 2;
     let a = fx.world.animators.get_mut(&SIM).unwrap();
@@ -2747,7 +2785,7 @@ fn the_walk_tests_word_64_as_it_was_when_the_tick_began() {
     // (0x58dcaf, kept at [ebp-0x24]). Here the person's own placed tree
     // (function 9) sets it as the step puts them. The asked stop still
     // takes the path for word 64 clear: the route ends blocked, where a
-    // fresh read would take the stop clip's path (0x58ef2f, not ported).
+    // fresh read would take the stop clip's path (0x58ef2f).
     const MY_PERSON_DATA: u8 = 18;
     const PLACED_TREE: u16 = 4200;
     let mut fx = facing_along();

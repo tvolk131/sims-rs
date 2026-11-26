@@ -144,6 +144,13 @@ impl NeighborhoodShell {
                 }
                 ShellOutcome::redraw()
             }
+            FamilyBinCommand::ExportFamily(id) => {
+                match u16::try_from(id) {
+                    Ok(fam_id) => self.export_family_with_notice(fam_id),
+                    Err(_) => self.note = Some(format!("Could not export family {id}.")),
+                }
+                ShellOutcome::redraw()
+            }
             FamilyBinCommand::CreateNewFamily => {
                 if let Err(err) = self.open_create_family() {
                     self.note = Some(format!("Could not open Create-a-Family: {err}"));

@@ -926,7 +926,7 @@ pub fn layout(usage: &HouseUsage) -> i32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use sims_formats::strings::{Format, TextEntry};
     use sims_formats::tuning::Constant;
@@ -1081,7 +1081,7 @@ mod tests {
         assert_eq!((house.ratings[YARD], house.lot), (Some(0), 2));
     }
 
-    fn object(id: u16, guid: u32, broken: i16, dirty: i16) -> sims_sim::Object {
+    pub(crate) fn object(id: u16, guid: u32, broken: i16, dirty: i16) -> sims_sim::Object {
         let mut data = vec![0; 128];
         data[BROKEN] = broken;
         data[DIRTY] = dirty;

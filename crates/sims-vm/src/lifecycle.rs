@@ -418,6 +418,13 @@ pub(crate) struct LotPrices {
     pool: i32,
     floors: BTreeMap<u16, i32>,
     walls: BTreeMap<u16, i32>,
+    /// The category of each floor pattern of the base game's own file
+    /// (`GameData/floors.iff`, keys 1 to 29), which a footstep reads
+    /// ([`crate::footsteps`]). The original keeps each pattern's in its
+    /// catalog entry (+0x2c, from the label of the pattern's `SPR2`,
+    /// 0x49fd95); the plug-in files' are not read here, so a footstep on
+    /// one of their patterns plays nothing.
+    floor_categories: BTreeMap<u16, u8>,
 }
 
 impl LotPrices {
@@ -488,8 +495,38 @@ impl LotPrices {
             pool,
             floors,
             walls,
+            floor_categories: builtin_floor_categories(install),
         }
     }
+
+    /// The floor patterns' categories by key ([`LotPrices::floor_categories`]
+    /// field).
+    pub(crate) fn floor_categories(&self) -> &BTreeMap<u16, u8> {
+        &self.floor_categories
+    }
+}
+
+/// The categories of the base game's own floor patterns, keys 1 to 29
+/// (each the `SPR2` of that ID in `GameData/floors.iff`). A key without
+/// its sprite is still listed, with the category its entry is made with
+/// (0x4a0722 clears +0x2c; 0x4a029a inserts it either way): 0. None of
+/// them when the file cannot be read.
+fn builtin_floor_categories(install: &Install) -> BTreeMap<u16, u8> {
+    let Some(iff) = install
+        .file("GameData/floors.iff")
+        .ok()
+        .and_then(|path| Iff::parse(std::fs::read(path).ok()?).ok())
+    else {
+        return BTreeMap::new();
+    };
+    (1u16..=29)
+        .map(|key| {
+            let category = iff.get(b"SPR2", key).map_or(0, |chunk| {
+                crate::footsteps::floor_category(iff.label_bytes(chunk))
+            });
+            (key, category)
+        })
+        .collect()
 }
 
 fn atoi(bytes: &[u8]) -> i32 {

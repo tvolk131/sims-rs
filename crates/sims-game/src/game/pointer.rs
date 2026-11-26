@@ -178,6 +178,10 @@ impl Game {
     /// (0x5eb3d1 with `+0x170` clear); the entry is chosen, or the menu
     /// closed, on the matching [`Game::release`] (0x5eb433).
     pub fn press(&mut self, point: [i32; 2]) -> Outcome {
+        // A new press starts clean: a non-modal dialog's capture from a press
+        // whose release never came (focus lost, an overlay took it) is
+        // dropped before anything else sees this one.
+        self.hud.cancel_non_modal_press();
         if self.coop_lobby.is_open() {
             self.pointer = Some(point);
             let snap = self.coop_snapshot();
@@ -256,7 +260,7 @@ impl Game {
                 ..Outcome::default()
             };
         }
-        if !self.has_dialog() && self.hud.menu.is_some() {
+        if !self.dialog_takes(point) && self.hud.menu.is_some() {
             self.pointer = Some(point);
             let mut redraw = self.hud.hover(point);
             redraw |= self.highlight(point);
@@ -283,7 +287,7 @@ impl Game {
                 .hud
                 .camera_strip_rect()
                 .is_some_and(|r| r.contains(point[0], point[1]));
-            if !self.has_dialog()
+            if !self.dialog_takes(point)
                 && !over_camera_strip
                 && self.hud.controls.mode == Mode::Buy
                 && self.hud.over_buy_catalog(self.view.size, point)
@@ -294,7 +298,7 @@ impl Game {
                 self.sell_held();
                 return Outcome::redraw();
             }
-            if !self.has_dialog()
+            if !self.dialog_takes(point)
                 && !over_camera_strip
                 && self.hud.controls.mode == Mode::Build
                 && let Some(action) = self.hud.press_build_subtool(point)
@@ -665,6 +669,9 @@ impl Game {
             return outcome;
         }
         let (released_dialog, dialog_cmd) = self.hud.release_dialog(Some(point));
+        // A press on a non-modal dialog is released there too: it never
+        // reaches a pie menu, a held object or a tool under the dialog.
+        let dialog_owned = self.hud.take_non_modal_press();
         if let Some(command) = dialog_cmd {
             let outcome = self.command(command, None);
             if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
@@ -673,6 +680,9 @@ impl Game {
             let sounds = self.hud.take_sounds();
             self.keep_sounds(sounds);
             return outcome;
+        }
+        if dialog_owned {
+            return Outcome::redraw();
         }
         if !self.in_view(point) {
             let mut out = self.release_outside();
@@ -812,6 +822,11 @@ impl Game {
         let (released_camera, _) = self.hud.release_camera_strip(None);
         let (released_action, _) = self.hud.release_options_action(None);
         let (released_dialog, _) = self.hud.release_dialog(None);
+        if self.hud.take_non_modal_press() {
+            // The press was the non-modal dialog's: what is under it (a pie
+            // menu, a drag) never sees its release.
+            return Outcome::redraw();
+        }
         if self.buy_dragging.take().is_some() {
             self.buy_commit_on_release = false;
             let redraw = self.hide_buy_cursor()
