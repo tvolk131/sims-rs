@@ -352,7 +352,46 @@ pub(super) fn raw_block_is_layout_free(code: &str) -> bool {
         }
         i += 1;
     }
-    depth == 0
+    depth == 0 && !raw_arms_end_alike(code)
+}
+
+/// Whether the block has an `if c { .. T } else { .. T }` whose arms may end in the same
+/// statement once the backend's other passes have run (any arm ending in a loop or an `if`
+/// counts).
+/// The backend joins such tails after the `if` (`opt::merge_duplicate_tails`), which changes the
+/// node layout the block spells out, so the block keeps the tree's layout instead: its arms stay
+/// as written. (A raw block is written to fix its nodes; structured code still gets the join.)
+fn raw_arms_end_alike(code: &str) -> bool {
+    fn any_alike(nodes: &[mir::Stmt]) -> bool {
+        nodes.iter().any(|n| match n {
+            mir::Stmt::Inst(_) => false,
+            mir::Stmt::While { body, .. } => any_alike(body),
+            mir::Stmt::If { arms, else_body } => {
+                // Other passes run first and may reshape an arm's end (a single-pass loop is
+                // unwrapped, a nested `if` folded), so only arms that all end with an
+                // instruction, no two the same, are known never to join.
+                let joinable = else_body.as_ref().is_some_and(|else_body| {
+                    let lasts: Option<Vec<&mir::Stmt>> = arms
+                        .iter()
+                        .map(|(_, body)| body.last())
+                        .chain(std::iter::once(else_body.last()))
+                        .collect();
+                    lasts.is_some_and(|lasts| {
+                        !lasts.iter().all(|l| matches!(l, mir::Stmt::Inst(_)))
+                            || lasts
+                                .iter()
+                                .enumerate()
+                                .any(|(i, a)| lasts[i + 1..].contains(a))
+                    })
+                });
+                joinable
+                    || arms.iter().any(|(_, body)| any_alike(body))
+                    || else_body.as_deref().is_some_and(any_alike)
+            }
+        })
+    }
+    // A block the backend cannot parse is left alone by it.
+    mir::parse_body(&layout_free_raw_lines(code).join("\n")).is_some_and(|nodes| any_alike(&nodes))
 }
 
 /// A layout-free raw block ([`raw_block_is_layout_free`]) as the lowering prints its own code:

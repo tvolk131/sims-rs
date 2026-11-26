@@ -1129,17 +1129,33 @@ impl<'a> TreeLowerer<'a> {
 
     /// Evaluates a helper return before emitting the matching cleanup and caller edge.
     /// A comparison keeps its own polarity, and logical operators short-circuit.
-    pub(super) fn emit_inline_bool_edges(
+    ///
+    /// `exits[v]` says that the edge for the value `v` goes
+    /// to an arm that exits the tree with a result. A constant leaf whose value reaches such an
+    /// arm leaves its value as the last result with a test node
+    /// ([`Self::emit_const_result_node`]), as a non-constant leaf's test does, unless the test
+    /// before it on that path already left that value.
+    fn emit_inline_bool_edges(
         &mut self,
         expr: &V2Expr,
         terminal: bool,
+        exits: [bool; 2],
         edge: &mut dyn FnMut(&mut Self, bool) -> Result<()>,
     ) -> Result<()> {
-        if let Some(value) = self.try_eval_const_bool(expr) {
-            return edge(self, value);
-        }
-        if let Some(value) = self.try_fold_literal_cond(expr) {
-            self.check_folded_cond(expr)?;
+        let value = match self.try_eval_const_bool(expr) {
+            Some(value) => Some(value),
+            None => match self.try_fold_literal_cond(expr) {
+                Some(value) => {
+                    self.check_folded_cond(expr)?;
+                    Some(value)
+                }
+                None => None,
+            },
+        };
+        if let Some(value) = value {
+            if exits[usize::from(value)] && self.edge_node_result != Some(value) {
+                self.emit_const_result_node(value);
+            }
             return edge(self, value);
         }
         match expr {
@@ -1148,7 +1164,12 @@ impl<'a> TreeLowerer<'a> {
                 inner,
                 ..
             } => {
-                return self.emit_inline_bool_edges(inner, terminal, &mut |c, b| edge(c, !b));
+                return self.emit_inline_bool_edges(
+                    inner,
+                    terminal,
+                    [exits[1], exits[0]],
+                    &mut |c, b| edge(c, !b),
+                );
             }
             V2Expr::Binary {
                 lhs,
@@ -1159,9 +1180,13 @@ impl<'a> TreeLowerer<'a> {
                 if self.try_fold_literal_cond(lhs) == Some(*op == V2BinOp::Or) {
                     self.check_folded_cond(rhs)?;
                 }
-                return self.emit_inline_bool_edges(lhs, terminal, &mut |c, b| {
+                // The value that goes on to `rhs` reaches no arm yet.
+                let go_on = usize::from(*op == V2BinOp::And);
+                let mut lhs_exits = exits;
+                lhs_exits[go_on] = false;
+                return self.emit_inline_bool_edges(lhs, terminal, lhs_exits, &mut |c, b| {
                     if b == (*op == V2BinOp::And) {
-                        c.emit_inline_bool_edges(rhs, terminal, edge)
+                        c.emit_inline_bool_edges(rhs, terminal, exits, edge)
                     } else {
                         edge(c, b)
                     }
@@ -1219,15 +1244,19 @@ impl<'a> TreeLowerer<'a> {
                 None => None,
             },
         };
+        let exits_with_result = |arm: &str| {
+            arm.lines()
+                .next()
+                .is_some_and(|l| matches!(l.trim(), "return true;" | "return false;"))
+        };
         let Some(value) = value else {
-            return self.emit_inline_bool_edges(expr, terminal, edge);
+            // A constant leaf inside the chain (`temp[0] == 1 && false`) follows the same rule.
+            self.edge_node_result = None;
+            let exits = [exits_with_result(arms.1), exits_with_result(arms.0)];
+            return self.emit_inline_bool_edges(expr, terminal, exits, edge);
         };
         let taken = if value { arms.0 } else { arms.1 };
-        let exits_with_result = taken
-            .lines()
-            .next()
-            .is_some_and(|l| matches!(l.trim(), "return true;" | "return false;"));
-        if !exits_with_result || self.last_node_result() == Some(value) {
+        if !exits_with_result(taken) || self.last_node_result() == Some(value) {
             return edge(self, value);
         }
         if value {
@@ -1242,6 +1271,16 @@ impl<'a> TreeLowerer<'a> {
             edge(self, false)?;
         }
         Ok(())
+    }
+
+    /// A test node that leaves `value` as the last result and goes on to the next line on
+    /// either exit: `if 1 == 1 { }` / `if 1 == 0 { }`. For a constant leaf of a short circuit
+    /// whose arm exits the tree with a result: the test that decided the path before it left
+    /// the opposite value.
+    fn emit_const_result_node(&mut self, value: bool) {
+        self.line(format!("if 1 == {} {{", u8::from(value)));
+        self.line("}".to_owned());
+        self.edge_node_result = Some(value);
     }
 
     /// The last result the node just emitted leaves on the straight-line path to the next
@@ -1277,9 +1316,13 @@ impl<'a> TreeLowerer<'a> {
     ) -> Result<()> {
         self.line(format!("if {test} {{"));
         self.em.indent();
+        // The node's own result on each edge: its polarity, as `!` swaps the exits.
+        let simple = restore.is_none() && !test.contains("&&") && !test.contains("||");
+        let node_result = |edge: bool| simple.then_some(edge != test.starts_with('!'));
         if let Some(saved) = restore {
             self.emit_stack_restore(saved);
         }
+        self.edge_node_result = node_result(true);
         edge(self, true)?;
         self.em.dedent();
         if terminal {
@@ -1292,6 +1335,7 @@ impl<'a> TreeLowerer<'a> {
             if let Some(saved) = restore {
                 self.emit_stack_restore(saved);
             }
+            self.edge_node_result = node_result(false);
             edge(self, false)?;
             self.em.dedent();
             if self.em.mark() == arm_at {
@@ -1303,12 +1347,31 @@ impl<'a> TreeLowerer<'a> {
         if let Some(saved) = restore {
             self.emit_stack_restore(saved);
         }
+        self.edge_node_result = node_result(false);
         edge(self, false)?;
         Ok(())
     }
 
     pub(super) fn emit_return_bool_expr(&mut self, expr: &V2Expr) -> Result<()> {
+        self.emit_return_bool_expr_after(expr, None)
+    }
+
+    /// [`Self::emit_return_bool_expr`] for `expr`, reached after the test before it left
+    /// `last` (`Some(None)`: unknown) as the result; `None` for a whole `return` value. A
+    /// constant right side of `&&` / `||` (`return temp[0] == 1 && false;`) leaves its own value
+    /// as the tree's last result ([`Self::emit_const_result_node`]), as a non-constant one's
+    /// test does, rather than the opposite result of the test before it.
+    fn emit_return_bool_expr_after(
+        &mut self,
+        expr: &V2Expr,
+        last: Option<Option<bool>>,
+    ) -> Result<()> {
         if let Some(b) = self.try_eval_const_bool(expr) {
+            if let Some(last) = last
+                && last != Some(b)
+            {
+                self.emit_const_result_node(b);
+            }
             self.line(if b {
                 "return true;".to_owned()
             } else {
@@ -1330,7 +1393,7 @@ impl<'a> TreeLowerer<'a> {
                     self.line("return false;".to_owned());
                     self.em.dedent();
                     self.line("}".to_owned());
-                    self.emit_return_bool_expr(rhs)
+                    self.emit_return_bool_expr_after(rhs, Some(test_result(&pos_lhs, true)))
                 } else {
                     let tmp = self.fresh("and");
                     self.line(format!("let {tmp} = 0;"));
@@ -1340,7 +1403,7 @@ impl<'a> TreeLowerer<'a> {
                     self.line("return false;".to_owned());
                     self.em.dedent();
                     self.line("}".to_owned());
-                    self.emit_return_bool_expr(rhs)
+                    self.emit_return_bool_expr_after(rhs, Some(Some(false)))
                 }
             }
             V2Expr::Binary {
@@ -1355,7 +1418,7 @@ impl<'a> TreeLowerer<'a> {
                     self.line("return true;".to_owned());
                     self.em.dedent();
                     self.line("}".to_owned());
-                    self.emit_return_bool_expr(rhs)
+                    self.emit_return_bool_expr_after(rhs, Some(test_result(&pos_lhs, false)))
                 } else {
                     let tmp = self.fresh("or");
                     self.line(format!("let {tmp} = 0;"));
@@ -1365,7 +1428,7 @@ impl<'a> TreeLowerer<'a> {
                     self.line("return true;".to_owned());
                     self.em.dedent();
                     self.line("}".to_owned());
-                    self.emit_return_bool_expr(rhs)
+                    self.emit_return_bool_expr_after(rhs, Some(Some(false)))
                 }
             }
             _ => {
@@ -1414,6 +1477,12 @@ impl<'a> TreeLowerer<'a> {
             }
         }
     }
+}
+
+/// The result a one-node test `test` leaves on the edge it takes for `value`: its polarity, as
+/// `!` swaps the exits. `None` for a test that is not one node.
+fn test_result(test: &str, value: bool) -> Option<bool> {
+    (!test.contains("&&") && !test.contains("||")).then_some(value != test.starts_with('!'))
 }
 
 /// Whether an `.air` line is an assignment (an Expression node, which returns true) to a cell

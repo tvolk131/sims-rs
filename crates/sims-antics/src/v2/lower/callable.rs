@@ -73,7 +73,20 @@ impl<'a> TreeLowerer<'a> {
                     return Err(Error::at(
                         span,
                         format!(
-                            "{} runs in the Sim-on-object context and can only be called from interactions, functionals, or other Sim trees",
+                            "{} runs in the Sim-on-object context and can only be called from interactions or other Sim trees",
+                            sig.display
+                        ),
+                    ));
+                }
+                // A functional's runner is whoever runs it: `run_functional` and Find Best Object
+                // run its action and guard on whichever object asks, so its `sim` binding may be
+                // an object, and a Sim tree would run with the object as its Sim. (The same rule
+                // refuses reaching a Sim tree through a `context = inherit` tree.)
+                if self.object_reachable && !self.inherit_tree {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "{} runs in the Sim-on-object context, and a functional's action or guard may run on an object ('run_functional' and Find Best Object run it on whichever object asks), so it cannot call a Sim tree",
                             sig.display
                         ),
                     ));

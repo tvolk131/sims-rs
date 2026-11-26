@@ -77,6 +77,18 @@ pub(super) fn stmts_mutate_or_borrow_ident_in(
                 || expr_borrows_ident_in(init, target_name, w)
                 || stmts_mutate_or_borrow_ident_in(else_body, target_name, w)
         }
+        V2Stmt::IfLetSome {
+            name,
+            init,
+            then_body,
+            else_body,
+            ..
+        } => {
+            name == target_name
+                || expr_borrows_ident_in(init, target_name, w)
+                || stmts_mutate_or_borrow_ident_in(then_body, target_name, w)
+                || stmts_mutate_or_borrow_ident_in(else_body, target_name, w)
+        }
         V2Stmt::Assign { target, value, .. } => {
             matches!(target, V2Expr::Ident(_, n) if n == target_name)
                 || expr_borrows_ident_in(target, target_name, w)
@@ -269,11 +281,18 @@ pub(super) fn stmts_unconditionally_diverge(
             | V2Stmt::Break { .. }
             | V2Stmt::Continue { .. },
         ) => true,
-        Some(V2Stmt::If {
-            then_body,
-            else_body,
-            ..
-        }) => {
+        Some(
+            V2Stmt::If {
+                then_body,
+                else_body,
+                ..
+            }
+            | V2Stmt::IfLetSome {
+                then_body,
+                else_body,
+                ..
+            },
+        ) => {
             !else_body.is_empty()
                 && stmts_unconditionally_diverge(then_body, env, owner_module, allow_local)
                 && stmts_unconditionally_diverge(else_body, env, owner_module, allow_local)
@@ -310,6 +329,11 @@ pub(super) fn loop_body_breaks(stmts: &[V2Stmt]) -> bool {
             then_body,
             else_body,
             ..
+        }
+        | V2Stmt::IfLetSome {
+            then_body,
+            else_body,
+            ..
         } => loop_body_breaks(then_body) || loop_body_breaks(else_body),
         V2Stmt::Match { arms, .. } => arms.iter().any(|a| loop_body_breaks(&a.body)),
         V2Stmt::WithLock { body, .. } | V2Stmt::Defer { body, .. } => loop_body_breaks(body),
@@ -325,6 +349,11 @@ pub(super) fn stmts_exit_loop(stmts: &[V2Stmt]) -> bool {
     stmts.iter().any(|s| match s {
         V2Stmt::Break { .. } | V2Stmt::Continue { .. } => true,
         V2Stmt::If {
+            then_body,
+            else_body,
+            ..
+        }
+        | V2Stmt::IfLetSome {
             then_body,
             else_body,
             ..
@@ -359,6 +388,11 @@ pub(super) fn stmts_have_return(stmts: &[V2Stmt]) -> bool {
             then_body,
             else_body,
             ..
+        }
+        | V2Stmt::IfLetSome {
+            then_body,
+            else_body,
+            ..
         } => stmts_have_return(then_body) || stmts_have_return(else_body),
         V2Stmt::Match { arms, .. } => arms.iter().any(|a| stmts_have_return(&a.body)),
         V2Stmt::Let { init, .. } => init_blocks(init).into_iter().any(stmts_have_return),
@@ -379,6 +413,11 @@ pub(super) fn stmts_return_through_loop(stmts: &[V2Stmt]) -> bool {
             body, else_body, ..
         } => stmts_have_return(body) || else_body.as_deref().is_some_and(stmts_have_return),
         V2Stmt::If {
+            then_body,
+            else_body,
+            ..
+        }
+        | V2Stmt::IfLetSome {
             then_body,
             else_body,
             ..
@@ -521,6 +560,11 @@ pub(super) fn stmts_always_return(
                 then_body,
                 else_body,
                 ..
+            }
+            | V2Stmt::IfLetSome {
+                then_body,
+                else_body,
+                ..
             } => {
                 if !else_body.is_empty()
                     && stmts_always_return(then_body, env, owner_module, allow_local)
@@ -583,7 +627,9 @@ pub(super) fn stmts_may_clobber_stack_obj(
     stmts.iter().any(|s| match s {
         // Rebinding the Sim name makes later `sim.x` reads foreign-object reads (stack_obj swaps)
         // that the field check below would otherwise treat as plain Sim reads.
-        V2Stmt::Let { name, .. } | V2Stmt::LetSome { name, .. }
+        V2Stmt::Let { name, .. }
+        | V2Stmt::LetSome { name, .. }
+        | V2Stmt::IfLetSome { name, .. }
             if Some(name.as_str()) == sim_name =>
         {
             true
@@ -603,6 +649,24 @@ pub(super) fn stmts_may_clobber_stack_obj(
         }
         V2Stmt::Let { init, .. } => {
             expr_may_clobber_stack_obj(init, env, owner_mod, allow_local_fns, sim_name, depth)
+        }
+        V2Stmt::IfLetSome {
+            init,
+            then_body,
+            else_body,
+            ..
+        } => {
+            expr_may_clobber_stack_obj(init, env, owner_mod, allow_local_fns, sim_name, depth)
+                || [then_body, else_body].into_iter().any(|body| {
+                    stmts_may_clobber_stack_obj(
+                        body,
+                        env,
+                        owner_mod,
+                        allow_local_fns,
+                        sim_name,
+                        depth,
+                    )
+                })
         }
         V2Stmt::Assign {
             target: V2Expr::Ident(_, name),

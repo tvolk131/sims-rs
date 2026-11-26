@@ -637,6 +637,17 @@ pub enum V2Stmt {
         init: V2Expr,
         else_body: Vec<V2Stmt>,
     },
+    /// `if let Some(name [: T]) = f(..) { then_body } [else { else_body }]`: `f` is a
+    /// `#[ret(temp = N)] -> Option<T>` tree; `name` holds its value in `then_body` only. An
+    /// `else if` chain is one nested `If` / `IfLetSome` in `else_body`, as for `If`.
+    IfLetSome {
+        span: Span,
+        name: String,
+        ty: Option<V2Type>,
+        init: V2Expr,
+        then_body: Vec<V2Stmt>,
+        else_body: Vec<V2Stmt>,
+    },
     Assign {
         span: Span,
         target: V2Expr,

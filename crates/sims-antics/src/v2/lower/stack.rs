@@ -167,6 +167,22 @@ impl<'a> TreeLowerer<'a> {
                 expr: e @ V2Expr::MethodCall { method, .. },
                 ..
             } if method == "remove" => self.cursor_expr_ok(e, cursor),
+            // A flag method on a cell (`o.flags2.set(F)`, `o.wall_placement.clear_all([A, B])`)
+            // lowers as the operator on that cell (`flag_set`, `|=`, `&=`), which the loop
+            // already takes.
+            V2Stmt::Expr {
+                expr:
+                    V2Expr::MethodCall {
+                        receiver,
+                        method,
+                        type_args,
+                        args,
+                        ..
+                    },
+                ..
+            } if matches!(method.as_str(), "set" | "clear" | "set_all" | "clear_all") => {
+                type_args.is_empty() && self.cursor_flag_method_ok(receiver, args, cursor)
+            }
             V2Stmt::Let { name, init, .. } => {
                 self.cursor_fresh_name(name, cursor) && self.cursor_expr_ok(init, cursor)
             }
@@ -279,6 +295,16 @@ impl<'a> TreeLowerer<'a> {
             }
             V2Expr::Field { .. } if self.bcon_field_ref(expr).is_some() => true,
             V2Expr::Field { .. } | V2Expr::Index { .. } => self.cursor_place_ok(expr, cursor),
+            // A flag test on a cell (`o.flags2.contains(F)`), as `flag_test` / `&` on it.
+            V2Expr::MethodCall {
+                receiver,
+                method,
+                type_args,
+                args,
+                ..
+            } if is_bitflag_predicate(method) => {
+                type_args.is_empty() && self.cursor_flag_method_ok(receiver, args, cursor)
+            }
             V2Expr::MethodCall {
                 receiver,
                 method,
@@ -304,6 +330,25 @@ impl<'a> TreeLowerer<'a> {
             }
             _ => false,
         }
+    }
+}
+
+impl TreeLowerer<'_> {
+    /// Whether a flag method's receiver and arguments keep the loop's cursor: the receiver is
+    /// a cell the loop may touch or a local (never the cursor handle itself), and the
+    /// arguments read nothing else (flag constants, locals, the cursor's own cells).
+    fn cursor_flag_method_ok(&self, receiver: &V2Expr, args: &[CallArg], cursor: &str) -> bool {
+        let receiver_ok = match receiver {
+            V2Expr::Field { .. } | V2Expr::Index { .. } => self.cursor_place_ok(receiver, cursor),
+            V2Expr::Ident(_, name) => {
+                name != cursor && matches!(self.lookup_var(name), Some(Binding::Local { .. }))
+            }
+            _ => false,
+        };
+        receiver_ok
+            && args
+                .iter()
+                .all(|a| a.name.is_none() && self.cursor_expr_ok(&a.value, cursor))
     }
 }
 

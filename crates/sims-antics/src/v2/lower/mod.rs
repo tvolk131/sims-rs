@@ -857,6 +857,10 @@ struct TreeLowerer<'a> {
     /// [`Self::reassigns_stack_obj`] from that point on. Set in lowering order, so a raw block
     /// after a loop does not change how the loop lowers.
     raw_moves_cursor: bool,
+    /// The result the test node a short-circuit edge leaves from ([`Self::emit_test_edges`]),
+    /// while that edge's code is emitted: the node's polarity on that edge, `None` when
+    /// unknown (a stack restore follows it). A constant leaf later in the chain reads it.
+    edge_node_result: Option<bool>,
     /// Resolving a held place ([`Self::resolve_borrowed_lvalue`]).
     borrowing_place: bool,
     /// The source assigns `stack_obj` itself (`stack_obj = x;`), so the stack object the tree
