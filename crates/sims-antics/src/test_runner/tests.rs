@@ -559,11 +559,195 @@ fn givens() {
     assert_eq!(g.globals.get(&6), Some(&7));
     assert_eq!(g.funds, Some(1234));
     assert_eq!(
-        g.create,
+        g.create.iter().map(|c| &c.object).collect::<Vec<_>>(),
         vec![
-            CreateRef::Slug("open-fridge".into()),
-            CreateRef::Guid(0x7F00_0020)
+            &CreateRef::Slug("open-fridge".into()),
+            &CreateRef::Guid(0x7F00_0020)
         ]
+    );
+    assert!(g.create.iter().all(|c| c.place.is_none()));
+}
+
+#[test]
+fn placed_rooms() {
+    let f = parse_ok(&format!(
+        r#"{HEAD}place = [6, 6]
+
+[lot]
+room = true
+
+[[test]]
+name = "a"
+tree = 1
+given = {{ create = [{{ object = "open-trash-can", place = [5, 4] }}, "open-counter", {{ object = 0x7F000020 }}] }}
+expect = {{ room = {{ score = -19.5, light = 0.25, lamp_light = 50, light_sources = 1, impact = 5, objects = 2 }}, objects = {{ open-trash-can = 1, open-counter = {{ count = 2, attrs = {{ stock = 1, 3 = 4 }}, temps = {{ 0 = 1 }}, data = {{ 7 = 2 }} }}, open-fridge = {{ data = {{ 29 = 1 }} }} }} }}
+
+[[test]]
+name = "b"
+tree = 1
+room = false
+"#
+    ));
+    assert!(f.room);
+    assert_eq!(f.subject_place, Some([6, 6]));
+    let (a, b) = (&f.cases[0], &f.cases[1]);
+    assert_eq!(
+        a.given.create,
+        vec![
+            Create {
+                object: CreateRef::Slug("open-trash-can".into()),
+                place: Some([5, 4])
+            },
+            Create {
+                object: CreateRef::Slug("open-counter".into()),
+                place: None
+            },
+            Create {
+                object: CreateRef::Guid(0x7F00_0020),
+                place: None
+            },
+        ]
+    );
+    // The places given first; then the free tiles in reading order from [4, 4].
+    assert_eq!(a.tiles(&f).unwrap(), vec![[6, 6], [5, 4], [4, 4], [6, 4]]);
+    assert!(a.in_room(&f));
+    assert!(!b.in_room(&f), "a case's own room = false wins");
+    assert_eq!(
+        a.expect.room,
+        Some(RoomExpect {
+            score: Some(-19.5),
+            light: Some(0.25),
+            lamp_light: Some(50),
+            light_sources: Some(1),
+            impact: Some(5),
+            objects: Some(2),
+        })
+    );
+    let o = &a.expect.objects;
+    assert_eq!(o["open-trash-can"].count, Some(1));
+    assert!(o["open-trash-can"].attrs.is_empty());
+    let counter = &o["open-counter"];
+    assert_eq!(counter.count, Some(2));
+    assert_eq!(counter.attrs.get(&AttrKey::Name("stock".into())), Some(&1));
+    assert_eq!(counter.attrs.get(&AttrKey::Index(3)), Some(&4));
+    assert_eq!(counter.temps.get(&0), Some(&1));
+    assert_eq!(counter.data.get(&7), Some(&2));
+    assert_eq!(o["open-fridge"].count, None, "at least one");
+
+    // Room mode is off by default, and a case may take it on its own; expect.objects needs
+    // no room.
+    let f = parse_ok(&format!(
+        r#"{HEAD}
+[[test]]
+name = "a"
+tree = 1
+expect = {{ objects = {{ obj = 0 }} }}
+
+[[test]]
+name = "b"
+tree = 1
+room = true
+expect = {{ room = {{ impact = 0 }} }}
+"#
+    ));
+    assert!(!f.room);
+    assert!(!f.cases[0].in_room(&f));
+    assert!(f.cases[1].in_room(&f));
+    assert_eq!(f.cases[1].tiles(&f).unwrap(), vec![[4, 4]]);
+}
+
+#[test]
+fn placed_room_errors() {
+    let room = |case: &str| {
+        format!("{HEAD}\n[lot]\nroom = true\n\n[[test]]\nname = \"t\"\ntree = 1\n{case}\n")
+    };
+    parse_err(
+        &room(r#"given = { create = [{ object = "a", place = [3, 4] }] }"#),
+        &[
+            "given.create[0] is placed at [3, 4], outside the room",
+            "4 to 11",
+        ],
+    );
+    parse_err(
+        &room(r#"given = { create = [{ object = "a", place = [4, 12] }] }"#),
+        &["outside the room"],
+    );
+    parse_err(
+        &format!(
+            "{HEAD}place = [4, 4]\n\n[lot]\nroom = true\n\n[[test]]\ntree = 1\n{}\n",
+            r#"given = { create = [{ object = "a", place = [4, 4] }] }"#
+        ),
+        &["the subject and given.create[0] are both placed at [4, 4]"],
+    );
+    let many = vec!["\"a\""; 64].join(", ");
+    parse_err(
+        &room(&format!("given = {{ create = [{many}] }}")),
+        &["no free tile left for given.create[63]"],
+    );
+    parse_err(
+        &room("given = { create = [{ place = [4, 4] }] }"),
+        &["give 'object'"],
+    );
+    parse_err(
+        &room(r#"given = { create = [{ object = "a", at = [4, 4] }] }"#),
+        &["unknown key 'at'"],
+    );
+    parse_err(
+        &room(r#"given = { create = [{ object = "a", place = [4] }] }"#),
+        &["must be a tile [x, y], not 1 values"],
+    );
+    parse_err(
+        &room(r#"given = { create = [{ object = "a", place = [-1, 4] }] }"#),
+        &["x = -1 is not a tile"],
+    );
+    parse_err(&room("given = { create = [true] }"), &["slug or a GUID"]);
+    parse_err(&room("room = 1"), &["room must be a boolean"]);
+    parse_err(
+        &format!("{HEAD}\n[lot]\nroom = \"yes\"\n\n[[test]]\ntree = 1\n"),
+        &["[lot].room must be a boolean"],
+    );
+    // Placement and the room's expectations need the room.
+    parse_err(
+        &one(r#"tree = 1
+given = { create = [{ object = "a", place = [4, 4] }] }"#),
+        &["given.create[0].place needs a room"],
+    );
+    parse_err(
+        &one("tree = 1\nexpect = { room = { impact = 0 } }"),
+        &["expect.room needs a counted room"],
+    );
+    parse_err(
+        &room("room = false\nexpect = { room = { impact = 0 } }"),
+        &["expect.room needs a counted room"],
+    );
+    parse_err(
+        &format!("{HEAD}place = [4, 4]\n\n[[test]]\ntree = 1\n"),
+        &["[subject].place needs a room"],
+    );
+    parse_err(
+        &room(r#"expect = { room = { score = "high" } }"#),
+        &["room.score must be a number"],
+    );
+    parse_err(
+        &room("expect = { room = { people = 1 } }"),
+        &["unknown key 'people'"],
+    );
+    parse_err(
+        &room("expect = { room = { impact = 3000000000 } }"),
+        &["32-bit"],
+    );
+    parse_err(
+        &room(r#"expect = { objects = { a = "x" } }"#),
+        &["objects.a must be a table"],
+    );
+    parse_err(&room("expect = { objects = { a = -1 } }"), &["objects.a"]);
+    parse_err(
+        &room("expect = { objects = { a = { count = 0, data = { 7 = 1 } } } }"),
+        &["count = 0 leaves no object"],
+    );
+    parse_err(
+        &room("expect = { objects = { a = { bogus = 1 } } }"),
+        &["unknown key 'bogus'"],
     );
 }
 
@@ -1289,6 +1473,260 @@ guard = "Wave"
         std::fs::write(&path, spec).unwrap();
         let file = TestFile::read(&path).unwrap_or_else(|e| panic!("{e}\n{spec}"));
         run_test_file(&file, &path).unwrap_or_else(|e| panic!("{e}\n{spec}"))
+    }
+
+    /// An object that changes its room impact, with and without marking its room.
+    const ROOMY: &str = r#"use std::engine::RefreshMode;
+
+object "Runner Roomy" {
+    guid: 0x7E00_7E10;
+    price: 1;
+    sprite: Sprite::procedural("floor_lamp", primary: #101010, accent: #202020, trim: #303030);
+
+    state level: i16 = 2;
+
+    main {
+        loop {
+            sleep(1);
+        }
+    }
+
+    #[bhav(id = 4500, label = "Raise")]
+    fn raise() {
+        self.room_impact = 7;
+        self.refresh(RefreshMode::RecountRoom);
+        return true;
+    }
+
+    #[bhav(id = 4501, label = "Quiet")]
+    fn quiet() {
+        self.room_impact = 7;
+        return true;
+    }
+
+    #[bhav(id = 4502, label = "Later")]
+    fn later() {
+        sleep(2);
+        self.room_impact = 4;
+        self.refresh(RefreshMode::RecountRoom);
+        sleep(2);
+        return true;
+    }
+}
+"#;
+
+    /// A second object for `expect.objects`, never placed with a state name of its own.
+    const OTHER: &str = r#"object "Runner Other" {
+    guid: 0x7E00_7E11;
+    price: 1;
+    sprite: Sprite::procedural("floor_lamp", primary: #101010, accent: #202020, trim: #303030);
+
+    state charge: i16 = 9;
+
+    main {
+        loop {
+            sleep(1);
+        }
+    }
+}
+"#;
+
+    fn run_roomy(name: &str, head: &str, cases: &str) -> FileReport {
+        run_spec(
+            name,
+            &[("roomy.antics", ROOMY), ("other.antics", OTHER)],
+            &format!(
+                "[subject]\nantics = \"roomy.antics\"\n\n[lot]\nalso = [\"other.antics\"]\n{head}\n{cases}"
+            ),
+        )
+    }
+
+    /// The room is counted before the run and again for what the run marked: a recount
+    /// after a change of the impact shows it, and a change no one marks leaves the room's
+    /// count as it was, as in the game. A placed object stands in room 1, facing north.
+    #[test]
+    fn a_counted_room_sees_what_its_objects_mark() {
+        let r = run_roomy(
+            "room-counts",
+            "room = true",
+            r#"
+[[test]]
+name = "marked"
+tree = "Raise"
+expect = { result = true, data = { 1 = 0, 7 = 7, 29 = 1 }, room = { impact = 7, objects = 1, light_sources = 0, lamp_light = 0, score = -28.444443, light = 0 } }
+
+[[test]]
+name = "unmarked"
+tree = "Quiet"
+expect = { result = true, data = { 7 = 7 }, room = { impact = 0, objects = 1 } }
+
+[[test]]
+name = "threaded"
+tree = "Later"
+turns = 8
+expect = { result = true, room = { impact = 4, objects = 1 } }
+
+[[test]]
+name = "two"
+tree = "Quiet"
+given = { create = ["other", { object = "roomy", place = [11, 11] }] }
+expect = { room = { impact = 0, objects = 3 }, objects = { roomy = { count = 2, data = { 29 = 1 } }, other = { count = 1, data = { 29 = 1 } } } }
+
+[[test]]
+name = "wrong"
+tree = "Raise"
+expect = { room = { impact = 6, objects = 2, light_sources = 1, lamp_light = 3, score = 1.5, light = 0.5 } }
+
+[[test]]
+name = "off the grid"
+tree = "Raise"
+room = false
+expect = { data = { 29 = -5 } }
+"#,
+        );
+        for case in ["marked", "unmarked", "threaded", "two", "off the grid"] {
+            let f = failures(&r, case);
+            assert!(f.is_empty(), "{case}: {f:?}");
+        }
+        assert_eq!(
+            failures(&r, "wrong"),
+            vec![
+                "room.score: expected 1.5, got -28.444443",
+                "room.light: expected 0.5, got 0",
+                "room.lamp_light: expected 3, got 0",
+                "room.light_sources: expected 1, got 0",
+                "room.impact: expected 6, got 7",
+                "room.objects: expected 2, got 1",
+            ]
+        );
+    }
+
+    /// With the placed room, the Sim's tile ([2, 2]) is in the outdoor room 2, and its room
+    /// word says so unless the case gives one; without it, the Sim is in room 1 as before.
+    #[test]
+    fn the_sim_of_a_placed_room_stands_outdoors() {
+        let r = run_roomy(
+            "room-sim",
+            "\n[sim]\n",
+            r#"
+[[test]]
+name = "outdoors"
+tree = "Quiet"
+room = true
+expect = { result = true, sim = { data = { 29 = 2 } } }
+
+[[test]]
+name = "given"
+tree = "Quiet"
+room = true
+given = { sim = { data = { 29 = 1 } } }
+expect = { result = true, sim = { data = { 29 = 1 } } }
+
+[[test]]
+name = "off the grid"
+tree = "Quiet"
+expect = { result = true, sim = { data = { 29 = 1 } } }
+"#,
+        );
+        for case in ["outdoors", "given", "off the grid"] {
+            let f = failures(&r, case);
+            assert!(f.is_empty(), "{case}: {f:?}");
+        }
+    }
+
+    /// `expect.objects` counts a slug's objects on the lot and checks each of them, by
+    /// state name of that object's own source or by index.
+    #[test]
+    fn expect_objects_counts_and_checks_each_object() {
+        let r = run_roomy(
+            "objects",
+            "",
+            r#"
+[[test]]
+name = "counts"
+tree = "Quiet"
+given = { create = ["roomy", "other"] }
+expect = { objects = { roomy = { count = 2, attrs = { level = 2 } }, other = { attrs = { charge = 9 }, data = { 7 = 0 } } } }
+
+[[test]]
+name = "wrong count"
+tree = "Quiet"
+given = { create = ["roomy"] }
+expect = { objects = { roomy = 1, other = 0 } }
+
+[[test]]
+name = "none"
+tree = "Quiet"
+expect = { objects = { other = { attrs = { charge = 9 } } } }
+
+[[test]]
+name = "wrong words"
+tree = "Quiet"
+given = { create = ["roomy"], attrs = { level = 5 } }
+expect = { objects = { roomy = { attrs = { level = 5, 300 = 1 }, temps = { 0 = 1 }, data = { 7 = 0 } } } }
+
+[[test]]
+name = "unknown slug"
+tree = "Quiet"
+expect = { objects = { bogus = 1 } }
+
+[[test]]
+name = "unknown state"
+tree = "Quiet"
+expect = { objects = { other = { attrs = { level = 1 } } } }
+
+[[test]]
+name = "two spellings"
+tree = "Quiet"
+expect = { objects = { other = { attrs = { charge = 1, 0 = 1 } } } }
+"#,
+        );
+        assert!(
+            failures(&r, "counts").is_empty(),
+            "{:?}",
+            failures(&r, "counts")
+        );
+        let f = failures(&r, "wrong count");
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(
+            f[0].starts_with("objects.roomy: expected 1, got 2 (the subject (object ")
+                && f[0].contains("), object "),
+            "{f:?}"
+        );
+        assert_eq!(
+            failures(&r, "none"),
+            vec!["objects.other: expected at least one, got none"]
+        );
+        let f = failures(&r, "wrong words");
+        // Only the made one fails the subject's given level; each check names its object.
+        assert!(
+            f.iter()
+                .filter(|m| m.contains("attrs.level (attr[0]): expected 5, got 2"))
+                .count()
+                == 1
+                && f.iter().any(|m| m.contains("(the subject (object "))
+                && f.iter()
+                    .any(|m| m.contains(".attrs.300: expected 1, but it has "))
+                && f.iter().any(|m| m.contains(".temps.0: expected 1, got 0"))
+                && f.iter().any(|m| m.contains(".data.7: expected 0, got 7")),
+            "{f:?}"
+        );
+        let f = failures(&r, "unknown slug");
+        assert!(
+            f.len() == 1
+                && f[0].contains("setup: expect.objects.bogus: no object 'bogus' is loaded"),
+            "{f:?}"
+        );
+        let f = failures(&r, "unknown state");
+        assert!(
+            f.len() == 1 && f[0].contains("'other' has no state 'level' (it has: charge)"),
+            "{f:?}"
+        );
+        let f = failures(&r, "two spellings");
+        assert!(
+            f.len() == 1 && f[0].contains("both set attribute 0"),
+            "{f:?}"
+        );
     }
 
     /// Interactions that finish in ways the runner must still see: at once, inside the
@@ -2325,6 +2763,53 @@ expect = { result = "yield" }
                  is busy))"
                     .to_owned()
             ]
+        );
+    }
+
+    /// A multi-tile object stands as a group; the room's placement is for one-tile objects.
+    #[test]
+    fn a_placed_multi_tile_object_is_a_setup_error() {
+        let (pack, bed) = looping_bed(&scratch("placed-bed"));
+        let r = run_spec(
+            "placed-bed-spec",
+            &[],
+            &format!(
+                "[subject]\nantics = \"{}\"\npack = \"{}\"\n\n[lot]\nroom = true\n{BED_CASES}",
+                bed.display(),
+                pack.display()
+            ),
+        );
+        let f = failures(&r, "left");
+        assert!(
+            f.len() == 1
+                && f[0].starts_with("setup: placing the subject: ")
+                && f[0].contains("multi-tile object")
+                && f[0].contains("one-tile objects only"),
+            "{f:?}"
+        );
+    }
+
+    /// `expect.objects` counts one-tile objects: a multi-tile object's tiles carry GUIDs of
+    /// their own, so counting the slug's GUID would say nothing about its instances.
+    #[test]
+    fn expect_objects_on_a_multi_tile_object_is_a_setup_error() {
+        let (pack, bed) = looping_bed(&scratch("objects-bed"));
+        let r = run_spec(
+            "objects-bed-spec",
+            &[],
+            &format!(
+                "[subject]\nantics = \"{}\"\npack = \"{}\"\n\n[sim]\nmotives = {{ energy = 0 }}\n\n[[test]]\nname = \"counted\"\ninteraction = \"Sleep (Left Side)\"\nturns = 3\nexpect = {{ objects = {{ open-double-bed = 1 }} }}\n",
+                bed.display(),
+                pack.display()
+            ),
+        );
+        let f = failures(&r, "counted");
+        assert!(
+            f.len() == 1
+                && f[0].starts_with("setup: expect.objects.open-double-bed: ")
+                && f[0].contains("multi-tile object")
+                && f[0].contains("one-tile objects only"),
+            "{f:?}"
         );
     }
 

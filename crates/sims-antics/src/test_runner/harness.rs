@@ -8,11 +8,14 @@
 //! through. Every case then gets a fresh world, built like the `open-pack` behavioural
 //! suite's (`tests/integration/open_pack_behavioral.rs`): a flat 64-by-64 lot with one indoor room,
 //! the Sim (if any) as object 1, and the subject made by the VM's own factory
-//! (`Interpreter::create`, which runs its Init).
+//! (`Interpreter::create`, which runs its Init). With `[lot] room = true` the room is counted
+//! and the objects the case makes stand on its tiles, as that suite's placed-room tests set
+//! them up ([`place_on_tile`]).
 
 use super::{
     Actor, AttrKey, CaseReport, CreateRef, DEFAULT_BUDGET, Expect, FileReport, ObjRef, Outcome,
-    SimState, Source, Stub, Target, TestCase, TestFile, TreeRef, dialog_kind_name,
+    ROOM_TILES, RoomExpect, SimState, Source, Stub, Target, TestCase, TestFile, TreeRef,
+    dialog_kind_name,
 };
 use crate::compile::compile_antics;
 use crate::encode::{encode_bcon, encode_bhav, encode_iff_with_rsmp};
@@ -124,6 +127,8 @@ struct Lot {
     subject_guid: u32,
     subject_resource: usize,
     subject_attr_names: BTreeMap<String, u16>,
+    /// Every loaded object's state names, by slug, for `expect.objects`.
+    attr_names: BTreeMap<String, BTreeMap<String, u16>>,
     /// Slug to GUID, for `given.create`.
     slugs: BTreeMap<String, u32>,
     /// Interaction names by object definition (resource and OBJD chunk) and menu number
@@ -671,6 +676,10 @@ impl Lot {
         }
         let mut menus = BTreeMap::new();
         let mut labels = BTreeMap::new();
+        let attr_names = std::iter::once(&subject)
+            .chain(&also)
+            .map(|o| (o.slug.clone(), o.attr_names.clone()))
+            .collect();
         for o in std::iter::once(&subject).chain(&also) {
             let res = resource_of(&object_file(&o.slug))?;
             for (chunk, (names, shown)) in interaction_names(&program, res, &bytes_of)? {
@@ -685,6 +694,7 @@ impl Lot {
             subject_guid,
             subject_resource,
             subject_attr_names: subject.attr_names,
+            attr_names,
             slugs,
             menus,
             labels,
@@ -1049,7 +1059,7 @@ fn sim_object(state: &SimState) -> Result<Object> {
     let mut data = vec![0i16; 72];
     data[11] = SIM_ID as i16;
     data[14] = -1;
-    data[29] = 1; // room 1
+    data[29] = 1; // room 1 (the outdoor room 2 with `room = true`: `empty_world`)
     data[67] = 5;
     let mut person = vec![0i16; 256];
     person[58] = 25; // an adult's age
@@ -1134,7 +1144,7 @@ fn set_funds(world: &mut World, funds: i32) {
     world.globals[13] = (funds % 10_000) as i16;
 }
 
-fn empty_world(sim: Option<&SimState>) -> Result<World> {
+fn empty_world(sim: Option<&SimState>, room: bool) -> Result<World> {
     let mut world = World::empty();
     world.size = 16;
     world.globals = vec![0; 64];
@@ -1163,12 +1173,56 @@ fn empty_world(sim: Option<&SimState>) -> Result<World> {
             ..Room::default()
         },
     );
+    if room {
+        // `[lot] room = true`: room 1 lists the tiles of [`ROOM_TILES`] on level 1, and its
+        // first tile has a covered west wall (segment bit 1, style 1 and pattern 1, as the
+        // behavioural suite's placed rooms have), so its score is finite.
+        // The rest of the ground level is an outdoor room 2, so an object that leaves the
+        // room's tiles is in a room that counts it, not in room 1 uncounted.
+        let mut outside = Vec::new();
+        for x in 0..64u8 {
+            for y in 0..64u8 {
+                if ROOM_TILES.contains(&x) && ROOM_TILES.contains(&y) {
+                    continue;
+                }
+                world.rooms.map[0][usize::from(x) * 64 + usize::from(y)] = 2;
+                if x < 16 && y < 16 {
+                    outside.push([x, y, 1]);
+                }
+            }
+        }
+        world.rooms.rooms.insert(
+            2,
+            Room {
+                outdoors: true,
+                tiles: outside,
+                ..Room::default()
+            },
+        );
+        let tiles = &mut world.rooms.rooms.get_mut(&1).expect("made above").tiles;
+        for x in ROOM_TILES {
+            for y in ROOM_TILES {
+                tiles.push([x, y, 1]);
+            }
+        }
+        let cell = (usize::from(ROOM_TILES.start) * 64 + usize::from(ROOM_TILES.start)) * 14;
+        let walls = &mut world.arrays.get_mut(&2).expect("made above").data;
+        walls[cell] = 1;
+        walls[cell + 2] = 1;
+        walls[cell + 6] = 1;
+    }
     world.indicators = [u16::MAX, u16::MAX];
     if let Some(state) = sim {
         world.order.push(SIM_ID);
         world.people.push(SIM_ID);
         world.types.insert(SIM_TYPE, SIM_GUID);
-        world.objects.insert(SIM_ID, sim_object(state)?);
+        let mut sim = sim_object(state)?;
+        // The Sim stands on tile [2, 2]: with the placed room, that is the outdoor room 2
+        // (unless the case gives its room word).
+        if room && !state.data.contains_key(&29) {
+            sim.data[29] = 2;
+        }
+        world.objects.insert(SIM_ID, sim);
     }
     Ok(world)
 }
@@ -1270,6 +1324,9 @@ struct Game<'a> {
     kinds: Vec<u8>,
     /// Whether the case checks the dialogs' kinds, which takes a look-ahead each update.
     track_kinds: bool,
+    /// `[lot] room = true`: the rooms marked are counted after each update, as the game
+    /// counts them before it draws a frame (`Interpreter::draw_frame_in`).
+    rooms: bool,
 }
 
 impl Game<'_> {
@@ -1300,9 +1357,17 @@ impl Game<'_> {
                 .scheduler_pass(&mut copy, &self.tuning, &mut Update::default());
             new_dialog_kinds(&copy)
         });
-        let (update, result) =
+        let (update, mut result) =
             self.lot
                 .lot_update_kept(world, &self.tuning, &mut self.player, None);
+        if result.is_ok()
+            && self.rooms
+            && let Err(f) = self.lot.update_pending_rooms(world)
+        {
+            result = Err(TickError::Unsupported(format!(
+                "the room update after the lot update faulted: {f}"
+            )));
+        }
         if result.is_ok()
             && let Some(kinds) = ahead
         {
@@ -1539,7 +1604,8 @@ fn run_case(
     assumptions: &mut Vec<String>,
 ) -> Result<Vec<String>> {
     let sim_state = case.sim_state(file);
-    let mut world = empty_world(sim_state.as_ref())?;
+    let room = case.in_room(file);
+    let mut world = empty_world(sim_state.as_ref(), room)?;
     let sounds = RefCell::new(Vec::new());
     let ahead_sounds = RefCell::new(Vec::new());
     let interpreter = |stream, sink| {
@@ -1561,12 +1627,18 @@ fn run_case(
         ),
         kinds: Vec::new(),
         track_kinds: case.expect.dialogs.is_some(),
+        rooms: room,
     };
 
+    let tiles = if room { case.tiles(file)? } else { Vec::new() };
     let subject = create(lot, &game.lot, &mut world, lot.subject_guid, assumptions)
         .map_err(|e| e.with_context("creating the subject"))?;
-    for c in &case.given.create {
-        let guid = match c {
+    if let Some(&tile) = tiles.first() {
+        place_on_tile(lot, &mut world, subject, tile)
+            .map_err(|e| e.with_context("placing the subject"))?;
+    }
+    for (i, c) in case.given.create.iter().enumerate() {
+        let guid = match &c.object {
             CreateRef::Guid(g) if [SIM_GUID, IDLE_GUID].contains(g) => {
                 return Err(Error::new(format!(
                     "given.create: GUID {g:#010x} is reserved for the runner's {}",
@@ -1584,8 +1656,12 @@ fn run_case(
                 ))
             })?,
         };
-        create(lot, &game.lot, &mut world, guid, assumptions)
-            .map_err(|e| e.with_context(format!("creating {c:?}")))?;
+        let id = create(lot, &game.lot, &mut world, guid, assumptions)
+            .map_err(|e| e.with_context(format!("creating {:?}", c.object)))?;
+        if let Some(&tile) = tiles.get(i + 1) {
+            place_on_tile(lot, &mut world, id, tile)
+                .map_err(|e| e.with_context(format!("placing {:?}", c.object)))?;
+        }
     }
     let ids = Ids {
         subject,
@@ -1632,6 +1708,15 @@ fn run_case(
     // What the run starts from: the dialogs the factory made are the game's before the case.
     game.settle(&mut world)
         .map_err(|why| Error::new(format!("making the lot's objects: {why}")))?;
+    if room {
+        // The run starts from counted rooms, as a loaded lot's rooms are: the room and the
+        // outdoor room around it.
+        world.mark_room(1);
+        world.mark_room(2);
+        game.lot
+            .update_pending_rooms(&mut world)
+            .map_err(|f| Error::new(format!("counting the room before the run: {f}")))?;
+    }
     game.kinds.clear();
     sounds.borrow_mut().clear();
     let queue_before: BTreeSet<i32> = ids
@@ -1648,6 +1733,11 @@ fn run_case(
     if let Some(why) = observed.stopped {
         return Ok(vec![why]);
     }
+    // The frame after the run: the rooms its code marked are counted. A room nothing marked
+    // keeps its count from before, as in the game.
+    if room && let Err(f) = game.lot.update_pending_rooms(&mut world) {
+        return Ok(vec![format!("the room update after the run faulted: {f}")]);
+    }
 
     let mut failures = Vec::new();
     check(
@@ -1663,6 +1753,75 @@ fn run_case(
         &mut failures,
     )?;
     Ok(failures)
+}
+
+/// Stands a just-made object on `tile` of room 1 on level 1, facing north, as the
+/// behavioural suite's placed-room tests do (`PackVmFixture::place_on_tile`): its position
+/// at the tile's centre, its footprint the tile, data word 1 (facing) 0, data word 29 (its
+/// room) 1, and the tile's head in the level's object grid (array 3) the object. A
+/// multi-tile object, whose tiles stand together, is refused.
+fn place_on_tile(lot: &Lot, world: &mut World, id: u16, tile: [u8; 2]) -> Result<()> {
+    let object = world
+        .objects
+        .get(&id)
+        .ok_or_else(|| Error::new(format!("object {id} left the lot when it was made")))?;
+    let group = lot
+        .catalog
+        .object(object.guid)
+        .and_then(|def| lot.program.definition(def.resource, def.chunk))
+        .map_or(0, |words| words[10]);
+    if group != 0 {
+        return Err(Error::new(format!(
+            "it is a tile of a multi-tile object (group {group}); [lot] room = true places \
+             one-tile objects only"
+        )));
+    }
+    let cell = (usize::from(tile[0]) * 64 + usize::from(tile[1])) * 2;
+    let grid = &world
+        .arrays
+        .get(&3)
+        .expect("the test lot has an object grid")
+        .data;
+    // An Init that placed the object itself left its grid head elsewhere: moving it here
+    // would leave that head behind, and the room would count the object twice.
+    if let Some(other) = (0..64 * 64)
+        .filter(|&c| c * 2 != cell)
+        .find(|&c| i16::from_le_bytes([grid[c * 2], grid[c * 2 + 1]]) == id as i16)
+    {
+        return Err(Error::new(format!(
+            "its Init already placed it on tile [{}, {}]; place it there (`place`) or make \
+             it without placing itself",
+            other / 64,
+            other % 64
+        )));
+    }
+    let head = i16::from_le_bytes([grid[cell], grid[cell + 1]]);
+    if head != 0 && head != id as i16 {
+        return Err(Error::new(format!(
+            "tile [{}, {}] already holds object {head} (made by a script before it was \
+             placed); place the object on another tile",
+            tile[0], tile[1]
+        )));
+    }
+    let [x, y] = tile.map(i32::from);
+    let (px, py) = (x * 16 + 8, y * 16 + 8);
+    let object = world.objects.get_mut(&id).expect("looked up above");
+    object.position = [px, py, 1];
+    object.footprint = [px - 8, py - 8, px + 8, py + 8];
+    for (word, value) in [(1, 0), (29, 1)] {
+        let len = object.data.len();
+        *object
+            .data
+            .get_mut(word)
+            .ok_or_else(|| Error::new(format!("object {id} has {len} data words")))? = value;
+    }
+    let grid = &mut world
+        .arrays
+        .get_mut(&3)
+        .expect("the test lot has an object grid")
+        .data;
+    grid[cell..cell + 2].copy_from_slice(&(id as i16).to_le_bytes());
+    Ok(())
 }
 
 /// Makes an object with the VM's factory (`Interpreter::create`, which runs its Init and its
@@ -2406,5 +2565,150 @@ fn check(
             ));
         }
     }
+
+    check_objects(lot, world, e, ids, failures)?;
+    if let Some(want) = &e.room {
+        check_room(world, want, failures);
+    }
     Ok(())
+}
+
+/// `expect.objects`: each slug's objects on the lot, in ID order.
+fn check_objects(
+    lot: &Lot,
+    world: &World,
+    e: &Expect,
+    ids: &Ids,
+    failures: &mut Vec<String>,
+) -> Result<()> {
+    for (slug, want) in &e.objects {
+        let what = format!("objects.{slug}");
+        let guid = *lot.slugs.get(slug).ok_or_else(|| {
+            Error::new(format!(
+                "expect.{what}: no object '{slug}' is loaded (the subject, or add it to \
+                 [lot].also)"
+            ))
+        })?;
+        // A multi-tile object is made of tiles with GUIDs of their own: counting the slug's
+        // GUID would count one tile, or none, of each instance.
+        let group = lot
+            .catalog
+            .object(guid)
+            .and_then(|def| lot.program.definition(def.resource, def.chunk))
+            .map_or(0, |words| words[10]);
+        if group != 0 {
+            return Err(Error::new(format!(
+                "expect.{what}: '{slug}' is a multi-tile object (group {group}); \
+                 expect.objects counts one-tile objects only"
+            )));
+        }
+        let names = &lot.attr_names[slug];
+        let mut attrs = Vec::new();
+        let mut seen: BTreeMap<u16, &AttrKey> = BTreeMap::new();
+        for (key, &v) in &want.attrs {
+            let i = match key {
+                AttrKey::Index(i) => *i,
+                AttrKey::Name(n) => *names.get(n).ok_or_else(|| {
+                    Error::new(format!(
+                        "expect.{what}.attrs: '{slug}' has no state '{n}'{}",
+                        if names.is_empty() {
+                            " (it has no named states; name attributes by index)".to_owned()
+                        } else {
+                            format!(
+                                " (it has: {})",
+                                names.keys().cloned().collect::<Vec<_>>().join(", ")
+                            )
+                        }
+                    ))
+                })?,
+            };
+            if let Some(prev) = seen.insert(i, key) {
+                return Err(Error::new(format!(
+                    "expect.{what}.attrs: '{prev}' and '{key}' both set attribute {i}; give it \
+                     once"
+                )));
+            }
+            attrs.push((key, i, v));
+        }
+        let found: Vec<(u16, &Object)> = world
+            .objects
+            .iter()
+            .filter(|(_, o)| o.guid == guid)
+            .map(|(&id, o)| (id, o))
+            .collect();
+        match want.count {
+            Some(n) if usize::from(n) != found.len() => {
+                failures.push(format!(
+                    "{what}: expected {n}, got {}{}",
+                    found.len(),
+                    listed(&found, ids)
+                ));
+                continue;
+            }
+            None if found.is_empty() => {
+                failures.push(format!("{what}: expected at least one, got none"));
+                continue;
+            }
+            _ => {}
+        }
+        for (id, o) in &found {
+            let who = format!("{what} ({})", ids.who(*id));
+            for &(key, i, want) in &attrs {
+                let label = match key {
+                    AttrKey::Index(_) => format!("{who}.attrs.{i}"),
+                    AttrKey::Name(n) => format!("{who}.attrs.{n} (attr[{i}])"),
+                };
+                match o.attributes.get(usize::from(i)) {
+                    Some(&got) if got == want => {}
+                    Some(&got) => failures.push(format!("{label}: expected {want}, got {got}")),
+                    None => failures.push(format!(
+                        "{label}: expected {want}, but it has {} attributes",
+                        o.attributes.len()
+                    )),
+                }
+            }
+            words(failures, &format!("{who}.temps"), &want.temps, &o.temps);
+            words(failures, &format!("{who}.data"), &want.data, &o.data);
+        }
+    }
+    Ok(())
+}
+
+/// The objects found, for a count message: ` (objects 3, 4)`.
+fn listed(found: &[(u16, &Object)], ids: &Ids) -> String {
+    if found.is_empty() {
+        return String::new();
+    }
+    let names: Vec<String> = found.iter().map(|(id, _)| ids.who(*id)).collect();
+    format!(" ({})", names.join(", "))
+}
+
+/// `expect.room`: room 1 as the last room update counted it.
+fn check_room(world: &World, want: &RoomExpect, failures: &mut Vec<String>) {
+    let Some(room) = world.rooms.rooms.get(&1) else {
+        failures.push("room: the lot has no room 1".to_owned());
+        return;
+    };
+    for (key, want, got) in [
+        ("score", want.score, room.score.to_f32()),
+        ("light", want.light, room.light.to_f32()),
+    ] {
+        if let Some(want) = want
+            && want.to_bits() != got.to_bits()
+        {
+            failures.push(format!("room.{key}: expected {want}, got {got}"));
+        }
+    }
+    for (key, want, got) in [
+        ("lamp_light", want.lamp_light, room.lamp_light),
+        ("light_sources", want.light_sources, room.lights),
+        ("impact", want.impact, room.impact),
+        ("objects", want.objects, room.objects),
+    ] {
+        if let Some(want) = want
+            && want != got
+        {
+            failures.push(format!("room.{key}: expected {want}, got {got}"));
+        }
+    }
 }

@@ -1,9 +1,11 @@
 # Live sims-vm unit tests for the Open Frost Fridge: the stock, Hunger and funds guards, the
 # counter and stove it needs, and the refund when the cooking chain fails part way.
 #
-# The runner makes every object off the lot's tile grid, so the stove has no tile in front of it
-# to put a plate on: its `cook` functional fails after the sizzle. The chain's success path,
-# with placed objects, is `tests/integration/open_pack_behavioral.rs`'s cooking chain test.
+# Off the room, the runner makes every object off the lot's tile grid, so the stove has no tile
+# in front of it to put a plate on: its `cook` functional fails after the sizzle, and the fridge
+# refunds. The last case stands the objects in the runner's room (`room = true`), where the
+# stove puts the plate on the tile ahead of it; the skill caps and a cancelled cook are
+# `tests/integration/open_pack_behavioral.rs`'s cooking chain tests.
 
 [subject]
 antics = "../objects/open-fridge.antics"
@@ -70,3 +72,12 @@ interaction = "Cook Meal"
 turns = 1
 given = { funds = 500, create = ["open-counter", "open-stove"] }
 expect = { result = "yield", funds = 485, attrs = { stock = 4, meals_cooked = 0 } }
+
+# The placed chain: the fridge, the counter and the stove stand on tiles of the room (the stove
+# at [6, 6], facing north, so the plate goes on [6, 5]). A novice's plate holds 40 nutrition.
+[[test]]
+name = "on placed objects the chain cooks a plate"
+interaction = "Cook Meal"
+room = true
+given = { funds = 500, create = ["open-counter", { object = "open-stove", place = [6, 6] }] }
+expect = { funds = 485, attrs = { stock = 4, meals_cooked = 1 }, sim = { skills = { cooking = 20 } }, objects = { open-meal-plate = { count = 1, attrs = { nutrition = 40, is_full = 1 } }, open-stove = 1 }, sounds = ["open_fridge_door", "open_counter_chop", "open_stove_sizzle"] }
