@@ -198,10 +198,11 @@ object "Fable Polish Paths" {
         has(
             &lifted,
             &[
-                "sim.motive[Motive::Hunger] = Tuning::e1;",
+                // v2.2 writes a named motive as a field.
+                "sim.motive.hunger = Tuning::e1;",
                 "sim.motive[2] = 1;",
-                "stack_obj.motive[Motive::Comfort] = 3;",
-                "inc_lt(&mut sim.motive[Motive::Fun], Tuning::e0)",
+                "stack_obj.motive.comfort = 3;",
+                "inc_lt(&mut sim.motive.fun, Tuning::e0)",
                 "use std::flags::{Expansions, ObjectFlags};",
             ],
         );

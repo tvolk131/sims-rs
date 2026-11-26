@@ -357,7 +357,6 @@ pub fn decompile_iff_to_v2_report(
                 let text = model.polish(text, &recompiled);
                 let (text, recompiled, mut checks) =
                     model.flip_negations(text, (recompiled, checks), &mut cache);
-                let text = model.dot_bcon_reads_the_lint_misses(text, &recompiled);
                 let text = model.allow_kept_negations(text);
                 let source = format_v2_source(&text)?;
                 let mut trees: Vec<DecompiledTree> = model
@@ -722,6 +721,17 @@ const POLISH_NAME_BUILDS: usize = 8;
 /// `let _ = f();` with the same bytes.
 const POLISH_DISCARD_BUILDS: usize = 8;
 
+/// The most builds [`Model::polish`] may take to find the cells and flag operations it can
+/// write by name with the same bytes.
+const POLISH_CELL_BUILDS: usize = 8;
+
+/// How many diagnostics of each rule, line and message a text lints with.
+type LintCounts = BTreeMap<(&'static str, usize, String), usize>;
+
+/// The most builds [`Model::polish`] may take, per pass, to find the functions whose locals
+/// can go unpinned, or whose arguments can be named, with the same bytes.
+const POLISH_FRAME_BUILDS: usize = 8;
+
 /// Names a tree is not given even when nothing in its file uses them, so the name it gets
 /// reads as the tree alone: every identifier-like string the v2 lexer, parser and lowering
 /// match on (keywords, builtin calls and their options, field names), `.air`'s reserved
@@ -857,39 +867,6 @@ impl<'a> TokenOffsets<'a> {
         (line.is_ascii() && t.span.column >= 1 && t.span.column - 1 <= line.len())
             .then(|| start + t.span.column - 1)
     }
-}
-
-/// `text` with each `Table::entry` path in code (tokens, never a string or comment) whose
-/// table is in `tables` and entry in `entries` written `Table.entry`.
-fn dot_paths(text: &str, tables: &[&str], entries: &[String]) -> Option<String> {
-    use crate::v2::lexer::{TokenKind as K, tokenize};
-    let tokens = tokenize(text).ok()?;
-    let offsets = TokenOffsets::new(text);
-    let mut out = String::with_capacity(text.len());
-    let mut done = 0;
-    for w in tokens.windows(3) {
-        if let (K::Ident(table), K::ColonColon, K::Ident(entry)) =
-            (&w[0].kind, &w[1].kind, &w[2].kind)
-            && tables.contains(&table.as_str())
-            && entries.contains(entry)
-        {
-            // Only a path written whole (`Table::entry`, nothing between) is rewritten.
-            let (Some(start), Some(colons)) = (offsets.of(&w[0]), offsets.of(&w[1])) else {
-                continue;
-            };
-            if colons != start + table.len()
-                || text.get(colons..colons + 2) != Some("::")
-                || offsets.of(&w[2]) != Some(colons + 2)
-            {
-                continue;
-            }
-            out.push_str(&text[done..colons]);
-            out.push('.');
-            done = colons + 2;
-        }
-    }
-    out.push_str(&text[done..]);
-    Some(out)
 }
 
 /// `text` with each word that `renames` maps written as its new name, outside string
@@ -1120,10 +1097,10 @@ fn group_imports(text: &str) -> String {
     out
 }
 
-/// One `if f(..) {}` statement written `let _ = f(..);`: the byte range from `if` through
-/// the closing `}`, and its replacement.
+/// One text rewrite of the final source: a byte range and its replacement (an `if f(..) {}`
+/// statement written `let _ = f(..);`, a cell written by name, a flag method).
 #[derive(Clone)]
-struct Discard {
+struct Rewrite {
     range: std::ops::Range<usize>,
     text: String,
 }
@@ -1132,7 +1109,7 @@ struct Discard {
 /// method chain ending in its arguments), with an empty block (no comment) and no `else`,
 /// that is not the `if` of an `else if`, as `let _ = f(..);`. `raw { }` bodies are one
 /// token, so `.air` is never touched.
-fn empty_if_calls(text: &str) -> Vec<Discard> {
+fn empty_if_calls(text: &str) -> Vec<Rewrite> {
     use crate::v2::lexer::{TokenKind as K, tokenize};
     let Ok(tokens) = tokenize(text) else {
         return Vec::new();
@@ -1218,7 +1195,7 @@ fn empty_if_calls(text: &str) -> Vec<Discard> {
         if !text[open + 1..close].trim().is_empty() {
             continue;
         }
-        out.push(Discard {
+        out.push(Rewrite {
             range: start..close + 1,
             text: format!("let _ = {};", text[test..open].trim()),
         });
@@ -1226,17 +1203,516 @@ fn empty_if_calls(text: &str) -> Vec<Discard> {
     out
 }
 
-/// `text` with each discard's range written as its replacement (ranges are disjoint and in
-/// order).
-fn apply_discards(text: &str, discards: &[Discard]) -> String {
+/// `text` with each rewrite's range written as its replacement (ranges are disjoint; they
+/// are applied in order of position).
+fn apply_rewrites(text: &str, rewrites: &[Rewrite]) -> String {
+    let mut sorted: Vec<&Rewrite> = rewrites.iter().collect();
+    sorted.sort_by_key(|r| r.range.start);
     let mut out = String::with_capacity(text.len());
     let mut done = 0;
-    for d in discards {
+    for d in sorted {
         out.push_str(&text[done..d.range.start]);
         out.push_str(&d.text);
         done = d.range.end;
     }
     out.push_str(&text[done..]);
+    out
+}
+
+/// `text` with every rewrite of `groups` applied.
+fn apply_groups(text: &str, groups: &[Vec<Rewrite>]) -> String {
+    let all: Vec<Rewrite> = groups.iter().flatten().cloned().collect();
+    apply_rewrites(text, &all)
+}
+
+/// The skill each person word holds, as `sim.skill.<name>` names it (the lowering's own
+/// table, `skill_by_name`).
+const SKILL_WORDS: [(i64, &str); 6] = [
+    (10, "cooking"),
+    (11, "charisma"),
+    (12, "mechanical"),
+    (15, "creativity"),
+    (17, "body"),
+    (18, "logic"),
+];
+
+/// The byte just past token `t`, for an identifier or a punctuation token (whose text is
+/// its spelling); `None` on a line [`TokenOffsets`] cannot place.
+fn token_end(offsets: &TokenOffsets, t: &crate::v2::lexer::Token) -> Option<usize> {
+    use crate::v2::lexer::TokenKind as K;
+    let len = match &t.kind {
+        K::Ident(s) => s.len(),
+        K::ColonColon => 2,
+        K::LBracket | K::RBracket | K::LParen | K::RParen | K::Semicolon | K::Dot | K::Bang => 1,
+        _ => return None,
+    };
+    Some(offsets.of(t)? + len)
+}
+
+/// For each `{` token, the index of its matching `}` (`None` when the braces do not balance).
+fn matching_braces(tokens: &[crate::v2::lexer::Token]) -> Option<BTreeMap<usize, usize>> {
+    use crate::v2::lexer::TokenKind as K;
+    let mut open = Vec::new();
+    let mut out = BTreeMap::new();
+    for (i, t) in tokens.iter().enumerate() {
+        match t.kind {
+            K::LBrace => open.push(i),
+            K::RBrace => {
+                out.insert(open.pop()?, i);
+            }
+            _ => {}
+        }
+    }
+    open.is_empty().then_some(out)
+}
+
+/// The cells and flag operations that read better by name, as rewrites:
+/// - `h.motive[Motive::Hunger]` as `h.motive.hunger`;
+/// - `h.person[10]` (a skill word) as `h.skill.cooking`;
+/// - `place flag_set Type::Flag;` as `place.set(Type::Flag);` (`flag_clear` as `.clear`);
+/// - `place flag_test Type::Flag` as `place.contains(Type::Flag)`, and `!(..)` around it as
+///   `!place.contains(..)`.
+///
+/// `h` and `place` are a path of names (`self.flags`, `sim.wall_placement`), not an indexed
+/// cell; the flag is a typed constant (`Type::Name`, upper-case, no BCON table of
+/// `tables`), never a bit number. Code tokens only: `raw { }` bodies are one token. Each
+/// flag rewrite comes with its place's text, each cell rewrite with `None`.
+fn cell_spellings(text: &str, tables: &BTreeSet<&str>) -> Vec<(Option<String>, Rewrite)> {
+    use crate::v2::lexer::{TokenKind as K, tokenize};
+    let Ok(tokens) = tokenize(text) else {
+        return Vec::new();
+    };
+    let offsets = TokenOffsets::new(text);
+    let kind = |k: usize| tokens.get(k).map(|t| &t.kind);
+    let ident = |k: usize, w: &str| matches!(kind(k), Some(K::Ident(s)) if s == w);
+    let span = |a: usize, b: usize| -> Option<std::ops::Range<usize>> {
+        Some(offsets.of(tokens.get(a)?)?..token_end(&offsets, tokens.get(b)?)?)
+    };
+    // `name(.name)*` from `i` (a root: no `.` before it), and the index past it.
+    let place = |i: usize| -> Option<usize> {
+        if !matches!(kind(i), Some(K::Ident(_))) || (i > 0 && tokens[i - 1].kind == K::Dot) {
+            return None;
+        }
+        let mut k = i + 1;
+        while kind(k) == Some(&K::Dot) && matches!(kind(k + 1), Some(K::Ident(_))) {
+            k += 2;
+        }
+        Some(k)
+    };
+    // A typed constant `Type::Name(::Name)*` from `i`, and the index past it.
+    let flag = |i: usize| -> Option<usize> {
+        let Some(K::Ident(ty)) = kind(i) else {
+            return None;
+        };
+        if !ty.starts_with(|c: char| c.is_ascii_uppercase()) || tables.contains(ty.as_str()) {
+            return None;
+        }
+        let mut k = i + 1;
+        while kind(k) == Some(&K::ColonColon) && matches!(kind(k + 1), Some(K::Ident(_))) {
+            k += 2;
+        }
+        (k > i + 1).then_some(k)
+    };
+    let mut out = Vec::new();
+    for i in 0..tokens.len() {
+        let Some(p) = place(i) else {
+            continue;
+        };
+        // `h.motive[Motive::Name]`.
+        if p == i + 3
+            && ident(i + 2, "motive")
+            && kind(p) == Some(&K::LBracket)
+            && ident(p + 1, "Motive")
+            && kind(p + 2) == Some(&K::ColonColon)
+            && kind(p + 4) == Some(&K::RBracket)
+            && let Some(K::Ident(name)) = kind(p + 3)
+            && let name = name.to_ascii_lowercase()
+            && crate::parser::motive_by_name(&name).is_some()
+            && let Some(range) = span(p, p + 4)
+        {
+            out.push((
+                None,
+                Rewrite {
+                    range,
+                    text: format!(".{name}"),
+                },
+            ));
+            continue;
+        }
+        // `h.person[N]` on a skill word.
+        if p == i + 3
+            && ident(i + 2, "person")
+            && kind(p) == Some(&K::LBracket)
+            && kind(p + 2) == Some(&K::RBracket)
+            && let Some(K::Int(n)) = kind(p + 1)
+            && let Some((_, skill)) = SKILL_WORDS.iter().find(|(w, _)| w == n)
+            && let Some(range) = span(i + 2, p + 2)
+        {
+            out.push((
+                None,
+                Rewrite {
+                    range,
+                    text: format!("skill.{skill}"),
+                },
+            ));
+            continue;
+        }
+        let Some(K::Ident(op)) = kind(p) else {
+            continue;
+        };
+        let Some(q) = flag(p + 1) else {
+            continue;
+        };
+        let (Some(place_at), Some(flag_at)) = (span(i, p - 1), span(p + 1, q - 1)) else {
+            continue;
+        };
+        let (place_text, flag_text) = (&text[place_at], &text[flag_at]);
+        match op.as_str() {
+            // A statement of its own: after `{`, `}`, `;` or a `raw { }` block.
+            "flag_set" | "flag_clear"
+                if i > 0
+                    && matches!(
+                        tokens[i - 1].kind,
+                        K::LBrace | K::RBrace | K::Semicolon | K::RawBlock(_)
+                    )
+                    && kind(q) == Some(&K::Semicolon) =>
+            {
+                let method = if op == "flag_set" { "set" } else { "clear" };
+                if let Some(range) = span(i, q) {
+                    out.push((
+                        Some(place_text.to_owned()),
+                        Rewrite {
+                            range,
+                            text: format!("{place_text}.{method}({flag_text});"),
+                        },
+                    ));
+                }
+            }
+            "flag_test"
+                if matches!(
+                    kind(q),
+                    Some(K::RParen | K::LBrace | K::AndAnd | K::OrOr | K::Semicolon | K::Comma)
+                ) =>
+            {
+                let call = format!("{place_text}.contains({flag_text})");
+                let negated = i >= 2
+                    && tokens[i - 1].kind == K::LParen
+                    && tokens[i - 2].kind == K::Bang
+                    && kind(q) == Some(&K::RParen);
+                if negated {
+                    if let Some(range) = span(i - 2, q) {
+                        out.push((
+                            Some(place_text.to_owned()),
+                            Rewrite {
+                                range,
+                                text: format!("!{call}"),
+                            },
+                        ));
+                    }
+                    continue;
+                }
+                // Where a comparison may stand: not after `!` (which would take the place
+                // alone) or another operator.
+                let operand = i > 0
+                    && match &tokens[i - 1].kind {
+                        K::LParen
+                        | K::AndAnd
+                        | K::OrOr
+                        | K::Assign
+                        | K::Comma
+                        | K::LBrace
+                        | K::RBrace
+                        | K::Semicolon
+                        | K::FatArrow => true,
+                        K::Ident(w) => matches!(w.as_str(), "if" | "while" | "return"),
+                        _ => false,
+                    };
+                if operand && let Some(range) = span(i, q - 1) {
+                    out.push((Some(place_text.to_owned()), Rewrite { range, text: call }));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// One function's rewrites for a frame pass ([`unpinned_locals`], [`named_params`]): the
+/// tree it is and the lines it spans.
+#[derive(Clone)]
+struct FrameGroup {
+    tree: u16,
+    lines: std::ops::RangeInclusive<usize>,
+    rewrites: Vec<Rewrite>,
+}
+
+/// Each function's `#[slot(N)] let ..` declarations with the attribute dropped, one group
+/// per function. A function whose `raw { }` code addresses a frame word by number
+/// (`local[`) keeps them: that code and the declaration share the word.
+fn unpinned_locals(text: &str) -> Vec<FrameGroup> {
+    use crate::v2::lexer::{TokenKind as K, tokenize};
+    let Ok(tokens) = tokenize(text) else {
+        return Vec::new();
+    };
+    let Some(close) = matching_braces(&tokens) else {
+        return Vec::new();
+    };
+    let offsets = TokenOffsets::new(text);
+    let kind = |k: usize| tokens.get(k).map(|t| &t.kind);
+    let ident = |k: usize, w: &str| matches!(kind(k), Some(K::Ident(s)) if s == w);
+    let mut open = Vec::new();
+    let mut groups: BTreeMap<usize, Vec<Rewrite>> = BTreeMap::new();
+    for i in 0..tokens.len() {
+        match tokens[i].kind {
+            K::LBrace => open.push(i),
+            K::RBrace => {
+                open.pop();
+            }
+            K::HashBracket
+                if ident(i + 1, "slot")
+                    && kind(i + 2) == Some(&K::LParen)
+                    && matches!(kind(i + 3), Some(K::Int(_)))
+                    && kind(i + 4) == Some(&K::RParen)
+                    && kind(i + 5) == Some(&K::RBracket)
+                    && ident(i + 6, "let") =>
+            {
+                if let Some(&block) = open.last()
+                    && let (Some(start), Some(end)) =
+                        (offsets.of(&tokens[i]), offsets.of(&tokens[i + 6]))
+                {
+                    groups.entry(block).or_default().push(Rewrite {
+                        range: start..end,
+                        text: String::new(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    let trees = token_trees(&tokens);
+    groups
+        .into_iter()
+        .filter_map(|(block, rewrites)| {
+            let end = close[&block];
+            let raw_reads = tokens[block..end]
+                .iter()
+                .any(|t| matches!(&t.kind, K::RawBlock(b) if b.contains("local[")));
+            (!raw_reads).then_some(FrameGroup {
+                tree: trees[block]?,
+                lines: tokens[block].span.line..=tokens[end].span.line,
+                rewrites,
+            })
+        })
+        .collect()
+}
+
+/// Each tree function (`#[bhav(.., args = N, ..)] fn f()` or `fn f(sim: Sim)`) whose body
+/// only reads its arguments by number (`param[k]`), with them named in its signature: `fn
+/// f(sim: Sim, p0: i16, _p1: i16, p2: i16)`, each read written `pK`, one group per
+/// function. These keep the numbers:
+/// - a function that writes an argument (`param[k] = ..`, `&mut param[k]`) or animates
+///   (the events may land in argument 0);
+/// - one that names an argument other than as `param[k]` (a `param:` operand) or indexes
+///   one by a value;
+/// - one whose `raw { }` code names an argument in any form, animates, or runs a primitive
+///   by its bytes;
+/// - one the file calls (each caller would have to pass the arguments);
+/// - one where a name is taken.
+///
+/// `sleep`/`idle` (and the `std::motives` loops, inlined, that sleep) count down in argument
+/// 0 too; the build saves and restores it around them only when the tree reads it, so a
+/// sleeping tree that does not read argument 0 keeps the numbers.
+/// The calls that sleep in the caller's tree: the builtins, and the `std::motives` loops
+/// (inlined at the call site).
+const SLEEPING_CALLS: [&str; 5] = [
+    "sleep",
+    "idle",
+    "restore_motive_tracked",
+    "restore_two_motives_tracked",
+    "repair_by_progress",
+];
+
+fn named_params(text: &str) -> Vec<FrameGroup> {
+    use crate::v2::lexer::{TokenKind as K, tokenize};
+    let Ok(tokens) = tokenize(text) else {
+        return Vec::new();
+    };
+    let Some(close) = matching_braces(&tokens) else {
+        return Vec::new();
+    };
+    let offsets = TokenOffsets::new(text);
+    let kind = |k: usize| tokens.get(k).map(|t| &t.kind);
+    let ident = |k: usize, w: &str| matches!(kind(k), Some(K::Ident(s)) if s == w);
+    // Every word of the file's code, `raw { }` bodies included (they may name a binding).
+    let mut words: BTreeSet<&str> = BTreeSet::new();
+    for t in &tokens {
+        match &t.kind {
+            K::Ident(w) => {
+                words.insert(w);
+            }
+            K::RawBlock(b) => {
+                words.extend(b.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')));
+            }
+            _ => {}
+        }
+    }
+    // The functions the file calls: each caller would have to pass the new arguments.
+    let called: BTreeSet<&str> = (1..tokens.len())
+        .filter_map(|k| match (&tokens[k - 1].kind, &tokens[k].kind, kind(k + 1)) {
+            (prev, K::Ident(w), Some(K::LParen)) if !matches!(prev, K::Ident(f) if f == "fn") => {
+                Some(w.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    let trees = token_trees(&tokens);
+    let mut out = Vec::new();
+    for i in 0..tokens.len() {
+        if !(ident(i, "fn")
+            && matches!(kind(i + 1), Some(K::Ident(f)) if !called.contains(f.as_str())))
+            || kind(i + 2) != Some(&K::LParen)
+        {
+            continue;
+        }
+        // The signature: `()` or `(sim: Sim)`.
+        let rparen = if kind(i + 3) == Some(&K::RParen) {
+            i + 3
+        } else if matches!(kind(i + 3), Some(K::Ident(_)))
+            && kind(i + 4) == Some(&K::Colon)
+            && ident(i + 5, "Sim")
+            && kind(i + 6) == Some(&K::RParen)
+        {
+            i + 6
+        } else {
+            continue;
+        };
+        // Right after its `#[bhav(..)]` attribute, which gives the argument count.
+        if i == 0 || tokens[i - 1].kind != K::RBracket {
+            continue;
+        }
+        let Some(attr) = (0..i).rev().find(|&j| tokens[j].kind == K::HashBracket) else {
+            continue;
+        };
+        if !ident(attr + 1, "bhav") {
+            continue;
+        }
+        let Some(args) = (attr..i).find_map(|j| match (kind(j), kind(j + 1), kind(j + 2)) {
+            (Some(K::Ident(w)), Some(K::Assign), Some(K::Int(n))) if w == "args" => Some(*n),
+            _ => None,
+        }) else {
+            continue;
+        };
+        // The body, after any `-> T`.
+        let Some(body) = (rparen + 1..tokens.len())
+            .find(|&k| matches!(tokens[k].kind, K::LBrace | K::Semicolon | K::Eof))
+            .filter(|&k| tokens[k].kind == K::LBrace)
+        else {
+            continue;
+        };
+        let end = close[&body];
+        let mut reads: BTreeMap<i64, Vec<std::ops::Range<usize>>> = BTreeMap::new();
+        let mut ok = true;
+        let mut sleeps = false;
+        for j in body..end {
+            match &tokens[j].kind {
+                // Sleep counts down in argument 0 (`.air`'s `idle`); the build restores it
+                // only for a tree that reads it.
+                K::RawBlock(b) if b.contains("idle(") => sleeps = true,
+                K::Ident(w) if SLEEPING_CALLS.contains(&w.as_str()) => sleeps = true,
+                // Raw code that names an argument in any form (`param[k]`, a `param:`
+                // operand such as Old Relationship's destination, the `scope(9, k)` cell),
+                // animates, or runs a primitive by its bytes may write one.
+                K::RawBlock(b)
+                    if ["param", "animate", "scope(9,", "op 0x"]
+                        .iter()
+                        .any(|w| b.contains(w)) =>
+                {
+                    ok = false
+                }
+                // Animation events land in argument 0 unless a local is named for them.
+                K::Ident(w) if w == "animate" => ok = false,
+                K::Ident(w) if w == "param" && tokens[j - 1].kind != K::Dot => {
+                    let written = matches!(
+                        kind(j + 4),
+                        Some(
+                            K::Assign
+                                | K::PlusEq
+                                | K::MinusEq
+                                | K::StarEq
+                                | K::SlashEq
+                                | K::PercentEq
+                                | K::AmpEq
+                                | K::PipeEq
+                                | K::CaretEq
+                        )
+                    ) || matches!(&tokens[j - 1].kind, K::Amp)
+                        || matches!(&tokens[j - 1].kind, K::Ident(m) if m == "mut");
+                    match (kind(j + 1), kind(j + 2), kind(j + 3)) {
+                        (Some(K::LBracket), Some(K::Int(n)), Some(K::RBracket))
+                            if !written && (0..args).contains(n) =>
+                        {
+                            match (offsets.of(&tokens[j]), token_end(&offsets, &tokens[j + 3])) {
+                                (Some(a), Some(b)) => reads.entry(*n).or_default().push(a..b),
+                                _ => ok = false,
+                            }
+                        }
+                        _ => ok = false,
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(&last) = reads.keys().next_back() else {
+            continue;
+        };
+        if !ok || (sleeps && !reads.contains_key(&0)) {
+            continue;
+        }
+        let names: Vec<String> = (0..=last)
+            .map(|n| {
+                if reads.contains_key(&n) {
+                    format!("p{n}")
+                } else {
+                    format!("_p{n}")
+                }
+            })
+            .collect();
+        if (0..=last).any(|n| {
+            words.contains(format!("p{n}").as_str()) || words.contains(format!("_p{n}").as_str())
+        }) {
+            continue;
+        }
+        let Some(at) = offsets.of(&tokens[rparen]) else {
+            continue;
+        };
+        let list = names
+            .iter()
+            .map(|n| format!("{n}: i16"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let Some(tree) = trees[body] else {
+            continue;
+        };
+        let mut group = vec![Rewrite {
+            range: at..at,
+            text: if rparen == i + 3 {
+                list
+            } else {
+                format!(", {list}")
+            },
+        }];
+        for (n, ranges) in reads {
+            group.extend(ranges.into_iter().map(|range| Rewrite {
+                range,
+                text: format!("p{n}"),
+            }));
+        }
+        out.push(FrameGroup {
+            tree,
+            lines: tokens[i].span.line..=tokens[end].span.line,
+            rewrites: group,
+        });
+    }
     out
 }
 
@@ -2312,11 +2788,17 @@ impl Model {
     /// `recompiled` (so every check stands):
     /// - a tree whose short name (its label in `snake_case`) is its own is called by it,
     ///   without the `_{id}` suffix (see [`Self::tree_renames`]);
+    /// - `else { if f() {} }` is `else { let _ = f(); }`;
+    /// - a named motive or skill cell is a field (`sim.motive.hunger`, `sim.skill.cooking`),
+    ///   and a typed flag operation a method (`.set(..)`, `.clear(..)`, `.contains(..)`); see
+    ///   [`cell_spellings`];
+    /// - in behavioral mode, a local without `#[slot(N)]` and an argument by name, per
+    ///   function (see [`Self::keep_frame_groups`]);
     /// - `else { if .. }` holding the chain alone is `else if ..`;
     /// - `use` lines importing from one module are one braced line.
     ///
-    /// The names are tried together, then in halves; the other two never change the bytes,
-    /// but are checked the same way.
+    /// Each kind is tried together, then in halves (the frame changes per tree first); the
+    /// last two never change the bytes, but are checked the same way.
     fn polish(&self, text: String, recompiled: &RecompiledFile) -> String {
         let same = |t: &str| {
             self.compile(t)
@@ -2350,10 +2832,56 @@ impl Model {
         let discards = empty_if_calls(&text);
         if !discards.is_empty() {
             let base = text.clone();
-            let ok = |d: &[Discard]| same(&apply_discards(&base, d));
-            let mut kept = keep_joint(&discards, &ok, POLISH_DISCARD_BUILDS);
-            kept.sort_by_key(|d| d.range.start);
-            text = apply_discards(&text, &kept);
+            let ok = |d: &[Rewrite]| same(&apply_rewrites(&base, d));
+            let kept = keep_joint(&discards, &ok, POLISH_DISCARD_BUILDS);
+            text = apply_rewrites(&text, &kept);
+        }
+        // Motive and skill cells by name: tried together, then in halves (reading the same
+        // cell by name in one place and by number in another may lower otherwise).
+        let tables: BTreeSet<&str> = self.bcons.iter().map(|b| b.label.as_str()).collect();
+        let cells: Vec<Rewrite> = cell_spellings(&text, &tables)
+            .into_iter()
+            .filter_map(|(place, r)| place.is_none().then_some(r))
+            .collect();
+        if !cells.is_empty() {
+            let base = text.clone();
+            let ok = |c: &[Rewrite]| same(&apply_rewrites(&base, c));
+            let kept = keep_joint(&cells, &ok, POLISH_CELL_BUILDS);
+            text = apply_rewrites(&text, &kept);
+        }
+        // Typed flags by method, one group per place: a place v2 types as `i16` (not
+        // `bitflags`, such as `world.expansions`) refuses every method.
+        let mut places: BTreeMap<String, Vec<Rewrite>> = BTreeMap::new();
+        for (place, r) in cell_spellings(&text, &tables) {
+            if let Some(place) = place {
+                places.entry(place).or_default().push(r);
+            }
+        }
+        if !places.is_empty() {
+            let groups: Vec<Vec<Rewrite>> = places.into_values().collect();
+            let base = text.clone();
+            let ok = |g: &[Vec<Rewrite>]| same(&apply_groups(&base, g));
+            let kept = keep_joint(&groups, &ok, POLISH_CELL_BUILDS);
+            text = apply_groups(&text, &kept);
+        }
+        // Behavioral mode: locals without `#[slot]`, then arguments by name. Every function's
+        // change is tried at once; a function's is kept when its own tree builds the same
+        // bytes and the lint reports nothing new on its lines (an unpinned local is linted,
+        // a pinned one never is). The file must then build the same bytes and lint nothing
+        // new; else the kept ones are tried together, then in halves. A text linted once is
+        // not linted again (the second pass starts from the first one's last text).
+        if self.behavioral {
+            let lints = std::cell::RefCell::new(Vec::new());
+            let passes: [fn(&str) -> Vec<FrameGroup>; 2] = [unpinned_locals, named_params];
+            for pass in passes {
+                let groups = pass(&text);
+                if groups.is_empty() {
+                    continue;
+                }
+                let kept = self.keep_frame_groups(&text, groups, recompiled, &lints);
+                let rewrites: Vec<Rewrite> = kept.into_iter().flat_map(|g| g.rewrites).collect();
+                text = apply_rewrites(&text, &rewrites);
+            }
         }
         if let Some(joined) = collapse_else_if(&text).filter(|t| same(t)) {
             text = joined;
@@ -2363,6 +2891,84 @@ impl Model {
             text = grouped;
         }
         text
+    }
+
+    /// The groups of `groups` that keep `text` building the bytes of `recompiled` and add no
+    /// lint diagnostic (see [`Self::polish`]).
+    fn keep_frame_groups(
+        &self,
+        text: &str,
+        groups: Vec<FrameGroup>,
+        recompiled: &RecompiledFile,
+        lints: &std::cell::RefCell<Vec<(String, Option<LintCounts>)>>,
+    ) -> Vec<FrameGroup> {
+        use crate::v2::lint::lint_v2_source;
+        let diagnostics = |t: &str| -> Option<LintCounts> {
+            if let Some((_, counts)) = lints.borrow().iter().find(|(linted, _)| linted == t) {
+                return counts.clone();
+            }
+            let counts = lint_v2_source(t, "decompiled.antics").ok().map(|found| {
+                let mut out = LintCounts::new();
+                for d in found {
+                    *out.entry((d.rule, d.line, d.message)).or_insert(0) += 1;
+                }
+                out
+            });
+            lints.borrow_mut().push((t.to_owned(), counts.clone()));
+            counts
+        };
+        let Some(before) = diagnostics(text) else {
+            return Vec::new();
+        };
+        // The lines of the diagnostics `t` has that `text` does not (the rewrites keep every
+        // line where it is); `None` when `t` does not lint.
+        let new_lines = |t: &str| -> Option<BTreeSet<usize>> {
+            Some(
+                diagnostics(t)?
+                    .into_iter()
+                    .filter(|(k, n)| before.get(k).is_none_or(|b| n > b))
+                    .map(|((_, line, _), _)| line)
+                    .collect(),
+            )
+        };
+        let apply = |g: &[FrameGroup]| {
+            let all: Vec<Rewrite> = g.iter().flat_map(|g| g.rewrites.iter().cloned()).collect();
+            apply_rewrites(text, &all)
+        };
+        let ok = |g: &[FrameGroup]| {
+            let t = apply(g);
+            self.compile(&t)
+                .is_ok_and(|r| r.iff_bytes == recompiled.iff_bytes)
+                && new_lines(&t).is_some_and(|l| l.is_empty())
+        };
+        let all = apply(&groups);
+        let likely: Vec<FrameGroup> = match (self.compile(&all), new_lines(&all)) {
+            (Ok(built), Some(lines))
+                if built.iff_bytes == recompiled.iff_bytes && lines.is_empty() =>
+            {
+                return groups;
+            }
+            (Ok(built), Some(lines)) => groups
+                .iter()
+                .filter(|g| {
+                    let same_tree = match (recompiled.trees.get(&g.tree), built.trees.get(&g.tree))
+                    {
+                        (Some(a), Some(b)) => same_tree_bytes(a, b),
+                        _ => false,
+                    };
+                    same_tree && !lines.iter().any(|l| g.lines.contains(l))
+                })
+                .cloned()
+                .collect(),
+            _ => groups,
+        };
+        if likely.is_empty() {
+            return likely;
+        }
+        if ok(&likely) {
+            return likely;
+        }
+        keep_joint(&likely, &ok, POLISH_FRAME_BUILDS)
     }
 
     /// In behavioral mode, the final `text` with `!(a op b)` tests written as the flipped
@@ -2424,53 +3030,6 @@ impl Model {
     /// still reports: one the lift keeps on purpose, as the original's compare node (strict
     /// mode keeps every node's bytes, and behavioral mode flips one only where the tree's
     /// check proves it). Unchanged when the result does not lint cleaner.
-    /// `text` with a BCON entry that lint `unused_decl` reports as never read written
-    /// `Table.entry` again in v2 code. The lint counts a read by a field's dot and by name in
-    /// `raw { }`, but not by a `Table::entry` path, so a table that raw code reads by name
-    /// would report its other entries. Only a file whose table is read both ways is linted,
-    /// and the rewrite (code tokens only) is kept only if the object builds the same bytes.
-    fn dot_bcon_reads_the_lint_misses(&self, text: String, recompiled: &RecompiledFile) -> String {
-        use crate::v2::lint::{UNUSED_DECL, lint_v2_source};
-        let both: Vec<&str> = self
-            .bcons
-            .iter()
-            .map(|b| b.label.as_str())
-            .filter(|l| text.contains(&format!("{l}::")) && text.contains(&format!("{l}.")))
-            .collect();
-        if both.is_empty() {
-            return text;
-        }
-        let unread = |text: &str| -> Option<Vec<String>> {
-            let lints = lint_v2_source(text, "decompiled.antics").ok()?;
-            Some(
-                lints
-                    .iter()
-                    .filter(|d| d.rule == UNUSED_DECL)
-                    .filter_map(|d| {
-                        let rest = d.message.strip_prefix("BCON entry `")?;
-                        Some(rest[..rest.find('`')?].to_owned())
-                    })
-                    .collect(),
-            )
-        };
-        let Some(names) = unread(&text) else {
-            return text;
-        };
-        if names.is_empty() {
-            return text;
-        }
-        let Some(out) = dot_paths(&text, &both, &names) else {
-            return text;
-        };
-        let same = self
-            .compile(&out)
-            .is_ok_and(|r| r.iff_bytes == recompiled.iff_bytes);
-        match unread(&out) {
-            Some(after) if same && after.is_empty() => out,
-            _ => text,
-        }
-    }
-
     fn allow_kept_negations(&self, text: String) -> String {
         use crate::v2::lint::{NEGATED_COMPARISON, lint_v2_source};
         // Cheap first: a file with no negated test needs no lint run.
@@ -8443,6 +9002,82 @@ mod tests {
         );
     }
 
+    /// Every `std::motives` function that sleeps is in [`SLEEPING_CALLS`].
+    #[test]
+    fn sleeping_calls_cover_the_std_motive_loops() {
+        let std = include_str!("std/motives.antics");
+        for part in std.split("pub fn ").skip(1) {
+            let name = part.split('(').next().expect("a name").trim();
+            let body = part.split("\npub fn ").next().expect("a body");
+            assert_eq!(
+                body.contains("sleep(") || body.contains("idle("),
+                SLEEPING_CALLS.contains(&name),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn skill_words_are_the_lowerings() {
+        for (word, name) in SKILL_WORDS {
+            assert_eq!(
+                crate::parser::skill_by_name(name).map(i64::from),
+                Some(word)
+            );
+        }
+    }
+
+    #[test]
+    fn cells_and_typed_flags_are_written_by_name() {
+        let text = "fn f() {\n    temp[0] = sim.motive[Motive::Hunger];\n    temp[1] = p.person[10] + sim.person[13] + x.neighbor.person[10];\n    temp[2] = sim.motive[1] + sim.motive[temp[0]];\n    self.flags flag_set ObjectFlags::InUse;\n    self.flags flag_clear 3;\n    self.data[8] flag_set ObjectFlags::InUse;\n    self.flags flag_set Tuning::e1;\n    if !(stack_obj.flags flag_test ObjectFlags::InUse) && w flag_test Expansions::Pets {\n    }\n    if !w flag_test Expansions::Pets {\n    }\n    raw {\n        my.data[8] flag_set 3;\n    }\n    sim.wall_placement flag_clear WallPlacement::NoWallLeft;\n}\n";
+        let tables = BTreeSet::from(["Tuning"]);
+        let found: Vec<String> = cell_spellings(text, &tables)
+            .into_iter()
+            .map(|(place, r)| format!("{place:?}: {} => {}", &text[r.range], r.text))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "None: [Motive::Hunger] => .hunger",
+                "None: person[10] => skill.cooking",
+                "Some(\"self.flags\"): self.flags flag_set ObjectFlags::InUse; => self.flags.set(ObjectFlags::InUse);",
+                "Some(\"stack_obj.flags\"): !(stack_obj.flags flag_test ObjectFlags::InUse) => !stack_obj.flags.contains(ObjectFlags::InUse)",
+                "Some(\"w\"): w flag_test Expansions::Pets => w.contains(Expansions::Pets)",
+                "Some(\"sim.wall_placement\"): sim.wall_placement flag_clear WallPlacement::NoWallLeft; => sim.wall_placement.clear(WallPlacement::NoWallLeft);",
+            ]
+        );
+    }
+
+    #[test]
+    fn frame_groups_skip_raw_frame_reads_written_arguments_and_called_trees() {
+        let text = "object \"O\" {\n#[bhav(id = 4300, args = 2, locals = 1)]\nfn a(sim: Sim) {\n    #[slot(0)] let slot_0: i16;\n    temp[0] = param[1] + slot_0;\n}\n#[bhav(id = 4301, args = 1, locals = 1)]\nfn b() {\n    #[slot(0)] let slot_0: i16;\n    raw {\n        local[0] := param[0];\n    }\n}\n#[bhav(id = 4302, args = 1)]\nfn c() {\n    param[0] += 1;\n}\n#[bhav(id = 4303, args = 1)]\nfn d() {\n    temp[0] = param[0];\n}\n#[bhav(id = 4304, args = 1)]\nfn e() {\n    d();\n    temp[0] = param[0];\n}\n}\n";
+        let show = |groups: Vec<FrameGroup>| -> Vec<String> {
+            groups
+                .into_iter()
+                .map(|g| {
+                    let mut rewrites = g.rewrites;
+                    rewrites.sort_by_key(|r| r.range.start);
+                    let parts: Vec<String> = rewrites
+                        .iter()
+                        .map(|r| format!("{:?}=>{:?}", &text[r.range.clone()], r.text))
+                        .collect();
+                    format!("{} {:?}: {}", g.tree, g.lines, parts.join(" "))
+                })
+                .collect()
+        };
+        assert_eq!(
+            show(unpinned_locals(text)),
+            ["4300 3..=6: \"#[slot(0)] \"=>\"\""]
+        );
+        assert_eq!(
+            show(named_params(text)),
+            [
+                "4300 3..=6: \"\"=>\", _p0: i16, p1: i16\" \"param[1]\"=>\"p1\"",
+                "4304 23..=26: \"\"=>\"p0: i16\" \"param[0]\"=>\"p0\"",
+            ]
+        );
+    }
+
     #[test]
     fn the_question_mark_matches_either_error_exit() {
         for exit in ["panic!();", "return error;"] {
@@ -8497,26 +9132,6 @@ mod tests {
         assert!(
             negated_comparisons("object \"O\" {\nfn f() {\n    if !(a > b) {\n    }\n}\n}\n")
                 .is_empty()
-        );
-    }
-
-    #[test]
-    fn dotted_constant_paths_touch_code_only() {
-        let text = "fn f() {\n    // Tuning::e0\n    temp[0] = Tuning::e0;\n    temp[1] = Tuning::e1;\n    show(\"Tuning::e0\");\n    temp[2] = Other::e0 + MyTuning::e0;\n}\n";
-        assert_eq!(
-            dot_paths(text, &["Tuning"], &["e0".to_owned()]).as_deref(),
-            Some(
-                "fn f() {\n    // Tuning::e0\n    temp[0] = Tuning.e0;\n    temp[1] = Tuning::e1;\n    show(\"Tuning::e0\");\n    temp[2] = Other::e0 + MyTuning::e0;\n}\n"
-            )
-        );
-        // A path written with something between its parts, or on a line with a multibyte
-        // character, is left alone; the others still change.
-        let text = "fn f() {\n    temp[0] = Tuning /* x */ ::e0;\n    show(\"é\"); temp[1] = Tuning::e0;\n    temp[2] = Tuning::e0;\n}\n";
-        assert_eq!(
-            dot_paths(text, &["Tuning"], &["e0".to_owned()]).as_deref(),
-            Some(
-                "fn f() {\n    temp[0] = Tuning /* x */ ::e0;\n    show(\"é\"); temp[1] = Tuning::e0;\n    temp[2] = Tuning.e0;\n}\n"
-            )
         );
     }
 
@@ -8787,7 +9402,7 @@ object "Fable Lamp" {
             &[
                 "return ready();",
                 "return !ready();",
-                "return !(self.flags flag_test ObjectFlags::InUse);",
+                "return !self.flags.contains(ObjectFlags::InUse);",
                 "} else {\n            return ready();",
             ],
         );
@@ -9044,9 +9659,9 @@ object "Fable Lamp" {
         has(
             &lifted,
             &[
-                "sim.wall_adjacency flag_set WallAdjacency::WallFront;",
+                "sim.wall_adjacency.set(WallAdjacency::WallFront);",
                 "if temp[0] flag_test 2 {",
-                "self.allowed_heights flag_clear Height::Floor;",
+                "self.allowed_heights.clear(Height::Floor);",
                 "if !(sim.hand == 0) {",
             ],
         );
