@@ -2657,10 +2657,34 @@ fn a_refresh_whose_event_plays_a_sound_takes_itself_off_quietly() {
     // sound writes nothing the lot reads, so in the refresh any sound key
     // plays nothing and the take-off goes on. The tick alone plays it
     // (`clip_sounds.rs`).
+    //
+    // The refresh takes the event past, so the tick after it plays
+    // nothing either; the sounds alone differ, and the tick alone's are
+    // kept: with the sounds noted, the deselected Sim's sound plays once.
     for key in ["sound", "selectedsound", "deselectedsound", "footstep"] {
         let mut fx = taking_itself_off(sleep());
         playing_an_event(&mut fx, key, "x");
         tick(&mut fx).unwrap_or_else(|f| panic!("{key}: {f}"));
+        let mut fx = taking_itself_off(sleep());
+        playing_an_event(&mut fx, key, "x");
+        let sink = std::cell::RefCell::new(Vec::new());
+        let mut interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter.sounds = Some(&sink);
+        let ticks = fx.world.ticks as i32;
+        interpreter
+            .tick_person(&mut fx.world, SIM, ticks, &tuning())
+            .unwrap_or_else(|f| panic!("{key} with the sounds noted: {f}"));
+        let sounds = sink.into_inner();
+        if key == "deselectedsound" {
+            assert_eq!(
+                sounds,
+                vec![sims_vm::SoundEvent::Play {
+                    object: SIM as i16,
+                    name: "x".into(),
+                }],
+                "{key}"
+            );
+        }
         let mut alone = standing();
         playing_an_event(&mut alone, key, "x");
         // A footstep reads the floor under the Sim (no pattern there).

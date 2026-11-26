@@ -872,8 +872,8 @@ impl Feed {
 /// widened with its sign, as the original's play does (0x57a60e, `movsx`),
 /// so -4 (an off-lot pet's sound) is 0xfffffffc, which the player places
 /// as the screen's centre at full volume (`sims_audio::placement::place`,
-/// an object at most 0). That a stop widens the same way is
-/// **unverified**.
+/// an object at most 0). A stop widens the same way (0x45255f,
+/// 0x4323c1).
 pub fn event(event: sims_vm::SoundEvent) -> SoundEvent {
     let widen = |object: i16| i32::from(object) as u32;
     match event {

@@ -128,13 +128,17 @@ noted.
      least 0 needs a step of 1 or 2. A speed below 0, or NaN, needs -1 or -2.
 - In a person's animator refresh at its take-off (0x58da12), a sound key plays nothing. The
   refresh is made only if the house view drew the person, which is not kept, and a sound
-  writes nothing the lot reads, so both branches of the refresh stay alike. Whether the
-  original plays it there is unverified.
+  writes nothing the lot reads, so both branches of the refresh stay alike. The refresh's
+  update still takes the due event past, so the tick after it plays nothing either. The
+  take-off's both-ways check therefore compares every cell but the sounds
+  (`Cells::same_but_sounds`), and keeps the sounds of the tick alone. Whether the original
+  plays a sound in the refresh is unverified. It confirms that a stop widens with its sign
+  too (0x45255f, 0x4323c1).
 
 Playback already worked: the game forwards `Update::sounds` to its sound thread, and
 `sims_audio::Player::play` resolves any event name against the loaded modules. One fix was
 needed: `sims_game::sound::event` now widens the 16-bit object with its sign, as the
-original's play does (0x57a60e, `movsx`). So -4 reaches the player as -4, which places it at
+original's play and stop do (0x57a60e, 0x45255f, 0x4323c1, `movsx`). So -4 reaches the player as -4, which places it at
 the screen's centre at full volume, instead of as 65532, an unknown object that would keep
 the previous placement.
 

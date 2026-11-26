@@ -484,8 +484,11 @@ fn a_share_just_below_a_whole_turn_steps_with_clip_minus_1() {
         true,
         500,
     );
+    // It repeats (end mode 1) until the step makes it stop at its end.
+    let mut playing = playing;
+    playing.mode = 1;
     let a = fx.world.animators.get_mut(&SIM).unwrap();
-    a.foreground = Some(playing);
+    a.foreground = Some(playing.clone());
     a.selection = 10;
     let destination = a.destination;
     tick(&mut fx).unwrap();
@@ -496,6 +499,19 @@ fn a_share_just_below_a_whole_turn_steps_with_clip_minus_1() {
     let layer = a.foreground.as_ref().unwrap();
     assert_eq!(layer.clip, "test-turn-10");
     assert_eq!((layer.mode, layer.speed), (0, a.rate));
+    assert_eq!(layer.weight.to_bits(), f32::INFINITY.to_bits());
+    // A foreground already noted as clip -1 is left as it is by 0x5926d7
+    // (0x5926ef): its end mode stays, though the speed and weight are set.
+    let mut fx = walking_to(0, [0.0, 0.0], 2.0);
+    at(&mut fx);
+    let a = fx.world.animators.get_mut(&SIM).unwrap();
+    a.foreground = Some(playing);
+    a.selection = -1;
+    tick(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    assert_eq!((a.state, a.selection), (5, -1));
+    let layer = a.foreground.as_ref().unwrap();
+    assert_eq!((layer.mode, layer.speed), (1, a.rate));
     assert_eq!(layer.weight.to_bits(), f32::INFINITY.to_bits());
     // With no foreground the original reads through a null pointer.
     let mut fx = walking_to(0, [0.0, 0.0], 2.0);

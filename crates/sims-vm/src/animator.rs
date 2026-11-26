@@ -467,9 +467,13 @@ impl Interpreter<'_> {
         pending.refreshed.restore(&mut refreshed, id);
         let refreshed_cells = cells.copy();
         let refreshed_ticked = refreshed_cells.on(self).tick_animator(&mut refreshed, id);
+        // The sounds may differ: the refresh plays none, but its update
+        // takes the due events past (`clip_events.rs`), so the tick after
+        // it does not play them either. Sounds change nothing the lot
+        // does, and the tick alone's are kept.
         if ticked != refreshed_ticked
             || !same_lot(&left, &refreshed)
-            || !left_cells.same(&refreshed_cells)
+            || !left_cells.same_but_sounds(&refreshed_cells)
             || !left_cells.same_refresh(&cells)
         {
             return Err(refused(
