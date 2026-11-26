@@ -419,16 +419,11 @@ fn raw_bits_and_cells_by_number_have_no_flag_method() {
 
 #[test]
 fn untyped_receivers_and_other_operands_have_no_flag_method() {
-    // `world.expansions` is an `i16` to lowering: `.contains` does not type-check there.
+    // `global[20]` written out: `untyped_engine_field` names it `world.expansions` first
+    // (`world.expansions` and `wall_placement` take methods since v2.2 step 2).
     let source = tree(
         "use std::flags::Expansions;\n",
-        "        if world.expansions flag_test Expansions::Pets {\n            temp[0] = 1;\n        }",
-    );
-    none(&source, "prefer_method_syntax");
-    // `wall_placement` stays an `i16` that takes `WallPlacement` constants.
-    let source = tree(
-        "use std::flags::WallPlacement;\n",
-        "        self.wall_placement flag_set WallPlacement::NoCorner;",
+        "        if global[20] flag_test Expansions::Pets {\n            temp[0] = 1;\n        }",
     );
     none(&source, "prefer_method_syntax");
     // A state, not the engine word.
@@ -708,13 +703,7 @@ fn a_negated_compare_before_an_exit_is_not_reported() {
     // `end_action`, `sims-vm/src/interpreter.rs` `branch`). The flipped compare has the
     // opposite result. On an error exit the result stays for play-mode recovery and a
     // person's reset.
-    for exit in [
-        "return false;",
-        "return true;",
-        "panic!();",
-        "return error;",
-        "return;",
-    ] {
+    for exit in ["return false;", "return true;", "panic!();", "return;"] {
         let (ret, tail) = if exit.starts_with("return true") || exit.starts_with("return false") {
             (" -> bool", "\n        return true;")
         } else {
@@ -761,7 +750,7 @@ fn an_exit_on_either_branch_keeps_the_rule_quiet() {
     for (then_body, else_body) in [
         ("temp[1] = 1;", "return false;"),
         ("panic!();", "temp[1] = 2;"),
-        ("temp[1] = 1;", "return error;"),
+        ("temp[1] = 1;", "panic!();"),
     ] {
         let source = obj(
             "",

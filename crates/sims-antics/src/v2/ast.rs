@@ -692,14 +692,18 @@ pub enum V2Stmt {
     Return {
         span: Span,
         value: Option<V2Expr>,
+        /// Written exactly `return error;` (or the bare `match` arm `=> return error`): the
+        /// spelling that was the error exit before v2.2. It returns a binding named `error`,
+        /// and is refused without one. `return (error);` and a tail `error` are ordinary
+        /// returns, which also read a `const error`.
+        bare_error: bool,
     },
-    /// `return error;` — exits the whole BHAV through the SimAntics error exit.
+    /// Exits the whole BHAV through the SimAntics error exit (253): a written `panic!()`, or
+    /// the false edge of `cond?;`. (`return error;` is an ordinary `return` of a value named
+    /// `error`.)
     ReturnError {
         span: Span,
-        /// Synthesized by `cond?;`: always the error exit, even when a binding named `error`
-        /// is in scope (a written `return error;` then returns that binding instead).
-        from_try: bool,
-        /// Written `panic!()`: also always the error exit, like `from_try`.
+        /// Written `panic!()`, rather than synthesized by `cond?;`.
         panic: bool,
     },
     Expr {

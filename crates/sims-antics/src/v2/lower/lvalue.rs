@@ -425,7 +425,7 @@ impl<'a> TreeLowerer<'a> {
                             let idx = self.eval_const_i16(index)?;
                             return Ok(LValue::Direct {
                                 air: format!("global[{idx}]"),
-                                ty: ValueType::I16,
+                                ty: global_word_type(idx),
                             });
                         }
                         "local" if self.lookup_var("local").is_none() => {
@@ -834,5 +834,17 @@ fn neighbor_place_root(e: &V2Expr) -> Option<&str> {
                 .filter(|_| matches!(inner, V2Expr::Field { field, .. } if field == "neighbor"))
         }
         _ => None,
+    }
+}
+
+/// The type of the world word `global[idx]`. `global[20]` (`world.expansions`) is the
+/// installed-expansions mask, a lenient engine `bitflags` word (`std::flags::Expansions`): it
+/// takes flag methods and still every numeric use, as the object words `flags` and
+/// `wall_placement` do. Every other world word is `i16`.
+pub(super) fn global_word_type(idx: i16) -> ValueType {
+    if idx == 20 {
+        ValueType::Bitflags("bitflags::std::flags::Expansions".to_owned())
+    } else {
+        ValueType::I16
     }
 }

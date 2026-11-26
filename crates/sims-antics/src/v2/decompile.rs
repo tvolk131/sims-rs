@@ -565,8 +565,7 @@ fn lint_spellings(text: &str) -> Vec<LintSpelling> {
 
 /// The end of the `if` statement at `start` that lint `prefer_question_mark` rewrites to
 /// `suggestion` (`f(..)?;`): `if !f(..) { panic!(); }`, or
-/// `if f(..) {} else { panic!(); }` (or either with `return error;`, the older spelling of
-/// the error exit). `None` when the text is not that statement.
+/// `if f(..) {} else { panic!(); }`. `None` when the text is not that statement.
 fn question_mark_end(text: &str, start: usize, suggestion: &str) -> Option<usize> {
     let call = suggestion.strip_suffix("?;")?;
     let rest = text.get(start..)?.strip_prefix("if ")?;
@@ -600,9 +599,9 @@ fn question_mark_end(text: &str, start: usize, suggestion: &str) -> Option<usize
     is_error_exit(text[at + 1..end - 1].trim()).then_some(end)
 }
 
-/// Whether `body` (trimmed) is just the error exit, in either spelling.
+/// Whether `body` (trimmed) is just the error exit, `panic!()`.
 fn is_error_exit(body: &str) -> bool {
-    matches!(body, "panic!();" | "panic!()" | "return error;")
+    matches!(body, "panic!();" | "panic!()")
 }
 
 /// The end of the bracketed group opening at `open` (`(`, `[` or `{`), past string literals.
@@ -2850,7 +2849,8 @@ impl Model {
             text = apply_rewrites(&text, &kept);
         }
         // Typed flags by method, one group per place: a place v2 types as `i16` (not
-        // `bitflags`, such as `world.expansions`) refuses every method.
+        // `bitflags`, such as an `i16` local) refuses every method. `world.expansions` and
+        // `wall_placement` are lenient engine `bitflags` words, which take methods.
         let mut places: BTreeMap<String, Vec<Rewrite>> = BTreeMap::new();
         for (place, r) in cell_spellings(&text, &tables) {
             if let Some(place) = place {
@@ -6598,9 +6598,9 @@ impl Translator<'_> {
                 if self.return_compare(id, cond, then_body, else_body, out) {
                     return;
                 }
-                // `if !f(..) { return error; }` is `f(..)?;`: v2 lowers both to the same test
+                // `if !f(..) { panic!(); }` is `f(..)?;`: v2 lowers both to the same test
                 // with the same error exit. With the other arm a plain return,
-                // `if f(..) { return X; } else { return error; }` is `f(..)?; return X;`.
+                // `if f(..) { return X; } else { panic!(); }` is `f(..)?; return X;`.
                 let is_error = |body: &[Stmt]| {
                     matches!(
                         body,
@@ -9079,14 +9079,19 @@ mod tests {
     }
 
     #[test]
-    fn the_question_mark_matches_either_error_exit() {
-        for exit in ["panic!();", "return error;"] {
+    fn the_question_mark_matches_the_error_exit() {
+        for exit in ["panic!();", "panic!()"] {
             let text = format!("if !f(1) {{\n    {exit}\n}}\nx");
             assert_eq!(question_mark_end(&text, 0, "f(1)?;"), Some(text.len() - 2));
             let text = format!("if f(1) {{}} else {{\n    {exit}\n}}\nx");
             assert_eq!(question_mark_end(&text, 0, "f(1)?;"), Some(text.len() - 2));
         }
         assert_eq!(question_mark_end("if !f(1) { g(); }", 0, "f(1)?;"), None);
+        // `return error;` returns a value named `error`: not the exit.
+        assert_eq!(
+            question_mark_end("if !f(1) { return error; }", 0, "f(1)?;"),
+            None
+        );
     }
 
     #[test]
@@ -9672,7 +9677,7 @@ object "Fable Lamp" {
     /// same bytes with the rewrite.
     #[test]
     fn lint_spellings_rewrite_both_question_mark_shapes_to_the_same_bytes() {
-        let text = "use std::globals::*;\n\nobject \"Fable Wave3 Query\" {\n    guid: 0x7E00_016B;\n    #[bhav(id = 4300)]\n    fn t() {\n        if !globals::init_object() {\n            return error;\n        }\n        if globals::init_object() {\n        } else {\n            return error;\n        }\n        return true;\n    }\n}\n";
+        let text = "use std::globals::*;\n\nobject \"Fable Wave3 Query\" {\n    guid: 0x7E00_016B;\n    #[bhav(id = 4300)]\n    fn t() {\n        if !globals::init_object() {\n            panic!();\n        }\n        if globals::init_object() {\n        } else {\n            panic!();\n        }\n        return true;\n    }\n}\n";
         let fixes = lint_spellings(text);
         assert_eq!(fixes.len(), 2, "{text}");
         let rewritten = apply_lint_spellings(text, &fixes);

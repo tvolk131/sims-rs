@@ -1,7 +1,7 @@
 //! `lift --v2` writes the error exit as `panic!();` and a call whose result nothing tests as
 //! `let _ = f();` (#475's forms), in strict and in behavioral mode. Each lifted file builds to
-//! the same bytes as its older spelling (`return error;`, `if f() {}`), and `raw { }` keeps
-//! `.air`'s own syntax. Every object is synthetic (GUIDs in the clean-room 0x7E00_xxxx range).
+//! the same bytes as its older spelling (`if f() {}`), and `raw { }` keeps `.air`'s own syntax
+//! (`return error;` there). Every object is synthetic (GUIDs in the clean-room 0x7E00_xxxx range).
 
 use sims_antics::compile_v2_source;
 use sims_antics::v2::{
@@ -57,7 +57,6 @@ fn lacks(lifted: &str, spellings: &[&str]) {
 /// `lifted` written back in the older spellings builds the same bytes.
 fn same_bytes_as_older_spelling(lifted: &str) {
     let older = lifted
-        .replace("panic!();", "return error;")
         .lines()
         .map(|line| match line.trim_start().strip_prefix("let _ = ") {
             Some(call) => {
@@ -68,8 +67,11 @@ fn same_bytes_as_older_spelling(lifted: &str) {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    assert_ne!(older, lifted);
-    assert_eq!(build(&older), build(lifted), "{older}");
+    // `panic!()` has no older spelling any more (`return error;` returns a value named
+    // `error`), so a file with no `let _` has nothing to compare.
+    if older != lifted {
+        assert_eq!(build(&older), build(lifted), "{older}");
+    }
 }
 
 #[test]
@@ -79,7 +81,7 @@ fn the_error_exit_is_panic() {
     #[bhav(id = 4300)]
     fn check() {
         if temp[0] == 1 {
-            return error;
+            panic!();
         }
         temp[1] = 2;
     }
@@ -126,18 +128,18 @@ fn a_result_call_that_fails_out_is_still_the_question_mark() {
     #[bhav(id = 4300, label = "Serve")]
     fn serve() {
         if !make_food() {
-            return error;
+            panic!();
         }
         if make_food() {
         } else {
-            return error;
+            panic!();
         }
         temp[1] = 1;
     }
     #[bhav(id = 4301, label = "Make Food")]
     fn make_food() -> Result {
         if temp[2] == 3 {
-            return error;
+            panic!();
         }
         return true;
     }

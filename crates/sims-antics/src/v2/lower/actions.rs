@@ -42,6 +42,8 @@ impl<'a> TreeLowerer<'a> {
         let kind_name = &kind_name;
         let kspan = &kspan;
         let (target_air, target_ty) = self.lower_value_expr(receiver)?;
+        // A lenient engine word is the number it holds, as an `i16` receiver is.
+        let target_ty = numeric_view(target_ty);
         if !matches!(
             target_ty,
             ValueType::ObjectId | ValueType::ObjectRef(_) | ValueType::I16
@@ -908,6 +910,8 @@ impl<'a> TreeLowerer<'a> {
                 None if name == "stack_obj" => Ok("stack_obj".to_owned()),
                 Some(Binding::Local { air_name, ty }) => match ty {
                     ValueType::I16 | ValueType::ObjectId => Ok(air_name.clone()),
+                    // A local read from a lenient engine word holds a number, as an `i16`.
+                    ty if is_engine_flags(ty) => Ok(air_name.clone()),
                     ValueType::ObjectRef(_) => Err(refuse(format!(
                         "set_to_next(dest: {name}): '{name}' is a typed object handle, and the next object need not be of its type; step an untyped 'ObjectId' local"
                     ))),

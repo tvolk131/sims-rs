@@ -131,7 +131,7 @@ impl<'a> TreeLowerer<'a> {
     pub(super) fn relationship_value_arg(&mut self, expr: &V2Expr, writes: bool) -> Result<String> {
         if writes {
             let (air, ty) = self.lower_value_expr(expr)?;
-            if ty != ValueType::I16 {
+            if !i16_like(&ty) {
                 return Err(Error::at(
                     expr.span(),
                     format!(
@@ -154,10 +154,8 @@ impl<'a> TreeLowerer<'a> {
             Err(e) => return Err(e),
         };
         match lval {
-            LValue::Direct {
-                air,
-                ty: ValueType::I16,
-            } => Ok(air),
+            // A lenient engine word is the `i16` cell it was before it was typed.
+            LValue::Direct { air, ty } if i16_like(&ty) => Ok(air),
             LValue::Direct { ty, .. } => Err(Error::at(
                 expr.span(),
                 format!(
@@ -186,7 +184,7 @@ impl<'a> TreeLowerer<'a> {
     ) -> Result<String> {
         if let V2Expr::Ident(_, name) = expr
             && let Some(Binding::Local { air_name, ty }) = self.lookup_var(name)
-            && (*ty == ValueType::I16 || (allow_enum && matches!(ty, ValueType::Enum(_))))
+            && (i16_like(ty) || (allow_enum && matches!(ty, ValueType::Enum(_))))
         {
             return Ok(air_name.clone());
         }
@@ -215,7 +213,7 @@ impl<'a> TreeLowerer<'a> {
             return Ok(None);
         }
         let (air, ty) = self.lower_value_expr(expr)?;
-        if ty != ValueType::I16 {
+        if !i16_like(&ty) {
             return Err(Error::at(
                 expr.span(),
                 format!(
@@ -506,7 +504,7 @@ impl<'a> TreeLowerer<'a> {
             index: Box::new(index.clone()),
         };
         let (rhs, rty) = self.lower_value_expr(value)?;
-        if !matches!(rty, ValueType::I16 | ValueType::Bool) {
+        if !(i16_like(&rty) || rty == ValueType::Bool) {
             return Err(Error::at(
                 value.span(),
                 format!(
@@ -575,7 +573,7 @@ impl<'a> TreeLowerer<'a> {
                         ),
                     ));
                 };
-                if ty != ValueType::I16 {
+                if !i16_like(&ty) {
                     return Err(Error::at(
                         place.span,
                         format!(
@@ -585,7 +583,7 @@ impl<'a> TreeLowerer<'a> {
                     ));
                 }
                 let (n, n_ty) = self.lower_value_expr(&bound.value)?;
-                if n_ty != ValueType::I16 {
+                if !i16_like(&n_ty) {
                     return Err(Error::at(
                         bound.span,
                         format!("{fname}(&mut x, n): 'n' must be an i16"),
@@ -620,7 +618,7 @@ impl<'a> TreeLowerer<'a> {
                     ));
                 }
                 let (mut range_air, range_ty) = self.lower_value_expr(&range.value)?;
-                if range_ty != ValueType::I16 {
+                if !i16_like(&range_ty) {
                     return Err(Error::at(
                         range.span,
                         "random_into(x, n): 'n' must be an i16",
@@ -641,7 +639,7 @@ impl<'a> TreeLowerer<'a> {
                         "random_into(x, n): 'x' must be a local, attribute, or other direct i16 slot of this object",
                     ));
                 };
-                if ty != ValueType::I16 {
+                if !i16_like(&ty) {
                     return Err(Error::at(
                         dst.span,
                         format!(

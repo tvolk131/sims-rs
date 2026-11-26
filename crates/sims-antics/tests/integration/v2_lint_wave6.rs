@@ -128,14 +128,14 @@ fn code_after_panic_is_unreachable_and_says_panic() {
             .as_str()
         )
     );
-    // A written `return error` keeps its own wording.
+    // `return error;` is a `return` (of a value named `error`), and says so.
     let source = tree("", "        return error;\n        self.level = 1;");
     let d = one(&source, "unreachable_code");
     assert_eq!(
         d.note.as_deref(),
         Some(
             format!(
-                "`return error` on line {} always leaves this block",
+                "`return` on line {} always leaves this block",
                 line_of(&source, "return error;")
             )
             .as_str()
@@ -159,7 +159,7 @@ fn an_if_whose_branches_all_panic_or_return_leaves() {
         ),
         "unreachable_code",
     );
-    // A `panic!()` in a loop body ends the loop like `return error`: nothing after it in
+    // A `panic!()` in a loop body ends the loop like `return`: nothing after it in
     // the body is reachable, but the loop itself may still be left by `break`.
     let source = tree(
         "",
@@ -193,19 +193,14 @@ fn a_result_call_that_only_panics_is_a_question_mark() {
         "if lib::must() {\n        } else {\n            panic!();\n        }",
         "lib::must()?;",
     );
-    // `return error;` still reports.
+    // `return error;` returns a value named `error`: it is no error exit, so no `?`.
     let source = tree("", "        if !lib::must() { return error; }");
-    rewrites(
-        &source,
-        "prefer_question_mark",
-        "if !lib::must() { return error; }",
-        "lib::must()?;",
-    );
+    none(&source, "prefer_question_mark");
 }
 
 #[test]
 fn panic_is_the_error_exit_even_beside_a_binding_named_error() {
-    // A written `return error;` would return the local; `panic!()` and `?` never do.
+    // `return error;` returns the local; `panic!()` and `?` never do.
     let source = tree(
         "",
         "        let error = random(3);\n        self.level = error;\n        if !lib::must() {\n            panic!();\n        }",

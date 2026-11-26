@@ -1,5 +1,5 @@
 //! `lift --v2` writes v2 PR H's spellings: lifecycle `#[frame]`, in-place `set_to_next`,
-//! `return error`, `#[slot]` lets, `const` branch specialization and `#[context(inherit)]`.
+//! the error exit (`panic!()`), `#[slot]` lets, `const` branch specialization and `#[context(inherit)]`.
 //! Every object is synthetic (GUIDs in the clean-room 0x7E00_xxxx range).
 
 use sims_antics::compile_v2_source;
@@ -97,7 +97,7 @@ fn cursor_steps_and_error_returns_lift_as_builtins() {
     fn step() -> bool {
         if !set_to_next(part, dest: stack_obj) { return false; }
         while set_to_next(guid, PROBE, dest: stack_obj) {
-            if temp[0] > 3 { return error; }
+            if temp[0] > 3 { panic!(); }
             temp[0] += 1;
         }
         return true;

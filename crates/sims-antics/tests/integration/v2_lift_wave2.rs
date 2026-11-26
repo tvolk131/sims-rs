@@ -74,26 +74,26 @@ fn failed_calls_returning_error_lift_as_try() {
     }
     #[bhav(id = 4301, locals = 0)]
     fn work() {
-        if !ready() { return error; }
+        if !ready() { panic!(); }
         temp[1] = 2;
-        if !ready() { return error; }
+        if !ready() { panic!(); }
         temp[2] = 3;
     }
     #[bhav(id = 4302, locals = 0)]
     fn finish() -> bool {
         temp[3] = 1;
-        if ready() { return true; } else { return error; }
+        if ready() { return true; } else { panic!(); }
     }
 }"#;
     for behavioral in [false, true] {
         let lifted = lift(source, behavioral);
         let work = tree(&lifted, 4301);
         assert_eq!(work.matches("()?;").count(), 2, "{work}");
-        lacks(work, &["return error;"]);
+        lacks(work, &["panic!();"]);
         // With a plain return on the other arm, the return follows the `?`.
         let finish = tree(&lifted, 4302);
         has(finish, &["()?;\n        return true;"]);
-        lacks(finish, &["return error;"]);
+        lacks(finish, &["panic!();"]);
     }
 }
 

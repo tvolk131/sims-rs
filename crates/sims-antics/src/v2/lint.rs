@@ -211,7 +211,7 @@ pub const LINT_RULES: &[LintRule] = &[
     ),
     warn(
         PREFER_QUESTION_MARK,
-        "`if !f(..) { panic!(); }` (or `return error;`) on a `Result` call instead of `f(..)?;`",
+        "`if !f(..) { panic!(); }` on a `Result` call instead of `f(..)?;`",
     ),
     warn(
         PREFER_METHOD_SYNTAX,
@@ -4728,8 +4728,7 @@ impl FileLinter<'_> {
         }
         let what = match &list[i] {
             V2Stmt::Return { .. } => "`return`",
-            V2Stmt::ReturnError { panic: true, .. } => "`panic!()`",
-            V2Stmt::ReturnError { .. } => "`return error`",
+            V2Stmt::ReturnError { .. } => "`panic!()`",
             V2Stmt::Break { .. } => "`break`",
             V2Stmt::Continue { .. } => "`continue`",
             V2Stmt::If { .. } => "every branch of the `if`",
@@ -6064,8 +6063,9 @@ impl FileLinter<'_> {
     /// `place.set(T::F)`, `flag_clear` is `.clear(..)`, `flag_test` is `.contains(..)`.
     ///
     /// Only in an object's body, for a named object flag word (`self.flags`,
-    /// `stack_obj.flags2`; not `self.data[8]`, nor `world.expansions` or `wall_placement`,
-    /// which lowering types `i16`) whose `std::flags` type `T` the operand names: a raw bit
+    /// `stack_obj.wall_placement`; not `self.data[8]`, which lowering types `i16`) or
+    /// `world.expansions` (not `global[20]` written out), whose `std::flags` type `T` the
+    /// operand names: a raw bit
     /// (`flag_set 8`) or another constant has no method form. `op` is the operator's
     /// spelling, `method` the method's.
     fn flag_method(&mut self, place: &V2Expr, bit: &V2Expr, op: &str, method: &str) {
@@ -6074,30 +6074,58 @@ impl FileLinter<'_> {
         let Some(scope) = self.body_scope.as_ref() else {
             return;
         };
-        let V2Expr::Field {
-            base: root, field, ..
-        } = place
-        else {
-            return;
-        };
-        let V2Expr::Ident(at, root) = root.as_ref() else {
-            return;
-        };
-        // A state of the same name wins over the engine word (`me` is the Sim in a Sim's
-        // body), and a typed handle's object may have one this file does not show.
-        if (root == "self" || (root == "me" && !self.sim_body)) && scope.states.contains(field) {
-            return;
-        }
-        if self.bound.contains(root) && root != "stack_obj" {
-            return;
-        }
-        // Lowering keeps `wall_placement` an `i16` that takes `WallPlacement` constants
-        // (`lower/tree.rs` `OBJECT_DATA_WORDS`): no bitflags receiver.
-        if field == "wall_placement" {
-            return;
-        }
-        let Some(ty) = field_flags(field) else {
-            return;
+        let src = self.source;
+        // The receiver as written, where it starts, and its `std::flags` type.
+        let (start, receiver, ty) = match place {
+            V2Expr::Field {
+                base: root, field, ..
+            } => {
+                let V2Expr::Ident(at, root) = root.as_ref() else {
+                    return;
+                };
+                // A state of the same name wins over the engine word (`me` is the Sim in a
+                // Sim's body), and a typed handle's object may have one this file does not
+                // show.
+                if (root == "self" || (root == "me" && !self.sim_body))
+                    && scope.states.contains(field)
+                {
+                    return;
+                }
+                if self.bound.contains(root) && root != "stack_obj" {
+                    return;
+                }
+                let Some(ty) = field_flags(field) else {
+                    return;
+                };
+                let Some(start) = self.offset(*at) else {
+                    return;
+                };
+                (start, format!("{root}.{field}"), ty)
+            }
+            // `world.expansions`, which the parser reads as `global[20]` with the span of
+            // its dot. A `global[20]` written out has no `world.` before its span.
+            V2Expr::Index { span, base, index }
+                if matches!(base.as_ref(), V2Expr::Ident(_, g) if g == "global")
+                    && matches!(index.as_ref(), V2Expr::Int(_, 20)) =>
+            {
+                let receiver = "world.expansions";
+                let Some(dot) = self.offset(*span) else {
+                    return;
+                };
+                let Some(start) = dot.checked_sub("world".len()) else {
+                    return;
+                };
+                if src.get(start..start + receiver.len()) != Some(receiver)
+                    || src[..start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    return;
+                }
+                (start, receiver.to_owned(), "Expansions")
+            }
+            _ => return,
         };
         let V2Expr::Path(bit_at, segs) = bit else {
             return;
@@ -6108,9 +6136,8 @@ impl FileLinter<'_> {
         if !self.std_flag_spelling(ty, ty_name) || scope.types.contains(ty_name) {
             return;
         }
-        let (at, receiver) = (*at, format!("{root}.{field}"));
-        let src = self.source;
-        let (Some(start), Some(bit_start)) = (self.offset(at), self.offset(*bit_at)) else {
+        let at = place.span();
+        let Some(bit_start) = self.offset(*bit_at) else {
             return;
         };
         let path = segs.join("::");
@@ -6210,8 +6237,7 @@ impl FileLinter<'_> {
     }
 
     /// `prefer_question_mark`: `if !f(..) { panic!(); }` or
-    /// `if f(..) {} else { panic!(); }` on a call that returns `Result`, and the same with
-    /// `return error;`, which v2 still accepts.
+    /// `if f(..) {} else { panic!(); }` on a call that returns `Result`.
     fn prefer_question_mark(&mut self, s: &V2Stmt) {
         let V2Stmt::If {
             span,
@@ -6222,36 +6248,22 @@ impl FileLinter<'_> {
         else {
             return;
         };
-        let error = |b: &[V2Stmt]| {
-            matches!(
-                b,
-                [V2Stmt::ReturnError {
-                    from_try: false,
-                    ..
-                }]
-            )
-        };
-        let (call, else_form, exit) = match cond {
+        let error = |b: &[V2Stmt]| matches!(b, [V2Stmt::ReturnError { panic: true, .. }]);
+        let (call, else_form) = match cond {
             V2Expr::Unary {
                 op: V2UnaryOp::Not,
                 inner,
                 ..
-            } if error(then_body) && else_body.is_empty() => (inner.as_ref(), false, then_body),
-            c if then_body.is_empty() && error(else_body) => (c, true, else_body),
+            } if error(then_body) && else_body.is_empty() => (inner.as_ref(), false),
+            c if then_body.is_empty() && error(else_body) => (c, true),
             _ => return,
         };
-        let panics = matches!(exit.as_slice(), [V2Stmt::ReturnError { panic: true, .. }]);
         let V2Expr::Call {
             span: open, callee, ..
         } = call
         else {
             return;
         };
-        // A written `return error;` returns a binding named `error`; `panic!()` is always
-        // the error exit, as `?` is.
-        if !panics && self.bound.contains("error") {
-            return;
-        }
         let Some(name) = self.result_callee(callee) else {
             return;
         };
@@ -6601,7 +6613,7 @@ fn first_unassigned_read(list: &[V2Stmt], name: &str, user: &dyn Fn(&str) -> boo
 }
 
 /// Whether control never goes on past `s` to the next statement of its block: a `return`,
-/// `panic!()` / `return error`, `break` or `continue`, or an `if` with an `else` / a `match` with a `_`
+/// `panic!()`, `break` or `continue`, or an `if` with an `else` / a `match` with a `_`
 /// arm whose every branch leaves. (A `match` without `_` falls through for a value no arm
 /// names; a loop, `with lock`, `defer` or `animate` may go on.)
 fn stmt_leaves(s: &V2Stmt) -> bool {
@@ -6988,13 +7000,13 @@ const fn typed(
 
 /// `self.data[N]` cells with an `i16` or `ObjectId` name, as lowering maps them
 /// (`lower/lvalue.rs`, `lower/expr.rs`, `lower/tree.rs` `OBJECT_DATA_FIELDS`). `flags`
-/// (`data[8]`), `allowed_heights` (`data[4]`) and `placement` (`data[42]`) are typed
-/// bitflags, which an `i16` use of the cell does not type-check as.
+/// (`data[8]`), `allowed_heights` (`data[4]`), `wall_placement` (`data[13]`) and
+/// `placement` (`data[42]`) are typed bitflags, which an `i16` use of the cell does not
+/// always type-check as: [`OBJECT_WORDS`] proposes them, byte-checked.
 const SELF_FIELDS: &[TypedField] = &[
     typed("data", 0, "graphic", true, false),
     typed("data", 7, "room_impact", true, false),
     typed("data", 11, "id", false, true),
-    typed("data", 13, "wall_placement", true, false),
     typed("data", 15, "broken", true, false),
     typed("data", 25, "in_use", true, false),
     typed("data", 29, "room", false, false),
