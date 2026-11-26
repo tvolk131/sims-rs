@@ -286,6 +286,9 @@ impl<'a> TreeLowerer<'a> {
         Ok((l_eff, r))
     }
 
+    /// `flags.contains(F)` / `.intersects(F)` / `.is_empty()`, and the list forms
+    /// `flags.contains_all([A, B])` / `.contains_any([A, B])`, which lower exactly as
+    /// `.contains(A | B)` / `.intersects(A | B)`.
     pub(super) fn lower_bitflag_predicate(
         &mut self,
         receiver: &V2Expr,
@@ -294,6 +297,14 @@ impl<'a> TreeLowerer<'a> {
         span: Span,
         negated: bool,
     ) -> Result<String> {
+        let contains = matches!(method, "contains" | "contains_all");
+        let folded;
+        let args = if FLAG_LIST_METHODS.contains(&method) {
+            folded = [super::stmt::fold_flag_list(method, args, span)?];
+            &folded[..]
+        } else {
+            args
+        };
         let derefed = self.maybe_auto_deref_mut_ref(receiver);
         let (lhs_air, lhs_ty) = self.lower_value_expr(derefed.as_ref().unwrap_or(receiver))?;
         let ValueType::Bitflags(key) = lhs_ty else {
@@ -330,14 +341,14 @@ impl<'a> TreeLowerer<'a> {
                 });
             }
             if mask == 0 {
-                let res = method == "contains";
+                let res = contains;
                 let effective = if negated { !res } else { res };
                 return Ok(if effective { "1 == 1" } else { "1 == 0" }.to_owned());
             }
             let tmp = self.fresh("bf_tst");
             self.emit_let(&tmp, &lhs_air);
             self.line(format!("{tmp} &= {mask};"));
-            return Ok(if method == "contains" {
+            return Ok(if contains {
                 if negated {
                     format!("{tmp} != {mask}")
                 } else {
@@ -372,7 +383,7 @@ impl<'a> TreeLowerer<'a> {
         let tmp = self.fresh("bf_tst");
         self.emit_let(&tmp, &lhs_snap);
         self.line(format!("{tmp} &= {rhs_air};"));
-        Ok(if method == "contains" {
+        Ok(if contains {
             if negated {
                 format!("{tmp} != {rhs_air}")
             } else {
@@ -459,13 +470,16 @@ impl<'a> TreeLowerer<'a> {
                 }
                 if let Some(sig) = self.resolve_callable(callee, *span)? {
                     return match sig.ret {
-                        ResolvedReturnAbi::Bool | ResolvedReturnAbi::Result => {
+                        // An `Option<T>` call tests `Some` (its true exit), like `-> bool`.
+                        ResolvedReturnAbi::Bool
+                        | ResolvedReturnAbi::Result
+                        | ResolvedReturnAbi::OptionValue { .. } => {
                             Ok(Some(self.prepare_callable_call(&sig, args, *span)?))
                         }
                         _ => Err(Error::at(
                             *span,
                             format!(
-                                "{} cannot be used as a condition (only '-> bool' and '-> Result' calls can)",
+                                "{} cannot be used as a condition (only '-> bool', '-> Result' and '-> Option<T>' calls can)",
                                 sig.display
                             ),
                         )),
@@ -566,7 +580,7 @@ impl<'a> TreeLowerer<'a> {
                 method,
                 type_args,
                 args,
-            } if matches!(method.as_str(), "contains" | "intersects" | "is_empty") => {
+            } if is_bitflag_predicate(method) => {
                 if !type_args.is_empty() {
                     return Err(Error::at(
                         *span,
@@ -685,7 +699,7 @@ impl<'a> TreeLowerer<'a> {
                 method,
                 type_args,
                 args,
-            } if matches!(method.as_str(), "contains" | "intersects" | "is_empty") => {
+            } if is_bitflag_predicate(method) => {
                 if !type_args.is_empty() {
                     return Err(Error::at(
                         *span,

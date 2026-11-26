@@ -254,11 +254,11 @@ fn temps_calls_to_trees_with_arguments_lift_in_behavioral_mode() {
     // Strict mode keeps the temps call raw: v2's copies of the temps are other nodes.
     let strict = lift(source, false);
     has(tree(&strict, 4301), &["call 4300(temps)"]);
-    // Behavioral mode names the callee; the copies need a frame local, which the header
-    // gains (frame storage is not compared there).
+    // Behavioral mode names the callee. Its arguments are already in their temps, so the
+    // call stages nothing and the frame gains no local.
     let lifted = lift(source, true);
     let heat = tree(&lifted, 4301);
-    has(heat, &["(temp[0], temp[1])", "args = 4, locals = 2,"]);
+    has(heat, &["(temp[0], temp[1])", "args = 4, locals = 0,"]);
     lacks(heat, &["call 4300(temps)", "raw"]);
 }
 

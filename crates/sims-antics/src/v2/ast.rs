@@ -69,8 +69,11 @@ pub enum ReturnAbi {
     Bool,
     /// `-> Result`: true exit = success, false exit = failure (`?` propagates `return error;`).
     Result,
-    /// `#[ret(temp = N)] .. -> T`: the callee leaves a value in `temp[N]` (true/false exit ignored).
-    Value { ty: V2Type, temp: u8 },
+    /// `#[ret(temp = N)] .. -> T`: the callee leaves a value in `temp[N]` (true/false exit
+    /// ignored). With `option`, it is `#[ret(temp = N)] .. -> Option<T>`: the true exit is
+    /// `Some`, with the value in `temp[N]`, and the false exit is `None` (an answer, not a
+    /// failure).
+    Value { ty: V2Type, temp: u8, option: bool },
     /// `#[ret(temp = N)] .. -> Result<T>`: true exit = success with the value in `temp[N]`, false = failure.
     ResultValue { ty: V2Type, temp: u8 },
 }
@@ -602,6 +605,10 @@ pub enum V2BinOp {
     BitOr,
     BitXor,
 }
+
+/// Bitflags methods that take a bracketed list of flags (`flags.set_all([A, B])`). The parser
+/// turns the list into the method call's positional arguments, one per element.
+pub const FLAG_LIST_METHODS: &[&str] = &["set_all", "clear_all", "contains_all", "contains_any"];
 
 /// Unary operators in `.antics` v2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
