@@ -342,15 +342,24 @@ impl NeighborhoodShell {
                 if sims_vm::caf::is_reserved_pool_family(id) || id > i16::MAX as u16 {
                     continue;
                 }
-                let member_count = parsed
+                let members: Vec<u16> = parsed
                     .export_info
                     .member_ids
                     .into_iter()
                     .take_while(|&id| id != 0)
-                    .count();
-                if member_count == 0 {
+                    .collect();
+                // The importer's member checks (`import_family_fam`): one
+                // to eight, ids up to i16::MAX, none twice.
+                let mut seen = BTreeSet::new();
+                if members.is_empty()
+                    || members.len() > sims_vm::caf::MAX_HOUSEHOLD_MEMBERS
+                    || !members
+                        .iter()
+                        .all(|&id| id <= i16::MAX as u16 && seen.insert(id))
+                {
                     continue;
                 }
+                let member_count = members.len();
                 let family_name = parsed
                     .iff
                     .get(b"CTSS", 1000)
@@ -841,24 +850,37 @@ pub(super) fn export_file_name(name: &str, family_id: u16) -> String {
         cleaned
     };
     // Windows takes a name whose part before the first dot is a device
-    // (`NUL.backup`) as that device: such a name gets a leading `_`.
-    let device = stem
+    // (`NUL.backup`, `COM¹`) as that device: such a name gets a leading `_`.
+    let device: Vec<char> = stem
         .split('.')
         .next()
         .unwrap_or("")
         .trim_end()
-        .to_ascii_uppercase();
-    let reserved = matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || ((device.starts_with("COM") || device.starts_with("LPT"))
-            && device.len() == 4
-            && device.as_bytes()[3].is_ascii_digit()
-            && device.as_bytes()[3] != b'0');
-    if reserved {
-        format!("_{stem}_{family_id}.FAM")
-    } else {
-        format!("{stem}_{family_id}.FAM")
+        .chars()
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    let reserved = match device.as_slice() {
+        ['C', 'O', 'N'] | ['P', 'R', 'N'] | ['A', 'U', 'X'] | ['N', 'U', 'L'] => true,
+        ['C', 'O', 'M', n] | ['L', 'P', 'T', n] => matches!(n, '1'..='9' | '¹' | '²' | '³'),
+        _ => false,
+    };
+    let prefix = if reserved { "_" } else { "" };
+    let tail = format!("_{family_id}.FAM");
+    // A file name is at most 255 bytes on the file systems the game runs
+    // on: a longer family name is cut, at a character, to fit. The family
+    // keeps its whole name inside the file.
+    let room = FILE_NAME_MOST - prefix.len() - tail.len();
+    let mut cut = stem.len().min(room);
+    while !stem.is_char_boundary(cut) {
+        cut -= 1;
     }
+    let stem = stem[..cut].trim_end_matches(['.', ' ']);
+    let stem = if stem.is_empty() { "Family" } else { stem };
+    format!("{prefix}{stem}{tail}")
 }
+
+/// The longest file name, in bytes, the export writes.
+const FILE_NAME_MOST: usize = 255;
 
 #[cfg(test)]
 mod export_name_tests {
@@ -912,5 +934,26 @@ mod export_name_tests {
         assert_eq!(export_file_name("Nullson", 7), "Nullson_7.FAM");
         // A long name still writes: the temporary name is short.
         assert_eq!(export_file_name(&"a".repeat(248), 7).len(), 254);
+        // Superscript device digits.
+        assert_eq!(
+            export_file_name("COM\u{b9}.backup", 7),
+            "_COM\u{b9}.backup_7.FAM"
+        );
+        assert_eq!(export_file_name("lpt\u{b3}", 7), "_lpt\u{b3}_7.FAM");
+        // Too long for a file name: cut at a character to 255 bytes.
+        for name in [
+            "\u{20ac}".repeat(100),
+            "a".repeat(300),
+            "NUL".to_owned() + &"x".repeat(300),
+        ] {
+            let file = export_file_name(&name, 32767);
+            assert!(file.len() <= 255, "{} bytes", file.len());
+            assert!(file.ends_with("_32767.FAM"));
+        }
+        assert_eq!(
+            export_file_name(&"\u{20ac}".repeat(100), 7),
+            "\u{20ac}".repeat(83) + "_7.FAM",
+            "249 / 3 whole characters"
+        );
     }
 }

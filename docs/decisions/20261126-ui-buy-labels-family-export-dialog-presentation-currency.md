@@ -33,8 +33,10 @@ way the original's exports are written. The file goes to:
   the shell never writes there.
 - **Name.** It uses the original's `<Name>_<id>.FAM` form. Characters that
   some platform cannot hold in a file name become `_`. A name whose part
-  before the first dot is a Windows device name (`NUL.backup`, `COM1`) gets
-  a leading `_`.
+  before the first dot is a Windows device name (`NUL.backup`, `COM1`,
+  `COM¹`) gets a leading `_`. A name too long for a 255-byte file name is
+  cut at a character to fit; the family keeps its whole name inside the
+  file.
 - **Overwrite.** It replaces an earlier export of the same family.
 - **Atomic write.** The bytes go to a hidden temporary file beside the
   target, created fresh for that one write (never an existing file or a
@@ -43,8 +45,9 @@ way the original's exports are written. The file goes to:
 
 The Import picker scans this folder as well, under the label "Exported", so
 an export can be imported back. The picker skips the reserved pool families
-(`sims_vm::caf::is_reserved_pool_family`) and ids past `i16::MAX`, which the
-importer refuses. It no longer skips every id from 4000 up. A notice tells
+(`sims_vm::caf::is_reserved_pool_family`), ids past `i16::MAX`, and files
+whose member list the importer would refuse: no members, more than eight,
+an id past `i16::MAX`, or a repeated id. It no longer skips every id from 4000 up. A notice tells
 the player the path, or the reason the export failed.
 
 ## Non-modal, anchored and large dialogs
@@ -98,7 +101,11 @@ Layout and input rules:
 The simulation does not yet hand non-modal dialogs to the interface.
 `sims-vm`'s tick answers them at once (FIRST, or DONE for informs), so this
 work is presentation and input routing that waits on the VM to stop doing
-that. The original also sets a 40-second auto-answer timer on non-anchored
+that. When the VM does stop, a non-modal prompt it publishes through
+`Lot::asking` needs two things. First, `Game::has_dialog` must not count it,
+since today that would swallow every press, including the dismiss box.
+Second, it needs an answer path that does not require a modal `Asking`
+record. The original also sets a 40-second auto-answer timer on non-anchored
 dialogs that do not ask for text (legacy `widget_setting`). That timer is
 not ported.
 
