@@ -19,8 +19,10 @@
 //!
 //! See `docs/decisions/20261124-antics-v2-lint.md`,
 //! `docs/decisions/20261125-antics-v2-new-lints.md`,
-//! `docs/decisions/20261125-antics-v2-lint-wave2.md` and
-//! `docs/decisions/20261125-antics-v2-lint-wave3.md`.
+//! `docs/decisions/20261125-antics-v2-lint-wave2.md`,
+//! `docs/decisions/20261125-antics-v2-lint-wave3.md`,
+//! `docs/decisions/20261125-antics-v2-lint-wave4.md` and
+//! `docs/decisions/20261125-antics-v2-lint-collapsible-else-if.md`.
 
 use crate::error::{Error, Result, Span};
 use crate::v2::ast::{
@@ -100,6 +102,7 @@ pub(crate) const FRAME_LOCAL_WARN: u16 = 12;
 pub const WHILE_TRUE: &str = "while_true";
 pub const REDUNDANT_BOOL_RETURN: &str = "redundant_bool_return";
 pub const COLLAPSIBLE_IF_CHAIN: &str = "collapsible_if_chain";
+pub const COLLAPSIBLE_ELSE_IF: &str = "collapsible_else_if";
 pub const MANUAL_RAW_HAS_BUILTIN: &str = "manual_raw_has_builtin";
 pub const MAGIC_GUID_LITERAL: &str = "magic_guid_literal";
 pub const NEGATED_COMPARISON: &str = "negated_comparison";
@@ -160,6 +163,10 @@ pub const LINT_RULES: &[LintRule] = &[
     warn(
         COLLAPSIBLE_IF_CHAIN,
         "an `if`/`else if` chain testing one place against 3+ values",
+    ),
+    warn(
+        COLLAPSIBLE_ELSE_IF,
+        "an `else { .. }` holding only an `if`, instead of `else if`",
     ),
     warn(
         MANUAL_RAW_HAS_BUILTIN,
@@ -368,6 +375,8 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             assigned: None,
             air_consts: BTreeMap::new(),
             source: &input.source,
+            tokens,
+            else_named: else_named(tokens),
             uses: &ast.uses,
             item_names: ast
                 .items
@@ -1602,6 +1611,10 @@ struct FileLinter<'a> {
     air_consts: BTreeMap<String, String>,
     /// The file's source.
     source: &'a str,
+    /// Its tokens (comments are not tokens; a `raw { }` body is one).
+    tokens: &'a [crate::v2::lexer::Token],
+    /// Whether some `else` in the file is a name, not the keyword (see [`else_named`]).
+    else_named: bool,
     /// Its `use` declarations.
     uses: &'a [crate::v2::ast::UseDecl],
     /// The names of its top-level items.
@@ -3422,6 +3435,11 @@ impl FileLinter<'_> {
         self.written.clear();
         self.assigned = None;
         self.prefer_question_mark(s);
+        if let V2Stmt::If { else_body, .. } = s
+            && let [V2Stmt::If { span, .. }] = else_body.as_slice()
+        {
+            self.collapsible_else_if(*span);
+        }
         match s {
             V2Stmt::While {
                 span,
@@ -3522,9 +3540,75 @@ impl FileLinter<'_> {
                     let pats: Vec<&MatchPattern> = arms.iter().map(|a| &a.pattern).collect();
                     self.enum_wildcard(&pats);
                 }
+                V2Expr::If { else_value, .. } => {
+                    if let V2Expr::If { span, .. } = else_value.as_ref() {
+                        self.collapsible_else_if(*span);
+                    }
+                }
                 _ => {}
             }
         }
+    }
+
+    /// `collapsible_else_if`: `else { if .. }`, an `else` block holding one `if` and
+    /// nothing else, where `else if ..` says the same. `inner` is the `if` the `else` holds.
+    ///
+    /// The parser reads both spellings to the same tree, so the AST cannot tell them apart:
+    /// the tokens around `inner` do. Reported only when the `if` and its `else` chain are
+    /// the whole block, and no comment sits where the collapse drops text (between `else`,
+    /// `{` and `if`, or between the chain's last `}` and the block's `}`).
+    fn collapsible_else_if(&mut self, inner: Span) {
+        let toks = self.tokens;
+        if self.else_named {
+            return;
+        }
+        let at =
+            toks.partition_point(|t| (t.span.line, t.span.column) < (inner.line, inner.column));
+        if at < 2 || !is_kw(toks.get(at), "if") {
+            return;
+        }
+        let (open, else_at) = (at - 1, at - 2);
+        if toks[open].kind != TokenKind::LBrace || !is_kw(toks.get(else_at), "else") {
+            return;
+        }
+        let Some(end) = if_chain_end(toks, at) else {
+            return;
+        };
+        let close = end + 1;
+        if toks.get(close).map(|t| &t.kind) != Some(&TokenKind::RBrace) {
+            return;
+        }
+        let offset = |i: usize| self.offset(toks[i].span);
+        let (Some(e), Some(o), Some(f), Some(x), Some(c)) = (
+            offset(else_at),
+            offset(open),
+            offset(at),
+            offset(end),
+            offset(close),
+        ) else {
+            return;
+        };
+        let blank = |from: usize, to: usize| {
+            from <= to
+                && self
+                    .source
+                    .get(from..to)
+                    .is_some_and(|gap| gap.trim().is_empty())
+        };
+        if !(blank(e + 4, o) && blank(o + 1, f) && blank(x + 1, c)) {
+            return;
+        }
+        self.emit(
+            COLLAPSIBLE_ELSE_IF,
+            toks[else_at].span,
+            "this `else` block holds only an `if`".to_owned(),
+            Some(
+                "write `else if ..`: drop the `else` block's braces; it parses to the same tree"
+                    .to_owned(),
+            ),
+            None,
+            None,
+        );
     }
 
     fn enum_wildcard(&mut self, pats: &[&MatchPattern]) {
@@ -5141,6 +5225,70 @@ fn split_args(src: &str, from: usize, to: usize) -> Option<Vec<&str>> {
 fn skip_ws(src: &str, at: usize) -> usize {
     src.get(at..)
         .map_or(at, |rest| at + rest.len() - rest.trim_start().len())
+}
+
+/// Whether some `else` in `toks` names something (`let else = 0;`) instead of being the
+/// keyword, which is always followed by `{` or `if`. `collapsible_else_if` is off in such a
+/// file: the collapse moves the inner chain's end next to whatever follows the block, and a
+/// statement `else = 3;` there would be read as the chain's `else`.
+fn else_named(toks: &[crate::v2::lexer::Token]) -> bool {
+    toks.windows(2).any(|w| {
+        is_kw(Some(&w[0]), "else") && w[1].kind != TokenKind::LBrace && !is_kw(Some(&w[1]), "if")
+    })
+}
+
+/// Whether `t` is the keyword (identifier token) `kw`.
+fn is_kw(t: Option<&crate::v2::lexer::Token>, kw: &str) -> bool {
+    matches!(t.map(|t| &t.kind), Some(TokenKind::Ident(k)) if k == kw)
+}
+
+/// The index of the `}` that ends the `if` at `toks[at]` with its `else if` / `else`
+/// chain, or `None` when the tokens are not plainly such a chain: a condition holding
+/// braces or an `if` / `match` (whose braces would be misread), or an unclosed group.
+fn if_chain_end(toks: &[crate::v2::lexer::Token], mut at: usize) -> Option<usize> {
+    // The `}` matching the `{` at `open`.
+    let group = |open: usize| {
+        let mut depth = 0usize;
+        for (i, t) in toks.iter().enumerate().skip(open) {
+            match t.kind {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                TokenKind::Eof => return None,
+                _ => {}
+            }
+        }
+        None
+    };
+    loop {
+        // The condition: up to the first `{` outside brackets.
+        let mut depth = 0usize;
+        let mut open = at + 1;
+        loop {
+            match &toks.get(open)?.kind {
+                TokenKind::LParen | TokenKind::LBracket => depth += 1,
+                TokenKind::RParen | TokenKind::RBracket => depth = depth.checked_sub(1)?,
+                TokenKind::LBrace if depth == 0 => break,
+                TokenKind::LBrace | TokenKind::RBrace | TokenKind::Eof => return None,
+                TokenKind::Ident(k) if k == "if" || k == "match" => return None,
+                _ => {}
+            }
+            open += 1;
+        }
+        let end = group(open)?;
+        if !is_kw(toks.get(end + 1), "else") {
+            return Some(end);
+        }
+        match toks.get(end + 2)?.kind {
+            TokenKind::LBrace => return group(end + 2),
+            TokenKind::Ident(ref k) if k == "if" => at = end + 2,
+            _ => return None,
+        }
+    }
 }
 
 /// Whether `text` holds a `//` or `/*` comment outside its strings.
