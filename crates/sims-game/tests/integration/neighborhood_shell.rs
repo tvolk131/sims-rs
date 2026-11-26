@@ -821,6 +821,108 @@ fn move_in_rollback_magic_town_magicoins_pace_sync_and_family_bin_clicks() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
+/// The Family Bin's Export button, clicked like a player would: select a
+/// family, press and release Export, and the shell writes
+/// `<saves>.userdata/<neighborhood>/Export/<Name>_<id>.FAM`, says so in a
+/// notice, and offers the file in the Import picker.
+#[test]
+fn family_bin_export_button_writes_an_importable_fam_and_says_where() {
+    use sims_ui::family_bin::{FamilyBinButton, FamilyBinLayout, FamilyBinMode};
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL is not set; skipping Family Bin export");
+        return;
+    };
+    let install = PathBuf::from(root);
+    let (tmp_dir, saves_path) = temp_redb("bin-export");
+    let mut shell = NeighborhoodShell::open(
+        install,
+        saves_path.clone(),
+        1,
+        true,
+        vec![3],
+        Frames::default(),
+    )
+    .expect("NeighborhoodShell opens");
+    shell.resize([800, 600]);
+    shell.open_family_bin();
+    assert_eq!(shell.screen(), ScreenKind::FamilyBin);
+    let entries = shell.family_bin_entries().to_vec();
+    assert!(
+        !entries.is_empty(),
+        "the stock neighborhood has bin families"
+    );
+    let layout = FamilyBinLayout::compute(800, 600, entries.len(), 0, FamilyBinMode::Standard);
+    let centre = |r: sims_ui::frame::Rect| [r.x + r.width / 2, r.y + r.height / 2];
+
+    // Export is disabled until a family is chosen.
+    let export = layout
+        .button_rect(FamilyBinButton::ExportFamily)
+        .expect("Export button rect");
+    shell.press(centre(export));
+    shell.release(centre(export));
+    let export_dir = shell.family_export_dir();
+    assert!(
+        !export_dir.exists(),
+        "nothing is exported with no family selected"
+    );
+
+    // Select the first row, then Export.
+    let row = centre(layout.row_rects[0]);
+    shell.press(row);
+    shell.release(row);
+    let family = entries[0].clone();
+    shell.press(centre(export));
+    shell.release(centre(export));
+
+    let id = u16::try_from(family.id).unwrap();
+    let files: Vec<_> = std::fs::read_dir(&export_dir)
+        .expect("export dir made")
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(
+        files.len(),
+        1,
+        "exactly one file, no partial left: {files:?}"
+    );
+    let path = &files[0];
+    assert!(
+        path.starts_with(sims_game::user_files::userdata_dir(&saves_path)),
+        "exports go beside the saves file, never into the install: {}",
+        path.display()
+    );
+    let file_name = path.file_name().unwrap().to_str().unwrap();
+    assert!(
+        file_name.ends_with(&format!("_{id}.FAM")),
+        "named <Name>_<id>.FAM: {file_name}"
+    );
+    let bytes = std::fs::read(path).unwrap();
+    let parsed = sims_formats::family_file::FamilyFile::parse(&bytes).expect("export parses");
+    assert_eq!(parsed.export_info.family_id, id);
+    assert!(
+        parsed.export_info.member_ids.iter().any(|&m| m != 0),
+        "the export carries its members"
+    );
+
+    // The player is told where it went.
+    assert!(shell.has_dialog(), "a notice reports the export");
+    let note = shell.note().expect("status note");
+    assert!(
+        note.contains(&path.display().to_string()),
+        "the notice names the file: {note}"
+    );
+
+    // The Import picker offers it back.
+    assert!(shell.importable_family_paths().contains(path));
+    assert!(shell.has_importable_family());
+
+    // Exporting again replaces the file rather than adding a second.
+    shell.export_family(id).expect("re-export");
+    assert_eq!(std::fs::read_dir(&export_dir).unwrap().count(), 1);
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
 #[test]
 fn neighborhood_shell_resizes_cleanly_across_non_native_viewports() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {

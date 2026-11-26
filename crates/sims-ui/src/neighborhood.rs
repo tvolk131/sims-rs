@@ -1494,23 +1494,11 @@ pub(crate) fn draw_tooltip(frame: &mut Frame, art: &Art, text: &str, anchor: [i3
 }
 
 /// Formats a Simoleon integer with `$` prefix (which renders as the Simoleon
-/// glyph in `variablesans_*.ffn`) and thousands separators.
+/// glyph in `variablesans_*.ffn`) and thousands separators, as the
+/// original's locale currency formatter does (0x6007df,
+/// [`crate::currency::simoleons`]): `$1,000`, `-$5`.
 pub fn format_simoleons(amount: i32) -> String {
-    let negative = amount < 0;
-    let abs = amount.unsigned_abs().to_string();
-    let mut grouped = String::with_capacity(abs.len() + abs.len() / 3 + 2);
-    if negative {
-        grouped.push('-');
-    }
-    grouped.push('$');
-    let len = abs.len();
-    for (i, ch) in abs.chars().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
-            grouped.push(',');
-        }
-        grouped.push(ch);
-    }
-    grouped
+    crate::currency::simoleons(i64::from(amount))
 }
 
 /// Formats the lot's street address from `lot_number` using the 1.91 `STR# 134`

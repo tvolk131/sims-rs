@@ -9,7 +9,7 @@ use crate::menu::{Menu, Release};
 use crate::pace::Pace;
 use crate::view::View;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
-use sims_content::{ArchivePool, Catalog, Index, Install, Neighborhood};
+use sims_content::{ArchivePool, BuyLabels, Catalog, Index, Install, Neighborhood};
 use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_sim::World;
 use sims_ui::art::Art;
@@ -253,6 +253,9 @@ pub struct Hud {
     rating_labels: RatingLabels,
     /// Buy Mode sell prompt templates (`GameData/UIText.iff STR# 136`, `0x50a343`).
     sell_labels: SellLabels,
+    /// The Buy Mode category buttons' text (`GameData/UIText.iff` STR# 150,
+    /// 200–207 and 210, 0x5057a2–0x5058cb), if `UIText.iff` has the tables.
+    category_labels: Option<BuyLabels>,
     /// The Buy Mode catalog strip state (sort, category, subcategory, page,
     /// selected GUID).
     pub buy_state: BuyState,
@@ -285,6 +288,7 @@ pub(crate) struct HudStatic {
     labels: Labels,
     rating_labels: RatingLabels,
     sell_labels: SellLabels,
+    category_labels: Option<BuyLabels>,
     texts: Texts,
     fame: Fame,
     options_texts: OptionsTexts,
@@ -299,6 +303,8 @@ impl HudStatic {
                 let labels = Labels::load(install).map_err(|e| e.to_string())?;
                 let rating_labels = RatingLabels::load(install);
                 let sell_labels = SellLabels::load(install);
+                // Without the category tables the Buy buttons have no text.
+                let category_labels = BuyLabels::load(install, US_ENGLISH).ok();
                 // Without the balloons', options', or camera strings the HUD still opens with defaults.
                 let texts = Texts::load(install).unwrap_or_default();
                 let fame = Fame::load(install).unwrap_or_default();
@@ -310,6 +316,7 @@ impl HudStatic {
                     labels,
                     rating_labels,
                     sell_labels,
+                    category_labels,
                     texts,
                     fame,
                     options_texts,
@@ -356,6 +363,7 @@ impl HudStatic {
             labels,
             rating_labels,
             sell_labels,
+            category_labels,
             texts,
             fame,
             options_texts,
@@ -368,6 +376,7 @@ impl HudStatic {
             labels,
             rating_labels,
             sell_labels,
+            category_labels,
             texts,
             fame,
             options_texts,
@@ -385,6 +394,7 @@ impl HudStatic {
             labels: Labels::default(),
             rating_labels: RatingLabels::default(),
             sell_labels: SellLabels::default(),
+            category_labels: None,
             texts: Texts::default(),
             fame: Fame::default(),
             options_texts: OptionsTexts::default(),
@@ -698,6 +708,7 @@ impl Hud {
             buy_catalog: None,
             rating_labels: static_part.rating_labels,
             sell_labels: static_part.sell_labels,
+            category_labels: static_part.category_labels,
             buy_state: BuyState::default(),
             buy_layout: BuyLayout::default(),
             install: install.clone(),
@@ -777,8 +788,14 @@ impl Hud {
 
     /// Loads the residential Buy Mode catalog on first use and returns it.
     pub fn ensure_buy_catalog(&mut self, assets: &Assets) -> &BuyCatalog {
-        self.buy_catalog
-            .get_or_insert_with(|| load_buy_catalog(assets, &self.rating_labels, &self.sell_labels))
+        self.buy_catalog.get_or_insert_with(|| {
+            load_buy_catalog(
+                assets,
+                &self.rating_labels,
+                &self.sell_labels,
+                self.category_labels.as_ref(),
+            )
+        })
     }
 
     /// The residential Buy Mode catalog, once loaded.
@@ -841,7 +858,12 @@ impl Hud {
         let zone = sims_ui::buy::BuyZone::for_lot(lot_id, lot_zoning);
         self.buy_state.set_zone(zone);
         let catalog = self.buy_catalog.get_or_insert_with(|| {
-            load_buy_catalog(assets, &self.rating_labels, &self.sell_labels)
+            load_buy_catalog(
+                assets,
+                &self.rating_labels,
+                &self.sell_labels,
+                self.category_labels.as_ref(),
+            )
         });
         let funds = sims_vm::available_funds(world);
         let layout = buy::layout_with_sell(size, catalog, &self.buy_state, &self.art, funds, sell);
@@ -3304,16 +3326,21 @@ impl Hud {
     }
 }
 
-/// The residential Buy Mode catalog with its popup rating and sell prompt
-/// labels, loaded on first use.
+/// The residential Buy Mode catalog with its popup rating, sell prompt and
+/// category button labels, loaded on first use.
 fn load_buy_catalog(
     assets: &Assets,
     rating_labels: &RatingLabels,
     sell_labels: &SellLabels,
+    category_labels: Option<&BuyLabels>,
 ) -> BuyCatalog {
-    BuyCatalog::load(assets.index(), assets.catalog())
+    let catalog = BuyCatalog::load(assets.index(), assets.catalog())
         .with_rating_labels(rating_labels.clone())
-        .with_sell_labels(sell_labels.clone())
+        .with_sell_labels(sell_labels.clone());
+    match category_labels {
+        Some(labels) => catalog.with_category_labels(labels.clone()),
+        None => catalog,
+    }
 }
 
 /// The actions whose icons were pressed while they show: a second press

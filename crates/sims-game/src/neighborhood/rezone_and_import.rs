@@ -281,6 +281,12 @@ impl NeighborhoodShell {
                 .to_owned();
             dirs.push((extra.clone(), label));
         }
+        // The shell's own exports ([`Self::family_export_dir`]) can be
+        // imported again, as the original's `Export` folder's can.
+        let exports = self.family_export_dir();
+        if exports.is_dir() && !dirs.iter().any(|(d, _)| d == &exports) {
+            dirs.push((exports, "Exported".to_owned()));
+        }
         if let Ok(user_dir) = resolve_user_dir(&self.install, self.slot) {
             if let Some(imp) = resolve_dir_case_insensitive(&user_dir, "Import") {
                 dirs.push((imp, format!("{}/Import", self.neighborhood_id)));
@@ -377,6 +383,15 @@ impl NeighborhoodShell {
             }
         }
         out
+    }
+
+    /// The `.FAM` files the Import picker would offer, in the order it
+    /// lists them.
+    pub fn importable_family_paths(&self) -> Vec<PathBuf> {
+        self.scan_importable_families()
+            .into_iter()
+            .map(|f| f.path)
+            .collect()
     }
 
     /// Rescans configured `Import/` and `Export/` folders for `.FAM` archives
@@ -511,6 +526,76 @@ impl NeighborhoodShell {
                 ShellOutcome::redraw()
             }
         }
+    }
+
+    /// Where the Family Bin's Export button writes `.FAM` files:
+    /// `<saves file name>.userdata/<neighborhood id>/Export/`, beside the
+    /// saves file and never in the install, as the shell's
+    /// `Neighborhood.iff` is ([`Self::neighborhood_iff_path`]). The
+    /// original writes its exports to its `UserData*/Export` folder.
+    pub fn family_export_dir(&self) -> PathBuf {
+        self.neighborhood_iff_dir().join("Export")
+    }
+
+    /// Exports family `family_id` from the Family Bin as a `.FAM` file in
+    /// [`Self::family_export_dir`], with the family's `FAMh` if its save
+    /// inputs hold one ([`sims_vm::caf::export_stored_family_fam`], the
+    /// routine 0x428a17 calls, with `FINV` as the original's exports have).
+    /// The file is named `<family name>_<family id>.FAM`, as the original
+    /// names its exports, and replaces an earlier export of the same
+    /// family. It is written to a temporary file first and renamed, so a
+    /// failed write never leaves half a file under the final name.
+    /// Returns the file written.
+    pub fn export_family(&mut self, family_id: u16) -> Result<PathBuf, String> {
+        if !self.stored.families.contains_key(&family_id) {
+            return Err(format!("family {family_id} is not in this neighborhood"));
+        }
+        let name = self
+            .family_names
+            .get(&family_id)
+            .cloned()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| format!("Family {family_id}"));
+        let bytes = sims_vm::caf::export_stored_family_fam(
+            &self.store,
+            &self.neighborhood_id,
+            family_id,
+            &name,
+            US_ENGLISH,
+            true,
+        )
+        .map_err(|e| e.to_string())?;
+        let dir = self.family_export_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let path = dir.join(export_file_name(&name, family_id));
+        let partial = path.with_extension("FAM.partial");
+        std::fs::write(&partial, &bytes).map_err(|e| format!("{}: {e}", partial.display()))?;
+        if let Err(e) = std::fs::rename(&partial, &path) {
+            let _ = std::fs::remove_file(&partial);
+            return Err(format!("{}: {e}", path.display()));
+        }
+        self.refresh_importable_families();
+        Ok(path)
+    }
+
+    /// Exports family `family_id` ([`Self::export_family`]) and tells the
+    /// player where the file went, or why it could not be written.
+    pub(super) fn export_family_with_notice(&mut self, family_id: u16) {
+        let name = self
+            .family_names
+            .get(&family_id)
+            .cloned()
+            .unwrap_or_else(|| format!("Family {family_id}"));
+        let title = "Export Family".to_owned();
+        let body = match self.export_family(family_id) {
+            Ok(path) => format!("{name} was exported to {}.", path.display()),
+            Err(e) => format!("Could not export {name}: {e}"),
+        };
+        self.note = Some(body.clone());
+        self.open_dialog(
+            ShellDialogKind::Notice,
+            Message::notice(title, body, self.dialogs.ok()).with_frame(FrameStyle::Generic),
+        );
     }
 
     pub(super) fn execute_import_family(
@@ -701,5 +786,44 @@ impl NeighborhoodShell {
                 object: None,
             });
         }
+    }
+}
+
+/// The file name the original gives a family export, `<family name>_<id>.FAM`
+/// (`Export/<name>_<id>.FAM`). Characters a file name cannot hold on every
+/// platform the game runs on become `_`; an empty name becomes `Family`.
+pub(super) fn export_file_name(name: &str, family_id: u16) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(['.', ' ']);
+    let stem = if cleaned.is_empty() {
+        "Family"
+    } else {
+        cleaned
+    };
+    format!("{stem}_{family_id}.FAM")
+}
+
+#[cfg(test)]
+mod export_name_tests {
+    use super::export_file_name;
+
+    #[test]
+    fn export_names_follow_name_underscore_id_and_stay_portable() {
+        assert_eq!(export_file_name("Newbie", 7), "Newbie_7.FAM");
+        assert_eq!(export_file_name("  Two Words ", 12), "Two Words_12.FAM");
+        assert_eq!(export_file_name("a/b\\c:d*e?f", 3), "a_b_c_d_e_f_3.FAM");
+        assert_eq!(export_file_name("", 4), "Family_4.FAM");
+        assert_eq!(export_file_name("..", 4), "Family_4.FAM");
+        assert_eq!(export_file_name("x\u{0}y", 5), "x_y_5.FAM");
     }
 }
