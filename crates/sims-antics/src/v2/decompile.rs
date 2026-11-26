@@ -357,7 +357,7 @@ pub fn decompile_iff_to_v2_report(
                 let text = model.polish(text, &recompiled);
                 let (text, recompiled, mut checks) =
                     model.flip_negations(text, (recompiled, checks), &mut cache);
-                let text = model.dot_bcon_reads_the_lint_misses(text);
+                let text = model.dot_bcon_reads_the_lint_misses(text, &recompiled);
                 let text = model.allow_kept_negations(text);
                 let source = format_v2_source(&text)?;
                 let mut trees: Vec<DecompiledTree> = model
@@ -825,21 +825,34 @@ fn code_words(text: &str) -> Option<BTreeSet<String>> {
     Some(out)
 }
 
-/// `text` with each `from` (a `Table::entry` path) that stands alone, not inside a longer
-/// word, written as `to`.
-fn replace_path(text: &str, from: &str, to: &str) -> String {
-    let word = |c: Option<char>| c.is_some_and(|c| c == '_' || c.is_ascii_alphanumeric());
+/// `text` with each `Table::entry` path in code (tokens, never a string or comment) whose
+/// table is in `tables` and entry in `entries` written `Table.entry`.
+fn dot_paths(text: &str, tables: &[&str], entries: &[String]) -> Option<String> {
+    use crate::v2::lexer::{TokenKind as K, tokenize};
+    let tokens = tokenize(text).ok()?;
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let offset = |t: &crate::v2::lexer::Token| line_starts[t.span.line - 1] + t.span.column - 1;
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find(from) {
-        let end = at + from.len();
-        let alone = !word(rest[..at].chars().next_back()) && !word(rest[end..].chars().next());
-        out.push_str(&rest[..at]);
-        out.push_str(if alone { to } else { from });
-        rest = &rest[end..];
+    let mut done = 0;
+    for w in tokens.windows(3) {
+        if let (K::Ident(table), K::ColonColon, K::Ident(entry)) =
+            (&w[0].kind, &w[1].kind, &w[2].kind)
+            && tables.contains(&table.as_str())
+            && entries.contains(entry)
+        {
+            let (start, colons) = (offset(&w[0]), offset(&w[1]));
+            if text.get(colons..colons + 2) != Some("::") || colons != start + table.len() {
+                return None;
+            }
+            out.push_str(&text[done..colons]);
+            out.push('.');
+            done = colons + 2;
+        }
     }
-    out.push_str(rest);
-    out
+    out.push_str(&text[done..]);
+    Some(out)
 }
 
 /// `text` with each word that `renames` maps written as its new name, outside string
@@ -1091,6 +1104,31 @@ fn negated_comparisons(text: &str) -> Vec<Flip> {
         .chain(text.match_indices('\n').map(|(i, _)| i + 1))
         .collect();
     let offset = |t: &crate::v2::lexer::Token| line_starts[t.span.line - 1] + t.span.column - 1;
+    // The tree each token is in: the last `#[bhav(id = N` or `#[id(N` attribute before it,
+    // read from tokens, so a quoted label that spells one never counts.
+    let is =
+        |k: usize, w: &str| matches!(tokens.get(k).map(|t| &t.kind), Some(K::Ident(x)) if x == w);
+    let int = |k: usize| match tokens.get(k).map(|t| &t.kind) {
+        Some(K::Int(n)) => u16::try_from(*n).ok(),
+        _ => None,
+    };
+    let mut tree = None;
+    let mut trees = Vec::with_capacity(tokens.len());
+    for k in 0..tokens.len() {
+        if tokens[k].kind == K::HashBracket {
+            let paren = |j: usize| tokens.get(j).map(|t| &t.kind) == Some(&K::LParen);
+            if is(k + 1, "bhav")
+                && paren(k + 2)
+                && is(k + 3, "id")
+                && tokens.get(k + 4).map(|t| &t.kind) == Some(&K::Assign)
+            {
+                tree = int(k + 5);
+            } else if is(k + 1, "id") && paren(k + 2) {
+                tree = int(k + 3);
+            }
+        }
+        trees.push(tree);
+    }
     let mut out = Vec::new();
     for i in 0..tokens.len().saturating_sub(3) {
         let K::Ident(w) = &tokens[i].kind else {
@@ -1134,7 +1172,7 @@ fn negated_comparisons(text: &str) -> Vec<Flip> {
                 _ => {}
             }
         }
-        let (Some(close), Some((at, flipped))) = (close, op) else {
+        let (Some(close), Some((at, flipped)), Some(tree)) = (close, op, trees[i]) else {
             continue;
         };
         if !plain || tokens.get(close + 1).map(|t| &t.kind) != Some(&K::LBrace) {
@@ -1148,24 +1186,10 @@ fn negated_comparisons(text: &str) -> Vec<Flip> {
         out.push(Flip {
             range: offset(&tokens[i + 1])..close_at + 1,
             text: format!("{lhs} {flipped} {rhs}"),
-            tree: 0,
+            tree,
         });
     }
     out
-}
-
-/// The tree whose code holds byte `at`: the last `#[bhav(id = N` or `#[id(N)]` before it.
-fn tree_at(text: &str, at: usize) -> Option<u16> {
-    let before = &text[..at];
-    let attr = ["#[bhav(id = ", "#[id("]
-        .iter()
-        .filter_map(|p| before.rfind(p).map(|i| (i, p.len())))
-        .max()?;
-    let digits: String = text[attr.0 + attr.1..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    digits.parse().ok()
 }
 
 /// The most passes [`Model::lint_spellings`] makes over a file.
@@ -2127,10 +2151,7 @@ impl Model {
         }
         let mut flips: Vec<Flip> = negated_comparisons(&text)
             .into_iter()
-            .filter_map(|mut f| {
-                f.tree = tree_at(&text, f.range.start)?;
-                matches!(checks.get(&f.tree), Some(TreeCheck::Equivalent)).then_some(f)
-            })
+            .filter(|f| matches!(checks.get(&f.tree), Some(TreeCheck::Equivalent)))
             .collect();
         let kind = std::mem::discriminant::<TreeCheck>;
         for _ in 0..NEGATION_ROUNDS {
@@ -2171,8 +2192,9 @@ impl Model {
     /// `text` with a BCON entry that lint `unused_decl` reports as never read written
     /// `Table.entry` again in v2 code. The lint counts a read by a field's dot and by name in
     /// `raw { }`, but not by a `Table::entry` path, so a table that raw code reads by name
-    /// would report its other entries. Only a file whose table is read both ways is linted.
-    fn dot_bcon_reads_the_lint_misses(&self, text: String) -> String {
+    /// would report its other entries. Only a file whose table is read both ways is linted,
+    /// and the rewrite (code tokens only) is kept only if the object builds the same bytes.
+    fn dot_bcon_reads_the_lint_misses(&self, text: String, recompiled: &RecompiledFile) -> String {
         use crate::v2::lint::{UNUSED_DECL, lint_v2_source};
         let both: Vec<&str> = self
             .bcons
@@ -2202,18 +2224,14 @@ impl Model {
         if names.is_empty() {
             return text;
         }
-        let mut out = text.clone();
-        for label in &both {
-            for name in &names {
-                out = replace_path(
-                    &out,
-                    &format!("{label}::{name}"),
-                    &format!("{label}.{name}"),
-                );
-            }
-        }
+        let Some(out) = dot_paths(&text, &both, &names) else {
+            return text;
+        };
+        let same = self
+            .compile(&out)
+            .is_ok_and(|r| r.iff_bytes == recompiled.iff_bytes);
         match unread(&out) {
-            Some(after) if after.is_empty() => out,
+            Some(after) if same && after.is_empty() => out,
             _ => text,
         }
     }
@@ -8166,7 +8184,7 @@ mod tests {
 
     #[test]
     fn negations_flip_only_as_a_whole_test() {
-        let text = "fn f() {\n    if !(temp[0] > -1) {\n    }\n    while !(a.b[2] == X::y) {\n    }\n    if !(a > b && c) {\n    }\n    if !(inc_lt(&mut a, 2)) {\n    }\n    raw {\n        if !(a > b) {\n        }\n    }\n}\n";
+        let text = "#[bhav(id = 4300)]\nfn f() {\n    if !(temp[0] > -1) {\n    }\n    while !(a.b[2] == X::y) {\n    }\n    if !(a > b && c) {\n    }\n    if !(inc_lt(&mut a, 2)) {\n    }\n    raw {\n        if !(a > b) {\n        }\n    }\n}\n";
         let flips: Vec<String> = negated_comparisons(text)
             .into_iter()
             .map(|f| format!("{} => {}", &text[f.range], f.text))
@@ -8177,6 +8195,27 @@ mod tests {
                 "!(temp[0] > -1) => temp[0] <= -1",
                 "!(a.b[2] == X::y) => a.b[2] != X::y"
             ]
+        );
+    }
+
+    #[test]
+    fn a_flip_belongs_to_the_tree_whose_attribute_comes_before_it_in_code() {
+        // A quoted label that spells another tree's attribute does not count.
+        let text = "#[id(4300)]\nfn a() {\n}\n#[bhav(id = 4301, label = \"Other #[id(4300)]\")]\nfn b() {\n    if !(temp[0] > 1) {\n    }\n}\n";
+        let trees: Vec<u16> = negated_comparisons(text).iter().map(|f| f.tree).collect();
+        assert_eq!(trees, [4301]);
+        // Before any tree attribute, a test has no tree and is never flipped.
+        assert!(negated_comparisons("fn f() {\n    if !(a > b) {\n    }\n}\n").is_empty());
+    }
+
+    #[test]
+    fn dotted_constant_paths_touch_code_only() {
+        let text = "fn f() {\n    // Tuning::e0\n    temp[0] = Tuning::e0;\n    temp[1] = Tuning::e1;\n    show(\"Tuning::e0\");\n    temp[2] = Other::e0 + MyTuning::e0;\n}\n";
+        assert_eq!(
+            dot_paths(text, &["Tuning"], &["e0".to_owned()]).as_deref(),
+            Some(
+                "fn f() {\n    // Tuning::e0\n    temp[0] = Tuning.e0;\n    temp[1] = Tuning::e1;\n    show(\"Tuning::e0\");\n    temp[2] = Other::e0 + MyTuning::e0;\n}\n"
+            )
         );
     }
 
