@@ -4379,7 +4379,11 @@ fn std_global_names() -> &'static BTreeSet<&'static str> {
             .filter_map(|line| {
                 let rest = line.trim().strip_prefix("#[id(")?;
                 let (_, rest) = rest.split_once(")]")?;
-                let (name, _) = rest.trim().strip_prefix("fn ")?.split_once('(')?;
+                let rest = rest
+                    .trim()
+                    .strip_prefix("#[ret(temp = 0)] ")
+                    .unwrap_or(rest.trim());
+                let (name, _) = rest.strip_prefix("fn ")?.split_once('(')?;
                 Some(name)
             })
             .collect()
@@ -4394,7 +4398,11 @@ fn std_global_table() -> &'static BTreeMap<u16, StdGlobal> {
             .filter_map(|line| {
                 let rest = line.trim().strip_prefix("#[id(")?;
                 let (id, rest) = rest.split_once(")]")?;
-                let rest = rest.trim().strip_prefix("fn ")?;
+                let rest = rest
+                    .trim()
+                    .strip_prefix("#[ret(temp = 0)] ")
+                    .unwrap_or(rest.trim());
+                let rest = rest.strip_prefix("fn ")?;
                 let (name, rest) = rest.split_once('(')?;
                 let (params, ret) = rest.split_once(')')?;
                 let params = if params.trim().is_empty() {
@@ -4405,6 +4413,7 @@ fn std_global_table() -> &'static BTreeMap<u16, StdGlobal> {
                 let result = match ret.trim() {
                     "-> Result;" => true,
                     "-> bool;" => false,
+                    r if r.starts_with("-> Option<") => false,
                     _ => return None,
                 };
                 Some((

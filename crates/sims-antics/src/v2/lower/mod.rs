@@ -14,12 +14,12 @@ use crate::manifest::{
 use crate::parser::{motive_by_name, person_field_by_name, skill_by_name};
 use crate::v2::ast::{
     AbiParam, AbiParamSlot, BconTableDecl, BitflagsDecl, CallArg, ConstIntExpr, EnumDecl,
-    ExternBconDecl, ExternModDecl, FnDecl, ForEachIter, FunctionalDecl, GuardBody, GuardDecl,
-    GuidValue, InteractionDecl, MatchArm, MatchExprArm, MatchPattern, MetaField, MetaFieldKind,
-    ObjectDecl, ObjectMember, ParamType, ParamValue, ReturnAbi, SlotDecl, SoundDecl, SpriteDecl,
-    StateDecl, StateInitValue, StateType, StringsDecl, TemplateDecl, TileDecl, TreeFrame,
-    TreeMemberDecl, V2AssignOp, V2BinOp, V2Expr, V2Item, V2Stmt, V2Type, V2UnaryOp, VariantDecl,
-    object_type_ident,
+    ExternBconDecl, ExternModDecl, FLAG_LIST_METHODS, FnDecl, ForEachIter, FunctionalDecl,
+    GuardBody, GuardDecl, GuidValue, InteractionDecl, MatchArm, MatchExprArm, MatchPattern,
+    MetaField, MetaFieldKind, ObjectDecl, ObjectMember, ParamType, ParamValue, ReturnAbi, SlotDecl,
+    SoundDecl, SpriteDecl, StateDecl, StateInitValue, StateType, StringsDecl, TemplateDecl,
+    TileDecl, TreeFrame, TreeMemberDecl, V2AssignOp, V2BinOp, V2Expr, V2Item, V2Stmt, V2Type,
+    V2UnaryOp, VariantDecl, object_type_ident,
 };
 use crate::v2::loader::{ModuleScope, ResolvedModule};
 use crate::v2::parser::snake_case_ident;
@@ -203,8 +203,21 @@ enum ResolvedReturnAbi {
     Void,
     Bool,
     Result,
-    Value { ty: ValueType, temp: u8 },
-    ResultValue { ty: ValueType, temp: u8 },
+    Value {
+        ty: ValueType,
+        temp: u8,
+    },
+    ResultValue {
+        ty: ValueType,
+        temp: u8,
+    },
+    /// `#[ret(temp = N)] -> Option<T>`: true exit = `Some` with the value in `temp[N]`, false
+    /// exit = `None`. Called like a `-> bool` tree; `let Some(v) = f() else { .. };` and
+    /// `f()?` read the value.
+    OptionValue {
+        ty: ValueType,
+        temp: u8,
+    },
 }
 
 /// Resolved parameter of a callable BHAV.
@@ -379,6 +392,19 @@ struct ObjectEnv<'a> {
     reads_global_34: bool,
     /// A finished tree's body may read global 34.
     saw_global_34: Cell<bool>,
+    /// Call arguments are staged as the copying form: every temp an argument reads is copied
+    /// into a fresh local first, and every store is emitted in parameter order, self-stores
+    /// included ([`TreeLowerer::emit_temp_moves`]). Set when a tree of the object keeps its
+    /// layout after staging in place (`saw_layout_staging`); the object is then lowered again.
+    copy_staging: bool,
+    /// A finished tree staged in place where its nodes or frame words are observable
+    /// ([`TreeLowerer::finish`]): the object is lowered again with `copy_staging`.
+    saw_layout_staging: Cell<bool>,
+    /// A finished tree staged in place.
+    saw_in_place: Cell<bool>,
+    /// A finished tree keeps its layout: it may read a frame word another tree's call left
+    /// there (`local[N]`, a raw block), so no tree of the object may change its frame.
+    saw_keep_layout: Cell<bool>,
     local_fns: BTreeMap<String, (String, FnDecl)>,
     /// Object/template-local enums by short name -> canonical key.
     local_enums: BTreeMap<String, String>,
@@ -505,6 +531,21 @@ impl ValueType {
 /// which reads the career and level in `temp[0]` and `temp[1]`), or a temp-indexed cell
 /// (`scope(27, k)`, `scope(30, k)`, `scope(31, k)`, which read the index in `temp[k]`).
 /// Staging that writes temps copies such an operand first.
+/// Whether `method` is a bitflags test: `contains`, `intersects`, `is_empty`, or a list form
+/// (`contains_all`, `contains_any`).
+fn is_bitflag_predicate(method: &str) -> bool {
+    matches!(
+        method,
+        "contains" | "intersects" | "is_empty" | "contains_all" | "contains_any"
+    )
+}
+
+/// `Some(k)` when the `.air` operand is exactly the cell `temp[k]`.
+fn bare_temp(air: &str) -> Option<usize> {
+    let k: usize = air.strip_prefix("temp[")?.strip_suffix(']')?.parse().ok()?;
+    (k < 8).then_some(k)
+}
+
 fn reads_temps(air: &str) -> bool {
     air.contains("temp[")
         || ["scope(27,", "scope(30,", "scope(31,", "scope(33,"]
@@ -866,6 +907,15 @@ struct TreeLowerer<'a> {
     /// following instruction's bytes), or a literal-argument call whose callee frame may read
     /// more than the four words in the call's own operands.
     keep_layout: bool,
+    /// Some call staged its arguments in place ([`TreeLowerer::emit_temp_moves`]): its nodes
+    /// differ from the copying form's.
+    staged_in_place: bool,
+    /// The tree has an explicit `kind` (an indexed tree is entered at a numbered node), so its
+    /// calls stage in the copying form.
+    fixed_entry: bool,
+    /// How many `#[temp]` loops enclose the code being lowered. Calls inside one stage in the
+    /// copying form, so the loop's counter check sees every store.
+    temp_loops: usize,
     /// One past the highest `param[n]` the tree names, so a functional's header can declare
     /// the words it reads.
     param_words_used: usize,

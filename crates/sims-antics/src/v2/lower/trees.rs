@@ -164,6 +164,7 @@ pub(super) fn lower_standalone_tree(
     }
     ctx.frame_locals = d.frame.and_then(|f| f.locals);
     ctx.frame_format = d.frame.and_then(|f| f.format);
+    ctx.fixed_entry = d.frame.and_then(|f| f.kind).is_some();
     ctx.frame_args = d.frame.and_then(|f| f.args).map_or_else(
         || {
             sig.params
@@ -174,13 +175,19 @@ pub(super) fn lower_standalone_tree(
         usize::from,
     );
     match &sig.ret {
-        ResolvedReturnAbi::Value { ty, temp } | ResolvedReturnAbi::ResultValue { ty, temp } => {
+        ResolvedReturnAbi::Value { ty, temp }
+        | ResolvedReturnAbi::ResultValue { ty, temp }
+        | ResolvedReturnAbi::OptionValue { ty, temp } => {
             ctx.value_return = Some(ValueReturnAbi {
                 ty: ty.clone(),
                 temp: *temp,
-                // `Result<T>` with `#[ret(temp = N)]` trees take the false exit with `return None;` (or
-                // `return false;` when T is not bool), so a caller's `?` runs its own cleanups.
-                allow_none: matches!(sig.ret, ResolvedReturnAbi::ResultValue { .. }),
+                // `Result<T>` / `Option<T>` with `#[ret(temp = N)]` trees take the false exit
+                // with `return None;` (or `return false;` when T is not bool), so a caller's `?`
+                // runs its own cleanups.
+                allow_none: matches!(
+                    sig.ret,
+                    ResolvedReturnAbi::ResultValue { .. } | ResolvedReturnAbi::OptionValue { .. }
+                ),
                 in_place: true,
                 what: "tree",
             });

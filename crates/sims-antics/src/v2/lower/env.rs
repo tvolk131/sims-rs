@@ -437,7 +437,19 @@ impl<'a> ObjectEnv<'a> {
             ReturnAbi::Void => ResolvedReturnAbi::Void,
             ReturnAbi::Bool => ResolvedReturnAbi::Bool,
             ReturnAbi::Result => ResolvedReturnAbi::Result,
-            ReturnAbi::Value { ty, temp } => ResolvedReturnAbi::Value {
+            ReturnAbi::Value {
+                ty,
+                temp,
+                option: false,
+            } => ResolvedReturnAbi::Value {
+                ty: resolve(ty, span, "return value")?,
+                temp: *temp,
+            },
+            ReturnAbi::Value {
+                ty,
+                temp,
+                option: true,
+            } => ResolvedReturnAbi::OptionValue {
                 ty: resolve(ty, span, "return value")?,
                 temp: *temp,
             },

@@ -55,6 +55,9 @@ impl<'a> TreeLowerer<'a> {
             inline_call_sites: Vec::new(),
             dup_decl: None,
             keep_layout: false,
+            staged_in_place: false,
+            temp_loops: 0,
+            fixed_entry: false,
             param_words_used: 0,
             frame_locals: None,
             frame_format: None,
@@ -199,7 +202,30 @@ impl<'a> TreeLowerer<'a> {
             // the named locals after it.
             out = replace_outside_strings(&out, PIN_SLOT, "0");
         }
-        Ok(mir::finish_body(out, &facts))
+        let finished = mir::finish_body(out, &facts);
+        // A call staged in place has fewer nodes and frame words than the copying form. Where
+        // either is observable, the object is lowered again with the copying form: a kept
+        // layout (numbered raw branches), main's rules (global 34, a bottom frame read before
+        // it is written, a pin), text that may name frame words (`$Local:N`), and a bottom
+        // frame left with no word at all (Create Object with flag 0x10 writes word 0).
+        if self.staged_in_place {
+            self.env.saw_in_place.set(true);
+            let empty_bottom = bottom_frame
+                && self.frame_locals.is_none()
+                && facts.min_locals == 0
+                && !finished.lines().any(|l| l.trim_start().starts_with("let "));
+            if self.keep_layout
+                || facts.main_rules
+                || mir::reads_a_word(&facts.text_reads)
+                || empty_bottom
+            {
+                self.env.saw_layout_staging.set(true);
+            }
+        }
+        if self.keep_layout {
+            self.env.saw_keep_layout.set(true);
+        }
+        Ok(finished)
     }
 
     /// A lifecycle tree's `#[frame(...)]`: `param[0..args]` become addressable and `locals` bounds
@@ -208,6 +234,7 @@ impl<'a> TreeLowerer<'a> {
         self.frame_locals = frame.locals;
         self.frame_format = frame.format;
         self.frame_args = frame.args.map_or(0, usize::from);
+        self.fixed_entry = frame.kind.is_some();
     }
 
     /// Adds `min_locals: N` to a tree header when an `#[slot(N - 1)]` word must be in the frame:

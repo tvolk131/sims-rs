@@ -7,12 +7,12 @@ use crate::parser::motive_by_name;
 use crate::v2::ast::{
     AbiParam, AbiParamSlot, AdvertiseDecl, BconTableDecl, BitflagVariant, BitflagsDecl, CallArg,
     ConstDecl, ConstIntExpr, EnumDecl, EnumVariant, ExternBconDecl, ExternBconEntry, ExternFnDecl,
-    ExternModDecl, FnDecl, FnParam, ForEachIter, FunctionalDecl, GuardBody, GuardDecl, GuidValue,
-    InteractionDecl, LifecycleBlock, MatchArm, MatchExprArm, MatchPattern, MetaField,
-    MetaFieldKind, ObjectDecl, ObjectMember, ParamAssignDecl, ParamDecl, ParamType, ParamValue,
-    ReturnAbi, SlotDecl, SoundDecl, SpriteDecl, StateDecl, StateInitValue, StateType, StringsDecl,
-    TemplateDecl, TileDecl, TreeMemberDecl, UseDecl, UseItem, V2AssignOp, V2BinOp, V2Expr, V2File,
-    V2Item, V2Stmt, V2Type, V2UnaryOp, VariantDecl,
+    ExternModDecl, FLAG_LIST_METHODS, FnDecl, FnParam, ForEachIter, FunctionalDecl, GuardBody,
+    GuardDecl, GuidValue, InteractionDecl, LifecycleBlock, MatchArm, MatchExprArm, MatchPattern,
+    MetaField, MetaFieldKind, ObjectDecl, ObjectMember, ParamAssignDecl, ParamDecl, ParamType,
+    ParamValue, ReturnAbi, SlotDecl, SoundDecl, SpriteDecl, StateDecl, StateInitValue, StateType,
+    StringsDecl, TemplateDecl, TileDecl, TreeMemberDecl, UseDecl, UseItem, V2AssignOp, V2BinOp,
+    V2Expr, V2File, V2Item, V2Stmt, V2Type, V2UnaryOp, VariantDecl,
 };
 use crate::v2::attrs::{Attr, AttrArg, AttrValue, ItemAttrs};
 use crate::v2::lexer::{Token, TokenKind, tokenize};
@@ -916,8 +916,8 @@ impl Parser {
         Ok((sim_binding, params))
     }
 
-    /// Parses an optional `-> bool | -> Result | -> T | -> Result<T>` ABI. A value result
-    /// (`-> T`, `-> Result<T>`) names the temporary the callee leaves it in with `ret_temp`
+    /// Parses an optional `-> bool | -> Result | -> T | -> Result<T> | -> Option<T>` ABI. A value
+    /// result (`-> T`, `-> Result<T>`, `-> Option<T>`) names the temporary the callee leaves it in with `ret_temp`
     /// (`#[ret(temp = N)]` or `#[bhav(ret_temp = N)]`).
     fn parse_return_abi(&mut self, what: &str, ret_temp: Option<(Span, u8)>) -> Result<ReturnAbi> {
         let no_value = |ret: ReturnAbi| match ret_temp {
@@ -949,9 +949,36 @@ impl Parser {
             };
             return Ok(ReturnAbi::ResultValue { ty, temp });
         }
+        // `-> Option<T>`: a true/false answer that carries a value in `temp[N]` when true.
+        if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "Option")
+            && self.peek_at(1).kind == TokenKind::Lt
+        {
+            self.bump();
+            self.bump();
+            let ty = self.parse_type()?;
+            self.expect(&TokenKind::Gt, "'>'")?;
+            let Some((_, temp)) = ret_temp else {
+                return Err(Error::at(
+                    rspan,
+                    format!(
+                        "{what} 'Option<{}>' return requires the temporary that carries it: add '#[ret(temp = N)]'",
+                        ty.display_name()
+                    ),
+                ));
+            };
+            return Ok(ReturnAbi::Value {
+                ty,
+                temp,
+                option: true,
+            });
+        }
         let ty = self.parse_type()?;
         if let Some((_, temp)) = ret_temp {
-            return Ok(ReturnAbi::Value { ty, temp });
+            return Ok(ReturnAbi::Value {
+                ty,
+                temp,
+                option: false,
+            });
         }
         if ty == V2Type::Bool {
             return Ok(ReturnAbi::Bool);
@@ -4078,7 +4105,11 @@ impl Parser {
                         && self.peek_at(1).kind == TokenKind::Lt
                     {
                         let type_args = self.parse_turbofish_type_args()?;
-                        let args = self.parse_call_args()?;
+                        let args = if FLAG_LIST_METHODS.contains(&field.as_str()) {
+                            self.parse_flag_list_args(&field)?
+                        } else {
+                            self.parse_call_args()?
+                        };
                         expr = V2Expr::MethodCall {
                             span,
                             receiver: Box::new(expr),
@@ -4087,7 +4118,11 @@ impl Parser {
                             args,
                         };
                     } else if self.peek().kind == TokenKind::LParen {
-                        let args = self.parse_call_args()?;
+                        let args = if FLAG_LIST_METHODS.contains(&field.as_str()) {
+                            self.parse_flag_list_args(&field)?
+                        } else {
+                            self.parse_call_args()?
+                        };
                         expr = V2Expr::MethodCall {
                             span,
                             receiver: Box::new(expr),
@@ -4194,6 +4229,57 @@ impl Parser {
             }
         }
         Ok(expr)
+    }
+
+    /// Parses the `([A, B, ..])` argument of a bitflags list method (`set_all`, `clear_all`,
+    /// `contains_all`, `contains_any`). The list is a parse-level form: each element becomes a
+    /// positional argument of the method call, and `[..]` is accepted nowhere else.
+    fn parse_flag_list_args(&mut self, method: &str) -> Result<Vec<CallArg>> {
+        let open_span = self.expect(&TokenKind::LParen, "'('")?;
+        if self.peek().kind != TokenKind::LBracket {
+            return Err(Error::at(
+                self.span(),
+                format!("'.{method}(...)' takes a bracketed list of flags: '.{method}([A, B])'"),
+            ));
+        }
+        self.bump(); // '['
+        self.enter_nesting(open_span)?;
+        let mut args = Vec::new();
+        let res = loop {
+            if self.eat(&TokenKind::RBracket) {
+                break Ok(());
+            }
+            let aspan = self.span();
+            // The list folds into a union nested one level per flag, so it shares the
+            // nesting limit a written-out union has.
+            if args.len() == MAX_NESTING_DEPTH {
+                break Err(Error::at(
+                    aspan,
+                    format!("'.{method}([..])' lists more than {MAX_NESTING_DEPTH} flags"),
+                ));
+            }
+            match self.parse_expr() {
+                Ok(value) => args.push(CallArg {
+                    span: aspan,
+                    name: None,
+                    value,
+                }),
+                Err(e) => break Err(e),
+            }
+            if !self.eat(&TokenKind::Comma) {
+                break self.expect(&TokenKind::RBracket, "']'").map(|_| ());
+            }
+        };
+        self.leave_nesting();
+        res?;
+        if self.peek().kind != TokenKind::RParen {
+            return Err(Error::at(
+                self.span(),
+                format!("'.{method}(...)' takes exactly one argument: the list of flags"),
+            ));
+        }
+        self.bump(); // ')'
+        Ok(args)
     }
 
     fn parse_call_args(&mut self) -> Result<Vec<CallArg>> {

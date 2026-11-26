@@ -218,8 +218,12 @@ impl<'a> TreeLowerer<'a> {
         }
 
         // Evaluate operands left to right in source order (named arguments may be reordered). An
-        // operand is snapshotted into a fresh local when it reads a temp (about to be overwritten)
-        // or a later-evaluated argument may run code (calls, foreign reads) that could change it.
+        // operand is snapshotted into a fresh local when it reads a temp (about to be
+        // overwritten), a later-evaluated argument may run code (calls, foreign reads) that could
+        // change it, or it may fault. That is the copying form. A call whose every argument is a
+        // bare `temp[k]` or a literal stages in place instead ([`Self::emit_temp_moves`]): no
+        // operand can fault or run code, so each temp is read where it is stored.
+        let in_place = !self.copy_staging() && values.iter().all(|v| self.stages_in_place(v));
         let mut operands: Vec<(String, Option<i16>)> = vec![(String::new(), None); n];
         for (k, &i) in source_order.iter().enumerate() {
             let expr = values[i];
@@ -249,7 +253,9 @@ impl<'a> TreeLowerer<'a> {
             // A runtime (`extern bcon`) read can fault on a missing chunk: read it now, in source
             // order, so a fault cannot follow a partial temp staging or an out-of-order read.
             let may_fault = air.starts_with("bcon[");
-            operands[i] = if const_val.is_none() && (reads_temps(&air) || later_impure || may_fault)
+            let read_at_store = in_place && bare_temp(&air).is_some();
+            operands[i] = if const_val.is_none()
+                && ((reads_temps(&air) && !read_at_store) || later_impure || may_fault)
             {
                 let snap = self.fresh("arg");
                 self.emit_let(&snap, &air);
@@ -268,6 +274,7 @@ impl<'a> TreeLowerer<'a> {
             None
         };
         let literals = literals.filter(|l| !(l.len() == 4 && l.iter().all(|&v| v == -1)));
+        let mut moves: Vec<(usize, String)> = Vec::with_capacity(n);
         for (i, p) in sig.params.iter().enumerate() {
             let dst = match p.slot {
                 AbiParamSlot::Temp(t) => usize::from(t),
@@ -277,9 +284,9 @@ impl<'a> TreeLowerer<'a> {
                     .position(|&x| x == i)
                     .expect("positional index"),
             };
-            let op = operands[i].0.clone();
-            self.line(format!("temp[{dst}] := {op};"));
+            moves.push((dst, operands[i].0.clone()));
         }
+        self.emit_temp_moves(moves, in_place);
         Ok(match literals {
             // An argless call is spelled `(temps)` (`[0xFF; 8]`), the authoring tools' encoding:
             // the callee sees the caller's temps as its arguments (the temps pass-through ABI).
@@ -295,6 +302,77 @@ impl<'a> TreeLowerer<'a> {
             }
             None => format!("call {}(temps)", sig.id),
         })
+    }
+
+    /// Whether call arguments are staged in the copying form ([`Self::emit_temp_moves`]): in an
+    /// object whose trees may read global 34 (each store is an Expression, which sets the
+    /// scratch pointer that read depends on, and a call carries the pointer into the callee),
+    /// in an object with a tree that keeps its layout (`ObjectEnv::copy_staging`: numbered raw
+    /// branch targets count nodes, or where `finish` finds frame words observable), inside a
+    /// `#[temp]` loop, whose counter check reads the stores, and in a tree with an explicit
+    /// `kind` (an indexed tree is entered at a numbered node).
+    pub(super) fn copy_staging(&self) -> bool {
+        self.env.copy_staging || self.env.reads_global_34 || self.temp_loops > 0 || self.fixed_entry
+    }
+
+    /// Whether `arg` can be staged in place: a literal, or a bare `temp[k]` (`k < 8`). Neither
+    /// can fault or run code, and the second is read where it is stored.
+    fn stages_in_place(&self, arg: &V2Expr) -> bool {
+        match arg {
+            V2Expr::Int(..) | V2Expr::Bool(..) => true,
+            V2Expr::Unary {
+                op: V2UnaryOp::Neg,
+                inner,
+                ..
+            } => matches!(inner.as_ref(), V2Expr::Int(..)),
+            V2Expr::Index { base, index, .. } => {
+                matches!(base.as_ref(), V2Expr::Ident(_, b) if b == "temp" && self.lookup_var(b).is_none())
+                    && matches!(index.as_ref(), V2Expr::Int(_, k) if (0..8).contains(k))
+            }
+            _ => false,
+        }
+    }
+
+    /// Stores call operands into their temps, each `(dst, src)` as `temp[dst] := src`, in
+    /// parameter order.
+    ///
+    /// The copying form (`in_place` false) emits every store as written; its operands were
+    /// snapshotted already. In place, every `src` is a literal or a bare `temp[k]`, which reads
+    /// the value it had before any of the stores: before a store overwrites a temp a later store
+    /// still reads (`f(temp[1], temp[0])`), that temp is saved into a fresh local, which the
+    /// later store reads instead. A store of a temp into itself is dropped, except the last
+    /// store: it is the staging's final Expression, whose result and scratch pointer the callee
+    /// sees, so it stays exactly as the copying form leaves it. No operand can fault, so no
+    /// other store is observable once the next one runs. The destinations are distinct (the
+    /// signature check refuses a `#[temp(N)]` inside the positional window).
+    pub(super) fn emit_temp_moves(&mut self, mut moves: Vec<(usize, String)>, in_place: bool) {
+        if !in_place {
+            for (dst, src) in moves {
+                self.line(format!("temp[{dst}] := {src};"));
+            }
+            return;
+        }
+        self.staged_in_place = true;
+        let last = moves.len().saturating_sub(1);
+        for k in 0..moves.len() {
+            let (dst, src) = moves[k].clone();
+            if k < last && bare_temp(&src) == Some(dst) {
+                continue;
+            }
+            if moves[k + 1..]
+                .iter()
+                .any(|(_, later)| bare_temp(later) == Some(dst))
+            {
+                let saved = self.fresh("arg");
+                self.emit_let(&saved, &format!("temp[{dst}]"));
+                for (_, later) in &mut moves[k + 1..] {
+                    if bare_temp(later) == Some(dst) {
+                        later.clone_from(&saved);
+                    }
+                }
+            }
+            self.line(format!("temp[{dst}] := {src};"));
+        }
     }
 
     /// Emits `if !<call> { <all cleanups> return error; }` for `?` propagation.
@@ -368,12 +446,23 @@ impl<'a> TreeLowerer<'a> {
                 self.line("}".to_owned());
                 Ok((self.capture_temp(temp, raw), ty))
             }
-            (ResolvedReturnAbi::ResultValue { ty, temp }, true) => {
+            (
+                ResolvedReturnAbi::ResultValue { ty, temp }
+                | ResolvedReturnAbi::OptionValue { ty, temp },
+                true,
+            ) => {
                 let (ty, temp) = (ty.clone(), *temp);
                 let call = self.prepare_callable_call(sig, args, span)?;
                 self.emit_try_fail_branch(&call, span)?;
                 Ok((self.capture_temp(temp, raw), ty))
             }
+            (ResolvedReturnAbi::OptionValue { .. }, false) => Err(Error::at(
+                span,
+                format!(
+                    "{} returns an Option: bind its value with 'let Some(v) = .. else {{ .. }};', unwrap it with '?', or test it with 'if'",
+                    sig.display
+                ),
+            )),
             (ResolvedReturnAbi::Bool, false) => {
                 let call = self.prepare_callable_call(sig, args, span)?;
                 let tmp = self.fresh("call");
@@ -401,7 +490,7 @@ impl<'a> TreeLowerer<'a> {
             (_, true) => Err(Error::at(
                 span,
                 format!(
-                    "'?' in value position needs a call returning 'Result<T>' with '#[ret(temp = N)]', but {} does not",
+                    "'?' in value position needs a call returning 'Result<T>' or 'Option<T>' with '#[ret(temp = N)]', but {} does not",
                     sig.display
                 ),
             )),
@@ -418,7 +507,7 @@ impl<'a> TreeLowerer<'a> {
     }
 
     /// If `expr` is a value-returning callable (`f(..)` with `#[ret(temp = N)] .. -> T`, or `f(..)?` with
-    /// `#[ret(temp = N)] .. -> Result<T>`), lowers the call and returns the raw `temp[N]` operand.
+    /// `#[ret(temp = N)] .. -> Result<T>` / `-> Option<T>`), lowers the call and returns the raw `temp[N]` operand.
     pub(super) fn try_lower_callable_value_raw(
         &mut self,
         expr: &V2Expr,
@@ -445,7 +534,10 @@ impl<'a> TreeLowerer<'a> {
         if !matches!(
             (&sig.ret, is_try),
             (ResolvedReturnAbi::Value { .. }, false)
-                | (ResolvedReturnAbi::ResultValue { .. }, true)
+                | (
+                    ResolvedReturnAbi::ResultValue { .. } | ResolvedReturnAbi::OptionValue { .. },
+                    true
+                )
         ) {
             return Ok(None);
         }

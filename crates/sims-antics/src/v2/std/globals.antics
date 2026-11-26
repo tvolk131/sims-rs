@@ -5,8 +5,10 @@
 // what each tree does; only the tree ids are engine facts.
 //
 // The signatures follow each tree's live code: the parameters it reads, and whether its false exit
-// is an answer callers branch on (`-> bool`) or a failure to propagate (`-> Result`). A parameter
-// that is a 0/1 switch is an `i16` holding 0 or 1.
+// is an answer callers branch on (`-> bool`) or a failure to propagate (`-> Result`). An answer
+// that carries a value in a temp when true is `#[ret(temp = N)] -> Option<T>`: callers test it
+// like a `-> bool`, or bind the value with `let Some(v) = .. else { .. };`. A parameter that is a
+// 0/1 switch is an `i16` holding 0 or 1.
 // Trees with no listed parameters ignore their header's argument. Many trees leave values in the
 // caller's temps; the comments name the ones a caller reads. Unless a comment says otherwise, a tree
 // that acts on "the stack object" needs the caller to set `stack_obj` first.
@@ -44,8 +46,8 @@ pub extern mod globals {
     // Waits up to `a` ticks; `b` is 1 to start a queued action while waiting, else 0. True when
     // interrupted.
     #[id(281)] fn wait_for_notify(a: i16, b: i16) -> bool;
-    // True when at least one whole `period` has passed; temp[0] is then the number of periods.
-    #[id(282)] fn take_elapsed_periods(period: i16) -> bool;
+    // `Some(n)` when at least one whole `period` has passed: `n` is the number of periods.
+    #[id(282)] #[ret(temp = 0)] fn take_elapsed_periods(period: i16) -> Option<i16>;
     // `unused` is never read; `busy_attr` names an attribute of the stack object.
     #[id(283)] fn wait_turn_near_stack(unused: i16, busy_attr: i16, timeout: i16) -> bool;
     #[id(366)] fn wait_hours(hours: i16) -> Result;
@@ -117,8 +119,8 @@ pub extern mod globals {
 
     // Companions and conversations.
     #[id(332)] fn push_on_companion(interaction: i16) -> bool;
-    // True when the Sim has a companion; temp[0] is then the companion's object id.
-    #[id(333)] fn find_companion() -> bool;
+    // `Some(id)` when the Sim has a companion: `id` is the companion's object id.
+    #[id(333)] #[ret(temp = 0)] fn find_companion() -> Option<ObjectId>;
     // `children` and `adults` are 1 to wake that group, else 0.
     #[id(399)] fn rouse_stack_room(children: i16, adults: i16) -> Result;
     // The other Sim is the stack object. Writes temp[0].

@@ -240,7 +240,7 @@ pub(super) fn expr_borrows_ident_in(expr: &V2Expr, target_name: &str, w: &[&str]
             args,
             ..
         } => {
-            (matches!(method.as_str(), "set" | "clear")
+            (matches!(method.as_str(), "set" | "clear" | "set_all" | "clear_all")
                 && matches!(receiver.as_ref(), V2Expr::Ident(_, n) if n == target_name))
                 || expr_borrows_ident_in(receiver, target_name, w)
                 || args
