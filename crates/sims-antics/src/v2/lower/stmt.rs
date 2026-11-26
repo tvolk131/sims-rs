@@ -53,6 +53,14 @@ impl<'a> TreeLowerer<'a> {
                 init,
                 else_body,
             } => self.lower_let_some(*span, name, ty.as_ref(), init, else_body),
+            V2Stmt::IfLetSome {
+                span,
+                name,
+                ty,
+                init,
+                then_body,
+                else_body,
+            } => self.lower_if_let_some(*span, name, ty.as_ref(), init, then_body, else_body),
             V2Stmt::LetUninit {
                 span,
                 name,
@@ -1599,6 +1607,105 @@ impl<'a> TreeLowerer<'a> {
         Ok(())
     }
 
+    /// The type a `{form} Some(name[: ann])` pattern binds for a result of type `inferred`.
+    fn some_binding_type(
+        &self,
+        form: &str,
+        span: Span,
+        name: &str,
+        ty_ann: Option<&V2Type>,
+        inferred: ValueType,
+    ) -> Result<ValueType> {
+        let Some(ann) = ty_ann else {
+            return Ok(inferred);
+        };
+        let expected =
+            self.env
+                .resolve_value_type(ann, &self.owner_module, self.in_object_scope, span)?;
+        if !types_compatible_for_assign(&expected, &inferred) {
+            return Err(Error::at(
+                span,
+                format!(
+                    "'{form} Some({name}: {})' does not match '{}' result",
+                    self.env.display_value_type(&expected),
+                    self.env.display_value_type(&inferred)
+                ),
+            ));
+        }
+        Ok(expected)
+    }
+
+    /// `if let Some(v) = f(..) { .. } else { .. }` on a `#[ret(temp = N)] -> Option<T>` tree:
+    /// the call's true exit binds `v` to `temp[N]` for the then block only, and its false exit
+    /// runs the else block. The same nodes and locals as `let Some(v) = f(..) else { .. }`.
+    pub(super) fn lower_if_let_some(
+        &mut self,
+        span: Span,
+        name: &str,
+        ty_ann: Option<&V2Type>,
+        init: &V2Expr,
+        then_body: &[V2Stmt],
+        else_body: &[V2Stmt],
+    ) -> Result<()> {
+        let sig = match init {
+            V2Expr::Call {
+                span: cspan,
+                callee,
+                type_args,
+                ..
+            } if type_args.is_empty() => self.resolve_callable(callee, *cspan)?,
+            _ => None,
+        };
+        let V2Expr::Call {
+            span: cspan, args, ..
+        } = init
+        else {
+            return Err(Error::at(span, IF_LET_NEEDS_OPTION_TREE));
+        };
+        let Some(sig) = sig else {
+            return Err(Error::at(span, IF_LET_NEEDS_OPTION_TREE));
+        };
+        let ResolvedReturnAbi::OptionValue { ty, temp } = &sig.ret else {
+            return Err(Error::at(
+                span,
+                format!(
+                    "'if let Some({name}) = ..' needs a call returning 'Option<T>' with '#[ret(temp = N)]', but {} does not",
+                    sig.display
+                ),
+            ));
+        };
+        let temp = *temp;
+        let final_ty = self.some_binding_type("if let", span, name, ty_ann, ty.clone())?;
+        let call = self.prepare_callable_call(&sig, args, *cspan)?;
+        self.line(format!("if {call} {{"));
+        self.em.indent();
+        self.push_scope(ScopeFrame::block());
+        let air_name = self.fresh(&format!("v_{name}"));
+        self.emit_let(&air_name, &format!("temp[{temp}]"));
+        self.bind_var(
+            name.to_owned(),
+            Binding::Local {
+                air_name,
+                ty: final_ty,
+            },
+        );
+        let r1 = self.lower_stmts(then_body);
+        let p1 = self.pop_scope_and_run_cleanups();
+        self.em.dedent();
+        if else_body.is_empty() {
+            self.line("}".to_owned());
+            return r1.and(p1);
+        }
+        self.line("} else {".to_owned());
+        self.em.indent();
+        self.push_scope(ScopeFrame::block());
+        let r2 = self.lower_stmts(else_body);
+        let p2 = self.pop_scope_and_run_cleanups();
+        self.em.dedent();
+        self.line("}".to_owned());
+        r1.and(p1).and(r2).and(p2)
+    }
+
     pub(super) fn lower_let_some(
         &mut self,
         span: Span,
@@ -1667,29 +1774,8 @@ impl<'a> TreeLowerer<'a> {
                     ),
                 ));
             };
-            let (inferred_ty, temp) = (ty.clone(), *temp);
-            let final_ty = match ty_ann {
-                Some(ann) => {
-                    let expected = self.env.resolve_value_type(
-                        ann,
-                        &self.owner_module,
-                        self.in_object_scope,
-                        span,
-                    )?;
-                    if !types_compatible_for_assign(&expected, &inferred_ty) {
-                        return Err(Error::at(
-                            span,
-                            format!(
-                                "'let Some({name}: {})' does not match '{}' result",
-                                self.env.display_value_type(&expected),
-                                self.env.display_value_type(&inferred_ty)
-                            ),
-                        ));
-                    }
-                    expected
-                }
-                None => inferred_ty,
-            };
+            let temp = *temp;
+            let final_ty = self.some_binding_type("let", span, name, ty_ann, ty.clone())?;
             let call = self.prepare_callable_call(&sig, args, *cspan)?;
             self.line(format!("if !{call} {{"));
             self.em.indent();
@@ -2497,3 +2583,6 @@ const STMT_BUILTINS_BEFORE_HELPERS: &[&str] = &[
     "clear_motive_changes",
     "dialog",
 ];
+
+/// Why an `if let Some(..) = ..` scrutinee is refused.
+const IF_LET_NEEDS_OPTION_TREE: &str = "'if let Some(v) = ..' needs a call to a tree returning 'Option<T>' with '#[ret(temp = N)]'; find_best_object, create_object, and run_functional bind with 'let Some(v) = .. else { .. }'";

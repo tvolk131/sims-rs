@@ -1509,12 +1509,13 @@ object "Pr I4 Tail" {
             let members = "    #[bhav] fn needs_sim(sim: Sim) -> bool { sim.fame > 0 }\n    \
                  #[bhav] #[context(inherit)] fn inherited() -> bool { needs_sim(me) }\n    \
                  #[bhav] fn bridge(sim: Sim) -> bool { inherited() }\n";
+            // A functional may not call a Sim tree at all (v2.3): its runner may be an object.
             expect_err(
                 "bridge_functional.antics",
                 &object(&format!(
                     "{members}    functional cook {{ run(sim) {{ bridge(sim); }} }}"
                 )),
-                "tree 'bridge' reaches a 'context = inherit' tree that runs a Sim tree",
+                "a functional's action or guard may run on an object",
             );
             // An interaction may still call it.
             expand(

@@ -461,11 +461,18 @@ impl Parser {
                     tail_to_return(last);
                 }
             }
-            Some(V2Stmt::If {
-                then_body,
-                else_body,
-                ..
-            }) => {
+            Some(
+                V2Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                }
+                | V2Stmt::IfLetSome {
+                    then_body,
+                    else_body,
+                    ..
+                },
+            ) => {
                 self.tails_to_returns(then_body, used);
                 self.tails_to_returns(else_body, used);
             }
@@ -3462,6 +3469,34 @@ impl Parser {
 
     fn parse_if_stmt(&mut self, span: Span) -> Result<V2Stmt> {
         self.bump(); // 'if'
+        // `if let Some(name [: Type]) = expr { .. } [else ..]`. A pattern follows `let`; a
+        // variable named `let` (`if let { .. }`, `if let == 1 { .. }`) is still a condition.
+        let let_some = if self.is_ident("let")
+            && matches!(
+                self.peek_at(1).kind,
+                TokenKind::Ident(_) | TokenKind::LParen
+            ) {
+            self.bump(); // 'let'
+
+            if !self.eat_ident("Some") {
+                return Err(Error::at(
+                    self.span(),
+                    "'if let' takes only the pattern 'Some(name)' ('if let Some(v) = f() { .. }')",
+                ));
+            }
+            self.expect(&TokenKind::LParen, "'('")?;
+            let (name, _) = self.expect_binding_ident("binding name")?;
+            let ty = if self.eat(&TokenKind::Colon) {
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+            self.expect(&TokenKind::RParen, "')'")?;
+            self.expect(&TokenKind::Assign, "'='")?;
+            Some((name, ty))
+        } else {
+            None
+        };
         let cond = self.parse_expr()?;
         let then_body = self.parse_block()?;
         let else_body = if self.eat_ident("else") {
@@ -3477,6 +3512,16 @@ impl Parser {
         } else {
             Vec::new()
         };
+        if let Some((name, ty)) = let_some {
+            return Ok(V2Stmt::IfLetSome {
+                span,
+                name,
+                ty,
+                init: cond,
+                then_body,
+                else_body,
+            });
+        }
         Ok(V2Stmt::If {
             span,
             cond,

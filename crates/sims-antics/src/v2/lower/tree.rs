@@ -23,6 +23,7 @@ impl<'a> TreeLowerer<'a> {
             explicit_stack_obj: false,
             reassigns_stack_obj: false,
             raw_moves_cursor: false,
+            edge_node_result: None,
             borrowing_place: false,
             sets_stack_obj: false,
             used_saved_stack_obj: false,
@@ -532,6 +533,7 @@ impl<'a> TreeLowerer<'a> {
             V2Stmt::Let { span, name, .. }
             | V2Stmt::LetUninit { span, name, .. }
             | V2Stmt::LetSome { span, name, .. }
+            | V2Stmt::IfLetSome { span, name, .. }
             | V2Stmt::ForEach {
                 span,
                 binding: name,

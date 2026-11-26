@@ -364,6 +364,7 @@ pub(super) fn stmt_span(s: &V2Stmt) -> Span {
     match s {
         V2Stmt::Let { span, .. }
         | V2Stmt::LetSome { span, .. }
+        | V2Stmt::IfLetSome { span, .. }
         | V2Stmt::Assign { span, .. }
         | V2Stmt::WithLock { span, .. }
         | V2Stmt::Defer { span, .. }
@@ -390,7 +391,9 @@ pub(super) fn stmt_span(s: &V2Stmt) -> Span {
 /// The expressions a statement evaluates itself (not those of nested statements).
 pub(super) fn stmt_exprs(s: &V2Stmt) -> Vec<&V2Expr> {
     match s {
-        V2Stmt::Let { init, .. } | V2Stmt::LetSome { init, .. } => vec![init],
+        V2Stmt::Let { init, .. }
+        | V2Stmt::LetSome { init, .. }
+        | V2Stmt::IfLetSome { init, .. } => vec![init],
         V2Stmt::Assign { target, value, .. } => vec![target, value],
         V2Stmt::WithLock { lock_expr, .. } => vec![lock_expr],
         V2Stmt::Repeat { count, .. } => vec![count],
@@ -431,6 +434,11 @@ pub(super) fn stmt_bodies(s: &V2Stmt) -> Vec<&[V2Stmt]> {
         | V2Stmt::While { body, .. }
         | V2Stmt::Animate { body, .. } => vec![body],
         V2Stmt::If {
+            then_body,
+            else_body,
+            ..
+        }
+        | V2Stmt::IfLetSome {
             then_body,
             else_body,
             ..
@@ -600,6 +608,7 @@ fn find_binding_of(stmts: &[V2Stmt], name: &str) -> Option<Span> {
         let binds = match s {
             V2Stmt::ForEach { binding, .. } => binding == name,
             V2Stmt::Animate { event, .. } => event.as_deref() == Some(name),
+            V2Stmt::IfLetSome { name: n, .. } => n == name,
             other => declared_name(other) == Some(name),
         };
         if binds {
@@ -780,12 +789,18 @@ fn subst_stmt(s: &mut V2Stmt, pairs: &[(String, V2Expr)]) -> Result<()> {
             }
         }
         V2Stmt::If {
-            cond,
+            cond: init,
+            then_body,
+            else_body,
+            ..
+        }
+        | V2Stmt::IfLetSome {
+            init,
             then_body,
             else_body,
             ..
         } => {
-            subst_expr(cond, pairs)?;
+            subst_expr(init, pairs)?;
             subst_stmts(then_body, pairs)?;
             subst_stmts(else_body, pairs)?;
         }

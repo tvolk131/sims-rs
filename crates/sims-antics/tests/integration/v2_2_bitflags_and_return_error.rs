@@ -502,8 +502,9 @@ mod lint_and_lift {
             "if global[20] flag_test Expansions::Pets { self.n = 1; }",
         );
         assert!(method_suggestions(&source).is_empty(), "{source}");
-        // Nor on an object-loop handle: the method form there leaves the direct cursor
-        // lowering (a pre-existing gap for every typed word), so the bytes would differ.
+        // Nor on an object-loop handle. Since v2.3 the method form there builds the
+        // operator's bytes too (`v2_3_if_let_and_fixes`), but suggesting it on handles is
+        // left to the lint.
         let source = obj(
             "",
             "for o in lot.objects() { o.wall_placement flag_set WallPlacement::NoCorner; }",

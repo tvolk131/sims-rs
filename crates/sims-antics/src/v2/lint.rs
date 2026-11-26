@@ -1194,7 +1194,11 @@ fn ret_kind(r: &ReturnAbi) -> RetKind {
 /// The expressions a statement holds directly (not those of nested statements).
 fn stmt_exprs(s: &V2Stmt) -> Vec<&V2Expr> {
     match s {
-        V2Stmt::Let { init, .. } | V2Stmt::LetSome { init, .. } => vec![init],
+        V2Stmt::Let { init, .. }
+        | V2Stmt::LetSome { init, .. }
+        | V2Stmt::IfLetSome { init, .. } => {
+            vec![init]
+        }
         V2Stmt::Assign { target, value, .. } => vec![target, value],
         V2Stmt::WithLock { lock_expr, .. } => vec![lock_expr],
         V2Stmt::Repeat { count, .. } => vec![count],
@@ -1216,6 +1220,11 @@ fn stmt_exprs(s: &V2Stmt) -> Vec<&V2Expr> {
 fn stmt_blocks(s: &V2Stmt) -> Vec<&[V2Stmt]> {
     match s {
         V2Stmt::LetSome { else_body, .. } => vec![else_body],
+        V2Stmt::IfLetSome {
+            then_body,
+            else_body,
+            ..
+        } => vec![then_body, else_body],
         V2Stmt::WithLock { body, .. }
         | V2Stmt::Defer { body, .. }
         | V2Stmt::Repeat { body, .. }
@@ -7180,6 +7189,7 @@ fn stmt_span(s: &V2Stmt) -> Span {
         match s {
             V2Stmt::Let { span, .. }
             | V2Stmt::LetSome { span, .. }
+            | V2Stmt::IfLetSome { span, .. }
             | V2Stmt::Assign { span, .. }
             | V2Stmt::WithLock { span, .. }
             | V2Stmt::Defer { span, .. }
