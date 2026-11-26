@@ -527,9 +527,13 @@ fn the_goths_sounds_play() {
         }),
         "{faults:?}"
     );
-    // The footsteps themselves play.
+    // The footsteps themselves play: at least one asked for is an event
+    // the sound files hold (the player found it, so no `no event`).
     assert!(
-        played.iter().any(|n| n.starts_with("footstep_")),
-        "{played:?}"
+        played
+            .iter()
+            .any(|n| n.starts_with("footstep_")
+                && !faults.iter().any(|f| f == &format!("no event {n}"))),
+        "{played:?} {faults:?}"
     );
 }
