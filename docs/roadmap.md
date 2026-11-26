@@ -3701,7 +3701,8 @@ through their public interfaces only; the simulation never depends on it.
     are `sims-vm`'s `interpreter` and `sims-game`'s `ratchet` and
     `ui_oracle_tour`.
 - **Done (Batch 18 — `.antics` v2.1 Waves 1 and 2: typed `std`, PR I-3
-  and I-4, three lint waves and two lift waves; group arrivals, #463–#471):**
+  and I-4, four lint waves and three lift waves; group arrivals,
+  #463–#473):**
   - **Travel (`sims-vm`, #464):**
     - A `HouseholdGroup` trip to a Magic Town community lot (93–99) no
       longer snaps back. When the destination has a native arrival and
@@ -3756,6 +3757,13 @@ through their public interfaces only; the simulation never depends on it.
       there are new `untyped_engine_constant`, `prefer_question_mark` and
       `prefer_method_syntax` warnings. Each such suggestion stands only
       when the edited file builds the same `.iff` bytes.
+    - Wave 4 (#472):
+      - a `use std::<module>::*;` import brings in the module's `pub fn`s;
+      - `untyped_engine_field` names `fame` (person word 81);
+      - `manual_raw_has_builtin` knows #469's spellings: `padN:` on
+        `play_sound` and `clear_motive_changes`, `reach(.., slot:)`, and
+        the scope 12, 24, 27, 30, 31 and 32 cells. Each is checked to
+        lower to the raw statement's own node.
   - **Lift (Track 9):**
     - #463: inline raw statements fall from 7,580 to 3,657 (strict),
       every local is named, `bcon[N]` references fall from 36,235 to
@@ -3765,7 +3773,16 @@ through their public interfaces only; the simulation never depends on it.
       mode `?` rises from 1,218 to 31,286, raw blocks fall from 22,721 to
       13,167, lint findings from 761 to 117, and the slowest object from
       19 s to 10 s.
-    - Both keep 0 DIFFERENT and 0 timeouts in both modes.
+    - Wave 3 (#473):
+      - lint wave 3's spellings (`untyped_engine_constant`,
+        `prefer_method_syntax`, `prefer_question_mark`) fall to 0 in both
+        modes, each kept only when the file builds the same bytes;
+      - PR I-4's cells, `padN:` options, `reach(.., slot:)`,
+        `make_new_character` and `drop_onto` slots;
+      - `lift_source` tests assert lint-clean output under every rule.
+      In behavioral mode inline raw statements fall from 17,165 to 14,553
+      and lint findings from 25,591 to 266.
+    - All three keep 0 DIFFERENT and 0 timeouts in both modes.
 - **Next (in flight, in order of player impact):**
   - **Travel follow-ups:**
     - A hop that leaves travelers behind (Go Somewhere Else for one
@@ -3807,6 +3824,10 @@ through their public interfaces only; the simulation never depends on it.
       form for them.
     - Strict temps calls: a lowering rule that passes the temps without
       copies, so strict mode can name them too (#471).
+    - Raw-block `if` tails: #469 hoists a shared tail out of a raw
+      block's `if` arms, which leaves 2 strict alarm trees non-idiomatic.
+      Lowering should keep the arms as written, or the lift should spell
+      joined arms (#473).
     - Readable locals: about 9,000 one-statement raw blocks are
       local-slot moves. This changes strict output, so it needs its own
       PR (#460).
