@@ -565,8 +565,9 @@ fn lint_spellings(text: &str) -> Vec<LintSpelling> {
 }
 
 /// The end of the `if` statement at `start` that lint `prefer_question_mark` rewrites to
-/// `suggestion` (`f(..)?;`): `if !f(..) { return error; }`, or
-/// `if f(..) {} else { return error; }`. `None` when the text is not that statement.
+/// `suggestion` (`f(..)?;`): `if !f(..) { panic!(); }`, or
+/// `if f(..) {} else { panic!(); }` (or either with `return error;`, the older spelling of
+/// the error exit). `None` when the text is not that statement.
 fn question_mark_end(text: &str, start: usize, suggestion: &str) -> Option<usize> {
     let call = suggestion.strip_suffix("?;")?;
     let rest = text.get(start..)?.strip_prefix("if ")?;
@@ -583,7 +584,7 @@ fn question_mark_end(text: &str, start: usize, suggestion: &str) -> Option<usize
     let then_end = group_end(text, at)?;
     let then_body = text[at + 1..then_end - 1].trim();
     if negated {
-        return (then_body == "return error;").then_some(then_end);
+        return is_error_exit(then_body).then_some(then_end);
     }
     if !then_body.is_empty() {
         return None;
@@ -597,7 +598,12 @@ fn question_mark_end(text: &str, start: usize, suggestion: &str) -> Option<usize
         return None;
     }
     let end = group_end(text, at)?;
-    (text[at + 1..end - 1].trim() == "return error;").then_some(end)
+    is_error_exit(text[at + 1..end - 1].trim()).then_some(end)
+}
+
+/// Whether `body` (trimmed) is just the error exit, in either spelling.
+fn is_error_exit(body: &str) -> bool {
+    matches!(body, "panic!();" | "panic!()" | "return error;")
 }
 
 /// The end of the bracketed group opening at `open` (`(`, `[` or `{`), past string literals.
@@ -711,6 +717,10 @@ const NEGATION_ROUNDS: usize = 3;
 
 /// The most builds [`Model::polish`] may take to find the tree names that keep the bytes.
 const POLISH_NAME_BUILDS: usize = 8;
+
+/// The most builds [`Model::polish`] may take to find the `if f() {}` statements it can write
+/// `let _ = f();` with the same bytes.
+const POLISH_DISCARD_BUILDS: usize = 8;
 
 /// Names a tree is not given even when nothing in its file uses them, so the name it gets
 /// reads as the tree alone: every identifier-like string the v2 lexer, parser and lowering
@@ -1107,6 +1117,126 @@ fn group_imports(text: &str) -> String {
         out.push('\n');
     }
     out.push_str(&text[end..]);
+    out
+}
+
+/// One `if f(..) {}` statement written `let _ = f(..);`: the byte range from `if` through
+/// the closing `}`, and its replacement.
+#[derive(Clone)]
+struct Discard {
+    range: std::ops::Range<usize>,
+    text: String,
+}
+
+/// Every statement `if f(..) {}` (or `if !f(..) {}`) whose test is a call alone (a path or
+/// method chain ending in its arguments), with an empty block (no comment) and no `else`,
+/// that is not the `if` of an `else if`, as `let _ = f(..);`. `raw { }` bodies are one
+/// token, so `.air` is never touched.
+fn empty_if_calls(text: &str) -> Vec<Discard> {
+    use crate::v2::lexer::{TokenKind as K, tokenize};
+    let Ok(tokens) = tokenize(text) else {
+        return Vec::new();
+    };
+    let offsets = TokenOffsets::new(text);
+    let kind = |k: usize| tokens.get(k).map(|t| &t.kind);
+    let mut out = Vec::new();
+    for i in 0..tokens.len() {
+        if !matches!(kind(i), Some(K::Ident(w)) if w == "if") {
+            continue;
+        }
+        // A statement of its own: after `{`, `}`, `;` or a `raw { }` block (one token), not
+        // after `else` or inside an expression.
+        if i == 0
+            || !matches!(
+                tokens[i - 1].kind,
+                K::LBrace | K::RBrace | K::Semicolon | K::RawBlock(_)
+            )
+        {
+            continue;
+        }
+        let negated = kind(i + 1) == Some(&K::Bang);
+        let first = i + 1 + usize::from(negated);
+        // The test: `name(::name|.name)* ( .. )` and further `.name( .. )` links, then `{`.
+        let mut k = first;
+        let mut call = false;
+        let mut ok = matches!(kind(k), Some(K::Ident(_)));
+        while ok {
+            match kind(k) {
+                Some(K::Ident(_)) => {
+                    k += 1;
+                    call = false;
+                }
+                Some(K::ColonColon | K::Dot) if matches!(kind(k + 1), Some(K::Ident(_))) => {
+                    k += 1;
+                }
+                Some(K::LParen) if matches!(kind(k - 1), Some(K::Ident(_))) => {
+                    // Skip to the matching `)`.
+                    let mut depth = 0usize;
+                    let mut j = k;
+                    loop {
+                        match kind(j) {
+                            Some(K::LParen) => depth += 1,
+                            Some(K::RParen) => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            Some(K::LBrace | K::RBrace | K::Semicolon | K::Eof) | None => {
+                                ok = false;
+                                break;
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    k = j + 1;
+                    call = true;
+                    if matches!(kind(k), Some(K::Dot)) {
+                        k += 1;
+                    }
+                }
+                Some(K::LBrace) => break,
+                _ => ok = false,
+            }
+        }
+        if !ok || !call || kind(k) != Some(&K::LBrace) || kind(k + 1) != Some(&K::RBrace) {
+            continue;
+        }
+        if matches!(kind(k + 2), Some(K::Ident(w)) if w == "else") {
+            continue;
+        }
+        let (Some(start), Some(test), Some(open), Some(close)) = (
+            offsets.of(&tokens[i]),
+            offsets.of(&tokens[first]),
+            offsets.of(&tokens[k]),
+            offsets.of(&tokens[k + 1]),
+        ) else {
+            continue;
+        };
+        // Nothing but blank space between the braces (a comment is no token).
+        if !text[open + 1..close].trim().is_empty() {
+            continue;
+        }
+        out.push(Discard {
+            range: start..close + 1,
+            text: format!("let _ = {};", text[test..open].trim()),
+        });
+    }
+    out
+}
+
+/// `text` with each discard's range written as its replacement (ranges are disjoint and in
+/// order).
+fn apply_discards(text: &str, discards: &[Discard]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut done = 0;
+    for d in discards {
+        out.push_str(&text[done..d.range.start]);
+        out.push_str(&d.text);
+        done = d.range.end;
+    }
+    out.push_str(&text[done..]);
     out
 }
 
@@ -2215,6 +2345,15 @@ impl Model {
                     }
                 }
             }
+        }
+        // Before `else if`: `else { let _ = f(); }` is the plainer form of `else if f() {}`.
+        let discards = empty_if_calls(&text);
+        if !discards.is_empty() {
+            let base = text.clone();
+            let ok = |d: &[Discard]| same(&apply_discards(&base, d));
+            let mut kept = keep_joint(&discards, &ok, POLISH_DISCARD_BUILDS);
+            kept.sort_by_key(|d| d.range.start);
+            text = apply_discards(&text, &kept);
         }
         if let Some(joined) = collapse_else_if(&text).filter(|t| same(t)) {
             text = joined;
@@ -7131,7 +7270,7 @@ impl Translator<'_> {
             Stmt::Return {
                 target: Target::Error,
                 ..
-            } if !self.in_handler => Some("return error;".to_owned()),
+            } if !self.in_handler => Some("panic!();".to_owned()),
             Stmt::Return {
                 target: Target::ReturnFalse,
                 ..
@@ -8276,6 +8415,34 @@ mod tests {
             ),
             "// action open\nfn open() { reopen_4100(); show(\"open_4100\"); }\n"
         );
+    }
+
+    #[test]
+    fn only_a_lone_empty_if_on_a_call_becomes_a_discard() {
+        let text = "fn f() {\n    if make() {}\n    if !a::b(1, (2)).c(x) {}\n    if temp[0] == 1 {}\n    if make() {} else {\n        temp[0] = 1;\n    }\n    if make() {\n        // kept\n    }\n    if make() {\n    } else if make() {}\n    raw {\n        if call 4301(temps) {}\n    }\n    if after_raw() {}\n    if make()? {}\n    if make {}\n}\n";
+        let found: Vec<String> = empty_if_calls(text)
+            .into_iter()
+            .map(|d| format!("{} => {}", &text[d.range], d.text))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "if make() {} => let _ = make();",
+                "if !a::b(1, (2)).c(x) {} => let _ = a::b(1, (2)).c(x);",
+                "if after_raw() {} => let _ = after_raw();"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_question_mark_matches_either_error_exit() {
+        for exit in ["panic!();", "return error;"] {
+            let text = format!("if !f(1) {{\n    {exit}\n}}\nx");
+            assert_eq!(question_mark_end(&text, 0, "f(1)?;"), Some(text.len() - 2));
+            let text = format!("if f(1) {{}} else {{\n    {exit}\n}}\nx");
+            assert_eq!(question_mark_end(&text, 0, "f(1)?;"), Some(text.len() - 2));
+        }
+        assert_eq!(question_mark_end("if !f(1) { g(); }", 0, "f(1)?;"), None);
     }
 
     #[test]
