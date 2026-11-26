@@ -37,7 +37,12 @@ people and the objects that hold someone, as `0x4b3510` does (`0x4b017b`,
 - **Threshold.** The person's position (`+0x240`, the skeleton root) is
   placed as a moved object (`0x4b966b` → `0x4b9991`). A pixel takes part
   when its depth is greater (farther) than `Depth::stand` of that anchor at
-  the row. As in the original, the row asked about is the clipped top plus
+  the row.
+- **Which depth.** The test reads the lot's depth from before the people,
+  not the canvas's. The original draws a person's mesh through Direct3D.
+  We assume (unverified) that this does not write the software depth
+  buffer `0x4ac301` reads. If it did, a person's front would hide their own
+  mosaic, which the original does not show. As in the original, the row asked about is the clipped top plus
   the row within the block, for every block row (`0x4ac4c8`, `0x4ac649`).
 - **Blocks.** Blocks are 2, 4 or 8 pixels by zoom. Pixels are read in the
   original's 5-6-5 unpacking: channels zero-filled, not widened. Each
@@ -54,11 +59,13 @@ which the simulation also uses. The presentation must never change the
 world. So `sims_game::people::People` keeps a copy of
 `World::global_rng`:
 
-- The copy is taken again whenever the world's state moves.
-- Between moves, only the mosaic advances the copy.
-- The first censored frame after a tick matches the original's draws. The
-  original's draws would also shift the simulation's later draws; ours do
-  not.
+- The copy is taken again after every tick (whenever `World::ticks` or the
+  stream's state changes).
+- Between ticks, only the mosaic advances the copy, so a paused frame
+  still varies.
+- The first censored frame after a tick draws as the original's would.
+  The original's draws would also shift the simulation's later draws; ours
+  do not.
 
 Headless pins (`TICK_43200` and the others) are untouched.
 
@@ -74,6 +81,9 @@ calls `sims_render::draw_held_by`:
 - It draws what the person holds (`held_by`): the person's slots, minus
   the first entry (a tile link), and what those hold, at every depth.
 - The walk stops at people.
+- What an earlier person's draw drew is left out. Slot lists that
+  disagree could otherwise draw an object twice.
+- The person's items keep slot order ([Object order](#object-order)).
 
 Then `draw_held_except` draws what holds a person (a bench), minus what
 the people already drew. Effects:
@@ -112,10 +122,13 @@ Walls are drawn run by run, each run from its start.
 
 Boundaries:
 
-- **Rotation history.** The original turns the graph by each rotation's
-  difference and sorts again (`0x479360`). So the order of runs with equal
-  keys depends on the rotations the view went through. We build at
-  rotation 0 and turn once.
+- **Rotation history.** The graph is built with the view's rotation at
+  that time. Each later view turn turns the graph by the difference and
+  sorts again (`0x479360`). So the order of runs with equal keys depends on
+  the rotations the view went through since the walls last changed. We
+  build at rotation 0 and turn once, which matches a graph built at the
+  current rotation only when the unturned order's ties survive the single
+  sort.
 - **Leftover segments.** Segments that no run covers (an invalid corner's)
   go last, by the old segment key.
 - **Sort routine.** `0x541389` is assumed to be the same `std::sort` as
@@ -124,25 +137,31 @@ Boundaries:
 
 ## Object order
 
-`object_order` follows the presenter's list:
+`object_order` keeps the depth order and adds the holder walk:
 
-- Objects in no slot are sorted by their tile's view key with the
-  original's sort. The tile is turned with the `63 - y` table. The input
-  is in object ID order.
-- Each object is followed by what its slots hold, slot by slot, as the
-  holder's walk draws them (`0x437c56`).
-- An object whose holder is not in the pass (a person) sorts as one in no
-  slot.
+- **Order of objects in no slot.** They stay far to near by depth anchor,
+  then by ID, as before.
+- **Slot contents.** Each object is followed by what its slots hold, slot
+  by slot, at every depth, as the holder's walk draws them (`0x437c56`).
+- **Holder outside the pass.** What such a holder holds (a person's) stays
+  together in slot order, at its first object's place.
 
-Boundaries:
+The presenter's own order was tried and is **not** used. It sorts by each
+object's view tile key `(x + y, x - y)` with the original's sort (legacy
+`rebuild_order`), from object ID order. Against the original's
+screenshots in the ratchet:
 
-- The original sorts its registry. We do not track that registry's order,
-  so ties on the same key may differ.
-- The original leaves out objects on the lot's outermost tiles. Those are
-  still drawn here.
-- Which tile axis the legacy `cached_tile` swapped is unverified. The key
-  uses this renderer's own rotation, as the walls do. A swap would change
-  only the `x - y` tie-break at rotation 0.
+| Order tried | Result |
+| --- | --- |
+| Tile key, from ID order | 6 pixels change in two 0816 scenes. All 6 matched the original before and none after. `far-r0-cut-0816` objects fall to 99.90%, under its 99.91% floor. |
+| Tile key, from depth order | The same 6 pixels. |
+| Tile key with the legacy's swapped axes | Far worse: 98.73% to 99.29% objects in three scenes. |
+| Depth order (kept) | Every pin is unchanged. |
+
+So the presenter's tile, or its key, is not understood yet. The order
+stays an open item: find which objects those pixels belong to, and what
+tile the presenter reads for them. The original also leaves out objects
+on the lot's outermost tiles; those are still drawn here.
 
 ## Linear glide
 
@@ -180,7 +199,8 @@ Unit tests:
 - **Walls:** corner classification, run order at rotations 0 and 2, every
   segment exactly once at each rotation, leftovers last.
 - **Ground:** the rule.
-- **Objects:** order by tile key, and holders before what they hold.
+- **Objects:** holders before what they hold, and a holder outside the
+  list keeps slot order.
 - **`held_by`:** on the bench, person and drink tree.
 - **Glide:** the glide's samples and its equal steps.
 - **Zoom:** house 99's zoom floor.

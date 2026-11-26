@@ -3325,7 +3325,9 @@ impl<'a> Painter<'a> {
             };
             list.push((anchor, screen, id, o, pose, [x, y], preview_at.is_some()));
         }
-        object_order(&mut list, self.camera, |item| (item.2, item.3, item.5));
+        object_order(&mut list, |item| {
+            (item.2, item.3, (std::cmp::Reverse(item.0.depth), item.2))
+        });
         for &(base_anchor, base_screen, id, o, pose, pos, blocked_preview) in &list {
             let Some(definition) = self.assets.definition_ref(o.guid) else {
                 self.stats.missing_objects += 1;
@@ -4264,24 +4266,21 @@ fn wall_corner(m: u8) -> (bool, bool) {
     (valid && junction, valid && m.count_ones() == 1)
 }
 
-/// Puts a level's objects in the order the original draws them
-/// (`0x4aa1d7`'s list, kept by the presenter): the objects not in another's
-/// slot sorted by their tiles' view keys, `(x + y, x - y)` with the tile
-/// turned to the view (`63 - y, x` and so on), with the original's sort,
-/// from object ID order; each followed by what its slots hold, slot by
-/// slot and at every depth, as the holder's draw walks them (`0x437c56`).
-/// What a holder outside `list` holds (a person's, whose draw puts it
-/// down slot by slot, `0x459e25`..`0x45a027`) stays together in slot
-/// order, sorted by the key of the first.
+/// Puts a level's objects in drawing order: the objects in no slot by
+/// `of`'s key (the caller's: far to near by depth anchor, then ID), each
+/// followed by what its slots hold, slot by slot and at every depth, as
+/// the holder's draw walks them (`0x437c56`). What a holder outside `list`
+/// holds (a person's, whose draw puts it down slot by slot,
+/// `0x459e25`..`0x45a027`) stays together in slot order, at its first
+/// object's key.
 ///
-/// The original sorts its registry, whose order this does not track; it
-/// matters only for objects on the same tile key. It also leaves out
-/// objects on the lot's outermost tiles, which are still drawn here.
-fn object_order<T: Copy>(
-    list: &mut Vec<T>,
-    camera: &Camera,
-    of: impl Fn(&T) -> (u16, &Object, [i32; 2]),
-) {
+/// The original's presenter sorts by each object's view tile key,
+/// `(x + y, x - y)`, with its own sort (legacy `rebuild_order`). That
+/// order, from object ID order or from depth order, draws 6 pixels of the
+/// screenshot ratchet's 0816 scenes unlike the original, where the depth
+/// order draws all of them alike. So the presenter's tile (or its key) is
+/// not yet understood, and the depth order stays.
+fn object_order<T: Copy, K: Ord>(list: &mut Vec<T>, of: impl Fn(&T) -> (u16, &Object, K)) {
     #[derive(Clone, Copy)]
     enum Root {
         /// An object in no slot.
@@ -4315,21 +4314,11 @@ fn object_order<T: Copy>(
             .filter(|h| !ids.contains_key(h))
             .map(|&h| Root::Absent(h)),
     );
-    let tile_key = |i: usize| {
-        let [x, y] = of(&list[i]).2.map(|n| n >> 4);
-        let [vx, vy] = match camera.rotation & 3 {
-            1 => [63 - y, x],
-            2 => [63 - x, 63 - y],
-            3 => [y, 63 - x],
-            _ => [x, y],
-        };
-        (vx + vy, vx - vy)
-    };
     let key = |r: &Root| match *r {
-        Root::Item(i) => tile_key(i),
-        Root::Absent(h) => tile_key(children[&h][0].2),
+        Root::Item(i) => of(&list[i]).2,
+        Root::Absent(h) => of(&list[children[&h][0].2]).2,
     };
-    sims_core::sort::sort_by(&mut top, |a, b| key(a) < key(b));
+    top.sort_by_key(key);
     let mut order = Vec::with_capacity(list.len());
     let mut placed = vec![false; list.len()];
     for root in top {
@@ -5897,7 +5886,7 @@ mod tests {
     }
 
     #[test]
-    fn objects_go_by_tile_key_each_followed_by_what_it_holds() {
+    fn objects_go_by_key_each_followed_by_what_it_holds() {
         // A table (1) at tile (3, 3) holds a plate (2) in slot 1 and a cup
         // (3) in slot 0; a chair (4) is at tile (2, 2); a lamp (5) at
         // (3, 2).
@@ -5918,16 +5907,13 @@ mod tests {
             object(4, 4, [2 * 16, 2 * 16, 1], &[]),
             object(5, 5, [3 * 16, 2 * 16, 1], &[]),
         ];
-        let ids = |rotation: u8| {
-            let mut list: Vec<&Object> = objects.iter().collect();
-            object_order(&mut list, &camera(rotation), |o| {
-                (o.id, *o, [o.position[0], o.position[1]])
-            });
-            list.iter().map(|o| o.id).collect::<Vec<_>>()
-        };
-        assert_eq!(ids(0), vec![4, 5, 1, 3, 2]);
-        // Half a turn: the table's tile is now the back one.
-        assert_eq!(ids(2), vec![1, 3, 2, 5, 4]);
+        // Keyed by the tile's x + y, then ID, as a stand-in for depth.
+        let mut list: Vec<&Object> = objects.iter().collect();
+        object_order(&mut list, |o| {
+            (o.id, *o, ((o.position[0] + o.position[1]) >> 4, o.id))
+        });
+        let ids: Vec<u16> = list.iter().map(|o| o.id).collect();
+        assert_eq!(ids, vec![4, 5, 1, 3, 2]);
     }
 
     #[test]
@@ -5950,9 +5936,7 @@ mod tests {
             ),
         ];
         let mut list: Vec<&Object> = objects.iter().collect();
-        object_order(&mut list, &camera(0), |o| {
-            (o.id, *o, [o.position[0], o.position[1]])
-        });
+        object_order(&mut list, |o| (o.id, *o, o.id));
         let ids: Vec<u16> = list.iter().map(|o| o.id).collect();
         let at = |id| ids.iter().position(|&i| i == id).unwrap();
         assert_eq!(ids.len(), 3);
