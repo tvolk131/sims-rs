@@ -56,8 +56,86 @@ pub const GENERIC_FRAME: i32 = 22;
 /// 133×103, loaded at `0x523572`) drawn behind 45×45 (`0x2d × 0x2d`)
 /// dialog icons (`0x524660..0x524782`, `0x524a6c..0x524ae7`).
 pub const ICON_STUB: i32 = 4992;
+/// The dismiss box a non-modal dialog shows in place of its buttons
+/// (`MinimizeBox.bmp`, 48×11: four 12×11 cells, normal, selected, hover,
+/// disabled, as [`BUTTON`]'s; legacy/crates/sims-app/src/tutorial_dialog.rs).
+pub const DISMISS: i32 = 31;
+/// The dismiss box's size and how far in from the dialog's top right
+/// corner it sits (the old prototype's `Card::layout`).
+pub const DISMISS_SIZE: [i32; 2] = [12, 11];
+const DISMISS_MARGIN: i32 = 5;
 /// The art a dialog needs besides the fonts.
-pub const RESOURCES: [i32; 4] = [BUTTON, BACKGROUND, GENERIC_FRAME, ICON_STUB];
+pub const RESOURCES: [i32; 5] = [BUTTON, BACKGROUND, GENERIC_FRAME, ICON_STUB, DISMISS];
+/// The tutorial controller's GUID: the original compares a dialog's
+/// caller with it and shows that caller's dialogs without a title (the
+/// old prototype's `Presentation::capture`; the same controller
+/// `sims_sim::load` names).
+pub const TUTORIAL_CONTROLLER: u32 = 0xC324_9A1D;
+
+/// How a dialog is shown, beside what it says: the Dialog instruction's
+/// flags and who asked, as the original reads them when it makes the
+/// dialog (0x43601c, 0x436a52; legacy/crates/sims-vm/src/dialog/presentation.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Presentation {
+    /// Operand 7 bit 7 clear: the dialog holds the game until it is
+    /// answered, with its buttons along the bottom. A non-modal one
+    /// (bit set) has a [`DISMISS`] box at its top right instead, and
+    /// presses elsewhere go on to the game.
+    pub modal: bool,
+    /// The caller owns interface events (`World::event_owner`, 0x44d906):
+    /// the dialog is put at the window's top right, not centered.
+    pub anchored: bool,
+    /// The caller is the [`TUTORIAL_CONTROLLER`]: no title is shown.
+    pub hide_title: bool,
+    /// Operand 5 bit 7: the width search aims at 1.2 times as wide as
+    /// tall, not 2.
+    pub large: bool,
+}
+
+impl Default for Presentation {
+    /// A plain modal dialog, as the shell's own dialogs are.
+    fn default() -> Self {
+        Self {
+            modal: true,
+            anchored: false,
+            hide_title: false,
+            large: false,
+        }
+    }
+}
+
+impl Presentation {
+    /// What the Dialog instruction's `operands` alone say: modal (operand
+    /// 7 bit 7 clear) and large (operand 5 bit 7).
+    pub fn from_operands(operands: &[u8; 8]) -> Self {
+        Self {
+            modal: operands[7] & 0x80 == 0,
+            large: operands[5] & 0x80 != 0,
+            ..Self::default()
+        }
+    }
+
+    /// Everything about `dialog`'s presentation, with who asked read from
+    /// `world` as it is now: anchored when its caller owns interface
+    /// events, title hidden when its caller is the tutorial controller.
+    pub fn capture(dialog: &Dialog, world: &World) -> Self {
+        let caller = dialog.caller;
+        Self {
+            anchored: caller != 0 && world.event_owner == caller,
+            hide_title: caller != 0
+                && world
+                    .objects
+                    .get(&caller)
+                    .is_some_and(|o| o.guid == TUTORIAL_CONTROLLER),
+            ..Self::from_operands(&dialog.operands)
+        }
+    }
+
+    /// The aspect ratio the width search aims at.
+    fn aspect(self) -> f64 {
+        if self.large { LARGE_ASPECT } else { ASPECT }
+    }
+}
 /// Half-period of the `cTSWinTextEdit2` caret blink timer in microseconds:
 /// 500 ms (`0x1f4` ms at `0x5f203e`).
 pub const CARET_BLINK_US: u64 = 500_000;
@@ -127,6 +205,8 @@ pub struct Message {
     /// Whether this dialog uses the edit-mode Save Card layout (`0x50d68a..0x50de10`,
     /// centered around `SAVE_CARD` 4994 with Lot Name and Lot Description fields).
     pub save_card: bool,
+    /// Modal or not, anchored, title hidden, large ([`Presentation`]).
+    pub presentation: Presentation,
 }
 
 /// What a dialog that asks for text holds when it opens: the original
@@ -1239,6 +1319,7 @@ impl Message {
             secondary_entry: None,
             frame: FrameStyle::Popup,
             save_card: false,
+            presentation: Presentation::default(),
         }
     }
 
@@ -1260,6 +1341,7 @@ impl Message {
             secondary_entry: None,
             frame: FrameStyle::Popup,
             save_card: false,
+            presentation: Presentation::default(),
         }
     }
 
@@ -1284,6 +1366,7 @@ impl Message {
             secondary_entry: None,
             frame: FrameStyle::Popup,
             save_card: false,
+            presentation: Presentation::default(),
         }
     }
 
@@ -1317,6 +1400,7 @@ impl Message {
             secondary_entry: Some(desc),
             frame: FrameStyle::Popup,
             save_card: true,
+            presentation: Presentation::default(),
         }
     }
 
@@ -1381,6 +1465,7 @@ impl Message {
         let Some(mut msg) = Self::from_file(&iff, labels, dialog.caller, &dialog.operands)? else {
             return Ok(None);
         };
+        msg.presentation = Presentation::capture(dialog, world);
 
         // 0x457d3b: when operand 6 is 0 (or yields an empty title), fall back
         // to the caller object's localized catalog display name (`CTSS[0]`).
@@ -1580,6 +1665,7 @@ impl Message {
             secondary_entry: None,
             frame: FrameStyle::Popup,
             save_card: false,
+            presentation: Presentation::from_operands(operands),
         }))
     }
 }
@@ -1608,6 +1694,9 @@ const TITLE_BOX: i32 = 4;
 /// (0x523409), is done within 0.05 of it, and halves the gap until it
 /// is 20 or less, for at most 10 tries.
 const ASPECT: f64 = 2.0;
+/// A large dialog's (operand 5 bit 7) aim: 1.2 times as wide as tall
+/// (the old prototype's `choose_width`).
+const LARGE_ASPECT: f64 = 1.2;
 const CLOSE: f64 = 0.05f32 as f64;
 const STEP: i32 = 20;
 const TRIES: i32 = 10;
@@ -1626,6 +1715,8 @@ pub struct Layout {
     pub title: [i32; 2],
     /// Each line of the message and where it starts.
     pub lines: Vec<(String, [i32; 2])>,
+    /// The buttons, in answer order. A non-modal dialog has one: its
+    /// [`DISMISS`] box, which answers with the first button.
     pub buttons: Vec<Rect>,
     /// The entry field of a dialog that asks for text (or Lot Name on a Save Card).
     pub entry: Option<Rect>,
@@ -1758,10 +1849,18 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
     // below can overflow.
     let title_line = title_font.line_height.clamp(0, 1024);
     let line = body.line_height.clamp(1, 1024);
-    let title = (!message.title.is_empty())
+    let presentation = message.presentation;
+    let aspect = presentation.aspect();
+    let title = (!message.title.is_empty() && !presentation.hide_title)
         .then(|| title_font.width(&message.title).clamp(0, 1 << 16) + TITLE_BOX);
     let text: Vec<char> = message.text.chars().collect();
-    let count = message.buttons.len().min(3);
+    // A non-modal dialog has no buttons along its bottom: its dismiss box
+    // sits in the top right corner.
+    let count = if presentation.modal {
+        message.buttons.len().min(3)
+    } else {
+        0
+    };
     let buttons = i32::try_from(count).unwrap_or(0);
     let icon_width = icon.map_or(0, |[w, _]| w);
     let least = match title {
@@ -1830,11 +1929,11 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
     let start = first.text_width;
     let (mut wide, mut narrow) = (start, start);
     let (mut wide_ratio, mut narrow_ratio) = (first.ratio() as f32, first.ratio() as f32);
-    if (first.ratio() - ASPECT).abs() > CLOSE {
+    if (first.ratio() - aspect).abs() > CLOSE {
         loop {
             let a = arrange(wide);
             wide_ratio = a.ratio() as f32;
-            if a.ratio() >= ASPECT || a.text_width >= WIDEST {
+            if a.ratio() >= aspect || a.text_width >= WIDEST {
                 break;
             }
             wide = a.text_width.saturating_mul(2).min(WIDEST);
@@ -1842,7 +1941,7 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
         for tries in 1.. {
             let a = arrange(narrow);
             narrow_ratio = a.ratio() as f32;
-            if a.ratio() <= ASPECT {
+            if a.ratio() <= aspect {
                 break;
             }
             narrow = a.text_width / 2;
@@ -1855,7 +1954,7 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
                 break;
             }
             let a = arrange((wide + narrow) / 2);
-            if a.ratio() >= ASPECT {
+            if a.ratio() >= aspect {
                 (wide, wide_ratio) = (a.text_width, a.ratio() as f32);
             } else {
                 (narrow, narrow_ratio) = (a.text_width, a.ratio() as f32);
@@ -1865,7 +1964,7 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
             }
         }
     }
-    let off = |ratio: f32| (f64::from(ratio) - ASPECT).abs();
+    let off = |ratio: f32| (f64::from(ratio) - aspect).abs();
     let mut before = last_width.get();
     let mut a = arrange(if off(wide_ratio) <= off(narrow_ratio) {
         wide
@@ -1892,8 +1991,14 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
         a.buttons -= line;
     }
     let width = a.size[0];
-    let y = ((size[1] - height) / 2).min(size[1] - height);
-    let rect = Rect::new((size[0] - width) / 2, y, width, height);
+    // An anchored dialog is flush with the window's top right corner (the
+    // old prototype's placement); any other is centered.
+    let rect = if presentation.anchored {
+        Rect::new(size[0] - width, 0, width, height)
+    } else {
+        let y = ((size[1] - height) / 2).min(size[1] - height);
+        Rect::new((size[0] - width) / 2, y, width, height)
+    };
     let title_x = match (title, icon) {
         (Some(title), Some(_)) => {
             top - PAD + icon_width + GAP + (a.text_width - band[0] - title) / 2
@@ -1910,16 +2015,22 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
     });
     let lines = beside.chain(below).collect();
     let gap = (a.text_width - buttons * BUTTON_SIZE[0]) / (buttons + 1);
-    let buttons = (0..buttons)
-        .map(|n| {
-            Rect::new(
-                rect.x + top + gap * (n + 1) + BUTTON_SIZE[0] * n,
-                rect.y + a.buttons,
-                BUTTON_SIZE[0],
-                BUTTON_SIZE[1],
-            )
-        })
-        .collect();
+    let buttons = if presentation.modal {
+        (0..buttons)
+            .map(|n| {
+                Rect::new(
+                    rect.x + top + gap * (n + 1) + BUTTON_SIZE[0] * n,
+                    rect.y + a.buttons,
+                    BUTTON_SIZE[0],
+                    BUTTON_SIZE[1],
+                )
+            })
+            .collect()
+    } else if message.buttons.is_empty() {
+        Vec::new()
+    } else {
+        vec![dismiss_rect(rect)]
+    };
     Some(Layout {
         caller: message.caller,
         rect,
@@ -1937,6 +2048,17 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
         lines,
         buttons,
     })
+}
+
+/// Where a non-modal dialog at `rect` has its [`DISMISS`] box: 5 in
+/// from its top right corner.
+pub fn dismiss_rect(rect: Rect) -> Rect {
+    Rect::new(
+        rect.x + rect.width - DISMISS_SIZE[0] - DISMISS_MARGIN,
+        rect.y + DISMISS_MARGIN,
+        DISMISS_SIZE[0],
+        DISMISS_SIZE[1],
+    )
 }
 
 /// Lays out the edit-mode Save Card (`cWinEditLotInfo`, `0x50d8c5..0x50de10`,
@@ -3240,6 +3362,7 @@ pub fn draw_with_state(
         FrameStyle::Popup => TITLE_FONT,
     };
     if !message.title.is_empty()
+        && !message.presentation.hide_title
         && let Some(font) = art.font(title_font_size)
     {
         font.draw(frame, &message.title, layout.title, LABEL);
@@ -3297,6 +3420,10 @@ pub fn draw_with_state(
         } else {
             (0, LABEL)
         };
+        if !message.presentation.modal {
+            draw_dismiss(frame, art, *rect, cell_idx, rgb);
+            continue;
+        }
         if let Some(cell) = art.cell(BUTTON, 4, cell_idx) {
             let w = i32::try_from(cell.width).unwrap_or(0);
             let h = i32::try_from(cell.height).unwrap_or(0);
@@ -3319,6 +3446,23 @@ pub fn draw_with_state(
             let x = (i64::from(rect.x) + offset).clamp(i64::from(i32::MIN), i64::from(i32::MAX));
             font.draw(frame, label, [x as i32, rect.y.saturating_add(5)], rgb);
         }
+    }
+}
+
+/// Draws a non-modal dialog's dismiss box at `rect`: the [`DISMISS`] cell
+/// for its state, or, without the art, an outline in the state's color.
+fn draw_dismiss(frame: &mut Frame, art: &Art, rect: Rect, cell: u32, rgb: [u8; 3]) {
+    if let Some(image) = art.cell(DISMISS, 4, cell) {
+        frame.draw_all(&image, [rect.x, rect.y]);
+        return;
+    }
+    for x in rect.x..rect.x.saturating_add(rect.width) {
+        frame.blend(x, rect.y, rgb, 255);
+        frame.blend(x, rect.y + rect.height - 1, rgb, 255);
+    }
+    for y in rect.y..rect.y.saturating_add(rect.height) {
+        frame.blend(rect.x, y, rgb, 255);
+        frame.blend(rect.x + rect.width - 1, y, rgb, 255);
     }
 }
 
@@ -3624,9 +3768,11 @@ fn draw_multiline_entry(
     }
 }
 
-/// What a press at `point` asks for: the answer of the button there.
-/// The dialog stops presses everywhere else while it is shown, as a modal
-/// dialog does.
+/// What a press at `point` asks for: the answer of the button there (a
+/// non-modal dialog's dismiss box answers with the first button). A
+/// modal dialog stops presses everywhere else while it is shown; whether
+/// a press elsewhere goes on to the game is the host's to decide
+/// ([`Presentation::modal`]).
 pub fn press(layout: &Layout, point: [i32; 2]) -> Option<Command> {
     press_with_state(layout, point, &DialogState::default())
 }
@@ -3770,6 +3916,7 @@ mod tests {
             secondary_entry: None,
             frame: FrameStyle::Popup,
             save_card: false,
+            presentation: Presentation::default(),
         }
     }
 
@@ -4003,6 +4150,285 @@ mod tests {
                 button: 1,
             })
         );
+    }
+
+    fn presented(text: &str, buttons: usize, presentation: Presentation) -> Message {
+        Message {
+            presentation,
+            ..message(text, buttons)
+        }
+    }
+
+    const NON_MODAL: Presentation = Presentation {
+        modal: false,
+        anchored: false,
+        hide_title: false,
+        large: false,
+    };
+
+    #[test]
+    fn presentation_reads_the_operands_and_who_asked() {
+        // Operand 7 bit 7 set: non-modal; operand 5 bit 7: large.
+        let mut operands = [0u8; 8];
+        assert_eq!(
+            Presentation::from_operands(&operands),
+            Presentation::default()
+        );
+        assert!(Presentation::default().modal);
+        operands[7] = 0x80 | (3 << 1);
+        operands[5] = 0x80;
+        let p = Presentation::from_operands(&operands);
+        assert!(!p.modal && p.large && !p.anchored && !p.hide_title);
+
+        let mut world = World::empty();
+        world
+            .objects
+            .insert(9, crate::house::tests::object(9, TUTORIAL_CONTROLLER, 0, 0));
+        world
+            .objects
+            .insert(4, crate::house::tests::object(4, 77, 0, 0));
+        let asked = |caller| Dialog {
+            caller,
+            operands,
+            status: 0,
+        };
+        // Neither owning events nor the tutorial controller.
+        let p = Presentation::capture(&asked(4), &world);
+        assert!(!p.anchored && !p.hide_title && !p.modal && p.large);
+        // The event owner's dialog is anchored.
+        world.event_owner = 4;
+        assert!(Presentation::capture(&asked(4), &world).anchored);
+        // The tutorial controller's has no title.
+        let p = Presentation::capture(&asked(9), &world);
+        assert!(p.hide_title && !p.anchored);
+        // No caller: neither, even when no object owns events.
+        world.event_owner = 0;
+        let p = Presentation::capture(&asked(0), &world);
+        assert!(!p.anchored && !p.hide_title);
+    }
+
+    #[test]
+    fn a_non_modal_dialog_has_a_dismiss_box_and_no_buttons_below() {
+        let art = art();
+        let modal = layout([800, 600], &message("B", 1), &art).unwrap();
+        let laid = layout([800, 600], &presented("B", 1, NON_MODAL), &art).unwrap();
+        // One button: the 12 by 11 box 5 in from the top right corner.
+        assert_eq!(laid.buttons.len(), 1);
+        let r = laid.rect;
+        let dismiss = laid.buttons[0];
+        assert_eq!(dismiss, dismiss_rect(r));
+        assert_eq!(dismiss, Rect::new(r.x + r.width - 12 - 5, r.y + 5, 12, 11));
+        // No button row: the dialog is the button's height and 9 shorter
+        // (INSET + text + 18 + 12, not + 33 + 9 more).
+        assert_eq!(modal.rect.height - r.height, BUTTON_SIZE[1] + PAD);
+        // The box answers with the first button; presses elsewhere on it,
+        // or just outside the box, answer nothing.
+        assert_eq!(
+            press(&laid, [dismiss.x, dismiss.y]),
+            Some(Command::AnswerDialog {
+                caller: 7,
+                button: 0
+            })
+        );
+        assert_eq!(
+            press(&laid, [dismiss.x + 11, dismiss.y + 10]),
+            Some(Command::AnswerDialog {
+                caller: 7,
+                button: 0
+            })
+        );
+        assert_eq!(press(&laid, [dismiss.x + 12, dismiss.y]), None);
+        assert_eq!(press(&laid, [dismiss.x, dismiss.y + 11]), None);
+        assert_eq!(press(&laid, [r.x + 2, r.y + r.height - 2]), None);
+        // A modal dialog's buttons are along its bottom as before.
+        assert_eq!(modal.buttons.len(), 1);
+        assert_eq!(
+            modal.buttons[0].y + modal.buttons[0].height,
+            modal.rect.y + modal.rect.height - 21
+        );
+        // A non-modal dialog with no buttons has no box.
+        let none = layout([800, 600], &presented("B", 0, NON_MODAL), &art).unwrap();
+        assert!(none.buttons.is_empty());
+    }
+
+    #[test]
+    fn a_non_modal_dialog_draws_its_dismiss_box_not_a_button() {
+        let mut art = art();
+        // Cells 0..3 of the dismiss art in distinct colours.
+        let mut sheet = Image {
+            width: 48,
+            height: 11,
+            rgba: vec![0; 48 * 11 * 4],
+        };
+        for (n, px) in sheet.rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let cell = (n % 48) / 12;
+            px.copy_from_slice(&[10 + cell as u8, 20, 30, 255]);
+        }
+        art.insert(DISMISS, sheet);
+        let m = presented("B", 1, NON_MODAL);
+        let laid = layout([800, 600], &m, &art).unwrap();
+        let d = laid.buttons[0];
+        let mut frame = Frame::new(800, 600, [0, 0, 0]);
+        draw(&mut frame, &art, &m, &laid, None);
+        assert_eq!(frame.pixel(d.x, d.y), Some([10, 20, 30]), "normal cell");
+        assert_eq!(frame.pixel(d.x + 11, d.y + 10), Some([10, 20, 30]));
+        let mut frame = Frame::new(800, 600, [0, 0, 0]);
+        draw(&mut frame, &art, &m, &laid, Some([d.x + 1, d.y + 1]));
+        assert_eq!(frame.pixel(d.x, d.y), Some([12, 20, 30]), "hover cell");
+        // Without the art an outline still marks it.
+        let bare = super::tests::art();
+        let mut frame = Frame::new(800, 600, [0, 0, 0]);
+        draw(&mut frame, &bare, &m, &laid, None);
+        assert_eq!(frame.pixel(d.x, d.y), Some(LABEL));
+    }
+
+    #[test]
+    fn an_anchored_dialog_sits_in_the_top_right_corner() {
+        let art = art();
+        let anchored = Presentation {
+            anchored: true,
+            ..NON_MODAL
+        };
+        for size in [[800, 600], [1024, 768]] {
+            let laid = layout(size, &presented("B B B", 1, anchored), &art).unwrap();
+            assert_eq!(laid.rect.x + laid.rect.width, size[0]);
+            assert_eq!(laid.rect.y, 0);
+            // The lines move with it.
+            assert!(
+                laid.lines
+                    .iter()
+                    .all(|(_, [x, y])| *x >= laid.rect.x && *y >= 0)
+            );
+        }
+        // Not anchored: centered, modal or not.
+        let centered = layout([800, 600], &presented("B", 1, NON_MODAL), &art).unwrap();
+        assert_eq!(
+            centered.rect.x,
+            (800 - centered.rect.width) / 2,
+            "a non-anchored non-modal dialog is centered"
+        );
+    }
+
+    #[test]
+    fn a_large_dialog_aims_at_1_2_not_2() {
+        let art = art();
+        // A long text gives the search room to reach either aim.
+        let text = "B ".repeat(400);
+        let plain = layout(
+            [4000, 4000],
+            &presented(&text, 1, Presentation::default()),
+            &art,
+        )
+        .unwrap();
+        let large = layout(
+            [4000, 4000],
+            &presented(
+                &text,
+                1,
+                Presentation {
+                    large: true,
+                    ..Presentation::default()
+                },
+            ),
+            &art,
+        )
+        .unwrap();
+        let ratio = |r: Rect| f64::from(r.width) / f64::from(r.height);
+        assert!(
+            (ratio(plain.rect) - ASPECT).abs() < (ratio(plain.rect) - LARGE_ASPECT).abs(),
+            "plain {:?}",
+            plain.rect
+        );
+        assert!(
+            (ratio(large.rect) - LARGE_ASPECT).abs() < (ratio(large.rect) - ASPECT).abs(),
+            "large {:?}",
+            large.rect
+        );
+        assert!(large.rect.width < plain.rect.width);
+    }
+
+    #[test]
+    fn a_hidden_title_takes_no_room_and_is_not_drawn() {
+        let art = art();
+        let hidden = Presentation {
+            hide_title: true,
+            ..Presentation::default()
+        };
+        let mut untitled = message("B", 1);
+        untitled.title.clear();
+        let shown = layout([800, 600], &message("B", 1), &art).unwrap();
+        let laid = layout([800, 600], &presented("B", 1, hidden), &art).unwrap();
+        let none = layout([800, 600], &untitled, &art).unwrap();
+        // Laid out as if it had no title.
+        assert_eq!(laid.rect, none.rect);
+        assert_eq!(laid.lines, none.lines);
+        assert!(laid.rect.height < shown.rect.height);
+        // Nothing drawn where the title would go: the frame is the same
+        // as the untitled dialog's.
+        let m = presented("B", 1, hidden);
+        let mut a = Frame::new(800, 600, [0, 0, 0]);
+        let mut b = Frame::new(800, 600, [0, 0, 0]);
+        draw(&mut a, &art, &m, &laid, None);
+        draw(&mut b, &art, &untitled, &none, None);
+        assert!(a == b, "a hidden title draws nothing");
+    }
+
+    #[test]
+    fn a_picture_icon_is_bmp_5000_plus_operand_1() {
+        // Icon mode 3 (operand 7 bits 1 to 3) loads `BMP_` 5000 + operand 1
+        // from the caller's file; the 5000 to 5024 pictures a tutorial
+        // dialog shows are that range.
+        let picture = |id: u16, w: u16, h: u16| {
+            let mut bmp = Vec::new();
+            let row = (usize::from(w) * 3).div_ceil(4) * 4;
+            let size = 54 + row * usize::from(h);
+            bmp.extend_from_slice(b"BM");
+            bmp.extend_from_slice(&(size as u32).to_le_bytes());
+            bmp.extend_from_slice(&[0; 4]);
+            bmp.extend_from_slice(&54u32.to_le_bytes());
+            bmp.extend_from_slice(&40u32.to_le_bytes());
+            bmp.extend_from_slice(&i32::from(w).to_le_bytes());
+            bmp.extend_from_slice(&i32::from(h).to_le_bytes());
+            bmp.extend_from_slice(&1u16.to_le_bytes());
+            bmp.extend_from_slice(&24u16.to_le_bytes());
+            bmp.extend_from_slice(&[0; 24]);
+            bmp.resize(size, 0x40);
+            sims_formats::iff::ChunkData {
+                tag: *b"BMP_",
+                id,
+                flags: 0x10,
+                label: String::new(),
+                data: bmp,
+            }
+        };
+        let bytes = sims_formats::iff::write(&[picture(5000, 3, 2), picture(5024, 5, 4)]).unwrap();
+        let iff = Iff::parse(bytes).unwrap();
+        let labels = Labels::default();
+        let mut operands = [0u8; 8];
+        operands[7] = 0x80 | (3 << 1);
+        for (n, size) in [(0u8, (3, 2)), (24, (5, 4))] {
+            operands[1] = n;
+            let m = Message::from_file(&iff, &labels, 3, &operands)
+                .unwrap()
+                .unwrap();
+            let icon = m.icon.expect("picture");
+            assert_eq!((icon.width, icon.height), size);
+            assert!(!m.presentation.modal);
+        }
+        // Another icon mode loads no picture.
+        operands[7] = 0x80 | (2 << 1);
+        operands[1] = 0;
+        let m = Message::from_file(&iff, &labels, 3, &operands)
+            .unwrap()
+            .unwrap();
+        assert!(m.icon.is_none());
+        // A picture that is not there: none.
+        operands[7] = 3 << 1;
+        operands[1] = 7;
+        let m = Message::from_file(&iff, &labels, 3, &operands)
+            .unwrap()
+            .unwrap();
+        assert!(m.icon.is_none() && m.presentation.modal);
     }
 
     #[test]

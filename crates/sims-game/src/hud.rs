@@ -1874,9 +1874,34 @@ impl Hud {
     }
 
     /// Whether any modal dialog (UI confirmation, loaded VM dialog, or drawn
-    /// layout) is currently active, even before the next [`Hud::draw`].
+    /// layout) is currently active, even before the next [`Hud::draw`]. A
+    /// non-modal simulation dialog ([`dialog::Presentation::modal`] clear)
+    /// is not one: it takes only the presses on it
+    /// ([`Hud::has_non_modal_dialog`]).
     pub fn has_dialog(&self) -> bool {
-        self.ui_dialog.is_some() || self.message.is_some() || self.dialog.is_some()
+        self.ui_dialog.is_some()
+            || match &self.message {
+                Some((message, _)) => message.presentation.modal,
+                None => self.dialog.is_some(),
+            }
+    }
+
+    /// Whether the dialog shown is a non-modal simulation dialog: drawn
+    /// with a dismiss box, taking presses on it only, so the game goes on
+    /// being played around it.
+    pub fn has_non_modal_dialog(&self) -> bool {
+        self.ui_dialog.is_none()
+            && self
+                .message
+                .as_ref()
+                .is_some_and(|(message, _)| !message.presentation.modal)
+    }
+
+    /// The rect of the non-modal dialog drawn last, if one is shown.
+    fn non_modal_rect(&self) -> Option<Rect> {
+        self.has_non_modal_dialog()
+            .then(|| self.dialog.as_ref().map(|l| l.rect))
+            .flatten()
     }
 
     /// Updates the native `[control_panel + 0x1ec]` idle-blink flag
@@ -2504,9 +2529,10 @@ impl Hud {
         self.dialog = self
             .active_message()
             .and_then(|m| dialog::layout(view.size, m, &self.art));
-        // A dialog takes every press until it is answered, so a menu open
-        // under it is closed rather than left to be chosen from after.
-        if self.dialog.is_some() {
+        // A modal dialog takes every press until it is answered, so a menu
+        // open under it is closed rather than left to be chosen from after.
+        // A non-modal one leaves the game to be played around it.
+        if self.dialog.is_some() && !self.has_non_modal_dialog() {
             self.menu = None;
             self.close_camera_strip();
         }
@@ -2821,6 +2847,9 @@ impl Hud {
     /// pixels), or a dialog or a pie menu is shown and takes every press.
     pub fn covers(&self, point: [i32; 2]) -> bool {
         self.has_dialog()
+            || self
+                .non_modal_rect()
+                .is_some_and(|r| r.contains(point[0], point[1]))
             || self.menu.is_some()
             || self.band.is_some_and(|b| b.contains(point[0], point[1]))
             || self
@@ -2922,6 +2951,7 @@ impl Hud {
     /// menu on this frame (`Hud::draw`).
     pub fn will_show_dialog(&self, size: [i32; 2]) -> bool {
         self.active_message()
+            .filter(|m| self.ui_dialog.is_some() || m.presentation.modal)
             .and_then(|m| dialog::layout(size, m, &self.art))
             .is_some()
     }
@@ -3110,7 +3140,14 @@ impl Hud {
     /// is, `sims_vm::Lot::residential`) as they are at the press, not as
     /// the frame drew them ([`hud::check_press`]).
     pub fn press(&mut self, point: [i32; 2], world: &World, residential: bool) -> Option<Command> {
-        if let Some(layout) = self.dialog.clone() {
+        // A non-modal dialog takes only the presses on it; any other goes on
+        // to what is under it.
+        let non_modal = self.has_non_modal_dialog();
+        if let Some(layout) = self
+            .dialog
+            .clone()
+            .filter(|l| !non_modal || l.rect.contains(point[0], point[1]))
+        {
             if let Some(message) = self.active_message().cloned()
                 && self
                     .dialog_state

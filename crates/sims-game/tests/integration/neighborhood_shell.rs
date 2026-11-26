@@ -821,6 +821,19 @@ fn move_in_rollback_magic_town_magicoins_pace_sync_and_family_bin_clicks() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
+/// The files in `dir`, sorted so the listing does not depend on the
+/// filesystem.
+#[allow(clippy::disallowed_methods)]
+fn sorted_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .expect("export dir made")
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    files.sort();
+    files
+}
+
 /// The Family Bin's Export button, clicked like a player would: select a
 /// family, press and release Export, and the shell writes
 /// `<saves>.userdata/<neighborhood>/Export/<Name>_<id>.FAM`, says so in a
@@ -875,11 +888,7 @@ fn family_bin_export_button_writes_an_importable_fam_and_says_where() {
     shell.release(centre(export));
 
     let id = u16::try_from(family.id).unwrap();
-    let files: Vec<_> = std::fs::read_dir(&export_dir)
-        .expect("export dir made")
-        .flatten()
-        .map(|e| e.path())
-        .collect();
+    let files = sorted_files(&export_dir);
     assert_eq!(
         files.len(),
         1,
@@ -918,7 +927,7 @@ fn family_bin_export_button_writes_an_importable_fam_and_says_where() {
 
     // Exporting again replaces the file rather than adding a second.
     shell.export_family(id).expect("re-export");
-    assert_eq!(std::fs::read_dir(&export_dir).unwrap().count(), 1);
+    assert_eq!(sorted_files(&export_dir), files);
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
