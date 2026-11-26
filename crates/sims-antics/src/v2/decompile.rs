@@ -1305,7 +1305,8 @@ fn if_let_spellings(text: &str) -> Vec<Vec<Rewrite>> {
             .any(|t| matches!(&t.kind, K::Ident(s) if s == w))
     };
     // The rewrites of the `temp[0]` reads from token `k` on, up to the first change of a
-    // temp or the `}` that closes the block `k` is in.
+    // temp (an assignment, `flag_set` / `flag_clear`, a method, `&` or `mut`), call or raw
+    // block, or the `}` that closes the block `k` is in.
     let reads = |mut k: usize, name: &str| -> Vec<Rewrite> {
         let mut out = Vec::new();
         let mut depth = 0usize;
@@ -1339,7 +1340,11 @@ fn if_let_spellings(text: &str) -> Vec<Vec<Rewrite>> {
                         | K::PipeEq
                         | K::CaretEq
                 )
-            ) || (k > 0 && (kind(k - 1) == Some(&K::Amp) || ident(k - 1, "mut")));
+            ) || ident(k + 4, "flag_set")
+                || ident(k + 4, "flag_clear")
+                // A method (`temp[0].set(F)`) may write the cell.
+                || kind(k + 4) == Some(&K::Dot)
+                || (k > 0 && (kind(k - 1) == Some(&K::Amp) || ident(k - 1, "mut")));
             if written {
                 break;
             }

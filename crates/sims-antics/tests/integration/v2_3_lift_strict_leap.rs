@@ -283,3 +283,87 @@ fn lifecycle_blocks_name_their_locals() {
         assert_eq!(tree(&trees, 4096).raw_statements, 0, "{lifted}");
     }
 }
+
+#[test]
+fn a_body_past_the_node_limit_stays_labeled() {
+    // Six arms, each ending in the same 45-store tail: a structured body copies the tail
+    // into each arm, past what a tree may hold. The structurer stops at 245 nodes, so the
+    // tree is written as its labeled nodes, as before. Structuring it anyway and building it
+    // with `share_tails` was measured and not adopted (see the ADR).
+    let tail: String = (0..45).map(|_| "self.n += 1; ").collect();
+    let arms: String = (1..=6)
+        .map(|k| format!("if x == {k} {{ self.m = {k}; {tail} return true; }} "))
+        .collect();
+    let body = format!("{arms} return false;");
+    let unshared = object(0x7E00_01A8, "", &body);
+    let refused = compile_v2_source("leap.antics", &unshared, &PackResolverConfig::default())
+        .expect_err("too many nodes")
+        .to_string();
+    assert!(refused.contains("exceeds maximum"), "{refused}");
+    let source = object(0x7E00_01A8, ", share_tails", &body);
+    for behavioral in [false, true] {
+        let (lifted, trees) = lift(&source, behavioral);
+        assert_eq!(tree(&trees, 4300).style, TreeStyle::RawLabeled, "{lifted}");
+        lacks(&lifted, &["share_tails"]);
+    }
+}
+
+#[test]
+fn option_reads_stop_at_a_flag_write() {
+    // `temp[0] flag_set 1` writes the temp: the binding covers the read before it only.
+    let source = r#"use std::globals::*;
+
+object "Fable Leap Option Flag" {
+    guid: 0x7E00_01A9;
+    #[bhav(id = 4300, label = "Follow", locals = 0)]
+    fn follow() {
+        if globals::find_companion() {
+            stack_obj = temp[0];
+            temp[0] flag_set 1;
+            self.attr[0] = temp[0];
+        }
+    }
+}"#;
+    let (lifted, _) = lift(source, true);
+    has(
+        &lifted,
+        &[
+            "Some(companion) = globals::find_companion()",
+            "stack_obj = companion;",
+            "temp[0] flag_set 1;",
+            "self.attr_0 = temp[0];",
+        ],
+    );
+}
+
+#[test]
+fn wide_inline_calls_get_no_pin() {
+    // The original runs its nodes in an order no structured lift writes, around a call that
+    // yields. The call before the last store passes its argument inline to a tree whose
+    // frame holds six, which reads its other arguments from the nodes after it: no pin may
+    // move them, and the structurer does not reorder around it. The tree is proven as its
+    // labeled nodes, with no pin.
+    let source = r#"object "Fable Leap Wide" {
+    guid: 0x7E00_01AA;
+    state n: i16;
+    #[bhav(id = 4301, args = 6)]
+    fn wide(a: i16) -> bool { true }
+    #[bhav(id = 4302)]
+    fn nap() -> bool { sleep(1); true }
+    #[bhav(id = 4300, label = "Leap", locals = 0)]
+    fn t() {
+        raw {
+            @n0:
+            expr(my.attr[0] := 1) -> true: @n3, false: error;
+            @n1:
+            expr(my.attr[0] := 3) -> true: true, false: error;
+            @n2:
+            call 4301(1) -> true: @n1, false: @n1;
+            @n3:
+            call 4302(temps) -> true: @n2, false: @n2;
+        }
+    }
+}"#;
+    let (lifted, _) = lift(source, false);
+    lacks(&lifted, &["node_order", "share_tails"]);
+}
