@@ -1282,8 +1282,11 @@ impl<'a> TreeLowerer<'a> {
         };
         self.bind_var(binding.to_owned(), counter);
         let (body_mark, raw_before) = (self.em.mark(), self.raw_blocks);
+        let in_temp_loop = usize::from(temp.is_some());
+        self.temp_loops += in_temp_loop;
         let res = self.lower_stmts(body);
         let pop_res = self.pop_scope_and_run_cleanups();
+        self.temp_loops -= in_temp_loop;
         if let Some(step) = &edge_step {
             self.emit_continue_step(step);
         }
@@ -1631,6 +1634,71 @@ impl<'a> TreeLowerer<'a> {
             return Ok(());
         }
 
+        // Form 3: `let Some(v) = f(..) else { ... };` on a `#[ret(temp = N)] -> Option<T>` tree:
+        // the call's false exit runs the else block, and `v` is the value its true exit left in
+        // `temp[N]`.
+        if let V2Expr::Call {
+            span: cspan,
+            callee,
+            type_args,
+            args,
+        } = init
+            && type_args.is_empty()
+            && let Some(sig) = self.resolve_callable(callee, *cspan)?
+        {
+            let ResolvedReturnAbi::OptionValue { ty, temp } = &sig.ret else {
+                return Err(Error::at(
+                    span,
+                    format!(
+                        "'let Some({name}) = ..' needs a call returning 'Option<T>' with '#[ret(temp = N)]', but {} does not",
+                        sig.display
+                    ),
+                ));
+            };
+            let (inferred_ty, temp) = (ty.clone(), *temp);
+            let final_ty = match ty_ann {
+                Some(ann) => {
+                    let expected = self.env.resolve_value_type(
+                        ann,
+                        &self.owner_module,
+                        self.in_object_scope,
+                        span,
+                    )?;
+                    if !types_compatible_for_assign(&expected, &inferred_ty) {
+                        return Err(Error::at(
+                            span,
+                            format!(
+                                "'let Some({name}: {})' does not match '{}' result",
+                                self.env.display_value_type(&expected),
+                                self.env.display_value_type(&inferred_ty)
+                            ),
+                        ));
+                    }
+                    expected
+                }
+                None => inferred_ty,
+            };
+            let call = self.prepare_callable_call(&sig, args, *cspan)?;
+            self.line(format!("if !{call} {{"));
+            self.em.indent();
+            self.push_scope(ScopeFrame::block());
+            let r = self.lower_stmts(else_body);
+            let p = self.pop_scope_and_run_cleanups();
+            self.em.dedent();
+            self.line("}".to_owned());
+            r.and(p)?;
+            let air_name = self.fresh(&format!("v_{name}"));
+            self.emit_let(&air_name, &format!("temp[{temp}]"));
+            self.bind_var(
+                name.to_owned(),
+                Binding::Local {
+                    air_name,
+                    ty: final_ty,
+                },
+            );
+            return Ok(());
+        }
+
         // Form 2: `let Some(obj) = find_best_object[::<T>](...) | create_object[::<T>](...) else { ... };`
         let V2Expr::Call {
             callee,
@@ -1641,13 +1709,13 @@ impl<'a> TreeLowerer<'a> {
         else {
             return Err(Error::at(
                 span,
-                "'let Some(x) = ... else { ... }' requires find_best_object(...), create_object(...), or obj.run_functional(...)",
+                "'let Some(x) = ... else { ... }' requires find_best_object(...), create_object(...), obj.run_functional(...), or a call returning 'Option<T>'",
             ));
         };
         let V2Expr::Ident(_, fname) = callee.as_ref() else {
             return Err(Error::at(
                 span,
-                "'let Some(x) = ... else { ... }' requires find_best_object(...), create_object(...), or obj.run_functional(...)",
+                "'let Some(x) = ... else { ... }' requires find_best_object(...), create_object(...), obj.run_functional(...), or a call returning 'Option<T>'",
             ));
         };
 
@@ -1851,7 +1919,7 @@ impl<'a> TreeLowerer<'a> {
                 return Err(Error::at(
                     span,
                     format!(
-                        "'let Some({name}) = {other}(...)' is not supported (expected 'find_best_object', 'create_object', or 'obj.run_functional')"
+                        "'let Some({name}) = {other}(...)' is not supported (expected 'find_best_object', 'create_object', 'obj.run_functional', or a call returning 'Option<T>')"
                     ),
                 ));
             }
@@ -2153,20 +2221,14 @@ impl<'a> TreeLowerer<'a> {
                     self.line(format!("{s};"));
                     Ok(())
                 }
-                "set" => {
-                    if !type_args.is_empty() {
-                        return Err(Error::at(*span, "'.set()' does not accept type arguments"));
-                    }
-                    self.emit_bitflag_mutate(receiver, args, *span, true)
-                }
-                "clear" => {
+                "set" | "clear" | "set_all" | "clear_all" => {
                     if !type_args.is_empty() {
                         return Err(Error::at(
                             *span,
-                            "'.clear()' does not accept type arguments",
+                            format!("'.{method}()' does not accept type arguments"),
                         ));
                     }
-                    self.emit_bitflag_mutate(receiver, args, *span, false)
+                    self.emit_bitflag_mutate(receiver, method, args, *span)
                 }
                 // `x.push_interaction(menu: ...)`: `push_interaction(object: x, menu: ...)`.
                 "push_interaction" => {
@@ -2223,14 +2285,23 @@ impl<'a> TreeLowerer<'a> {
         None
     }
 
+    /// `flags.set(F)` / `flags.clear(F)`, and the list forms `flags.set_all([A, B])` /
+    /// `flags.clear_all([A, B])`, which lower exactly as `.set(A | B)` / `.clear(A | B)`.
     pub(super) fn emit_bitflag_mutate(
         &mut self,
         receiver: &V2Expr,
+        method: &str,
         args: &[CallArg],
         span: Span,
-        is_set: bool,
     ) -> Result<()> {
-        let method = if is_set { "set" } else { "clear" };
+        let is_set = matches!(method, "set" | "set_all");
+        let folded;
+        let args = if FLAG_LIST_METHODS.contains(&method) {
+            folded = [fold_flag_list(method, args, span)?];
+            &folded[..]
+        } else {
+            args
+        };
         if args.len() != 1 || args[0].name.is_some() {
             return Err(Error::at(
                 span,
@@ -2284,6 +2355,38 @@ impl<'a> TreeLowerer<'a> {
             self.emit_lvalue_assign(&lval, V2AssignOp::BitAnd, &inv)
         }
     }
+}
+
+/// The one argument a bitflags list method (`set_all`, `clear_all`, `contains_all`,
+/// `contains_any`) stands for: its flags joined by `|`, folded left as `A | B | C` parses, so
+/// the list form lowers exactly as the single-argument method over that union. An empty list
+/// is refused: it names no flag, and `contains_all([])` / `contains_any([])` would be a
+/// constant answer.
+pub(super) fn fold_flag_list(method: &str, args: &[CallArg], span: Span) -> Result<CallArg> {
+    let mut items = args.iter();
+    let Some(first) = items.next() else {
+        return Err(Error::at(
+            span,
+            format!("'.{method}([])' names no flags: list at least one ('.{method}([A])')"),
+        ));
+    };
+    if let Some(named) = args.iter().find(|a| a.name.is_some()) {
+        return Err(Error::at(
+            named.span,
+            format!("'.{method}(...)' takes a list of flags, not named arguments"),
+        ));
+    }
+    let value = items.fold(first.value.clone(), |lhs, a| V2Expr::Binary {
+        span: a.value.span(),
+        lhs: Box::new(lhs),
+        op: V2BinOp::BitOr,
+        rhs: Box::new(a.value.clone()),
+    });
+    Ok(CallArg {
+        span: first.span,
+        name: None,
+        value,
+    })
 }
 
 /// Whether every use of `cell` in the `.air` text is a read: the right side of an assignment or

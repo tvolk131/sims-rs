@@ -1086,9 +1086,7 @@ impl<'a> TreeLowerer<'a> {
                 self.emit_run_functional(receiver, args, *span, Some(&tmp))?;
                 Ok((tmp, ValueType::Bool))
             }
-            V2Expr::MethodCall { method, .. }
-                if matches!(method.as_str(), "contains" | "intersects" | "is_empty") =>
-            {
+            V2Expr::MethodCall { method, .. } if is_bitflag_predicate(method) => {
                 let tmp = self.fresh("bf");
                 self.line(format!("let {tmp} = 0;"));
                 self.emit_bool_into_local(expr, &tmp)?;
