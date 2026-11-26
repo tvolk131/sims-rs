@@ -25,6 +25,7 @@ pub mod lexer;
 pub mod lift;
 pub mod lower;
 pub mod manifest;
+pub mod node_order;
 pub mod parser;
 pub mod sim_pack;
 pub mod structure_lift;

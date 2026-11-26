@@ -347,6 +347,27 @@ impl Parser {
                 self.bump();
                 Ok(AttrValue::Ident(s))
             }
+            TokenKind::LBracket => {
+                self.bump();
+                let mut items = Vec::new();
+                while !self.eat(&TokenKind::RBracket) {
+                    // An integer, or `-` and an integer (no `+`, no doubled signs).
+                    let neg = self.eat(&TokenKind::Minus);
+                    let tok = self.bump();
+                    let TokenKind::Int(v) = tok.kind else {
+                        return Err(Error::at(
+                            tok.span,
+                            format!("expected a list entry (integer), found {:?}", tok.kind),
+                        ));
+                    };
+                    items.push(if neg { -v } else { v });
+                    if !self.eat(&TokenKind::Comma) {
+                        self.expect(&TokenKind::RBracket, "']'")?;
+                        break;
+                    }
+                }
+                Ok(AttrValue::List(items))
+            }
             _ => {
                 let (v, _) = self.parse_signed_int("attribute value (integer, string, or name)")?;
                 Ok(AttrValue::Int(v))
@@ -1172,7 +1193,7 @@ impl Parser {
             params,
             ret,
             body,
-            frame: attrs.frame,
+            frame: attrs.frame.clone(),
         })
     }
 
@@ -1233,7 +1254,7 @@ impl Parser {
             let (kw, kw_span) = self.expect_ident("object or template member")?;
             let pinned_id = attrs.id.map(|(_, id)| id);
             let pinned_guard_id = attrs.guard_id.map(|(_, id)| id);
-            let frame = attrs.frame;
+            let frame = attrs.frame.clone();
             match kw.as_str() {
                 "init" | "main" | "load" | "reset" | "cleanup" => {
                     let what = format!("'{kw}'");

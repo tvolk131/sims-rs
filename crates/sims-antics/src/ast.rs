@@ -59,6 +59,17 @@ pub struct TreeHeader {
     pub flags: u16,
     pub revision: u32,
     pub trailing: Vec<u8>,
+    /// `share_tails: true`: nodes that run alike are merged after assembly
+    /// ([`crate::node_order`]).
+    pub share_tails: bool,
+    /// `node_order: [..]`: entry `i` names the compiled node (after `share_tails`) that becomes
+    /// node `i` ([`crate::node_order`]).
+    pub node_order: Option<Vec<u16>>,
+    /// `narrow_callees: [..]`: trees whose frame holds at most four arguments. A tree that
+    /// `share_tails` or `node_order` rewrites may call only these with inline arguments: a
+    /// callee with a wider frame reads the rest from the nodes after the call, which a rewrite
+    /// moves.
+    pub narrow_callees: Vec<u16>,
 }
 
 impl Default for TreeHeader {
@@ -72,6 +83,9 @@ impl Default for TreeHeader {
             flags: 0,
             revision: 0,
             trailing: Vec::new(),
+            share_tails: false,
+            node_order: None,
+            narrow_callees: Vec::new(),
         }
     }
 }

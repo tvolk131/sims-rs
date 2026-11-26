@@ -188,7 +188,12 @@ pub(super) fn resolve_tree_sigs(
             .iter()
             .filter(|p| matches!(p.slot, AbiParamSlot::Positional))
             .count();
-        sig.frame_args = Some(d.frame.and_then(|f| f.args).map_or(positional, usize::from));
+        sig.frame_args = Some(
+            d.frame
+                .as_ref()
+                .and_then(|f| f.args)
+                .map_or(positional, usize::from),
+        );
         out.insert(d.ident.clone(), sig);
     }
     Ok(out)

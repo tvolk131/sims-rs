@@ -155,7 +155,7 @@ pub struct TreeMemberDecl {
 }
 
 /// Explicit BHAV header fields for a standalone `#[bhav] fn` (`#[frame(...)]`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TreeFrame {
     pub span: Span,
     pub args: Option<u8>,
@@ -167,6 +167,12 @@ pub struct TreeFrame {
     /// `#[frame(empty)]`: a 0-node BHAV (the body must be `{}`). Entering one faults, as the
     /// original's do; a plain `{}` body is `return true;`.
     pub empty: bool,
+    /// `#[bhav(share_tails)]`: the compiled nodes that run alike are merged (`.air`
+    /// `share_tails: true`, [`crate::node_order`]).
+    pub share_tails: bool,
+    /// `#[bhav(node_order = [..])]`: entry `i` names the compiled node that becomes node `i`
+    /// (`.air` `node_order: [..]`, [`crate::node_order`]).
+    pub node_order: Option<Vec<u16>>,
 }
 
 /// Zero-cost integer enum declaration (`[pub] enum Name { VariantA, VariantB = 2 }`).

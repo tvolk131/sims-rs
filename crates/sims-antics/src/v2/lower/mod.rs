@@ -936,6 +936,12 @@ struct TreeLowerer<'a> {
     /// following instruction's bytes), or a literal-argument call whose callee frame may read
     /// more than the four words in the call's own operands.
     keep_layout: bool,
+    /// Trees this tree calls with inline arguments whose frame holds at most four arguments
+    /// (the `.air` header's `narrow_callees`, which `share_tails` and `node_order` need).
+    narrow_callees: BTreeSet<u16>,
+    /// The first emitted inline-argument call to a callee with a wider frame, which reads the
+    /// nodes after the call: `share_tails` and `node_order` refuse it.
+    wide_call: Option<(Span, String)>,
     /// Some call staged its arguments in place ([`TreeLowerer::emit_temp_moves`]): its nodes
     /// differ from the copying form's.
     staged_in_place: bool,

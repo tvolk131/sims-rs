@@ -56,6 +56,8 @@ impl<'a> TreeLowerer<'a> {
             inline_call_sites: Vec::new(),
             dup_decl: None,
             keep_layout: false,
+            narrow_callees: BTreeSet::new(),
+            wide_call: None,
             staged_in_place: false,
             temp_loops: 0,
             fixed_entry: false,
@@ -734,7 +736,8 @@ const OBJECT_DATA_WORDS: &[(&str, EngineWord)] = &[
             EngineWordTy::Flags("bitflags::std::flags::WallAdjacency"),
         ),
     ),
-    // Nonzero: the object lights the room it stands in.
+    // How much the object adds to (or, negative, takes from) the score of the room it stands
+    // in; outdoors only a negative value counts (sims-sim `rooms.rs` `count_object`).
     ("room_impact", word(7, EngineWordTy::I16)),
     // Movement and intersection flags; any bitflags type converts (`std::flags::ObjectFlags`).
     ("flags", word(8, EngineWordTy::Flags(ANY_BITFLAGS))),
@@ -770,6 +773,11 @@ const OBJECT_DATA_WORDS: &[(&str, EngineWord)] = &[
         "buy_flags",
         word(43, EngineWordTy::Flags("bitflags::std::flags::BuyFlags")),
     ),
+    // The light the object gives. When `flags2` holds `LightSource` and the object stands on
+    // the lot, the room count adds it to its room's lamp light (a window's to its window
+    // light), and a lamp that gives light is drawn lit (sims-sim `rooms.rs` `count_object`,
+    // sims-render `lot.rs` `gives_light`).
+    ("light", word(51, EngineWordTy::I16)),
     ("category", word(59, EngineWordTy::I16)),
 ];
 

@@ -7,6 +7,7 @@ use crate::ast::{
 };
 use crate::error::{Error, Result, Span};
 use crate::ir::{BconChunk, BhavChunk, StringEntry, StringFormat, StringTableChunk};
+use crate::node_order::{Edge, WideNode, apply_node_order, check_node_order, narrow, share_tails};
 use crate::verify::apply_operand_pad;
 use sims_formats::behavior::Instruction;
 use std::collections::{BTreeMap, BTreeSet};
@@ -178,10 +179,19 @@ pub fn lower_module(module: &Module) -> Result<LoweredModule> {
         }
     }
 
+    let module_trees: BTreeSet<u16> = module
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Tree(tree) => Some(tree.id),
+            _ => None,
+        })
+        .collect();
+    let mut sibling_calls = Vec::new();
     let mut behaviors = BTreeMap::new();
     for item in &module.items {
         if let Item::Tree(tree) = item {
-            let bhav = lower_tree(tree, &symbols)?;
+            let bhav = lower_tree(tree, &symbols, &module_trees, &mut sibling_calls)?;
             if behaviors.insert(bhav.id, bhav).is_some() {
                 return Err(Error::at(
                     tree.span,
@@ -190,6 +200,7 @@ pub fn lower_module(module: &Module) -> Result<LoweredModule> {
             }
         }
     }
+    check_sibling_frames(&sibling_calls, &behaviors)?;
 
     Ok(LoweredModule {
         behaviors,
@@ -557,6 +568,8 @@ struct TreeBuilder<'a> {
     max_allowed_args: usize,
     max_allowed_locals: usize,
     is_verbatim_explicit: bool,
+    /// `share_tails`: the tree may hold more than [`MAX_BHAV_NODES`] nodes before they merge.
+    wide: bool,
 }
 
 impl<'a> TreeBuilder<'a> {
@@ -582,6 +595,7 @@ impl<'a> TreeBuilder<'a> {
             max_allowed_args,
             max_allowed_locals,
             is_verbatim_explicit,
+            wide: false,
         }
     }
 
@@ -714,7 +728,7 @@ impl<'a> TreeBuilder<'a> {
         on_false: PendingTarget,
     ) -> Result<usize> {
         let idx = self.nodes.len();
-        let max_nodes = if self.is_verbatim_explicit {
+        let max_nodes = if self.is_verbatim_explicit || self.wide {
             usize::from(u16::MAX)
         } else {
             MAX_BHAV_NODES
@@ -1958,6 +1972,45 @@ impl<'a> TreeBuilder<'a> {
         }
     }
 
+    /// [`Self::resolve_target`] before numbering, for a tree whose nodes are merged or
+    /// renumbered: every branch must name a node of the tree or return.
+    fn resolve_edge(&self, target: &PendingTarget, count: usize) -> Result<Edge> {
+        let (index, span) = match target {
+            PendingTarget::Resolved(b) if *b >= TARGET_ERROR => return Ok(Edge::Exit(*b)),
+            PendingTarget::Resolved(b) if usize::from(*b) >= MAX_BHAV_NODES => {
+                return Err(Error::new(format!(
+                    "branch byte {b} names no node (a tree holds at most {MAX_BHAV_NODES}): \
+                     'share_tails' and 'node_order' could turn it into a branch to a node"
+                )));
+            }
+            PendingTarget::Resolved(b) => (usize::from(*b), None),
+            PendingTarget::Label { name, span } => {
+                let &idx = self
+                    .labels
+                    .get(name)
+                    .ok_or_else(|| Error::at(*span, format!("unresolved label '@{name}'")))?;
+                (idx, Some(*span))
+            }
+            PendingTarget::Node { index, span } => (*index, Some(*span)),
+            PendingTarget::Sentinel(id) => {
+                return Err(Error::new(format!(
+                    "internal compiler error: unpatched branch sentinel #{id}"
+                )));
+            }
+        };
+        if index >= count {
+            let message = format!(
+                "branch to node {index}, which the tree does not have ({count} nodes): \
+                 'share_tails' and 'node_order' need every branch to name a node or return"
+            );
+            return Err(match span {
+                Some(span) => Error::at(span, message),
+                None => Error::new(message),
+            });
+        }
+        Ok(Edge::Node(index))
+    }
+
     fn resolve_target(&self, target: &PendingTarget, count: usize) -> Result<u8> {
         match target {
             PendingTarget::Resolved(b) => Ok(*b),
@@ -2037,7 +2090,162 @@ fn format_limits(format: u16) -> Option<(usize, usize)> {
     }
 }
 
-fn lower_tree(tree: &TreeDecl, symbols: &ModuleSymbols) -> Result<BhavChunk> {
+/// Whether a call from tree `caller` to tree `callee` runs the callee from the caller's own
+/// file: the VM looks a tree up in the library its ID range names (global `256..=4095`,
+/// private `4096..=8191`, semi-global `8192..`), so only a callee in the caller's own range is
+/// the tree of the same `.air` module. Any other callee comes from another file (a global's
+/// private callee from whatever object runs it), whatever this module holds.
+fn same_library(caller: u16, callee: u16) -> bool {
+    let range = |id: u16| match id {
+        0..=255 => 0,
+        256..=4095 => 1,
+        4096..=8191 => 2,
+        _ => 3,
+    };
+    range(caller) == range(callee) && range(callee) != 0
+}
+
+/// Refuses an inline call of a rewritten tree to a tree of the module whose frame holds more
+/// than four arguments as the VM reads it (`Behavior::frame_dimensions`: format `0x8000` has
+/// four, `0x8001` at most four, `0x8002` its header's count, given or inferred from its body).
+fn check_sibling_frames(calls: &[SiblingCall], behaviors: &BTreeMap<u16, BhavChunk>) -> Result<()> {
+    for call in calls {
+        let args = behaviors.get(&call.callee).map_or(0, |b| match b.format {
+            0x8000 => 4,
+            0x8001 => b.args.min(4),
+            _ => b.args,
+        });
+        if args > 4 {
+            return Err(Error::at(
+                call.span,
+                format!(
+                    "tree '{}': node {} calls tree {} with inline arguments, and its frame holds \
+                     {args} arguments: it reads those past the fourth from the nodes after the \
+                     call, which 'share_tails' and 'node_order' move",
+                    call.tree, call.node, call.callee
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// An inline call of a rewritten tree to a tree of the same module: its frame is checked once
+/// every tree is lowered ([`check_sibling_frames`]).
+struct SiblingCall {
+    tree: String,
+    node: usize,
+    callee: u16,
+    span: Span,
+}
+
+/// The instructions of a tree whose header asks for `share_tails` or a `node_order`
+/// ([`crate::node_order`]): the assembled nodes, merged, then renumbered. Inline calls to trees
+/// of `module_trees` are pushed to `sibling_calls`.
+fn rewrite_nodes(
+    tree: &TreeDecl,
+    builder: &TreeBuilder<'_>,
+    module_trees: &BTreeSet<u16>,
+    sibling_calls: &mut Vec<SiblingCall>,
+) -> Result<Vec<Instruction>> {
+    let count = builder.nodes.len();
+    // A call with inline arguments (opcode 256 and up, operands other than the `temps`
+    // sentinel) to a callee whose frame holds more than four arguments reads the rest from the
+    // nodes after the call, which merging or renumbering moves. A tree of this module is checked
+    // by the frame it compiles to; any other callee must be listed.
+    for (i, node) in builder.nodes.iter().enumerate() {
+        if node.opcode < 256 || node.operands == [0xFF; 8] {
+            continue;
+        }
+        if module_trees.contains(&node.opcode) && same_library(tree.id, node.opcode) {
+            sibling_calls.push(SiblingCall {
+                tree: tree.label.clone(),
+                node: i,
+                callee: node.opcode,
+                span: node.span,
+            });
+        } else if !tree.header.narrow_callees.contains(&node.opcode) {
+            return Err(Error::at(
+                node.span,
+                format!(
+                    "tree '{}': node {i} calls tree {} with inline arguments; a callee whose \
+                     frame holds more than four arguments reads the rest from the nodes after the \
+                     call, which 'share_tails' and 'node_order' move. List {} in \
+                     'narrow_callees' when its frame holds at most four",
+                    tree.label, node.opcode, node.opcode
+                ),
+            ));
+        }
+    }
+    let mut nodes = Vec::with_capacity(count);
+    for node in &builder.nodes {
+        nodes.push(WideNode {
+            opcode: node.opcode,
+            operands: node.operands,
+            on_true: builder.resolve_edge(&node.on_true, count)?,
+            on_false: builder.resolve_edge(&node.on_false, count)?,
+        });
+    }
+    // An indexed tree enters at the node its first argument names, so none may move.
+    let indexed = tree.header.kind == 4;
+    if tree.header.share_tails {
+        nodes = share_tails(&nodes, MAX_BHAV_NODES).map_err(|at_least| {
+            Error::at(
+                tree.span,
+                format!(
+                    "tree '{}' still has at least {at_least} nodes after 'share_tails'; a tree \
+                     holds at most {MAX_BHAV_NODES}",
+                    tree.label
+                ),
+            )
+        })?;
+        if indexed && nodes.len() != count {
+            return Err(Error::at(
+                tree.span,
+                format!(
+                    "tree '{}' is an indexed tree (kind 4), which enters at the node its first \
+                     argument names: 'share_tails' would merge {} of its {count} nodes",
+                    tree.label,
+                    count - nodes.len()
+                ),
+            ));
+        }
+    }
+    // A verbatim tree may assemble more nodes than a branch byte can name.
+    if nodes.len() > MAX_BHAV_NODES {
+        return Err(Error::at(
+            tree.span,
+            format!(
+                "tree '{}' has {} nodes; 'node_order' renumbers at most {MAX_BHAV_NODES}",
+                tree.label,
+                nodes.len()
+            ),
+        ));
+    }
+    if let Some(order) = &tree.header.node_order {
+        check_node_order(order, nodes.len())
+            .map_err(|message| Error::at(tree.span, format!("tree '{}': {message}", tree.label)))?;
+        if indexed && order.iter().enumerate().any(|(i, &n)| usize::from(n) != i) {
+            return Err(Error::at(
+                tree.span,
+                format!(
+                    "tree '{}' is an indexed tree (kind 4), which enters at the node its first \
+                     argument names: its node_order must keep every node in place",
+                    tree.label
+                ),
+            ));
+        }
+        nodes = apply_node_order(&nodes, order);
+    }
+    Ok(narrow(&nodes))
+}
+
+fn lower_tree(
+    tree: &TreeDecl,
+    symbols: &ModuleSymbols,
+    module_trees: &BTreeSet<u16>,
+    sibling_calls: &mut Vec<SiblingCall>,
+) -> Result<BhavChunk> {
     let (max_allowed_args, max_allowed_locals) =
         format_limits(tree.header.format).ok_or_else(|| {
             Error::at(
@@ -2119,6 +2327,7 @@ fn lower_tree(tree: &TreeDecl, symbols: &ModuleSymbols) -> Result<BhavChunk> {
         None
     };
 
+    let rewrites = tree.header.share_tails || tree.header.node_order.is_some();
     let mut builder = TreeBuilder::new(
         symbols,
         named_locals,
@@ -2128,6 +2337,7 @@ fn lower_tree(tree: &TreeDecl, symbols: &ModuleSymbols) -> Result<BhavChunk> {
         max_allowed_locals,
         usage.is_verbatim_explicit,
     );
+    builder.wide = tree.header.share_tails;
     let entry = builder.lower_block(&tree.body, PendingTarget::Resolved(TARGET_TRUE))?;
 
     // If a high-level tree consisted solely of `return true/false/error`, emit a
@@ -2142,17 +2352,22 @@ fn lower_tree(tree: &TreeDecl, symbols: &ModuleSymbols) -> Result<BhavChunk> {
     }
 
     let count = builder.nodes.len();
-    let mut instructions = Vec::with_capacity(count);
-    for node in &builder.nodes {
-        let on_true = builder.resolve_target(&node.on_true, count)?;
-        let on_false = builder.resolve_target(&node.on_false, count)?;
-        instructions.push(Instruction {
-            opcode: node.opcode,
-            on_true,
-            on_false,
-            operands: node.operands,
-        });
-    }
+    let instructions = if rewrites {
+        rewrite_nodes(tree, &builder, module_trees, sibling_calls)?
+    } else {
+        let mut instructions = Vec::with_capacity(count);
+        for node in &builder.nodes {
+            let on_true = builder.resolve_target(&node.on_true, count)?;
+            let on_false = builder.resolve_target(&node.on_false, count)?;
+            instructions.push(Instruction {
+                opcode: node.opcode,
+                on_true,
+                on_false,
+                operands: node.operands,
+            });
+        }
+        instructions
+    };
 
     // Verbatim explicit-branch trees (such as lifted original BHAVs) preserve exact header
     // `args`/`locals` when explicitly declared (including non-standard high-byte local counts

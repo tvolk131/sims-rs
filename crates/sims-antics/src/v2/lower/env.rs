@@ -294,6 +294,48 @@ impl<'a> ObjectEnv<'a> {
             .map(|(m, decl)| (m.clone(), false, decl))
     }
 
+    /// Whether tree `id`'s frame holds at most four arguments, by every declaration of it the
+    /// object can see from anywhere: a sibling tree's frame, or an `extern` fn's positional
+    /// parameters in any module or in the object (an `extern` is trusted to declare its whole
+    /// frame). The question ignores scope, since one tree has one frame: an inlined helper
+    /// sees its module's declarations, but the object's own may disagree. `false` when none
+    /// names it or two disagree.
+    ///
+    /// Always `false` for a semi-global ID (`8192..`): which library holds it depends on the
+    /// object that runs the call (its `GLOB` link), so a declaration made for one library says
+    /// nothing about another's tree.
+    pub(super) fn frame_is_narrow(&self, id: u16) -> bool {
+        if id >= 8192 {
+            return false;
+        }
+        let positional = |f: &crate::v2::ast::ExternFnDecl| {
+            f.params
+                .iter()
+                .filter(|p| p.slot == AbiParamSlot::Positional)
+                .count()
+        };
+        let mut frames = self
+            .trees
+            .values()
+            .filter(|sig| sig.id == id)
+            .map(|sig| sig.frame_args)
+            .collect::<Vec<_>>();
+        let scoped = self
+            .resolved
+            .module_scopes
+            .values()
+            .flat_map(|s| s.extern_mods.values());
+        for (_, decl) in scoped.chain(self.local_extern_mods.values()) {
+            frames.extend(
+                decl.fns
+                    .iter()
+                    .filter(|f| f.id == id)
+                    .map(|f| Some(positional(f))),
+            );
+        }
+        !frames.is_empty() && frames.iter().all(|n| n.is_some_and(|n| n <= 4))
+    }
+
     pub(super) fn lookup_extern_bcon(
         &self,
         owner_module: &str,

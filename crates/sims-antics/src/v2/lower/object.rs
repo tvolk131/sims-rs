@@ -127,9 +127,10 @@ fn lower_object_with(
                 "'empty' is only allowed on a standalone '#[bhav] fn' (a lifecycle tree always has nodes)",
             ));
         }
+        let span = f.span;
         if lifecycle_frames.insert(label, f).is_some() {
             return Err(Error::at(
-                f.span,
+                span,
                 format!("'#[frame]' on more than one block of the '{label}' tree"),
             ));
         }
@@ -352,7 +353,7 @@ fn lower_object_with(
                     local_bitflags_raw.insert(b.name.clone(), (owner_mod.to_owned(), b.clone()));
                 }
                 ObjectMember::Init(b) => {
-                    note_lifecycle_frame("Init", b.frame)?;
+                    note_lifecycle_frame("Init", b.frame.clone())?;
                     if let Some(pid) = b.pinned_id {
                         init_pinned_id = Some(pid);
                     }
@@ -362,7 +363,7 @@ fn lower_object_with(
                     });
                 }
                 ObjectMember::Main(b) => {
-                    note_lifecycle_frame("Main", b.frame)?;
+                    note_lifecycle_frame("Main", b.frame.clone())?;
                     if let Some(pid) = b.pinned_id {
                         main_pinned_id = Some(pid);
                     }
@@ -372,7 +373,7 @@ fn lower_object_with(
                     });
                 }
                 ObjectMember::Load(b) => {
-                    note_lifecycle_frame("Load", b.frame)?;
+                    note_lifecycle_frame("Load", b.frame.clone())?;
                     if let Some(pid) = b.pinned_id {
                         load_pinned_id = Some(pid);
                     }
@@ -382,7 +383,7 @@ fn lower_object_with(
                     });
                 }
                 ObjectMember::Reset(b) => {
-                    note_lifecycle_frame("Reset", b.frame)?;
+                    note_lifecycle_frame("Reset", b.frame.clone())?;
                     if let Some(pid) = b.pinned_id {
                         reset_pinned_id = Some(pid);
                     }
@@ -392,7 +393,7 @@ fn lower_object_with(
                     });
                 }
                 ObjectMember::Cleanup(b) => {
-                    note_lifecycle_frame("Cleanup", b.frame)?;
+                    note_lifecycle_frame("Cleanup", b.frame.clone())?;
                     if let Some(pid) = b.pinned_id {
                         cleanup_pinned_id = Some(pid);
                     }
@@ -1114,7 +1115,7 @@ fn lower_object_with(
     // 8c. Init tree.
     {
         let mut ctx = TreeLowerer::new(&env, TreeContext::ObjectSelf, &resolved.module_id, false);
-        let frame = lifecycle_frames.get("Init").copied().unwrap_or_default();
+        let frame = lifecycle_frames.get("Init").cloned().unwrap_or_default();
         ctx.set_lifecycle_frame(&frame);
         let mut stack_ops = ExplicitStackOps::default();
         ctx.explicit_stack_obj = init_blocks
@@ -1222,7 +1223,7 @@ fn lower_object_with(
     // 8d. Main tree.
     {
         let mut ctx = TreeLowerer::new(&env, TreeContext::ObjectSelf, &resolved.module_id, false);
-        let frame = lifecycle_frames.get("Main").copied().unwrap_or_default();
+        let frame = lifecycle_frames.get("Main").cloned().unwrap_or_default();
         ctx.set_lifecycle_frame(&frame);
         ctx.explicit_stack_obj = main_block.as_ref().is_some_and(|b| {
             ExplicitStackOps::default().in_stmts(&b.stmts, &env, &b.owner_module, true)
@@ -1272,7 +1273,7 @@ fn lower_object_with(
         let mut ctx = TreeLowerer::new(&env, TreeContext::ObjectSelf, &resolved.module_id, false);
         let frame = lifecycle_frames
             .get(tree_label)
-            .copied()
+            .cloned()
             .unwrap_or_default();
         ctx.set_lifecycle_frame(&frame);
         let mut stack_ops = ExplicitStackOps::default();

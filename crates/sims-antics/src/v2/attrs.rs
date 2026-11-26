@@ -15,6 +15,8 @@ pub(crate) enum AttrValue {
     Int(i64),
     Str(String),
     Ident(String),
+    /// `[a, b, ..]`: integers (`node_order = [0, 2, 1]`).
+    List(Vec<i64>),
 }
 
 /// One attribute argument: `key = value` or a positional `value`.
@@ -254,15 +256,25 @@ impl ItemAttrs {
             ..TreeFrame::default()
         });
         let Some(key) = arg.key.as_deref() else {
-            if arg.value == AttrValue::Ident("empty".to_owned()) {
-                if std::mem::replace(&mut frame.empty, true) {
-                    return Err(Error::at(arg.span, "duplicate header field 'empty'"));
+            let flag = match &arg.value {
+                AttrValue::Ident(name) if name == "empty" => Some((&mut frame.empty, "empty")),
+                AttrValue::Ident(name) if name == "share_tails" => {
+                    Some((&mut frame.share_tails, "share_tails"))
+                }
+                _ => None,
+            };
+            if let Some((slot, name)) = flag {
+                if std::mem::replace(slot, true) {
+                    return Err(Error::at(
+                        arg.span,
+                        format!("duplicate header field '{name}'"),
+                    ));
                 }
                 return Ok(());
             }
             return Err(Error::at(
                 arg.span,
-                format!("expected 'key = value' or 'empty' in '#[{attr}(..)]'"),
+                format!("expected 'key = value', 'empty' or 'share_tails' in '#[{attr}(..)]'"),
             ));
         };
         let int = |what: &str| -> Result<i64> {
@@ -279,6 +291,12 @@ impl ItemAttrs {
             u16::try_from(int(what)?)
                 .map_err(|_| Error::at(arg.span, format!("'{what}' is out of u16 range")))
         };
+        if matches!(key, "empty" | "share_tails") {
+            return Err(Error::at(
+                arg.span,
+                format!("'{key}' takes no value: write '#[{attr}(.., {key})]'"),
+            ));
+        }
         let dup = match key {
             "args" => frame.args.replace(byte("args")?).is_some(),
             "locals" => frame.locals.replace(word("locals")?).is_some(),
@@ -291,6 +309,26 @@ impl ItemAttrs {
                 )
                 .is_some(),
             "kind" => frame.kind.replace(byte("kind")?).is_some(),
+            "node_order" => {
+                let AttrValue::List(entries) = &arg.value else {
+                    return Err(Error::at(
+                        arg.span,
+                        "'node_order' takes a list of node numbers (node_order = [0, 2, 1])",
+                    ));
+                };
+                let order = entries
+                    .iter()
+                    .map(|&n| {
+                        u16::try_from(n).map_err(|_| {
+                            Error::at(
+                                arg.span,
+                                format!("'node_order' entry {n} is not a node number"),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<u16>>>()?;
+                frame.node_order.replace(order).is_some()
+            }
             other => {
                 let more = if attr == "bhav" {
                     "id, label, context, ret_temp, "
@@ -300,7 +338,7 @@ impl ItemAttrs {
                 return Err(Error::at(
                     arg.span,
                     format!(
-                        "unknown '#[{attr}(..)]' field '{other}' (expected {more}args, locals, format, revision, kind, or empty)"
+                        "unknown '#[{attr}(..)]' field '{other}' (expected {more}args, locals, format, revision, kind, node_order, empty, or share_tails)"
                     ),
                 ));
             }
