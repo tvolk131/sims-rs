@@ -1786,11 +1786,23 @@ fn a_lit_floor_lamp_lights_its_room() {
         (room.lights, room.lamp_light, room.impact)
     };
     let light = |world: &World| world.rooms.rooms[&1].light.to_f32();
+    // What the renderer asks of a light (`sims_render::lot::gives_light`): on the lot, a
+    // light source (flags2 0x400), a light (word 51) and light mode 1 (word 16).
+    let gives_light = |world: &World| {
+        let word = |i: usize| world.objects[&lamp].data[i];
+        word(34) == 0
+            && word(29) >= 0
+            && word(40) as u16 & 0x400 != 0
+            && word(51) != 0
+            && word(16) == 1
+    };
     assert_eq!(
         counted(&fx.world),
         (1, 50, 5),
         "a new lamp is a lit light source"
     );
+    assert_eq!(fx.world.objects[&lamp].data[16], 1, "light mode 1");
+    assert!(gives_light(&fx.world), "a lit lamp casts its light");
     let lit = light(&fx.world);
     assert!(lit > 0.0, "the lamp lights the room ({lit})");
 
@@ -1811,6 +1823,11 @@ fn a_lit_floor_lamp_lights_its_room() {
     );
     let dark = light(&fx.world);
     assert!(dark < lit, "the room goes darker ({lit} -> {dark})");
+    assert_eq!(
+        fx.world.objects[&lamp].data[16], 1,
+        "switching off keeps the light mode"
+    );
+    assert!(!gives_light(&fx.world), "a dark lamp casts no light");
 }
 
 #[test]

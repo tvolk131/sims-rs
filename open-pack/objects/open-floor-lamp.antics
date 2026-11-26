@@ -1,6 +1,6 @@
 // Open Floor Lamp (0x7F00_0070) — toggleable warm lighting with off/on graphics. It is a light
-// source: a lit lamp gives its room light, and raises the room's score (and so the Room of
-// everyone in it) through its room impact.
+// source: a lit lamp gives its room light, casts floor light pools and lights the Sims near it,
+// and raises the room's score (and so the Room of everyone in it) through its room impact.
 
 use crate::templates::toggle::ToggleablePower;
 use std::engine::RefreshMode;
@@ -28,8 +28,12 @@ object "Open Floor Lamp" from ToggleablePower {
     slot front = routing([0.0, -0.65, 0.0]);
 
     init {
-        // A light source: the room count adds its light to the room's lamp light.
+        // A light source: the room count adds its light to the room's lamp light, and with
+        // light mode 1 it casts a local light (floor pools, light on Sims) while its light is
+        // not 0. Light sources set the mode once and never change it: switching off sets
+        // `light` to 0.
         self.flags2.set(ObjectFlags2::LightSource);
+        self.light_mode = 1;
         if self.power {
             self.room_impact = lit_room_impact;
             self.light = lit_light;

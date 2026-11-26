@@ -3091,9 +3091,7 @@ impl FileLinter<'_> {
                 let kind = if self.bound.contains(root) || root == "stack_obj" {
                     Root::Handle
                 } else if root == "self" {
-                    if self.sims.iter().any(|s| s == "self") {
-                        return;
-                    }
+                    // `self` is never a binding (v2.4): it is always the running object.
                     Root::Object
                 } else if self.sims.iter().any(|s| s == root) {
                     Root::Sim
@@ -4474,11 +4472,7 @@ impl FileLinter<'_> {
                 // `if let Some(x)` binds a new `x` in its `then` block alone: an outer `x`
                 // holding this object's handle is hidden there, and back after it.
                 let held = self.self_handles.remove(name);
-                // What `self` means where a binding takes the name is an open language
-                // question (#489): such a block is not judged.
-                if name != "self" {
-                    inner_ended |= self.clobber_walk(then_body, clobbered);
-                }
+                inner_ended |= self.clobber_walk(then_body, clobbered);
                 if held {
                     self.self_handles.insert(name.clone());
                 } else {
@@ -6343,8 +6337,12 @@ impl FileLinter<'_> {
         else {
             return;
         };
-        // A state of the same name wins over the engine word.
-        if kind != Root::Sim && self.states.contains_key(field.name) {
+        // A state of the same name wins over the engine word: on `self`, and on a typed handle
+        // (`h: Self`), which names its object's states. Any state of the file counts, a
+        // template's too: a template no object of the set builds is not tried, and code the
+        // build folds away (`if false`) builds the same bytes either way. `stack_obj` never
+        // names a state, so it is left to the trial build.
+        if kind != Root::Sim && root != "stack_obj" && self.states.contains_key(field.name) {
             return;
         }
         // An engine enum (`Direction`, `PersonKind`) is no `i16`: it stands in for the cell
@@ -7812,6 +7810,8 @@ const OBJECT_WORDS: &[TypedField] = &[
     typed("data", 8, "flags", true, false),
     typed("data", 13, "wall_placement", true, false),
     typed("data", 15, "broken", true, false),
+    // How a light source lights the lot (#495): 1 casts floor pools and light on Sims.
+    typed("data", 16, "light_mode", true, false),
     typed("data", 27, "weight", true, false),
     typed("data", 28, "support_strength", true, false),
     typed("data", 40, "flags2", true, false),

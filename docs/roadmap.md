@@ -3938,11 +3938,11 @@ through their public interfaces only; the simulation never depends on it.
       outermost tiles; walls are turned once from rotation 0, not through
       each view change.
     - open-pack: the test runner should place `given.create` objects on
-      the tile grid (or add `expect.objects`); a real daily bill gate for
+      the tile grid (or add `expect.objects`) (closed in Batch 23, #494); a real daily bill gate for
       the mailbox, if wanted. (The lamp is a light source since Batch 22.)
     - `.antics`: a lint rule suggesting `if let`; the lift writing `if f() { .. temp[N] .. }` as `if let`
       (Track 9); a language decision on what `self.x` means when `self`
-      is rebound.
+      is rebound. (All three closed in Batch 23: #494, #493, #495.)
 - **Done (Batch 22 — `.antics` v2.3 Step 2 and the lit lamp, #490, #491
   and Track 7's v2.3 Step 3):**
   - **The `.antics` v2 compiler (Track 8, #491,
@@ -3992,7 +3992,115 @@ through their public interfaces only; the simulation never depends on it.
       pools and its light on nearby Sims need word 16 too (sims-render
       `lot.rs` `gives_light`). open-pack bans raw `data[N]`, so the lamp
       lights its room and glows, without pools or light on Sims, until the
-      word has a name.
+      word has a name. (Closed in Batch 23: #495 named it `light_mode`, and
+      the lamp sets it.)
+- **Done (Batch 23 — `.antics` v2.4 and the fully lit lamp, #493–#496 and
+  Track 7's v2.4 Step 2):**
+  - **Lift (Track 9, #493,
+    `docs/decisions/20261126-antics-v2-3-step3-lift-strict-leap.md`):**
+    the strict leap. Unproven trees try a `node_order` pin (938 strict
+    pins) or `share_tails` then a pin (297). Locals of plain trees and
+    lifecycle blocks get names, `data[51]` is written `light`, and the
+    `std::globals` `Option` calls are written `if let` / `let .. else`.
+    Strict idiomatic trees went from 8,503 (32.4%) to 9,523 (36.3%), and
+    behavioral `frame_headroom` from 46 to 2, with 0 DIFFERENT.
+  - **Test runner and lint (Track 7, #494,
+    `docs/decisions/20261126-antics-v2-4-runner-grid-and-if-let-lint.md`):**
+    - `sims-antics test` places objects on a real tile grid, per file
+      (`[lot] room = true`) or per case: an 8-by-8 counted room 1 and an
+      outdoor room 2, with `place = [x, y]` and setup errors rather than
+      fallbacks. `expect.room` checks room 1's score, light, lamp light,
+      light sources, impact and object count; `expect.objects` counts a
+      loaded object's instances and checks their attributes, data and
+      temps. 156 specs pass (148 older ones unchanged).
+    - `prefer_if_let` suggests `if let Some(v) = f()` /
+      `let Some(v) = f() else { .. };` where code reads an `Option` tree's
+      value as `temp[N]`, byte-checked.
+  - **The `.antics` v2 compiler (Track 8, #495,
+    `docs/decisions/20261126-antics-v2-4-light-mode-glob-option-alias-self.md`):**
+    - `light_mode` names object data word 16. Light sources set it to 1,
+      which the renderer asks for before it draws floor pools and light
+      on Sims; the room count reads only word 51, `light`, which is also
+      the on/off switch.
+    - `semi_global: "Name";` writes the object's native `GLOB` link, and
+      `extern "Lib" mod` tags a semi-global library's declarations, so a
+      linked object's calls into narrow semi-global trees drop
+      `wide_call` (failing closed on any doubt).
+    - `std::globals` frames count for every object (256..=4095), whether
+      or not the file imports it; each of the 64 declarations was checked
+      against the original's tree headers, and 334 and 425 joined.
+    - Option bindings read in place (`mir/option_alias.rs`): `if let` /
+      `let .. else` read `temp[N]` directly, with no frame word, wherever
+      nothing may write the temp first and no dropped word is observable.
+    - `self` is never a binding (`let`, `for`, `if let`, `const`, every
+      parameter), which settles what `self.x` means.
+  - **Lift (Track 9, #496,
+    `docs/decisions/20261126-antics-v2-4-lift-scope27-and-joins.md`):**
+    - Raw blocks holding only sprite-flag cells, `remove_object` or
+      `clear_motive_changes` are written as builtins:
+      `manual_raw_has_builtin` 268 → 2 (behavioral), 3 → 1 (strict).
+    - Shared-tail joins: both branches reaching one node are written
+      once after a `loop { .. break; }`, kept only when it builds fewer
+      nodes, with a per-tree fallback to copied tails.
+    - Behavioral idiomatic trees 97.6% (25,580), 23.6k fewer lines and
+      18.9k fewer raw lines; strict 36.5% (9,567); 0 DIFFERENT.
+    - **Strict-gap census** of the 16,638 strict raw trees:
+      - 9,669 of the 9,818 same-node-count trees with another CFG have
+        the original's CFG once a statement that cannot fail has its dead
+        false target ignored; only 6 differ for real.
+      - In the bucket that matches the node count only after
+        `share_tails` (4,467 trees), the census's exit count finds 3,949
+        of 4,473 trees compiling fewer `false: error` exits than the
+        original. That is a count of exits, not a CFG match.
+      - The original compiler writes `false: error` for such statements;
+        v2 writes `false: next`.
+  - **Lint and open-pack (Track 7, v2.4 Step 2,
+    `docs/decisions/20261126-antics-v2-4-step2-light-mode-lint-and-lit-lamp.md`):**
+    - `untyped_engine_field` names `data[16]` `light_mode` on `self`,
+      `stack_obj` and handles, byte-checked, and stays quiet when a state
+      takes the name.
+    - The Open Floor Lamp sets light mode 1 in its init: lit, it now
+      passes the renderer's `gives_light`, so it is a local light for the
+      floor-pool and Sim-light passes, besides the room light it gave
+      since Batch 22; switched off, it keeps the mode and its light goes
+      to 0. Older starter-lot saves are refused (no migration). A
+      standalone game does not show the pools or the Sim light yet (see
+      the follow-ups).
+    - `untyped_engine_field` no longer lets a state silence `stack_obj`,
+      which never names one; the trial build decides there. No lift
+      finding changed.
+    - The lint's `self`-binding branches, dead since #495, are gone.
+    - `prefer_if_let` after #495, on the v2.4 lifts: behavioral 21 of 154
+      proposals kept (was 16 of 148), now including two compound stores
+      of `take_elapsed_periods`; strict 0 of 26. All byte-identical when
+      applied, 0 false positives.
+  - **Follow-ups:**
+    - Track 8: a spelling for a statement's dead false target `error`
+      (`dead_false = error`, per statement or as a tree's default), so
+      `NodePin` can match most of the 9,669 census trees with the
+      original's CFG, and possibly many of the 3,949 `share_tails` ones
+      (building).
+    - Track 8: the in-place option alias misses trees of the kept shape
+      depending on root and header (`me` without a fixed header,
+      `stack_obj`, `if let` on `me`): 62 behavioral `prefer_if_let`
+      proposals wait on it.
+    - Track 8: an import alias can still be named `self`
+      (`use .. as self;`), a gap in #495's "self is never bound".
+    - Rendering, standalone: the lit lamp's floor pools need the pool
+      maps worked out without `lightMap.dat` (`0x4bb5bc`, `0x4a38b6`),
+      and its light on Sims needs the mesh renderer in open-pack mode
+      (Sims are drawn procedurally there).
+    - Track 7: `untyped_engine_field` checks every state of the file on
+      `self` and on handles, which is coarser than needed; scope it to
+      each receiver's own states.
+    - Track 9: write `data[16]` as `light_mode` (48 behavioral lint
+      findings until then), emit `semi_global` / `extern "Lib" mod`,
+      lift strict `if let`, rebaseline for the 334/425 names; the 179
+      renumbered trees no pin reaches and the 560 unstructurable ones;
+      count raw statements from the final bodies (`merge_arms`).
+    - Track 7: `collapsible_if_chain` 2 → 4 in behavioral mode, on trees
+      #496 made idiomatic.
+    - `#382 -> bool` in `std::globals`, joint Track 8 and Track 9.
 - **Next (in flight, in order of player impact):**
   - **Travel follow-ups:**
     - A hop that leaves travelers behind (Go Somewhere Else for one
@@ -4025,17 +4133,20 @@ through their public interfaces only; the simulation never depends on it.
     - whether the co-op executor should refuse a peer's pick on an
       object parked off the lot (#458).
   - **The `.antics` v2 toolchain:**
-    - Node pinning: about 8,600 strict lift trees fail only on node
-      order (#459). The compiler side landed (`node_order`, #491); Track
-      9's lift integration is running.
-    - Shared suffixes across `match` arms and loop exits: `share_tails`
-      (#491) closes the 46 behavioral `frame_headroom` trees in the
-      compiler; the lift writing it is Track 9's, running. A
-      partial-sharing mode is open, since the original shares only some
-      tails.
-    - More `std` global frames (IDs 334 and 425 appear in refused trees)
-      and each object's `GLOB` link in v2, so a rewritten tree can call
-      more callees inline (#491).
+    - Dead false targets (Track 8, building): the original compiler
+      writes `false: error` for statements that cannot fail, v2 writes
+      `false: next`. A `dead_false = error` spelling would let the lift's
+      node pins (#493) reach most of the 9,669 strict trees #496's census
+      matched, and possibly many of 3,949 more; the strict lift is at
+      36.5% idiomatic.
+    - Shared tails: the lift writes `share_tails` (#493) and its own
+      joins (#496). A partial-sharing mode is open, since the original
+      shares only some tails.
+    - Semi-global calls: v2 has the `GLOB` link and `extern "Lib" mod`
+      (#495); the lift emitting them is Track 9's.
+    - Option bindings read in place (#495) miss some trees of the plain
+      shape (`me` without a fixed header, `stack_obj`); 62 behavioral
+      `prefer_if_let` proposals wait on it (Batch 23).
     - Raw-block `if` tails: a raw `if` whose arms may end alike now
       keeps its layout (#489). The 2 strict alarm trees #473 left
       non-idiomatic need a re-lift to confirm.
@@ -4049,8 +4160,6 @@ through their public interfaces only; the simulation never depends on it.
         the original labels renamed;
       - a typed `bool + value` ABI for 282 and 333, with `#[temp(N)]`
         parameters.
-    - What `self.x` means when a binding named `self` is in scope is a
-      language decision (#489).
   - **Legacy mining backlog:** see
     `docs/legacy-mining-audit.md#porting-backlog`.
     - Parity-relevant items still open: the dialogs' 40-second
