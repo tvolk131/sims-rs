@@ -7441,6 +7441,8 @@ const OBJECT_WORDS: &[TypedField] = &[
     typed("data", 41, "value", true, false),
     typed("data", 42, "placement", true, false),
     typed("data", 43, "buy_flags", true, false),
+    // The light the object gives (#491).
+    typed("data", 51, "light", true, false),
     typed("data", 59, "category", true, false),
 ];
 

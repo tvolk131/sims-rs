@@ -1,8 +1,10 @@
-// Open Floor Lamp (0x7F00_0070) — toggleable warm lighting with off/on graphics; a lit lamp
-// raises its room's score (and so the Room of everyone in it) through its room impact.
+// Open Floor Lamp (0x7F00_0070) — toggleable warm lighting with off/on graphics. It is a light
+// source: a lit lamp gives its room light, and raises the room's score (and so the Room of
+// everyone in it) through its room impact.
 
 use crate::templates::toggle::ToggleablePower;
 use std::engine::RefreshMode;
+use std::flags::ObjectFlags2;
 
 object "Open Floor Lamp" from ToggleablePower {
     guid: 0x7F00_0070;
@@ -17,14 +19,20 @@ object "Open Floor Lamp" from ToggleablePower {
     initial_power: true;
     /// The room impact (object data word 7) while lit: the room score counts it.
     param lit_room_impact: i16 = 5;
+    /// The light (object data word 51) while lit: the room count adds it to the room's lamp
+    /// light.
+    param lit_light: i16 = 50;
 
     sound switch_click = preset("ui_click", wav: "open_lamp_switch");
 
     slot front = routing([0.0, -0.65, 0.0]);
 
     init {
+        // A light source: the room count adds its light to the room's lamp light.
+        self.flags2.set(ObjectFlags2::LightSource);
         if self.power {
             self.room_impact = lit_room_impact;
+            self.light = lit_light;
         }
     }
 
@@ -32,9 +40,11 @@ object "Open Floor Lamp" from ToggleablePower {
         if on {
             set_graphic(0);
             self.room_impact = lit_room_impact;
+            self.light = lit_light;
         } else {
             set_graphic(1);
             self.room_impact = 0;
+            self.light = 0;
         }
         // The room keeps its score until it is recounted.
         self.refresh(RefreshMode::RecountRoom);
