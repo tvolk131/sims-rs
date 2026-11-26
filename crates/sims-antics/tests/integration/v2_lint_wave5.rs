@@ -249,7 +249,9 @@ fn else_if_is_already_collapsed() {
         RULE,
     );
     none(
-        &tree("        let x = if a == 1 { 1 } else if a == 2 { 2 } else { 3 };\n        temp[0] = x;"),
+        &tree(
+            "        let x = if a == 1 { 1 } else if a == 2 { 2 } else { 3 };\n        temp[0] = x;",
+        ),
         RULE,
     );
 }
