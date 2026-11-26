@@ -94,6 +94,10 @@ pub struct ExternModDecl {
     pub span: Span,
     pub is_pub: bool,
     pub name: String,
+    /// The semi-global library whose trees the block declares (`extern "Lib" mod name { .. }`):
+    /// the `GLOB` link of the objects whose semi-global IDs these are. Its fns are all
+    /// semi-global (`8192..`), and an object linked to another library cannot call them.
+    pub library: Option<String>,
     pub fns: Vec<ExternFnDecl>,
 }
 
@@ -394,6 +398,9 @@ pub enum MetaFieldKind {
     Sprite(SpriteDecl),
     Graphics(Vec<SpriteDecl>),
     Tiles(Vec<TileDecl>),
+    /// `semi_global: "Name";`: the object's semi-global library link (its `GLOB` chunk), a
+    /// name the engine looks up as `Name.iff`.
+    SemiGlobal(String),
 }
 
 /// Compile-time tuning parameter declaration (`param name: i16 [= default];` or `bool`).

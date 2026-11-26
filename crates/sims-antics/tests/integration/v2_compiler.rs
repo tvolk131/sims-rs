@@ -3608,7 +3608,8 @@ object "Const Fold Probe" {
     vm.run_interaction(obj_id, "Power Off", None);
     assert_eq!(vm.obj_attr(obj_id, 0), 0);
 
-    // Sol R1 P2-1a: `param self: i16 = 7` must NOT shadow `self` ObjectId when calling a helper!
+    // Sol R1 P2-1a: `param self: i16 = 7` must NOT shadow `self` ObjectId when calling a helper.
+    // Since v2.4 the parser refuses a parameter named `self`, so it can never shadow.
     let self_shadow_src = r#"
 fn store_id(v: i16, out: &mut i16) {
     *out = v;
@@ -3627,21 +3628,17 @@ object "Self Shadow Probe" {
     }
 }
 "#;
-    let self_expanded = sims_antics::v2::expand_v2_source_to_objects(
+    let self_shadow = sims_antics::v2::expand_v2_source_to_objects(
         "self_shadow.antics",
         self_shadow_src,
         &PackResolverConfig::default(),
     )
-    .expect("expand self shadow");
+    .expect_err("v2.4: `param self` is refused");
     assert!(
-        !self_expanded[0].air_source.contains("bcon.self"),
-        "`self` passed to read-only i16 helper must resolve to object id, never `bcon.self`:\n{}",
-        self_expanded[0].air_source
-    );
-    assert!(
-        self_expanded[0].air_source.contains("stack_obj"),
-        "expected stack_obj for `self`:\n{}",
-        self_expanded[0].air_source
+        self_shadow
+            .to_string()
+            .contains("'self' always names the running object"),
+        "{self_shadow}"
     );
 
     // Sol R1 P2-1b: `param index: i16 = 0` shadowed by helper param `index: i16` in `self.attr[index]`!

@@ -82,6 +82,45 @@ pub fn compile_object_from_sources(
 
 /// Compiles a pre-built [`ObjectManifest`] together with `.air` (Antics IR) sources into
 /// a complete `.iff` (with `rsmp`) and synthesized WAVs.
+/// The chunk ID the original's `GLOB` chunks use.
+const GLOB_CHUNK_ID: u16 = 128;
+
+/// The longest semi-global link name: the length-prefixed form's limit (a first byte below 48
+/// is a length), which the NUL-terminated form keeps.
+const MAX_SEMI_GLOBAL_NAME: usize = 47;
+
+/// Checks a semi-global library link name (`semi_global: "Name";`): 1 to 47 ASCII letters,
+/// digits, `_`, `-` or spaces, starting with a letter or digit. The engine appends `.iff` and
+/// matches it against the loaded files' names, ignoring case. A first character at or above
+/// `'0'` (48) is what makes the reader take the name as NUL-terminated, not length-prefixed.
+pub(crate) fn check_semi_global_name(name: &str) -> std::result::Result<(), String> {
+    let first_ok = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric());
+    let chars_ok = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ' '));
+    if first_ok && chars_ok && name.len() <= MAX_SEMI_GLOBAL_NAME {
+        Ok(())
+    } else {
+        Err(format!(
+            "semi-global library name {name:?} must be 1 to {MAX_SEMI_GLOBAL_NAME} ASCII letters, \
+             digits, '_', '-' or spaces, starting with a letter or digit (the file name \
+             without '.iff')"
+        ))
+    }
+}
+
+/// A `GLOB` chunk's payload: the name, NUL-terminated (the form whose first byte is at least
+/// 48).
+pub(crate) fn encode_global_link(name: &str) -> std::result::Result<Vec<u8>, String> {
+    check_semi_global_name(name)?;
+    let mut data = name.as_bytes().to_vec();
+    data.push(0);
+    Ok(data)
+}
+
 pub(crate) fn compile_object_from_manifest(
     manifest: ObjectManifest,
     antics_sources: &[(&str, &str)],
@@ -601,6 +640,18 @@ pub(crate) fn compile_object_from_manifest(
             flags: IFF_CONVERTED_FLAG,
             label: str_chunk.label.clone(),
             data: encode_string_table(str_chunk)?,
+        });
+    }
+
+    // 5c. GLOB: the semi-global library link.
+    if let Some(link) = &manifest.semi_global {
+        chunks.push(ChunkData {
+            tag: *b"GLOB",
+            id: GLOB_CHUNK_ID,
+            flags: IFF_CONVERTED_FLAG,
+            label: String::new(),
+            data: encode_global_link(link)
+                .map_err(|e| Error::new(format!("object '{}': {e}", manifest.name)))?,
         });
     }
 

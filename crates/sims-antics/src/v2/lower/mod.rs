@@ -422,6 +422,9 @@ struct ObjectEnv<'a> {
     local_extern_mods: BTreeMap<String, (String, ExternModDecl)>,
     /// Object/template-local `extern bcon` blocks by name -> (owner module, decl).
     local_extern_bcons: BTreeMap<String, (String, ExternBconDecl)>,
+    /// The object's semi-global library link (`semi_global: "Name";`), which decides whose
+    /// trees its semi-global IDs name.
+    semi_global: Option<String>,
     /// Object/template-local `const` items by name.
     local_consts: BTreeMap<String, i64>,
     /// Private named BCON tables by reference name (`LampTuning` and `lamp_tuning`).
@@ -939,6 +942,10 @@ struct TreeLowerer<'a> {
     /// Trees this tree calls with inline arguments whose frame holds at most four arguments
     /// (the `.air` header's `narrow_callees`, which `share_tails` and `node_order` need).
     narrow_callees: BTreeSet<u16>,
+    /// The locals an option binding copies its call's temp into (`if let Some(v) = f()`,
+    /// `let Some(v) = f() else { .. };`), which the backend may read in place
+    /// ([`mir::alias_option_temps`]).
+    option_aliases: BTreeSet<String>,
     /// The first emitted inline-argument call to a callee with a wider frame, which reads the
     /// nodes after the call: `share_tails` and `node_order` refuse it.
     wide_call: Option<(Span, String)>,

@@ -363,20 +363,20 @@ fn the_earlier_typed_names_still_report() {
 
 #[test]
 fn every_std_global_declared_locally_is_a_duplicate() {
-    // Each of the 62 `std::globals` lines, declared again with the same ID and ABI.
+    // Each of the 64 `std::globals` lines, declared again with the same ID and ABI.
     let std = include_str!("../../src/v2/std/globals.antics");
     let decls: Vec<&str> = std
         .lines()
         .map(str::trim)
         .filter(|l| l.starts_with("#[id("))
         .collect();
-    assert_eq!(decls.len(), 62);
+    assert_eq!(decls.len(), 64);
     let source = format!(
         "extern mod mine {{\n{}\n}}\nobject \"Synth Probe\" {{\n    guid: 0x7E00_0301;\n    price: 1;\n}}\n",
         decls.join("\n")
     );
     let found = of(&source, "duplicate_std_global");
-    assert_eq!(found.len(), 62, "{found:#?}");
+    assert_eq!(found.len(), 64, "{found:#?}");
     // Another ABI is another way to call the tree: no finding.
     let source = "extern mod mine {\n    #[id(271)] fn init_object() -> bool;\n}\nobject \"Synth Probe\" {\n    guid: 0x7E00_0301;\n    price: 1;\n}\n";
     none(source, "duplicate_std_global");

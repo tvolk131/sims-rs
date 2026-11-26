@@ -581,6 +581,21 @@ pub(crate) fn merge_extern_mods(
         (None, Some(_)) => ((b_owner, b), (a_owner, a)),
         _ => ((a_owner, a), (b_owner, b)),
     };
+    if !same_library(&a.library, &b.library) {
+        let lib = |l: &Option<String>| match l {
+            Some(l) => format!("semi-global library \"{l}\""),
+            None => "no library".to_owned(),
+        };
+        return Err(Error::at(
+            at,
+            format!(
+                "extern mod '{}' is declared for {} in {a_owner} and for {} in {b_owner}",
+                a.name,
+                lib(&a.library),
+                lib(&b.library)
+            ),
+        ));
+    }
     let mut merged = base.clone();
     for f in &extra.fns {
         // Every fn of the other side for the same tree, an exact duplicate's aliases too.
@@ -627,6 +642,16 @@ pub(crate) fn merge_extern_mods(
         merged.fns.push(f.clone());
     }
     Ok((base_owner.to_owned(), merged))
+}
+
+/// Whether two semi-global library names name the same file (the engine matches them ignoring
+/// ASCII case).
+pub(crate) fn same_library(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// The built-in module that declares the prelude types (`Height`, `Placement`).

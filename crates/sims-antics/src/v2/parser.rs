@@ -186,6 +186,17 @@ impl Parser {
                 ),
             ));
         }
+        // A binding named `self` would make `self.x` ambiguous: a field of the running object
+        // (as everywhere else) or of the bound handle.
+        if name == "self" {
+            return Err(Error::at(
+                span,
+                format!(
+                    "'self' always names the running object and cannot be used as a {desc}; \
+                     choose another name (a Sim parameter is 'sim: Sim')"
+                ),
+            ));
+        }
         self.bound_vars.insert(name.clone());
         Ok((name, span))
     }
@@ -403,10 +414,14 @@ impl Parser {
             )?;
             match kw.as_str() {
                 "extern" => {
+                    let library = self.parse_extern_library()?;
                     let (what, wspan) = self.expect_ident("'mod' or 'bcon' after 'extern'")?;
                     match what.as_str() {
-                        "mod" => {
-                            items.push(V2Item::ExternMod(self.parse_extern_mod(kw_span, is_pub)?))
+                        "mod" => items.push(V2Item::ExternMod(
+                            self.parse_extern_mod(kw_span, is_pub, library)?,
+                        )),
+                        "bcon" if library.is_some() => {
+                            return Err(Error::at(wspan, EXTERN_LIBRARY_ON_BCON));
                         }
                         "bcon" => {
                             items
@@ -1020,8 +1035,24 @@ impl Parser {
         ))
     }
 
-    /// Parses `extern mod name { #[id(N)] fn f(...) [-> Abi]; ... }` (after `extern mod`).
-    fn parse_extern_mod(&mut self, span: Span, is_pub: bool) -> Result<ExternModDecl> {
+    /// The semi-global library of `extern "Lib" mod`, after `extern`.
+    fn parse_extern_library(&mut self) -> Result<Option<(String, Span)>> {
+        if !matches!(self.peek().kind, TokenKind::Str(_)) {
+            return Ok(None);
+        }
+        let (name, span) = self.expect_string("semi-global library name")?;
+        crate::compile::check_semi_global_name(&name).map_err(|e| Error::at(span, e))?;
+        Ok(Some((name, span)))
+    }
+
+    /// Parses `extern ["Lib"] mod name { #[id(N)] fn f(...) [-> Abi]; ... }` (after `extern
+    /// ["Lib"] mod`).
+    fn parse_extern_mod(
+        &mut self,
+        span: Span,
+        is_pub: bool,
+        library: Option<(String, Span)>,
+    ) -> Result<ExternModDecl> {
         let (name, _) = self.expect_ident("extern mod name")?;
         self.expect(&TokenKind::LBrace, "'{'")?;
         let mut fns: Vec<ExternFnDecl> = Vec::new();
@@ -1037,6 +1068,16 @@ impl Parser {
                     ispan,
                     format!(
                         "extern BHAV #[id({v})] must be a global (256..=4095) or semi-global (8192..) tree"
+                    ),
+                ));
+            }
+            if let (Some((lib, _)), Some((ispan, v))) = (&library, attrs.id)
+                && v < 8192
+            {
+                return Err(Error::at(
+                    ispan,
+                    format!(
+                        "'extern \"{lib}\" mod' declares semi-global trees (8192..), but #[id({v})] is a global tree, the same for every object: declare it in an 'extern mod' without a library"
                     ),
                 ));
             }
@@ -1076,6 +1117,7 @@ impl Parser {
             span,
             is_pub,
             name,
+            library: library.map(|(lib, _)| lib),
             fns,
         })
     }
@@ -1199,7 +1241,13 @@ impl Parser {
 
     /// Parses `NAME = <integer>;` after `const`.
     fn parse_const(&mut self, span: Span, is_pub: bool) -> Result<ConstDecl> {
-        let (name, _) = self.expect_ident("constant name")?;
+        let (name, nspan) = self.expect_ident("constant name")?;
+        if name == "self" {
+            return Err(Error::at(
+                nspan,
+                "'self' always names the running object and cannot name a constant",
+            ));
+        }
         self.expect(&TokenKind::Assign, "'='")?;
         let (value, vspan) = self.parse_signed_int("constant value")?;
         if !(i64::from(i16::MIN)..=i64::from(u32::MAX)).contains(&value) {
@@ -1421,11 +1469,15 @@ impl Parser {
                     members.push(ObjectMember::Bcon(self.parse_bcon_table(kw_span)?));
                 }
                 "extern" => {
+                    let library = self.parse_extern_library()?;
                     let (what, wspan) = self.expect_ident("'mod' or 'bcon' after 'extern'")?;
                     match what.as_str() {
                         "mod" => members.push(ObjectMember::ExternMod(
-                            self.parse_extern_mod(kw_span, false)?,
+                            self.parse_extern_mod(kw_span, false, library)?,
                         )),
+                        "bcon" if library.is_some() => {
+                            return Err(Error::at(wspan, EXTERN_LIBRARY_ON_BCON));
+                        }
                         "bcon" => members.push(ObjectMember::ExternBcon(
                             self.parse_extern_bcon(kw_span, false)?,
                         )),
@@ -1547,6 +1599,12 @@ impl Parser {
     fn parse_param_member(&mut self, span: Span) -> Result<ObjectMember> {
         // A tuning parameter is a constant, so a const binding may yield it.
         let (name, name_span) = self.expect_ident("parameter name")?;
+        if name == "self" {
+            return Err(Error::at(
+                name_span,
+                "'self' always names the running object and cannot be used as a parameter name",
+            ));
+        }
         if name == "stack_obj" {
             return Err(Error::at(
                 name_span,
@@ -2074,6 +2132,11 @@ impl Parser {
                 MetaFieldKind::Graphics(list)
             }
             "tiles" => MetaFieldKind::Tiles(self.parse_tiles_array()?),
+            "semi_global" => {
+                let (name, nspan) = self.expect_string("semi_global library name")?;
+                crate::compile::check_semi_global_name(&name).map_err(|e| Error::at(nspan, e))?;
+                MetaFieldKind::SemiGlobal(name)
+            }
             _ => unreachable!("guarded by is_meta_field_name"),
         };
         self.eat_member_terminator();
@@ -4560,6 +4623,8 @@ fn default_container_slot(span: Span, name: String) -> SlotDecl {
     }
 }
 
+const EXTERN_LIBRARY_ON_BCON: &str = "only 'extern mod' takes a semi-global library ('extern \"Lib\" mod name { .. }'), not 'extern bcon'";
+
 fn is_meta_field_name(name: &str) -> bool {
     matches!(
         name,
@@ -4583,6 +4648,7 @@ fn is_meta_field_name(name: &str) -> bool {
             | "sprite"
             | "graphics"
             | "tiles"
+            | "semi_global"
     )
 }
 
@@ -4659,6 +4725,13 @@ fn reject_world_binding(name: &str, span: Span) -> Result<()> {
         return Err(Error::at(
             span,
             "'world' names the engine globals ('world.hour') and cannot be used as a const binding",
+        ));
+    }
+    if name == "self" {
+        return Err(Error::at(
+            span,
+            "'self' always names the running object and cannot be used as a const binding; \
+             choose another name",
         ));
     }
     Ok(())

@@ -523,12 +523,7 @@ fn an_if_let_binding_hides_a_saved_self_handle() {
     );
     iff(&source);
     none(&source, "stack_obj_clobber_after_self");
-    // `if let Some(self)` is not judged (whether it may bind `self` is open, #489).
-    let source = if_let_tree(
-        "sim: Sim",
-        "        stack_obj = sim;\n        if let Some(self) = pick_for(sim) {\n            temp[3] = self;\n        }",
-    );
-    none(&source, "stack_obj_clobber_after_self");
+    // (`if let Some(self)` no longer parses: `self` cannot be bound, v2.4.)
 }
 
 // --- v2.3 step 2: flag methods and names on `lot.objects()` loop handles -------------------

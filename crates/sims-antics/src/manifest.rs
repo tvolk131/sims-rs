@@ -747,6 +747,8 @@ pub struct ObjectManifest {
     pub attributes: u16,
     pub interaction_group: i16,
     pub data_58: i16,
+    /// The semi-global library link (`GLOB`), written when set.
+    pub semi_global: Option<String>,
     pub init: Option<TreeRef>,
     pub main: Option<TreeRef>,
     pub scripts: Vec<String>,
@@ -1076,6 +1078,7 @@ impl ObjectManifest {
             attributes,
             interaction_group,
             data_58,
+            semi_global: None,
             init,
             main,
             scripts,

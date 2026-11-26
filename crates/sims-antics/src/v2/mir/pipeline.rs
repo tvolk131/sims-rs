@@ -46,6 +46,13 @@ pub(crate) struct FrameFacts<'a> {
     pub(crate) local_origins: &'a BTreeMap<String, String>,
     /// The `min_locals` floor the tree's header will carry (0 for none).
     pub(crate) min_locals: usize,
+    /// The locals that copy an option call's result out of its temp (`if let Some(v) = f()`,
+    /// `let Some(v) = f() else { .. };`), which may read the temp in place
+    /// ([`alias_option_temps`]).
+    pub(crate) option_aliases: &'a BTreeSet<String>,
+    /// Set when [`alias_option_temps`] read some binding in place (dropped its copy), which
+    /// moves nodes and frame words as a staging in place does.
+    pub(crate) aliased: &'a std::cell::Cell<bool>,
 }
 
 /// Runs the backend passes over one lowered tree body.
@@ -86,6 +93,18 @@ fn finish_frame(out: String, facts: &FrameFacts<'_>) -> String {
             out
         }
     } else {
+        // An option binding reads its temp in place while nothing can write it. The copy it
+        // drops is an Expression (a scratch-pointer write, which main's rules keep), and the
+        // frame words it frees move the others (which text that names frame words may see).
+        let out = if !main_rules && !reads_text {
+            let aliased = alias_option_temps(&out, facts.option_aliases);
+            if aliased != out {
+                facts.aliased.set(true);
+            }
+            aliased
+        } else {
+            out
+        };
         let optimize = |decl_groups| {
             crate::v2::opt::optimize_tree_body(
                 &out,
