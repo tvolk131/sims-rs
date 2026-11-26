@@ -204,7 +204,7 @@ fn a_tree_both_contexts_call_is_written_inherit() {
         &[
             "label = \"Ring\"",
             "context = inherit)]\n    fn ring() {",
-            "me.person[3] = 1;",
+            "me.personality.active = 1;",
             "me.motive[2] = 4;",
             "temp[0] = stack_obj.attr[1];",
         ],

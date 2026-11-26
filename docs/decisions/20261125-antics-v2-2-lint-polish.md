@@ -157,16 +157,8 @@ The tests pin all three points:
     `buy_flags` 595, `placement` 526, `flags2` 178, `wall_adjacency` 116);
   - lint time for the corpus: 2.2 s → 3.1 s wall (8 threads), from the extra trial
     builds.
-- **Track 9 (the lift):** five lift tests need Track 9's parallel PR, which writes the
-  dot names and the flag methods:
-  - four assert that lifted text lints clean, and now see the flag operators the lift
-    still writes:
-    - `v2::decompile::tests::bit_operations_and_sim_slots_leave_raw`;
-    - `v2::decompile::tests::calls_and_flag_tests_are_returned_whole`;
-    - `v2_lift_rust_polish::motives_constants_and_imports_take_their_paths`;
-    - `v2_lift_wave3::typed_constants_bring_their_imports_and_method_forms_replace_target_arguments`;
-  - `v2_lift_pr_h_idioms::a_tree_both_contexts_call_is_written_inherit` expects
-    `me.person[3] = 1;`. The lift applies `untyped_engine_field` and now writes
-    `me.personality.active = 1;`.
-  - The lift reads a `prefer_method_syntax` finding only as `name(..)`, so it skips the
-    flag findings rather than applying them wrongly.
+- **Track 9 (the lift):** #481 writes the dot names and the flag methods, so the four lift
+  tests that assert lifted text lints clean pass again. One expectation changes:
+  `v2_lift_pr_h_idioms::a_tree_both_contexts_call_is_written_inherit` now expects
+  `me.personality.active = 1;` for `me.person[3] = 1;`, since the lift applies
+  `untyped_engine_field`.
