@@ -99,7 +99,8 @@ lowering (`cond.rs`) uses the same idiom.
 ## Decision 3: the other tail spelling is a per-tree fallback
 
 The lifter keeps, for each structured tree, its lift with the other tail spelling
-(`TreeModel::other_tails`), for both branch orders.
+(`TreeModel::other_tails`) in both branch orders. The copied lifts' two orders are made on
+their own: two joined lifts can be one text where the copied ones are two.
 
 - **Which goes first.** Whichever of joined and copied has fewer lines is written first;
   on a tie, the structurer's choice (fewer nodes) goes first.

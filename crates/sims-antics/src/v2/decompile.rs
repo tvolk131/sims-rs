@@ -364,7 +364,7 @@ pub fn decompile_iff_to_v2_report(
                     &mut cache,
                 );
                 let text = model.lint_spellings(text, &recompiled);
-                let text = model.polish(text, &recompiled);
+                let (text, raw_spelled) = model.polish(text, &recompiled);
                 let (text, recompiled, mut checks) =
                     model.flip_negations(text, (recompiled, checks), &mut cache);
                 let text = model.allow_kept_negations(text);
@@ -377,7 +377,12 @@ pub fn decompile_iff_to_v2_report(
                         style: plan.style(t),
                         standalone_lifecycle: t.lifecycle.is_some()
                             && plan.standalone.contains(&t.id),
-                        raw_statements: generated.raw_counts.get(&t.id).copied().unwrap_or(0),
+                        raw_statements: generated
+                            .raw_counts
+                            .get(&t.id)
+                            .copied()
+                            .unwrap_or(0)
+                            .saturating_sub(raw_spelled.get(&t.id).copied().unwrap_or(0)),
                         check: match &t.omitted {
                             Some(why) => TreeCheck::Omitted(why.clone()),
                             None => checks.remove(&t.id).unwrap_or(TreeCheck::NotChecked),
@@ -1292,8 +1297,9 @@ fn matching_braces(tokens: &[crate::v2::lexer::Token]) -> Option<BTreeMap<usize,
 ///   `clear_motive_changes(padI: 0xNN, ..)`.
 ///
 /// The lifter writes these itself only in trees that keep the wave 2 and 3 idioms; the
-/// caller keeps a rewrite only if the file builds the same bytes.
-fn raw_builtin_spellings(text: &str) -> Vec<Rewrite> {
+/// caller keeps a rewrite only if the file builds the same bytes. Each rewrite comes with
+/// the raw statements it takes away.
+fn raw_builtin_spellings(text: &str) -> Vec<(Rewrite, usize)> {
     use crate::v2::lexer::{TokenKind as K, tokenize};
     let Ok(tokens) = tokenize(text) else {
         return Vec::new();
@@ -1325,12 +1331,28 @@ fn raw_builtin_spellings(text: &str) -> Vec<Rewrite> {
         if !indent.chars().all(|c| c == ' ') {
             continue;
         }
-        out.push(Rewrite {
+        let rewrite = Rewrite {
             range: start..end,
             text: stmts.join(&format!("\n{indent}")),
-        });
+        };
+        out.push((rewrite, stmts.len()));
     }
     out
+}
+
+/// The id of the tree whose header (`#[bhav(id = N, ..)]` or `#[id(N)]`) is the last one
+/// before byte `pos` of `text`.
+fn tree_id_before(text: &str, pos: usize) -> Option<u16> {
+    text[..pos].lines().rev().find_map(|l| {
+        let rest = l.trim_start();
+        let rest = rest
+            .strip_prefix("#[bhav(id = ")
+            .or_else(|| rest.strip_prefix("#[id("))?;
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        rest[..digits].parse().ok()
+    })
 }
 
 /// The v2 statements of a `raw { }` body that holds only what [`raw_builtin_spellings`]
@@ -2339,8 +2361,10 @@ fn swap_tails(t: &mut TreeModel) {
     t.other_order = std::mem::replace(second, current).map(Box::new);
 }
 
-/// `t`'s structured lifts with their shared tails copied, in the slots of `t.lifted` and
-/// `t.other_order` (behavioral mode writes the true branch first), when they differ.
+/// `t`'s structured lifts with their shared tails copied, when they differ from its lifts:
+/// first the branch order the mode writes first (behavioral mode the true branch, strict
+/// mode the lower-numbered node), then the other one when it is another text. Both orders
+/// are made whether or not `t` has two: joined lifts can coincide where copied ones do not.
 fn copied_tails(
     t: &TreeModel,
     opts: LiftOptions,
@@ -2356,9 +2380,8 @@ fn copied_tails(
         StructuredLiftOutcome::Lifted(text) => ordered_lift(&text),
         _ => None,
     };
-    let swapped = behavioral && t.other_order.is_some();
-    let first = copy(!swapped)?;
-    let second = t.other_order.as_ref().and_then(|_| copy(swapped));
+    let first = copy(!behavioral)?;
+    let second = copy(behavioral).filter(|o| o.lifted != first.lifted);
     let differs = first.lifted != t.lifted
         || second.as_ref().map(|o| &o.lifted) != t.other_order.as_ref().map(|o| &o.lifted);
     differs.then(|| Box::new((first, second)))
@@ -3229,19 +3252,22 @@ impl Model {
     /// - a named motive or skill cell is a field (`sim.motive.hunger`, `sim.skill.cooking`),
     ///   and a typed flag operation a method (`.set(..)`, `.clear(..)`, `.contains(..)`); see
     ///   [`cell_spellings`];
+    /// - a `raw { }` block of builtins only is those builtins ([`raw_builtin_spellings`]);
     /// - in behavioral mode, a local without `#[slot(N)]` and an argument by name, per
     ///   function (see [`Self::keep_frame_groups`]);
     /// - `else { if .. }` holding the chain alone is `else if ..`;
     /// - `use` lines importing from one module are one braced line.
     ///
     /// Each kind is tried together, then in halves (the frame changes per tree first); the
-    /// last two never change the bytes, but are checked the same way.
-    fn polish(&self, text: String, recompiled: &RecompiledFile) -> String {
+    /// last two never change the bytes, but are checked the same way. Also returns, per tree,
+    /// the raw statements the text no longer writes raw.
+    fn polish(&self, text: String, recompiled: &RecompiledFile) -> (String, BTreeMap<u16, usize>) {
         let same = |t: &str| {
             self.compile(t)
                 .is_ok_and(|r| r.iff_bytes == recompiled.iff_bytes)
         };
         let mut text = text;
+        let mut raw_spelled: BTreeMap<u16, usize> = BTreeMap::new();
         let renames = self.tree_renames(&text);
         if !renames.is_empty() {
             let base = text.clone();
@@ -3306,9 +3332,17 @@ impl Model {
         let raws = raw_builtin_spellings(&text);
         if !raws.is_empty() {
             let base = text.clone();
-            let ok = |r: &[Rewrite]| same(&apply_rewrites(&base, r));
+            let rewrites = |r: &[(Rewrite, usize)]| -> Vec<Rewrite> {
+                r.iter().map(|(w, _)| w.clone()).collect()
+            };
+            let ok = |r: &[(Rewrite, usize)]| same(&apply_rewrites(&base, &rewrites(r)));
             let kept = keep_joint(&raws, &ok, POLISH_RAW_BUILDS);
-            text = apply_rewrites(&text, &kept);
+            for (w, n) in &kept {
+                if let Some(id) = tree_id_before(&text, w.range.start) {
+                    *raw_spelled.entry(id).or_default() += n;
+                }
+            }
+            text = apply_rewrites(&text, &rewrites(&kept));
         }
         // `if let Some(v) = globals::f()` and `let Some(v) = globals::f() else { .. };`, one
         // statement at a time.
@@ -3345,7 +3379,7 @@ impl Model {
         if grouped != text && same(&grouped) {
             text = grouped;
         }
-        text
+        (text, raw_spelled)
     }
 
     /// The groups of `groups` that keep `text` building the bytes of `recompiled` and add no
@@ -9638,7 +9672,10 @@ mod tests {
     #[test]
     fn raw_builtin_blocks_are_spelled_as_builtins() {
         let text = "fn t() {\n    raw {\n        scope(27, 1) := temp[0];\n        temp[2] := scope(27, 1);\n    }\n    raw { remove_object(0, flags: 3) }\n    raw { remove_object(stack_obj, no_yield: true) }\n    raw { remove_object(1, flags: 4) }\n    raw { clear_motive_changes() pad(2: 0x05) }\n}\n";
-        let rewritten = apply_rewrites(text, &raw_builtin_spellings(text));
+        let raws = raw_builtin_spellings(text);
+        assert_eq!(raws.iter().map(|(_, n)| n).sum::<usize>(), 6);
+        let rewrites: Vec<Rewrite> = raws.into_iter().map(|(w, _)| w).collect();
+        let rewritten = apply_rewrites(text, &rewrites);
         assert_eq!(
             rewritten,
             "fn t() {\n    stack_obj.sprite_flags[temp[1]] = temp[0];\n    temp[2] = stack_obj.sprite_flags[temp[1]];\n    me.remove(no_yield: true, skip_resets: true);\n    stack_obj.remove(no_yield: true);\n    stack_obj.remove(flags: 4);\n    clear_motive_changes(pad2: 0x05);\n}\n"
