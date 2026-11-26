@@ -229,7 +229,7 @@ enum CallContext {
 /// context only when the inherit tree itself runs on a Sim. So such a tree, and every inherit
 /// or Sim tree that calls it, must not be called from an object's own tree or from a
 /// functional, which an object may run ([`check_inherit_calls`]).
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct InheritCallFacts {
     /// Inherit trees that call a Sim tree by name, with that call's span.
     calls_sim: BTreeMap<String, Span>,
