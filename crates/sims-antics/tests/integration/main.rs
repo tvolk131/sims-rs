@@ -31,6 +31,7 @@ mod structured_equiv;
 mod v2_2_bitflags_and_return_error;
 mod v2_2_lift_polish;
 mod v2_2_lint_polish;
+mod v2_2_step2_lint;
 mod v2_2_temps_and_flags;
 mod v2_compiler;
 mod v2_fmt_and_decompile;

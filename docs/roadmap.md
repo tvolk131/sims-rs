@@ -3808,6 +3808,40 @@ through their public interfaces only; the simulation never depends on it.
   - **Lift (Track 9, #477):** the error exit is written `panic!();`
     (5,584 sites), and a call whose result is unused `let _ = f();`
     (1,470 sites).
+- **Done (Batch 20 — `.antics` v2.2 polish wave, #479–#482):**
+  - **The `.antics` v2 language (Track 8):**
+    - #480: bitflags list methods (`x.set_all([A, B])`, `clear_all`,
+      `contains_all`, `contains_any`) build the same bytes as the union
+      form. A call whose arguments are literals or bare temps passes them
+      without copies where no node or frame identity is observable. A
+      `#[ret(temp = N)] -> Option<T>` answer binds with `let v = f()?;`
+      or `let Some(v) = f() else { .. };`.
+    - #482: `wall_placement` (`WallPlacement`) and `world.expansions`
+      (`Expansions`) are typed bitflags; their `i16` uses keep their
+      bytes. `panic!()` is the only spelling of the error exit: a bare
+      `return error;` returns a binding named `error`, and is refused
+      without one.
+  - **Lint (Track 7, #479):** `untyped_engine_field` names a Sim's
+    numbered skills, traits and motives (`sim.skill.cooking`), and
+    `prefer_method_syntax` suggests `.set` / `.clear` / `.contains` for
+    the flag operators on typed words. Both are byte-checked, and are
+    tried after every older proposal. `negated_comparison` stays quiet
+    before an exit: the VM records the compare's own result there.
+  - **Lift (Track 9, #481):** named motive and skill cells, and flag
+    methods on typed words, in both modes; in behavioral mode, unpinned
+    locals (19,087 → 14,127 `#[slot(N)] let`) and named arguments (953
+    functions). Typed flag operators fall from 6,767 to 2,795
+    (behavioral), with 0 DIFFERENT.
+  - **Follow-ups:**
+    - Track 8: a flag method on the loop handle of a `for o in lot.objects()`
+      (`o.flags2.set(..)`, now `o.wall_placement.set(..)` too) skips the
+      direct cursor lowering (`cursor_stmt_ok`), so its bytes differ from
+      the operator's; lint and lift write the operator there. A method on
+      any other receiver in the loop (`world.expansions`, `self.flags`) is
+      not affected. Also `if let` for `Option<T>` answers, once the lint
+      walker supports it.
+    - Track 9: re-measure the 1,191-object corpus after #482, which lifts
+      `wall_placement` and `world.expansions` operators as methods.
 - **Next (in flight, in order of player impact):**
   - **Travel follow-ups:**
     - A hop that leaves travelers behind (Go Somewhere Else for one
