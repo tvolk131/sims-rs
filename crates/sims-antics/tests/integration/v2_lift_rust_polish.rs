@@ -153,7 +153,7 @@ fn trees_are_called_by_their_own_name_and_keep_the_id_on_a_clash() {
                 // Two trees share the label: both keep their IDs.
                 "fn open_4302() {",
                 "fn open_4303() {",
-                "if open_4302() {}",
+                "let _ = open_4302();",
                 // A builtin's name, and a name the file already uses (the sound), keep theirs.
                 "fn sleep_4304() {",
                 "fn fable_chime_4305() {",
