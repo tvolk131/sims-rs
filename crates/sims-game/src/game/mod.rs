@@ -168,11 +168,12 @@ impl Outcome {
 /// rate is not ported).
 pub const SPIN_FRAME_US: u64 = 50_000;
 
-/// Duration of the smooth camera pan glide when double-clicking / re-clicking a
-/// Sim's portrait to centre the view (`0x4c9a27`), in microseconds (350 ms).
-pub const CAMERA_PAN_DURATION_US: u64 = 350_000;
+/// Duration of the camera glide to a Sim when their portrait is clicked
+/// again (`0x4c9a27`): the original's `[0x6c7788]`, 250 ms, which nothing
+/// writes.
+pub const CAMERA_PAN_DURATION_US: u64 = 250_000;
 
-/// Active smooth camera pan interpolation from `start_origin` to `target_origin`.
+/// A camera glide from `start_origin` to `target_origin`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CameraPan {
     start_origin: [i32; 2],
@@ -182,26 +183,96 @@ struct CameraPan {
 }
 
 impl CameraPan {
+    /// The origin at `now_us`, and whether the glide is over.
+    ///
+    /// The original's glide is linear in its millisecond clock. Each axis
+    /// keeps a single-precision slope, `(target - start) / duration`
+    /// (`0x4733b7`), and its value is `target - slope * (end - now)`
+    /// (`0x473390`), rounded half away from zero (`0x4c9b4e`, `0x4c9b87`).
+    /// The x axis glides in the original's column, ours plus
+    /// [`crate::pick::ORIGIN_COLUMN`], which only moves where the rounding
+    /// changes sign.
     fn sample(&self, now_us: u64) -> ([i32; 2], bool) {
-        let elapsed = now_us.saturating_sub(self.start_us);
-        if self.duration_us == 0 || elapsed >= self.duration_us {
+        let duration = self.duration_us / 1000;
+        let start = self.start_us / 1000;
+        let (end, now) = (start + duration, now_us / 1000);
+        if duration == 0 || now >= end {
             return (self.target_origin, true);
         }
-        let t = (elapsed as f64) / (self.duration_us as f64);
-        let inv = 1.0 - t;
-        // Cubic ease-out: fast responsive departure, gentle deceleration onto the Sim.
-        let eased = 1.0 - inv * inv * inv;
-        let lerp = |a: i32, b: i32| -> i32 {
-            let delta = f64::from(b) - f64::from(a);
-            (f64::from(a) + delta * eased).round() as i32
+        let remaining = (end - now) as f32;
+        // In 64 bits, so no origin overflows; the result lies between the
+        // two ends.
+        let axis = |from: i64, to: i64| -> i64 {
+            let slope = (to - from) as f32 / duration as f32;
+            let value = to as f64 - f64::from(slope) * f64::from(remaining);
+            let rounded = if value >= 0.0 {
+                value + 0.5
+            } else {
+                value - 0.5
+            };
+            (rounded as i64).clamp(from.min(to), from.max(to))
         };
+        let column = i64::from(crate::pick::ORIGIN_COLUMN);
+        let [sx, sy] = self.start_origin.map(i64::from);
+        let [tx, ty] = self.target_origin.map(i64::from);
+        let clamp = |v: i64| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
         (
             [
-                lerp(self.start_origin[0], self.target_origin[0]),
-                lerp(self.start_origin[1], self.target_origin[1]),
+                clamp(axis(sx + column, tx + column) - column),
+                clamp(axis(sy, ty)),
             ],
             false,
         )
+    }
+}
+
+#[cfg(test)]
+mod camera_pan_tests {
+    use super::*;
+
+    fn pan(from: [i32; 2], to: [i32; 2]) -> CameraPan {
+        CameraPan {
+            start_origin: from,
+            target_origin: to,
+            start_us: 1_000_000,
+            duration_us: CAMERA_PAN_DURATION_US,
+        }
+    }
+
+    #[test]
+    fn the_glide_is_linear_over_250_milliseconds() {
+        let p = pan([-1, 0], [99, -125]);
+        assert_eq!(p.sample(1_000_000), ([-1, 0], false));
+        // Halfway: x glides 0 -> 100 in the original's column; y's -62.5
+        // rounds away from zero.
+        assert_eq!(p.sample(1_125_000), ([49, -63], false));
+        // 187 ms to go: 25.2 and -31.5.
+        assert_eq!(p.sample(1_063_000), ([24, -32], false));
+        // The clock is in whole milliseconds.
+        assert_eq!(p.sample(1_062_999), p.sample(1_062_000));
+        assert!(!p.sample(1_249_999).1);
+        assert_eq!(p.sample(1_250_000), ([99, -125], true));
+        assert_eq!(p.sample(9_000_000), ([99, -125], true));
+    }
+
+    #[test]
+    fn extreme_origins_stay_between_the_ends() {
+        let p = pan([i32::MAX, i32::MAX], [i32::MIN, i32::MIN]);
+        assert_eq!(p.sample(1_000_000).0, [i32::MAX, i32::MAX]);
+        let (mid, _) = p.sample(1_125_000);
+        assert!(mid[0].abs() < 1 << 10 && mid[1].abs() < 1 << 10, "{mid:?}");
+        assert_eq!(p.sample(1_250_000), ([i32::MIN, i32::MIN], true));
+    }
+
+    #[test]
+    fn the_glide_moves_by_equal_steps() {
+        let p = pan([0, 0], [500, 0]);
+        let xs: Vec<i32> = (0..250)
+            .map(|ms| p.sample(1_000_000 + ms * 1000).0[0])
+            .collect();
+        for w in xs.windows(2) {
+            assert_eq!(w[1] - w[0], 2);
+        }
     }
 }
 
@@ -1857,7 +1928,7 @@ fn native_zoom_or_rotate(
             Some(next)
         }
         Move::ZoomOut => {
-            let next = camera.zoom.zoom_out();
+            let next = camera.zoom.zoom_out_on(lot.house);
             if next == camera.zoom {
                 return false;
             }

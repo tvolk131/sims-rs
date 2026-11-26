@@ -257,6 +257,37 @@ pub struct People {
     /// What went wrong, one line each, each said once, for the host to
     /// show.
     pub problems: Vec<String>,
+    /// The stream the censor mosaic draws from ([`People::draw_censor`]).
+    censor_random: CensorRandom,
+}
+
+/// The censor mosaic's random draws. The original takes them from the
+/// global stream (`0x46f457`), which the simulation also draws from. The
+/// presentation must never change the world, so the mosaic draws from a
+/// copy of the world's global stream instead: taken again after every
+/// tick (or whenever the stream, the tick count or the restore generation
+/// changes, so a restored save draws as it did when saved), and
+/// advanced only by the mosaic in between. So the first frame after a
+/// tick draws as the original's first censored frame after it does, and
+/// frames while paused keep drawing on. The original's draws would also
+/// move the simulation's later draws; this copy's do not.
+#[derive(Debug, Default, Clone, Copy)]
+struct CensorRandom {
+    /// The restore generation, the world's tick count and stream state the
+    /// copy was taken from, and the copy.
+    copy: Option<((u64, u32, u32), sims_core::rng::GameRng)>,
+}
+
+impl CensorRandom {
+    fn follow(&mut self, world: &World, generation: u64) -> &mut sims_core::rng::GameRng {
+        let at = (generation, world.ticks, world.global_rng.state());
+        let (seen, copy) = self.copy.get_or_insert((at, world.global_rng));
+        if *seen != at {
+            *seen = at;
+            *copy = world.global_rng;
+        }
+        copy
+    }
 }
 
 impl People {
@@ -273,6 +304,7 @@ impl People {
             people,
             _temp_cast_dir: None,
             problems: Vec::new(),
+            censor_random: CensorRandom::default(),
         }
     }
 
@@ -333,6 +365,7 @@ impl People {
             people: sims_people::People::new(assets, library, cast),
             _temp_cast_dir: Some(staging),
             problems: Vec::new(),
+            censor_random: CensorRandom::default(),
         })
     }
 
@@ -393,6 +426,65 @@ impl People {
             written_rects,
         );
         self.note(drawn.problems);
+    }
+
+    /// Like [`People::draw_in_viewport_tracked`], calling `held` just
+    /// before each person is drawn, with their ID, attach points and the
+    /// canvas, to draw what they hold first
+    /// ([`sims_people::People::draw_on_lot_in_viewport_tracked_holding`]).
+    pub fn draw_in_viewport_tracked_holding(
+        &mut self,
+        world: &World,
+        camera: &Camera,
+        viewport: (u32, u32),
+        canvas: &mut Canvas,
+        written_rects: &mut Vec<sims_render::canvas::Rect>,
+        held: impl FnMut(u16, sims_render::PersonAttach, &mut Canvas),
+    ) {
+        let drawn = self.people.draw_on_lot_in_viewport_tracked_holding(
+            world,
+            camera,
+            viewport,
+            canvas,
+            written_rects,
+            held,
+        );
+        self.note(drawn.problems);
+    }
+
+    /// Draws the censor mosaic over the people the last draw drew whose
+    /// censor word is set (`sims_render::draw_censor`), into `canvas`,
+    /// which holds the lot `lot` and those people drawn with `camera`;
+    /// `lot_depth` is the lot's depth from before the people, with what
+    /// their held objects wrote; `restore_generation` is the game's
+    /// ([`CensorRandom`]). Pushes the rectangles it changed onto `rects`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_censor(
+        &mut self,
+        world: &World,
+        lot: &sims_render::Lot,
+        camera: &Camera,
+        viewport: (u32, u32),
+        lot_depth: &[u16],
+        restore_generation: u64,
+        canvas: &mut Canvas,
+        rects: &mut Vec<sims_render::canvas::Rect>,
+    ) {
+        let censored = self.people.censored();
+        if censored.is_empty() {
+            return;
+        }
+        let random = self.censor_random.follow(world, restore_generation);
+        sims_render::draw_censor(
+            lot,
+            camera,
+            viewport,
+            censored,
+            lot_depth,
+            || random.next_u32(),
+            canvas,
+            rects,
+        );
     }
 
     /// Where each person the last draw drew draws what they hold

@@ -15,6 +15,7 @@ pub mod cache;
 pub mod camera;
 pub mod canvas;
 pub mod caps;
+pub mod censor;
 pub mod cutaway;
 pub mod depth;
 pub mod grass;
@@ -31,14 +32,16 @@ pub use assets::{Assets, BaseAssets};
 pub use cache::{CacheHit, LotCache};
 pub use camera::{Camera, Walls, Zoom};
 pub use canvas::{Canvas, EMPTY_DEPTH, ID_NONE, Ids, Image, clamp_depth, pack_rgb, unpack_rgb};
+pub use censor::{Censored, draw_censor};
 pub use cutaway::{Focus, Selected, screen_centre_pick, unproject_terrain};
 pub use light::Light;
 pub use lot::Lot;
 pub use open::{Opened, open_house};
 pub use scene::{
-    PersonAttach, RenderOptions, Stats, draw, draw_held, draw_held_with_attach,
-    draw_held_with_options, draw_lot, draw_lot_in_viewport, draw_lot_in_viewport_with_options,
-    draw_lot_with_preview, draw_lot_with_preview_and_options, holds_person,
+    PersonAttach, RenderOptions, Stats, draw, draw_held, draw_held_by, draw_held_except,
+    draw_held_with_attach, draw_held_with_options, draw_lot, draw_lot_in_viewport,
+    draw_lot_in_viewport_with_options, draw_lot_with_preview, draw_lot_with_preview_and_options,
+    held_by, holds_person,
 };
 
 /// An error with a message saying what failed.

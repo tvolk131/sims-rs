@@ -147,6 +147,26 @@ impl Game {
         let milliseconds = (self.clock_us / 1000) as u32;
         self.people.set_clock(milliseconds);
         self.people_rects.clear();
+        let mut held_by_people = std::collections::BTreeSet::new();
+        // The lot's depth from before the people, which the censor's test
+        // reads.
+        let pixels = self.canvas.width.saturating_mul(self.canvas.height);
+        let lot_depth: &[u16] = self
+            .lot_cache
+            .last_lot_depth()
+            .filter(|d| self.lot_depth_from_cache && d.len() == pixels)
+            .unwrap_or(&self.lot_depth);
+        // The censor's test also sees the Sims' held objects: the
+        // original's software renderer draws them into the depth it
+        // reads, and the Sims' meshes (Direct3D) not. So while someone is
+        // censored, each Sim's held objects are drawn again into a canvas
+        // holding only the lot's depth.
+        let censoring = world.objects.values().any(|o| {
+            o.person
+                .as_ref()
+                .is_some_and(|p| p.data.get(30).is_some_and(|&w| w != 0))
+        });
+        let mut censor_canvas: Option<sims_render::Canvas> = None;
         if self.open_pack_mode {
             crate::open_pack::draw_open_pack_sims(
                 world,
@@ -157,12 +177,54 @@ impl Game {
                 &mut self.people_rects,
             );
         } else {
-            self.people.draw_in_viewport_tracked(
+            // What each Sim holds is drawn just before the Sim, at their
+            // attach points (a carried plate in the right palm), as the
+            // person's own draw does (0x459e45..0x45a027, then the Sim at
+            // 0x45a131); depth-tested both ways.
+            let camera = self.view.camera;
+            let assets = &mut self.assets;
+            self.people.draw_in_viewport_tracked_holding(
                 world,
-                &self.view.camera,
+                &camera,
                 viewport,
                 &mut self.canvas,
                 &mut self.people_rects,
+                |person, attach, canvas| {
+                    if censoring
+                        && lot_depth.len() == pixels
+                        && !sims_render::held_by(world, person).is_empty()
+                    {
+                        let scratch = censor_canvas.get_or_insert_with(|| {
+                            let mut c =
+                                sims_render::Canvas::new(canvas.width, canvas.height, [0; 3]);
+                            c.depth.copy_from_slice(lot_depth);
+                            c
+                        });
+                        sims_render::draw_held_by(
+                            world,
+                            draw_shape,
+                            assets,
+                            &camera,
+                            render_options,
+                            person,
+                            attach,
+                            &held_by_people,
+                            scratch,
+                        );
+                    }
+                    let drawn = sims_render::draw_held_by(
+                        world,
+                        draw_shape,
+                        assets,
+                        &camera,
+                        render_options,
+                        person,
+                        attach,
+                        &held_by_people,
+                        canvas,
+                    );
+                    held_by_people.extend(drawn);
+                },
             );
         }
         for (&id, obj) in &world.objects {
@@ -175,20 +237,42 @@ impl Game {
         // Who the pick notes: the people as drawn, before a bench they sit
         // on draws over them, captured only within their tight drawn rects.
         self.people_ids.take_rects(&self.canvas, &self.people_rects);
-        // What a Sim holds is drawn at the Sim's attach points (a carried
-        // plate in the right palm), after the people and depth-tested, as
-        // the person's own draw does (0x459dc0 → 0x59185d).
+        // The censor mosaic over the people whose censor word is set,
+        // after the people and before the objects that hold someone, as
+        // the original's frame does (0x4b3510: 0x4b017b, 0x4ac707, then
+        // 0x4aa1d7). Open-pack Sims have no censor boxes.
+        // Its depth test reads the lot's depth from before the people,
+        // with the Sims' held objects.
+        let mut censor_rects = Vec::new();
+        if !self.open_pack_mode {
+            let censor_depth = censor_canvas.as_ref().map_or(lot_depth, |c| &c.depth[..]);
+            self.people.draw_censor(
+                world,
+                draw_shape,
+                &self.view.camera,
+                viewport,
+                censor_depth,
+                self.restore_generation,
+                &mut self.canvas,
+                &mut censor_rects,
+            );
+        }
+        // Then the objects that hold someone (a bench a Sim sits on), and
+        // what the people's draws left: what a Sim without attach points
+        // holds stays at its own position.
         let attach = self.held_attach();
-        sims_render::draw_held_with_attach(
+        sims_render::draw_held_except(
             world,
             draw_shape,
             &mut self.assets,
             &self.view.camera,
             render_options,
             &attach,
+            &held_by_people,
             &mut self.canvas,
         );
         let mut cur_dynamic_rects = self.people_rects.clone();
+        cur_dynamic_rects.extend_from_slice(&censor_rects);
         for id in sims_render::holds_person(world) {
             if let Some(rect) = self.canvas.drawn(id) {
                 cur_dynamic_rects.push(rect);
