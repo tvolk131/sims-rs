@@ -30,6 +30,7 @@ mod open_pack_household_sim;
 mod structured_equiv;
 mod v2_compiler;
 mod v2_fmt_and_decompile;
+mod v2_lift_panic_and_discard;
 mod v2_lift_pilot;
 mod v2_lift_pr_h_idioms;
 mod v2_lift_rust_polish;

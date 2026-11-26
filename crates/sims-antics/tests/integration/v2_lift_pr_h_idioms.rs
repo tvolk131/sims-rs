@@ -110,7 +110,7 @@ fn cursor_steps_and_error_returns_lift_as_builtins() {
             "if !set_to_next(part, dest: stack_obj) {",
             "while set_to_next(guid, ",
             ", dest: stack_obj) {",
-            "return error;",
+            "panic!();",
         ],
     );
     assert!(!lifted.contains("raw"), "{lifted}");
