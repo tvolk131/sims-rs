@@ -1,9 +1,11 @@
 # Live sims-vm unit tests for the Open Floor Lamp: it starts lit, the switch entries are offered
-# by power state, and the switch sets the graphic and the room impact.
+# by power state, and the switch sets the graphic, the room impact and the light.
 #
 # A lit lamp raises Room the way the room score does it: through the object's room impact (data
-# word 7), which every room update adds to the score of the room the lamp stands in. The runner's
-# objects stand in no room, so the specs check the word; the room score itself is `sims-sim`'s.
+# word 7), which every room update adds to the score of the room the lamp stands in. It is a light
+# source (`flags2` `LightSource`, data word 40 bit 0x400), so the room count also adds its light
+# (`self.light`, data word 51) to the room's lamp light. The runner's objects stand in no room, so
+# the specs check the words; the room score and light themselves are `sims-sim`'s.
 
 [subject]
 antics = "../objects/open-floor-lamp.antics"
@@ -12,9 +14,9 @@ pack = ".."
 [sim]
 
 [[test]]
-name = "a new lamp is lit and lights its room"
+name = "a new lamp is a lit light source and lights its room"
 tree = "Init"
-expect = { result = true, attrs = { power = 1, occupied = 0 }, data = { 7 = 5 } }
+expect = { result = true, attrs = { power = 1, occupied = 0 }, data = { 7 = 5, 40 = 1024, 51 = 50 } }
 
 [[test]]
 name = "a lit lamp offers Turn Off Light"
@@ -33,18 +35,18 @@ given = { attrs = { power = 0 } }
 expect = { result = true }
 
 [[test]]
-name = "turning the light off shows the dark lamp and drops the room impact"
+name = "turning the light off shows the dark lamp and drops the room impact and the light"
 interaction = "Turn Off Light"
-given = { data = { 0 = 0, 7 = 5 } }
-expect = { attrs = { power = 0 }, data = { 0 = 1, 7 = 0 }, sounds = ["open_lamp_switch"] }
+given = { data = { 0 = 0, 7 = 5, 51 = 50 } }
+expect = { attrs = { power = 0 }, data = { 0 = 1, 7 = 0, 40 = 1024, 51 = 0 }, sounds = ["open_lamp_switch"] }
 
 [[test]]
-name = "turning the light on shows the lit lamp and raises the room impact"
+name = "turning the light on shows the lit lamp and raises the room impact and the light"
 interaction = "Turn On Light"
-given = { attrs = { power = 0 }, data = { 0 = 1, 7 = 0 } }
-expect = { attrs = { power = 1 }, data = { 0 = 0, 7 = 5 }, sounds = ["open_lamp_switch"] }
+given = { attrs = { power = 0 }, data = { 0 = 1, 7 = 0, 51 = 0 } }
+expect = { attrs = { power = 1 }, data = { 0 = 0, 7 = 5, 40 = 1024, 51 = 50 }, sounds = ["open_lamp_switch"] }
 
 [[test]]
 name = "a lit lamp cannot be turned on again"
 interaction = "Turn On Light"
-expect = { result = "unavailable", data = { 7 = 5 }, sounds = [] }
+expect = { result = "unavailable", data = { 7 = 5, 51 = 50 }, sounds = [] }

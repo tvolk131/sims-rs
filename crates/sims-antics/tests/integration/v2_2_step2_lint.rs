@@ -777,3 +777,31 @@ fn an_object_from_a_template_of_its_own_file_is_judged() {
         ["`extern bcon` entry `g260_0` of `library_consts` is never read"]
     );
 }
+
+// --- v2.3 step 3: `light` (object data word 51) ----------------------------------------------
+
+#[test]
+fn data_word_51_is_named_light() {
+    for cell in ["self", "stack_obj"] {
+        let untyped = format!("{cell}.data[51]");
+        let typed = format!("{cell}.light");
+        let read = tree("", "", &format!("        temp[0] = {untyped};"));
+        rewrites(&read, "untyped_engine_field", &untyped, &typed);
+        let write = tree("", "", &format!("        {untyped} = 50;"));
+        rewrites(&write, "untyped_engine_field", &untyped, &typed);
+    }
+    // A Sim handle names it too: it is an object word every object has.
+    let source = tree("", "sim: Sim", "        temp[0] = sim.data[51];");
+    rewrites(&source, "untyped_engine_field", "sim.data[51]", "sim.light");
+}
+
+#[test]
+fn a_state_named_light_keeps_data_word_51_unnamed() {
+    let source = tree("", "", "        self.data[51] = 50;").replace(
+        "#[slot(2)] state level: i16;",
+        "#[slot(2)] state level: i16;\n    #[slot(3)] state light: i16;",
+    );
+    assert!(source.contains("state light"), "{source}");
+    iff(&source);
+    none(&source, "untyped_engine_field");
+}
