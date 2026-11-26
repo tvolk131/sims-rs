@@ -20,8 +20,8 @@ use crate::error::{Error, Result};
 use crate::ir::BhavChunk;
 use crate::lift::{format_bhav_labeled_air_with_arities, lift_bhav};
 use crate::structure_lift::{
-    LiftOptions, StructuredLiftOutcome, lift_bhav_structured_in_node_order,
-    lift_bhav_structured_with_arities,
+    LiftOptions, StructuredLiftOutcome, lift_bhav_structured_copying_tails,
+    lift_bhav_structured_in_node_order, lift_bhav_structured_with_arities,
 };
 use crate::v2::ast::{is_reserved_type_name, object_type_ident};
 use crate::v2::fmt::format_v2_source;
@@ -286,6 +286,7 @@ pub fn decompile_iff_to_v2_report(
                     && !tree.is_some_and(|id| plan.drop_extras(id, &generated))
                     && !tree.is_some_and(|id| plan.unname_locals(id, &generated))
                     && !tree.is_some_and(|id| plan.number_raw_bcons(id, &generated))
+                    && !tree.is_some_and(|id| plan.copy_tails(&mut model, id))
                     && !plan.lower_at_line(&model, &generated, line)
                     // A tree that fails at its lowest level is left out.
                     && !tree.is_some_and(|id| model.omit(id, &message))
@@ -296,7 +297,7 @@ pub fn decompile_iff_to_v2_report(
             Err(Failure::Air { tree, message }) => {
                 let handled = match tree {
                     Some(id) => {
-                        let handled = plan.air_fallback(&model, &generated, id, &message)
+                        let handled = plan.air_fallback(&mut model, &generated, id, &message)
                             || model.omit(id, &message);
                         if handled && message.contains(LOCALS_SHORT) {
                             // The build stops at the first tree short of locals: one build with
@@ -308,7 +309,7 @@ pub fn decompile_iff_to_v2_report(
                                 if other != id && needed > declared {
                                     let message =
                                         format!("tree declares {declared}{LOCALS_SHORT}{needed}");
-                                    plan.air_fallback(&model, &generated, other, &message);
+                                    plan.air_fallback(&mut model, &generated, other, &message);
                                 }
                             }
                         }
@@ -349,6 +350,7 @@ pub fn decompile_iff_to_v2_report(
                             || plan.drop_extras(id, &generated)
                             || plan.unname_locals(id, &generated)
                             || plan.other_order(&mut model, id)
+                            || plan.copy_tails(&mut model, id)
                             || plan.lower_tree(&model, id)
                             || plan.number_raw_bcons(id, &generated);
                     }
@@ -1416,7 +1418,8 @@ fn raw_builtin_body(body: &str) -> Option<Vec<String>> {
                 }
             }
             format!("{target}.remove({});", opts.join(", "))
-        } else if let Some(rest) = stmt.strip_prefix("clear_motive_changes") {
+        } else {
+            let rest = stmt.strip_prefix("clear_motive_changes")?;
             let rest = rest.trim().strip_prefix("()")?.trim();
             let mut pads = Vec::new();
             if !rest.is_empty() {
@@ -1432,8 +1435,6 @@ fn raw_builtin_body(body: &str) -> Option<Vec<String>> {
                 }
             }
             format!("clear_motive_changes({});", pads.join(", "))
-        } else {
-            return None;
         };
         out.push(spelled);
     }
@@ -2304,6 +2305,11 @@ struct TreeModel {
     /// The structured lift with the other branch order (true branch first rather than the
     /// lower-numbered one), when it differs: [`Plan::other_order`] swaps it in.
     other_order: Option<Box<OrderedLift>>,
+    /// The structured lift and its other branch order with the other tail spelling (shared
+    /// tails copied into each branch, or joined in `while true { }`), when that differs:
+    /// [`Plan::copy_tails`] swaps it in. The shorter spelling is written first
+    /// ([`swap_tails`]).
+    other_tails: Option<Box<(OrderedLift, Option<OrderedLift>)>>,
     /// Whether the idiomatic body runs as a Sim acting on this object (`(sim: Sim)`).
     sim_ctx: bool,
     lifecycle: Option<Lifecycle>,
@@ -2318,6 +2324,44 @@ fn swap_lift(t: &mut TreeModel) {
         std::mem::swap(&mut t.body_lines, &mut other.body_lines);
         std::mem::swap(&mut t.body, &mut other.body);
     }
+}
+
+/// Swaps `t`'s structured lifts for [`TreeModel::other_tails`], if it has them.
+fn swap_tails(t: &mut TreeModel) {
+    let Some(other) = t.other_tails.as_mut() else {
+        return;
+    };
+    let (first, second) = &mut **other;
+    std::mem::swap(&mut t.lifted, &mut first.lifted);
+    std::mem::swap(&mut t.body_lines, &mut first.body_lines);
+    std::mem::swap(&mut t.body, &mut first.body);
+    let current = t.other_order.take().map(|b| *b);
+    t.other_order = std::mem::replace(second, current).map(Box::new);
+}
+
+/// `t`'s structured lifts with their shared tails copied, in the slots of `t.lifted` and
+/// `t.other_order` (behavioral mode writes the true branch first), when they differ.
+fn copied_tails(
+    t: &TreeModel,
+    opts: LiftOptions,
+    arities: &BTreeMap<u16, usize>,
+    behavioral: bool,
+) -> Option<Box<(OrderedLift, Option<OrderedLift>)>> {
+    let copy = |node_order| match lift_bhav_structured_copying_tails(
+        &t.original,
+        opts,
+        Some(arities),
+        node_order,
+    ) {
+        StructuredLiftOutcome::Lifted(text) => ordered_lift(&text),
+        _ => None,
+    };
+    let swapped = behavioral && t.other_order.is_some();
+    let first = copy(!swapped)?;
+    let second = t.other_order.as_ref().and_then(|_| copy(swapped));
+    let differs = first.lifted != t.lifted
+        || second.as_ref().map(|o| &o.lifted) != t.other_order.as_ref().map(|o| &o.lifted);
+    differs.then(|| Box::new((first, second)))
 }
 
 /// One structured lift of a tree: its lines, header and closing-brace indices, and
@@ -2583,6 +2627,7 @@ impl Model {
                 structured: false,
                 body: None,
                 other_order: None,
+                other_tails: None,
                 sim_ctx: false,
                 lifecycle: lifecycle.get(&c.id).copied(),
                 omitted: None,
@@ -2642,6 +2687,18 @@ impl Model {
                 // first, as written, which needs no negated conditions.
                 if behavioral {
                     swap_lift(&mut tree);
+                }
+            }
+            if tree.structured {
+                tree.other_tails = copied_tails(&tree, opts, &lift_arities, behavioral);
+                // The structurer joins tails when that builds fewer nodes; the shorter text
+                // goes first, the other is the fallback.
+                if tree
+                    .other_tails
+                    .as_ref()
+                    .is_some_and(|o| o.0.lifted.len() < tree.lifted.len())
+                {
+                    swap_tails(&mut tree);
                 }
             }
             // A variant runs its init/main tree as the object itself.
@@ -2927,6 +2984,20 @@ impl Model {
 
     fn tree(&self, id: u16) -> Option<&TreeModel> {
         self.trees.iter().find(|t| t.id == id)
+    }
+
+    /// Swaps tree `id`'s lifts for [`TreeModel::other_tails`], once. `false` when it has
+    /// none (left).
+    fn copy_tails(&mut self, id: u16) -> bool {
+        let Some(t) = self.trees.iter_mut().find(|t| t.id == id) else {
+            return false;
+        };
+        if t.other_tails.is_none() {
+            return false;
+        }
+        swap_tails(t);
+        t.other_tails = None;
+        true
     }
 
     /// Swaps tree `id`'s structured lift for its other branch order.
@@ -5848,7 +5919,7 @@ impl Plan {
     /// `false` when it has none left but being left out.
     fn air_fallback(
         &mut self,
-        model: &Model,
+        model: &mut Model,
         generated: &Generated,
         id: u16,
         message: &str,
@@ -5866,6 +5937,7 @@ impl Plan {
             || self.drop_extras(id, generated)
             || self.unname_locals(id, generated)
             || self.number_raw_bcons(id, generated)
+            || self.copy_tails(model, id)
             || self.lower_tree(model, id)
     }
 
@@ -6129,6 +6201,25 @@ impl Plan {
         }
         model.swap_order(id);
         self.swapped.insert(id, level);
+        self.retry_extras(id);
+        self.raw_stmts.remove(&id);
+        true
+    }
+
+    /// Writes tree `id` with its other tail spelling ([`TreeModel::other_tails`]: shared
+    /// tails copied into each branch, or joined), once, before it goes raw:
+    /// a join may build nodes the original does not run in that order, and copies build
+    /// more nodes than an original that shares the tail. The extra idioms and the
+    /// statements written raw start over, and each branch order gets another try.
+    fn copy_tails(&mut self, model: &mut Model, id: u16) -> bool {
+        if model
+            .tree(id)
+            .is_none_or(|t| self.level(t) == Level::RawLabeled)
+            || !model.copy_tails(id)
+        {
+            return false;
+        }
+        self.swapped.remove(&id);
         self.retry_extras(id);
         self.raw_stmts.remove(&id);
         true
@@ -9543,6 +9634,31 @@ fn header_gap(original: &BhavChunk, rebuilt: &BhavChunk) -> Option<String> {
 mod tests {
     use super::*;
     use sims_formats::behavior::Instruction;
+
+    #[test]
+    fn raw_builtin_blocks_are_spelled_as_builtins() {
+        let text = "fn t() {\n    raw {\n        scope(27, 1) := temp[0];\n        temp[2] := scope(27, 1);\n    }\n    raw { remove_object(0, flags: 3) }\n    raw { remove_object(stack_obj, no_yield: true) }\n    raw { remove_object(1, flags: 4) }\n    raw { clear_motive_changes() pad(2: 0x05) }\n}\n";
+        let rewritten = apply_rewrites(text, &raw_builtin_spellings(text));
+        assert_eq!(
+            rewritten,
+            "fn t() {\n    stack_obj.sprite_flags[temp[1]] = temp[0];\n    temp[2] = stack_obj.sprite_flags[temp[1]];\n    me.remove(no_yield: true, skip_resets: true);\n    stack_obj.remove(no_yield: true);\n    stack_obj.remove(flags: 4);\n    clear_motive_changes(pad2: 0x05);\n}\n"
+        );
+    }
+
+    #[test]
+    fn raw_blocks_with_other_statements_stay_raw() {
+        for body in [
+            "scope(27, 1) := 1; local[0] := 2",
+            "scope(27, 9) := 1",
+            "scope(26, 1) := 1",
+            "remove_object(2)",
+            "remove_object(me, flags: x)",
+            "if x { remove_object(me) }",
+            "@n0: remove_object(me) -> true: @n1",
+        ] {
+            assert_eq!(raw_builtin_body(body), None, "{body}");
+        }
+    }
 
     #[test]
     fn library_constant_names() {

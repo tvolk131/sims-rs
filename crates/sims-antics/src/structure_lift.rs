@@ -1845,7 +1845,7 @@ pub fn lift_bhav_structured_with_context(
     callee_arities: Option<&BTreeMap<u16, usize>>,
     symbols: Option<&LiftSymbols>,
 ) -> StructuredLiftOutcome {
-    lift_structured(chunk, opts, callee_arities, symbols, false)
+    lift_structured(chunk, opts, callee_arities, symbols, false, true)
 }
 
 /// [`lift_bhav_structured_with_arities`], writing each two-way `if`/`else` with the branch
@@ -1859,7 +1859,21 @@ pub fn lift_bhav_structured_in_node_order(
     opts: LiftOptions,
     callee_arities: Option<&BTreeMap<u16, usize>>,
 ) -> StructuredLiftOutcome {
-    lift_structured(chunk, opts, callee_arities, None, true)
+    lift_structured(chunk, opts, callee_arities, None, true, true)
+}
+
+/// [`lift_bhav_structured_with_arities`] (or, with `node_order`,
+/// [`lift_bhav_structured_in_node_order`]) with no joins: a tail both branches of an `if`
+/// share is copied into each, as before joins. A tree that copies no tail lifts to the
+/// same text.
+#[must_use]
+pub fn lift_bhav_structured_copying_tails(
+    chunk: &BhavChunk,
+    opts: LiftOptions,
+    callee_arities: Option<&BTreeMap<u16, usize>>,
+    node_order: bool,
+) -> StructuredLiftOutcome {
+    lift_structured(chunk, opts, callee_arities, None, node_order, false)
 }
 
 fn lift_structured(
@@ -1868,6 +1882,7 @@ fn lift_structured(
     callee_arities: Option<&BTreeMap<u16, usize>>,
     symbols: Option<&LiftSymbols>,
     node_order: bool,
+    joins: bool,
 ) -> StructuredLiftOutcome {
     let scoped = symbols.map(|s| s.for_caller(chunk.id));
     let symbols = scoped.as_deref();
@@ -2000,34 +2015,35 @@ fn lift_structured(
         node_order,
         emitted_nodes: 0,
         max_emitted_nodes: 245, // Stay safely under MAX_BHAV_NODES (251)
-        over_budget: false,
         joins: false,
         join_regions: Vec::new(),
     };
 
+    // The body with each tail both branches of an `if` share copied into each branch, and
+    // (with `joins`) with each such tail written once, after a `while true { }` the branches
+    // `break` out of. The joined body is kept only when it writes fewer nodes: a join that
+    // saves no node adds a loop for nothing.
     let header_len = emitter.out.len();
-    if emitter
-        .emit_region(0, None, None, &mut BTreeSet::new(), 1, false)
-        .is_err()
-    {
-        // A body that copies its shared tails past the budget is emitted again with each
-        // shared tail written once, after a `while true { }` the branches `break` out of.
-        if !emitter.over_budget {
-            return StructuredLiftOutcome::Unstructured;
-        }
+    let mut emit = |joins: bool| {
         emitter.out.truncate(header_len);
         emitter.emitted_nodes = 0;
-        emitter.joins = true;
-        if emitter
+        emitter.joins = joins;
+        emitter.join_regions.clear();
+        emitter
             .emit_region(0, None, None, &mut BTreeSet::new(), 1, false)
-            .is_err()
-        {
-            return StructuredLiftOutcome::Unstructured;
-        }
-    }
-
-    emitter.out.push_str("}\n");
-    StructuredLiftOutcome::Lifted(emitter.out)
+            .ok()?;
+        Some((emitter.out.clone(), emitter.emitted_nodes))
+    };
+    let copied = emit(false);
+    let joined = if joins { emit(true) } else { None };
+    let mut out = match (copied, joined) {
+        (Some(c), Some(j)) if j.1 < c.1 => j.0,
+        (Some(c), _) => c.0,
+        (None, Some(j)) => j.0,
+        (None, None) => return StructuredLiftOutcome::Unstructured,
+    };
+    out.push_str("}\n");
+    StructuredLiftOutcome::Lifted(out)
 }
 
 fn compute_dominators(n: usize, reachable: &[bool], succs: &[Vec<usize>]) -> Vec<BTreeSet<usize>> {
@@ -2267,6 +2283,12 @@ fn compute_loop_ipdoms(
 struct LoopCtx {
     header: u8,
     exit: Option<u8>,
+    /// A `while true { }` join ([`StructEmitter::shared_join`]) rather than a loop of the
+    /// tree: an `if` inside may merge at its exit, and is followed by `break;`.
+    join: bool,
+    /// The loop of the tree whose DAG post-dominators ([`compute_loop_ipdoms`]) give the
+    /// merges inside: the loop itself, or the one a join sits in.
+    dag: Option<u8>,
 }
 
 struct StructEmitter<'a> {
@@ -2280,8 +2302,6 @@ struct StructEmitter<'a> {
     node_order: bool,
     emitted_nodes: usize,
     max_emitted_nodes: usize,
-    /// Whether the last pass stopped at `max_emitted_nodes`.
-    over_budget: bool,
     /// Whether an `if`/`else` whose branches meet again before a `return` is wrapped in a
     /// `while true { }` that `break`s to the node they share ([`Self::shared_join`]).
     joins: bool,
@@ -2506,7 +2526,6 @@ impl StructEmitter<'_> {
                         if !defer_to_loop {
                             self.emitted_nodes += 1;
                             if self.emitted_nodes > self.max_emitted_nodes {
-                                self.over_budget = true;
                                 return Err(());
                             }
                             self.indent(depth);
@@ -2519,6 +2538,8 @@ impl StructEmitter<'_> {
                                 Some(LoopCtx {
                                     header: cur,
                                     exit: Some(exit_target),
+                                    join: false,
+                                    dag: Some(cur),
                                 }),
                                 active,
                                 depth + 1,
@@ -2546,6 +2567,8 @@ impl StructEmitter<'_> {
                     Some(LoopCtx {
                         header: cur,
                         exit: loop_exit,
+                        join: false,
+                        dag: Some(cur),
                     }),
                     active,
                     depth + 1,
@@ -2564,7 +2587,6 @@ impl StructEmitter<'_> {
 
             self.emitted_nodes += 1;
             if self.emitted_nodes > self.max_emitted_nodes {
-                self.over_budget = true;
                 return Err(());
             }
 
@@ -2614,7 +2636,7 @@ impl StructEmitter<'_> {
                     // Case C: General `if` / `else`, merging at loop-DAG ipdom or global ipdom.
                     let loop_merge = loop_ctx.and_then(|ctx| {
                         self.loop_ipdoms
-                            .get(&usize::from(ctx.header))
+                            .get(&usize::from(ctx.dag?))
                             .and_then(|m| m.get(&idx))
                             .copied()
                     });
@@ -2624,12 +2646,15 @@ impl StructEmitter<'_> {
                         .filter(|&m| {
                             Some(m) != stop_at
                                 && !active.contains(&m)
-                                && loop_ctx.is_none_or(|c| m != c.header && c.exit != Some(m))
-                                // Inside a join, a merge past the join is reached by `break`.
-                                && self
-                                    .join_regions
-                                    .last()
-                                    .is_none_or(|r| r.contains(&usize::from(m)))
+                                && loop_ctx.is_none_or(|c| {
+                                    m != c.header && (c.join || c.exit != Some(m))
+                                })
+                                // Inside a join, a merge past the join is reached by `break`;
+                                // a merge at the join itself is followed by one.
+                                && self.join_regions.last().is_none_or(|r| {
+                                    r.contains(&usize::from(m))
+                                        || loop_ctx.is_some_and(|c| c.join && c.exit == Some(m))
+                                })
                         });
                     let branch_stop = merge.or(stop_at);
 
@@ -2666,6 +2691,29 @@ impl StructEmitter<'_> {
                             cur = *on_true;
                             continue;
                         }
+                        // Both exit and one leaves a join: `if cond { <term> } <term>`.
+                        if let (Some(tt), Some(tf)) = (term_t, term_f)
+                            && (tt == "break;" || tf == "break;")
+                            && self.join_regions.last().is_some()
+                        {
+                            let (cond, first, second) = if self.node_order && *on_false < *on_true {
+                                (format!("!{text}"), tf, tt)
+                            } else {
+                                (text.clone(), tt, tf)
+                            };
+                            self.indent(depth);
+                            let _ = write!(self.out, "if {cond} {{");
+                            self.push_comment(comment.as_deref());
+                            self.indent(depth + 1);
+                            self.out.push_str(first);
+                            self.out.push('\n');
+                            self.indent(depth);
+                            self.out.push_str("}\n");
+                            self.indent(depth);
+                            self.out.push_str(second);
+                            self.out.push('\n');
+                            return Ok(());
+                        }
                     }
 
                     // Both branches reach a node again before they return: write that node and
@@ -2690,6 +2738,8 @@ impl StructEmitter<'_> {
                             Some(LoopCtx {
                                 header: cur,
                                 exit: Some(join),
+                                join: true,
+                                dag: loop_ctx.and_then(|c| c.dag),
                             }),
                             active,
                             depth + 1,
