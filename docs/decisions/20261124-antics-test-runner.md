@@ -268,6 +268,12 @@ synthetic fixture with its spec (global stubs and a pushed interaction) lives in
 `open-pack`'s pure-v2 rule forbids, and `**/tests/fixtures/` is ignored by git. All of them
 run from `cargo test`, through both the library and the built binary.
 
+**Update (2026-11-26, #488):** `open-pack/tests/` now holds a spec for each of the pack's
+20 objects, 148 cases in all, which pass with no `ASSUME` line; none sets `idle_main` any
+more. `every_open_pack_object_has_a_behavioral_spec` checks that every object in
+`pack.toml` has one. The counts of four specs above are as of this decision.
+`open-pack/tests/README.md` lists the spec patterns and the runner limits they work around.
+
 ## Consequences and follow-ups
 
 - **A hand-built lot.** The lot is one flat room, the Sim is a bare person with no

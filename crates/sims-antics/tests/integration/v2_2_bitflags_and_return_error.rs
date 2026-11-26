@@ -502,14 +502,20 @@ mod lint_and_lift {
             "if global[20] flag_test Expansions::Pets { self.n = 1; }",
         );
         assert!(method_suggestions(&source).is_empty(), "{source}");
-        // Nor on an object-loop handle. Since v2.3 the method form there builds the
-        // operator's bytes too (`v2_3_if_let_and_fixes`), but suggesting it on handles is
-        // left to the lint.
+        // On an object-loop handle too (v2.3 step 2): the method form there builds the
+        // operator's bytes (`v2_3_if_let_and_fixes`).
         let source = obj(
             "",
             "for o in lot.objects() { o.wall_placement flag_set WallPlacement::NoCorner; }",
         );
-        assert!(method_suggestions(&source).is_empty(), "{source}");
+        let got = method_suggestions(&source);
+        assert_eq!(
+            got,
+            ["o.wall_placement.set(WallPlacement::NoCorner)"],
+            "{source}"
+        );
+        let fixed = source.replace("o.wall_placement flag_set WallPlacement::NoCorner", &got[0]);
+        same_bytes("loop-handle fix", &source, &fixed);
     }
 
     #[test]
