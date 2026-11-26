@@ -532,6 +532,29 @@ pub(crate) fn capture(world: &mut World, id: u16) -> Result<Place, Trap> {
     })
 }
 
+/// The container [`capture`] finds for an object (0x4325b5), read
+/// without its one write: an object linked as a tile's first with nothing
+/// before it keeps its slot word.
+pub(crate) fn container(world: &World, id: u16) -> Result<Option<u16>, Trap> {
+    let mut root = id;
+    let mut seen = BTreeSet::new();
+    loop {
+        if !seen.insert(root) {
+            return Err(Trap::Invalid(format!(
+                "the objects before object {id} on its tile form a loop"
+            )));
+        }
+        if datum(world, root, data::SLOT)? != 0 {
+            break;
+        }
+        let Some(before) = registered(world, datum(world, root, data::BEFORE)?) else {
+            break;
+        };
+        root = before;
+    }
+    Ok(registered(world, datum(world, root, data::BEFORE)?))
+}
+
 /// Takes an object out of the slot or grid cell that names it.
 fn unlink(world: &mut World, id: u16) -> Result<(), Trap> {
     let old = capture_raw(world, id)?;

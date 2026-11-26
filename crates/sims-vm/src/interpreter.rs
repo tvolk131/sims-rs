@@ -226,6 +226,11 @@ pub struct Interpreter<'a> {
     /// with (0x47b006), from the lot's install
     /// ([`crate::lifecycle::LotPrices`]). None leaves the value as it was.
     pub(crate) architecture_prices: Option<&'a crate::lifecycle::LotPrices>,
+    /// The floor patterns' categories by key, which a clip's footstep
+    /// reads (0x4a1463; [`crate::footsteps`]), when given. None takes
+    /// them from [`Interpreter::architecture_prices`], which a booted lot
+    /// gives.
+    pub floor_categories: Option<&'a std::collections::BTreeMap<u16, u8>>,
 }
 
 /// One call of the original's "run this object's function" (0x422d46):
@@ -239,6 +244,13 @@ pub struct Asked {
 }
 
 impl<'a> Interpreter<'a> {
+    /// The floor patterns' categories a footstep reads
+    /// ([`Interpreter::floor_categories`]).
+    pub(crate) fn floor_categories(&self) -> Option<&'a std::collections::BTreeMap<u16, u8>> {
+        self.floor_categories
+            .or_else(|| self.architecture_prices.map(|p| p.floor_categories()))
+    }
+
     pub fn new(program: &'a Program, catalog: &'a Catalog, stream: Stream) -> Self {
         Self {
             program,
@@ -273,6 +285,7 @@ impl<'a> Interpreter<'a> {
             fast: None,
             move_objects: false,
             architecture_prices: None,
+            floor_categories: None,
         }
     }
 
@@ -441,6 +454,7 @@ impl<'a> Interpreter<'a> {
             special_panels: self.special_panels,
             inline_special_panel: self.inline_special_panel,
             in_both_ways: self.in_both_ways,
+            floor_categories: self.floor_categories(),
             global_lib: self.global_lib,
             fast: self.fast,
             active_frame: None,
@@ -605,6 +619,10 @@ pub(crate) struct Machine<'a, 'w> {
         Option<&'a (dyn crate::primitives::dialog::InlinePanelSink + 'a)>,
     /// See [`Interpreter::in_both_ways`].
     pub(crate) in_both_ways: bool,
+    /// See [`Interpreter::floor_categories`]: the table the machine's
+    /// interpreter had, so a service's nested interpreter hears the same
+    /// floors.
+    pub(crate) floor_categories: Option<&'a std::collections::BTreeMap<u16, u8>>,
     /// See [`Interpreter::global_lib`].
     pub(crate) global_lib: Option<&'a Library>,
     /// See [`Interpreter::fast`].
@@ -657,6 +675,7 @@ impl<'a> Machine<'a, '_> {
             in_both_ways: self.in_both_ways,
             move_objects: false,
             architecture_prices: None,
+            floor_categories: self.floor_categories,
             global_lib: self.global_lib,
             fast: self.fast,
         }

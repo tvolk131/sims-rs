@@ -47,6 +47,7 @@ mod daily;
 mod error;
 mod factory;
 mod fault;
+mod footsteps;
 mod forget;
 mod frame;
 mod group_factory;
