@@ -4162,8 +4162,10 @@ fn wall_order(camera: &Camera, lot: &Lot, index: usize) -> Vec<(i32, i32, Segmen
         }
     }
     corners.sort_by_key(|&c| key(c));
-    // Each run: its two ends, and its segments from the first end.
-    let mut runs: Vec<([i32; 2], [i32; 2], Vec<[i32; 3]>)> = Vec::new();
+    // Each run: its two ends, and its segments (tile and bit) from the
+    // first end.
+    type Run = ([i32; 2], [i32; 2], Vec<[i32; 3]>);
+    let mut runs: Vec<Run> = Vec::new();
     let mut covered = BTreeSet::new();
     for &start in &corners {
         let m = mask(start);

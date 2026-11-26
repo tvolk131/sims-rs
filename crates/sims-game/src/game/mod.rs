@@ -248,7 +248,7 @@ mod camera_pan_tests {
         assert_eq!(p.sample(1_063_000), ([24, -32], false));
         // The clock is in whole milliseconds.
         assert_eq!(p.sample(1_062_999), p.sample(1_062_000));
-        assert_eq!(p.sample(1_249_999).1, false);
+        assert!(!p.sample(1_249_999).1);
         assert_eq!(p.sample(1_250_000), ([99, -125], true));
         assert_eq!(p.sample(9_000_000), ([99, -125], true));
     }
