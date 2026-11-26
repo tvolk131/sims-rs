@@ -392,6 +392,12 @@ struct ObjectEnv<'a> {
     reads_global_34: bool,
     /// A finished tree's body may read global 34.
     saw_global_34: Cell<bool>,
+    /// Some tree of the object formats text, so when `text_reads` names a frame word, every
+    /// tree's frame words are observable through it ([`TreeLowerer::copy_staging`]).
+    /// `lower_object` lowers again when a finished tree sets `saw_text_tree`.
+    text_trees: bool,
+    /// A finished tree formats text.
+    saw_text_tree: Cell<bool>,
     /// Call arguments are staged as the copying form: every temp an argument reads is copied
     /// into a fresh local first, and every store is emitted in parameter order, self-stores
     /// included ([`TreeLowerer::emit_temp_moves`]). Set when a tree of the object keeps its
@@ -940,7 +946,8 @@ struct TreeLowerer<'a> {
     /// more than the four words in the call's own operands.
     keep_layout: bool,
     /// Trees this tree calls with inline arguments whose frame holds at most four arguments
-    /// (the `.air` header's `narrow_callees`, which `share_tails` and `node_order` need).
+    /// (the `.air` header's `narrow_callees`, which `share_tails`, `node_order` and
+    /// `dead_false` need).
     narrow_callees: BTreeSet<u16>,
     /// The locals an option binding copies its call's temp into (`if let Some(v) = f()`,
     /// `let Some(v) = f() else { .. };`), which the backend may read in place

@@ -65,10 +65,14 @@ pub struct TreeHeader {
     /// `node_order: [..]`: entry `i` names the compiled node (after `share_tails`) that becomes
     /// node `i` ([`crate::node_order`]).
     pub node_order: Option<Vec<u16>>,
+    /// `dead_false: error`: a statement node whose instruction always branches true
+    /// ([`crate::verify::is_always_true_instruction`]) gets `false: error` (0xFD), as the
+    /// original compiler writes it, in place of `false: next`. Branches written out stay.
+    pub dead_false_error: bool,
     /// `narrow_callees: [..]`: trees whose frame holds at most four arguments. A tree that
-    /// `share_tails` or `node_order` rewrites may call only these with inline arguments: a
-    /// callee with a wider frame reads the rest from the nodes after the call, which a rewrite
-    /// moves.
+    /// `share_tails`, `node_order` or `dead_false` rewrites may call only these with inline
+    /// arguments: a callee with a wider frame reads the rest from the nodes after the call,
+    /// which a rewrite moves or changes.
     pub narrow_callees: Vec<u16>,
 }
 
@@ -85,6 +89,7 @@ impl Default for TreeHeader {
             trailing: Vec::new(),
             share_tails: false,
             node_order: None,
+            dead_false_error: false,
             narrow_callees: Vec::new(),
         }
     }

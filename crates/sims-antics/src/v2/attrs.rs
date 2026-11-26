@@ -329,6 +329,16 @@ impl ItemAttrs {
                     .collect::<Result<Vec<u16>>>()?;
                 frame.node_order.replace(order).is_some()
             }
+            "dead_false" => {
+                if !matches!(&arg.value, AttrValue::Ident(v) if v == "error") {
+                    return Err(Error::at(
+                        arg.span,
+                        "'dead_false' takes 'error' (dead_false = error); without it, a \
+                         statement's dead false branch goes to the next node",
+                    ));
+                }
+                std::mem::replace(&mut frame.dead_false_error, true)
+            }
             other => {
                 let more = if attr == "bhav" {
                     "id, label, context, ret_temp, "
@@ -338,7 +348,7 @@ impl ItemAttrs {
                 return Err(Error::at(
                     arg.span,
                     format!(
-                        "unknown '#[{attr}(..)]' field '{other}' (expected {more}args, locals, format, revision, kind, node_order, empty, or share_tails)"
+                        "unknown '#[{attr}(..)]' field '{other}' (expected {more}args, locals, format, revision, kind, node_order, dead_false, empty, or share_tails)"
                     ),
                 ));
             }

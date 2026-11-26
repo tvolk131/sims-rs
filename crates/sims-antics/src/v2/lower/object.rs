@@ -7,7 +7,7 @@ pub(super) fn lower_object(
     resolved: &ResolvedModule,
     obj: &ObjectDecl,
 ) -> Result<ExpandedV2Object> {
-    lower_object_with(resolved, obj, None, false, false)
+    lower_object_with(resolved, obj, None, false, false, false)
 }
 
 /// The frame words the object's strings may make the formatter read (see
@@ -40,13 +40,15 @@ fn object_text_reads(
 /// [`lower_object`], finishing every tree with `text_reads` as the object's text facts (all
 /// reads, and those besides a `$Me` name's) when they are given, and otherwise with the fact the strings known before any tree is lowered give, and
 /// with `reads_global_34` as the object's global-34 fact (`ObjectEnv::reads_global_34`), staging
-/// call arguments in the copying form when `copy_staging` (`ObjectEnv::copy_staging`).
+/// call arguments in the copying form when `copy_staging` (`ObjectEnv::copy_staging`), and with
+/// `text_trees` as whether some tree formats text (`ObjectEnv::text_trees`).
 fn lower_object_with(
     resolved: &ResolvedModule,
     obj: &ObjectDecl,
     text_reads: Option<(mir::TableLocals, mir::TableLocals)>,
     reads_global_34: bool,
     copy_staging: bool,
+    text_trees: bool,
 ) -> Result<ExpandedV2Object> {
     // 1. Resolve optional `from Template`.
     let template_opt: Option<(String, TemplateDecl)> = match &obj.from_template {
@@ -989,6 +991,8 @@ fn lower_object_with(
         text_reads_besides_me,
         reads_global_34,
         saw_global_34: Cell::new(false),
+        text_trees,
+        saw_text_tree: Cell::new(false),
         copy_staging,
         saw_layout_staging: Cell::new(false),
         saw_in_place: Cell::new(false),
@@ -1666,10 +1670,15 @@ fn lower_object_with(
     let saw_global_34 = env.saw_global_34.get() && !env.reads_global_34;
     let saw_layout_staging = !env.copy_staging
         && (env.saw_layout_staging.get() || (env.saw_in_place.get() && env.saw_keep_layout.get()));
+    // And when a tree formats text, the object's text may name a frame word, and the trees were
+    // finished without that fact.
+    let saw_text_tree =
+        env.saw_text_tree.get() && !env.text_trees && mir::reads_a_word(&final_reads.0);
     if final_reads.0 != env.text_reads
         || final_reads.1 != env.text_reads_besides_me
         || saw_global_34
         || saw_layout_staging
+        || saw_text_tree
     {
         return lower_object_with(
             resolved,
@@ -1677,6 +1686,7 @@ fn lower_object_with(
             Some(final_reads),
             env.reads_global_34 || saw_global_34,
             env.copy_staging || saw_layout_staging,
+            env.text_trees || saw_text_tree,
         );
     }
 

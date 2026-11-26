@@ -89,6 +89,9 @@ impl<'a> TreeLowerer<'a> {
 
     pub(super) fn finish(mut self) -> Result<String> {
         let formats_text = self.raw_formats_text || mir::body_formats_text(self.em.text());
+        if formats_text {
+            self.env.saw_text_tree.set(true);
+        }
         // The frame words the tree's text may read: none unless it formats text.
         // A tree of an object any of whose trees may read global 34 keeps main's rule (every
         // text tree reads): dropping the entry save removes an Expression, whose scratch-pointer
