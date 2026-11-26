@@ -1144,8 +1144,14 @@ fn empty_if_calls(text: &str) -> Vec<Discard> {
         if !matches!(kind(i), Some(K::Ident(w)) if w == "if") {
             continue;
         }
-        // A statement of its own: after `{`, `}` or `;` (not `else`, not an expression).
-        if i == 0 || !matches!(tokens[i - 1].kind, K::LBrace | K::RBrace | K::Semicolon) {
+        // A statement of its own: after `{`, `}`, `;` or a `raw { }` block (one token), not
+        // after `else` or inside an expression.
+        if i == 0
+            || !matches!(
+                tokens[i - 1].kind,
+                K::LBrace | K::RBrace | K::Semicolon | K::RawBlock(_)
+            )
+        {
             continue;
         }
         let negated = kind(i + 1) == Some(&K::Bang);
@@ -8413,7 +8419,7 @@ mod tests {
 
     #[test]
     fn only_a_lone_empty_if_on_a_call_becomes_a_discard() {
-        let text = "fn f() {\n    if make() {}\n    if !a::b(1, (2)).c(x) {}\n    if temp[0] == 1 {}\n    if make() {} else {\n        temp[0] = 1;\n    }\n    if make() {\n        // kept\n    }\n    if make() {\n    } else if make() {}\n    raw {\n        if call 4301(temps) {}\n    }\n    if make()? {}\n    if make {}\n}\n";
+        let text = "fn f() {\n    if make() {}\n    if !a::b(1, (2)).c(x) {}\n    if temp[0] == 1 {}\n    if make() {} else {\n        temp[0] = 1;\n    }\n    if make() {\n        // kept\n    }\n    if make() {\n    } else if make() {}\n    raw {\n        if call 4301(temps) {}\n    }\n    if after_raw() {}\n    if make()? {}\n    if make {}\n}\n";
         let found: Vec<String> = empty_if_calls(text)
             .into_iter()
             .map(|d| format!("{} => {}", &text[d.range], d.text))
@@ -8422,7 +8428,8 @@ mod tests {
             found,
             [
                 "if make() {} => let _ = make();",
-                "if !a::b(1, (2)).c(x) {} => let _ = a::b(1, (2)).c(x);"
+                "if !a::b(1, (2)).c(x) {} => let _ = a::b(1, (2)).c(x);",
+                "if after_raw() {} => let _ = after_raw();"
             ]
         );
     }
