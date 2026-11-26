@@ -1062,3 +1062,55 @@ fn prefer_if_let_skips_names_the_region_declares_and_keeps_comments() {
         &fixed,
     );
 }
+
+// --- v2.4 step 3: `dead_false = error` trees (#498) -------------------------------------------
+// The lint reads `#[bhav(..)]` headers through the parser's own field table, which lists
+// `dead_false`; its trial builds compile the header as written. These pin that.
+
+/// `source` with `dead_false = error` in its probe tree's header.
+fn dead_false(source: &str) -> String {
+    let marked = source.replacen(
+        "#[bhav(label = \"Probe\")]",
+        "#[bhav(label = \"Probe\", dead_false = error)]",
+        1,
+    );
+    assert_ne!(marked, source, "no probe header in\n{source}");
+    marked
+}
+
+#[test]
+fn a_dead_false_tree_keeps_its_byte_checked_rewrites() {
+    // `self.data[16] = 1;` always branches true: the header changes its false target.
+    let plain = tree("", "", "        self.data[16] = 1;");
+    let source = dead_false(&plain);
+    assert_ne!(
+        iff(&plain),
+        iff(&source),
+        "dead_false must change the build"
+    );
+    let fixed = rewrites(
+        &source,
+        "untyped_engine_field",
+        "self.data[16]",
+        "self.light_mode",
+    );
+    assert!(fixed.contains("dead_false = error"), "{fixed}");
+    none(&fixed, "untyped_engine_field");
+    // `prefer_if_let`, checked against the flagged build.
+    let source = dead_false(&tree(
+        "use std::globals::*;\n",
+        "",
+        "        if globals::find_companion() {\n            stack_obj = temp[0];\n        }",
+    ));
+    let fixed = dead_false(&tree(
+        "use std::globals::*;\n",
+        "",
+        "        if let Some(companion) = globals::find_companion() {\n            stack_obj = companion;\n        }",
+    ));
+    if_let_rewrite(
+        &source,
+        "if globals::",
+        "if let Some(companion) = globals::find_companion() {",
+        &fixed,
+    );
+}

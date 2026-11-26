@@ -4079,7 +4079,7 @@ through their public interfaces only; the simulation never depends on it.
       (`dead_false = error`, per statement or as a tree's default), so
       `NodePin` can match most of the 9,669 census trees with the
       original's CFG, and possibly many of the 3,949 `share_tails` ones
-      (building).
+      (closed in Batch 24, #498 and #499).
     - Track 8: the in-place option alias misses trees of the kept shape
       depending on root and header (`me` without a fixed header,
       `stack_obj`, `if let` on `me`): 62 behavioral `prefer_if_let`
@@ -4093,7 +4093,8 @@ through their public interfaces only; the simulation never depends on it.
     - Track 7: `untyped_engine_field` checks every state of the file on
       `self` and on handles, which is coarser than needed; scope it to
       each receiver's own states.
-    - Track 9: write `data[16]` as `light_mode` (48 behavioral lint
+    - Track 9 (`light_mode` and the semi-global links done in Batch 24,
+      #499): write `data[16]` as `light_mode` (48 behavioral lint
       findings until then), emit `semi_global` / `extern "Lib" mod`,
       lift strict `if let`, rebaseline for the 334/425 names; the 179
       renumbered trees no pin reaches and the 560 unstructurable ones;
@@ -4101,6 +4102,108 @@ through their public interfaces only; the simulation never depends on it.
     - Track 7: `collapsible_if_chain` 2 → 4 in behavioral mode, on trees
       #496 made idiomatic.
     - `#382 -> bool` in `std::globals`, joint Track 8 and Track 9.
+- **Done (Batch 24 — `.antics` v2.4 finale: dead false targets and the
+  strict lift leap, #498, #499 and Track 7's v2.4 Step 3):**
+  - **The `.antics` v2 compiler (Track 8, #498,
+    `docs/decisions/20261126-antics-v2-4-dead-false-error.md`):**
+    - `#[bhav(.., dead_false = error)]` (and `dead_false: error` in an
+      `.air` header): a statement that cannot fail gets `false: error`,
+      as the original compiler writes it, not `false: next`. The flag is
+      opt-in, so it changes no existing source's bytes; it takes the same
+      fail-closed wide-call checks as `share_tails` and `node_order`.
+    - Census of the original: 99.87% of always-true nodes write
+      `false: error`, and 21,601 of 21,797 trees (99.1%) write every one
+      that way, so a tree-level flag is enough.
+    - Pin helpers for the lift: `match_tree_pin` (predicts `dead_false`,
+      `share_tails` and the node order from the bytes),
+      `match_tree_pin_compiled` and `TreePin::bhav_fields()`.
+    - In-place call staging now keeps the copying form when any tree of
+      the object formats text that may name frame words (`$Local:N`),
+      as #495's alias does. So an unflagged `locals = 0` tree whose call
+      then needs copies is refused when a sibling formats such text
+      ("declares 0 locals but requires at least 2"); neither open-pack
+      nor the lifted corpus has one.
+  - **Lift (Track 9, #499,
+    `docs/decisions/20261126-antics-v2-4-lift-dead-false-and-v24-features.md`):**
+    - Node pins come from `match_tree_pin`, so they include
+      `dead_false = error`; 11,677 strict raw-fallback trees became v2
+      code.
+    - The lift writes `semi_global: "Name";` and
+      `extern "Name" mod semi_globals`; semi-global trees not known to be
+      narrow go in an untagged `semi_globals_wide` block (15 trees in 10
+      files). Of the 476 files whose `GLOB` did not round-trip, 475 now
+      link the same name (231 byte-identical, 244 in the other byte
+      form); 1 has an empty name `semi_global:` cannot write.
+      Inconclusive verdicts fall from 20,684 to 18,661 in both modes.
+    - New spellings, each byte-gated: neighbour cells (scopes 24 and
+      32), padded `play_sound`, literal `if` chains on one operand as
+      `match`, and `data[16]` as `light_mode`.
+    - Results (1,191 objects, 26,206 trees; 0 DIFFERENT, 0 errors or
+      timeouts, 0 `fmt --check` dirty files in both modes):
+
+      | | v2.3 | v2.4 step 1 | v2.4 final |
+      |---|---|---|---|
+      | strict idiomatic | 9,523 (36.3%) | 9,567 (36.5%) | **21,244 (81.1%)** |
+      | strict raw-fallback | 16,682 | 16,638 | 4,961 |
+      | strict identical / equivalent | 1,113 / 4,408 | 1,116 / 4,405 | **4,234 / 3,310** |
+      | strict lint | 14 | 12 | 26 |
+      | behavioral idiomatic | 25,308 (96.6%) | 25,580 (97.6%) | **25,590 (97.6%)** |
+      | behavioral identical / equivalent | 870 / 4,651 | 889 / 4,632 | **1,143 / 6,401** |
+      | behavioral lint | 347 | 86 | 9 |
+
+      Behavioral `untyped_engine_field` fell from 48 to 0 and
+      `duplicate_std_global` from 8 to 0; the five style rules stay at 0.
+      Strict inline raw lines rise (7,662 → 100,604) because the newly
+      idiomatic trees bring their raw blocks with them.
+  - **Lint (Track 7, v2.4 Step 3):**
+    - `dead_false` audit: the only table of known header fields is the
+      parser's (`v2/attrs.rs`, and the `.air` parser), which #498 already
+      extended; the formatter works on tokens and the lint reads headers
+      through the parser. The one stale list, the rustdoc of
+      `TreeMemberDecl::frame` in `v2/ast.rs`, now names every pin. A
+      lint test pins that byte-checked rewrites (`untyped_engine_field`,
+      `prefer_if_let`) still fire, and stay byte-identical, in a
+      `dead_false = error` tree.
+    - Corpus check on `lift-v2-4-final-{beh,strict}` (1,191 files each,
+      no lint errors): exactly #499's numbers. Behavioral 9
+      (`prefer_if_let` 6, `manual_raw_has_builtin` 2,
+      `collapsible_if_chain` 1), strict 26
+      (`manual_raw_has_builtin` 25, `frame_headroom` 1);
+      `untyped_engine_field`, `duplicate_std_global` and the style rules
+      at 0.
+    - `prefer_if_let`: of 139 behavioral proposals, the trial build keeps
+      6. Applied together, they build byte-identical FARs, pass
+      `fmt --check` and leave no finding. On
+      the strict corpus, 118 proposals (105 negated guards, 13 positive
+      `if`s) reach the trial build and none is reported: no false
+      positives on the newly idiomatic trees. Every one sits in a tree
+      with a fixed `locals = N` header (92 also carry `node_order` and
+      `dead_false` pins). The trial refuses them for other bytes or,
+      where the binding needs a local the header does not declare, a
+      build error.
+  - **Follow-ups:**
+    - Track 8: a keep-layout attribute, so the 25 strict
+      `manual_raw_has_builtin` layout anchors (the last `scope` / `pad` /
+      `local` raw block of a tree, which keeps the optimizer off) can be
+      written as v2.
+    - Track 9: the 6 behavioral `prefer_if_let` sites are free (a plain
+      store into a local, folded by `forward_copies`; byte-identical when
+      the lint's rewrite is applied), so the lift's `if let` pass, not
+      lowering, is what misses them.
+    - Track 8: an `Option` binding with no frame word where the value is
+      read later (in `let .. else` and `if let`) would serve some of the
+      118 strict and 133 dropped behavioral proposals. A binding read in
+      place needs no local, even under `locals = 0`; only a rewrite that
+      still copies the value into a local needs a free one in a strict
+      tree's fixed `locals = N` frame.
+    - Track 8: the 62 option-alias shapes that miss by root and header
+      (Batch 23), and refusing `use .. as self;`.
+    - Frame-width declarations for the 15 `semi_globals_wide` trees (10
+      files), and links for the 27 files that call semi-globals without a
+      `GLOB` chunk.
+    - Not needed yet: a per-node dead-false marker for the 196 mixed
+      trees. The one behavioral `collapsible_if_chain` whose `match`
+      fails the byte gate stays.
 - **Next (in flight, in order of player impact):**
   - **Travel follow-ups:**
     - A hop that leaves travelers behind (Go Somewhere Else for one
@@ -4133,20 +4236,24 @@ through their public interfaces only; the simulation never depends on it.
     - whether the co-op executor should refuse a peer's pick on an
       object parked off the lot (#458).
   - **The `.antics` v2 toolchain:**
-    - Dead false targets (Track 8, building): the original compiler
-      writes `false: error` for statements that cannot fail, v2 writes
-      `false: next`. A `dead_false = error` spelling would let the lift's
-      node pins (#493) reach most of the 9,669 strict trees #496's census
-      matched, and possibly many of 3,949 more; the strict lift is at
-      36.5% idiomatic.
+    - Strict lift at 81.1% idiomatic (#499, with #498's
+      `dead_false = error`). Of what is left, the 25 strict
+      `manual_raw_has_builtin` layout anchors need a keep-layout
+      attribute (Track 8); a per-node dead-false marker for the 196
+      mixed trees is not needed yet.
     - Shared tails: the lift writes `share_tails` (#493) and its own
       joins (#496). A partial-sharing mode is open, since the original
       shares only some tails.
     - Semi-global calls: v2 has the `GLOB` link and `extern "Lib" mod`
-      (#495); the lift emitting them is Track 9's.
+      (#495), and the lift writes them (#499). Open: a way to declare a
+      semi-global tree's frame width (the 15 `semi_globals_wide` trees),
+      and the 27 files that call semi-globals with no `GLOB` chunk.
     - Option bindings read in place (#495) miss some trees of the plain
       shape (`me` without a fixed header, `stack_obj`); 62 behavioral
-      `prefer_if_let` proposals wait on it (Batch 23).
+      `prefer_if_let` proposals wait on it (Batch 23). A `let .. else`
+      with no frame word where the value is read later is open too; the
+      6 behavioral findings left are already free, for the lift to take
+      (Batch 24).
     - Raw-block `if` tails: a raw `if` whose arms may end alike now
       keeps its layout (#489). The 2 strict alarm trees #473 left
       non-idiomatic need a re-lift to confirm.
