@@ -110,8 +110,10 @@ their own: two joined lifts can be one text where the copied ones are two.
   - in the `.v2` build-error chain, before the line-level fallback;
   - in `air_fallback`, before `lower_tree`.
 
-  It restores the tree's extra idioms (`retry_extras`) and gives each branch order another
-  try.
+  It restores the tree's extra idioms (`retry_extras`). In the unproven chain, strict mode
+  then gives the other branch order another try (`other_order`). The build-error chains
+  try only the first order, as they always have for `other_order`. A build error comes
+  from a statement, which both orders write.
 
 **Why a fallback.** Without it, 13 strict trees regressed: a join builds nodes in an order
 that the original does not run. With it, no object loses an idiomatic or proven tree.
@@ -184,6 +186,27 @@ Identical.
 `error`: per statement, or per tree as the original compiler's default. With that, the lift
 can write what the original holds, and most of the 9,818 + 4,467 trees could pin.
 
+## Decision 5: review rounds
+
+Codex reviewed two rounds.
+
+- **Round 1.**
+  - **Both copied branch orders are made on their own.** `copied_tails` used to make the
+    second copied order only when the joined lift had two orders, so a tree could go raw
+    without trying the copied order that runs the true branch first.
+  - **Raw statements left in the report after polish.** `DecompiledTree::raw_statements`
+    still counted raw statements that the polish had written as builtins. `polish` now
+    returns, per tree, the statements it took out of raw blocks. `tree_id_before`
+    attributes each rewrite to the last tree header before it, and the report subtracts
+    them. Behavioral inline raw statements: 12,597 before the fix, 12,323 after.
+- **Round 2.**
+  - **Build errors try the first branch order only.** That is qualified in Decision 3
+    rather than changed.
+  - **`merge_arms` double count.** A pre-existing overcount of raw statements shared by
+    both arms (`merge_arms`, #471) is left as a follow-up.
+  - **Stale count.** The strict raw count in this ADR is updated.
+  - **Checked and clean:** join targeting, nested loops, negation and the node budget.
+
 ## Results
 
 The base install: 1,191 objects, 26,206 trees. Before is `lift-v2-3-*`, after is
@@ -195,9 +218,9 @@ The base install: 1,191 objects, 26,206 trees. Before is `lift-v2-3-*`, after is
 | identical / equivalent | 870 / 4,651 | 889 / 4,632 | 1,113 / 4,408 | 1,116 / 4,405 |
 | raw-fallback trees | 897 | 625 | 16,682 | 16,638 |
 | zero-raw objects | 264 | 267 | 56 | 56 |
-| inline raw statements | 13,347 | 12,597 | 3,441 | 3,519 |
+| inline raw statements | 13,347 | 12,323 | 3,441 | 3,517 |
 | inline raw lines | 76,439 | 57,515 | 8,017 | 7,662 |
-| total lines | 936,369 | 912,812 | 965,908 | 966,192 |
+| total lines | 936,369 | 912,746 | 965,908 | 966,192 |
 | `node_order` / `share_tails` pins | 0 / 44 | 0 / 20 | 938 / 297 | 988 / 32 |
 | lint `manual_raw_has_builtin` | 268 | 2 | 3 | 1 |
 | lint `frame_headroom` | 2 | 2 | 3 | 3 |
@@ -220,13 +243,13 @@ Invariants, both modes:
 The 3 files that grow most without a new idiomatic tree (+97 lines each) share one
 tree. Its joined text now proves with a `share_tails` pin, so the copied text that v2.3
 proved, which is shorter in the final branch order, is never tried. The lift does not
-compare lines across branch orders. Strict inline raw statements rise by 78, but inline raw lines
+compare lines across branch orders. Strict inline raw statements rise by 76, but inline raw lines
 fall by 355: the new idiomatic trees bring small raw blocks.
 
-**Behavioral:** 272 more idiomatic trees, 23,557 fewer lines, and 18,924 fewer inline raw
-lines. The raw statements of 106 files rise: a raw tree that becomes idiomatic brings its
+**Behavioral:** 272 more idiomatic trees, 23,623 fewer lines, and 18,924 fewer inline raw
+lines. The raw statements of 104 files rise: a raw tree that becomes idiomatic brings its
 raw blocks along. For example, one object goes from 1 raw tree to 0 and from 1 inline
-statement to 95.
+statement to 91.
 
 Sweeps take 111 to 150 s per mode across runs, against 104 to 136 s before. The machine was
 loaded during these runs. The lift now structures each tree both ways (joined and copied),
@@ -241,4 +264,9 @@ twice more for its other tail spelling.
 - **Track 8 (lowering):** the dead-false spelling in Decision 4.
 - **Follow-ups:**
   - the 179 renumbered trees with the original's CFG and operands, which no pin reaches yet;
-  - the 560 unstructurable trees.
+  - the 560 unstructurable trees;
+  - `DecompiledTree::raw_statements` counts the raw statements the lifter wrote, minus those
+    the polish writes as builtins (review round 1). It still counts twice a raw statement
+    that both arms of an `if` share and that `merge_arms` (#471) writes once after it.
+    Counting from the final tree bodies would fix that, but it changes what the sweeps
+    have measured since v2.1.
