@@ -1,0 +1,57 @@
+# Live sims-vm unit tests for the Open Hearth Stove's `cook` functional (the fridge's cooking
+# chain runs it on the stove as the stack object).
+#
+# The runner makes objects off the lot's tile grid, so the stove has no tile in front of it to
+# serve a plate on and `cook` fails after the sizzle. Serving placed plates, with nutrition scaled
+# by Cooking, is `tests/integration/open_pack_behavioral.rs`'s cooking chain test.
+#
+# `cook` runs on the Sim's thread in the chain: the cooking cases run as the Sim, with a running
+# action's priority. A Sim whose action is cancelled (priority 0) while the pan is on serves
+# nothing; off the grid that looks the same as the failed placement, so the cancel (and the
+# fridge's refund) is checked by the placed cooking chain test too.
+#
+# A cook holds the stove (`occupied`) from the sizzle until it serves or fails, so a second Sim's
+# chain finds it taken; the placed two-cook test runs that contention.
+
+[subject]
+antics = "../objects/open-stove.antics"
+pack = ".."
+
+[lot]
+also = ["../objects/open-meal-plate.antics"]
+
+[[test]]
+name = "a free stove can cook"
+tree = "Can_Cook"
+stack_obj = "object"
+params = [0, 0, 0, 0]
+expect = { result = true }
+
+[[test]]
+name = "a stove another Sim is cooking on cannot"
+tree = "Can_Cook"
+stack_obj = "object"
+params = [0, 0, 0, 0]
+given = { attrs = { occupied = 1 } }
+expect = { result = false }
+
+[[test]]
+name = "cooking takes time"
+tree = "Functional_Cook"
+me = "sim"
+stack_obj = "object"
+params = [0, 0, 0, 10]
+turns = 1
+given = { sim = { priority = 50 } }
+expect = { result = "yield", attrs = { meals_cooked = 0, occupied = 1 }, sounds = ["open_stove_sizzle"] }
+
+[[test]]
+name = "a stove with no tile in front of it serves no plate"
+tree = "Functional_Cook"
+me = "sim"
+stack_obj = "object"
+params = [600, 0, 0, 10]
+turns = 8
+given = { sim = { priority = 50 } }
+expect = { result = false, attrs = { meals_cooked = 0, occupied = 0 }, sounds = ["open_stove_sizzle"] }
+

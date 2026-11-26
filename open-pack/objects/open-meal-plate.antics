@@ -12,6 +12,7 @@ object "Open Meal Plate" {
 
     state nutrition: i16 = default_nutrition;
     state is_full: bool = true;
+    state occupied: bool = false;
 
     sound eat_sfx = preset("chime", wav: "open_plate_eat");
     sound dispose_sfx = preset("ui_click", wav: "open_plate_dispose");
@@ -31,15 +32,23 @@ object "Open Meal Plate" {
     interaction "Eat Meal" {
         autonomy: 40,
         advertises: [hunger +70],
+        lock: self.occupied,
         guard(sim) => self.is_full,
         run(sim) {
+            // Each bite takes its share off the plate, so a cancelled meal leaves the rest on a
+            // plate that is still there to finish.
             let per_bite = self.nutrition / bites;
-            let remainder = self.nutrition % bites;
-            repeat bites {
+            let mut eaten: i16 = 0;
+            while eaten < bites cancel_on_abort {
                 sleep(bite_ticks);
                 sim.motive.hunger += per_bite;
+                self.nutrition -= per_bite;
+                eaten += 1;
             }
-            sim.motive.hunger += remainder;
+            if eaten < bites {
+                return false;
+            }
+            sim.motive.hunger += self.nutrition;
             play_sound(eat_sfx);
 
             self.is_full = false;

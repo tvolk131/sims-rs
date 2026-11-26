@@ -1,0 +1,38 @@
+# Live sims-vm unit tests for the Open Dining Chair: the Comfort guard, the occupancy lock, and
+# the cancel-safe sitting loop (three cycles of 18 Comfort).
+
+[subject]
+antics = "../objects/open-dining-chair.antics"
+pack = ".."
+
+[sim]
+motives = { comfort = 0 }
+
+[[test]]
+name = "the chair is offered below 95 Comfort"
+guard = "Sit"
+given = { sim = { motives = { comfort = 94 } } }
+expect = { result = true }
+
+[[test]]
+name = "the chair is not offered at 95 Comfort"
+guard = "Sit"
+given = { sim = { motives = { comfort = 95 } } }
+expect = { result = false }
+
+[[test]]
+name = "sitting restores 54 Comfort"
+interaction = "Sit"
+expect = { attrs = { occupied = 0 }, sim = { motives = { comfort = 54 } }, sounds = ["open_chair_creak"] }
+
+[[test]]
+name = "sitting stops at full Comfort"
+interaction = "Sit"
+given = { sim = { motives = { comfort = 80 } } }
+expect = { sim = { motives = { comfort = 100 } }, turns = 5 }
+
+[[test]]
+name = "an occupied chair is not offered"
+interaction = "Sit"
+given = { attrs = { occupied = 1 } }
+expect = { result = "unavailable", sounds = [] }

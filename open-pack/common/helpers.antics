@@ -1,6 +1,7 @@
 // Shared clean-room behavioral helpers for `open-pack/`. The motive and repair loops delegate to
 // the built-in `std::motives`.
 
+use std::math::min;
 use std::motives::repair_by_progress as std_repair_by_progress;
 use std::motives::restore_motive_tracked as std_restore_motive_tracked;
 use std::motives::restore_two_motives_tracked as std_restore_two_motives_tracked;
@@ -103,6 +104,14 @@ pub fn restore_two_motives_loop(
     completed
 }
 
+/// Raises `sim`'s `skill` by `amount`, never past `max` (a skill runs from 0 to 1000). A skill
+/// already at or past `max` is left alone, so the sum never overflows.
+pub fn gain_skill(sim: Sim, skill: Skill, amount: i16, max: i16 = 1000) {
+    if sim.skill[skill] < max {
+        sim.skill[skill] = min(sim.skill[skill] + amount, max);
+    }
+}
+
 /// Sets a boolean toggle/power/lock state and plays the associated object sound.
 pub fn set_toggle_state(flag: &mut bool, enabled: bool, sfx: Sound) {
     *flag = enabled;
@@ -117,7 +126,7 @@ pub fn record_fixture_wear(wear: &mut i16, broken: &mut bool, threshold: i16) ->
         *broken = true;
         return true;
     }
-    return false;
+    false
 }
 
 /// Cancel-safe Mechanical-skill-scaled repair loop (`std::motives::repair_by_progress`).
@@ -148,5 +157,5 @@ pub fn run_timed_cycles(target_cycles: i16, ticks: i16 = 2) -> bool {
         sleep(ticks);
         cycles += 1;
     }
-    return cycles >= target_cycles;
+    cycles >= target_cycles
 }

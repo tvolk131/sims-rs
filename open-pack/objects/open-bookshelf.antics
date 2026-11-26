@@ -1,6 +1,6 @@
 // Open Timber Bookshelf (0x7F00_0053) — Fun reading + Cooking & Mechanical skill study.
 
-use crate::common::helpers::restore_motive_loop;
+use crate::common::helpers::{gain_skill, restore_motive_loop};
 
 object "Open Timber Bookshelf" {
     guid: 0x7F00_0053;
@@ -30,9 +30,7 @@ object "Open Timber Bookshelf" {
         let mut cycles: i16 = 0;
         repeat study_cycles cancel_on_abort {
             sleep(read_ticks);
-            if sim.skill[skill] < max_skill {
-                sim.skill[skill] += study_skill_step;
-            }
+            gain_skill(sim, skill, study_skill_step, max: max_skill);
             sim.motive.fun += study_fun_step;
             cycles += 1;
         }

@@ -1,6 +1,8 @@
-// Open Floor Lamp (0x7F00_0070) — toggleable warm lighting with off/on graphics and Room boost.
+// Open Floor Lamp (0x7F00_0070) — toggleable warm lighting with off/on graphics; a lit lamp
+// raises its room's score (and so the Room of everyone in it) through its room impact.
 
 use crate::templates::toggle::ToggleablePower;
+use std::engine::RefreshMode;
 
 object "Open Floor Lamp" from ToggleablePower {
     guid: 0x7F00_0070;
@@ -13,20 +15,29 @@ object "Open Floor Lamp" from ToggleablePower {
     ];
 
     initial_power: true;
-    param room_boost: i16 = 35;
-    param enjoy_ticks: i16 = 1;
+    /// The room impact (object data word 7) while lit: the room score counts it.
+    param lit_room_impact: i16 = 5;
 
     sound switch_click = preset("ui_click", wav: "open_lamp_switch");
 
     slot front = routing([0.0, -0.65, 0.0]);
 
+    init {
+        if self.power {
+            self.room_impact = lit_room_impact;
+        }
+    }
+
     fn on_power_changed(sim: Sim, on: bool) {
         if on {
             set_graphic(0);
-            sim.motive.room += room_boost;
+            self.room_impact = lit_room_impact;
         } else {
             set_graphic(1);
+            self.room_impact = 0;
         }
+        // The room keeps its score until it is recounted.
+        self.refresh(RefreshMode::RecountRoom);
     }
 
     interaction "Turn On Light" {
@@ -43,17 +54,6 @@ object "Open Floor Lamp" from ToggleablePower {
         guard(sim) => self.power,
         run(sim) {
             apply_power(sim, false);
-        }
-    }
-
-    interaction "Enjoy Warm Light" {
-        autonomy: 30,
-        advertises: [room +45],
-        lock: self.occupied,
-        guard(sim) => self.power,
-        run(sim) {
-            sleep(enjoy_ticks);
-            sim.motive.room += room_boost;
         }
     }
 }

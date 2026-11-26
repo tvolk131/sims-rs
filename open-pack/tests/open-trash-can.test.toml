@@ -1,0 +1,62 @@
+# Live sims-vm unit tests for the Open Pedal Trash Can: dispose up to a full can, the emptying
+# loop down to zero, and the room impact (data word 7) of -1 a bag, which the room score adds for
+# the room the can stands in. The runner's objects stand in no room, so the specs check the word.
+
+[subject]
+antics = "../objects/open-trash-can.antics"
+pack = ".."
+
+[sim]
+
+[[test]]
+name = "a new can holds one bag"
+tree = "Init"
+expect = { result = true, attrs = { trash_count = 1, times_emptied = 0 }, data = { 7 = -1 } }
+
+[[test]]
+name = "Dispose Trash is offered below five bags"
+guard = "Dispose Trash"
+given = { attrs = { trash_count = 4 } }
+expect = { result = true }
+
+[[test]]
+name = "Dispose Trash is not offered on a full can"
+guard = "Dispose Trash"
+given = { attrs = { trash_count = 5 } }
+expect = { result = false }
+
+[[test]]
+name = "disposing adds a bag"
+interaction = "Dispose Trash"
+given = { data = { 7 = -1 } }
+expect = { attrs = { trash_count = 2, occupied = 0 }, data = { 7 = -2 }, sounds = ["open_trash_lid"] }
+
+[[test]]
+name = "Empty Trash is not offered on an empty can"
+guard = "Empty Trash"
+given = { attrs = { trash_count = 0 } }
+expect = { result = false }
+
+[[test]]
+name = "emptying takes every bag out and counts the trip"
+interaction = "Empty Trash"
+given = { attrs = { trash_count = 4 }, data = { 7 = -4 } }
+expect = { attrs = { trash_count = 0, times_emptied = 1, occupied = 0 }, data = { 7 = 0 }, sounds = ["open_trash_lid", "open_trash_lid"] }
+
+# Emptying runs as the Sim's thread with a running action's priority: its loop stops at once
+# when the action's priority drops to 0 (cancelled), as it is for a Sim with no action.
+[[test]]
+name = "each bag taken out lifts the room impact"
+action = "Empty Trash"
+me = "sim"
+turns = 2
+given = { attrs = { trash_count = 3 }, data = { 7 = -3 }, sim = { priority = 50 } }
+expect = { result = "yield", attrs = { trash_count = 2, times_emptied = 0 }, data = { 7 = -2 } }
+
+[[test]]
+name = "a cancelled empty stops before the first bag"
+action = "Empty Trash"
+me = "sim"
+turns = 8
+given = { attrs = { trash_count = 3 }, data = { 7 = -3 }, sim = { priority = 0 } }
+expect = { result = true, attrs = { trash_count = 3, times_emptied = 0 }, data = { 7 = -3 }, sounds = ["open_trash_lid"] }

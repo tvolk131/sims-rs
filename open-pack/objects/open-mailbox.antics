@@ -1,16 +1,21 @@
-// Open Street Mailbox (0x7F00_0090) — daily household bills with budget debit & lock safety.
+// Open Street Mailbox (0x7F00_0090) — household bills with budget debit & lock safety (checking
+// the mail brings a new bill whenever none is waiting);
+// unpaid bills lower the lot's score through the mailbox's room impact.
+
+use std::engine::RefreshMode;
 
 object "Open Street Mailbox" {
     guid: 0x7F00_0090;
     price: 50;
     category: misc;
-    description: "A clean-room curbside mailbox for receiving and paying daily household bills via alter_budget.";
+    description: "A clean-room curbside mailbox for receiving and paying household bills via alter_budget.";
     sprite: Sprite::procedural("mailbox", primary: #486C94, accent: #D0403A, trim: #765638);
 
     param initial_bills: i16 = 1;
     param bill_amount: i16 = 75;
     param pay_ticks: i16 = 1;
-    param paid_room_gain: i16 = 20;
+    /// The room impact (object data word 7) while any bill is unpaid: the room score counts it.
+    param unpaid_room_impact: i16 = -4;
     param check_fun_gain: i16 = 8;
 
     state occupied: bool = false;
@@ -21,6 +26,23 @@ object "Open Street Mailbox" {
     sound paid_chime = preset("chime", wav: "open_bills_paid");
 
     slot front = routing([0.0, -0.75, 0.0]);
+
+    init {
+        if self.unpaid_bills > 0 {
+            self.room_impact = unpaid_room_impact;
+        }
+    }
+
+    /// Sets the room impact for the unpaid bills and has the room recounted (a room keeps its
+    /// score until then).
+    fn update_room_impact() {
+        if self.unpaid_bills > 0 {
+            self.room_impact = unpaid_room_impact;
+        } else {
+            self.room_impact = 0;
+        }
+        self.refresh(RefreshMode::RecountRoom);
+    }
 
     interaction "Pay Bills" {
         autonomy: 70,
@@ -38,7 +60,7 @@ object "Open Street Mailbox" {
             }
             self.unpaid_bills -= 1;
             self.paid_bills += 1;
-            sim.motive.room += paid_room_gain;
+            update_room_impact();
             play_sound(paid_chime);
         }
     }
@@ -51,6 +73,7 @@ object "Open Street Mailbox" {
             play_sound(latch);
             if self.unpaid_bills == 0 {
                 self.unpaid_bills = 1;
+                update_room_impact();
             }
             sim.motive.fun += check_fun_gain;
         }

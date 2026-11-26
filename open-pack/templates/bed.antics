@@ -15,7 +15,7 @@ pub template BedBase {
     sound settle = preset("soft_thud");
 
     fn run_sleep_loop(sim: Sim) -> i16 {
-        return restore_two_motives_loop(
+        restore_two_motives_loop(
             sim,
             Motive::Energy,
             energy_step,
@@ -24,7 +24,7 @@ pub template BedBase {
             cycles: sleep_cycles,
             ticks: sleep_ticks,
             primary_cap: wake_energy,
-        );
+        )
     }
 
     fn run_sleep_loop_tracked(sim: Sim, completed: &mut i16) {

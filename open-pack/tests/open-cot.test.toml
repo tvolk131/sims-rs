@@ -1,0 +1,38 @@
+# Live sims-vm unit tests for the Open Camp Cot: the Energy guard, the occupancy lock, and the
+# nap loop (three cycles of 20 Energy and 5 Comfort).
+
+[subject]
+antics = "../objects/open-cot.antics"
+pack = ".."
+
+[sim]
+motives = { energy = 0, comfort = 0 }
+
+[[test]]
+name = "the cot is offered below 80 Energy"
+guard = "Take a Nap"
+given = { sim = { motives = { energy = 79 } } }
+expect = { result = true }
+
+[[test]]
+name = "the cot is not offered at 80 Energy"
+guard = "Take a Nap"
+given = { sim = { motives = { energy = 80 } } }
+expect = { result = false }
+
+[[test]]
+name = "an occupied cot is not offered"
+guard = "Take a Nap"
+given = { attrs = { occupied = 1 } }
+expect = { result = false }
+
+[[test]]
+name = "a nap restores Energy and some Comfort"
+interaction = "Take a Nap"
+expect = { attrs = { occupied = 0 }, sim = { motives = { energy = 60, comfort = 15 } }, sounds = ["open_cot_settle"] }
+
+[[test]]
+name = "a nap runs all three cycles even as Energy fills"
+interaction = "Take a Nap"
+given = { sim = { motives = { energy = 70 } } }
+expect = { sim = { motives = { energy = 100, comfort = 15 } } }

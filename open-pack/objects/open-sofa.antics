@@ -29,6 +29,7 @@ object "Open Plush Sofa" from SeatBase {
         autonomy: 55,
         advertises: [comfort +65],
         lock: self.occupied,
+        guard(sim) => sim.motive.comfort < max_entry_comfort,
         run(sim) {
             play_sound(creak);
             sit_comfort_loop(sim);

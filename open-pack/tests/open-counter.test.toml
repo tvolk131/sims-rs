@@ -1,0 +1,32 @@
+# Live sims-vm unit tests for the Open Oak Counter: its `prep` functional (the fridge's cooking
+# chain runs it on the counter as the stack object) and the occupancy check.
+
+[subject]
+antics = "../objects/open-counter.antics"
+pack = ".."
+
+[[test]]
+name = "a free counter can prep"
+tree = "Can_Prep"
+stack_obj = "object"
+expect = { result = true }
+
+[[test]]
+name = "an occupied counter cannot"
+tree = "Can_Prep"
+stack_obj = "object"
+given = { attrs = { occupied = 1 } }
+expect = { result = false }
+
+[[test]]
+name = "prepping returns the nutrition bonus and counts the meal"
+tree = "Functional_Prep"
+stack_obj = "object"
+expect = { result = true, temps = { 0 = 10 }, attrs = { meals_prepped = 1 }, sounds = ["open_counter_chop"] }
+
+[[test]]
+name = "prepped meals accumulate"
+tree = "Functional_Prep"
+stack_obj = "object"
+given = { attrs = { meals_prepped = 7 } }
+expect = { result = true, attrs = { meals_prepped = 8 } }

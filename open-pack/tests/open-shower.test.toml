@@ -46,3 +46,9 @@ name = "a skilled mechanic repairs faster"
 interaction = "Repair Shower"
 given = { attrs = { broken = 1 }, sim = { skills = { mechanical = 600 } } }
 expect = { attrs = { broken = 0, last_repair_cycles = 2 }, sim = { skills = { mechanical = 615 } } }
+
+[[test]]
+name = "repair never raises Mechanical past 1000"
+interaction = "Repair Shower"
+given = { attrs = { broken = 1 }, sim = { skills = { mechanical = 990 } } }
+expect = { attrs = { broken = 0 }, sim = { skills = { mechanical = 1000 } } }

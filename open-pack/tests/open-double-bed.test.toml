@@ -1,0 +1,80 @@
+# Live sims-vm unit tests for the Open Double Bed: per-side occupancy flags (`BedSide`), the
+# Energy guard, and the sleep loop's cleanup that clears the side and plays the wake sound.
+
+[subject]
+antics = "../objects/open-double-bed.antics"
+pack = ".."
+
+[sim]
+motives = { energy = 0, comfort = 0 }
+
+[[test]]
+name = "the left side is offered on an empty bed"
+guard = "Sleep (Left Side)"
+expect = { result = true }
+
+[[test]]
+name = "the right side is offered on an empty bed"
+guard = "Sleep (Right Side)"
+expect = { result = true }
+
+[[test]]
+name = "the left side is not offered while it is taken"
+guard = "Sleep (Left Side)"
+given = { attrs = { occupancy = 1 } }
+expect = { result = false }
+
+[[test]]
+name = "the right side is still offered while the left is taken"
+guard = "Sleep (Right Side)"
+given = { attrs = { occupancy = 1 } }
+expect = { result = true }
+
+[[test]]
+name = "the right side is not offered while it is taken"
+guard = "Sleep (Right Side)"
+given = { attrs = { occupancy = 2 } }
+expect = { result = false }
+
+[[test]]
+name = "the left side is still offered while the right is taken"
+guard = "Sleep (Left Side)"
+given = { attrs = { occupancy = 2 } }
+expect = { result = true }
+
+[[test]]
+name = "the left side is not offered to a rested Sim"
+guard = "Sleep (Left Side)"
+given = { sim = { motives = { energy = 85 } } }
+expect = { result = false }
+
+[[test]]
+name = "the right side is not offered to a rested Sim"
+guard = "Sleep (Right Side)"
+given = { sim = { motives = { energy = 85 } } }
+expect = { result = false }
+
+[[test]]
+name = "a Sim asleep on the right marks the right side too"
+interaction = "Sleep (Right Side)"
+turns = 1
+given = { attrs = { occupancy = 1 } }
+expect = { result = "yield", attrs = { occupancy = 3 }, sounds = ["open_double_bed_settle"] }
+
+# Four cycles of 24 Energy reach the 95 wake level (96), so the fifth never runs.
+[[test]]
+name = "sleeping on the left wakes at the Energy goal and frees the side"
+interaction = "Sleep (Left Side)"
+expect = { attrs = { occupancy = 0, completed_cycles = 4 }, sim = { motives = { energy = 96, comfort = 40 } }, sounds = ["open_double_bed_settle", "open_double_bed_wake"] }
+
+[[test]]
+name = "sleeping on the right keeps the left side's flag"
+interaction = "Sleep (Right Side)"
+given = { attrs = { occupancy = 1 } }
+expect = { attrs = { occupancy = 1, completed_cycles = 4 }, sounds = ["open_double_bed_settle", "open_double_bed_wake"] }
+
+[[test]]
+name = "a tired Sim sleeps all five cycles"
+interaction = "Sleep (Left Side)"
+given = { sim = { motives = { energy = -100 } } }
+expect = { attrs = { occupancy = 0, completed_cycles = 5 }, sim = { motives = { energy = 20, comfort = 50 } } }

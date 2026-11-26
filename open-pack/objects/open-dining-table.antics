@@ -1,4 +1,7 @@
-// Open Dining Table (0x7F00_0060) — dining surface with container slot and set/tidy states.
+// Open Dining Table (0x7F00_0060) — dining surface with container slot and set/tidy states; a
+// set table raises its room's score through its room impact.
+
+use std::engine::RefreshMode;
 
 object "Open Dining Table" {
     guid: 0x7F00_0060;
@@ -8,7 +11,8 @@ object "Open Dining Table" {
     sprite: Sprite::procedural("table", primary: #A67648, accent: #CCA272, trim: #583C24);
 
     param action_ticks: i16 = 1;
-    param room_gain: i16 = 25;
+    /// The room impact (object data word 7) while the table is set: the room score counts it.
+    param set_room_impact: i16 = 3;
 
     state occupied: bool = false;
     state is_set: bool = false;
@@ -18,11 +22,17 @@ object "Open Dining Table" {
     slot top_surface = container([0.0, 0.0, 0.65]);
     slot front = routing([0.0, -0.75, 0.0], sitting: true);
 
-    fn toggle_table_setting(sim: Sim, set_state: bool) {
+    fn toggle_table_setting(set_state: bool) {
         play_sound(tap);
         sleep(action_ticks);
         self.is_set = set_state;
-        sim.motive.room += room_gain;
+        if set_state {
+            self.room_impact = set_room_impact;
+        } else {
+            self.room_impact = 0;
+        }
+        // The room keeps its score until it is recounted.
+        self.refresh(RefreshMode::RecountRoom);
     }
 
     interaction "Set Table" {
@@ -31,17 +41,16 @@ object "Open Dining Table" {
         lock: self.occupied,
         guard(sim) => !self.is_set,
         run(sim) {
-            toggle_table_setting(sim, true);
+            toggle_table_setting(true);
         }
     }
 
     interaction "Tidy Table" {
         autonomy: 40,
-        advertises: [room +35],
         lock: self.occupied,
         guard(sim) => self.is_set,
         run(sim) {
-            toggle_table_setting(sim, false);
+            toggle_table_setting(false);
         }
     }
 }

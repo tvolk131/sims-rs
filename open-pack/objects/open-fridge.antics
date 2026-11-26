@@ -1,5 +1,6 @@
 // Open Frost Fridge (0x7F00_0020) — initiates the multi-object cooking chain with defer rollback.
 
+use crate::common::helpers::gain_skill;
 use crate::objects::open_counter::OpenOakCounter;
 use crate::objects::open_stove::OpenHearthStove;
 
@@ -60,7 +61,7 @@ object "Open Frost Fridge" {
 
             self.last_plate = plate;
             self.meals_cooked += 1;
-            sim.skill.cooking += cooking_xp;
+            gain_skill(sim, Skill::Cooking, cooking_xp);
             committed = true;
         }
     }
