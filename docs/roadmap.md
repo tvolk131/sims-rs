@@ -3783,16 +3783,21 @@ through their public interfaces only; the simulation never depends on it.
       In behavioral mode inline raw statements fall from 17,165 to 14,553
       and lint findings from 25,591 to 266.
     - All three keep 0 DIFFERENT and 0 timeouts in both modes.
-- **Done (Batch 19 — `.antics` v2.1 Rust-idiom polish, Step 1, #474–#476):**
+- **Done (Batch 19 — `.antics` v2.1 Rust-idiom polish, Steps 1–2, #474–#478):**
   - **The `.antics` v2 language (Track 8, #475):**
     - `panic!()` is the error exit. It builds the same bytes as
       `return error;`, but it is always the error exit, even when a
       binding named `error` is in scope.
     - `let _ = expr;` discards a value on purpose, and makes no local.
-  - **Lint (Track 7, #474):** a new `collapsible_else_if` warning reports
-    `else { if .. }` when the block holds one `if` chain and nothing else.
-    On the behavioral lift corpus it found 630, and every one collapses to
-    identical `.air`.
+  - **Lint (Track 7):**
+    - #474: a new `collapsible_else_if` warning reports `else { if .. }`
+      when the block holds one `if` chain and nothing else. On the
+      behavioral lift corpus it found 630, and every one collapses to
+      identical `.air`.
+    - #478: the rules read `panic!()` and `let _ = expr;`, and
+      `unused_decl` counts `Table::entry` BCON reads. That fixes 17 false
+      findings, and reports again 508 unread entries in tables read only
+      by path.
   - **Lift (Track 9, #476):**
     - functions are named by label (`have_a_meal`, not `have_a_meal_4098`);
     - `else if`, `sim.motive[Motive::Hunger]`, and `Table::entry` for
@@ -3800,6 +3805,9 @@ through their public interfaces only; the simulation never depends on it.
     - braced `use` lines;
     - negated tests written the other way round where that is proven.
     Each form is kept only when the object builds the same bytes.
+  - **Lift (Track 9, #477):** the error exit is written `panic!();`
+    (5,584 sites), and a call whose result is unused `let _ = f();`
+    (1,470 sites).
 - **Next (in flight, in order of player impact):**
   - **Travel follow-ups:**
     - A hop that leaves travelers behind (Go Somewhere Else for one

@@ -26,8 +26,9 @@
 
 use crate::error::{Error, Result, Span};
 use crate::v2::ast::{
-    CallArg, ExternFnDecl, FnDecl, ForEachIter, GuardBody, GuardDecl, MatchPattern, ObjectMember,
-    ReturnAbi, StateType, V2AssignOp, V2BinOp, V2Expr, V2File, V2Item, V2Stmt, V2Type, V2UnaryOp,
+    CallArg, ExternFnDecl, FnDecl, ForEachIter, GuardBody, GuardDecl, MatchPattern, ObjectDecl,
+    ObjectMember, ReturnAbi, StateType, V2AssignOp, V2BinOp, V2Expr, V2File, V2Item, V2Stmt,
+    V2Type, V2UnaryOp,
 };
 use crate::v2::lexer::{TokenKind, tokenize};
 use crate::v2::parser::parse_v2_file;
@@ -202,7 +203,7 @@ pub const LINT_RULES: &[LintRule] = &[
     ),
     warn(
         UNTYPED_ENGINE_FIELD,
-        "`global[N]`, or a `data` / `person` / `slot` cell of `self`, a Sim or a handle, that has a typed name",
+        "`global[N]`, or a `data` / `person` / `motive` / `slot` cell of `self`, a Sim or a handle, that has a typed name (`sim.skill.cooking`)",
     ),
     warn(
         UNTYPED_ENGINE_CONSTANT,
@@ -214,7 +215,7 @@ pub const LINT_RULES: &[LintRule] = &[
     ),
     warn(
         PREFER_METHOD_SYNTAX,
-        "a builtin call whose target has a method form (`x.play_sound(s)`)",
+        "a builtin call whose target has a method form (`x.play_sound(s)`), or a flag operator on a typed flag word (`x.flags.set(F)`)",
     ),
     LintRule {
         name: RAW_SYNTAX,
@@ -353,6 +354,7 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             sure_callables: file_sure_callables(ast),
             enums: file_enums(input, ast),
             states: file_states(ast),
+            body_scope: None,
             frames,
             object: None,
             object_template: None,
@@ -396,6 +398,7 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
                             .any(|i| i.name == "globals" && i.alias.is_none()))
             }),
             pending: Vec::new(),
+            secondary: false,
             stmt: None,
             stmt_flows: false,
             body: 0,
@@ -1557,6 +1560,9 @@ struct FileLinter<'a> {
     enums: BTreeMap<String, Option<Vec<String>>>,
     /// The file's object states by name, with their type (`None` when two disagree).
     states: BTreeMap<String, Option<StateType>>,
+    /// What the linted object's body declares, with its template's (`None` outside an
+    /// object, or when the template is in another file).
+    body_scope: Option<BodyScope>,
     /// The lowered `.air` frames of each object the file expands to, by object name
     /// (`None` when the file does not expand on its own).
     frames: Option<BTreeMap<String, Vec<AirFrame>>>,
@@ -1633,6 +1639,8 @@ struct FileLinter<'a> {
     std_globals: bool,
     /// Findings that stand only if their rewrite builds the same bytes ([`verified`]).
     pending: Vec<Pending>,
+    /// What is proposed now is secondary (see [`Pending::secondary`]).
+    secondary: bool,
     /// The statement being linted.
     stmt: Option<Span>,
     /// Whether that statement binds names (see [`Pending::flows`]).
@@ -1804,6 +1812,51 @@ fn file_consts(file: &V2File) -> BTreeSet<String> {
         }
     }
     out
+}
+
+/// The enum and bitflags types and the states an object's body sees as members.
+struct BodyScope {
+    types: BTreeSet<String>,
+    states: BTreeSet<String>,
+}
+
+/// The members object `o` sees: its own and its template's. `None` when the template is
+/// not in `file`: its members are unknown here.
+fn body_scope(file: &V2File, o: &ObjectDecl) -> Option<BodyScope> {
+    let mut members = vec![o.members.as_slice()];
+    if let Some((t, _)) = &o.from_template {
+        let template = file.items.iter().find_map(|item| match item {
+            V2Item::Template(d) if d.name == *t => Some(d),
+            _ => None,
+        })?;
+        members.push(&template.members);
+    }
+    Some(BodyScope {
+        types: members.iter().flat_map(|m| member_type_names(m)).collect(),
+        states: members
+            .iter()
+            .flat_map(|m| m.iter())
+            .filter_map(|m| match m {
+                ObjectMember::State(st) => Some(st.name.clone()),
+                _ => None,
+            })
+            .collect(),
+    })
+}
+
+/// Whether `raw` is the cell `root.cell[..]` as written, spaces aside: not
+/// `(root).cell[..]`, whose range would start inside the parentheses.
+fn cell_text_is(raw: &str, root: &str, cell: &str) -> bool {
+    let blank = |t: &str| t.trim_start_matches([' ', '\t', '\r']).to_owned();
+    let Some(rest) = raw.strip_prefix(root).map(blank) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('.').map(blank) else {
+        return false;
+    };
+    rest.strip_prefix(cell)
+        .map(blank)
+        .is_some_and(|rest| rest.starts_with('['))
 }
 
 fn file_states(file: &V2File) -> BTreeMap<String, Option<StateType>> {
@@ -2310,6 +2363,7 @@ impl FileLinter<'_> {
                 V2Item::Object(o) => {
                     self.object = Some(o.name.clone());
                     self.object_template = o.from_template.as_ref().map(|(t, _)| t.clone());
+                    self.body_scope = body_scope(file, o);
                     // A template from another module may declare a BCON table `me`.
                     self.me_bcon |= o
                         .from_template
@@ -2350,6 +2404,7 @@ impl FileLinter<'_> {
                     self.lint_members(&o.members, false);
                     self.object = None;
                     self.object_template = None;
+                    self.body_scope = None;
                     self.strings.clear();
                     self.dialog_strings.clear();
                     self.tables.clear();
@@ -3461,12 +3516,18 @@ impl FileLinter<'_> {
         }
         if let V2Stmt::Assign {
             target,
-            op: V2AssignOp::FlagSet | V2AssignOp::FlagClear,
+            op: op @ (V2AssignOp::FlagSet | V2AssignOp::FlagClear),
             value,
             ..
         } = s
         {
             self.flag_constant(target, value);
+            let (op, method) = if *op == V2AssignOp::FlagSet {
+                ("flag_set", "set")
+            } else {
+                ("flag_clear", "clear")
+            };
+            self.flag_method(target, value, op, method);
         }
         self.written.clear();
         self.assigned = None;
@@ -3557,7 +3618,10 @@ impl FileLinter<'_> {
                     op: V2BinOp::FlagTest,
                     rhs,
                     ..
-                } => self.flag_constant(lhs, rhs),
+                } => {
+                    self.flag_constant(lhs, rhs);
+                    self.flag_method(lhs, rhs, "flag_test", "contains");
+                }
                 V2Expr::Call { .. } | V2Expr::MethodCall { .. } => self.call_constants(x),
                 V2Expr::Int(span, v) if *v > 0xFFFF => {
                     let text = self.text_at(*span);
@@ -4957,6 +5021,9 @@ struct Pending {
     /// Its statement binds names (`let`, `match`, `for`) whose types its rewrite may change:
     /// it is built apart from every other `untyped_engine_field` finding of its body.
     flows: bool,
+    /// It restates a typed spelling in a nicer form (a Sim's dot names, a flag method):
+    /// builds go to the other findings first, so these never crowd one out of the budget.
+    secondary: bool,
 }
 
 /// The most builds one file's pending findings may take.
@@ -5036,9 +5103,15 @@ fn verified(
     //   binds names: the binding takes the typed word's type on to other statements.
     // Rewrites of other statements, and of other bodies, do not meet: each group member
     // then stands or falls as it would alone.
+    // Secondary findings go in groups of their own, built after every other group (and its
+    // halves), so they never take a build another finding needs.
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let field = |p: &Pending| p.diag.rule == UNTYPED_ENGINE_FIELD;
-    for (i, p) in pending.iter().enumerate() {
+    let order = (0..pending.len())
+        .filter(|&i| !pending[i].secondary)
+        .chain((0..pending.len()).filter(|&i| pending[i].secondary));
+    for i in order {
+        let p = &pending[i];
         let clashes = |g: &Vec<usize>| {
             g.iter().any(|&j| {
                 let q = &pending[j];
@@ -5049,7 +5122,10 @@ fn verified(
                         .any(|a| p.fixes.iter().any(|b| a.start < b.end && b.start < a.end))
             })
         };
-        match groups.iter_mut().find(|g| !clashes(g)) {
+        match groups
+            .iter_mut()
+            .find(|g| !clashes(g) && pending[g[0]].secondary == p.secondary)
+        {
             Some(g) => g.push(i),
             None => groups.push(vec![i]),
         }
@@ -5082,18 +5158,22 @@ fn verified(
     let (fields, mut kept): (Vec<usize>, Vec<usize>) = stands
         .into_iter()
         .partition(|&i: &usize| pending[i].diag.rule == UNTYPED_ENGINE_FIELD);
+    // The other findings join first; the secondary ones (a Sim's dot names) then join only
+    // what those kept, so they never crowd one out.
+    let (secondary, fields): (Vec<usize>, Vec<usize>) =
+        fields.into_iter().partition(|&i| pending[i].secondary);
     let mut joint: Vec<usize> = Vec::new();
-    let mut todo = vec![fields];
+    let mut todo = vec![secondary, fields];
     let mut first = true;
     while let Some(part) = todo.pop() {
+        if part.is_empty() {
+            continue;
+        }
         // One passing group already built them all together.
         let tested = first && statics.is_empty() && groups_built_whole(&part, &accepted_groups);
         first = false;
         if tested {
             joint.extend(part);
-            continue;
-        }
-        if part.is_empty() {
             continue;
         }
         if joint_budget == 0 {
@@ -5164,6 +5244,7 @@ fn lift_fixes(source: &str, reported: &[LintDiagnostic]) -> Vec<Pending> {
                 stmt: None,
                 body: 0,
                 flows: false,
+                secondary: false,
             })
         })
         .collect()
@@ -5716,6 +5797,7 @@ impl FileLinter<'_> {
             stmt: self.stmt,
             body: self.body,
             flows: self.stmt_flows,
+            secondary: self.secondary,
         });
     }
 
@@ -5735,8 +5817,8 @@ impl FileLinter<'_> {
     ) {
         let tables: &[&[TypedField]] = match kind {
             Root::Object => &[OBJECT_WORDS],
-            Root::Sim => &[SIM_WORDS, OBJECT_WORDS],
-            Root::Handle => &[HANDLE_WORDS, OBJECT_WORDS],
+            Root::Sim => &[SIM_WORDS, SIM_GROUP_WORDS, OBJECT_WORDS],
+            Root::Handle => &[HANDLE_WORDS, SIM_GROUP_WORDS, OBJECT_WORDS],
         };
         let Some(&field) = tables
             .iter()
@@ -5789,10 +5871,16 @@ impl FileLinter<'_> {
         // The lift replaces from the column (as a byte offset) to the first `]`: the cell
         // must be that text, on one line.
         let raw = self.source[start..end].to_owned();
-        if !self.column_is_byte(at) || raw.contains('\n') || raw.find(']') != Some(raw.len() - 1) {
+        if !self.column_is_byte(at)
+            || raw.contains('\n')
+            || raw.find(']') != Some(raw.len() - 1)
+            || !cell_text_is(&raw, root, cell)
+        {
             return;
         }
         let typed = format!("{root}.{}", field.name);
+        // A Sim's dot names (`skill.cooking`) are secondary to the typed words.
+        self.secondary = field.name.contains('.');
         self.propose(
             UNTYPED_ENGINE_FIELD,
             at,
@@ -5806,6 +5894,7 @@ impl FileLinter<'_> {
             }],
             None,
         );
+        self.secondary = false;
     }
 
     /// How this file spells `std::<module>::<ty>`, and the `use` line it needs first:
@@ -5934,6 +6023,127 @@ impl FileLinter<'_> {
         if let Some(ty) = self.flag_word_type(place) {
             self.engine_constant(bit, "flags", ty);
         }
+    }
+
+    /// Whether `name` names `std::flags::<ty>` in this file: an import of it (`ObjectFlags`,
+    /// `Of`), or `ty` itself from a `std::flags` glob or the prelude (`Placement`,
+    /// `Height`). Not when a file item or another import takes the name, nor `ty` itself
+    /// by a glob or the prelude when a glob of another module may bind it.
+    fn std_flag_spelling(&self, ty: &str, name: &str) -> bool {
+        if self.item_names.contains(name) {
+            return false;
+        }
+        let std_flags = |u: &crate::v2::ast::UseDecl| u.module_path == ["std", "flags"];
+        let mut imported = false;
+        let mut glob = matches!(ty, "Height" | "Placement");
+        let mut foreign_glob = false;
+        for u in self.uses {
+            for item in &u.items {
+                let local = item.alias.as_deref().unwrap_or(&item.name);
+                if item.name == "*" {
+                    if std_flags(u) {
+                        glob = true;
+                    } else if u.module_path.first().is_none_or(|m| m != "std") {
+                        foreign_glob = true;
+                    }
+                } else if local == name {
+                    if std_flags(u) && item.name == ty {
+                        imported = true;
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        }
+        // An explicit import wins over a glob; another module's glob may bind `ty` where
+        // only a glob or the prelude brings `std`'s.
+        imported || (glob && name == ty && !foreign_glob)
+    }
+
+    /// `prefer_method_syntax` on a flag operation: `place flag_set T::F` is
+    /// `place.set(T::F)`, `flag_clear` is `.clear(..)`, `flag_test` is `.contains(..)`.
+    ///
+    /// Only in an object's body, for a named object flag word (`self.flags`,
+    /// `stack_obj.flags2`; not `self.data[8]`, nor `world.expansions` or `wall_placement`,
+    /// which lowering types `i16`) whose `std::flags` type `T` the operand names: a raw bit
+    /// (`flag_set 8`) or another constant has no method form. `op` is the operator's
+    /// spelling, `method` the method's.
+    fn flag_method(&mut self, place: &V2Expr, bit: &V2Expr, op: &str, method: &str) {
+        // In an object's body, whose members (and its template's) are known: a template's
+        // objects, or a module helper's callers, may declare a state or type of the name.
+        let Some(scope) = self.body_scope.as_ref() else {
+            return;
+        };
+        let V2Expr::Field {
+            base: root, field, ..
+        } = place
+        else {
+            return;
+        };
+        let V2Expr::Ident(at, root) = root.as_ref() else {
+            return;
+        };
+        // A state of the same name wins over the engine word (`me` is the Sim in a Sim's
+        // body), and a typed handle's object may have one this file does not show.
+        if (root == "self" || (root == "me" && !self.sim_body)) && scope.states.contains(field) {
+            return;
+        }
+        if self.bound.contains(root) && root != "stack_obj" {
+            return;
+        }
+        // Lowering keeps `wall_placement` an `i16` that takes `WallPlacement` constants
+        // (`lower/tree.rs` `OBJECT_DATA_WORDS`): no bitflags receiver.
+        if field == "wall_placement" {
+            return;
+        }
+        let Some(ty) = field_flags(field) else {
+            return;
+        };
+        let V2Expr::Path(bit_at, segs) = bit else {
+            return;
+        };
+        let [ty_name, _] = segs.as_slice() else {
+            return;
+        };
+        if !self.std_flag_spelling(ty, ty_name) || scope.types.contains(ty_name) {
+            return;
+        }
+        let (at, receiver) = (*at, format!("{root}.{field}"));
+        let src = self.source;
+        let (Some(start), Some(bit_start)) = (self.offset(at), self.offset(*bit_at)) else {
+            return;
+        };
+        let path = segs.join("::");
+        let word_ends = |at: usize| {
+            src[at..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+        };
+        // The receiver, the operator and the operand, as written, with nothing else.
+        let receiver_end = start + receiver.len();
+        let end = bit_start + path.len();
+        if bit_start < receiver_end
+            || src.get(start..receiver_end) != Some(receiver.as_str())
+            || src.get(bit_start..end) != Some(path.as_str())
+            || !word_ends(receiver_end)
+            || !word_ends(end)
+            || src[receiver_end..bit_start].trim() != op
+        {
+            return;
+        }
+        let text = format!("{receiver}.{method}({path})");
+        self.secondary = true;
+        self.propose(
+            PREFER_METHOD_SYNTAX,
+            at,
+            format!("`{op}` on a typed flag word has a method form"),
+            format!("write `{text}`; it builds the same nodes"),
+            text.clone(),
+            vec![Fix { start, end, text }],
+            None,
+        );
+        self.secondary = false;
     }
 
     /// `untyped_engine_constant` on a builtin's arguments: the `category:` of the budget
@@ -6838,6 +7048,34 @@ const SIM_WORDS: &[TypedField] = &[
     typed("person", 65, "gender_kind", true, false),
     typed("person", 77, "date_partner", true, false),
     typed("person", 81, "fame", true, false),
+];
+
+/// A Sim's skills, personality traits and motives by number, with their dot names
+/// (`parser.rs` `skill_by_name` and `motive_by_name`, `lower/prim_table.rs`
+/// `personality_trait`). A Sim and an untyped handle name them; a typed handle's
+/// object is no Sim, and lowering refuses the dot name there, so that proposal falls.
+const SIM_GROUP_WORDS: &[TypedField] = &[
+    typed("person", 2, "personality.nice", true, false),
+    typed("person", 3, "personality.active", true, false),
+    typed("person", 5, "personality.playful", true, false),
+    typed("person", 6, "personality.outgoing", true, false),
+    typed("person", 7, "personality.neat", true, false),
+    typed("person", 10, "skill.cooking", true, false),
+    typed("person", 11, "skill.charisma", true, false),
+    typed("person", 12, "skill.mechanical", true, false),
+    typed("person", 15, "skill.creativity", true, false),
+    typed("person", 17, "skill.body", true, false),
+    typed("person", 18, "skill.logic", true, false),
+    typed("motive", 3, "motive.mood", true, false),
+    typed("motive", 5, "motive.energy", true, false),
+    typed("motive", 6, "motive.comfort", true, false),
+    typed("motive", 7, "motive.hunger", true, false),
+    typed("motive", 8, "motive.hygiene", true, false),
+    typed("motive", 9, "motive.bladder", true, false),
+    typed("motive", 11, "motive.alertness", true, false),
+    typed("motive", 13, "motive.room", true, false),
+    typed("motive", 14, "motive.social", true, false),
+    typed("motive", 15, "motive.fun", true, false),
 ];
 
 /// The cells `stack_obj` and handles name (`lower/tree.rs` `handle_field_cell`), besides
