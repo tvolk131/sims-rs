@@ -79,7 +79,7 @@ fn for_else_handles_every_object_iterator() {
         ("self.parts()", 3),
     ] {
         let tree = compile_tree(&format!(
-            "#[bhav(id = 4300)] fn scan() {{ for candidate in {iter} {{ break; }} else {{ return error; }} return true; }}"
+            "#[bhav(id = 4300)] fn scan() {{ for candidate in {iter} {{ break; }} else {{ panic!(); }} return true; }}"
         ));
         let step = tree
             .instructions

@@ -695,6 +695,12 @@ impl<'a> TreeLowerer<'a> {
                 if let Some(&b) = self.env.bool_params.get(name) {
                     return Ok((if b { "1" } else { "0" }.to_owned(), ValueType::Bool));
                 }
+                if name == "error" {
+                    return Err(Error::at(
+                        *span,
+                        "unknown identifier 'error' (the error exit is 'panic!();')",
+                    ));
+                }
                 Err(Error::at(*span, format!("unknown identifier '{name}'")))
             }
             V2Expr::Deref { span, inner } => {
@@ -1279,7 +1285,7 @@ impl<'a> TreeLowerer<'a> {
 
     pub(super) fn lower_job_operand(&mut self, key: &str, arg: &CallArg) -> Result<String> {
         let (air, ty) = self.lower_value_expr(&arg.value)?;
-        if ty != ValueType::I16 {
+        if !i16_like(&ty) {
             return Err(Error::at(
                 arg.span,
                 format!("job_data {key} must be an i16"),
@@ -1465,7 +1471,7 @@ impl<'a> TreeLowerer<'a> {
         target: &ValueType,
         ty: &ValueType,
     ) -> Result<()> {
-        if *ty != ValueType::I16 && ty != target {
+        if !i16_like(ty) && ty != target {
             return Err(Error::at(
                 arg.span(),
                 format!(

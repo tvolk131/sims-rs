@@ -690,7 +690,7 @@ fn a_statement_after_return_break_or_continue_is_unreachable() {
             .as_str()
         )
     );
-    let source = tree("        return error;\n        sleep(1);");
+    let source = tree("        panic!();\n        sleep(1);");
     one(&source, "unreachable_code");
     let source = tree(
         "        for i in 0..3 {\n            if i == 1 {\n                continue;\n                self.level = i;\n            }\n            self.level = 2;\n        }",
@@ -711,7 +711,7 @@ fn a_statement_after_return_break_or_continue_is_unreachable() {
 #[test]
 fn a_statement_after_an_if_or_match_that_always_leaves_is_unreachable() {
     let source = tree(
-        "        if self.level == 0 {\n            return;\n        } else if self.level == 1 {\n            sleep(1);\n            return;\n        } else {\n            return error;\n        }\n        self.level = 4;",
+        "        if self.level == 0 {\n            return;\n        } else if self.level == 1 {\n            sleep(1);\n            return;\n        } else {\n            panic!();\n        }\n        self.level = 4;",
     );
     let d = one(&source, "unreachable_code");
     assert_eq!(d.line, line_of(&source, "self.level = 4"));

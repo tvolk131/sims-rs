@@ -498,7 +498,7 @@ fn engine_words_compare_and_convert_like_i16() {
         "skill_named.antics",
         &sim_tree(
             "use std::globals::*;",
-            "if !globals::show_skill_progress(skill: 250) { return error; }",
+            "if !globals::show_skill_progress(skill: 250) { panic!(); }",
         ),
     );
     expect_lines("skill_named", &air, &["call 286(250)"]);

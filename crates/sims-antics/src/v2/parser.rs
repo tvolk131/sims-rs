@@ -2948,24 +2948,20 @@ impl Parser {
                 "return" => {
                     self.bump();
                     if self.eat(&TokenKind::Semicolon) {
-                        return Ok(V2Stmt::Return { span, value: None });
-                    }
-                    if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "error")
-                        && self.peek_at(1).kind == TokenKind::Semicolon
-                    {
-                        self.bump();
-                        self.bump();
-                        return Ok(V2Stmt::ReturnError {
+                        return Ok(V2Stmt::Return {
                             span,
-                            from_try: false,
-                            panic: false,
+                            value: None,
+                            bare_error: false,
                         });
                     }
+                    let bare_error =
+                        self.is_ident("error") && self.peek_at(1).kind == TokenKind::Semicolon;
                     let expr = self.parse_expr()?;
                     self.expect(&TokenKind::Semicolon, "';'")?;
                     return Ok(V2Stmt::Return {
                         span,
                         value: Some(expr),
+                        bare_error,
                     });
                 }
                 _ => {}
@@ -3788,8 +3784,8 @@ impl Parser {
         Ok(V2Expr::Block { span, body })
     }
 
-    /// `panic!()`: the SimAntics error exit (253), the same statement as `return error;` but
-    /// never a binding named `error`. The exit carries no message, so arguments are refused.
+    /// `panic!()`: the SimAntics error exit (253). The exit carries no message, so arguments
+    /// are refused.
     fn parse_panic_macro(&mut self) -> Result<Option<V2Stmt>> {
         if !(self.is_ident("panic") && self.peek_at(1).kind == TokenKind::Bang) {
             return Ok(None);
@@ -3805,14 +3801,10 @@ impl Parser {
             ));
         }
         self.bump(); // ')'
-        Ok(Some(V2Stmt::ReturnError {
-            span,
-            from_try: false,
-            panic: true,
-        }))
+        Ok(Some(V2Stmt::ReturnError { span, panic: true }))
     }
 
-    /// A bare `break`, `continue`, `return`, `return error` or `return value` as a `match` arm
+    /// A bare `break`, `continue`, `return`, `panic!()` or `return value` as a `match` arm
     /// (`_ => return false,`), ending before the arm's `,` / `}`.
     fn parse_bare_exit(&mut self) -> Result<Option<V2Stmt>> {
         let span = self.span();
@@ -3825,20 +3817,18 @@ impl Parser {
             V2Stmt::Continue { span }
         } else if self.eat_ident("return") {
             if matches!(self.peek().kind, TokenKind::Comma | TokenKind::RBrace) {
-                V2Stmt::Return { span, value: None }
-            } else if self.is_ident("error")
-                && matches!(self.peek_at(1).kind, TokenKind::Comma | TokenKind::RBrace)
-            {
-                self.bump();
-                V2Stmt::ReturnError {
+                V2Stmt::Return {
                     span,
-                    from_try: false,
-                    panic: false,
+                    value: None,
+                    bare_error: false,
                 }
             } else {
+                let bare_error = self.is_ident("error")
+                    && matches!(self.peek_at(1).kind, TokenKind::Comma | TokenKind::RBrace);
                 V2Stmt::Return {
                     span,
                     value: Some(self.parse_expr()?),
+                    bare_error,
                 }
             }
         } else {
@@ -4592,6 +4582,7 @@ fn tail_to_return(stmt: &mut V2Stmt) {
         *stmt = V2Stmt::Return {
             span,
             value: Some(expr),
+            bare_error: false,
         };
     }
 }

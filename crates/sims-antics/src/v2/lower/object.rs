@@ -1486,6 +1486,7 @@ fn lower_object_with(
                             then_body: vec![V2Stmt::Return {
                                 span: lspan,
                                 value: Some(V2Expr::Bool(lspan, false)),
+                                bare_error: false,
                             }],
                             else_body: Vec::new(),
                         });

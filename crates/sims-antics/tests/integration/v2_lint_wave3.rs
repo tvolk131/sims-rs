@@ -554,25 +554,25 @@ fn budget_categories_and_refresh_operands() {
 // --- prefer_question_mark -----------------------------------------------------------------
 
 #[test]
-fn a_result_call_that_only_returns_its_error() {
+fn a_result_call_that_only_panics() {
     let source = tree(
         "",
-        "        if !lib::must() {\n            return error;\n        }\n        temp[0] = 1;",
+        "        if !lib::must() {\n            panic!();\n        }\n        temp[0] = 1;",
     );
     rewrites(
         &source,
         "prefer_question_mark",
-        "if !lib::must() {\n            return error;\n        }",
+        "if !lib::must() {\n            panic!();\n        }",
         "lib::must()?;",
     );
     let source = tree(
         "",
-        "        if lib::must() {\n        } else {\n            return error;\n        }",
+        "        if lib::must() {\n        } else {\n            panic!();\n        }",
     );
     rewrites(
         &source,
         "prefer_question_mark",
-        "if lib::must() {\n        } else {\n            return error;\n        }",
+        "if lib::must() {\n        } else {\n            panic!();\n        }",
         "lib::must()?;",
     );
 }
@@ -581,22 +581,22 @@ fn a_result_call_that_only_returns_its_error() {
 fn std_globals_and_local_trees_return_result_too() {
     let source = tree(
         "use std::globals::*;\n",
-        "        if !globals::init_object() { return error; }",
+        "        if !globals::init_object() { panic!(); }",
     );
     rewrites(
         &source,
         "prefer_question_mark",
-        "if !globals::init_object() { return error; }",
+        "if !globals::init_object() { panic!(); }",
         "globals::init_object()?;",
     );
     let source = obj(
         "",
-        "    #[bhav(label = \"Helper\")] fn helper(n: i16) -> Result {\n        temp[0] = n;\n        return true;\n    }\n    #[bhav(label = \"Probe\")] fn probe() {\n        if !helper(3) { return error; }\n    }",
+        "    #[bhav(label = \"Helper\")] fn helper(n: i16) -> Result {\n        temp[0] = n;\n        return true;\n    }\n    #[bhav(label = \"Probe\")] fn probe() {\n        if !helper(3) { panic!(); }\n    }",
     );
     rewrites(
         &source,
         "prefer_question_mark",
-        "if !helper(3) { return error; }",
+        "if !helper(3) { panic!(); }",
         "helper(3)?;",
     );
 }
@@ -605,7 +605,7 @@ fn std_globals_and_local_trees_return_result_too() {
 fn no_question_mark_for_bool_calls_other_exits_comments_or_else_if() {
     // A `bool` answer is not an error.
     none(
-        &tree("", "        if !lib::probe_bool() { return error; }"),
+        &tree("", "        if !lib::probe_bool() { panic!(); }"),
         "prefer_question_mark",
     );
     // Another exit.
@@ -617,7 +617,7 @@ fn no_question_mark_for_bool_calls_other_exits_comments_or_else_if() {
     none(
         &tree(
             "",
-            "        if !lib::must() {\n            temp[0] = 1;\n            return error;\n        }",
+            "        if !lib::must() {\n            temp[0] = 1;\n            panic!();\n        }",
         ),
         "prefer_question_mark",
     );
@@ -625,7 +625,7 @@ fn no_question_mark_for_bool_calls_other_exits_comments_or_else_if() {
     none(
         &tree(
             "",
-            "        if !lib::must() {\n            // why\n            return error;\n        }",
+            "        if !lib::must() {\n            // why\n            panic!();\n        }",
         ),
         "prefer_question_mark",
     );
@@ -633,14 +633,14 @@ fn no_question_mark_for_bool_calls_other_exits_comments_or_else_if() {
     none(
         &tree(
             "",
-            "        if temp[0] == 1 {\n            temp[1] = 1;\n        } else if !lib::must() {\n            return error;\n        }",
+            "        if temp[0] == 1 {\n            temp[1] = 1;\n        } else if !lib::must() {\n            panic!();\n        }",
         ),
         "prefer_question_mark",
     );
     // A local `extern mod globals` hides `std::globals`, here with a `bool` tree.
     let source = tree(
         "use std::globals::*;\nextern mod globals {\n    #[id(271)] fn init_object() -> bool;\n}\n",
-        "        if !globals::init_object() { return error; }",
+        "        if !globals::init_object() { panic!(); }",
     );
     none(&source, "prefer_question_mark");
     // Inside `raw { }`: not v2.
@@ -772,12 +772,12 @@ fn wide_strings_before_a_rewrite_on_its_line() {
     // The lexer counts a string's characters: the rewrite still lands on the `if`.
     let source = tree(
         "",
-        "        dialog(kind: ok, title: \"ééé\", message: \"M\"); /*é*/if !lib::must() { return error; }",
+        "        dialog(kind: ok, title: \"ééé\", message: \"M\"); /*é*/if !lib::must() { panic!(); }",
     );
     rewrites(
         &source,
         "prefer_question_mark",
-        "if !lib::must() { return error; }",
+        "if !lib::must() { panic!(); }",
         "lib::must()?;",
     );
     // The lift reads a field's column as a byte offset: after a wide string it is not one.

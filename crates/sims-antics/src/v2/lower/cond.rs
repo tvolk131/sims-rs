@@ -205,7 +205,7 @@ impl<'a> TreeLowerer<'a> {
         let (l, l_ty) = self.lower_value_expr(lhs)?;
         // An engine word also takes a raw bit number (`w flag_test 3`), compared below exactly
         // as an `i16` word is; an `i16` word takes a single flag constant of any bitflags type
-        // (`world.expansions flag_test Expansions::Pets`).
+        // (`temp[0] flag_test Expansions::Pets`).
         if op == V2BinOp::FlagTest
             && let Some(key) = flag_op_key(&l_ty)
             && let const_bit = self.try_eval_const_bitflag(rhs, key)?

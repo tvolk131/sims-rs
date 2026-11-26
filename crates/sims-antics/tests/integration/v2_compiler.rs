@@ -681,7 +681,7 @@ tree 4097 "SimMain" (args: 1) {
     }
 
     /// Runs `tree` on the Sim with `target_id` as the stack object and `param0`, returning the
-    /// tree's true/false exit or the VM fault (e.g. `Trap::ErrorBranch` from `return error;`).
+    /// tree's true/false exit or the VM fault (e.g. `Trap::ErrorBranch` from `panic!()`).
     fn try_run_tree(
         &mut self,
         target_id: u16,

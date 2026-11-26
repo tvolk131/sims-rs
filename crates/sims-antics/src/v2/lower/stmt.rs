@@ -198,9 +198,12 @@ impl<'a> TreeLowerer<'a> {
                                 ),
                             ));
                         }
-                        // An engine word takes any compound assignment from a raw word.
+                        // An engine word takes any compound assignment from a raw word, or
+                        // from a word of its own type (`w += world.expansions`), as `w + ..`
+                        // takes arithmetic.
                         ValueType::Bitflags(_)
-                            if is_engine_flags(&target_ty) && val_ty == ValueType::I16 => {}
+                            if is_engine_flags(&target_ty)
+                                && (val_ty == ValueType::I16 || val_ty == target_ty) => {}
                         ValueType::Bitflags(_) => {
                             if !matches!(
                                 op,
@@ -836,7 +839,32 @@ impl<'a> TreeLowerer<'a> {
                 self.line("continue;".to_owned());
                 Ok(())
             }
-            V2Stmt::Return { span, value } => {
+            V2Stmt::Return {
+                span,
+                value,
+                bare_error,
+            } => {
+                // `return error;` returns a value named `error`. It was once the error exit,
+                // unless a local or parameter of that name was in scope; with none, point at
+                // the one spelling the exit has now. A `const error` alone did not count, so
+                // returning it would silently swap the error exit for a value.
+                // (`return (error);` and a tail `error` were always values.)
+                if *bare_error
+                    && let Some(V2Expr::Ident(at, name)) = value
+                    && name == "error"
+                    && self.lookup_var(name).is_none()
+                    && !self.env.i16_params.contains_key(name)
+                    && !self.env.bool_params.contains_key(name)
+                {
+                    return Err(Error::at(
+                        *at,
+                        if self.const_item(name).is_some() {
+                            "'return error;' names only the const 'error', and was the error exit before v2.2: write 'panic!();' for the exit, or return the const under another name"
+                        } else {
+                            "unknown identifier 'error': 'return error;' is no longer the error exit; write 'panic!();' (or bind a value named 'error' to return it)"
+                        },
+                    ));
+                }
                 if let Some(active_fn) = self.active_inline_fn.clone() {
                     if active_fn.owner_defer_id != self.current_defer_id {
                         return Err(Error::at(
@@ -952,10 +980,12 @@ impl<'a> TreeLowerer<'a> {
                             &[V2Stmt::Return {
                                 span: *span,
                                 value: Some(V2Expr::Bool(*span, true)),
+                                bare_error: false,
                             }],
                             &[V2Stmt::Return {
                                 span: *span,
                                 value: Some(V2Expr::Bool(*span, false)),
+                                bare_error: false,
                             }],
                             true,
                         )? {
@@ -994,27 +1024,9 @@ impl<'a> TreeLowerer<'a> {
                     }
                 }
             }
-            V2Stmt::ReturnError {
-                span,
-                from_try,
-                panic,
-            } => {
-                // A written `return error;` with `error` bound as a local/param/i16 or bool param
-                // keeps its pre-v2-interop meaning (returns that value). `cond?;` and `panic!()`
-                // always error.
-                if !*from_try
-                    && !*panic
-                    && (self.lookup_var("error").is_some()
-                        || self.env.i16_params.contains_key("error")
-                        || self.env.bool_params.contains_key("error"))
-                {
-                    return self.lower_stmt(&V2Stmt::Return {
-                        span: *span,
-                        value: Some(V2Expr::Ident(*span, "error".to_owned())),
-                    });
-                }
+            V2Stmt::ReturnError { span, panic } => {
                 if self.in_defer() {
-                    let what = if *panic { "panic!()" } else { "return error;" };
+                    let what = if *panic { "panic!()" } else { "?" };
                     return Err(Error::at(
                         *span,
                         format!("'{what}' cannot exit out of a 'defer' block"),
@@ -1157,7 +1169,7 @@ impl<'a> TreeLowerer<'a> {
                 return Ok(Bound::Lit(v));
             }
             let (air, ty) = c.lower_value_expr(expr)?;
-            if ty != ValueType::I16 {
+            if !i16_like(&ty) {
                 return Err(Error::at(
                     expr.span(),
                     format!(
@@ -1996,7 +2008,6 @@ impl<'a> TreeLowerer<'a> {
                     },
                     then_body: vec![V2Stmt::ReturnError {
                         span: *span,
-                        from_try: true,
                         panic: false,
                     }],
                     else_body: Vec::new(),

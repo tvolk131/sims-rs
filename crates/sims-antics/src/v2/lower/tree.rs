@@ -484,7 +484,7 @@ impl<'a> TreeLowerer<'a> {
             v.to_string()
         } else if self.is_pure_single_operand(index) {
             let (air, ty) = self.lower_value_expr(index)?;
-            if ty != ValueType::I16 {
+            if !i16_like(&ty) {
                 return Err(Error::at(
                     index.span(),
                     format!(
@@ -736,10 +736,16 @@ const OBJECT_DATA_WORDS: &[(&str, EngineWord)] = &[
     ("room_impact", word(7, EngineWordTy::I16)),
     // Movement and intersection flags; any bitflags type converts (`std::flags::ObjectFlags`).
     ("flags", word(8, EngineWordTy::Flags(ANY_BITFLAGS))),
-    // The wall-placement rules (`std::flags::WallPlacement`). Stays `i16`, as it was before the
-    // typed words, so every numeric use still compiles; an `i16` word takes typed single-flag
-    // constants (`self.wall_placement flag_set WallPlacement::NoCorner`).
-    ("wall_placement", word(13, EngineWordTy::I16)),
+    // The wall-placement rules: a lenient engine `bitflags` word, like `wall_adjacency`. It
+    // takes flag methods (`self.wall_placement.set(WallPlacement::NoCorner)`) and still every
+    // numeric use (`self.wall_placement flag_set 5`, `self.wall_placement == 0`).
+    (
+        "wall_placement",
+        word(
+            13,
+            EngineWordTy::Flags("bitflags::std::flags::WallPlacement"),
+        ),
+    ),
     // Broken (a broken object sells for half).
     ("broken", word(15, EngineWordTy::I16)),
     // Weight, and the weight a container may hold.

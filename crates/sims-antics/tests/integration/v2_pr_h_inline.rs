@@ -130,7 +130,7 @@ fn negated_if_and_try_use_their_own_exit_polarities() {
         helper,
         "",
         "ready()?; self.n = 2; return true;",
-        "if temp[0] == 0 { return error; } temp[1] = 3; self.n = 2; return true;",
+        "if temp[0] == 0 { panic!(); } temp[1] = 3; self.n = 2; return true;",
         0,
     );
     // The false exit gets a `1 == 0` test: the node before it (`temp[0] == 0`, taken) left
@@ -440,7 +440,7 @@ fn guid_parameters_forward_literals_and_default_consts() {
 #[test]
 fn result_helper_error_remains_the_tree_error_exit() {
     let helper = r#"fn check() -> Result {
-            if temp[0] > 0 { return error; }
+            if temp[0] > 0 { panic!(); }
             if temp[1] > 0 { return false; }
             return true;
         }"#;
@@ -454,8 +454,8 @@ fn result_helper_error_remains_the_tree_error_exit() {
         helper,
         "",
         "check()?; self.n = 1; return true;",
-        r#"if temp[0] > 0 { return error; }
-        if temp[1] > 0 { return error; }
+        r#"if temp[0] > 0 { panic!(); }
+        if temp[1] > 0 { panic!(); }
         self.n = 1;
         return true;"#,
         0,

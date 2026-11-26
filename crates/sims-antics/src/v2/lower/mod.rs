@@ -618,6 +618,23 @@ fn is_engine_flags(ty: &ValueType) -> bool {
     matches!(ty, ValueType::Bitflags(k) if is_engine_flags_key(k))
 }
 
+/// Whether a value of type `ty` goes where an `i16` is asked for: an `i16`, or a lenient engine
+/// `bitflags` word (`self.wall_placement`, `world.expansions`), which keeps every numeric use
+/// it had before it was typed.
+fn i16_like(ty: &ValueType) -> bool {
+    *ty == ValueType::I16 || is_engine_flags(ty)
+}
+
+/// The `i16` a lenient engine `bitflags` value reads as where a number is wanted; any other
+/// type unchanged.
+fn numeric_view(ty: ValueType) -> ValueType {
+    if is_engine_flags(&ty) {
+        ValueType::I16
+    } else {
+        ty
+    }
+}
+
 fn types_compatible_for_assign(target: &ValueType, value: &ValueType) -> bool {
     if target == value {
         return true;
@@ -666,6 +683,14 @@ enum LValue {
 }
 
 impl LValue {
+    fn set_value_type(&mut self, new: ValueType) {
+        match self {
+            LValue::Direct { ty, .. }
+            | LValue::ForeignAttr { ty, .. }
+            | LValue::ForeignCell { ty, .. } => *ty = new,
+        }
+    }
+
     fn value_type(&self) -> &ValueType {
         match self {
             LValue::Direct { ty, .. }

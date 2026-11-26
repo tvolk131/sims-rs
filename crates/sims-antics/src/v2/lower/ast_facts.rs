@@ -343,7 +343,8 @@ pub(super) fn stmts_exit_loop(stmts: &[V2Stmt]) -> bool {
 
 pub(super) fn stmts_have_return(stmts: &[V2Stmt]) -> bool {
     stmts.iter().any(|s| match s {
-        // `return error;` may resolve to an ordinary `return <local error>;` (see lowering).
+        // The error exit counts too, as it always has (a helper with `panic!()` or `?` in
+        // its prefix keeps the return-flag form).
         V2Stmt::Return { .. } | V2Stmt::ReturnError { .. } => true,
         V2Stmt::WithLock { body, .. }
         | V2Stmt::Defer { body, .. }

@@ -254,6 +254,12 @@ impl<'a> TreeLowerer<'a> {
             Some((v, ty)) => (v.to_string(), ty.clone()),
             None => self.lower_value_expr(scrutinee)?,
         };
+        // A lenient engine `bitflags` word (`world.expansions`, `self.wall_placement`) matches
+        // as the `i16` it was before it was typed: its arms are integers.
+        let val_ty = match val_ty {
+            ValueType::Bitflags(ref k) if is_engine_flags_key(k) => ValueType::I16,
+            ty => ty,
+        };
         if !matches!(val_ty, ValueType::I16 | ValueType::Enum(_)) {
             return Err(Error::at(
                 span,

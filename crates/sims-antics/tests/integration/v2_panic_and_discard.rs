@@ -1,5 +1,5 @@
-//! `.antics` v2.1 Rust-idiom polish: `panic!()` (the SimAntics error exit, the same statement
-//! as `return error;`) and `let _ = expr;` (evaluate and discard). All sources are synthetic.
+//! `.antics` v2.1 Rust-idiom polish: `panic!()` (the SimAntics error exit, its one spelling
+//! since v2.2 step 2) and `let _ = expr;` (evaluate and discard). All sources are synthetic.
 
 use sims_antics::v2::{format_v2_source, is_v2_formatted};
 use sims_antics::{PackResolverConfig, compile_v2_source};
@@ -63,99 +63,73 @@ fn same_iff(case: &str, uses: &str, items: &str, a: &str, b: &str) {
 mod panic_macro {
     use super::*;
 
+    /// `body` builds, and tree `t` takes the error exit (`.air` `return error;`).
+    fn exits(case: &str, body: &str) {
+        let src = sim_obj("", "", body);
+        iff("exit.antics", &src);
+        let air = air("exit.antics", &src);
+        assert!(tree_t(&air).contains("return error;"), "{case}\n{air}");
+    }
+
     #[test]
-    fn statement_and_tail_forms_match_return_error() {
-        same_iff(
-            "statement",
-            "",
-            "",
-            "if self.n == 1 { panic!(); } self.n = 2;",
-            "if self.n == 1 { return error; } self.n = 2;",
-        );
+    fn statement_and_tail_forms_are_the_error_exit() {
+        exits("statement", "if self.n == 1 { panic!(); } self.n = 2;");
         same_iff(
             "block tail without ';'",
             "",
             "",
             "if self.n == 1 { panic!() } self.n = 2;",
-            "if self.n == 1 { return error; } self.n = 2;",
+            "if self.n == 1 { panic!(); } self.n = 2;",
         );
-        same_iff(
-            "last statement of the tree",
-            "",
-            "",
-            "self.n = 2; panic!();",
-            "self.n = 2; return error;",
-        );
-        same_iff(
+        exits("last statement of the tree", "self.n = 2; panic!();");
+        exits(
             "after cleanups",
-            "",
-            "",
             "defer { self.n = 0; } if self.n == 1 { panic!(); } self.n = 2;",
-            "defer { self.n = 0; } if self.n == 1 { return error; } self.n = 2;",
         );
     }
 
     #[test]
-    fn match_arms_match_return_error() {
+    fn match_arms_are_the_error_exit() {
         same_iff(
             "value match arm",
             "",
             "",
             "let z = match self.n { 1 => 4, 2 => panic!(), _ => 5, }; self.n = z;",
-            "let z = match self.n { 1 => 4, 2 => return error, _ => 5, }; self.n = z;",
+            "let z = match self.n { 1 => 4, 2 => { panic!(); } _ => 5, }; self.n = z;",
         );
-        same_iff(
+        exits(
             "value match wildcard arm",
-            "",
-            "",
             "let z = match self.n { 1 => 4, _ => panic!() }; self.n = z;",
-            "let z = match self.n { 1 => 4, _ => return error }; self.n = z;",
         );
         same_iff(
             "statement match arm",
             "",
             "",
             "match self.n { 1 => panic!(), _ => self.n = 3, }",
-            "match self.n { 1 => return error, _ => self.n = 3, }",
+            "match self.n { 1 => { panic!(); } _ => { self.n = 3; } }",
         );
-        same_iff(
+        exits(
             "statement match block arm",
-            "",
-            "",
             "match self.n { 1 => { panic!() } _ => { self.n = 3; } }",
-            "match self.n { 1 => { return error; } _ => { self.n = 3; } }",
         );
     }
 
     #[test]
-    fn diverging_value_branches_match_return_error() {
+    fn diverging_value_branches_are_the_error_exit() {
         same_iff(
             "let-if else",
             "",
             "",
             "let y = if self.n == 1 { 2 } else { panic!() }; self.n = y;",
-            "let y = if self.n == 1 { 2 } else { return error; }; self.n = y;",
-        );
-        same_iff(
-            "let-if else with ';'",
-            "",
-            "",
             "let y = if self.n == 1 { 2 } else { panic!(); }; self.n = y;",
-            "let y = if self.n == 1 { 2 } else { return error; }; self.n = y;",
         );
-        same_iff(
+        exits(
             "let-if then",
-            "",
-            "",
             "let y = if self.n == 1 { panic!() } else { 3 }; self.n = y;",
-            "let y = if self.n == 1 { return error; } else { 3 }; self.n = y;",
         );
-        same_iff(
+        exits(
             "nested diverging if",
-            "",
-            "",
             "let y = if self.n == 1 { 2 } else if self.n == 2 { 3 } else { panic!() }; self.n = y;",
-            "let y = if self.n == 1 { 2 } else if self.n == 2 { 3 } else { return error; }; self.n = y;",
         );
     }
 
@@ -173,15 +147,11 @@ mod panic_macro {
             "fn check(v: i16) { if v == 1 { panic!(); } }",
             "check(self.n); self.n = 2;",
         );
-        let b = sim_obj(
-            "",
-            "fn check(v: i16) { if v == 1 { return error; } }",
-            "check(self.n); self.n = 2;",
-        );
-        assert_eq!(iff("a.antics", &a), iff("b.antics", &b));
+        let air = air("a.antics", &a);
+        assert!(tree_t(&air).contains("return error;"), "{air}");
     }
 
-    /// A written `return error;` returns a binding named `error`; `panic!()` always errors.
+    /// `return error;` returns a binding named `error`; `panic!()` always errors.
     #[test]
     fn panic_ignores_a_binding_named_error() {
         let tree = |body: &str| {
@@ -227,10 +197,12 @@ mod panic_macro {
             &sim_obj("", "", "panic!() self.n = 1;"),
             "expected ';'",
         );
-        // `return error;` is unchanged.
-        iff(
+        // `return error;` is no error exit any more: with no `error` in scope it names
+        // `panic!()`.
+        expect_err(
             "return error.antics",
             &sim_obj("", "", "if self.n == 1 { return error; }"),
+            "'return error;' is no longer the error exit; write 'panic!();'",
         );
     }
 
@@ -262,7 +234,7 @@ mod discard_let {
 }"#;
 
     const HELPERS: &str = "fn ok() -> bool { self.n == 1 }
-    fn fallible() -> Result { if self.n == 2 { return error; } true }
+    fn fallible() -> Result { if self.n == 2 { panic!(); } true }
     fn val() -> i16 { self.n = 3; 7 }
     fn noop() { self.n = 4; }
     #[bhav] fn b(sim: Sim) -> bool { self.n == 5 }";

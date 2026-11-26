@@ -415,6 +415,10 @@ impl<'a> TreeLowerer<'a> {
                 let expected_inner =
                     self.env
                         .resolve_value_type(inner, fn_mod, is_local_fn, param.span)?;
+                // `&mut i16` takes a lenient engine word's cell, seen as the `i16` it holds.
+                if expected_inner == ValueType::I16 && is_engine_flags(lval.value_type()) {
+                    lval.set_value_type(ValueType::I16);
+                }
                 if lval.value_type() != &expected_inner {
                     return Err(Error::at(
                         arg_span,
@@ -730,8 +734,8 @@ impl<'a> TreeLowerer<'a> {
         )
     }
 
-    /// An inline Result uses the same true/false edges as bool. An explicit
-    /// `return error;` still exits the enclosing BHAV, as it does in other helpers.
+    /// An inline Result uses the same true/false edges as bool. `panic!()` still exits the
+    /// enclosing BHAV, as it does in other helpers.
     /// Preserve the meaning of existing user-defined types named Result.
     pub(super) fn helper_returns_condition(
         &self,
@@ -751,10 +755,22 @@ impl<'a> TreeLowerer<'a> {
     /// Whether a bool or Result helper ends in one `return <cond>;`, which
     /// inlines as a branch condition without the return-flag loop wrapper.
     pub(super) fn has_single_inline_tail_return(&self, fn_decl: &FnDecl) -> bool {
-        let Some((V2Stmt::Return { value: Some(_), .. }, prefix)) = fn_decl.body.split_last()
+        let Some((
+            V2Stmt::Return {
+                value: Some(_),
+                bare_error,
+                ..
+            },
+            prefix,
+        )) = fn_decl.body.split_last()
         else {
             return false;
         };
+        // `return error;` (a binding named `error`) keeps the lowering it had when it parsed
+        // as the error exit, which was never a tail return.
+        if *bare_error {
+            return false;
+        }
         !stmts_have_return(prefix)
             && !prefix.iter().any(|s| matches!(s, V2Stmt::Defer { .. }))
             && (self.in_defer() || self.enclosing_cancel_flag().is_none())
