@@ -1992,9 +1992,11 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
     }
     let width = a.size[0];
     // An anchored dialog is flush with the window's top right corner (the
-    // old prototype's placement); any other is centered.
+    // old prototype's placement); any other is centered. One taller than
+    // the window keeps to its bottom either way, so its buttons stay on
+    // screen.
     let rect = if presentation.anchored {
-        Rect::new(size[0] - width, 0, width, height)
+        Rect::new(size[0] - width, 0.min(size[1] - height), width, height)
     } else {
         let y = ((size[1] - height) / 2).min(size[1] - height);
         Rect::new((size[0] - width) / 2, y, width, height)
@@ -4300,6 +4302,22 @@ mod tests {
                     .all(|(_, [x, y])| *x >= laid.rect.x && *y >= 0)
             );
         }
+        // Taller than the window: kept to its bottom, so its buttons are
+        // reachable.
+        let modal_anchored = Presentation {
+            anchored: true,
+            ..Presentation::default()
+        };
+        let tall = layout(
+            [800, 60],
+            &presented("B B B B B B B B B B", 1, modal_anchored),
+            &art,
+        )
+        .unwrap();
+        assert!(tall.rect.height > 60, "{:?}", tall.rect);
+        assert_eq!(tall.rect.y + tall.rect.height, 60);
+        let b = tall.buttons[0];
+        assert!(b.y >= 0 && b.y + b.height <= 60, "{b:?}");
         // Not anchored: centered, modal or not.
         let centered = layout([800, 600], &presented("B", 1, NON_MODAL), &art).unwrap();
         assert_eq!(

@@ -337,7 +337,7 @@ impl NeighborhoodShell {
                     continue;
                 };
                 // Skip system NPC/stray households (`Strays_4000.FAM`).
-                if parsed.export_info.family_id >= 4000 {
+                if sims_vm::caf::is_reserved_pool_family(parsed.export_info.family_id) {
                     continue;
                 }
                 let member_count = parsed
@@ -568,12 +568,7 @@ impl NeighborhoodShell {
         let dir = self.family_export_dir();
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let path = dir.join(export_file_name(&name, family_id));
-        let partial = path.with_extension("FAM.partial");
-        std::fs::write(&partial, &bytes).map_err(|e| format!("{}: {e}", partial.display()))?;
-        if let Err(e) = std::fs::rename(&partial, &path) {
-            let _ = std::fs::remove_file(&partial);
-            return Err(format!("{}: {e}", path.display()));
-        }
+        write_replacing(&path, &bytes)?;
         self.refresh_importable_families();
         Ok(path)
     }
@@ -789,6 +784,42 @@ impl NeighborhoodShell {
     }
 }
 
+/// Writes `bytes` to `path`, replacing it whole or not at all: they go to a
+/// new file beside it, made for this write alone (never one already there,
+/// nor a link), which is closed and then renamed over `path`. The new
+/// file is removed if any step fails.
+fn write_replacing(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let shown = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    let stem = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("export");
+    let (partial, mut file) = loop {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let partial = path.with_file_name(format!(".{stem}.{}.{n}.partial", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
+        {
+            Ok(file) => break (partial, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(shown(&partial, e)),
+        }
+    };
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    let result = written
+        .map_err(|e| shown(&partial, e))
+        .and_then(|()| std::fs::rename(&partial, path).map_err(|e| shown(path, e)));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    result
+}
+
 /// The file name the original gives a family export, `<family name>_<id>.FAM`
 /// (`Export/<name>_<id>.FAM`). Characters a file name cannot hold on every
 /// platform the game runs on become `_`; an empty name becomes `Family`.
@@ -815,7 +846,31 @@ pub(super) fn export_file_name(name: &str, family_id: u16) -> String {
 
 #[cfg(test)]
 mod export_name_tests {
-    use super::export_file_name;
+    use super::{export_file_name, write_replacing};
+
+    #[test]
+    fn an_export_replaces_the_file_whole_and_leaves_nothing_else() {
+        let dir =
+            std::env::temp_dir().join(format!("sims-game-export-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Newbie_7.FAM");
+        write_replacing(&path, b"first").unwrap();
+        write_replacing(&path, b"second, longer").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second, longer");
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["Newbie_7.FAM"], "no partial file is left");
+        // A folder that is not there: an error, and nothing made.
+        let missing = dir.join("gone").join("x.FAM");
+        assert!(write_replacing(&missing, b"x").is_err());
+        assert!(!dir.join("gone").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn export_names_follow_name_underscore_id_and_stay_portable() {

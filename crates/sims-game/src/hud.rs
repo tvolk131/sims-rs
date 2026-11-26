@@ -174,6 +174,9 @@ pub struct Hud {
     /// Interactive state (focus, caret, 500 ms blink, pressed button) of the
     /// active modal dialog.
     dialog_state: DialogState,
+    /// The press held now landed on a non-modal dialog
+    /// ([`Hud::take_non_modal_press`]): its release is the dialog's too.
+    non_modal_press: bool,
     dialog: Option<dialog::Layout>,
     /// Active Sound volume slider being dragged (`0x5f6245..0x5f6336`).
     dragging_slider: Option<VolumeChannel>,
@@ -672,6 +675,7 @@ impl Hud {
             message: None,
             ui_dialog: None,
             dialog_state: DialogState::default(),
+            non_modal_press: false,
             dialog: None,
             dragging_slider: None,
             pressed_options_action: None,
@@ -1796,6 +1800,11 @@ impl Hud {
     /// - `Char(ch)` activates localized Yes (button 0) or No (button 1) on
     ///   non-entry confirmations whose buttons match `STR# 142[3]` / `STR# 142[4]`.
     pub fn confirm_key(&mut self, key: DialogKey) -> Option<Command> {
+        // A non-modal dialog is answered only through its dismiss box: keys
+        // go on to whatever else has them.
+        if !self.has_dialog() {
+            return None;
+        }
         let message = self.active_message()?;
         let count = message.buttons.len();
         if count == 0 {
@@ -1902,6 +1911,20 @@ impl Hud {
         self.has_non_modal_dialog()
             .then(|| self.dialog.as_ref().map(|l| l.rect))
             .flatten()
+    }
+
+    /// Whether `point` is on a non-modal dialog: a press there is the
+    /// dialog's, before any pie menu, held object or tool under it.
+    pub fn over_non_modal_dialog(&self, point: [i32; 2]) -> bool {
+        self.non_modal_rect()
+            .is_some_and(|r| r.contains(point[0], point[1]))
+    }
+
+    /// Whether the press being released landed on a non-modal dialog
+    /// (so its release must not reach what is under the dialog), clearing
+    /// it. Call once per release, after [`Hud::release_dialog`].
+    pub fn take_non_modal_press(&mut self) -> bool {
+        std::mem::take(&mut self.non_modal_press)
     }
 
     /// Updates the native `[control_panel + 0x1ec]` idle-blink flag
@@ -3143,11 +3166,13 @@ impl Hud {
         // A non-modal dialog takes only the presses on it; any other goes on
         // to what is under it.
         let non_modal = self.has_non_modal_dialog();
+        self.non_modal_press = false;
         if let Some(layout) = self
             .dialog
             .clone()
             .filter(|l| !non_modal || l.rect.contains(point[0], point[1]))
         {
+            self.non_modal_press = non_modal;
             if let Some(message) = self.active_message().cloned()
                 && self
                     .dialog_state

@@ -34,11 +34,15 @@ way the original's exports are written. The file goes to:
 - **Name.** It uses the original's `<Name>_<id>.FAM` form. Characters that
   some platform cannot hold in a file name become `_`.
 - **Overwrite.** It replaces an earlier export of the same family.
-- **Atomic write.** The bytes go to a `.FAM.partial` file first, which is
-  then renamed.
+- **Atomic write.** The bytes go to a hidden temporary file beside the
+  target, created fresh for that one write (never an existing file or a
+  link). It is synced, closed and then renamed over the target, and it is
+  removed if any step fails.
 
 The Import picker scans this folder as well, under the label "Exported", so
-an export can be imported back. A notice tells the player the path, or the
+an export can be imported back. The picker skips only the reserved pool
+families (`sims_vm::caf::is_reserved_pool_family`), not every id from 4000
+up. A notice tells the player the path, or the
 reason the export failed.
 
 ## Non-modal, anchored and large dialogs
@@ -67,9 +71,15 @@ Layout and input rules:
   - `has_dialog` and `will_show_dialog` are false;
   - `covers` is true only inside its rect;
   - a press outside it goes on to the game;
+  - a press on it goes to the dialog before an open pie menu, a held Buy
+    object or a Build tool (`Game::dialog_takes`), and its release stays
+    with the dialog (`Hud::take_non_modal_press`);
+  - keys never answer it;
   - the pie menu and camera strip stay open.
 - **Anchored.** The dialog sits flush in the window's top right corner.
   This is the legacy placement and is **unverified** against the original.
+  An anchored dialog taller than the window keeps to the bottom instead, as
+  a centered one does, so its buttons stay on screen.
   Any other dialog is centered, modal or not. The legacy bottom-left
   placement of other non-modal dialogs came from the host and was never
   measured, so it is not ported.
