@@ -1506,13 +1506,19 @@ const NON_YIELDING_CALLS: &[&str] = &[
     "Some",
 ];
 
-/// Methods that never yield.
+/// Methods that never yield: among them every bitflags method, the list forms
+/// (`set_all([A, B])`, [`crate::v2::ast::FLAG_LIST_METHODS`]) too.
 const NON_YIELDING_METHODS: &[&str] = &[
     "is_type",
     "set",
     "clear",
     "contains",
+    "intersects",
     "is_empty",
+    "set_all",
+    "clear_all",
+    "contains_all",
+    "contains_any",
     "play_sound",
     "stop_all_sounds",
     "refresh",
@@ -2634,7 +2640,12 @@ impl FileLinter<'_> {
 
     /// `untyped_engine_field`: `x` is an engine cell by number that has a typed name.
     fn untyped_engine_field(&mut self, x: &V2Expr, parent: Option<&V2Expr>) {
-        let V2Expr::Index { base, index, .. } = x else {
+        let V2Expr::Index {
+            base,
+            index,
+            span: open,
+        } = x
+        else {
             return;
         };
         let V2Expr::Int(n_at, n) = index.as_ref() else {
@@ -2648,7 +2659,9 @@ impl FileLinter<'_> {
             return;
         }
         let n = *n;
-        let (at, typed, field) = match base.as_ref() {
+        // The finding, its typed name, and the root and cell of a `root.cell[N]` (`None` for
+        // `global[N]`).
+        let (at, typed, field, cell) = match base.as_ref() {
             // `world.hour` parses to `global[0]` too: only the spelled-out form counts.
             V2Expr::Ident(at, name)
                 if name == "global" && self.text_at(*at).starts_with("global") =>
@@ -2666,7 +2679,7 @@ impl FileLinter<'_> {
                     writable: true,
                     object_id: false,
                 };
-                (*at, format!("world.{name}"), field)
+                (*at, format!("world.{name}"), field, None)
             }
             V2Expr::Field {
                 base: root, field, ..
@@ -2698,7 +2711,12 @@ impl FileLinter<'_> {
                     self.trial_engine_field(x, parent, *at, root, kind, field, n);
                     return;
                 };
-                (*at, format!("{root}.{}", typed.name), typed)
+                (
+                    *at,
+                    format!("{root}.{}", typed.name),
+                    typed,
+                    Some((root, field)),
+                )
             }
             _ => return,
         };
@@ -2719,9 +2737,48 @@ impl FileLinter<'_> {
                 return;
             }
         }
-        let raw = self.text_at(at);
-        let end = raw.find(']').map_or(raw.len(), |i| i + 1);
-        let raw = raw[..end].to_owned();
+        // The suggestion replaces the text from the finding's column to the first `]`: that
+        // must be the whole cell as written (`global[20]`, `self.data [13]`), on one line, not
+        // `(global)[20]` or a cell with a `]` in a comment.
+        let (Some(start), Some(open)) = (self.offset(at), self.offset(*open)) else {
+            return;
+        };
+        let Some(end) = group_end(self.source, open) else {
+            return;
+        };
+        let raw = self.source[start..end].to_owned();
+        let shaped = match cell {
+            Some((root, cell)) => cell_text_is(&raw, root, cell),
+            None => raw
+                .strip_prefix("global")
+                .is_some_and(|rest| rest.trim_start_matches([' ', '\t', '\r']).starts_with('[')),
+        };
+        // Between the brackets only the number itself, maybe in parentheses: no comment,
+        // no other `]`.
+        let literal = raw
+            .rfind('[')
+            .and_then(|i| raw[i + 1..].strip_suffix(']'))
+            .is_some_and(|n| {
+                let mut n = n.trim_matches([' ', '\t', '\r']);
+                while let Some(inner) = n.strip_prefix('(').and_then(|n| n.strip_suffix(')')) {
+                    n = inner.trim_matches([' ', '\t', '\r']);
+                }
+                !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            });
+        // `global[20]flag_set ..` would read `world.expansionsflag_set ..`.
+        let glued = self.source[end..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if !self.column_is_byte(at)
+            || raw.contains('\n')
+            || raw.find(']') != Some(raw.len() - 1)
+            || !shaped
+            || !literal
+            || glued
+        {
+            return;
+        }
         self.emit(
             UNTYPED_ENGINE_FIELD,
             at,
@@ -3559,7 +3616,7 @@ impl FileLinter<'_> {
                         UNBOUNDED_LOOP_WITHOUT_YIELD,
                         *span,
                         "this loop never exits and never yields".to_owned(),
-                        Some("add `idle();` / `sleep(n);` inside it, or a `break` / `return`; a loop that never yields runs until the VM's per-tick iteration limit errors the object out".to_owned()),
+                        Some("add `idle(n);` / `sleep(n);` inside it, or a `break` / `return`; a loop that never yields runs until the VM's per-tick iteration limit errors the object out".to_owned()),
                         None,
                         None,
                     );
@@ -6075,8 +6132,9 @@ impl FileLinter<'_> {
             return;
         };
         let src = self.source;
-        // The receiver as written, where it starts, and its `std::flags` type.
-        let (start, receiver, ty) = match place {
+        // The receiver as written, where it starts (as a span and as a byte offset), and its
+        // `std::flags` type.
+        let (at, start, receiver, ty) = match place {
             V2Expr::Field {
                 base: root, field, ..
             } => {
@@ -6100,7 +6158,7 @@ impl FileLinter<'_> {
                 let Some(start) = self.offset(*at) else {
                     return;
                 };
-                (start, format!("{root}.{field}"), ty)
+                (*at, start, format!("{root}.{field}"), ty)
             }
             // `world.expansions`, which the parser reads as `global[20]` with the span of
             // its dot. A `global[20]` written out has no `world.` before its span.
@@ -6123,10 +6181,20 @@ impl FileLinter<'_> {
                 {
                     return;
                 }
-                (start, receiver.to_owned(), "Expansions")
+                // The finding points at `world`, as at any receiver's start.
+                let at = Span {
+                    line: span.line,
+                    column: span.column.saturating_sub("world".len()),
+                };
+                (at, start, receiver.to_owned(), "Expansions")
             }
             _ => return,
         };
+        // The lift places a fix by its column as a byte offset: after a string with
+        // multi-byte characters on the line, the two differ.
+        if !self.column_is_byte(at) {
+            return;
+        }
         let V2Expr::Path(bit_at, segs) = bit else {
             return;
         };
@@ -6136,7 +6204,6 @@ impl FileLinter<'_> {
         if !self.std_flag_spelling(ty, ty_name) || scope.types.contains(ty_name) {
             return;
         }
-        let at = place.span();
         let Some(bit_start) = self.offset(*bit_at) else {
             return;
         };
