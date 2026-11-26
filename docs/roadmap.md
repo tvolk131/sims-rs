@@ -3783,6 +3783,23 @@ through their public interfaces only; the simulation never depends on it.
       In behavioral mode inline raw statements fall from 17,165 to 14,553
       and lint findings from 25,591 to 266.
     - All three keep 0 DIFFERENT and 0 timeouts in both modes.
+- **Done (Batch 19 — `.antics` v2.1 Rust-idiom polish, Step 1, #474–#476):**
+  - **The `.antics` v2 language (Track 8, #475):**
+    - `panic!()` is the error exit. It builds the same bytes as
+      `return error;`, but it is always the error exit, even when a
+      binding named `error` is in scope.
+    - `let _ = expr;` discards a value on purpose, and makes no local.
+  - **Lint (Track 7, #474):** a new `collapsible_else_if` warning reports
+    `else { if .. }` when the block holds one `if` chain and nothing else.
+    On the behavioral lift corpus it found 630, and every one collapses to
+    identical `.air`.
+  - **Lift (Track 9, #476):**
+    - functions are named by label (`have_a_meal`, not `have_a_meal_4098`);
+    - `else if`, `sim.motive[Motive::Hunger]`, and `Table::entry` for
+      BCON reads;
+    - braced `use` lines;
+    - negated tests written the other way round where that is proven.
+    Each form is kept only when the object builds the same bytes.
 - **Next (in flight, in order of player impact):**
   - **Travel follow-ups:**
     - A hop that leaves travelers behind (Go Somewhere Else for one
@@ -3828,6 +3845,9 @@ through their public interfaces only; the simulation never depends on it.
       block's `if` arms, which leaves 2 strict alarm trees non-idiomatic.
       Lowering should keep the arms as written, or the lift should spell
       joined arms (#473).
+    - `extern bcon` entries have no unread-entry check. Path reads of
+      them are recorded, so one can be added once lifted files are
+      checked against it.
     - Readable locals: about 9,000 one-statement raw blocks are
       local-slot moves. This changes strict output, so it needs its own
       PR (#460).
