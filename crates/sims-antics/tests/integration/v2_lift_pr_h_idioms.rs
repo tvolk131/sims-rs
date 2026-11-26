@@ -203,7 +203,7 @@ fn a_tree_both_contexts_call_is_written_inherit() {
         &lifted,
         &[
             "label = \"Ring\"",
-            "context = inherit)]\n    fn ring_4300() {",
+            "context = inherit)]\n    fn ring() {",
             "me.person[3] = 1;",
             "me.motive[2] = 4;",
             "temp[0] = stack_obj.attr[1];",
@@ -228,7 +228,7 @@ fn argless_calls_between_sim_trees_name_the_sim() {
     }
 }"#,
     );
-    has(&lifted, &["tune_4300(sim)"]);
+    has(&lifted, &["tune(sim)"]);
     assert!(!lifted.contains("raw"), "{lifted}");
 }
 

@@ -210,8 +210,8 @@ fn synthetic_lamp_round_trips_with_idioms() {
         "debit_funds(5, category: 0);",
         "random_into(temp[2], 10);",
         "label = \"Can_TurnOn\"",
-        "fn can_turn_on_4098(sim: Sim) {",
-        "sim.motive[13] += SynthLampTuning.e0;",
+        "fn can_turn_on(sim: Sim) {",
+        "sim.motive[Motive::Room] += SynthLampTuning::e0;",
         "guid: 0x7E00_0001;",
         "bcon 4097 \"Tuning\" {",
         // The FWAV keeps its ID and event name.
@@ -228,7 +228,7 @@ fn synthetic_counter_round_trips() {
     let source = assert_round_trip("synth-counter.antics", COUNTER);
     assert!(source.contains("while self.attr_3 > 0"), "{source}");
     assert!(source.contains("#[slot(3)] state attr_3: i16;"), "{source}");
-    assert!(source.contains("Limits.e1"), "{source}");
+    assert!(source.contains("Limits::e1"), "{source}");
     // The census loop's cursor is `stack_obj` itself (no loop local) since v2 PR F.
     assert!(source.contains("for o in lot.objects() {"), "{source}");
     assert!(!source.contains("set_to_next"), "{source}");
@@ -303,7 +303,7 @@ fn zero_local_loops_sounds_and_frame_kinds_round_trip() {
         "for p in lot.sims() {",
         "if p.kind == 0 {",
         "temp[1] += p.personality.playful;",
-        "#[bhav(id = 4304, label = \"Kinded\", args = 0, locals = 0, format = 0x8002, revision = 0, kind = 3)]\n    fn kinded_4304() {",
+        "#[bhav(id = 4304, label = \"Kinded\", args = 0, locals = 0, format = 0x8002, revision = 0, kind = 3)]\n    fn kinded() {",
         "sound sound_0 = fwav(0, wav: \"synth_chime\");",
         "sound sound_7 = fwav(7, wav: \"synth_chime\");",
         "play_sound(sound_0);",
