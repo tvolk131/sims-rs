@@ -846,9 +846,9 @@ fn lifts_handle_flags_and_preserves_numeric_flag_operations() {
         "stack_obj.flags = self.flags;",
         "if stack_obj.flags.is_empty() {",
         "self.flags = stack_obj.flags;",
-        "stack_obj.flags flag_set ObjectFlags::FloatsOnWater;",
-        "stack_obj.flags flag_test ObjectFlags::FloatsOnWater",
-        "stack_obj.flags flag_clear ObjectFlags::FloatsOnWater;",
+        "stack_obj.flags.set(ObjectFlags::FloatsOnWater);",
+        "stack_obj.flags.contains(ObjectFlags::FloatsOnWater)",
+        "stack_obj.flags.clear(ObjectFlags::FloatsOnWater);",
     ] {
         assert!(lifted.contains(spelling), "missing {spelling}\n{lifted}");
     }

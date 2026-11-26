@@ -498,7 +498,16 @@ fn extern_fn_text(f: &ExternFnDecl) -> String {
         ReturnAbi::Void => String::new(),
         ReturnAbi::Bool => " -> bool".to_owned(),
         ReturnAbi::Result => " -> Result".to_owned(),
-        ReturnAbi::Value { ty, temp } => format!(" -> {} (temp {temp})", ty.display_name()),
+        ReturnAbi::Value {
+            ty,
+            temp,
+            option: false,
+        } => format!(" -> {} (temp {temp})", ty.display_name()),
+        ReturnAbi::Value {
+            ty,
+            temp,
+            option: true,
+        } => format!(" -> Option<{}> (temp {temp})", ty.display_name()),
         ReturnAbi::ResultValue { ty, temp } => {
             format!(" -> Result<{}> (temp {temp})", ty.display_name())
         }
@@ -507,9 +516,14 @@ fn extern_fn_text(f: &ExternFnDecl) -> String {
 }
 
 /// Whether two extern fns call their tree the same way: parameter types and slots, and the
-/// return ABI (parameter names may differ).
+/// return ABI (parameter names may differ). `-> bool` and `-> Option<T>` call it the same way
+/// (the second also reads the temp the true exit fills), so a declaration written as `-> bool`
+/// still merges with one that types the value. Two `Option` declarations must agree on the type
+/// and the temp.
 fn same_extern_abi(a: &ExternFnDecl, b: &ExternFnDecl) -> bool {
-    a.ret == b.ret
+    let option = |r: &ReturnAbi| matches!(r, ReturnAbi::Value { option: true, .. });
+    let bool_and_option = |x: &ReturnAbi, y: &ReturnAbi| *x == ReturnAbi::Bool && option(y);
+    (a.ret == b.ret || bool_and_option(&a.ret, &b.ret) || bool_and_option(&b.ret, &a.ret))
         && a.params.len() == b.params.len()
         && a.params
             .iter()
@@ -587,7 +601,10 @@ pub(crate) fn merge_extern_mods(
             ));
         }
         if let Some(b) = base.fns.iter().find(|b| b.name == f.name) {
+            // One name keeps one meaning: its declarations must agree exactly, so the merge does
+            // not depend on which side comes first.
             let same = b.id == f.id
+                && b.ret == f.ret
                 && same_extern_abi(b, f)
                 && b.params
                     .iter()

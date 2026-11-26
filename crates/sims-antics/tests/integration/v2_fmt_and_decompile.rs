@@ -211,7 +211,7 @@ fn synthetic_lamp_round_trips_with_idioms() {
         "random_into(temp[2], 10);",
         "label = \"Can_TurnOn\"",
         "fn can_turn_on(sim: Sim) {",
-        "sim.motive[Motive::Room] += SynthLampTuning::e0;",
+        "sim.motive.room += SynthLampTuning::e0;",
         "guid: 0x7E00_0001;",
         "bcon 4097 \"Tuning\" {",
         // The FWAV keeps its ID and event name.
