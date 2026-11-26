@@ -31,7 +31,7 @@ use crate::verify::{
     EquivOptions, EquivResult, LiveContext, LiveOptions, apply_operand_pad,
     canonicalize_primitive_operands, check_bhav_equivalent_combined, same_tree_bytes,
 };
-use sims_formats::behavior::{InteractionTable, ObjectDefinition};
+use sims_formats::behavior::{Instruction, InteractionTable, ObjectDefinition};
 use sims_formats::iff::{Chunk, Iff};
 use sims_formats::strings::StringTable;
 use std::borrow::Cow;
@@ -273,6 +273,7 @@ pub fn decompile_iff_to_v2_report(
                         || plan.drop_all_extras(&generated)
                         || plan.number_all_raw_bcons(&generated));
                 if !unblamed
+                    && !tree.is_some_and(|id| plan.drop_pin(id, &generated))
                     && !tree.is_some_and(|id| plan.add_frame(&model, id))
                     && !tree.is_some_and(|id| plan.keep_temps_raw(id, &generated))
                     && !tree.is_some_and(|id| plan.unmerge(id, &generated))
@@ -332,7 +333,8 @@ pub fn decompile_iff_to_v2_report(
                 }
                 if !changed {
                     for &id in &unproven {
-                        changed |= plan.keep_temps_raw(id, &generated)
+                        changed |= plan.pin_nodes(&model, id, &generated, &recompiled)
+                            || plan.keep_temps_raw(id, &generated)
                             || plan.fix_locals(id)
                             || plan.unmerge(id, &generated)
                             || plan.drop_wave3(id, &generated)
@@ -345,7 +347,7 @@ pub fn decompile_iff_to_v2_report(
                             || plan.number_raw_bcons(id, &generated);
                     }
                 }
-                if changed {
+                if changed || plan.share_large(&model, &generated, &recompiled) {
                     continue;
                 }
                 let (text, recompiled, checks) = model.type_engine_fields(
@@ -1265,9 +1267,178 @@ fn matching_braces(tokens: &[crate::v2::lexer::Token]) -> Option<BTreeMap<usize,
     open.is_empty().then_some(out)
 }
 
+/// The `std::globals` trees declared `#[ret(temp = 0)] .. -> Option<T>`, by name, and the
+/// name an `if let` binds their value to. A unit test keeps the list in step with `std`.
+const OPTION_CALLS: [(&str, &str); 2] = [
+    ("take_elapsed_periods", "periods"),
+    ("find_companion", "companion"),
+];
+
+/// Every `if globals::f(..) {` whose callee leaves its value in `temp[0]` when it returns
+/// true ([`OPTION_CALLS`]) and whose then block reads that value, as `if let Some(v) =
+/// globals::f(..) {` with the reads written `v`; and every `if !globals::f(..) { .. }`
+/// with no `else` whose following statements read it, as `let Some(v) = globals::f(..)
+/// else { .. };`. One group of rewrites per statement.
+/// - The reads are those before anything could change `temp[0]`: from the block's start
+///   (the statement's end) to the block's end, the first call (any `(` after a name), the
+///   first `raw { }` or the first write of a temp.
+/// - A file that already spells the binding's name keeps the `if` as written. `raw { }`
+///   bodies are one token.
+fn if_let_spellings(text: &str) -> Vec<Vec<Rewrite>> {
+    use crate::v2::lexer::{TokenKind as K, tokenize};
+    let Ok(tokens) = tokenize(text) else {
+        return Vec::new();
+    };
+    let Some(braces) = matching_braces(&tokens) else {
+        return Vec::new();
+    };
+    let offsets = TokenOffsets::new(text);
+    let kind = |k: usize| tokens.get(k).map(|t| &t.kind);
+    let ident = |k: usize, w: &str| matches!(kind(k), Some(K::Ident(s)) if s == w);
+    let spelled = |w: &str| {
+        tokens
+            .iter()
+            .any(|t| matches!(&t.kind, K::Ident(s) if s == w))
+    };
+    // The rewrites of the `temp[0]` reads from token `k` on, up to the first change of a
+    // temp or the `}` that closes the block `k` is in.
+    let reads = |mut k: usize, name: &str| -> Vec<Rewrite> {
+        let mut out = Vec::new();
+        let mut depth = 0usize;
+        while let Some(t) = kind(k) {
+            match t {
+                K::LBrace => depth += 1,
+                K::RBrace if depth == 0 => break,
+                K::RBrace => depth -= 1,
+                K::RawBlock(_) => break,
+                K::Ident(_) if kind(k + 1) == Some(&K::LParen) => break,
+                _ => {}
+            }
+            let is_temp = ident(k, "temp")
+                && kind(k + 1) == Some(&K::LBracket)
+                && matches!(kind(k + 2), Some(K::Int(_)))
+                && kind(k + 3) == Some(&K::RBracket);
+            if !is_temp {
+                k += 1;
+                continue;
+            }
+            let written = matches!(
+                kind(k + 4),
+                Some(
+                    K::Assign
+                        | K::PlusEq
+                        | K::MinusEq
+                        | K::StarEq
+                        | K::SlashEq
+                        | K::PercentEq
+                        | K::AmpEq
+                        | K::PipeEq
+                        | K::CaretEq
+                )
+            ) || (k > 0 && (kind(k - 1) == Some(&K::Amp) || ident(k - 1, "mut")));
+            if written {
+                break;
+            }
+            if kind(k + 2) == Some(&K::Int(0))
+                && let (Some(a), Some(b)) =
+                    (offsets.of(&tokens[k]), token_end(&offsets, &tokens[k + 3]))
+            {
+                out.push(Rewrite {
+                    range: a..b,
+                    text: name.to_owned(),
+                });
+            }
+            k += 4;
+        }
+        out
+    };
+    let mut out = Vec::new();
+    for i in 0..tokens.len() {
+        if !ident(i, "if") {
+            continue;
+        }
+        // `if [!] globals :: f (`
+        let negated = kind(i + 1) == Some(&K::Bang);
+        let g = i + 1 + usize::from(negated);
+        if !ident(g, "globals") || kind(g + 1) != Some(&K::ColonColon) {
+            continue;
+        }
+        let Some(K::Ident(callee)) = kind(g + 2) else {
+            continue;
+        };
+        let Some(&(_, name)) = OPTION_CALLS.iter().find(|(f, _)| f == callee) else {
+            continue;
+        };
+        if kind(g + 3) != Some(&K::LParen) || spelled(name) {
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut k = g + 3;
+        let close = loop {
+            match kind(k) {
+                Some(K::LParen) => depth += 1,
+                Some(K::RParen) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break Some(k);
+                    }
+                }
+                Some(K::LBrace | K::RBrace | K::Semicolon) | None => break None,
+                _ => {}
+            }
+            k += 1;
+        };
+        let Some(open) = close.map(|c| c + 1) else {
+            continue;
+        };
+        let (Some(K::LBrace), Some(&end)) = (kind(open), braces.get(&open)) else {
+            continue;
+        };
+        let (Some(at), Some(callee_at)) = (offsets.of(&tokens[i]), offsets.of(&tokens[g])) else {
+            continue;
+        };
+        let mut group = Vec::new();
+        if negated {
+            let (Some(open_at), Some(end_at)) =
+                (offsets.of(&tokens[open]), offsets.of(&tokens[end]))
+            else {
+                continue;
+            };
+            if ident(end + 1, "else") {
+                continue;
+            }
+            group.push(Rewrite {
+                range: at..callee_at,
+                text: format!("let Some({name}) = "),
+            });
+            group.push(Rewrite {
+                range: open_at..open_at,
+                text: "else ".to_owned(),
+            });
+            group.push(Rewrite {
+                range: end_at..end_at + 1,
+                text: "};".to_owned(),
+            });
+            // The `else` block must leave: the build refuses one that falls through.
+            group.extend(reads(end + 1, name));
+        } else {
+            group.push(Rewrite {
+                range: callee_at..callee_at,
+                text: format!("let Some({name}) = "),
+            });
+            group.extend(reads(open + 1, name));
+        }
+        if group.iter().any(|r| r.text == name) {
+            out.push(group);
+        }
+    }
+    out
+}
+
 /// The cells and flag operations that read better by name, as rewrites:
 /// - `h.motive[Motive::Hunger]` as `h.motive.hunger`;
 /// - `h.person[10]` (a skill word) as `h.skill.cooking`;
+/// - `h.data[51]` as `h.light`;
 /// - `place flag_set Type::Flag;` as `place.set(Type::Flag);` (`flag_clear` as `.clear`);
 /// - `place flag_test Type::Flag` as `place.contains(Type::Flag)`, and `!(..)` around it as
 ///   `!place.contains(..)`.
@@ -1352,6 +1523,24 @@ fn cell_spellings(text: &str, tables: &BTreeSet<&str>) -> Vec<(Option<String>, R
                 Rewrite {
                     range,
                     text: format!("skill.{skill}"),
+                },
+            ));
+            continue;
+        }
+        // `h.data[51]`: the light the object gives (`self.light`), a word lint
+        // `untyped_engine_field` may not name yet.
+        if p == i + 3
+            && ident(i + 2, "data")
+            && kind(p) == Some(&K::LBracket)
+            && kind(p + 1) == Some(&K::Int(51))
+            && kind(p + 2) == Some(&K::RBracket)
+            && let Some(range) = span(i + 2, p + 2)
+        {
+            out.push((
+                None,
+                Rewrite {
+                    range,
+                    text: "light".to_owned(),
                 },
             ));
             continue;
@@ -2862,6 +3051,15 @@ impl Model {
             let base = text.clone();
             let ok = |g: &[Vec<Rewrite>]| same(&apply_groups(&base, g));
             let kept = keep_joint(&groups, &ok, POLISH_CELL_BUILDS);
+            text = apply_groups(&text, &kept);
+        }
+        // `if let Some(v) = globals::f()` and `let Some(v) = globals::f() else { .. };`, one
+        // statement at a time.
+        let if_lets = if_let_spellings(&text);
+        if !if_lets.is_empty() {
+            let base = text.clone();
+            let ok = |g: &[Vec<Rewrite>]| same(&apply_groups(&base, g));
+            let kept = keep_joint(&if_lets, &ok, POLISH_CELL_BUILDS);
             text = apply_groups(&text, &kept);
         }
         // Behavioral mode: locals without `#[slot]`, then arguments by name. Every function's
@@ -5254,6 +5452,64 @@ struct Plan {
     /// [`Plan::grow_locals`]) was not proven: a dialog's `$Local` tokens read the frame, so
     /// the idiom that needed the words goes raw instead.
     fixed_locals: BTreeSet<u16>,
+    /// Tree ID -> the text of the tree (written without a pin) that a node pin was worked
+    /// out for, and the pin: `None` once it was tried and none is kept (see
+    /// [`Plan::pin_nodes`]). A pin applies only while the tree is written as that text.
+    pins: BTreeMap<u16, (String, Option<NodePin>)>,
+}
+
+/// `share_tails` and a `node_order` written in a tree's `#[bhav(..)]` header, which
+/// renumber the nodes it compiles to ([`crate::node_order`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NodePin {
+    share_tails: bool,
+    /// `None` when the nodes keep their order.
+    order: Option<Vec<u16>>,
+}
+
+impl NodePin {
+    /// The header fields, each after `, `.
+    fn fields(&self) -> String {
+        let mut out = String::new();
+        if self.share_tails {
+            out.push_str(", share_tails");
+        }
+        if let Some(order) = &self.order {
+            let order: Vec<String> = order.iter().map(u16::to_string).collect();
+            out.push_str(&format!(", node_order = [{}]", order.join(", ")));
+        }
+        out
+    }
+
+    /// The pin that makes `compiled` (a tree built without one) compile to `original`'s
+    /// nodes exactly: a `node_order` alone, or `share_tails` with or without one. `None` when
+    /// the nodes already match or no pin makes them.
+    fn matching(compiled: &[Instruction], original: &[Instruction]) -> Option<Self> {
+        if let Some(order) = crate::node_order::match_node_order(compiled, original) {
+            return (!is_identity(&order)).then_some(Self {
+                share_tails: false,
+                order: Some(order),
+            });
+        }
+        let shared = shared_tails(compiled)?;
+        let order = crate::node_order::match_node_order(&shared, original)?;
+        Some(Self {
+            share_tails: true,
+            order: (!is_identity(&order)).then_some(order),
+        })
+    }
+}
+
+/// `compiled` with the nodes that run alike merged (`share_tails`), or `None` when nothing
+/// merges.
+fn shared_tails(compiled: &[Instruction]) -> Option<Vec<Instruction>> {
+    let wide = crate::node_order::widen(compiled)?;
+    let shared = crate::node_order::share_tails(&wide, crate::lower::MAX_BHAV_NODES).ok()?;
+    (shared.len() < wide.len()).then(|| crate::node_order::narrow(&shared))
+}
+
+fn is_identity(order: &[u16]) -> bool {
+    order.iter().enumerate().all(|(i, &n)| usize::from(n) == i)
 }
 
 impl Plan {
@@ -5339,6 +5595,7 @@ impl Plan {
             pre_wave2: BTreeSet::new(),
             pre_wave3: BTreeSet::new(),
             fixed_locals: BTreeSet::new(),
+            pins: BTreeMap::new(),
         }
     }
 
@@ -5406,7 +5663,8 @@ impl Plan {
         id: u16,
         message: &str,
     ) -> bool {
-        self.grow_locals(model, id, message)
+        self.drop_pin(id, generated)
+            || self.grow_locals(model, id, message)
             || self.add_frame(model, id)
             || self.keep_temps_raw(id, generated)
             || self.unmerge(id, generated)
@@ -5417,6 +5675,95 @@ impl Plan {
             || self.drop_extras(id, generated)
             || self.number_raw_bcons(id, generated)
             || self.lower_tree(model, id)
+    }
+
+    /// Pins tree `id`'s nodes (see [`NodePin::matching`]) when the round wrote it without a
+    /// pin, it is not proven, and a pin makes it compile to the original's nodes exactly. A
+    /// pinned tree that is still not proven loses its pin. Each text is tried once.
+    /// - The node numbers are what strict mode compares, so a structured tree that runs the
+    ///   original's nodes in another order is proven with its order pinned.
+    /// - An indexed tree (kind 4) enters at the node its first argument names: none may move.
+    fn pin_nodes(
+        &mut self,
+        model: &Model,
+        id: u16,
+        generated: &Generated,
+        recompiled: &RecompiledFile,
+    ) -> bool {
+        if self.drop_pin(id, generated) {
+            return true;
+        }
+        let (Some(text), Some(t), Some(b)) = (
+            generated.tree_texts.get(&id),
+            model.tree(id),
+            recompiled.trees.get(&id),
+        ) else {
+            return false;
+        };
+        if self
+            .pins
+            .get(&id)
+            .is_some_and(|(written, _)| written == text)
+        {
+            return false;
+        }
+        let pin = (t.original.kind != 4)
+            .then(|| NodePin::matching(&b.instructions, &t.original.instructions))
+            .flatten();
+        let found = pin.is_some();
+        self.pins.insert(id, (text.clone(), pin));
+        found
+    }
+
+    /// Drops tree `id`'s pin when the round wrote it with one: the build refused it (an
+    /// inline call to a callee with more than four arguments moves with the nodes), or the
+    /// tree is not proven with it.
+    fn drop_pin(&mut self, id: u16, generated: &Generated) -> bool {
+        if !generated.pinned.contains(&id) {
+            return false;
+        }
+        match self.pins.get_mut(&id) {
+            Some((_, pin)) => pin.take().is_some(),
+            None => false,
+        }
+    }
+
+    /// Gives `share_tails` to every tree the round compiled to more nodes than lint
+    /// `frame_headroom` allows (and its original holds no more), when merging its nodes
+    /// brings it down. Each text is tried once; a tree not proven with it loses it again
+    /// ([`Self::pin_nodes`]). The order is pinned too when that makes the nodes the original's.
+    fn share_large(
+        &mut self,
+        model: &Model,
+        generated: &Generated,
+        recompiled: &RecompiledFile,
+    ) -> bool {
+        let mut changed = false;
+        for t in model.trees.iter().filter(|t| t.omitted.is_none()) {
+            let (Some(text), Some(b)) =
+                (generated.tree_texts.get(&t.id), recompiled.trees.get(&t.id))
+            else {
+                continue;
+            };
+            if t.original.kind == 4
+                || b.instructions.len() <= crate::v2::lint::FRAME_NODE_WARN
+                || t.original.instructions.len() > crate::v2::lint::FRAME_NODE_WARN
+                || self
+                    .pins
+                    .get(&t.id)
+                    .is_some_and(|(written, _)| written == text)
+            {
+                continue;
+            }
+            let pin = shared_tails(&b.instructions).map(|shared| NodePin {
+                share_tails: true,
+                order: crate::node_order::match_node_order(&shared, &t.original.instructions)
+                    .filter(|order| !is_identity(order)),
+            });
+            changed |= pin.is_some();
+            self.pins.insert(t.id, (text.clone(), pin));
+        }
+        changed
     }
 
     /// Writes lifecycle block `id` with its whole header as `#[frame(..)]` from now on, when
@@ -5735,6 +6082,10 @@ struct Generated {
     wave3: BTreeSet<u16>,
     /// Raw-level trees whose lines name BCON entries.
     raw_bcons_named: BTreeSet<u16>,
+    /// Tree ID -> the tree's text as written without a pin (see [`Plan::pins`]).
+    tree_texts: BTreeMap<u16, String>,
+    /// Trees written with a pin.
+    pinned: BTreeSet<u16>,
     /// 0-based lines holding the `variant` members.
     variant_lines: std::ops::Range<usize>,
     /// 0-based lines holding the `strings` members.
@@ -5774,6 +6125,8 @@ impl Model {
         let mut wave2_trees = BTreeSet::new();
         let mut wave3_trees = BTreeSet::new();
         let mut raw_bcons_named = BTreeSet::new();
+        let mut tree_texts = BTreeMap::new();
+        let mut pinned = BTreeSet::new();
         out.line("// Decompiled by `sims-antics lift --v2`.");
         if self.behavioral {
             for line in BEHAVIORAL_HEADER {
@@ -5934,6 +6287,8 @@ impl Model {
             let start = out.lines.len();
             let sim = plan.sim(t);
             let as_lifecycle = t.lifecycle.filter(|_| !plan.standalone.contains(&t.id));
+            // The `#[id(..)]` or `#[bhav(..)]` line, which a pin goes in.
+            let mut header_line = start;
             match as_lifecycle {
                 Some(kind) if !plan.framed.contains(&t.id) => {
                     out.line(format!("#[id({})]", t.id));
@@ -5943,19 +6298,7 @@ impl Model {
                 Some(kind) => {
                     // The block keeps the tree's own header, as a plain tree does.
                     let b = &t.original;
-                    let frame_kind = if b.kind == 0 {
-                        String::new()
-                    } else {
-                        format!(", kind = {}", b.kind)
-                    };
-                    out.line(format!(
-                        "#[bhav(id = {}, args = {}, locals = {}, format = {:#06x}, revision = {}{frame_kind})]",
-                        t.id,
-                        b.args,
-                        plan.locals(t),
-                        b.format,
-                        b.revision,
-                    ));
+                    out.line(lifecycle_header(t, plan));
                     write_frame_allow(&mut out, b);
                     out.line(format!("{} {{", kind.keyword()));
                 }
@@ -5967,6 +6310,7 @@ impl Model {
                         ));
                     }
                     let b = &t.original;
+                    header_line = out.lines.len();
                     let mut params = Vec::new();
                     if sim {
                         params.push("sim: Sim".to_owned());
@@ -6135,6 +6479,22 @@ impl Model {
             }
             out.indent -= 1;
             out.line("}");
+            let text = out.lines[start..].join("\n");
+            if let Some((written, Some(pin))) = plan.pins.get(&t.id)
+                && *written == text
+            {
+                let line = &mut out.lines[header_line];
+                let indent = line.len() - line.trim_start().len();
+                let header = if as_lifecycle.is_some() && !plan.framed.contains(&t.id) {
+                    lifecycle_header(t, plan)
+                } else {
+                    line.trim_start().to_owned()
+                };
+                let header = header.strip_suffix(")]").unwrap_or(&header);
+                *line = format!("{}{header}{})]", &line[..indent], pin.fields());
+                pinned.insert(t.id);
+            }
+            tree_texts.insert(t.id, text);
             tree_ranges.push((t.id, start, out.lines.len() - 1));
             raw_counts.insert(t.id, raw_count);
             out.line("");
@@ -6192,10 +6552,30 @@ impl Model {
             wave2: wave2_trees,
             wave3: wave3_trees,
             raw_bcons_named,
+            tree_texts,
+            pinned,
             variant_lines,
             strings_lines,
         }
     }
+}
+
+/// The `#[bhav(..)]` header of lifecycle block `t` that keeps the tree's own header.
+fn lifecycle_header(t: &TreeModel, plan: &Plan) -> String {
+    let b = &t.original;
+    let frame_kind = if b.kind == 0 {
+        String::new()
+    } else {
+        format!(", kind = {}", b.kind)
+    };
+    format!(
+        "#[bhav(id = {}, args = {}, locals = {}, format = {:#06x}, revision = {}{frame_kind})]",
+        t.id,
+        b.args,
+        plan.locals(t),
+        b.format,
+        b.revision,
+    )
 }
 
 /// `text` as the inside of a v2 string literal.
@@ -9000,6 +9380,23 @@ mod tests {
                 "if after_raw() {} => let _ = after_raw();"
             ]
         );
+    }
+
+    /// [`OPTION_CALLS`] are the `std::globals` trees that return `Option<T>` in `temp[0]`.
+    #[test]
+    fn option_calls_are_the_std_option_trees() {
+        let std = include_str!("std/globals.antics");
+        let options: Vec<&str> = std
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//") && l.contains("-> Option<"))
+            .collect();
+        assert!(options.iter().all(|l| l.contains("#[ret(temp = 0)]")));
+        let declared: Vec<&str> = options
+            .iter()
+            .filter_map(|l| l.split("fn ").nth(1)?.split('(').next())
+            .collect();
+        let listed: Vec<&str> = OPTION_CALLS.iter().map(|(f, _)| *f).collect();
+        assert_eq!(declared, listed);
     }
 
     /// Every `std::motives` function that sleeps is in [`SLEEPING_CALLS`].
