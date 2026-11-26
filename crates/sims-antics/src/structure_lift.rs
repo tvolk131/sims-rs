@@ -1845,7 +1845,7 @@ pub fn lift_bhav_structured_with_context(
     callee_arities: Option<&BTreeMap<u16, usize>>,
     symbols: Option<&LiftSymbols>,
 ) -> StructuredLiftOutcome {
-    lift_structured(chunk, opts, callee_arities, symbols, false)
+    lift_structured(chunk, opts, callee_arities, symbols, false, true)
 }
 
 /// [`lift_bhav_structured_with_arities`], writing each two-way `if`/`else` with the branch
@@ -1859,7 +1859,21 @@ pub fn lift_bhav_structured_in_node_order(
     opts: LiftOptions,
     callee_arities: Option<&BTreeMap<u16, usize>>,
 ) -> StructuredLiftOutcome {
-    lift_structured(chunk, opts, callee_arities, None, true)
+    lift_structured(chunk, opts, callee_arities, None, true, true)
+}
+
+/// [`lift_bhav_structured_with_arities`] (or, with `node_order`,
+/// [`lift_bhav_structured_in_node_order`]) with no joins: a tail both branches of an `if`
+/// share is copied into each, as before joins. A tree that copies no tail lifts to the
+/// same text.
+#[must_use]
+pub fn lift_bhav_structured_copying_tails(
+    chunk: &BhavChunk,
+    opts: LiftOptions,
+    callee_arities: Option<&BTreeMap<u16, usize>>,
+    node_order: bool,
+) -> StructuredLiftOutcome {
+    lift_structured(chunk, opts, callee_arities, None, node_order, false)
 }
 
 fn lift_structured(
@@ -1868,6 +1882,7 @@ fn lift_structured(
     callee_arities: Option<&BTreeMap<u16, usize>>,
     symbols: Option<&LiftSymbols>,
     node_order: bool,
+    joins: bool,
 ) -> StructuredLiftOutcome {
     let scoped = symbols.map(|s| s.for_caller(chunk.id));
     let symbols = scoped.as_deref();
@@ -2000,17 +2015,35 @@ fn lift_structured(
         node_order,
         emitted_nodes: 0,
         max_emitted_nodes: 245, // Stay safely under MAX_BHAV_NODES (251)
+        joins: false,
+        join_regions: Vec::new(),
     };
 
-    if emitter
-        .emit_region(0, None, None, &mut BTreeSet::new(), 1, false)
-        .is_err()
-    {
-        return StructuredLiftOutcome::Unstructured;
-    }
-
-    emitter.out.push_str("}\n");
-    StructuredLiftOutcome::Lifted(emitter.out)
+    // The body with each tail both branches of an `if` share copied into each branch, and
+    // (with `joins`) with each such tail written once, after a `while true { }` the branches
+    // `break` out of. The joined body is kept only when it writes fewer nodes: a join that
+    // saves no node adds a loop for nothing.
+    let header_len = emitter.out.len();
+    let mut emit = |joins: bool| {
+        emitter.out.truncate(header_len);
+        emitter.emitted_nodes = 0;
+        emitter.joins = joins;
+        emitter.join_regions.clear();
+        emitter
+            .emit_region(0, None, None, &mut BTreeSet::new(), 1, false)
+            .ok()?;
+        Some((emitter.out.clone(), emitter.emitted_nodes))
+    };
+    let copied = emit(false);
+    let joined = if joins { emit(true) } else { None };
+    let mut out = match (copied, joined) {
+        (Some(c), Some(j)) if j.1 < c.1 => j.0,
+        (Some(c), _) => c.0,
+        (None, Some(j)) => j.0,
+        (None, None) => return StructuredLiftOutcome::Unstructured,
+    };
+    out.push_str("}\n");
+    StructuredLiftOutcome::Lifted(out)
 }
 
 fn compute_dominators(n: usize, reachable: &[bool], succs: &[Vec<usize>]) -> Vec<BTreeSet<usize>> {
@@ -2250,6 +2283,12 @@ fn compute_loop_ipdoms(
 struct LoopCtx {
     header: u8,
     exit: Option<u8>,
+    /// A `while true { }` join ([`StructEmitter::shared_join`]) rather than a loop of the
+    /// tree: an `if` inside may merge at its exit, and is followed by `break;`.
+    join: bool,
+    /// The loop of the tree whose DAG post-dominators ([`compute_loop_ipdoms`]) give the
+    /// merges inside: the loop itself, or the one a join sits in.
+    dag: Option<u8>,
 }
 
 struct StructEmitter<'a> {
@@ -2263,6 +2302,11 @@ struct StructEmitter<'a> {
     node_order: bool,
     emitted_nodes: usize,
     max_emitted_nodes: usize,
+    /// Whether an `if`/`else` whose branches meet again before a `return` is wrapped in a
+    /// `while true { }` that `break`s to the node they share ([`Self::shared_join`]).
+    joins: bool,
+    /// The nodes of each `while true { }` join being emitted, innermost last.
+    join_regions: Vec<BTreeSet<usize>>,
 }
 
 impl StructEmitter<'_> {
@@ -2339,6 +2383,70 @@ impl StructEmitter<'_> {
             .into_iter()
             .max_by(|(v1, c1), (v2, c2)| c1.cmp(c2).then_with(|| v2.cmp(v1)))
             .map(|(v, _)| v as u8)
+    }
+
+    /// The node to join the two branches of `cur` at, and the nodes before it, when both
+    /// branches reach it and every other way out of them is a `return`.
+    ///
+    /// Of the nodes both branches reach, the one with the most nodes after it (outside the
+    /// branches) wins, the lowest on a tie. A branch that reaches `stop_at`, an active node,
+    /// `cur` again or the enclosing loop's header or exit other than through the join has no
+    /// join: inside the `while true { }`, `break` and `continue` would name the wrong loop.
+    fn shared_join(
+        &self,
+        cur: u8,
+        on_true: u8,
+        on_false: u8,
+        stop_at: Option<u8>,
+        loop_ctx: Option<LoopCtx>,
+        active: &BTreeSet<u8>,
+    ) -> Option<(u8, BTreeSet<usize>)> {
+        let barrier = |v: usize| {
+            let v = v as u8;
+            v == cur
+                || Some(v) == stop_at
+                || active.contains(&v)
+                || loop_ctx.is_some_and(|c| c.header == v || c.exit == Some(v))
+        };
+        // The nodes reached from `start`, not past `avoid`, and whether a barrier was met.
+        let reach = |start: u8, avoid: Option<usize>| {
+            let mut seen = BTreeSet::new();
+            let mut hit = false;
+            let mut work = Vec::new();
+            if !matches!(start, TARGET_ERROR..=TARGET_FALSE) {
+                work.push(usize::from(start));
+            }
+            while let Some(v) = work.pop() {
+                if Some(v) == avoid {
+                    continue;
+                }
+                if barrier(v) {
+                    hit = true;
+                    continue;
+                }
+                if seen.insert(v) {
+                    work.extend(self.succs[v].iter().copied());
+                }
+            }
+            (seen, hit)
+        };
+        let (a, _) = reach(on_true, None);
+        let (b, _) = reach(on_false, None);
+        let mut best: Option<(usize, usize, BTreeSet<usize>)> = None;
+        for &join in a.intersection(&b) {
+            let (ra, hit_a) = reach(on_true, Some(join));
+            let (rb, hit_b) = reach(on_false, Some(join));
+            if hit_a || hit_b {
+                continue;
+            }
+            let mut region: BTreeSet<usize> = ra.union(&rb).copied().collect();
+            region.insert(usize::from(cur));
+            let tail = reach(join as u8, None).0.difference(&region).count();
+            if best.as_ref().is_none_or(|(t, _, _)| tail > *t) {
+                best = Some((tail, join, region));
+            }
+        }
+        best.map(|(_, join, region)| (join as u8, region))
     }
 
     fn emit_region(
@@ -2430,6 +2538,8 @@ impl StructEmitter<'_> {
                                 Some(LoopCtx {
                                     header: cur,
                                     exit: Some(exit_target),
+                                    join: false,
+                                    dag: Some(cur),
                                 }),
                                 active,
                                 depth + 1,
@@ -2457,6 +2567,8 @@ impl StructEmitter<'_> {
                     Some(LoopCtx {
                         header: cur,
                         exit: loop_exit,
+                        join: false,
+                        dag: Some(cur),
                     }),
                     active,
                     depth + 1,
@@ -2524,7 +2636,7 @@ impl StructEmitter<'_> {
                     // Case C: General `if` / `else`, merging at loop-DAG ipdom or global ipdom.
                     let loop_merge = loop_ctx.and_then(|ctx| {
                         self.loop_ipdoms
-                            .get(&usize::from(ctx.header))
+                            .get(&usize::from(ctx.dag?))
                             .and_then(|m| m.get(&idx))
                             .copied()
                     });
@@ -2534,7 +2646,15 @@ impl StructEmitter<'_> {
                         .filter(|&m| {
                             Some(m) != stop_at
                                 && !active.contains(&m)
-                                && loop_ctx.is_none_or(|c| m != c.header && c.exit != Some(m))
+                                && loop_ctx.is_none_or(|c| {
+                                    m != c.header && (c.join || c.exit != Some(m))
+                                })
+                                // Inside a join, a merge past the join is reached by `break`;
+                                // a merge at the join itself is followed by one.
+                                && self.join_regions.last().is_none_or(|r| {
+                                    r.contains(&usize::from(m))
+                                        || loop_ctx.is_some_and(|c| c.join && c.exit == Some(m))
+                                })
                         });
                     let branch_stop = merge.or(stop_at);
 
@@ -2571,6 +2691,67 @@ impl StructEmitter<'_> {
                             cur = *on_true;
                             continue;
                         }
+                        // Both exit and one leaves a join: `if cond { <term> } <term>`.
+                        if let (Some(tt), Some(tf)) = (term_t, term_f)
+                            && (tt == "break;" || tf == "break;")
+                            && self.join_regions.last().is_some()
+                        {
+                            let (cond, first, second) = if self.node_order && *on_false < *on_true {
+                                (format!("!{text}"), tf, tt)
+                            } else {
+                                (text.clone(), tt, tf)
+                            };
+                            self.indent(depth);
+                            let _ = write!(self.out, "if {cond} {{");
+                            self.push_comment(comment.as_deref());
+                            self.indent(depth + 1);
+                            self.out.push_str(first);
+                            self.out.push('\n');
+                            self.indent(depth);
+                            self.out.push_str("}\n");
+                            self.indent(depth);
+                            self.out.push_str(second);
+                            self.out.push('\n');
+                            return Ok(());
+                        }
+                    }
+
+                    // Both branches reach a node again before they return: write that node and
+                    // what follows it once, after a `while true { }` they `break` out of.
+                    if self.joins
+                        && merge.is_none()
+                        && !true_is_skip
+                        && !false_is_skip
+                        && !(is_entering && loop_ctx.is_some_and(|c| c.header == cur))
+                        && let Some((join, region)) =
+                            self.shared_join(cur, *on_true, *on_false, stop_at, loop_ctx, active)
+                    {
+                        // The pass inside counts `cur` again.
+                        self.emitted_nodes -= 1;
+                        self.indent(depth);
+                        self.out.push_str("while true {\n");
+                        self.join_regions.push(region);
+                        active.insert(cur);
+                        let res = self.emit_region(
+                            cur,
+                            None,
+                            Some(LoopCtx {
+                                header: cur,
+                                exit: Some(join),
+                                join: true,
+                                dag: loop_ctx.and_then(|c| c.dag),
+                            }),
+                            active,
+                            depth + 1,
+                            true,
+                        );
+                        active.remove(&cur);
+                        self.join_regions.pop();
+                        res?;
+                        self.indent(depth);
+                        self.out.push_str("}\n");
+                        cur = join;
+                        continue;
                     }
 
                     active.insert(cur);

@@ -20,8 +20,8 @@ use crate::error::{Error, Result};
 use crate::ir::BhavChunk;
 use crate::lift::{format_bhav_labeled_air_with_arities, lift_bhav};
 use crate::structure_lift::{
-    LiftOptions, StructuredLiftOutcome, lift_bhav_structured_in_node_order,
-    lift_bhav_structured_with_arities,
+    LiftOptions, StructuredLiftOutcome, lift_bhav_structured_copying_tails,
+    lift_bhav_structured_in_node_order, lift_bhav_structured_with_arities,
 };
 use crate::v2::ast::{is_reserved_type_name, object_type_ident};
 use crate::v2::fmt::format_v2_source;
@@ -286,6 +286,7 @@ pub fn decompile_iff_to_v2_report(
                     && !tree.is_some_and(|id| plan.drop_extras(id, &generated))
                     && !tree.is_some_and(|id| plan.unname_locals(id, &generated))
                     && !tree.is_some_and(|id| plan.number_raw_bcons(id, &generated))
+                    && !tree.is_some_and(|id| plan.copy_tails(&mut model, id))
                     && !plan.lower_at_line(&model, &generated, line)
                     // A tree that fails at its lowest level is left out.
                     && !tree.is_some_and(|id| model.omit(id, &message))
@@ -296,7 +297,7 @@ pub fn decompile_iff_to_v2_report(
             Err(Failure::Air { tree, message }) => {
                 let handled = match tree {
                     Some(id) => {
-                        let handled = plan.air_fallback(&model, &generated, id, &message)
+                        let handled = plan.air_fallback(&mut model, &generated, id, &message)
                             || model.omit(id, &message);
                         if handled && message.contains(LOCALS_SHORT) {
                             // The build stops at the first tree short of locals: one build with
@@ -308,7 +309,7 @@ pub fn decompile_iff_to_v2_report(
                                 if other != id && needed > declared {
                                     let message =
                                         format!("tree declares {declared}{LOCALS_SHORT}{needed}");
-                                    plan.air_fallback(&model, &generated, other, &message);
+                                    plan.air_fallback(&mut model, &generated, other, &message);
                                 }
                             }
                         }
@@ -349,6 +350,7 @@ pub fn decompile_iff_to_v2_report(
                             || plan.drop_extras(id, &generated)
                             || plan.unname_locals(id, &generated)
                             || plan.other_order(&mut model, id)
+                            || plan.copy_tails(&mut model, id)
                             || plan.lower_tree(&model, id)
                             || plan.number_raw_bcons(id, &generated);
                     }
@@ -362,7 +364,7 @@ pub fn decompile_iff_to_v2_report(
                     &mut cache,
                 );
                 let text = model.lint_spellings(text, &recompiled);
-                let text = model.polish(text, &recompiled);
+                let (text, raw_spelled) = model.polish(text, &recompiled);
                 let (text, recompiled, mut checks) =
                     model.flip_negations(text, (recompiled, checks), &mut cache);
                 let text = model.allow_kept_negations(text);
@@ -375,7 +377,12 @@ pub fn decompile_iff_to_v2_report(
                         style: plan.style(t),
                         standalone_lifecycle: t.lifecycle.is_some()
                             && plan.standalone.contains(&t.id),
-                        raw_statements: generated.raw_counts.get(&t.id).copied().unwrap_or(0),
+                        raw_statements: generated
+                            .raw_counts
+                            .get(&t.id)
+                            .copied()
+                            .unwrap_or(0)
+                            .saturating_sub(raw_spelled.get(&t.id).copied().unwrap_or(0)),
                         check: match &t.omitted {
                             Some(why) => TreeCheck::Omitted(why.clone()),
                             None => checks.remove(&t.id).unwrap_or(TreeCheck::NotChecked),
@@ -731,6 +738,10 @@ const POLISH_DISCARD_BUILDS: usize = 8;
 /// The most builds [`Model::polish`] may take to find the cells and flag operations it can
 /// write by name with the same bytes.
 const POLISH_CELL_BUILDS: usize = 8;
+
+/// The most builds [`Model::polish`] may take to find the `raw { }` blocks it can write as
+/// v2 builtins with the same bytes ([`raw_builtin_spellings`]).
+const POLISH_RAW_BUILDS: usize = 24;
 
 /// How many diagnostics of each rule, line and message a text lints with.
 type LintCounts = BTreeMap<(&'static str, usize, String), usize>;
@@ -1271,6 +1282,185 @@ fn matching_braces(tokens: &[crate::v2::lexer::Token]) -> Option<BTreeMap<usize,
         }
     }
     open.is_empty().then_some(out)
+}
+
+/// Every `raw { }` block whose statements v2 all spells as builtins (what lint
+/// `manual_raw_has_builtin` asks for), as those statements, one rewrite per block:
+/// - `scope(27, N) := v` and `temp[K] := scope(27, N)`, for `N` and `K` in `0..=7` and `v`
+///   a number or `temp[K]`: the stack object's sprite flag `temp[N]`, as
+///   `stack_obj.sprite_flags[temp[N]]`;
+/// - `remove_object(T)` / `remove_object(T, flags: F)` with `T` the frame's object (`0`,
+///   `me`, `self`) or the stack object (`1`, `stack_obj`), as `me.remove(..)` or
+///   `stack_obj.remove(..)`, with `no_yield: true` / `skip_resets: true` for flags 1 and 2
+///   (`flags: F` for any other bit);
+/// - `clear_motive_changes()` with an optional `pad(I: 0xNN, ..)`, as
+///   `clear_motive_changes(padI: 0xNN, ..)`.
+///
+/// The lifter writes these itself only in trees that keep the wave 2 and 3 idioms; the
+/// caller keeps a rewrite only if the file builds the same bytes. Each rewrite comes with
+/// the raw statements it takes away.
+fn raw_builtin_spellings(text: &str) -> Vec<(Rewrite, usize)> {
+    use crate::v2::lexer::{TokenKind as K, tokenize};
+    let Ok(tokens) = tokenize(text) else {
+        return Vec::new();
+    };
+    let offsets = TokenOffsets::new(text);
+    let mut out = Vec::new();
+    for t in &tokens {
+        let K::RawBlock(body) = &t.kind else {
+            continue;
+        };
+        let Some(start) = offsets.of(t) else {
+            continue;
+        };
+        let Some(brace) = text[start..].find('{').map(|b| start + b) else {
+            continue;
+        };
+        let end = brace + 1 + body.len() + 1;
+        if text.get(brace + 1..end - 1) != Some(body.as_str())
+            || text.get(end - 1..end) != Some("}")
+            || !text[start..brace].trim_end().ends_with("raw")
+        {
+            continue;
+        }
+        let Some(stmts) = raw_builtin_body(body) else {
+            continue;
+        };
+        let line_start = text[..start].rfind('\n').map_or(0, |n| n + 1);
+        let indent = &text[line_start..start];
+        if !indent.chars().all(|c| c == ' ') {
+            continue;
+        }
+        let rewrite = Rewrite {
+            range: start..end,
+            text: stmts.join(&format!("\n{indent}")),
+        };
+        out.push((rewrite, stmts.len()));
+    }
+    out
+}
+
+/// The id of the tree whose header (`#[bhav(id = N, ..)]` or `#[id(N)]`) is the last one
+/// before byte `pos` of `text`.
+fn tree_id_before(text: &str, pos: usize) -> Option<u16> {
+    text[..pos].lines().rev().find_map(|l| {
+        let rest = l.trim_start();
+        let rest = rest
+            .strip_prefix("#[bhav(id = ")
+            .or_else(|| rest.strip_prefix("#[id("))?;
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        rest[..digits].parse().ok()
+    })
+}
+
+/// The v2 statements of a `raw { }` body that holds only what [`raw_builtin_spellings`]
+/// spells, or `None`.
+fn raw_builtin_body(body: &str) -> Option<Vec<String>> {
+    if body.contains(['#', '"', '{', '}', '@']) || body.contains("//") || body.contains("->") {
+        return None;
+    }
+    let number = |v: &str| {
+        let v = v.trim();
+        let digits = v.strip_prefix('-').unwrap_or(v);
+        let ok = match digits.strip_prefix("0x") {
+            Some(hex) => !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()),
+            None => !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()),
+        };
+        ok.then(|| v.to_owned())
+    };
+    let small = |v: &str| v.trim().parse::<u8>().ok().filter(|n| *n <= 7);
+    let temp = |v: &str| {
+        let i = v
+            .trim()
+            .strip_prefix("temp")?
+            .trim_start()
+            .strip_prefix('[')?;
+        small(i.strip_suffix(']')?)
+    };
+    let sprite = |v: &str| {
+        let inner = v
+            .trim()
+            .strip_prefix("scope")?
+            .trim_start()
+            .strip_prefix('(')?;
+        let (scope, n) = inner.strip_suffix(')')?.split_once(',')?;
+        (scope.trim() == "27").then_some(())?;
+        small(n)
+    };
+    let mut out = Vec::new();
+    for stmt in body.split(';') {
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        let spelled = if let Some((dst, src)) = stmt.split_once(":=") {
+            if let Some(n) = sprite(dst) {
+                let value = match temp(src) {
+                    Some(k) => format!("temp[{k}]"),
+                    None => number(src)?,
+                };
+                format!("stack_obj.sprite_flags[temp[{n}]] = {value};")
+            } else {
+                let k = temp(dst)?;
+                let n = sprite(src)?;
+                format!("temp[{k}] = stack_obj.sprite_flags[temp[{n}]];")
+            }
+        } else if let Some(rest) = stmt.strip_prefix("remove_object") {
+            let inner = rest.trim().strip_prefix('(')?.strip_suffix(')')?;
+            let mut args = inner.split(',').map(str::trim);
+            let target = match args.next()? {
+                "0" | "me" | "self" => "me",
+                "1" | "stack_obj" => "stack_obj",
+                _ => return None,
+            };
+            let mut flags = 0u8;
+            for a in args {
+                let (k, v) = a.split_once(':')?;
+                match (k.trim(), v.trim()) {
+                    ("flags", v) => flags |= v.parse::<u8>().ok()?,
+                    ("no_yield", "true") => flags |= 1,
+                    ("skip_resets", "true") => flags |= 2,
+                    ("no_yield" | "skip_resets", "false") => {}
+                    _ => return None,
+                }
+            }
+            // The method form, as lint `prefer_method_syntax` asks; the two known flag bits
+            // by name.
+            let mut opts = Vec::new();
+            if flags & !3 != 0 {
+                opts.push(format!("flags: {flags}"));
+            } else {
+                if flags & 1 != 0 {
+                    opts.push("no_yield: true".to_owned());
+                }
+                if flags & 2 != 0 {
+                    opts.push("skip_resets: true".to_owned());
+                }
+            }
+            format!("{target}.remove({});", opts.join(", "))
+        } else {
+            let rest = stmt.strip_prefix("clear_motive_changes")?;
+            let rest = rest.trim().strip_prefix("()")?.trim();
+            let mut pads = Vec::new();
+            if !rest.is_empty() {
+                let bytes = rest
+                    .strip_prefix("pad")?
+                    .trim_start()
+                    .strip_prefix('(')?
+                    .strip_suffix(')')?;
+                for b in bytes.split(',') {
+                    let (i, v) = b.split_once(':')?;
+                    let i = i.trim().parse::<u8>().ok()?;
+                    pads.push(format!("pad{i}: {}", number(v)?));
+                }
+            }
+            format!("clear_motive_changes({});", pads.join(", "))
+        };
+        out.push(spelled);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// The `std::globals` trees declared `#[ret(temp = 0)] .. -> Option<T>`, by name, and the
@@ -2137,6 +2327,11 @@ struct TreeModel {
     /// The structured lift with the other branch order (true branch first rather than the
     /// lower-numbered one), when it differs: [`Plan::other_order`] swaps it in.
     other_order: Option<Box<OrderedLift>>,
+    /// The structured lift and its other branch order with the other tail spelling (shared
+    /// tails copied into each branch, or joined in `while true { }`), when that differs:
+    /// [`Plan::copy_tails`] swaps it in. The shorter spelling is written first
+    /// ([`swap_tails`]).
+    other_tails: Option<Box<(OrderedLift, Option<OrderedLift>)>>,
     /// Whether the idiomatic body runs as a Sim acting on this object (`(sim: Sim)`).
     sim_ctx: bool,
     lifecycle: Option<Lifecycle>,
@@ -2151,6 +2346,45 @@ fn swap_lift(t: &mut TreeModel) {
         std::mem::swap(&mut t.body_lines, &mut other.body_lines);
         std::mem::swap(&mut t.body, &mut other.body);
     }
+}
+
+/// Swaps `t`'s structured lifts for [`TreeModel::other_tails`], if it has them.
+fn swap_tails(t: &mut TreeModel) {
+    let Some(other) = t.other_tails.as_mut() else {
+        return;
+    };
+    let (first, second) = &mut **other;
+    std::mem::swap(&mut t.lifted, &mut first.lifted);
+    std::mem::swap(&mut t.body_lines, &mut first.body_lines);
+    std::mem::swap(&mut t.body, &mut first.body);
+    let current = t.other_order.take().map(|b| *b);
+    t.other_order = std::mem::replace(second, current).map(Box::new);
+}
+
+/// `t`'s structured lifts with their shared tails copied, when they differ from its lifts:
+/// first the branch order the mode writes first (behavioral mode the true branch, strict
+/// mode the lower-numbered node), then the other one when it is another text. Both orders
+/// are made whether or not `t` has two: joined lifts can coincide where copied ones do not.
+fn copied_tails(
+    t: &TreeModel,
+    opts: LiftOptions,
+    arities: &BTreeMap<u16, usize>,
+    behavioral: bool,
+) -> Option<Box<(OrderedLift, Option<OrderedLift>)>> {
+    let copy = |node_order| match lift_bhav_structured_copying_tails(
+        &t.original,
+        opts,
+        Some(arities),
+        node_order,
+    ) {
+        StructuredLiftOutcome::Lifted(text) => ordered_lift(&text),
+        _ => None,
+    };
+    let first = copy(!behavioral)?;
+    let second = copy(behavioral).filter(|o| o.lifted != first.lifted);
+    let differs = first.lifted != t.lifted
+        || second.as_ref().map(|o| &o.lifted) != t.other_order.as_ref().map(|o| &o.lifted);
+    differs.then(|| Box::new((first, second)))
 }
 
 /// One structured lift of a tree: its lines, header and closing-brace indices, and
@@ -2416,6 +2650,7 @@ impl Model {
                 structured: false,
                 body: None,
                 other_order: None,
+                other_tails: None,
                 sim_ctx: false,
                 lifecycle: lifecycle.get(&c.id).copied(),
                 omitted: None,
@@ -2475,6 +2710,18 @@ impl Model {
                 // first, as written, which needs no negated conditions.
                 if behavioral {
                     swap_lift(&mut tree);
+                }
+            }
+            if tree.structured {
+                tree.other_tails = copied_tails(&tree, opts, &lift_arities, behavioral);
+                // The structurer joins tails when that builds fewer nodes; the shorter text
+                // goes first, the other is the fallback.
+                if tree
+                    .other_tails
+                    .as_ref()
+                    .is_some_and(|o| o.0.lifted.len() < tree.lifted.len())
+                {
+                    swap_tails(&mut tree);
                 }
             }
             // A variant runs its init/main tree as the object itself.
@@ -2762,6 +3009,20 @@ impl Model {
         self.trees.iter().find(|t| t.id == id)
     }
 
+    /// Swaps tree `id`'s lifts for [`TreeModel::other_tails`], once. `false` when it has
+    /// none (left).
+    fn copy_tails(&mut self, id: u16) -> bool {
+        let Some(t) = self.trees.iter_mut().find(|t| t.id == id) else {
+            return false;
+        };
+        if t.other_tails.is_none() {
+            return false;
+        }
+        swap_tails(t);
+        t.other_tails = None;
+        true
+    }
+
     /// Swaps tree `id`'s structured lift for its other branch order.
     fn swap_order(&mut self, id: u16) {
         if let Some(t) = self.trees.iter_mut().find(|t| t.id == id) {
@@ -2991,19 +3252,22 @@ impl Model {
     /// - a named motive or skill cell is a field (`sim.motive.hunger`, `sim.skill.cooking`),
     ///   and a typed flag operation a method (`.set(..)`, `.clear(..)`, `.contains(..)`); see
     ///   [`cell_spellings`];
+    /// - a `raw { }` block of builtins only is those builtins ([`raw_builtin_spellings`]);
     /// - in behavioral mode, a local without `#[slot(N)]` and an argument by name, per
     ///   function (see [`Self::keep_frame_groups`]);
     /// - `else { if .. }` holding the chain alone is `else if ..`;
     /// - `use` lines importing from one module are one braced line.
     ///
     /// Each kind is tried together, then in halves (the frame changes per tree first); the
-    /// last two never change the bytes, but are checked the same way.
-    fn polish(&self, text: String, recompiled: &RecompiledFile) -> String {
+    /// last two never change the bytes, but are checked the same way. Also returns, per tree,
+    /// the raw statements the text no longer writes raw.
+    fn polish(&self, text: String, recompiled: &RecompiledFile) -> (String, BTreeMap<u16, usize>) {
         let same = |t: &str| {
             self.compile(t)
                 .is_ok_and(|r| r.iff_bytes == recompiled.iff_bytes)
         };
         let mut text = text;
+        let mut raw_spelled: BTreeMap<u16, usize> = BTreeMap::new();
         let renames = self.tree_renames(&text);
         if !renames.is_empty() {
             let base = text.clone();
@@ -3064,6 +3328,22 @@ impl Model {
             let kept = keep_joint(&groups, &ok, POLISH_CELL_BUILDS);
             text = apply_groups(&text, &kept);
         }
+        // `raw { }` blocks of builtins only, as the builtins.
+        let raws = raw_builtin_spellings(&text);
+        if !raws.is_empty() {
+            let base = text.clone();
+            let rewrites = |r: &[(Rewrite, usize)]| -> Vec<Rewrite> {
+                r.iter().map(|(w, _)| w.clone()).collect()
+            };
+            let ok = |r: &[(Rewrite, usize)]| same(&apply_rewrites(&base, &rewrites(r)));
+            let kept = keep_joint(&raws, &ok, POLISH_RAW_BUILDS);
+            for (w, n) in &kept {
+                if let Some(id) = tree_id_before(&text, w.range.start) {
+                    *raw_spelled.entry(id).or_default() += n;
+                }
+            }
+            text = apply_rewrites(&text, &rewrites(&kept));
+        }
         // `if let Some(v) = globals::f()` and `let Some(v) = globals::f() else { .. };`, one
         // statement at a time.
         let if_lets = if_let_spellings(&text);
@@ -3099,7 +3379,7 @@ impl Model {
         if grouped != text && same(&grouped) {
             text = grouped;
         }
-        text
+        (text, raw_spelled)
     }
 
     /// The groups of `groups` that keep `text` building the bytes of `recompiled` and add no
@@ -5673,7 +5953,7 @@ impl Plan {
     /// `false` when it has none left but being left out.
     fn air_fallback(
         &mut self,
-        model: &Model,
+        model: &mut Model,
         generated: &Generated,
         id: u16,
         message: &str,
@@ -5691,6 +5971,7 @@ impl Plan {
             || self.drop_extras(id, generated)
             || self.unname_locals(id, generated)
             || self.number_raw_bcons(id, generated)
+            || self.copy_tails(model, id)
             || self.lower_tree(model, id)
     }
 
@@ -5954,6 +6235,25 @@ impl Plan {
         }
         model.swap_order(id);
         self.swapped.insert(id, level);
+        self.retry_extras(id);
+        self.raw_stmts.remove(&id);
+        true
+    }
+
+    /// Writes tree `id` with its other tail spelling ([`TreeModel::other_tails`]: shared
+    /// tails copied into each branch, or joined), once, before it goes raw:
+    /// a join may build nodes the original does not run in that order, and copies build
+    /// more nodes than an original that shares the tail. The extra idioms and the
+    /// statements written raw start over, and each branch order gets another try.
+    fn copy_tails(&mut self, model: &mut Model, id: u16) -> bool {
+        if model
+            .tree(id)
+            .is_none_or(|t| self.level(t) == Level::RawLabeled)
+            || !model.copy_tails(id)
+        {
+            return false;
+        }
+        self.swapped.remove(&id);
         self.retry_extras(id);
         self.raw_stmts.remove(&id);
         true
@@ -9368,6 +9668,34 @@ fn header_gap(original: &BhavChunk, rebuilt: &BhavChunk) -> Option<String> {
 mod tests {
     use super::*;
     use sims_formats::behavior::Instruction;
+
+    #[test]
+    fn raw_builtin_blocks_are_spelled_as_builtins() {
+        let text = "fn t() {\n    raw {\n        scope(27, 1) := temp[0];\n        temp[2] := scope(27, 1);\n    }\n    raw { remove_object(0, flags: 3) }\n    raw { remove_object(stack_obj, no_yield: true) }\n    raw { remove_object(1, flags: 4) }\n    raw { clear_motive_changes() pad(2: 0x05) }\n}\n";
+        let raws = raw_builtin_spellings(text);
+        assert_eq!(raws.iter().map(|(_, n)| n).sum::<usize>(), 6);
+        let rewrites: Vec<Rewrite> = raws.into_iter().map(|(w, _)| w).collect();
+        let rewritten = apply_rewrites(text, &rewrites);
+        assert_eq!(
+            rewritten,
+            "fn t() {\n    stack_obj.sprite_flags[temp[1]] = temp[0];\n    temp[2] = stack_obj.sprite_flags[temp[1]];\n    me.remove(no_yield: true, skip_resets: true);\n    stack_obj.remove(no_yield: true);\n    stack_obj.remove(flags: 4);\n    clear_motive_changes(pad2: 0x05);\n}\n"
+        );
+    }
+
+    #[test]
+    fn raw_blocks_with_other_statements_stay_raw() {
+        for body in [
+            "scope(27, 1) := 1; local[0] := 2",
+            "scope(27, 9) := 1",
+            "scope(26, 1) := 1",
+            "remove_object(2)",
+            "remove_object(me, flags: x)",
+            "if x { remove_object(me) }",
+            "@n0: remove_object(me) -> true: @n1",
+        ] {
+            assert_eq!(raw_builtin_body(body), None, "{body}");
+        }
+    }
 
     #[test]
     fn library_constant_names() {

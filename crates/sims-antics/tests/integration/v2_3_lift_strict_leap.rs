@@ -2,8 +2,10 @@
 //! compile to the original's nodes, shares the tails of a tree that would pass lint
 //! `frame_headroom`, names `data[51]` as `light`, writes `if let Some(v) = f()` and
 //! `let Some(v) = f() else { .. };` for `std::globals` `Option<T>` calls, and names the
-//! locals of lifecycle blocks and trees written without the extra idioms. Every object is
-//! synthetic (GUIDs in the clean-room 0x7E00_xxxx range).
+//! locals of lifecycle blocks and trees written without the extra idioms. Since v2.4 the
+//! structurer joins a tail the arms of an `if` share (`loop { .. break; }`) when that
+//! builds fewer nodes. Every object is synthetic (GUIDs in the clean-room 0x7E00_xxxx
+//! range).
 
 use sims_antics::compile_v2_source;
 use sims_antics::v2::{
@@ -123,7 +125,8 @@ fn strict_lift_pins_the_original_node_order() {
 }
 
 /// Arms that end in the same tail, which `share_tails` builds once and a structured lift
-/// writes in each arm. The tail yields, so strict mode compares its nodes.
+/// joins (v2.4) rather than writing it in each arm. The tail yields, so strict mode
+/// compares its nodes.
 const SHARED_ARMS: &str = "
         if self.m == 1 {
             self.m = 3;
@@ -143,17 +146,19 @@ const SHARED_ARMS: &str = "
         return false;";
 
 #[test]
-fn strict_lift_shares_the_tails_the_original_shares() {
+fn strict_lift_joins_the_tails_the_original_shares() {
     let plain = nodes_of(&object(0x7E00_01A1, "", SHARED_ARMS), 4300);
     let source = object(0x7E00_01A1, ", share_tails", SHARED_ARMS);
     assert!(nodes_of(&source, 4300) < plain);
+    // The arms `break` to the tail they share, written once: no `share_tails` pin.
     let (lifted, trees) = lift(&source, false);
-    has(&lifted, &["share_tails"]);
+    has(&lifted, &["loop {", "break;"]);
+    lacks(&lifted, &["share_tails"]);
     idiomatic_and_identical(&trees, 4300, &lifted);
 }
 
 #[test]
-fn behavioral_lift_shares_tails_past_the_node_warning() {
+fn behavioral_lift_joins_tails_past_the_node_warning() {
     // Five arms, each ending in the same 40-store tail: over 200 nodes unless they merge.
     let tail: String = (0..40).map(|_| "self.n += 1; ").collect();
     let arms: String = (1..=5)
@@ -163,9 +168,12 @@ fn behavioral_lift_shares_tails_past_the_node_warning() {
     assert!(nodes_of(&object(0x7E00_01A2, "", &body), 4300) > 200);
     let source = object(0x7E00_01A2, ", share_tails", &body);
     assert!(nodes_of(&source, 4300) < 80);
-    // `lift` checks that the text lints clean: no `frame_headroom`.
+    // `lift` checks that the text lints clean: no `frame_headroom`. The arms join their
+    // shared tail (`loop { .. break; }`), which builds it once with no pin.
     let (lifted, trees) = lift(&source, true);
-    has(&lifted, &["share_tails"]);
+    has(&lifted, &["loop {"]);
+    lacks(&lifted, &["share_tails", "node_order"]);
+    assert_eq!(lifted.matches("self.attr_0 += 1;").count(), 40);
     assert_eq!(tree(&trees, 4300).style, TreeStyle::Idiomatic);
 }
 
@@ -285,11 +293,11 @@ fn lifecycle_blocks_name_their_locals() {
 }
 
 #[test]
-fn a_body_past_the_node_limit_stays_labeled() {
-    // Six arms, each ending in the same 45-store tail: a structured body copies the tail
-    // into each arm, past what a tree may hold. The structurer stops at 245 nodes, so the
-    // tree is written as its labeled nodes, as before. Structuring it anyway and building it
-    // with `share_tails` was measured and not adopted (see the ADR).
+fn a_body_past_the_node_limit_joins_its_tails() {
+    // Six arms, each ending in the same 45-store tail: a structured body that copies the
+    // tail into each arm goes past what a tree may hold. The structurer writes the arms in a
+    // loop they `break` out of, and the tail once after it, so the tree lifts in both modes
+    // with no pin.
     let tail: String = (0..45).map(|_| "self.n += 1; ").collect();
     let arms: String = (1..=6)
         .map(|k| format!("if x == {k} {{ self.m = {k}; {tail} return true; }} "))
@@ -303,8 +311,12 @@ fn a_body_past_the_node_limit_stays_labeled() {
     let source = object(0x7E00_01A8, ", share_tails", &body);
     for behavioral in [false, true] {
         let (lifted, trees) = lift(&source, behavioral);
-        assert_eq!(tree(&trees, 4300).style, TreeStyle::RawLabeled, "{lifted}");
-        lacks(&lifted, &["share_tails"]);
+        assert_eq!(tree(&trees, 4300).style, TreeStyle::Idiomatic, "{lifted}");
+        assert_eq!(tree(&trees, 4300).raw_statements, 0, "{lifted}");
+        assert_eq!(lifted.matches("self.attr_0 += 1;").count(), 45, "{lifted}");
+        assert_eq!(lifted.matches("break;").count(), 6, "{lifted}");
+        has(&lifted, &["loop {"]);
+        lacks(&lifted, &["share_tails", "node_order"]);
     }
 }
 
