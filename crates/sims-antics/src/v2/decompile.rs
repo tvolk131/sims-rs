@@ -825,15 +825,36 @@ fn code_words(text: &str) -> Option<BTreeSet<String>> {
     Some(out)
 }
 
+/// Byte offsets of tokens in `text`. The lexer counts a column per byte, except a
+/// multibyte character inside a string literal, which counts once; so a token on a line
+/// with any non-ASCII byte gets no offset, and whatever needs it is left as it is.
+struct TokenOffsets<'a> {
+    text: &'a str,
+    line_starts: Vec<usize>,
+}
+
+impl<'a> TokenOffsets<'a> {
+    fn new(text: &'a str) -> Self {
+        let line_starts = std::iter::once(0)
+            .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+            .collect();
+        Self { text, line_starts }
+    }
+
+    fn of(&self, t: &crate::v2::lexer::Token) -> Option<usize> {
+        let start = *self.line_starts.get(t.span.line.checked_sub(1)?)?;
+        let line = self.text[start..].split('\n').next()?;
+        (line.is_ascii() && t.span.column >= 1 && t.span.column - 1 <= line.len())
+            .then(|| start + t.span.column - 1)
+    }
+}
+
 /// `text` with each `Table::entry` path in code (tokens, never a string or comment) whose
 /// table is in `tables` and entry in `entries` written `Table.entry`.
 fn dot_paths(text: &str, tables: &[&str], entries: &[String]) -> Option<String> {
     use crate::v2::lexer::{TokenKind as K, tokenize};
     let tokens = tokenize(text).ok()?;
-    let line_starts: Vec<usize> = std::iter::once(0)
-        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
-        .collect();
-    let offset = |t: &crate::v2::lexer::Token| line_starts[t.span.line - 1] + t.span.column - 1;
+    let offsets = TokenOffsets::new(text);
     let mut out = String::with_capacity(text.len());
     let mut done = 0;
     for w in tokens.windows(3) {
@@ -842,9 +863,15 @@ fn dot_paths(text: &str, tables: &[&str], entries: &[String]) -> Option<String> 
             && tables.contains(&table.as_str())
             && entries.contains(entry)
         {
-            let (start, colons) = (offset(&w[0]), offset(&w[1]));
-            if text.get(colons..colons + 2) != Some("::") || colons != start + table.len() {
-                return None;
+            // Only a path written whole (`Table::entry`, nothing between) is rewritten.
+            let (Some(start), Some(colons)) = (offsets.of(&w[0]), offsets.of(&w[1])) else {
+                continue;
+            };
+            if colons != start + table.len()
+                || text.get(colons..colons + 2) != Some("::")
+                || offsets.of(&w[2]) != Some(colons + 2)
+            {
+                continue;
             }
             out.push_str(&text[done..colons]);
             out.push('.');
@@ -1092,6 +1119,85 @@ struct Flip {
     tree: u16,
 }
 
+/// The tree each token is in, read from tokens (a quoted label never counts). A tree is
+/// the `fn`, `init`, `main`, `load`, `reset` or `cleanup` member right after a
+/// `#[bhav(.., id = N, ..)]` or `#[id(N)]` attribute; any other member (an unpinned `fn`,
+/// an interaction with its guard, a declaration) is in no tree. Members are an object's:
+/// they sit one brace deep.
+fn token_trees(tokens: &[crate::v2::lexer::Token]) -> Vec<Option<u16>> {
+    use crate::v2::lexer::TokenKind as K;
+    let kind = |k: usize| tokens.get(k).map(|t| &t.kind);
+    let mut depth = 0usize;
+    let (mut pending, mut tree) = (None, None);
+    let mut trees = Vec::with_capacity(tokens.len());
+    let mut k = 0;
+    while k < tokens.len() {
+        match &tokens[k].kind {
+            K::HashBracket => {
+                // The attribute runs to its matching `]`.
+                let mut end = k + 1;
+                let mut nest = 0usize;
+                while let Some(t) = kind(end) {
+                    match t {
+                        K::LBracket | K::HashBracket => nest += 1,
+                        K::RBracket if nest == 0 => break,
+                        K::RBracket => nest -= 1,
+                        _ => {}
+                    }
+                    end += 1;
+                }
+                let attr = &tokens[k + 1..end.min(tokens.len())];
+                let word = |j: usize, w: &str| matches!(attr.get(j).map(|t| &t.kind), Some(K::Ident(x)) if x == w);
+                let int = |j: usize| match attr.get(j).map(|t| &t.kind) {
+                    Some(K::Int(n)) => u16::try_from(*n).ok(),
+                    _ => None,
+                };
+                if word(0, "bhav") {
+                    pending = (1..attr.len()).find_map(|j| {
+                        (word(j, "id") && attr.get(j + 1).map(|t| &t.kind) == Some(&K::Assign))
+                            .then(|| int(j + 2))
+                            .flatten()
+                    });
+                } else if word(0, "id") {
+                    pending = int(2);
+                }
+                for _ in k..=end.min(tokens.len() - 1) {
+                    trees.push(tree);
+                }
+                k = end + 1;
+                continue;
+            }
+            K::LBrace => depth += 1,
+            K::RBrace => depth = depth.saturating_sub(1),
+            K::Ident(w) if depth == 1 => {
+                // A member starts after `{`, `}`, `;`, an attribute's `]` or `pub`.
+                let starts = k == 0
+                    || matches!(
+                        &tokens[k - 1].kind,
+                        K::LBrace | K::RBrace | K::Semicolon | K::RBracket
+                    )
+                    || matches!(&tokens[k - 1].kind, K::Ident(p) if p == "pub");
+                if starts {
+                    tree = if ["fn", "init", "main", "load", "reset", "cleanup"]
+                        .contains(&w.as_str())
+                    {
+                        pending.take()
+                    } else {
+                        if w != "pub" {
+                            pending = None;
+                        }
+                        None
+                    };
+                }
+            }
+            _ => {}
+        }
+        trees.push(tree);
+        k += 1;
+    }
+    trees
+}
+
 /// Every test `!(a op b)` that directly follows `if` or `while` and opens the block (`{`
 /// next), with one comparison inside the parentheses and nothing else at their top level,
 /// as the flipped comparison. `raw { }` bodies are one token, so `.air` is never touched.
@@ -1100,35 +1206,8 @@ fn negated_comparisons(text: &str) -> Vec<Flip> {
     let Ok(tokens) = tokenize(text) else {
         return Vec::new();
     };
-    let line_starts: Vec<usize> = std::iter::once(0)
-        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
-        .collect();
-    let offset = |t: &crate::v2::lexer::Token| line_starts[t.span.line - 1] + t.span.column - 1;
-    // The tree each token is in: the last `#[bhav(id = N` or `#[id(N` attribute before it,
-    // read from tokens, so a quoted label that spells one never counts.
-    let is =
-        |k: usize, w: &str| matches!(tokens.get(k).map(|t| &t.kind), Some(K::Ident(x)) if x == w);
-    let int = |k: usize| match tokens.get(k).map(|t| &t.kind) {
-        Some(K::Int(n)) => u16::try_from(*n).ok(),
-        _ => None,
-    };
-    let mut tree = None;
-    let mut trees = Vec::with_capacity(tokens.len());
-    for k in 0..tokens.len() {
-        if tokens[k].kind == K::HashBracket {
-            let paren = |j: usize| tokens.get(j).map(|t| &t.kind) == Some(&K::LParen);
-            if is(k + 1, "bhav")
-                && paren(k + 2)
-                && is(k + 3, "id")
-                && tokens.get(k + 4).map(|t| &t.kind) == Some(&K::Assign)
-            {
-                tree = int(k + 5);
-            } else if is(k + 1, "id") && paren(k + 2) {
-                tree = int(k + 3);
-            }
-        }
-        trees.push(tree);
-    }
+    let offsets = TokenOffsets::new(text);
+    let trees = token_trees(&tokens);
     let mut out = Vec::new();
     for i in 0..tokens.len().saturating_sub(3) {
         let K::Ident(w) = &tokens[i].kind else {
@@ -1178,13 +1257,20 @@ fn negated_comparisons(text: &str) -> Vec<Flip> {
         if !plain || tokens.get(close + 1).map(|t| &t.kind) != Some(&K::LBrace) {
             continue;
         }
-        let (lhs_start, op_start) = (offset(&tokens[i + 3]), offset(&tokens[at]));
-        let op_end = offset(&tokens[at + 1]);
-        let close_at = offset(&tokens[close]);
+        let at_of = |k: usize| offsets.of(&tokens[k]);
+        let (Some(bang), Some(lhs_start), Some(op_start), Some(op_end), Some(close_at)) = (
+            at_of(i + 1),
+            at_of(i + 3),
+            at_of(at),
+            at_of(at + 1),
+            at_of(close),
+        ) else {
+            continue;
+        };
         let lhs = text[lhs_start..op_start].trim();
         let rhs = text[op_end..close_at].trim();
         out.push(Flip {
-            range: offset(&tokens[i + 1])..close_at + 1,
+            range: bang..close_at + 1,
             text: format!("{lhs} {flipped} {rhs}"),
             tree,
         });
@@ -8184,7 +8270,7 @@ mod tests {
 
     #[test]
     fn negations_flip_only_as_a_whole_test() {
-        let text = "#[bhav(id = 4300)]\nfn f() {\n    if !(temp[0] > -1) {\n    }\n    while !(a.b[2] == X::y) {\n    }\n    if !(a > b && c) {\n    }\n    if !(inc_lt(&mut a, 2)) {\n    }\n    raw {\n        if !(a > b) {\n        }\n    }\n}\n";
+        let text = "object \"O\" {\n#[bhav(id = 4300)]\nfn f() {\n    if !(temp[0] > -1) {\n    }\n    while !(a.b[2] == X::y) {\n    }\n    if !(a > b && c) {\n    }\n    if !(inc_lt(&mut a, 2)) {\n    }\n    raw {\n        if !(a > b) {\n        }\n    }\n}\n}\n";
         let flips: Vec<String> = negated_comparisons(text)
             .into_iter()
             .map(|f| format!("{} => {}", &text[f.range], f.text))
@@ -8201,11 +8287,26 @@ mod tests {
     #[test]
     fn a_flip_belongs_to_the_tree_whose_attribute_comes_before_it_in_code() {
         // A quoted label that spells another tree's attribute does not count.
-        let text = "#[id(4300)]\nfn a() {\n}\n#[bhav(id = 4301, label = \"Other #[id(4300)]\")]\nfn b() {\n    if !(temp[0] > 1) {\n    }\n}\n";
+        let text = "object \"O\" {\n#[id(4300)]\nfn a() {\n}\n#[bhav(id = 4301, label = \"Other #[id(4300)]\")]\nfn b() {\n    if !(temp[0] > 1) {\n    }\n}\n}\n";
         let trees: Vec<u16> = negated_comparisons(text).iter().map(|f| f.tree).collect();
         assert_eq!(trees, [4301]);
+        // `id` after other fields and in hex; an unpinned helper after a tree is in no tree;
+        // a lifecycle block's `#[id(N)]` counts.
+        let text = "#[bhav(id = 4300)]\nfn a() {\n    if !(temp[0] > 1) {\n    }\n}\n#[bhav(locals = 1, id = 0x10CD)]\nfn b() {\n    if !(temp[0] > 2) {\n    }\n}\nfn helper() {\n    if !(temp[0] > 3) {\n    }\n}\n#[id(4096)]\ninit {\n    if !(temp[0] > 4) {\n    }\n}\n";
+        let wrapped = format!("object \"O\" {{\n{text}}}\n");
+        let trees: Vec<u16> = negated_comparisons(&wrapped)
+            .iter()
+            .map(|f| f.tree)
+            .collect();
+        assert_eq!(trees, [4300, 0x10CD, 4096]);
+        // A line with a multibyte character gets no offsets, so nothing on it is flipped.
+        let text = "object \"O\" {\n#[bhav(id = 4300, label = \"é\")] fn a() { if !(temp[0] > 1) {\n    }\n}\n}\n";
+        assert!(negated_comparisons(text).is_empty());
         // Before any tree attribute, a test has no tree and is never flipped.
-        assert!(negated_comparisons("fn f() {\n    if !(a > b) {\n    }\n}\n").is_empty());
+        assert!(
+            negated_comparisons("object \"O\" {\nfn f() {\n    if !(a > b) {\n    }\n}\n}\n")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -8215,6 +8316,15 @@ mod tests {
             dot_paths(text, &["Tuning"], &["e0".to_owned()]).as_deref(),
             Some(
                 "fn f() {\n    // Tuning::e0\n    temp[0] = Tuning.e0;\n    temp[1] = Tuning::e1;\n    show(\"Tuning::e0\");\n    temp[2] = Other::e0 + MyTuning::e0;\n}\n"
+            )
+        );
+        // A path written with something between its parts, or on a line with a multibyte
+        // character, is left alone; the others still change.
+        let text = "fn f() {\n    temp[0] = Tuning /* x */ ::e0;\n    show(\"é\"); temp[1] = Tuning::e0;\n    temp[2] = Tuning::e0;\n}\n";
+        assert_eq!(
+            dot_paths(text, &["Tuning"], &["e0".to_owned()]).as_deref(),
+            Some(
+                "fn f() {\n    temp[0] = Tuning /* x */ ::e0;\n    show(\"é\"); temp[1] = Tuning::e0;\n    temp[2] = Tuning.e0;\n}\n"
             )
         );
     }

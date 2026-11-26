@@ -55,7 +55,9 @@ object still builds to the **identical** `.iff`, so every check carries over unc
   `Table::entry`. So when raw code reads a table by name, an entry that only v2 code reads
   would be reported as never read. In that case (a file whose table is read both ways
   and whose lint reports such an entry) the lift writes that entry `Table.entry` again. It
-  has the same bytes. Once the lint counts paths, this fallback can go.
+  rewrites code only, never strings or comments, and keeps the change only if the object
+  builds the same bytes. In the corpus this happens 3 times. Once the lint counts paths,
+  this fallback can go.
 - **`!call()`.** A negated call loses its parentheses: `!inc_lt(&mut temp[0], 6)`. A
   comparison keeps them, and so does a double negation (`!(!x.is_empty())`).
 
