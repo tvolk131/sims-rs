@@ -3938,12 +3938,61 @@ through their public interfaces only; the simulation never depends on it.
       outermost tiles; walls are turned once from rotation 0, not through
       each view change.
     - open-pack: the test runner should place `given.create` objects on
-      the tile grid (or add `expect.objects`); a v2 name for object data
-      word 51 (light amount) so the lamp can be a light source; a real
-      daily bill gate for the mailbox, if wanted.
+      the tile grid (or add `expect.objects`); a real daily bill gate for
+      the mailbox, if wanted. (The lamp is a light source since Batch 22.)
     - `.antics`: a lint rule suggesting `if let`; the lift writing `if f() { .. temp[N] .. }` as `if let`
       (Track 9); a language decision on what `self.x` means when `self`
       is rebound.
+- **Done (Batch 22 — `.antics` v2.3 Step 2 and the lit lamp, #490, #491
+  and Track 7's v2.3 Step 3):**
+  - **The `.antics` v2 compiler (Track 8, #491,
+    `docs/decisions/20261126-antics-v2-3-step2-node-order-and-shared-tails.md`):**
+    strict-mode enablers for Track 9's lift.
+    - `node_order = [..]` (on `#[bhav(..)]` and the `.air` header)
+      renumbers a compiled tree; `sims_antics::node_order::match_node_order`
+      finds the pin. Kind-4 trees keep the identity.
+    - Opt-in `share_tails` merges nodes that run alike (node 0 stays the
+      entry). It closes all 46 behavioral `frame_headroom` trees; the
+      largest drops to 196 nodes.
+    - `narrow_callees: [..]`: a rewritten tree calls inline only into
+      callees listed as reading no more than four arguments from their
+      frame. v2 lists a callee only when its frame is known (a
+      same-library sibling, or a global or extern one whose declarations
+      all agree; never a semi-global); a handwritten `.air` list is
+      trusted as written.
+    - `light` names object data word 51, the light the object gives.
+    - Strict zero-copy temps: analysed, no change. #480 and MIR copy
+      propagation already drop every copy that can be dropped.
+  - **Lint (Track 7, #490,
+    `docs/decisions/20261126-antics-v2-3-step2-lint.md`):** the Batch 21
+    lint bullet above, after two review rounds. It also counts a raw read
+    of a binding's frame word (`__v_name_N`), raw `bcon[T:E]`,
+    `const[T,E]` and `scope(26, N)` reads, and judges `extern bcon`
+    entries only when every object's template is in its own file.
+  - **Lint and open-pack (Track 7, v2.3 Step 3):**
+    - `untyped_engine_field` names `data[51]` `light` on `self`,
+      `stack_obj` and handles, byte-checked like every object word.
+    - The Open Floor Lamp is a light source. Its init sets `flags2`
+      `LightSource`, and its switch sets `self.light` to 50 when lit and 0
+      when dark, beside the room impact. A placed lamp adds 50 to its
+      room's lamp light and lights the room; switched off it still counts
+      as a light source, with no light, and the room goes darker
+      (`open_pack_behavioral::a_lit_floor_lamp_lights_its_room`).
+  - **Follow-ups:**
+    - Track 9: write `node_order` and `share_tails` into the strict lift
+      (running), leaving both off kind-4 trees and trees whose raw blocks
+      call undeclared or semi-global callees inline.
+    - Track 8: declare more global frames in `std` (IDs 334 and 425
+      appear in refused trees); give v2 each object's `GLOB` link, so
+      semi-global frames can be known; a partial-sharing mode, since the
+      original shares only some tails.
+    - Track 8: a v2 name for object data word 16 (meaning unknown). The
+      original's light sources set it to 1 in their init. The lamp's own
+      sprite already shows in full light (word 51 alone), but its floor
+      pools and its light on nearby Sims need word 16 too (sims-render
+      `lot.rs` `gives_light`). open-pack bans raw `data[N]`, so the lamp
+      lights its room and glows, without pools or light on Sims, until the
+      word has a name.
 - **Next (in flight, in order of player impact):**
   - **Travel follow-ups:**
     - A hop that leaves travelers behind (Go Somewhere Else for one
@@ -3976,13 +4025,17 @@ through their public interfaces only; the simulation never depends on it.
     - whether the co-op executor should refuse a peer's pick on an
       object parked off the lot (#458).
   - **The `.antics` v2 toolchain:**
-    - Node pinning (Track 8): about 8,600 strict lift trees fail only
-      on node order (#459).
-    - Shared suffixes across `match` arms and loop exits: the 46
-      behavioral `frame_headroom` findings left after #471 need a v2
-      form for them.
-    - Strict temps calls: a lowering rule that passes the temps without
-      copies, so strict mode can name them too (#471).
+    - Node pinning: about 8,600 strict lift trees fail only on node
+      order (#459). The compiler side landed (`node_order`, #491); Track
+      9's lift integration is running.
+    - Shared suffixes across `match` arms and loop exits: `share_tails`
+      (#491) closes the 46 behavioral `frame_headroom` trees in the
+      compiler; the lift writing it is Track 9's, running. A
+      partial-sharing mode is open, since the original shares only some
+      tails.
+    - More `std` global frames (IDs 334 and 425 appear in refused trees)
+      and each object's `GLOB` link in v2, so a rewritten tree can call
+      more callees inline (#491).
     - Raw-block `if` tails: a raw `if` whose arms may end alike now
       keeps its layout (#489). The 2 strict alarm trees #473 left
       non-idiomatic need a re-lift to confirm.

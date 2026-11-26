@@ -1762,6 +1762,58 @@ fn room_impact_changes_reach_the_room_score() {
 }
 
 #[test]
+fn a_lit_floor_lamp_lights_its_room() {
+    let pack = compile_pack_dir(&open_pack_dir()).unwrap();
+    let mut fx = PackVmFixture::from_pack(&pack, 500);
+    let mut vm = Interpreter::new(&fx.program, &fx.catalog, Stream::Lot);
+    let sim = fx.sim_id;
+    let lamp = vm
+        .create(&mut fx.world, pack_guid(&pack, "open-floor-lamp"))
+        .unwrap();
+    PackVmFixture::place_on_tile(&mut fx.world, lamp, 6, 6, 0);
+    let room = fx.world.rooms.rooms.get_mut(&1).unwrap();
+    room.tiles.push([6, 6, 1]);
+    // One covered wall gives the synthetic room a finite score.
+    let offset = (6 * 64 + 6) * 14;
+    let walls = &mut fx.world.arrays.get_mut(&2).unwrap().data;
+    walls[offset] = 1;
+    walls[offset + 2] = 1;
+    walls[offset + 6] = 1;
+    fx.world.mark_room(1);
+    vm.update_pending_rooms(&mut fx.world).unwrap();
+    let counted = |world: &World| {
+        let room: &Room = &world.rooms.rooms[&1];
+        (room.lights, room.lamp_light, room.impact)
+    };
+    let light = |world: &World| world.rooms.rooms[&1].light.to_f32();
+    assert_eq!(
+        counted(&fx.world),
+        (1, 50, 5),
+        "a new lamp is a lit light source"
+    );
+    let lit = light(&fx.world);
+    assert!(lit > 0.0, "the lamp lights the room ({lit})");
+
+    // A lit lamp offers its one entry, "Turn Off Light".
+    let entries = PackVmFixture::pie_menu_names(&mut vm, &mut fx.world, sim, lamp);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let off = entries[0].0;
+    PackVmFixture::run_pie_interaction(&mut vm, &mut fx.world, sim, lamp, off, 32, |_, _| {});
+    assert_eq!(
+        vm.update_pending_rooms(&mut fx.world).unwrap(),
+        vec![1],
+        "the switch marks its room"
+    );
+    assert_eq!(
+        counted(&fx.world),
+        (1, 0, 0),
+        "a dark lamp is still a light source, with no light"
+    );
+    let dark = light(&fx.world);
+    assert!(dark < lit, "the room goes darker ({lit} -> {dark})");
+}
+
+#[test]
 fn a_plate_feeds_one_sim_at_a_time_and_a_cancelled_meal_can_be_finished() {
     let pack = compile_pack_dir(&open_pack_dir()).unwrap();
     let mut fx = PackVmFixture::from_pack(&pack, 500);
