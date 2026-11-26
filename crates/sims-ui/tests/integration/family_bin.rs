@@ -115,6 +115,12 @@ fn native_and_compact_layouts_have_zero_overlaps() {
         native.button_rect(FamilyBinButton::MoveInFamily),
         Some(Rect::new(506, 530, 164, 62))
     );
+    // The shell's Export button sits right of Move In, on screen.
+    assert_eq!(
+        native.button_rect(FamilyBinButton::ExportFamily),
+        Some(Rect::new(676, 530, 100, 62))
+    );
+    assert_eq!(native.buttons.len(), FamilyBinButton::ALL.len());
 }
 
 #[test]
@@ -138,6 +144,7 @@ fn selection_buttons_double_click_and_empty_slots() {
     // Without selection, Delete and MoveIn are disabled; Create & Cancel work.
     assert_eq!(click_btn(&mut bin, FamilyBinButton::DeleteFamily), None);
     assert_eq!(click_btn(&mut bin, FamilyBinButton::MoveInFamily), None);
+    assert_eq!(click_btn(&mut bin, FamilyBinButton::ExportFamily), None);
     assert_eq!(
         click_btn(&mut bin, FamilyBinButton::CreateNewFamily),
         Some(FamilyBinCommand::CreateNewFamily)
@@ -171,6 +178,14 @@ fn selection_buttons_double_click_and_empty_slots() {
         click_btn(&mut bin, FamilyBinButton::DeleteFamily),
         Some(FamilyBinCommand::DeleteFamily(102))
     );
+    assert_eq!(
+        click_btn(&mut bin, FamilyBinButton::ExportFamily),
+        Some(FamilyBinCommand::ExportFamily(102))
+    );
+    // A press that leaves Export before the release does nothing.
+    let export = layout.button_rect(FamilyBinButton::ExportFamily).unwrap();
+    assert_eq!(bin.press(export.x + 5, export.y + 5, size, &view), None);
+    assert_eq!(bin.release(export.x - 20, export.y + 5, size, &view), None);
 
     // Removing a preceding row keeps selection pinned to stable ID 102 (never retargets!).
     let shifted: Vec<FamilyEntry> = families[1..].to_vec(); // ids 101, 102

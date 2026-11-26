@@ -808,25 +808,19 @@ impl Snapshot {
         format!("{half} {twelve:2}:{:02}", self.minute.clamp(0, 59))
     }
 
-    /// The funds as the panel writes them: `$2,542`. Checked against
-    /// the original for that value; how it writes a debt is
-    /// **unverified** (here `-$5`).
+    /// The funds as the panel writes them: `$2,542`, checked against the
+    /// original for that value. A debt is `-$5`: the original's locale
+    /// currency formatter (0x6007df, [`crate::currency`]) writes the minus
+    /// before the symbol in US English.
     pub fn money(&self) -> String {
         money(self.funds)
     }
 }
 
-/// An amount as the panel writes money: `$2,542` ([`Snapshot::money`]).
+/// An amount as the panel writes money: `$2,542`, `-$5`
+/// ([`crate::currency::simoleons`], 0x6007df).
 pub fn money(amount: i32) -> String {
-    let digits = amount.unsigned_abs().to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    format!("{}${out}", if amount < 0 { "-" } else { "" })
+    crate::currency::simoleons(i64::from(amount))
 }
 
 /// The careers of `work.iff`, by the ID of their `CARR` resource, as

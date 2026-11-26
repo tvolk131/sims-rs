@@ -9,7 +9,7 @@ use crate::menu::{Menu, Release};
 use crate::pace::Pace;
 use crate::view::View;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
-use sims_content::{ArchivePool, Catalog, Index, Install, Neighborhood};
+use sims_content::{ArchivePool, BuyLabels, Catalog, Index, Install, Neighborhood};
 use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_sim::World;
 use sims_ui::art::Art;
@@ -174,6 +174,9 @@ pub struct Hud {
     /// Interactive state (focus, caret, 500 ms blink, pressed button) of the
     /// active modal dialog.
     dialog_state: DialogState,
+    /// The press held now landed on a non-modal dialog
+    /// ([`Hud::take_non_modal_press`]): its release is the dialog's too.
+    non_modal_press: bool,
     dialog: Option<dialog::Layout>,
     /// Active Sound volume slider being dragged (`0x5f6245..0x5f6336`).
     dragging_slider: Option<VolumeChannel>,
@@ -253,6 +256,9 @@ pub struct Hud {
     rating_labels: RatingLabels,
     /// Buy Mode sell prompt templates (`GameData/UIText.iff STR# 136`, `0x50a343`).
     sell_labels: SellLabels,
+    /// The Buy Mode category buttons' text (`GameData/UIText.iff` STR# 150,
+    /// 200–207 and 210, 0x5057a2–0x5058cb), if `UIText.iff` has the tables.
+    category_labels: Option<BuyLabels>,
     /// The Buy Mode catalog strip state (sort, category, subcategory, page,
     /// selected GUID).
     pub buy_state: BuyState,
@@ -285,6 +291,7 @@ pub(crate) struct HudStatic {
     labels: Labels,
     rating_labels: RatingLabels,
     sell_labels: SellLabels,
+    category_labels: Option<BuyLabels>,
     texts: Texts,
     fame: Fame,
     options_texts: OptionsTexts,
@@ -299,6 +306,8 @@ impl HudStatic {
                 let labels = Labels::load(install).map_err(|e| e.to_string())?;
                 let rating_labels = RatingLabels::load(install);
                 let sell_labels = SellLabels::load(install);
+                // Without the category tables the Buy buttons have no text.
+                let category_labels = BuyLabels::load(install, US_ENGLISH).ok();
                 // Without the balloons', options', or camera strings the HUD still opens with defaults.
                 let texts = Texts::load(install).unwrap_or_default();
                 let fame = Fame::load(install).unwrap_or_default();
@@ -310,6 +319,7 @@ impl HudStatic {
                     labels,
                     rating_labels,
                     sell_labels,
+                    category_labels,
                     texts,
                     fame,
                     options_texts,
@@ -356,6 +366,7 @@ impl HudStatic {
             labels,
             rating_labels,
             sell_labels,
+            category_labels,
             texts,
             fame,
             options_texts,
@@ -368,6 +379,7 @@ impl HudStatic {
             labels,
             rating_labels,
             sell_labels,
+            category_labels,
             texts,
             fame,
             options_texts,
@@ -385,6 +397,7 @@ impl HudStatic {
             labels: Labels::default(),
             rating_labels: RatingLabels::default(),
             sell_labels: SellLabels::default(),
+            category_labels: None,
             texts: Texts::default(),
             fame: Fame::default(),
             options_texts: OptionsTexts::default(),
@@ -662,6 +675,7 @@ impl Hud {
             message: None,
             ui_dialog: None,
             dialog_state: DialogState::default(),
+            non_modal_press: false,
             dialog: None,
             dragging_slider: None,
             pressed_options_action: None,
@@ -698,6 +712,7 @@ impl Hud {
             buy_catalog: None,
             rating_labels: static_part.rating_labels,
             sell_labels: static_part.sell_labels,
+            category_labels: static_part.category_labels,
             buy_state: BuyState::default(),
             buy_layout: BuyLayout::default(),
             install: install.clone(),
@@ -777,8 +792,14 @@ impl Hud {
 
     /// Loads the residential Buy Mode catalog on first use and returns it.
     pub fn ensure_buy_catalog(&mut self, assets: &Assets) -> &BuyCatalog {
-        self.buy_catalog
-            .get_or_insert_with(|| load_buy_catalog(assets, &self.rating_labels, &self.sell_labels))
+        self.buy_catalog.get_or_insert_with(|| {
+            load_buy_catalog(
+                assets,
+                &self.rating_labels,
+                &self.sell_labels,
+                self.category_labels.as_ref(),
+            )
+        })
     }
 
     /// The residential Buy Mode catalog, once loaded.
@@ -841,7 +862,12 @@ impl Hud {
         let zone = sims_ui::buy::BuyZone::for_lot(lot_id, lot_zoning);
         self.buy_state.set_zone(zone);
         let catalog = self.buy_catalog.get_or_insert_with(|| {
-            load_buy_catalog(assets, &self.rating_labels, &self.sell_labels)
+            load_buy_catalog(
+                assets,
+                &self.rating_labels,
+                &self.sell_labels,
+                self.category_labels.as_ref(),
+            )
         });
         let funds = sims_vm::available_funds(world);
         let layout = buy::layout_with_sell(size, catalog, &self.buy_state, &self.art, funds, sell);
@@ -1774,6 +1800,11 @@ impl Hud {
     /// - `Char(ch)` activates localized Yes (button 0) or No (button 1) on
     ///   non-entry confirmations whose buttons match `STR# 142[3]` / `STR# 142[4]`.
     pub fn confirm_key(&mut self, key: DialogKey) -> Option<Command> {
+        // A non-modal dialog is answered only through its dismiss box: keys
+        // go on to whatever else has them.
+        if !self.has_dialog() {
+            return None;
+        }
         let message = self.active_message()?;
         let count = message.buttons.len();
         if count == 0 {
@@ -1852,9 +1883,58 @@ impl Hud {
     }
 
     /// Whether any modal dialog (UI confirmation, loaded VM dialog, or drawn
-    /// layout) is currently active, even before the next [`Hud::draw`].
+    /// layout) is currently active, even before the next [`Hud::draw`]. A
+    /// non-modal simulation dialog ([`dialog::Presentation::modal`] clear)
+    /// is not one: it takes only the presses on it
+    /// ([`Hud::has_non_modal_dialog`]).
     pub fn has_dialog(&self) -> bool {
-        self.ui_dialog.is_some() || self.message.is_some() || self.dialog.is_some()
+        self.ui_dialog.is_some()
+            || match &self.message {
+                Some((message, _)) => message.presentation.modal,
+                None => self.dialog.is_some(),
+            }
+    }
+
+    /// Whether the dialog shown is a non-modal simulation dialog: drawn
+    /// with a dismiss box, taking presses on it only, so the game goes on
+    /// being played around it.
+    pub fn has_non_modal_dialog(&self) -> bool {
+        self.ui_dialog.is_none()
+            && self
+                .message
+                .as_ref()
+                .is_some_and(|(message, _)| !message.presentation.modal)
+    }
+
+    /// The rect of the non-modal dialog drawn last, if one is shown.
+    fn non_modal_rect(&self) -> Option<Rect> {
+        self.has_non_modal_dialog()
+            .then(|| self.dialog.as_ref().map(|l| l.rect))
+            .flatten()
+    }
+
+    /// Whether `point` is on a non-modal dialog: a press there is the
+    /// dialog's, before any pie menu, held object or tool under it.
+    pub fn over_non_modal_dialog(&self, point: [i32; 2]) -> bool {
+        self.non_modal_rect()
+            .is_some_and(|r| r.contains(point[0], point[1]))
+    }
+
+    /// Whether the press being released landed on a non-modal dialog
+    /// (so its release must not reach what is under the dialog), clearing
+    /// it. Call once per release, after [`Hud::release_dialog`].
+    pub fn take_non_modal_press(&mut self) -> bool {
+        std::mem::take(&mut self.non_modal_press)
+    }
+
+    /// Drops a non-modal dialog's capture left by a press whose release
+    /// never came, and the button it held. A modal dialog's held button is
+    /// left as it is.
+    pub fn cancel_non_modal_press(&mut self) {
+        if std::mem::take(&mut self.non_modal_press) {
+            self.dialog_state.pressed_button = None;
+            self.dialog_state.dragging_entry = None;
+        }
     }
 
     /// Updates the native `[control_panel + 0x1ec]` idle-blink flag
@@ -2482,11 +2562,19 @@ impl Hud {
         self.dialog = self
             .active_message()
             .and_then(|m| dialog::layout(view.size, m, &self.art));
-        // A dialog takes every press until it is answered, so a menu open
-        // under it is closed rather than left to be chosen from after.
-        if self.dialog.is_some() {
+        // A modal dialog takes every press until it is answered, so a menu
+        // open under it is closed rather than left to be chosen from after.
+        // A non-modal one leaves the game to be played around it.
+        if self.dialog.is_some() && !self.has_non_modal_dialog() {
             self.menu = None;
             self.close_camera_strip();
+        }
+        // A modal dialog closes any pie menu (above), so only a non-modal
+        // one is ever drawn with a menu open: it goes over the menu's
+        // labels, as presses on it go to it first (`Game::dialog_takes`).
+        if let Some(menu) = &mut self.menu {
+            menu.layout(&self.art, view.size);
+            menu.draw_labels(&mut frame, &self.art, self.controls.pointer);
         }
         if let (Some(message), Some(layout)) = (self.active_message(), &self.dialog) {
             let alpha = if clock_us == 0 {
@@ -2503,10 +2591,6 @@ impl Hud {
                 &self.dialog_state,
                 alpha,
             );
-        }
-        if let Some(menu) = &mut self.menu {
-            menu.layout(&self.art, view.size);
-            menu.draw_labels(&mut frame, &self.art, self.controls.pointer);
         }
         self.band = status.and_then(|status| self.status(&mut frame, status));
         if self.cheat_console.is_open() {
@@ -2799,6 +2883,9 @@ impl Hud {
     /// pixels), or a dialog or a pie menu is shown and takes every press.
     pub fn covers(&self, point: [i32; 2]) -> bool {
         self.has_dialog()
+            || self
+                .non_modal_rect()
+                .is_some_and(|r| r.contains(point[0], point[1]))
             || self.menu.is_some()
             || self.band.is_some_and(|b| b.contains(point[0], point[1]))
             || self
@@ -2900,6 +2987,7 @@ impl Hud {
     /// menu on this frame (`Hud::draw`).
     pub fn will_show_dialog(&self, size: [i32; 2]) -> bool {
         self.active_message()
+            .filter(|m| self.ui_dialog.is_some() || m.presentation.modal)
             .and_then(|m| dialog::layout(size, m, &self.art))
             .is_some()
     }
@@ -3088,7 +3176,16 @@ impl Hud {
     /// is, `sims_vm::Lot::residential`) as they are at the press, not as
     /// the frame drew them ([`hud::check_press`]).
     pub fn press(&mut self, point: [i32; 2], world: &World, residential: bool) -> Option<Command> {
-        if let Some(layout) = self.dialog.clone() {
+        // A non-modal dialog takes only the presses on it; any other goes on
+        // to what is under it.
+        let non_modal = self.has_non_modal_dialog();
+        self.non_modal_press = false;
+        if let Some(layout) = self
+            .dialog
+            .clone()
+            .filter(|l| !non_modal || l.rect.contains(point[0], point[1]))
+        {
+            self.non_modal_press = non_modal;
             if let Some(message) = self.active_message().cloned()
                 && self
                     .dialog_state
@@ -3304,16 +3401,21 @@ impl Hud {
     }
 }
 
-/// The residential Buy Mode catalog with its popup rating and sell prompt
-/// labels, loaded on first use.
+/// The residential Buy Mode catalog with its popup rating, sell prompt and
+/// category button labels, loaded on first use.
 fn load_buy_catalog(
     assets: &Assets,
     rating_labels: &RatingLabels,
     sell_labels: &SellLabels,
+    category_labels: Option<&BuyLabels>,
 ) -> BuyCatalog {
-    BuyCatalog::load(assets.index(), assets.catalog())
+    let catalog = BuyCatalog::load(assets.index(), assets.catalog())
         .with_rating_labels(rating_labels.clone())
-        .with_sell_labels(sell_labels.clone())
+        .with_sell_labels(sell_labels.clone());
+    match category_labels {
+        Some(labels) => catalog.with_category_labels(labels.clone()),
+        None => catalog,
+    }
 }
 
 /// The actions whose icons were pressed while they show: a second press

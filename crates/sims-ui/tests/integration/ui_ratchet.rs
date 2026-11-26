@@ -222,9 +222,15 @@ fn family_bin_chrome_matches_191_oracle() {
     bin.draw(&mut frame, &view, &art, &strings);
     let q = frame.quantized();
 
-    // Exclude dynamic household portrait cells (x=145..520, y=90..290).
+    // Exclude dynamic household portrait cells (x=145..520, y=90..290) and
+    // the modern shell's Export button, which the original's Family Bin
+    // does not have (docs/decisions: Family Bin export).
+    let export =
+        family_bin::FamilyBinLayout::compute(800, 600, families.len(), 0, FamilyBinMode::Standard)
+            .button_rect(family_bin::FamilyBinButton::ExportFamily)
+            .expect("Export button");
     let (exact, total) = match_rate_565(&q.rgb(), &oracle_fb, 800, 0..600, |x, y| {
-        (145..520).contains(&x) && (90..290).contains(&y)
+        ((145..520).contains(&x) && (90..290).contains(&y)) || export.contains(x as i32, y as i32)
     });
     let pct = 100.0 * exact as f64 / total as f64;
     assert!(

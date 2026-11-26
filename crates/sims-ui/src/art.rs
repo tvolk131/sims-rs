@@ -643,6 +643,17 @@ impl Art {
             crate::dialog::BUTTON,
             build_button_strip(65, 33, 4, [54, 102, 162]),
         );
+        // Non-modal dialog dismiss box: four 12x11 cells (normal, selected,
+        // hover, disabled).
+        art.insert(
+            crate::dialog::DISMISS,
+            build_button_strip(
+                crate::dialog::DISMISS_SIZE[0] as u32,
+                crate::dialog::DISMISS_SIZE[1] as u32,
+                4,
+                [54, 102, 162],
+            ),
+        );
         art.insert(
             crate::dialog::BACKGROUND,
             build_nine_slice(

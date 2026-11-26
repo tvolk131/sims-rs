@@ -31,6 +31,14 @@ impl Game {
             || self.active_special_panel.is_some()
     }
 
+    /// Whether a press at `point` belongs to a dialog: any press while a
+    /// modal one is open ([`Game::has_dialog`]), or one on a non-modal
+    /// dialog, which takes it before a pie menu, a held object or a tool
+    /// under it.
+    pub fn dialog_takes(&self, point: [i32; 2]) -> bool {
+        self.has_dialog() || self.hud.over_non_modal_dialog(point)
+    }
+
     /// Loads persisted Options preferences from an `Options.iff` (`Optn` 128)
     /// file (`0x4e6505..0x4e685e`), applying Free Will to the lot's global 30.
     pub fn load_options(&mut self, path: &Path) -> Result<(), String> {

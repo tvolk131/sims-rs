@@ -9,7 +9,7 @@ use crate::frame::{Frame, Rect};
 use crate::hud::STRIP;
 use crate::thumbnail::{SIZE as CELL, TEMPLATE, Thumbnails};
 use sims_content::ui_graphics::US_ENGLISH;
-use sims_content::{BuyEligibility, CatalogText};
+use sims_content::{BuyEligibility, BuyLabels, CatalogText};
 use sims_content::{Catalog, Index, Install};
 use sims_formats::behavior::InteractionTable;
 use sims_formats::iff::Iff;
@@ -48,6 +48,36 @@ impl BuyZone {
             }
             _ => Self::Residential,
         }
+    }
+
+    /// The catalog 0x506765 switches on for this zone and `sort`, the row
+    /// of `UIText.iff` STR# 150 its category buttons read
+    /// ([`BuyLabels::label`]): 0 by room and 1 by function on a residential
+    /// lot, then 2 Downtown, 3 Vacation, 4 Community, 5 Studio Town and 6
+    /// Magic Town (checked against the strings of each row).
+    pub const fn catalog(self, sort: BuySort) -> usize {
+        match self {
+            Self::Residential => match sort {
+                BuySort::ByRoom => 0,
+                BuySort::ByFunction => 1,
+            },
+            Self::Downtown => 2,
+            Self::Vacation => 3,
+            Self::Community => 4,
+            Self::StudioTown => 5,
+            Self::MagicTown => 6,
+        }
+    }
+
+    /// The STR# 150 column of each top-level category button, in button
+    /// order: the columns [`BuyLabels::shown`] leaves at the root (0 to 7
+    /// residential; 0 to 3 and 7 on a commercial lot, which hides 4 to 6).
+    /// The commercial columns are [`COMMERCIAL_BITS`]' bits.
+    pub fn root_columns(self) -> Vec<usize> {
+        let catalog = self.catalog(BuySort::ByFunction);
+        (0..8)
+            .filter(|&column| BuyLabels::shown(catalog, 0, column))
+            .collect()
     }
 
     /// Number of top-level category buttons for this zone (`8` on Residential,
@@ -489,6 +519,9 @@ pub struct BuyCatalog {
     fallback_names: std::collections::BTreeMap<u32, String>,
     rating_labels: RatingLabels,
     sell_labels: SellLabels,
+    /// The category buttons' text (`UIText.iff` STR# 150, 200–207 and
+    /// 210, 0x5057a2–0x5058cb), if loaded.
+    category_labels: Option<BuyLabels>,
 }
 
 /// OBJD byte offsets read by `0x4cb8e7..0x4cbaa8` and `0x457a36`; the words
@@ -818,6 +851,7 @@ impl BuyCatalog {
             fallback_names,
             rating_labels: RatingLabels::default(),
             sell_labels: SellLabels::default(),
+            category_labels: None,
         }
     }
 
@@ -825,6 +859,31 @@ impl BuyCatalog {
     pub fn with_rating_labels(mut self, rating_labels: RatingLabels) -> Self {
         self.rating_labels = rating_labels;
         self
+    }
+
+    /// Attaches the category buttons' text ([`BuyLabels`], `UIText.iff`
+    /// STR# 150, 200–207 and 210) to this catalog. Without it the buttons
+    /// have no label.
+    pub fn with_category_labels(mut self, labels: BuyLabels) -> Self {
+        self.category_labels = Some(labels);
+        self
+    }
+
+    /// The text 0x506765 gives category button `column` (STR# 150 column,
+    /// or subcategory slot inside a category) for `state`'s zone, sort and
+    /// open category, or an empty string without [`BuyLabels`].
+    pub fn category_label(&self, state: &BuyState, column: usize) -> String {
+        let Some(labels) = &self.category_labels else {
+            return String::new();
+        };
+        let catalog = state.zone.catalog(state.sort);
+        // +0x46c is nonzero inside a category; the function row is the open
+        // category (by function).
+        let (subcatalog, row) = match state.category {
+            Some(category) => (1, category),
+            None => (0, 0),
+        };
+        decode_text(labels.label(catalog, subcatalog, row, column))
     }
 
     /// Attaches localized `UIText.iff STR# 136` sell prompt labels to this catalog.
@@ -847,6 +906,7 @@ impl BuyCatalog {
             fallback_names: std::collections::BTreeMap::new(),
             rating_labels: RatingLabels::default(),
             sell_labels: SellLabels::default(),
+            category_labels: None,
         }
     }
 
@@ -954,6 +1014,9 @@ pub struct BuyWidget {
     pub rect: Rect,
     pub kind: BuyWidgetKind,
     pub command: Option<Command>,
+    /// A category button's text ([`BuyCatalog::category_label`]), shown
+    /// while the pointer is over it; empty for other widgets.
+    pub label: String,
 }
 
 /// How a [`BuyWidget`] draws.
@@ -1102,11 +1165,16 @@ pub fn layout_with_sell(
                             enabled: true,
                         },
                         command: Some(Command::BuyCategory(i)),
+                        label: catalog.category_label(state, i),
                     });
                 }
             } else {
+                // 0x506765 hides root buttons 4 to 6 on a commercial lot
+                // (`BuyLabels::shown`): its five buttons are columns 0 to 3
+                // and 7, the bits of `COMMERCIAL_BITS`.
                 let bmps = commercial_cat_bmps(state.zone);
-                for (i, &id) in bmps.iter().enumerate() {
+                let columns = state.zone.root_columns();
+                for (i, (&id, &column)) in bmps.iter().zip(&columns).enumerate() {
                     let [w, h] = btn_size(id);
                     let pos = COMMERCIAL_CAT_POS[i];
                     widgets.push(BuyWidget {
@@ -1117,6 +1185,7 @@ pub fn layout_with_sell(
                             enabled: true,
                         },
                         command: Some(Command::BuyCategory(i)),
+                        label: catalog.category_label(state, column),
                     });
                 }
             }
@@ -1138,6 +1207,7 @@ pub fn layout_with_sell(
                     enabled: true,
                 },
                 command: Some(Command::BuyBack),
+                label: String::new(),
             });
 
             for sub in 0..8 {
@@ -1167,6 +1237,7 @@ pub fn layout_with_sell(
                         enabled: true,
                     },
                     command: Some(Command::BuySubcategory(sub)),
+                    label: catalog.category_label(state, sub),
                 });
             }
 
@@ -1203,6 +1274,7 @@ pub fn layout_with_sell(
                         affordable: item.price <= available_funds,
                     },
                     command: Some(Command::BuyItem(item.guid)),
+                    label: String::new(),
                 });
             }
 
@@ -1216,6 +1288,7 @@ pub fn layout_with_sell(
                         enabled: true,
                     },
                     command: Some(Command::BuyPage(-1)),
+                    label: String::new(),
                 });
             }
             if start + per_page < items.len() {
@@ -1228,6 +1301,7 @@ pub fn layout_with_sell(
                         enabled: true,
                     },
                     command: Some(Command::BuyPage(1)),
+                    label: String::new(),
                 });
             }
         }
@@ -1490,6 +1564,25 @@ pub fn draw(
                 y += line_step;
             }
         }
+    }
+
+    // A category button's text shows over it while the pointer is on it
+    // (0x506765 gives the buttons their STR# 150/200-207/210 text). Where
+    // the original puts the tip is not measured: here it is centered
+    // above the button, as the Family Bin's are.
+    if let Some([px, py]) = pointer
+        && let Some(widget) = layout.widgets.iter().rev().find(|w| {
+            matches!(w.kind, BuyWidgetKind::Button { .. })
+                && !w.label.is_empty()
+                && w.rect.contains(px, py)
+        })
+    {
+        crate::neighborhood::draw_tooltip(
+            frame,
+            art,
+            &widget.label,
+            [widget.rect.x + widget.rect.width / 2, widget.rect.y - 18],
+        );
     }
 }
 
@@ -1798,6 +1891,185 @@ mod tests {
         assert_eq!(state.selected, None);
         assert!(state.apply(&Command::BuyToggleSort));
         assert_eq!(state.sort, BuySort::ByFunction);
+    }
+
+    /// A synthetic `UIText.iff` whose category tables (STR# 150, 200–207
+    /// and 210) hold `T<id>.<n>` in US English.
+    fn category_labels() -> BuyLabels {
+        let mut tables = vec![(150u16, 56usize), (210, 5)];
+        tables.extend((200..=207).map(|id| (id, 4)));
+        let payloads: Vec<(u16, Vec<u8>)> = tables
+            .into_iter()
+            .map(|(id, count)| {
+                let mut bytes = (-3i16).to_le_bytes().to_vec();
+                bytes.extend((count as u16).to_le_bytes());
+                for n in 1..=count {
+                    bytes.push(1);
+                    bytes.extend(format!("T{id}.{n}").into_bytes());
+                    bytes.extend([0, 0]);
+                }
+                (id, bytes)
+            })
+            .collect();
+        let chunks: Vec<(&[u8; 4], u16, &[u8])> = payloads
+            .iter()
+            .map(|(id, bytes)| (b"STR#", *id, bytes.as_slice()))
+            .collect();
+        let mut file = build_iff(&chunks);
+        // Mark each chunk little-endian (flag 0x10), as UIText.iff's are.
+        let mut at = 64;
+        while at + 76 <= file.len() {
+            let size = u32::from_be_bytes(file[at + 4..at + 8].try_into().unwrap()) as usize;
+            file[at + 10..at + 12].copy_from_slice(&0x10u16.to_be_bytes());
+            at += size;
+        }
+        let iff = Iff::parse(file).expect("synthetic UIText.iff");
+        BuyLabels::from_iff(&iff, 1).expect("category tables")
+    }
+
+    fn button_labels(layout: &BuyLayout) -> Vec<(Command, String)> {
+        layout
+            .widgets
+            .iter()
+            .filter(|w| matches!(w.kind, BuyWidgetKind::Button { .. }))
+            .filter_map(|w| Some((w.command.clone()?, w.label.clone())))
+            .collect()
+    }
+
+    #[test]
+    fn category_buttons_carry_their_buy_labels() {
+        let cat = sample_catalog().with_category_labels(category_labels());
+        let art = Art::default();
+        let mut state = BuyState::default();
+
+        // Residential by function: STR# 150 row 1 (strings 9 to 16).
+        let top = layout([800, 600], &cat, &state, &art, 0);
+        let labels = button_labels(&top);
+        assert_eq!(labels.len(), 8);
+        for (i, (command, label)) in labels.iter().enumerate() {
+            assert_eq!(*command, Command::BuyCategory(i));
+            assert_eq!(*label, format!("T150.{}", 9 + i));
+        }
+
+        // Inside Seating: function row 0 (STR# 200) for slots 0 to 3, then
+        // STR# 210's 4, 5, 2 and 3 for slots 4 to 7; Seating shows no 4/5.
+        state.apply(&Command::BuyCategory(0));
+        let seating = button_labels(&layout([800, 600], &cat, &state, &art, 0));
+        let sub = |n: usize| {
+            seating
+                .iter()
+                .find(|(c, _)| *c == Command::BuySubcategory(n))
+                .map(|(_, l)| l.clone())
+        };
+        assert_eq!(sub(0).as_deref(), Some("T200.1"));
+        assert_eq!(sub(3).as_deref(), Some("T200.4"));
+        assert_eq!(sub(4), None);
+        assert_eq!(sub(6).as_deref(), Some("T210.2"));
+        assert_eq!(sub(7).as_deref(), Some("T210.3"));
+        assert!(
+            seating
+                .iter()
+                .any(|(c, l)| *c == Command::BuyBack && l.is_empty()),
+            "the back button has no category label"
+        );
+
+        // Miscellaneous (category 7) reads STR# 207 and shows Pets/Magic.
+        state.apply(&Command::BuyCategory(7));
+        let misc = button_labels(&layout([800, 600], &cat, &state, &art, 0));
+        let label_of = |n: usize| {
+            misc.iter()
+                .find(|(c, _)| *c == Command::BuySubcategory(n))
+                .map(|(_, l)| l.clone())
+        };
+        assert_eq!(label_of(0).as_deref(), Some("T207.1"));
+        assert_eq!(label_of(4).as_deref(), Some("T210.4"));
+        assert_eq!(label_of(5).as_deref(), Some("T210.5"));
+
+        // Residential by room: STR# 150 row 0; its subcategories are the
+        // functions, row 1.
+        state.apply(&Command::BuyBack);
+        state.apply(&Command::BuyToggleSort);
+        let rooms = button_labels(&layout([800, 600], &cat, &state, &art, 0));
+        assert_eq!(rooms[0].1, "T150.1");
+        assert_eq!(rooms[7].1, "T150.8");
+        state.apply(&Command::BuyCategory(2));
+        let bedroom = button_labels(&layout([800, 600], &cat, &state, &art, 0));
+        assert!(
+            bedroom
+                .iter()
+                .any(|(c, l)| *c == Command::BuySubcategory(2) && l == "T150.11")
+        );
+    }
+
+    #[test]
+    fn commercial_roots_hide_columns_four_to_six() {
+        let cat = sample_catalog().with_category_labels(category_labels());
+        let art = Art::default();
+        for (zone, catalog) in [
+            (BuyZone::Downtown, 2),
+            (BuyZone::Vacation, 3),
+            (BuyZone::Community, 4),
+            (BuyZone::StudioTown, 5),
+        ] {
+            assert_eq!(zone.catalog(BuySort::ByFunction), catalog);
+            assert_eq!(zone.root_columns(), vec![0, 1, 2, 3, 7]);
+            let mut state = BuyState::default();
+            state.set_zone(zone);
+            let labels = button_labels(&layout([800, 600], &cat, &state, &art, 0));
+            let expected: Vec<String> = [0, 1, 2, 3, 7]
+                .iter()
+                .map(|c| format!("T150.{}", catalog * 8 + c + 1))
+                .collect();
+            assert_eq!(
+                labels.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>(),
+                expected,
+                "{zone:?}"
+            );
+            // A column's label matches its category's sort bit.
+            for (i, column) in zone.root_columns().into_iter().enumerate() {
+                assert_eq!(COMMERCIAL_BITS[i], 1 << column);
+            }
+        }
+        // Magic Town reads row 5, with buttons 2 and 3 from row 5 column 4
+        // and row 4 column 2.
+        let mut state = BuyState::default();
+        state.set_zone(BuyZone::MagicTown);
+        assert_eq!(state.zone.catalog(state.sort), 6);
+        let magic: Vec<String> = button_labels(&layout([800, 600], &cat, &state, &art, 0))
+            .into_iter()
+            .map(|(_, l)| l)
+            .collect();
+        assert_eq!(
+            magic,
+            ["T150.41", "T150.42", "T150.45", "T150.35", "T150.48"]
+        );
+        // Inside a commercial category the subcategories are the functions.
+        state.apply(&Command::BuyCategory(1));
+        let sub = button_labels(&layout([800, 600], &cat, &state, &art, 0));
+        assert!(
+            sub.iter()
+                .any(|(c, l)| *c == Command::BuySubcategory(7) && l == "T150.16")
+        );
+    }
+
+    #[test]
+    fn category_labels_are_empty_without_buy_labels_and_draw_safely() {
+        let cat = sample_catalog();
+        let art = Art::default();
+        let state = BuyState::default();
+        let top = layout([800, 600], &cat, &state, &art, 0);
+        assert!(top.widgets.iter().all(|w| w.label.is_empty()));
+        let labelled = sample_catalog().with_category_labels(category_labels());
+        let top = layout([800, 600], &labelled, &state, &art, 0);
+        let first = top.widgets[0].rect;
+        let mut frame = Frame::new(800, 600, [0, 0, 0]);
+        draw(
+            &mut frame,
+            &art,
+            &Thumbnails::default(),
+            &top,
+            Some([first.x + 1, first.y + 1]),
+        );
     }
 
     /// Builds a minimal IFF 2.5 buffer from `(type_code, id, payload)` chunks.
