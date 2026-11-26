@@ -348,12 +348,17 @@ pub fn decompile_iff_to_v2_report(
                 if changed {
                     continue;
                 }
-                let (text, recompiled, mut checks) = model.type_engine_fields(
+                let (text, recompiled, checks) = model.type_engine_fields(
                     &generated.text,
                     (recompiled, checks, &unproven),
                     &mut cache,
                 );
                 let text = model.lint_spellings(text, &recompiled);
+                let text = model.polish(text, &recompiled);
+                let (text, recompiled, mut checks) =
+                    model.flip_negations(text, (recompiled, checks), &mut cache);
+                let text = model.dot_bcon_reads_the_lint_misses(text);
+                let text = model.allow_kept_negations(text);
                 let source = format_v2_source(&text)?;
                 let mut trees: Vec<DecompiledTree> = model
                     .trees
@@ -699,6 +704,468 @@ fn keep_joint<T: Clone>(fixes: &[T], ok: &dyn Fn(&[T]) -> bool, budget: usize) -
     let mut budget = budget;
     go(&mut kept, fixes, ok, &mut budget);
     kept
+}
+
+/// The most rounds [`Model::flip_negations`] takes.
+const NEGATION_ROUNDS: usize = 3;
+
+/// The most builds [`Model::polish`] may take to find the tree names that keep the bytes.
+const POLISH_NAME_BUILDS: usize = 8;
+
+/// Names a tree is not given even when nothing in its file uses them, so the name it gets
+/// reads as the tree alone: every identifier-like string the v2 lexer, parser and lowering
+/// match on (keywords, builtin calls and their options, field names), `.air`'s reserved
+/// words, and every callable and module `std` declares.
+fn reserved_tree_names() -> &'static BTreeSet<&'static str> {
+    const COMPILER: [&str; 27] = [
+        include_str!("lexer.rs"),
+        include_str!("parser.rs"),
+        include_str!("lower/actions.rs"),
+        include_str!("lower/air_text.rs"),
+        include_str!("lower/ast_facts.rs"),
+        include_str!("lower/builtins.rs"),
+        include_str!("lower/callable.rs"),
+        include_str!("lower/cond.rs"),
+        include_str!("lower/consteval.rs"),
+        include_str!("lower/dialog.rs"),
+        include_str!("lower/env.rs"),
+        include_str!("lower/expr.rs"),
+        include_str!("lower/inline.rs"),
+        include_str!("lower/lvalue.rs"),
+        include_str!("lower/match_lower.rs"),
+        include_str!("lower/matching.rs"),
+        include_str!("lower/mod.rs"),
+        include_str!("lower/object.rs"),
+        include_str!("lower/prim_table.rs"),
+        include_str!("lower/raw.rs"),
+        include_str!("lower/raw_consts.rs"),
+        include_str!("lower/schema.rs"),
+        include_str!("lower/scope.rs"),
+        include_str!("lower/stack.rs"),
+        include_str!("lower/stmt.rs"),
+        include_str!("lower/tree.rs"),
+        include_str!("lower/trees.rs"),
+    ];
+    const STD: [&str; 6] = [
+        include_str!("std/budget.antics"),
+        include_str!("std/engine.antics"),
+        include_str!("std/flags.antics"),
+        include_str!("std/globals.antics"),
+        include_str!("std/math.antics"),
+        include_str!("std/motives.antics"),
+    ];
+    static NAMES: std::sync::OnceLock<BTreeSet<&'static str>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let ident = |s: &str| {
+            s.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+                && s.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        };
+        let mut names = BTreeSet::new();
+        for source in COMPILER {
+            for line in source.lines() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                // The text between quotes, `\"` and `'"'` aside: a stray pair only adds
+                // names, which costs a tree its short name and nothing else.
+                let code = code.replace("\\\"", "").replace("'\"'", "");
+                for lit in code.split('"').skip(1).step_by(2) {
+                    if ident(lit) {
+                        names.insert(&*lit.to_owned().leak());
+                    }
+                }
+            }
+        }
+        for source in STD {
+            for line in source.lines() {
+                let Some(at) = line.find("fn ") else { continue };
+                let rest = &line[at + 3..];
+                let name = rest.split('(').next().unwrap_or_default().trim();
+                if ident(name) {
+                    names.insert(&*name.to_owned().leak());
+                }
+            }
+        }
+        names.extend([
+            "std",
+            "globals",
+            "more_globals",
+            "library_consts",
+            "budget",
+            "engine",
+            "flags",
+            "math",
+            "motives",
+            "tree",
+        ]);
+        names
+    })
+}
+
+/// Every identifier `text`'s code holds: each identifier token, and each word of a
+/// `raw { }` body (strings and comments aside). `None` when `text` does not lex.
+fn code_words(text: &str) -> Option<BTreeSet<String>> {
+    use crate::v2::lexer::{TokenKind as K, tokenize};
+    let mut out = BTreeSet::new();
+    for t in tokenize(text).ok()? {
+        match t.kind {
+            K::Ident(w) => {
+                out.insert(w);
+            }
+            K::RawBlock(body) => out.extend(
+                body.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .filter(|w| !w.is_empty())
+                    .map(str::to_owned),
+            ),
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
+/// `text` with each `from` (a `Table::entry` path) that stands alone, not inside a longer
+/// word, written as `to`.
+fn replace_path(text: &str, from: &str, to: &str) -> String {
+    let word = |c: Option<char>| c.is_some_and(|c| c == '_' || c.is_ascii_alphanumeric());
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(from) {
+        let end = at + from.len();
+        let alone = !word(rest[..at].chars().next_back()) && !word(rest[end..].chars().next());
+        out.push_str(&rest[..at]);
+        out.push_str(if alone { to } else { from });
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `text` with each word that `renames` maps written as its new name, outside string
+/// literals (comments included).
+fn apply_renames(text: &str, renames: &[(String, String)]) -> String {
+    let map: BTreeMap<&str, &str> = renames
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let (mut in_string, mut escaped) = (false, false);
+        let mut word_start: Option<usize> = None;
+        let flush = |out: &mut String, word: &str| {
+            out.push_str(map.get(word).copied().unwrap_or(word));
+        };
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i];
+            let word_char = c.is_ascii_alphanumeric() || c == b'_';
+            if word_char && !in_string {
+                word_start.get_or_insert(i);
+                i += 1;
+                continue;
+            }
+            if let Some(start) = word_start.take() {
+                flush(&mut out, &line[start..i]);
+            }
+            if !in_string && line[i..].starts_with("//") {
+                // A comment: names in it are renamed too, quotes or not.
+                let rest = &line[i..];
+                let mut last = 0;
+                for (at, w) in
+                    rest.match_indices(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                {
+                    flush(&mut out, &rest[last..at]);
+                    out.push_str(w);
+                    last = at + w.len();
+                }
+                flush(&mut out, &rest[last..]);
+                break;
+            }
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if c == b'\\' {
+                    escaped = true;
+                } else if c == b'"' {
+                    in_string = false;
+                }
+            } else if c == b'"' {
+                in_string = true;
+            }
+            let ch_len = line[i..].chars().next().map_or(1, char::len_utf8);
+            out.push_str(&line[i..i + ch_len]);
+            i += ch_len;
+        }
+        if let Some(start) = word_start.take() {
+            flush(&mut out, &line[start..]);
+        }
+    }
+    out
+}
+
+/// `text` with every `else { if .. }` whose block holds the `if` chain alone (no other
+/// statement, no comment) written `else if ..`, and `None` when there is none. Only an
+/// `if`'s `else` is joined (not a `for` loop's), and `raw { }` bodies are one token, so
+/// `.air` is never touched. The parser reads both forms as the same statement.
+fn collapse_else_if(text: &str) -> Option<String> {
+    use crate::v2::lexer::{TokenKind as K, tokenize};
+    let tokens = tokenize(text).ok()?;
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let offset = |t: &crate::v2::lexer::Token| line_starts[t.span.line - 1] + t.span.column - 1;
+    let is = |i: usize, word: &str| matches!(&tokens.get(i).map(|t| &t.kind), Some(K::Ident(w)) if w == word);
+    // The matching brace of each brace.
+    let mut pair = vec![usize::MAX; tokens.len()];
+    let mut open = Vec::new();
+    for (i, t) in tokens.iter().enumerate() {
+        match t.kind {
+            K::LBrace => open.push(i),
+            K::RBrace => {
+                let o = open.pop()?;
+                pair[o] = i;
+                pair[i] = o;
+            }
+            _ => {}
+        }
+    }
+    // The `{` that opens the body of the `if` / `while` / `for` whose header starts at
+    // token `start`: the first `{` outside parentheses and brackets.
+    let body_open = |start: usize| {
+        let mut depth = 0i32;
+        for (k, t) in tokens.iter().enumerate().skip(start + 1) {
+            match t.kind {
+                K::LParen | K::LBracket => depth += 1,
+                K::RParen | K::RBracket => depth -= 1,
+                K::LBrace if depth == 0 => return Some(k),
+                K::RBrace | K::Semicolon | K::Eof => return None,
+                _ => {}
+            }
+        }
+        None
+    };
+    // The keyword that heads the block whose `{` is token `open`.
+    let head = |open: usize| {
+        let mut depth = 0i32;
+        for k in (0..open).rev() {
+            match &tokens[k].kind {
+                K::RParen | K::RBracket => depth += 1,
+                K::LParen | K::LBracket => depth -= 1,
+                K::LBrace | K::RBrace | K::Semicolon if depth == 0 => return None,
+                K::Ident(w)
+                    if depth == 0
+                        && matches!(w.as_str(), "if" | "for" | "while" | "loop" | "match") =>
+                {
+                    return Some(w.as_str());
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    let blank = |a: usize, b: usize| text[a..b].trim().is_empty();
+    let mut cuts: Vec<std::ops::Range<usize>> = Vec::new();
+    for i in 1..tokens.len() {
+        if !(is(i, "else") && matches!(tokens[i - 1].kind, K::RBrace) && is(i + 2, "if")) {
+            continue;
+        }
+        if !matches!(tokens[i + 1].kind, K::LBrace) || head(pair[i - 1]) != Some("if") {
+            continue;
+        }
+        let close = pair[i + 1];
+        // The chain inside: `if .. { } (else if .. { })* (else { })?`, then the `}`.
+        let mut j = i + 2;
+        let end = loop {
+            let Some(body) = body_open(j) else { break None };
+            let body_end = pair[body];
+            if !is(body_end + 1, "else") {
+                break Some(body_end);
+            }
+            if is(body_end + 2, "if") {
+                j = body_end + 2;
+            } else if matches!(tokens.get(body_end + 2).map(|t| &t.kind), Some(K::LBrace)) {
+                break Some(pair[body_end + 2]);
+            } else {
+                break None;
+            }
+        };
+        let Some(end) = end else { continue };
+        if end + 1 != close {
+            continue;
+        }
+        let (brace, first) = (offset(&tokens[i + 1]), offset(&tokens[i + 2]));
+        let (last, closing) = (offset(&tokens[end]) + 1, offset(&tokens[close]));
+        if !(blank(brace + 1, first) && blank(last, closing)) {
+            continue;
+        }
+        cuts.push(brace..first);
+        cuts.push(last..closing + 1);
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    cuts.sort_by_key(|r| std::cmp::Reverse(r.start));
+    let mut out = text.to_owned();
+    for r in cuts {
+        out.replace_range(r, "");
+    }
+    Some(out)
+}
+
+/// `text` with the `use` lines of its leading block that import single names from one
+/// module joined into one braced, sorted line (`use std::flags::{Expansions, ObjectFlags};`).
+/// A glob or already-braced line stays as it is.
+fn group_imports(text: &str) -> String {
+    let header: usize = text
+        .split_inclusive('\n')
+        .take_while(|l| l.starts_with("//"))
+        .map(str::len)
+        .sum();
+    let rest = &text[header..];
+    let block = header + rest.len() - rest.trim_start_matches('\n').len();
+    let mut end = block;
+    let mut lines: Vec<&str> = Vec::new();
+    for line in text[block..].split_inclusive('\n') {
+        let l = line.trim_end();
+        if !(l.starts_with("use ") && l.ends_with(';')) {
+            break;
+        }
+        lines.push(l);
+        end += line.len();
+    }
+    let mut groups: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    let mut kept: Vec<String> = Vec::new();
+    for l in &lines {
+        let path = &l["use ".len()..l.len() - 1];
+        match path.rsplit_once("::") {
+            Some((module, name))
+                if !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+            {
+                groups.entry(module).or_default().insert(name);
+            }
+            _ => kept.push((*l).to_owned()),
+        }
+    }
+    if groups.values().all(|names| names.len() < 2) {
+        return text.to_owned();
+    }
+    for (module, names) in groups {
+        let names: Vec<&str> = names.into_iter().collect();
+        kept.push(if names.len() == 1 {
+            format!("use {module}::{};", names[0])
+        } else {
+            format!("use {module}::{{{}}};", names.join(", "))
+        });
+    }
+    kept.sort();
+    let mut out = text[..block].to_owned();
+    for l in kept {
+        out.push_str(&l);
+        out.push('\n');
+    }
+    out.push_str(&text[end..]);
+    out
+}
+
+/// One `if !(a op b) {` / `while !(a op b) {` test written `a flipped b`: the byte range
+/// from `!` through `)`, its replacement, and the tree it is in.
+#[derive(Clone)]
+struct Flip {
+    range: std::ops::Range<usize>,
+    text: String,
+    tree: u16,
+}
+
+/// Every test `!(a op b)` that directly follows `if` or `while` and opens the block (`{`
+/// next), with one comparison inside the parentheses and nothing else at their top level,
+/// as the flipped comparison. `raw { }` bodies are one token, so `.air` is never touched.
+fn negated_comparisons(text: &str) -> Vec<Flip> {
+    use crate::v2::lexer::{TokenKind as K, tokenize};
+    let Ok(tokens) = tokenize(text) else {
+        return Vec::new();
+    };
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let offset = |t: &crate::v2::lexer::Token| line_starts[t.span.line - 1] + t.span.column - 1;
+    let mut out = Vec::new();
+    for i in 0..tokens.len().saturating_sub(3) {
+        let K::Ident(w) = &tokens[i].kind else {
+            continue;
+        };
+        if !(w == "if" || w == "while")
+            || tokens[i + 1].kind != K::Bang
+            || tokens[i + 2].kind != K::LParen
+        {
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut op: Option<(usize, &'static str)> = None;
+        let mut close = None;
+        let mut plain = true;
+        for (k, t) in tokens.iter().enumerate().skip(i + 3) {
+            match &t.kind {
+                K::LParen | K::LBracket => depth += 1,
+                K::RParen if depth == 0 => {
+                    close = Some(k);
+                    break;
+                }
+                K::RParen | K::RBracket => depth -= 1,
+                K::EqEq | K::BangEq | K::Lt | K::Gt | K::LtEq | K::GtEq if depth == 0 => {
+                    let flipped = match t.kind {
+                        K::EqEq => "!=",
+                        K::BangEq => "==",
+                        K::Lt => ">=",
+                        K::Gt => "<=",
+                        K::LtEq => ">",
+                        _ => "<",
+                    };
+                    plain &= op.is_none();
+                    op = Some((k, flipped));
+                }
+                K::AndAnd | K::OrOr | K::Bang | K::LBrace | K::RBrace | K::Semicolon | K::Eof
+                    if depth == 0 =>
+                {
+                    plain = false;
+                }
+                _ => {}
+            }
+        }
+        let (Some(close), Some((at, flipped))) = (close, op) else {
+            continue;
+        };
+        if !plain || tokens.get(close + 1).map(|t| &t.kind) != Some(&K::LBrace) {
+            continue;
+        }
+        let (lhs_start, op_start) = (offset(&tokens[i + 3]), offset(&tokens[at]));
+        let op_end = offset(&tokens[at + 1]);
+        let close_at = offset(&tokens[close]);
+        let lhs = text[lhs_start..op_start].trim();
+        let rhs = text[op_end..close_at].trim();
+        out.push(Flip {
+            range: offset(&tokens[i + 1])..close_at + 1,
+            text: format!("{lhs} {flipped} {rhs}"),
+            tree: 0,
+        });
+    }
+    out
+}
+
+/// The tree whose code holds byte `at`: the last `#[bhav(id = N` or `#[id(N)]` before it.
+fn tree_at(text: &str, at: usize) -> Option<u16> {
+    let before = &text[..at];
+    let attr = ["#[bhav(id = ", "#[id("]
+        .iter()
+        .filter_map(|p| before.rfind(p).map(|i| (i, p.len())))
+        .max()?;
+    let digits: String = text[attr.0 + attr.1..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
 }
 
 /// The most passes [`Model::lint_spellings`] makes over a file.
@@ -1589,6 +2056,238 @@ impl Model {
             text = apply_lint_spellings(&text, &kept);
         }
         text
+    }
+
+    /// The final `text` in plainer Rust, where the object still builds to the bytes of
+    /// `recompiled` (so every check stands):
+    /// - a tree whose short name (its label in `snake_case`) is its own is called by it,
+    ///   without the `_{id}` suffix (see [`Self::tree_renames`]);
+    /// - `else { if .. }` holding the chain alone is `else if ..`;
+    /// - `use` lines importing from one module are one braced line.
+    ///
+    /// The names are tried together, then in halves; the other two never change the bytes,
+    /// but are checked the same way.
+    fn polish(&self, text: String, recompiled: &RecompiledFile) -> String {
+        let same = |t: &str| {
+            self.compile(t)
+                .is_ok_and(|r| r.iff_bytes == recompiled.iff_bytes)
+        };
+        let mut text = text;
+        let renames = self.tree_renames(&text);
+        if !renames.is_empty() {
+            let base = text.clone();
+            let ok = |r: &[(String, String)]| same(&apply_renames(&base, r));
+            let kept = keep_joint(&renames, &ok, POLISH_NAME_BUILDS);
+            if !kept.is_empty() {
+                text = apply_renames(&text, &kept);
+                // A label the new name spells is the one the compiler gives it.
+                for t in &self.trees {
+                    if kept
+                        .iter()
+                        .any(|(old, new)| *old == t.ident && *new == t.label)
+                    {
+                        let attr = format!("#[bhav(id = {}, label = \"{}\", ", t.id, t.label);
+                        let plain = format!("#[bhav(id = {}, ", t.id);
+                        let dropped = text.replacen(&attr, &plain, 1);
+                        if dropped != text && same(&dropped) {
+                            text = dropped;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(joined) = collapse_else_if(&text).filter(|t| same(t)) {
+            text = joined;
+        }
+        let grouped = group_imports(&text);
+        if grouped != text && same(&grouped) {
+            text = grouped;
+        }
+        text
+    }
+
+    /// In behavioral mode, the final `text` with `!(a op b)` tests written as the flipped
+    /// comparison (`a <= b` for `!(a > b)`). The flip is the opposite compare node with its
+    /// branches swapped back, so it changes the node's own result: it is taken only where
+    /// the checker still proves the tree, so the result is never observed:
+    /// - only in a tree proven equivalent (an identical one would stop being identical);
+    /// - a tree whose check changes in any way gets back its negations, and the rest are
+    ///   tried again (a few rounds at most);
+    /// - no flip is kept unless every other tree's check is unchanged too.
+    ///
+    /// Strict mode keeps every `!(a op b)`: the flipped node is never the same bytes.
+    fn flip_negations(
+        &self,
+        text: String,
+        (recompiled, checks): (RecompiledFile, BTreeMap<u16, TreeCheck>),
+        cache: &mut BTreeMap<(u16, String, String), TreeCheck>,
+    ) -> (String, RecompiledFile, BTreeMap<u16, TreeCheck>) {
+        if !self.behavioral {
+            return (text, recompiled, checks);
+        }
+        let mut flips: Vec<Flip> = negated_comparisons(&text)
+            .into_iter()
+            .filter_map(|mut f| {
+                f.tree = tree_at(&text, f.range.start)?;
+                matches!(checks.get(&f.tree), Some(TreeCheck::Equivalent)).then_some(f)
+            })
+            .collect();
+        let kind = std::mem::discriminant::<TreeCheck>;
+        for _ in 0..NEGATION_ROUNDS {
+            if flips.is_empty() {
+                break;
+            }
+            let mut flipped = text.clone();
+            let mut sorted: Vec<&Flip> = flips.iter().collect();
+            sorted.sort_by_key(|f| std::cmp::Reverse(f.range.start));
+            for f in sorted {
+                flipped.replace_range(f.range.clone(), &f.text);
+            }
+            let Ok(rebuilt) = self.compile(&flipped) else {
+                break;
+            };
+            let (new_checks, _) = self.check_all(&rebuilt, cache);
+            let changed: BTreeSet<u16> = checks
+                .iter()
+                .filter(|(id, c)| new_checks.get(id).is_none_or(|n| kind(n) != kind(c)))
+                .map(|(id, _)| *id)
+                .collect();
+            if changed.is_empty() {
+                return (flipped, rebuilt, new_checks);
+            }
+            let flipped_trees: BTreeSet<u16> = flips.iter().map(|f| f.tree).collect();
+            if !changed.is_subset(&flipped_trees) {
+                break;
+            }
+            flips.retain(|f| !changed.contains(&f.tree));
+        }
+        (text, recompiled, checks)
+    }
+
+    /// The final `text` with an `allow` above each `!(a op b)` lint `negated_comparison`
+    /// still reports: one the lift keeps on purpose, as the original's compare node (strict
+    /// mode keeps every node's bytes, and behavioral mode flips one only where the tree's
+    /// check proves it). Unchanged when the result does not lint cleaner.
+    /// `text` with a BCON entry that lint `unused_decl` reports as never read written
+    /// `Table.entry` again in v2 code. The lint counts a read by a field's dot and by name in
+    /// `raw { }`, but not by a `Table::entry` path, so a table that raw code reads by name
+    /// would report its other entries. Only a file whose table is read both ways is linted.
+    fn dot_bcon_reads_the_lint_misses(&self, text: String) -> String {
+        use crate::v2::lint::{UNUSED_DECL, lint_v2_source};
+        let both: Vec<&str> = self
+            .bcons
+            .iter()
+            .map(|b| b.label.as_str())
+            .filter(|l| text.contains(&format!("{l}::")) && text.contains(&format!("{l}.")))
+            .collect();
+        if both.is_empty() {
+            return text;
+        }
+        let unread = |text: &str| -> Option<Vec<String>> {
+            let lints = lint_v2_source(text, "decompiled.antics").ok()?;
+            Some(
+                lints
+                    .iter()
+                    .filter(|d| d.rule == UNUSED_DECL)
+                    .filter_map(|d| {
+                        let rest = d.message.strip_prefix("BCON entry `")?;
+                        Some(rest[..rest.find('`')?].to_owned())
+                    })
+                    .collect(),
+            )
+        };
+        let Some(names) = unread(&text) else {
+            return text;
+        };
+        if names.is_empty() {
+            return text;
+        }
+        let mut out = text.clone();
+        for label in &both {
+            for name in &names {
+                out = replace_path(
+                    &out,
+                    &format!("{label}::{name}"),
+                    &format!("{label}.{name}"),
+                );
+            }
+        }
+        match unread(&out) {
+            Some(after) if after.is_empty() => out,
+            _ => text,
+        }
+    }
+
+    fn allow_kept_negations(&self, text: String) -> String {
+        use crate::v2::lint::{NEGATED_COMPARISON, lint_v2_source};
+        // Cheap first: a file with no negated test needs no lint run.
+        if !text.contains("!(") {
+            return text;
+        }
+        let Ok(before) = lint_v2_source(&text, "decompiled.antics") else {
+            return text;
+        };
+        let lines: BTreeSet<usize> = before
+            .iter()
+            .filter(|d| d.rule == NEGATED_COMPARISON)
+            .map(|d| d.line)
+            .collect();
+        if lines.is_empty() {
+            return text;
+        }
+        let mut out = String::with_capacity(text.len());
+        for (n, line) in text.split_inclusive('\n').enumerate() {
+            if lines.contains(&(n + 1)) {
+                let indent = &line[..line.len() - line.trim_start().len()];
+                out.push_str(&format!(
+                    "{indent}// antics-lint: allow({NEGATED_COMPARISON}): the original's compare node, kept as it is\n"
+                ));
+            }
+            out.push_str(line);
+        }
+        match lint_v2_source(&out, "decompiled.antics") {
+            Ok(after)
+                if after.len() + lines.len() <= before.len()
+                    && after.iter().all(|d| d.rule != NEGATED_COMPARISON) =>
+            {
+                out
+            }
+            _ => text,
+        }
+    }
+
+    /// `(ident, short name)` for each tree that may drop its `_{id}` suffix: its label's
+    /// `snake_case` form is no other tree's, is no word of `text` (a local, state, sound,
+    /// constant or declaration), and is not reserved ([`reserved_tree_names`]).
+    fn tree_renames(&self, text: &str) -> Vec<(String, String)> {
+        let short = |t: &TreeModel| {
+            t.ident
+                .strip_suffix(&format!("_{}", t.id))
+                .filter(|base| !base.is_empty())
+                .map(str::to_owned)
+        };
+        let mut count: BTreeMap<String, usize> = BTreeMap::new();
+        for t in &self.trees {
+            if let Some(base) = short(t) {
+                *count.entry(base).or_default() += 1;
+            }
+        }
+        let Some(used) = code_words(text) else {
+            return Vec::new();
+        };
+        let reserved = reserved_tree_names();
+        self.trees
+            .iter()
+            .filter_map(|t| {
+                let base = short(t)?;
+                (count[&base] == 1
+                    && !used.contains(base.as_str())
+                    && !reserved.contains(base.as_str())
+                    && !crate::parser::is_reserved_ident(&base)
+                    && used.contains(t.ident.as_str()))
+                .then(|| (t.ident.clone(), base))
+            })
+            .collect()
     }
 
     /// Why tree `t`, proven by its code, still may not behave the same in the rebuilt
@@ -6473,9 +7172,9 @@ impl Translator<'_> {
             Condition::Not(inner) => {
                 let text = self.cond(inner)?;
                 // Any binary condition (a compare, or a padded `expr` written as one) binds
-                // looser than `!`.
-                if matches!(inner.as_ref(), Condition::Compare { .. }) || has_top_level_space(&text)
-                {
+                // looser than `!`. A call (`inc_lt(..)`, `x.is_empty()`) does not; a negation
+                // keeps its parentheses (`!(!x)`).
+                if has_top_level_space(&text) || text.starts_with('!') {
                     Some(format!("!({text})"))
                 } else {
                     Some(format!("!{text}"))
@@ -6732,22 +7431,7 @@ impl Translator<'_> {
                 delta_per_hour,
                 stop_at,
             } if *motive < 16 && self.wave2() => {
-                const NAMES: [(u8, &str); 10] = [
-                    (3, "Mood"),
-                    (5, "Energy"),
-                    (6, "Comfort"),
-                    (7, "Hunger"),
-                    (8, "Hygiene"),
-                    (9, "Bladder"),
-                    (11, "Alertness"),
-                    (13, "Room"),
-                    (14, "Social"),
-                    (15, "Fun"),
-                ];
-                let motive = NAMES
-                    .iter()
-                    .find(|(m, _)| m == motive)
-                    .map_or_else(|| motive.to_string(), |(_, n)| format!("Motive::{n}"));
+                let motive = motive_index(i16::from(*motive));
                 format!(
                     "set_motive_change({motive}, {}, {})",
                     self.rvalue(delta_per_hour)?,
@@ -7088,11 +7772,12 @@ impl Translator<'_> {
             26 => {
                 let addr = o.index as u16;
                 let table = addr >> 7;
+                // v2 code names an entry by path (`Table::entry`); raw `.air` keeps the dot.
                 if table < 64 {
-                    self.model.bcon_path(addr)
+                    self.model.bcon_path(addr).map(|p| p.replacen('.', "::", 1))
                 } else {
                     let name = self.model.extern_bcons.get(&addr)?;
-                    Some(format!("library_consts.{name}"))
+                    Some(format!("library_consts::{name}"))
                 }
             }
             10 if o.index == 0 && self.cursor.is_some() => self.cursor.clone(),
@@ -7279,7 +7964,12 @@ impl Translator<'_> {
                 _ => None,
             };
             if let Some((handle, field)) = cell {
-                return (i <= 255).then(|| format!("{handle}.{field}[{i}]"));
+                let index = if field == "motive" {
+                    motive_index(i)
+                } else {
+                    i.to_string()
+                };
+                return (i <= 255).then(|| format!("{handle}.{field}[{index}]"));
             }
         }
         Some(match (o.scope, self.sim) {
@@ -7310,8 +8000,8 @@ impl Translator<'_> {
                 let field = if o.scope == 1 { "attr" } else { "data" };
                 format!("{handle}.{field}[{i}]")
             }
-            (15, _) if i <= 255 && self.extra() => format!("stack_obj.motive[{i}]"),
-            (14, true) => format!("sim.motive[{i}]"),
+            (15, _) if i <= 255 && self.extra() => format!("stack_obj.motive[{}]", motive_index(i)),
+            (14, true) => format!("sim.motive[{}]", motive_index(i)),
             // PR I-4's typed person word (the lint's table does not name it).
             (18, true) if i == FAME && self.wave3() => "sim.fame".to_owned(),
             (19, _) if i == FAME && self.wave3() => {
@@ -7356,6 +8046,27 @@ impl Translator<'_> {
     }
 }
 
+/// A motive index as v2 writes it: `Motive::Hunger` for the motives `std` names (the
+/// lowering's own table, `motive_by_name`), else the number.
+fn motive_index(i: i16) -> String {
+    const NAMES: [(i16, &str); 10] = [
+        (3, "Mood"),
+        (5, "Energy"),
+        (6, "Comfort"),
+        (7, "Hunger"),
+        (8, "Hygiene"),
+        (9, "Bladder"),
+        (11, "Alertness"),
+        (13, "Room"),
+        (14, "Social"),
+        (15, "Fun"),
+    ];
+    NAMES
+        .iter()
+        .find(|(m, _)| *m == i)
+        .map_or_else(|| i.to_string(), |(_, n)| format!("Motive::{n}"))
+}
+
 fn assign_operator(op: &AssignOp) -> Option<&'static str> {
     Some(match op {
         AssignOp::Set => "=",
@@ -7394,6 +8105,79 @@ mod tests {
         assert_eq!(library_bcon_name((64 << 7) | 1).as_deref(), Some("s8192_1"));
         assert_eq!(library_bcon_name(5), None);
         assert_eq!(library_bcon_name(192 << 7), None);
+    }
+
+    #[test]
+    fn motive_names_are_the_lowerings() {
+        for i in 0..16 {
+            let name = motive_index(i);
+            let expected = name
+                .strip_prefix("Motive::")
+                .and_then(|n| crate::parser::motive_by_name(&n.to_ascii_lowercase()));
+            match expected {
+                Some(m) => assert_eq!(i16::from(m), i),
+                None => assert_eq!(name, i.to_string()),
+            }
+        }
+    }
+
+    #[test]
+    fn an_else_joins_its_if_only_when_the_if_chain_is_all_it_holds() {
+        let text = "fn f() {\n    if a {\n        x = 1;\n    } else {\n        if b {\n            x = 2;\n        } else {\n            if c {\n                x = 3;\n            }\n        }\n    }\n}\n";
+        assert_eq!(
+            collapse_else_if(text).as_deref(),
+            Some(
+                "fn f() {\n    if a {\n        x = 1;\n    } else if b {\n            x = 2;\n        } else if c {\n                x = 3;\n            }\n}\n"
+            )
+        );
+        // A statement after the chain, a comment, or a `for` loop's `else` stays.
+        for kept in [
+            "fn f() {\n    if a {\n    } else {\n        if b {\n        }\n        x = 1;\n    }\n}\n",
+            "fn f() {\n    if a {\n    } else {\n        // why\n        if b {\n        }\n    }\n}\n",
+            "fn f() {\n    for p in lot.sims() {\n    } else {\n        if b {\n        }\n    }\n}\n",
+            "fn f() {\n    raw {\n        if a {\n        } else {\n            if b {\n            }\n        }\n    }\n}\n",
+        ] {
+            assert_eq!(collapse_else_if(kept), None, "{kept}");
+        }
+    }
+
+    #[test]
+    fn single_name_imports_from_one_module_are_braced() {
+        let text = "// header\n\nuse std::flags::ObjectFlags;\nuse std::engine::RefreshMode;\nuse std::flags::Expansions;\nuse std::globals::*;\n\nobject \"A\" {}\n";
+        assert_eq!(
+            group_imports(text),
+            "// header\n\nuse std::engine::RefreshMode;\nuse std::flags::{Expansions, ObjectFlags};\nuse std::globals::*;\n\nobject \"A\" {}\n"
+        );
+        let single = "use std::flags::ObjectFlags;\nuse std::globals::*;\n\nobject \"A\" {}\n";
+        assert_eq!(group_imports(single), single);
+    }
+
+    #[test]
+    fn renames_touch_code_and_comments_but_not_strings() {
+        let renames = [("open_4100".to_owned(), "open".to_owned())];
+        assert_eq!(
+            apply_renames(
+                "// action open_4100\nfn open_4100() { reopen_4100(); show(\"open_4100\"); }\n",
+                &renames
+            ),
+            "// action open\nfn open() { reopen_4100(); show(\"open_4100\"); }\n"
+        );
+    }
+
+    #[test]
+    fn negations_flip_only_as_a_whole_test() {
+        let text = "fn f() {\n    if !(temp[0] > -1) {\n    }\n    while !(a.b[2] == X::y) {\n    }\n    if !(a > b && c) {\n    }\n    if !(inc_lt(&mut a, 2)) {\n    }\n    raw {\n        if !(a > b) {\n        }\n    }\n}\n";
+        let flips: Vec<String> = negated_comparisons(text)
+            .into_iter()
+            .map(|f| format!("{} => {}", &text[f.range], f.text))
+            .collect();
+        assert_eq!(
+            flips,
+            [
+                "!(temp[0] > -1) => temp[0] <= -1",
+                "!(a.b[2] == X::y) => a.b[2] != X::y"
+            ]
+        );
     }
 
     #[test]
@@ -7661,10 +8445,10 @@ object "Fable Lamp" {
         has(
             &lifted,
             &[
-                "return ready_4300();",
-                "return !ready_4300();",
+                "return ready();",
+                "return !ready();",
                 "return !(self.flags flag_test ObjectFlags::InUse);",
-                "} else {\n            return ready_4300();",
+                "} else {\n            return ready();",
             ],
         );
     }
@@ -7690,7 +8474,7 @@ object "Fable Lamp" {
         );
         has(
             &lifted,
-            &["if !ready_4300() {\n            return false;\n        }"],
+            &["if !ready() {\n            return false;\n        }"],
         );
         assert!(!lifted.contains("raw"), "{lifted}");
     }
@@ -8019,7 +8803,7 @@ object "Fable Lamp" {
 }"#,
         );
         // The leaf drops back to the object's context and keeps its idioms.
-        let leaf = &lifted[lifted.find("fn fade_4302").expect("leaf")..];
+        let leaf = &lifted[lifted.find("fn fade()").expect("leaf")..];
         assert!(!leaf.contains("raw {"), "{lifted}");
         has(leaf, &["self.attr_2 = 1;", "play_sound(5);"]);
     }
@@ -8092,7 +8876,13 @@ object "Fable Lamp" {
         );
         has(
             &lifted,
-            &["scope(21, 3) := Tuning.e1;", "temp[0] = Tuning.e0;"],
+            &[
+                "scope(21, 3) := Tuning.e1;",
+                "temp[1] = Tuning::e1;",
+                // Lint `unused_decl` does not count a `Table::entry` read, and raw code reads
+                // this table by name, so the entry only v2 code reads keeps its dot.
+                "temp[0] = Tuning.e0;",
+            ],
         );
         assert!(!lifted.contains("bcon["), "{lifted}");
         let path = |addr: u16| (addr == 1).then(|| "Tuning.size".to_owned());
@@ -8125,7 +8915,7 @@ object "Fable Lamp" {
     }
 }"#,
         );
-        has(&lifted, &["if !ready_4300() {\n            temp[0] = 2;"]);
+        has(&lifted, &["if !ready() {\n            temp[0] = 2;"]);
     }
 
     #[test]

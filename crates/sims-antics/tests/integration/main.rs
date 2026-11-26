@@ -32,6 +32,7 @@ mod v2_compiler;
 mod v2_fmt_and_decompile;
 mod v2_lift_pilot;
 mod v2_lift_pr_h_idioms;
+mod v2_lift_rust_polish;
 mod v2_lift_wave2;
 mod v2_lift_wave3;
 mod v2_lint;
