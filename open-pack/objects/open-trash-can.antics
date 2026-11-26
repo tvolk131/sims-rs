@@ -1,4 +1,7 @@
-// Open Pedal Trash Can (0x7F00_0071) — cleanliness utility with dispose & cancel-safe empty loop.
+// Open Pedal Trash Can (0x7F00_0071) — cleanliness utility with dispose & cancel-safe empty loop;
+// every bag in the can lowers its room's score through its room impact.
+
+use std::engine::RefreshMode;
 
 object "Open Pedal Trash Can" {
     guid: 0x7F00_0071;
@@ -9,8 +12,8 @@ object "Open Pedal Trash Can" {
 
     param max_trash: i16 = 5;
     param empty_ticks: i16 = 1;
-    param dispose_room_gain: i16 = 15;
-    param empty_room_gain: i16 = 35;
+    /// The room impact (object data word 7) each bag in the can adds: the room score counts it.
+    param bag_room_impact: i16 = -1;
 
     state occupied: bool = false;
     state trash_count: i16 = 1;
@@ -20,15 +23,25 @@ object "Open Pedal Trash Can" {
 
     slot front = routing([0.0, -0.60, 0.0]);
 
+    init {
+        self.room_impact = self.trash_count * bag_room_impact;
+    }
+
+    /// Sets the room impact for the bags in the can and has the room recounted (a room keeps its
+    /// score until then).
+    fn update_room_impact() {
+        self.room_impact = self.trash_count * bag_room_impact;
+        self.refresh(RefreshMode::RecountRoom);
+    }
+
     interaction "Dispose Trash" {
         autonomy: 40,
-        advertises: [room +25],
         lock: self.occupied,
         guard(sim) => self.trash_count < max_trash,
         run(sim) {
             play_sound(lid);
             self.trash_count += 1;
-            sim.motive.room += dispose_room_gain;
+            update_room_impact();
         }
     }
 
@@ -42,9 +55,9 @@ object "Open Pedal Trash Can" {
             while self.trash_count > 0 cancel_on_abort {
                 sleep(empty_ticks);
                 self.trash_count -= 1;
+                update_room_impact();
             }
             if self.trash_count == 0 {
-                sim.motive.room += empty_room_gain;
                 self.times_emptied += 1;
                 play_sound(lid);
             }

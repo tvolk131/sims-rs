@@ -1,0 +1,72 @@
+# Live sims-vm unit tests for the Open Frost Fridge: the stock, Hunger and funds guards, the
+# counter and stove it needs, and the refund when the cooking chain fails part way.
+#
+# The runner makes every object off the lot's tile grid, so the stove has no tile in front of it
+# to put a plate on: its `cook` functional fails after the sizzle. The chain's success path,
+# with placed objects, is `tests/integration/open_pack_behavioral.rs`'s cooking chain test.
+
+[subject]
+antics = "../objects/open-fridge.antics"
+pack = ".."
+
+[lot]
+also = ["../objects/open-counter.antics", "../objects/open-stove.antics", "../objects/open-meal-plate.antics"]
+
+[sim]
+motives = { hunger = 0 }
+
+[[test]]
+name = "a new fridge holds five meals"
+tree = "Init"
+expect = { result = true, attrs = { stock = 5, meals_cooked = 0, last_plate = 0 } }
+
+[[test]]
+name = "Cook Meal is offered with stock, appetite and money"
+guard = "Cook Meal"
+given = { funds = 15 }
+expect = { result = true }
+
+[[test]]
+name = "Cook Meal is not offered without the money"
+guard = "Cook Meal"
+given = { funds = 14 }
+expect = { result = false }
+
+[[test]]
+name = "Cook Meal is not offered from an empty fridge"
+guard = "Cook Meal"
+given = { funds = 500, attrs = { stock = 0 } }
+expect = { result = false }
+
+[[test]]
+name = "Cook Meal is not offered to a Sim at 90 Hunger"
+guard = "Cook Meal"
+given = { funds = 500, sim = { motives = { hunger = 90 } } }
+expect = { result = false }
+
+[[test]]
+name = "without a counter nothing is spent"
+interaction = "Cook Meal"
+given = { funds = 500, create = ["open-stove"] }
+expect = { funds = 500, attrs = { stock = 5, meals_cooked = 0 }, sounds = [] }
+
+[[test]]
+name = "without a stove nothing is spent"
+interaction = "Cook Meal"
+given = { funds = 500, create = ["open-counter"] }
+expect = { funds = 500, attrs = { stock = 5, meals_cooked = 0 }, sounds = [] }
+
+[[test]]
+name = "a chain that fails after the prep refunds the meal and the stock"
+interaction = "Cook Meal"
+given = { funds = 500, create = ["open-counter", "open-stove"] }
+expect = { funds = 500, attrs = { stock = 5, meals_cooked = 0, last_plate = 0 }, sim = { skills = { cooking = 0 } }, sounds = ["open_fridge_door", "open_counter_chop", "open_stove_sizzle"] }
+
+# The refund above is a rollback, not a chain that never charged: part way through, the meal is
+# paid for and a portion is out of the fridge.
+[[test]]
+name = "the meal is paid for and taken out while it cooks"
+interaction = "Cook Meal"
+turns = 1
+given = { funds = 500, create = ["open-counter", "open-stove"] }
+expect = { result = "yield", funds = 485, attrs = { stock = 4, meals_cooked = 0 } }

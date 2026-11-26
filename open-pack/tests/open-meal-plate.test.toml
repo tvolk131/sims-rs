@@ -1,0 +1,93 @@
+# Live sims-vm unit tests for the Open Meal Plate: eating its nutrition in two bites (the odd
+# point last), the full/empty guards, and the plate disposing of itself.
+
+[subject]
+antics = "../objects/open-meal-plate.antics"
+pack = ".."
+
+[sim]
+motives = { hunger = 0 }
+
+[[test]]
+name = "a new plate is full"
+tree = "Init"
+expect = { result = true, attrs = { nutrition = 40, is_full = 1 } }
+
+[[test]]
+name = "a full plate offers Eat Meal"
+guard = "Eat Meal"
+expect = { result = true }
+
+[[test]]
+name = "an empty plate does not"
+guard = "Eat Meal"
+given = { attrs = { is_full = 0 } }
+expect = { result = false }
+
+[[test]]
+name = "one Sim eats a plate at a time"
+guard = "Eat Meal"
+given = { attrs = { occupied = 1 } }
+expect = { result = false }
+
+[[test]]
+name = "a Sim eating holds the plate"
+action = "Eat Meal"
+me = "sim"
+turns = 1
+given = { sim = { priority = 50 } }
+expect = { result = "yield", attrs = { occupied = 1 } }
+
+[[test]]
+name = "Clean Up is offered only on an empty plate"
+guard = "Clean Up"
+expect = { result = false }
+
+[[test]]
+name = "eating restores the plate's nutrition"
+interaction = "Eat Meal"
+expect = { sim = { motives = { hunger = 40 } }, sounds = ["open_plate_eat", "open_plate_dispose"] }
+
+[[test]]
+name = "an odd nutrition loses no point"
+interaction = "Eat Meal"
+given = { attrs = { nutrition = 41 } }
+expect = { sim = { motives = { hunger = 41 } } }
+
+# Eating runs as the Sim's thread with a running action's priority: the bite loop stops at once
+# when the action's priority drops to 0 (cancelled), as it is for a Sim with no action.
+[[test]]
+name = "eating takes a tick per bite"
+action = "Eat Meal"
+me = "sim"
+turns = 1
+given = { sim = { priority = 50 } }
+expect = { result = "yield", attrs = { nutrition = 40, is_full = 1 }, sim = { motives = { hunger = 0 } }, sounds = [] }
+
+[[test]]
+name = "each bite is taken off the plate"
+action = "Eat Meal"
+me = "sim"
+turns = 2
+given = { sim = { priority = 50 } }
+expect = { result = "yield", attrs = { nutrition = 20, is_full = 1 }, sim = { motives = { hunger = 20 } }, sounds = [] }
+
+[[test]]
+name = "a cancelled meal leaves the rest on the plate"
+action = "Eat Meal"
+me = "sim"
+turns = 8
+given = { sim = { priority = 0 } }
+expect = { result = false, attrs = { nutrition = 40, is_full = 1 }, sim = { motives = { hunger = 0 } }, sounds = [] }
+
+[[test]]
+name = "a half-eaten plate is finished in two smaller bites"
+interaction = "Eat Meal"
+given = { attrs = { nutrition = 21 } }
+expect = { sim = { motives = { hunger = 21 } }, sounds = ["open_plate_eat", "open_plate_dispose"] }
+
+[[test]]
+name = "cleaning up an empty plate"
+interaction = "Clean Up"
+given = { attrs = { is_full = 0 } }
+expect = { sim = { motives = { hunger = 0 } }, sounds = ["open_plate_dispose"] }

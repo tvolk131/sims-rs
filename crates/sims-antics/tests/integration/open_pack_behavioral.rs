@@ -1014,6 +1014,77 @@ fn vm_pattern_b_multi_object_cooking_chain_on_lot_and_skill_scaling() {
     );
     assert!(fx.world.removals.contains(&plate2));
 
+    // Meal 3: a near-master cook (990) gains only the 10 points left to 1000, and the plate
+    // carries 990/20 + 30 + 10 = 89.
+    let set_cooking = |world: &mut World, skill: i16| {
+        world
+            .objects
+            .get_mut(&sim)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[SKILL_COOKING] = skill;
+    };
+    let cooking = |world: &World| world.objects[&sim].person.as_ref().unwrap().data[SKILL_COOKING];
+    // The fridge offers Cook Meal only below 90 Hunger.
+    let make_hungry = |world: &mut World| {
+        world
+            .objects
+            .get_mut(&sim)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .motives[MOTIVE_HUNGER] = 0.0;
+    };
+    set_cooking(&mut fx.world, 990);
+    make_hungry(&mut fx.world);
+    PackVmFixture::run_pie_interaction(&mut vm, &mut fx.world, sim, fridge, 0, 32, |_, _| {});
+    assert_eq!(cooking(&fx.world), 1000, "Cooking stops at 1000");
+    let plate3 = fx.world.objects[&fridge].attributes[2] as u16;
+    assert_eq!(fx.world.objects[&plate3].attributes[0], 89);
+    PackVmFixture::run_pie_interaction(&mut vm, &mut fx.world, sim, plate3, 0, 32, |_, _| {});
+    assert!(fx.world.removals.contains(&plate3));
+
+    // Meal 4: a skill past the cap (1200) is left alone (no overflow) and the nutrition stops at
+    // the stove's 95.
+    set_cooking(&mut fx.world, 1200);
+    make_hungry(&mut fx.world);
+    PackVmFixture::run_pie_interaction(&mut vm, &mut fx.world, sim, fridge, 0, 32, |_, _| {});
+    assert_eq!(
+        cooking(&fx.world),
+        1200,
+        "a skill past the cap is not raised"
+    );
+    let plate4 = fx.world.objects[&fridge].attributes[2] as u16;
+    assert_eq!(fx.world.objects[&plate4].attributes[0], 95);
+    PackVmFixture::run_pie_interaction(&mut vm, &mut fx.world, sim, plate4, 0, 32, |_, _| {});
+    assert!(fx.world.removals.contains(&plate4));
+
+    // A cook cancelled while the pan is on (the action's priority drops to 0 during the stove's
+    // sleep) serves no plate, and the fridge gives back the money and the stock.
+    set_cooking(&mut fx.world, 0);
+    make_hungry(&mut fx.world);
+    let funds_before_cancel = fx.world.budget.funds;
+    let stock_before_cancel = fx.world.objects[&fridge].attributes[0];
+    let meals_before_cancel = fx.world.objects[&stove].attributes[0];
+    let cancel_yields =
+        PackVmFixture::run_pie_interaction(&mut vm, &mut fx.world, sim, fridge, 0, 32, |w, _| {
+            w.objects
+                .get_mut(&sim)
+                .unwrap()
+                .person
+                .as_mut()
+                .unwrap()
+                .data[33] = 0;
+        });
+    assert!(cancel_yields >= 1, "the cancel landed during the cook");
+    assert_eq!(fx.world.budget.funds, funds_before_cancel);
+    assert_eq!(fx.world.objects[&fridge].attributes[0], stock_before_cancel);
+    assert_eq!(fx.world.objects[&stove].attributes[0], meals_before_cancel);
+    assert_eq!(cooking(&fx.world), 0, "a cancelled cook teaches nothing");
+
     // Verify atomic refund if stove cannot place a plate (block tile (6, 5) with a bench!).
     let blocker = vm.create(&mut fx.world, BENCH_GUID).unwrap();
     PackVmFixture::place_on_tile(&mut fx.world, blocker, 6, 5, 0);
@@ -1604,6 +1675,230 @@ fn cli_check_validates_on_disk_open_pack() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Open Starter Pack"));
     assert!(stdout.contains("20 objects"));
+}
+
+/// Every object the pack lists has a live-VM spec, `open-pack/tests/<object>.test.toml`, whose
+/// subject is that object; `antics_test_runner` runs them all.
+/// The guid of the open-pack object `slug`.
+fn pack_guid(pack: &CompiledPack, slug: &str) -> u32 {
+    pack.objects
+        .iter()
+        .find(|o| o.slug == slug)
+        .unwrap_or_else(|| panic!("open-pack has no {slug}"))
+        .object
+        .guid
+}
+
+/// Adds a second Sim (object 2) to the fixture's lot.
+fn add_second_sim(world: &mut World) -> u16 {
+    let sim2 = 2;
+    world.objects.insert(sim2, make_sim_object(sim2));
+    world.people.push(sim2);
+    world.order.push(sim2);
+    sim2
+}
+
+#[test]
+fn room_impact_changes_reach_the_room_score() {
+    let pack = compile_pack_dir(&open_pack_dir()).unwrap();
+    let mut fx = PackVmFixture::from_pack(&pack, 500);
+    let mut vm = Interpreter::new(&fx.program, &fx.catalog, Stream::Lot);
+    let sim = fx.sim_id;
+    let table = vm
+        .create(&mut fx.world, pack_guid(&pack, "open-dining-table"))
+        .unwrap();
+    let trash_can = vm
+        .create(&mut fx.world, pack_guid(&pack, "open-trash-can"))
+        .unwrap();
+    PackVmFixture::place_on_tile(&mut fx.world, table, 6, 6, 0);
+    PackVmFixture::place_on_tile(&mut fx.world, trash_can, 7, 6, 0);
+    let room = fx.world.rooms.rooms.get_mut(&1).unwrap();
+    room.tiles.push([6, 6, 1]);
+    room.tiles.push([7, 6, 1]);
+    // One covered wall gives the synthetic room a finite score.
+    let offset = (6 * 64 + 6) * 14;
+    let walls = &mut fx.world.arrays.get_mut(&2).unwrap().data;
+    walls[offset] = 1;
+    walls[offset + 2] = 1;
+    walls[offset + 6] = 1;
+    fx.world.mark_room(1);
+    vm.update_pending_rooms(&mut fx.world).unwrap();
+    let impact = |world: &World| world.rooms.rooms[&1].impact;
+    let score = |world: &World| world.rooms.rooms[&1].score.to_f32();
+    assert_eq!(impact(&fx.world), -1, "the can's one bag");
+    let bare = score(&fx.world);
+
+    // Each change has the room recounted by the next room update, with no outside mark.
+    PackVmFixture::run_pie_interaction(&mut vm, &mut fx.world, sim, table, 0, 32, |_, _| {});
+    assert_eq!(
+        vm.update_pending_rooms(&mut fx.world).unwrap(),
+        vec![1],
+        "setting the table marks its room"
+    );
+    assert_eq!(impact(&fx.world), 2);
+    let set = score(&fx.world);
+    assert!(set > bare, "a set table raises the score ({bare} -> {set})");
+
+    // "Empty Trash" is the can's second entry.
+    let empty = 1;
+    assert!(
+        PackVmFixture::pie_menu_names(&mut vm, &mut fx.world, sim, trash_can)
+            .iter()
+            .any(|(index, _)| *index == empty),
+        "Empty Trash is offered"
+    );
+    PackVmFixture::run_pie_interaction(
+        &mut vm,
+        &mut fx.world,
+        sim,
+        trash_can,
+        empty,
+        32,
+        |_, _| {},
+    );
+    assert_eq!(vm.update_pending_rooms(&mut fx.world).unwrap(), vec![1]);
+    assert_eq!(impact(&fx.world), 3);
+    assert!(score(&fx.world) > set, "an empty can raises it again");
+}
+
+#[test]
+fn a_plate_feeds_one_sim_at_a_time_and_a_cancelled_meal_can_be_finished() {
+    let pack = compile_pack_dir(&open_pack_dir()).unwrap();
+    let mut fx = PackVmFixture::from_pack(&pack, 500);
+    let mut vm = Interpreter::new(&fx.program, &fx.catalog, Stream::Lot);
+    let sim = fx.sim_id;
+    let sim2 = add_second_sim(&mut fx.world);
+    let plate = vm.create(&mut fx.world, PLATE_GUID).unwrap();
+    PackVmFixture::place_on_tile(&mut fx.world, plate, 6, 6, 0);
+    // An odd meal: 41 is two bites of 20 and the last point.
+    fx.world.objects.get_mut(&plate).unwrap().attributes[0] = 41;
+    let hunger =
+        |w: &World, id: u16| w.objects[&id].person.as_ref().unwrap().motives[MOTIVE_HUNGER];
+    let (start, start2) = (hunger(&fx.world, sim), hunger(&fx.world, sim2));
+
+    let action = vm.pie_menu(&mut fx.world, sim, plate).unwrap()[0]
+        .action
+        .clone();
+    let uid = vm.pick(&mut fx.world, sim, action).unwrap().unwrap();
+    for _ in 0..2 {
+        fx.world.objects.get_mut(&sim).unwrap().data[25] = 1;
+        assert!(matches!(
+            vm.turn(&mut fx.world, sim, 4000).unwrap(),
+            Status::Yielded
+        ));
+    }
+    assert_eq!(hunger(&fx.world, sim) - start, 20.0, "one bite taken");
+    assert_eq!(&fx.world.objects[&plate].attributes[..3], &[21, 1, 1]);
+    assert!(
+        vm.pie_menu(&mut fx.world, sim2, plate).unwrap().is_empty(),
+        "a second Sim cannot eat from the plate while the first does"
+    );
+
+    // Cancelled during the second bite's wait: the bite is not eaten and the plate stays.
+    assert!(vm.cancel(&mut fx.world, sim, uid).unwrap());
+    fx.world.objects.get_mut(&sim).unwrap().data[25] = 1;
+    vm.turn(&mut fx.world, sim, 4000).unwrap();
+    assert_eq!(hunger(&fx.world, sim) - start, 20.0);
+    assert_eq!(&fx.world.objects[&plate].attributes[..3], &[21, 1, 0]);
+    assert!(!fx.world.removals.contains(&plate));
+    if let Some(person) = fx.world.objects.get_mut(&sim).unwrap().person.as_mut() {
+        person.active.uid = 0;
+        person.active.flags = 0;
+        person.data[33] = 0;
+        person.object_uses.clear();
+    }
+
+    // The second Sim finishes it: the 21 points left, in two smaller bites, and the plate goes.
+    let eat = PackVmFixture::pie_menu_names(&mut vm, &mut fx.world, sim2, plate);
+    assert_eq!(eat.len(), 1, "the plate is free again");
+    PackVmFixture::run_pie_interaction(
+        &mut vm,
+        &mut fx.world,
+        sim2,
+        plate,
+        eat[0].0,
+        32,
+        |_, _| {},
+    );
+    assert_eq!(hunger(&fx.world, sim2) - start2, 21.0);
+    assert!(fx.world.removals.contains(&plate));
+}
+
+#[test]
+fn a_stove_cooks_for_one_sim_at_a_time() {
+    let pack = compile_pack_dir(&open_pack_dir()).unwrap();
+    let mut fx = PackVmFixture::from_pack(&pack, 500);
+    let mut vm = Interpreter::new(&fx.program, &fx.catalog, Stream::Lot);
+    let sim = fx.sim_id;
+    let sim2 = add_second_sim(&mut fx.world);
+    let fridge = vm.create(&mut fx.world, FRIDGE_GUID).unwrap();
+    let counter = vm.create(&mut fx.world, COUNTER_GUID).unwrap();
+    let stove = vm.create(&mut fx.world, STOVE_GUID).unwrap();
+    PackVmFixture::place_on_tile(&mut fx.world, fridge, 4, 6, 0);
+    PackVmFixture::place_on_tile(&mut fx.world, counter, 5, 6, 0);
+    PackVmFixture::place_on_tile(&mut fx.world, stove, 6, 6, 0);
+
+    // The first Sim's chain reaches the stove and holds it.
+    let action = vm.pie_menu(&mut fx.world, sim, fridge).unwrap()[0]
+        .action
+        .clone();
+    vm.pick(&mut fx.world, sim, action).unwrap().unwrap();
+    fx.world.objects.get_mut(&sim).unwrap().data[25] = 1;
+    assert!(matches!(
+        vm.turn(&mut fx.world, sim, 4000).unwrap(),
+        Status::Yielded
+    ));
+    assert_eq!(fx.world.budget.funds, 485);
+    assert_eq!(
+        fx.world.objects[&stove].attributes[1], 1,
+        "the stove is taken"
+    );
+
+    // The second Sim's chain finds the stove taken and gives everything back.
+    PackVmFixture::run_pie_interaction(&mut vm, &mut fx.world, sim2, fridge, 0, 32, |_, _| {});
+    assert_eq!(fx.world.budget.funds, 485, "the second meal is refunded");
+    assert_eq!(fx.world.objects[&fridge].attributes[0], 4);
+    assert_eq!(fx.world.objects[&stove].attributes[0], 0);
+
+    // The first cook finishes, serves its plate and frees the stove.
+    for _ in 0..8 {
+        fx.world.objects.get_mut(&sim).unwrap().data[25] = 1;
+        vm.turn(&mut fx.world, sim, 4000).unwrap();
+    }
+    assert_eq!(fx.world.objects[&stove].attributes[..2], [1, 0]);
+    assert_eq!(fx.world.budget.funds, 485);
+    assert!(fx.world.objects.values().any(|o| o.guid == PLATE_GUID));
+}
+
+#[test]
+fn every_open_pack_object_has_a_behavioral_spec() {
+    let pack = open_pack_dir();
+    let manifest = sims_antics::manifest::PackManifest::parse(
+        &std::fs::read_to_string(pack.join("pack.toml")).unwrap(),
+    )
+    .expect("pack.toml parses");
+    assert_eq!(manifest.objects.len(), 20, "{:?}", manifest.objects);
+    let tests = pack.join("tests");
+    for object in &manifest.objects {
+        let source = pack.join("objects").join(format!("{object}.antics"));
+        let source = source
+            .canonicalize()
+            .unwrap_or_else(|e| panic!("{object}: {}: {e}", source.display()));
+        let spec = tests.join(format!("{object}.test.toml"));
+        let text = std::fs::read_to_string(&spec)
+            .unwrap_or_else(|e| panic!("{object} has no spec at {}: {e}", spec.display()));
+        let file = sims_antics::test_runner::TestFile::parse(&text, &tests)
+            .unwrap_or_else(|e| panic!("{}: {e}", spec.display()));
+        let subject = file.subject.path().canonicalize().unwrap_or_else(|e| {
+            panic!(
+                "{}: subject {}: {e}",
+                spec.display(),
+                file.subject.path().display()
+            )
+        });
+        assert_eq!(subject, source, "{} does not test {object}", spec.display());
+        assert!(!file.cases.is_empty(), "{} has no case", spec.display());
+    }
 }
 
 #[test]

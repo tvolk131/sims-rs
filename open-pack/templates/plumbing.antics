@@ -1,5 +1,7 @@
 // Shared plumbing fixture template with occupancy lock, wear-to-broken state, and repair finish.
 
+use crate::common::helpers::gain_skill;
+
 pub template PlumbingFixture {
     category: plumbing;
 
@@ -20,7 +22,7 @@ pub template PlumbingFixture {
     fn complete_fixture_repair(sim: Sim, confirm_sfx: Sound) {
         self.broken = false;
         self.wear = 0;
-        sim.skill.mechanical += mechanic_xp;
+        gain_skill(sim, Skill::Mechanical, mechanic_xp);
         play_sound(confirm_sfx);
     }
 }

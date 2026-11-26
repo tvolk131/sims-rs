@@ -17,12 +17,12 @@ pub template SeatBase {
     slot seat_entry = routing([0.0, -0.75, 0.0], sitting: true);
 
     fn sit_comfort_loop(sim: Sim) -> i16 {
-        return restore_motive_loop(
+        restore_motive_loop(
             sim,
             Motive::Comfort,
             cycles: sit_cycles,
             step: comfort_step,
             ticks: sit_ticks,
-        );
+        )
     }
 }

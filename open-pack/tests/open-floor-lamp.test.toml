@@ -1,0 +1,50 @@
+# Live sims-vm unit tests for the Open Floor Lamp: it starts lit, the switch entries are offered
+# by power state, and the switch sets the graphic and the room impact.
+#
+# A lit lamp raises Room the way the room score does it: through the object's room impact (data
+# word 7), which every room update adds to the score of the room the lamp stands in. The runner's
+# objects stand in no room, so the specs check the word; the room score itself is `sims-sim`'s.
+
+[subject]
+antics = "../objects/open-floor-lamp.antics"
+pack = ".."
+
+[sim]
+
+[[test]]
+name = "a new lamp is lit and lights its room"
+tree = "Init"
+expect = { result = true, attrs = { power = 1, occupied = 0 }, data = { 7 = 5 } }
+
+[[test]]
+name = "a lit lamp offers Turn Off Light"
+guard = "Turn Off Light"
+expect = { result = true }
+
+[[test]]
+name = "a lit lamp does not offer Turn On Light"
+guard = "Turn On Light"
+expect = { result = false }
+
+[[test]]
+name = "a dark lamp offers Turn On Light"
+guard = "Turn On Light"
+given = { attrs = { power = 0 } }
+expect = { result = true }
+
+[[test]]
+name = "turning the light off shows the dark lamp and drops the room impact"
+interaction = "Turn Off Light"
+given = { data = { 0 = 0, 7 = 5 } }
+expect = { attrs = { power = 0 }, data = { 0 = 1, 7 = 0 }, sounds = ["open_lamp_switch"] }
+
+[[test]]
+name = "turning the light on shows the lit lamp and raises the room impact"
+interaction = "Turn On Light"
+given = { attrs = { power = 0 }, data = { 0 = 1, 7 = 0 } }
+expect = { attrs = { power = 1 }, data = { 0 = 0, 7 = 5 }, sounds = ["open_lamp_switch"] }
+
+[[test]]
+name = "a lit lamp cannot be turned on again"
+interaction = "Turn On Light"
+expect = { result = "unavailable", data = { 7 = 5 }, sounds = [] }

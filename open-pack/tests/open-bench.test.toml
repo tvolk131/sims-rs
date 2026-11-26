@@ -1,0 +1,56 @@
+# Live sims-vm unit tests for the Open Pine Bench: the Comfort guard, the occupancy lock, and
+# the cancel-safe sitting loop (four cycles of 10 Comfort, two ticks each).
+
+[subject]
+antics = "../objects/open-bench.antics"
+pack = ".."
+
+[sim]
+motives = { comfort = 0 }
+
+[[test]]
+name = "the bench is offered below 95 Comfort"
+guard = "Sit and Rest"
+given = { sim = { motives = { comfort = 94 } } }
+expect = { result = true }
+
+[[test]]
+name = "the bench is not offered at 95 Comfort"
+guard = "Sit and Rest"
+given = { sim = { motives = { comfort = 95 } } }
+expect = { result = false }
+
+[[test]]
+name = "an occupied bench is not offered"
+guard = "Sit and Rest"
+given = { attrs = { occupied = 1 } }
+expect = { result = false }
+
+[[test]]
+name = "resting restores 40 Comfort over four cycles"
+interaction = "Sit and Rest"
+expect = { attrs = { occupied = 0 }, sim = { motives = { comfort = 40 } }, sounds = ["open_bench_creak"] }
+
+# The action tree run as the Sim's thread, with a running action's priority: each cycle sleeps
+# two ticks, so after four turns one cycle has ended. A priority of 0 is a cancelled action.
+[[test]]
+name = "resting takes time"
+action = "Sit and Rest"
+me = "sim"
+turns = 4
+given = { sim = { priority = 50 } }
+expect = { result = "yield", sim = { motives = { comfort = 10 } } }
+
+[[test]]
+name = "resting stops once Comfort is full"
+interaction = "Sit and Rest"
+given = { sim = { motives = { comfort = 75 } } }
+expect = { sim = { motives = { comfort = 100 } }, turns = 7 }
+
+[[test]]
+name = "a cancelled rest restores nothing"
+action = "Sit and Rest"
+me = "sim"
+turns = 4
+given = { sim = { priority = 0 } }
+expect = { result = true, sim = { motives = { comfort = 0 } }, sounds = ["open_bench_creak"] }

@@ -3457,7 +3457,8 @@ fn on_disk_open_pack_is_pure_v2_expands_all_20_objects_and_passes_safety() {
         0,
         "lamp must boot with graphic 0 (lit) to preserve v0.3.0 initial world state"
     );
-    let room_before = vm.sim_motive(13);
+    // A lit lamp raises Room through its room impact (data word 7), which the room score adds.
+    assert_eq!(vm.obj_data(lamp_id, 7), 5, "a lit lamp has a room impact");
     vm.run_interaction(lamp_id, "Turn Off Light", None);
     assert_eq!(vm.obj_attr(lamp_id, 1), 0);
     assert_eq!(
@@ -3465,6 +3466,7 @@ fn on_disk_open_pack_is_pure_v2_expands_all_20_objects_and_passes_safety() {
         1,
         "Turn Off Light switches to off graphic 1"
     );
+    assert_eq!(vm.obj_data(lamp_id, 7), 0, "a dark lamp has no room impact");
     vm.run_interaction(lamp_id, "Turn On Light", None);
     assert_eq!(vm.obj_attr(lamp_id, 1), 1);
     assert_eq!(
@@ -3472,9 +3474,10 @@ fn on_disk_open_pack_is_pure_v2_expands_all_20_objects_and_passes_safety() {
         0,
         "Turn On Light switches back to lit graphic 0"
     );
-    assert!(
-        vm.sim_motive(13) > room_before + 30.0,
-        "Turn On Light hook must boost Sim room motive"
+    assert_eq!(
+        vm.obj_data(lamp_id, 7),
+        5,
+        "Turn On Light hook must restore the lamp's room impact"
     );
 
     // 6. Verify 2-Sim contention on `open-cot`: while Sim 1 naps, Sim 2 cannot claim the cot!

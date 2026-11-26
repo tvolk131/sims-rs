@@ -1,0 +1,64 @@
+# Live sims-vm unit tests for the Open Oak Front Door: the welcome social, and the lock state
+# that blocks it, switched only while nobody is at the door.
+
+[subject]
+antics = "../objects/open-front-door.antics"
+pack = ".."
+
+[sim]
+motives = { social = 0, fun = 0 }
+
+[[test]]
+name = "an unlocked door offers a welcome"
+guard = "Knock and Welcome"
+expect = { result = true }
+
+[[test]]
+name = "a locked door does not"
+guard = "Knock and Welcome"
+given = { attrs = { locked = 1 } }
+expect = { result = false }
+
+[[test]]
+name = "a welcome raises Social and Fun and counts the guest"
+interaction = "Knock and Welcome"
+expect = { attrs = { welcomed_guests = 1, occupied = 0 }, sim = { motives = { social = 30, fun = 10 } }, sounds = ["open_door_knock", "open_door_bell"] }
+
+[[test]]
+name = "Social stops at the motive maximum"
+interaction = "Knock and Welcome"
+given = { attrs = { welcomed_guests = 2 }, sim = { motives = { social = 90 } } }
+expect = { attrs = { welcomed_guests = 3 }, sim = { motives = { social = 100, fun = 10 } } }
+
+[[test]]
+name = "Lock Door is offered on an unlocked door"
+guard = "Lock Door"
+expect = { result = true }
+
+[[test]]
+name = "Lock Door is not offered while someone is at the door"
+guard = "Lock Door"
+given = { attrs = { occupied = 1 } }
+expect = { result = false }
+
+[[test]]
+name = "Unlock Door is offered only on a locked door"
+guard = "Unlock Door"
+expect = { result = false }
+
+[[test]]
+name = "locking the door"
+interaction = "Lock Door"
+expect = { attrs = { locked = 1 }, sounds = ["open_door_knock"] }
+
+[[test]]
+name = "unlocking the door"
+interaction = "Unlock Door"
+given = { attrs = { locked = 1 } }
+expect = { attrs = { locked = 0 }, sounds = ["open_door_knock"] }
+
+[[test]]
+name = "a locked door is not offered for a welcome"
+interaction = "Knock and Welcome"
+given = { attrs = { locked = 1 } }
+expect = { result = "unavailable", attrs = { welcomed_guests = 0 }, sim = { motives = { social = 0 } } }

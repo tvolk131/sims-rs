@@ -1079,17 +1079,34 @@ fn household_sim_exercises_all_eight_motives_skills_bills_and_cancel_zero_traps(
     );
     assert_eq!(world.objects[&front_door].attributes[1], 1);
 
-    // 8. Room -> Open Floor Lamp + Dining Table + Trash Can
-    let before_room = world.objects[&sim_id].person.as_ref().unwrap().motives[MOTIVE_ROOM];
+    // 8. Room -> Open Floor Lamp + Dining Table + Trash Can. The person tick sets Room from the
+    // room's score, which adds every object's room impact (data word 7) for the room it stands
+    // in; the objects set that word, so it is what is checked here.
+    const ROOM_IMPACT: usize = 7;
+    assert_eq!(
+        world.objects[&floor_lamp].data[ROOM_IMPACT], 5,
+        "a new lamp is lit"
+    );
     run_pie_interaction_by_name(
         &mut vm,
         &mut world,
         &ttas_by_guid,
         sim_id,
         floor_lamp,
-        "Enjoy Warm Light",
+        "Turn Off Light",
         40,
     );
+    assert_eq!(world.objects[&floor_lamp].data[ROOM_IMPACT], 0);
+    run_pie_interaction_by_name(
+        &mut vm,
+        &mut world,
+        &ttas_by_guid,
+        sim_id,
+        floor_lamp,
+        "Turn On Light",
+        40,
+    );
+    assert_eq!(world.objects[&floor_lamp].data[ROOM_IMPACT], 5);
     run_pie_interaction_by_name(
         &mut vm,
         &mut world,
@@ -1098,6 +1115,11 @@ fn household_sim_exercises_all_eight_motives_skills_bills_and_cancel_zero_traps(
         dining_table,
         "Set Table",
         40,
+    );
+    assert_eq!(world.objects[&dining_table].data[ROOM_IMPACT], 3);
+    assert!(
+        world.objects[&trash_can].data[ROOM_IMPACT] < 0,
+        "a bag in the can"
     );
     run_pie_interaction_by_name(
         &mut vm,
@@ -1108,10 +1130,8 @@ fn household_sim_exercises_all_eight_motives_skills_bills_and_cancel_zero_traps(
         "Empty Trash",
         40,
     );
-    assert!(
-        world.objects[&sim_id].person.as_ref().unwrap().motives[MOTIVE_ROOM] > before_room + 50.0
-    );
     assert_eq!(world.objects[&trash_can].attributes[1], 0);
+    assert_eq!(world.objects[&trash_can].data[ROOM_IMPACT], 0);
 
     // 9. Bills via alter_budget -> Open Mailbox
     let before_funds = world.budget.funds;

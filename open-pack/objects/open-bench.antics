@@ -21,9 +21,7 @@ object "Open Pine Bench" from SeatBase {
         guard(sim) => sim.motive.comfort < max_entry_comfort,
         run(sim) {
             play_sound(creak);
-            repeat sit_cycles {
-                sim.motive.comfort += comfort_step;
-            }
+            sit_comfort_loop(sim);
         }
     }
 }

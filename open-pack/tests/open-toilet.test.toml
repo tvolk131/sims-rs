@@ -1,0 +1,55 @@
+# Live sims-vm unit tests for the Open Porcelain Toilet: Bladder relief with a flush, wear to a
+# clog on the fourth use, and unclogging (three plunges) that clears it and trains Mechanical.
+
+[subject]
+antics = "../objects/open-toilet.antics"
+pack = ".."
+
+[sim]
+motives = { bladder = 0 }
+
+[[test]]
+name = "the toilet is offered below 92 Bladder"
+guard = "Use Toilet"
+given = { sim = { motives = { bladder = 91 } } }
+expect = { result = true }
+
+[[test]]
+name = "the toilet is not offered at 92 Bladder"
+guard = "Use Toilet"
+given = { sim = { motives = { bladder = 92 } } }
+expect = { result = false }
+
+[[test]]
+name = "a clogged toilet is not offered"
+guard = "Use Toilet"
+given = { attrs = { broken = 1 } }
+expect = { result = false }
+
+[[test]]
+name = "a use relieves Bladder, flushes and wears"
+interaction = "Use Toilet"
+expect = { attrs = { wear = 1, broken = 0, occupied = 0 }, sim = { motives = { bladder = 100 } }, sounds = ["open_toilet_flush"] }
+
+[[test]]
+name = "the fourth use clogs it"
+interaction = "Use Toilet"
+given = { attrs = { wear = 3 } }
+expect = { attrs = { wear = 4, broken = 1 } }
+
+[[test]]
+name = "Unclog Toilet is offered only when clogged"
+guard = "Unclog Toilet"
+expect = { result = false }
+
+[[test]]
+name = "unclogging clears the clog and trains Mechanical"
+interaction = "Unclog Toilet"
+given = { attrs = { wear = 4, broken = 1 } }
+expect = { attrs = { wear = 0, broken = 0, occupied = 0 }, sim = { skills = { mechanical = 12 } }, sounds = ["open_toilet_plunge", "open_toilet_flush"] }
+
+[[test]]
+name = "unclogging never raises Mechanical past 1000"
+interaction = "Unclog Toilet"
+given = { attrs = { broken = 1 }, sim = { skills = { mechanical = 995 } } }
+expect = { attrs = { broken = 0 }, sim = { skills = { mechanical = 1000 } } }

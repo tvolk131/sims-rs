@@ -1,6 +1,7 @@
 // Open Hearth Stove (0x7F00_0022) — cooking range (OBJf functional cook) spawning Open Meal Plate.
 
 use crate::objects::open_meal_plate::OpenMealPlate;
+use std::math::min;
 
 object "Open Hearth Stove" {
     guid: 0x7F00_0022;
@@ -26,21 +27,26 @@ object "Open Hearth Stove" {
         score: cook_score,
         guard(sim) => !self.occupied,
         run(sim) {
-            play_sound(sizzle);
-            sleep(cook_ticks);
+            // One cook at a time: the stove is taken until the plate is served or the cook fails.
+            with lock(self.occupied) {
+                play_sound(sizzle);
+                sleep(cook_ticks);
+                // A Sim whose action was cancelled while the pan was on serves nothing: the
+                // fridge gives back the ingredients.
+                if sim.priority == 0 {
+                    return false;
+                }
 
-            let mut nutrition = cooking_skill / skill_divisor + base_hunger_value + prep_bonus;
-            if nutrition > max_nutrition {
-                nutrition = max_nutrition;
+                let nutrition = min(cooking_skill / skill_divisor + base_hunger_value + prep_bonus, max_nutrition);
+
+                let Some(plate) = create_object::<OpenMealPlate>(mode: stack_ahead, flags: 0x40) else {
+                    return false;
+                };
+                plate.nutrition = nutrition;
+                plate.is_full = true;
+                self.meals_cooked += 1;
+                return plate;
             }
-
-            let Some(plate) = create_object::<OpenMealPlate>(mode: stack_ahead, flags: 0x40) else {
-                return false;
-            };
-            plate.nutrition = nutrition;
-            plate.is_full = true;
-            self.meals_cooked += 1;
-            return plate;
         }
     }
 }

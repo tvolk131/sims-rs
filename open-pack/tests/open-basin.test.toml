@@ -1,0 +1,44 @@
+# Live sims-vm unit tests for the Open Ceramic Basin: the Bladder guard, a full Bladder and a
+# Hygiene top-up per use, and the use counter.
+
+[subject]
+antics = "../objects/open-basin.antics"
+pack = ".."
+
+[sim]
+motives = { bladder = 0, hygiene = 0 }
+
+[[test]]
+name = "the basin is offered below 90 Bladder"
+guard = "Use Basin"
+given = { sim = { motives = { bladder = 89 } } }
+expect = { result = true }
+
+[[test]]
+name = "the basin is not offered at 90 Bladder"
+guard = "Use Basin"
+given = { sim = { motives = { bladder = 90 } } }
+expect = { result = false }
+
+[[test]]
+name = "a use fills Bladder and washes hands"
+interaction = "Use Basin"
+expect = { attrs = { uses = 1 }, sim = { motives = { bladder = 100, hygiene = 25 } }, sounds = ["open_basin_flush"] }
+
+[[test]]
+name = "Hygiene stops at the motive maximum"
+interaction = "Use Basin"
+given = { sim = { motives = { hygiene = 90 } } }
+expect = { sim = { motives = { bladder = 100, hygiene = 100 } } }
+
+[[test]]
+name = "uses accumulate"
+interaction = "Use Basin"
+given = { attrs = { uses = 4 } }
+expect = { attrs = { uses = 5 } }
+
+[[test]]
+name = "a Sim with a full Bladder is not offered the basin"
+interaction = "Use Basin"
+given = { sim = { motives = { bladder = 100 } } }
+expect = { result = "unavailable", attrs = { uses = 0 }, sounds = [] }

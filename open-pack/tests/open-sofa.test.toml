@@ -1,0 +1,61 @@
+# Live sims-vm unit tests for the Open Plush Sofa: Relax (Comfort), Take Nap (Energy first,
+# then Comfort, waking at 95 Energy) and Chat on Sofa (Social and Comfort), and the session
+# counter.
+
+[subject]
+antics = "../objects/open-sofa.antics"
+pack = ".."
+
+[sim]
+motives = { comfort = 0, energy = 0, social = 0 }
+
+[[test]]
+name = "relaxing restores 72 Comfort"
+interaction = "Relax"
+expect = { attrs = { sessions = 1, occupied = 0 }, sim = { motives = { comfort = 72 } }, sounds = ["open_sofa_creak"] }
+
+[[test]]
+name = "Relax is offered below full Comfort"
+guard = "Relax"
+given = { sim = { motives = { comfort = 99 } } }
+expect = { result = true }
+
+[[test]]
+name = "Relax is not offered at full Comfort"
+guard = "Relax"
+given = { sim = { motives = { comfort = 100 } } }
+expect = { result = false }
+
+[[test]]
+name = "a nap restores Energy and Comfort"
+interaction = "Take Nap"
+expect = { attrs = { sessions = 1 }, sim = { motives = { energy = 54, comfort = 36 } }, sounds = ["open_sofa_creak"] }
+
+[[test]]
+name = "a nap ends on the first cycle that reaches 95 Energy"
+interaction = "Take Nap"
+given = { sim = { motives = { energy = 80 } } }
+expect = { sim = { motives = { energy = 98, comfort = 12 } } }
+
+[[test]]
+name = "Take Nap is not offered at 85 Energy"
+guard = "Take Nap"
+given = { sim = { motives = { energy = 85 } } }
+expect = { result = false }
+
+[[test]]
+name = "chatting restores Social and Comfort"
+interaction = "Chat on Sofa"
+expect = { attrs = { sessions = 1 }, sim = { motives = { social = 44, comfort = 28 } }, sounds = ["open_sofa_chime"] }
+
+[[test]]
+name = "sessions accumulate across interactions"
+interaction = "Chat on Sofa"
+given = { attrs = { sessions = 2 } }
+expect = { attrs = { sessions = 3 } }
+
+[[test]]
+name = "an occupied sofa is not offered"
+interaction = "Relax"
+given = { attrs = { occupied = 1 } }
+expect = { result = "unavailable", attrs = { sessions = 0 } }

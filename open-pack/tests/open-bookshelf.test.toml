@@ -1,0 +1,49 @@
+# Live sims-vm unit tests for the Open Timber Bookshelf: reading for Fun, studying Cooking or
+# Mechanical (capped at the 1000 skill maximum), and the session counter.
+
+[subject]
+antics = "../objects/open-bookshelf.antics"
+pack = ".."
+
+[sim]
+motives = { fun = 0 }
+
+[[test]]
+name = "reading a novel restores 60 Fun"
+interaction = "Read Novel"
+expect = { attrs = { sessions = 1, occupied = 0 }, sim = { motives = { fun = 60 } }, sounds = ["open_book_turn"] }
+
+[[test]]
+name = "reading stops once Fun is full"
+interaction = "Read Novel"
+given = { sim = { motives = { fun = 70 } } }
+expect = { attrs = { sessions = 1 }, sim = { motives = { fun = 100 } }, turns = 5 }
+
+[[test]]
+name = "studying Cooking raises the skill and a little Fun"
+interaction = "Study Cooking"
+expect = { attrs = { sessions = 1 }, sim = { skills = { cooking = 75, mechanical = 0 }, motives = { fun = 18 } }, sounds = ["open_book_turn", "open_skill_chime"] }
+
+[[test]]
+name = "studying Mechanical raises only Mechanical"
+interaction = "Study Mechanical"
+given = { sim = { skills = { mechanical = 100 } } }
+expect = { attrs = { sessions = 1 }, sim = { skills = { cooking = 0, mechanical = 175 } } }
+
+[[test]]
+name = "study never raises a skill past 1000"
+interaction = "Study Cooking"
+given = { sim = { skills = { cooking = 990 } } }
+expect = { sim = { skills = { cooking = 1000 }, motives = { fun = 18 } } }
+
+[[test]]
+name = "a maxed skill stays at 1000 and the session still counts"
+interaction = "Study Mechanical"
+given = { sim = { skills = { mechanical = 1000 } } }
+expect = { attrs = { sessions = 1 }, sim = { skills = { mechanical = 1000 }, motives = { fun = 18 } } }
+
+[[test]]
+name = "an occupied bookshelf is not offered"
+interaction = "Read Novel"
+given = { attrs = { occupied = 1 } }
+expect = { result = "unavailable", attrs = { sessions = 0 } }
