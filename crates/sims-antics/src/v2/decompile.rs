@@ -9210,9 +9210,9 @@ object "Fable Lamp" {
             &[
                 "scope(21, 3) := Tuning.e1;",
                 "temp[1] = Tuning::e1;",
-                // Lint `unused_decl` does not count a `Table::entry` read, and raw code reads
-                // this table by name, so the entry only v2 code reads keeps its dot.
-                "temp[0] = Tuning.e0;",
+                // Lint `unused_decl` counts a `Table::entry` read (Track 7, Step 2), so the
+                // entry only v2 code reads takes the path too, though raw code reads the table.
+                "temp[0] = Tuning::e0;",
             ],
         );
         assert!(!lifted.contains("bcon["), "{lifted}");

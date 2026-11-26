@@ -210,7 +210,7 @@ pub const LINT_RULES: &[LintRule] = &[
     ),
     warn(
         PREFER_QUESTION_MARK,
-        "`if !f(..) { return error; }` on a `Result` call instead of `f(..)?;`",
+        "`if !f(..) { panic!(); }` (or `return error;`) on a `Result` call instead of `f(..)?;`",
     ),
     warn(
         PREFER_METHOD_SYNTAX,
@@ -317,8 +317,11 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
         parsed.push((input, ast, tokens));
     }
     let mut symbols = Symbols::default();
-    for (_, ast, tokens) in &parsed {
+    for (input, ast, tokens) in &parsed {
         symbols.add_file(ast, tokens);
+        symbols
+            .bcon_paths
+            .extend(bcon_path_reads(input, ast, tokens));
     }
 
     let mut out = Vec::new();
@@ -352,6 +355,7 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             states: file_states(ast),
             frames,
             object: None,
+            object_template: None,
             strings: BTreeMap::new(),
             dialog_strings: Vec::new(),
             tables: BTreeMap::new(),
@@ -990,6 +994,10 @@ struct Symbols {
     returns: BTreeMap<String, Option<RetKind>>,
     /// Every identifier written right after a `.` (fields, methods, BCON entries).
     field_names: BTreeSet<String>,
+    /// Every two-segment path `A::b` that may read a BCON entry, as `(body, A, b)` with
+    /// `body` `object:<file>:Name`, `template:Name`, or `module` (outside any body). Filled
+    /// per file by [`bcon_path_reads`].
+    bcon_paths: BTreeSet<(String, String, String)>,
     /// The names of BCON tables (`bcon` labels, `extern bcon` names), anywhere in the set.
     bcon_names: BTreeSet<String>,
     /// The templates the file set declares.
@@ -1554,6 +1562,8 @@ struct FileLinter<'a> {
     frames: Option<BTreeMap<String, Vec<AirFrame>>>,
     /// The object being linted.
     object: Option<String>,
+    /// The template it is built `from`, if any.
+    object_template: Option<String>,
     /// The linted object's `strings` entries: name -> text.
     strings: BTreeMap<String, String>,
     /// Its dialog strings (`STR#` 301), in order: a dialog's numeric string is 1-based.
@@ -2299,6 +2309,7 @@ impl FileLinter<'_> {
                 V2Item::Const(c) if !c.is_pub => self.unused_const(c),
                 V2Item::Object(o) => {
                     self.object = Some(o.name.clone());
+                    self.object_template = o.from_template.as_ref().map(|(t, _)| t.clone());
                     // A template from another module may declare a BCON table `me`.
                     self.me_bcon |= o
                         .from_template
@@ -2338,6 +2349,7 @@ impl FileLinter<'_> {
                     self.air_consts = air_consts(file, &o.members);
                     self.lint_members(&o.members, false);
                     self.object = None;
+                    self.object_template = None;
                     self.strings.clear();
                     self.dialog_strings.clear();
                     self.tables.clear();
@@ -2492,10 +2504,34 @@ impl FileLinter<'_> {
                     }
                 }
                 ObjectMember::Bcon(b) if !template && !self.symbols.bcon_by_number => {
+                    // `Table::entry` reads the table too (see `bcon_path_reads`): in this
+                    // object's body, or in its template's unless this object declares a type
+                    // of the table's name, which wins the path in the merged scope.
+                    let tables = bcon_names(&b.label);
+                    let own_types = member_type_names(members);
+                    let mut bodies = vec![("module".to_owned(), false)];
+                    if let Some(o) = &self.object {
+                        bodies.push((format!("object:{}:{o}", self.file), false));
+                    }
+                    if let Some(t) = &self.object_template {
+                        bodies.push((format!("template:{t}"), true));
+                    }
                     let used: Vec<bool> = b
                         .entries
                         .iter()
-                        .map(|(_, name, _)| self.symbols.field_names.contains(name))
+                        .map(|(_, name, _)| {
+                            self.symbols.field_names.contains(name)
+                                || tables.iter().any(|t| {
+                                    bodies.iter().any(|(body, inherited)| {
+                                        !(*inherited && own_types.contains(t))
+                                            && self.symbols.bcon_paths.contains(&(
+                                                body.clone(),
+                                                t.clone(),
+                                                name.clone(),
+                                            ))
+                                    })
+                                })
+                        })
                         .collect();
                     if used.iter().any(|u| *u) {
                         for ((span, name, _), used) in b.entries.iter().zip(used) {
@@ -3476,6 +3512,9 @@ impl FileLinter<'_> {
                 self.dropped_bool_call(*span, expr);
                 self.prefer_method_syntax(expr);
             }
+            // `let _ = f(..);` drops the call's result on purpose (no `dropped_bool_call`),
+            // and the call may still have a method form.
+            V2Stmt::Let { name, init, .. } if name == "_" => self.prefer_method_syntax(init),
             V2Stmt::RawAir { span, code } => {
                 self.raw_builtin(*span, code);
                 self.raw_blocks.push((*span, code.clone()));
@@ -3695,16 +3734,31 @@ impl FileLinter<'_> {
                 Some(k) => k,
                 None => return,
             },
-            V2Expr::MethodCall { method, .. } if method == "is_type" => {
-                ("is_type".to_owned(), RetKind::Bool)
+            // The help spells the receiver: `is_type` alone is no callable.
+            V2Expr::MethodCall {
+                receiver, method, ..
+            } if method == "is_type" => {
+                fn dotted(e: &V2Expr) -> Option<String> {
+                    match e {
+                        V2Expr::Ident(_, r) => Some(r.clone()),
+                        V2Expr::Field { base, field, .. } => {
+                            Some(format!("{}.{field}", dotted(base)?))
+                        }
+                        _ => None,
+                    }
+                }
+                let receiver = dotted(receiver).unwrap_or_else(|| "<object>".to_owned());
+                (format!("{receiver}.is_type"), RetKind::Bool)
             }
             _ => return,
         };
         let help = match kind {
             RetKind::Result => format!(
-                "propagate the failure with `{name}(..)?;`, or test it with `if !{name}(..) {{ ... }}`"
+                "propagate the failure with `{name}(..)?;`, test it with `if !{name}(..) {{ ... }}`, or drop it on purpose with `let _ = {name}(..);`"
             ),
-            RetKind::Bool => format!("test it: `if {name}(..) {{ ... }}`, or return it"),
+            RetKind::Bool => format!(
+                "test it: `if {name}(..) {{ ... }}`, return it, or drop it on purpose with `let _ = {name}(..);`"
+            ),
             RetKind::Other => return,
         };
         self.emit(
@@ -4610,6 +4664,7 @@ impl FileLinter<'_> {
         }
         let what = match &list[i] {
             V2Stmt::Return { .. } => "`return`",
+            V2Stmt::ReturnError { panic: true, .. } => "`panic!()`",
             V2Stmt::ReturnError { .. } => "`return error`",
             V2Stmt::Break { .. } => "`break`",
             V2Stmt::Continue { .. } => "`continue`",
@@ -5237,6 +5292,182 @@ fn else_named(toks: &[crate::v2::lexer::Token]) -> bool {
     })
 }
 
+/// The enum and bitflags types `members` declare.
+fn member_type_names(members: &[ObjectMember]) -> BTreeSet<String> {
+    members
+        .iter()
+        .filter_map(|m| match m {
+            ObjectMember::Bitflags(b) => Some(b.name.clone()),
+            ObjectMember::Enum(e) => Some(e.name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The two-segment paths `A::b` in a file that may read BCON entry `b` of a table named
+/// `A`, as `(body, A, b)`. `body` is `object:<file>:Name` or `template:Name` (a BCON table
+/// is in scope only in its object, and its template's body), or `module` for a path outside
+/// any body: a module-level helper is inlined into whatever object calls it.
+/// Lowering gives the path to an enum or bitflags type `A` in scope first. Not counted:
+/// - a segment of a longer path (`m::A::b`);
+/// - a called path (`globals::f()`, `((globals::f))()`);
+/// - a path whose `A` names such a type: one the file's module sees (its own items,
+///   imports, globs and aliases, from the resolver), a `std` prelude type, or one the body
+///   declares or (for an object) its `from` template declares. An object's own types also
+///   win in its template's body; the BCON check applies that, since templates are shared.
+///   When the module does not resolve, every name the file imports is taken for a type.
+///
+/// Raw blocks are one token: `.air` reads are counted from their text instead.
+fn bcon_path_reads(
+    input: &LintInput,
+    file: &V2File,
+    tokens: &[crate::v2::lexer::Token],
+) -> BTreeSet<(String, String, String)> {
+    let kind = |k: usize| tokens.get(k).map(|t| &t.kind);
+    // Candidate paths first: most files have none, and they need no resolving.
+    let mut candidates = Vec::new();
+    for i in 2..tokens.len() {
+        let (TokenKind::Ident(table), Some(TokenKind::ColonColon), Some(TokenKind::Ident(entry))) =
+            (&tokens[i - 2].kind, kind(i - 1), kind(i))
+        else {
+            continue;
+        };
+        let longer = (i >= 3 && kind(i - 3) == Some(&TokenKind::ColonColon))
+            || kind(i + 1) == Some(&TokenKind::ColonColon);
+        // `(( A::b ))(..)` calls it too.
+        let mut groups = 0;
+        while i >= 3 + groups
+            && kind(i - 3 - groups) == Some(&TokenKind::LParen)
+            && kind(i + 1 + groups) == Some(&TokenKind::RParen)
+        {
+            groups += 1;
+        }
+        let called = kind(i + 1 + groups) == Some(&TokenKind::LParen);
+        if !longer && !called {
+            candidates.push((i, table, entry));
+        }
+    }
+    if candidates.is_empty() {
+        return BTreeSet::new();
+    }
+    let resolved = match (&input.path, &input.pack_dir) {
+        (Some(path), Some(pack)) => crate::v2::resolve_v2_file(path, Some(pack)),
+        _ => crate::v2::resolve_v2_source(
+            &input.name,
+            &input.source,
+            &crate::v2::PackResolverConfig::default(),
+        ),
+    }
+    .ok();
+    let mut types = BTreeSet::new();
+    for item in &file.items {
+        match item {
+            V2Item::Bitflags(b) => {
+                types.insert(b.name.clone());
+            }
+            V2Item::Enum(e) => {
+                types.insert(e.name.clone());
+            }
+            _ => {}
+        }
+    }
+    match &resolved {
+        Some(m) => {
+            types.extend(m.enums.keys().cloned());
+            types.extend(m.bitflags.keys().cloned());
+        }
+        None => {
+            for u in &file.uses {
+                for item in &u.items {
+                    if item.name != "*" {
+                        types.insert(item.alias.clone().unwrap_or_else(|| item.name.clone()));
+                    }
+                }
+            }
+        }
+    }
+    let template_members = |name: &str| -> Option<&[ObjectMember]> {
+        file.items
+            .iter()
+            .find_map(|i| match i {
+                V2Item::Template(t) if t.name == name => Some(t.members.as_slice()),
+                _ => None,
+            })
+            .or_else(|| {
+                resolved
+                    .as_ref()
+                    .and_then(|m| m.templates.get(name))
+                    .map(|(_, t)| t.members.as_slice())
+            })
+    };
+    // Each object or template body's token range, its key, and the types in scope in it.
+    let mut bodies: Vec<(usize, usize, String, BTreeSet<String>)> = Vec::new();
+    for item in &file.items {
+        let (span, key, members, from) = match item {
+            V2Item::Object(o) => (
+                o.span,
+                format!("object:{}:{}", input.name, o.name),
+                &o.members,
+                o.from_template.as_ref().map(|(t, _)| t),
+            ),
+            V2Item::Template(t) => (t.span, format!("template:{}", t.name), &t.members, None),
+            _ => continue,
+        };
+        let at = (span.line, span.column);
+        let Some(start) = tokens
+            .iter()
+            .position(|t| (t.span.line, t.span.column) >= at)
+            .and_then(|k| {
+                tokens[k..]
+                    .iter()
+                    .position(|t| t.kind == TokenKind::LBrace)
+                    .map(|o| k + o)
+            })
+        else {
+            continue;
+        };
+        let mut depth = 0usize;
+        let mut end = tokens.len();
+        for (k, t) in tokens.iter().enumerate().skip(start) {
+            match t.kind {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = k;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut own = member_type_names(members);
+        if let Some(members) = from.and_then(|t| template_members(t)) {
+            own.extend(member_type_names(members));
+        }
+        bodies.push((start, end, key, own));
+    }
+    let mut out = BTreeSet::new();
+    for (i, table, entry) in candidates {
+        // Outside any body (a module-level helper, inlined into whatever object calls it):
+        // it counts for every object.
+        let (key, own) = match bodies
+            .iter()
+            .find(|(start, end, ..)| (*start..*end).contains(&i))
+        {
+            Some((_, _, key, own)) => (key.clone(), Some(own)),
+            None => ("module".to_owned(), None),
+        };
+        let typed = types.contains(table)
+            || crate::v2::ast::is_std_prelude_type_name(table)
+            || own.is_some_and(|own| own.contains(table));
+        if !typed {
+            out.insert((key, table.clone(), entry.clone()));
+        }
+    }
+    out
+}
+
 /// Whether `t` is the keyword (identifier token) `kw`.
 fn is_kw(t: Option<&crate::v2::lexer::Token>, kw: &str) -> bool {
     matches!(t.map(|t| &t.kind), Some(TokenKind::Ident(k)) if k == kw)
@@ -5768,8 +5999,9 @@ impl FileLinter<'_> {
             .map(|_| segs.join("::"))
     }
 
-    /// `prefer_question_mark`: `if !f(..) { return error; }` or
-    /// `if f(..) {} else { return error; }` on a call that returns `Result`.
+    /// `prefer_question_mark`: `if !f(..) { panic!(); }` or
+    /// `if f(..) {} else { panic!(); }` on a call that returns `Result`, and the same with
+    /// `return error;`, which v2 still accepts.
     fn prefer_question_mark(&mut self, s: &V2Stmt) {
         let V2Stmt::If {
             span,
@@ -5789,23 +6021,25 @@ impl FileLinter<'_> {
                 }]
             )
         };
-        let (call, else_form) = match cond {
+        let (call, else_form, exit) = match cond {
             V2Expr::Unary {
                 op: V2UnaryOp::Not,
                 inner,
                 ..
-            } if error(then_body) && else_body.is_empty() => (inner.as_ref(), false),
-            c if then_body.is_empty() && error(else_body) => (c, true),
+            } if error(then_body) && else_body.is_empty() => (inner.as_ref(), false, then_body),
+            c if then_body.is_empty() && error(else_body) => (c, true, else_body),
             _ => return,
         };
+        let panics = matches!(exit.as_slice(), [V2Stmt::ReturnError { panic: true, .. }]);
         let V2Expr::Call {
             span: open, callee, ..
         } = call
         else {
             return;
         };
-        // A written `return error;` returns a binding named `error`.
-        if self.bound.contains("error") {
+        // A written `return error;` returns a binding named `error`; `panic!()` is always
+        // the error exit, as `?` is.
+        if !panics && self.bound.contains("error") {
             return;
         }
         let Some(name) = self.result_callee(callee) else {
@@ -6103,11 +6337,17 @@ fn first_unassigned_read(list: &[V2Stmt], name: &str, user: &dyn Fn(&str) -> boo
                 // `relationship` writes its `value:` local only when it returns true (a
                 // missing row returns false first), and a call statement goes on either
                 // way: no write. As `relationship(..)?` or a test it is one.
+                // `let _ = relationship(..);` builds the same as the call statement.
                 V2Stmt::Expr {
                     expr: V2Expr::Call { callee, args, .. },
                     ..
+                }
+                | V2Stmt::Let {
+                    init: V2Expr::Call { callee, args, .. },
+                    ..
                 } if matches!(callee.as_ref(), V2Expr::Ident(_, f) if f == "relationship")
-                    && !user("relationship") =>
+                    && !user("relationship")
+                    && !matches!(s, V2Stmt::Let { name: n, .. } if n != "_") =>
                 {
                     for (k, a) in args.iter().enumerate() {
                         if !(writes_arg("relationship", args, k) && is_ident(&a.value, name)) {
@@ -6151,7 +6391,7 @@ fn first_unassigned_read(list: &[V2Stmt], name: &str, user: &dyn Fn(&str) -> boo
 }
 
 /// Whether control never goes on past `s` to the next statement of its block: a `return`,
-/// `return error`, `break` or `continue`, or an `if` with an `else` / a `match` with a `_`
+/// `panic!()` / `return error`, `break` or `continue`, or an `if` with an `else` / a `match` with a `_`
 /// arm whose every branch leaves. (A `match` without `_` falls through for a value no arm
 /// names; a loop, `with lock`, `defer` or `animate` may go on.)
 fn stmt_leaves(s: &V2Stmt) -> bool {
