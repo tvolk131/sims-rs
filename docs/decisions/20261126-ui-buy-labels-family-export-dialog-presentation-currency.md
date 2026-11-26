@@ -32,18 +32,20 @@ way the original's exports are written. The file goes to:
   (`user_files::userdata_dir`). It is never written into the install, since
   the shell never writes there.
 - **Name.** It uses the original's `<Name>_<id>.FAM` form. Characters that
-  some platform cannot hold in a file name become `_`.
+  some platform cannot hold in a file name become `_`. A name whose part
+  before the first dot is a Windows device name (`NUL.backup`, `COM1`) gets
+  a leading `_`.
 - **Overwrite.** It replaces an earlier export of the same family.
 - **Atomic write.** The bytes go to a hidden temporary file beside the
   target, created fresh for that one write (never an existing file or a
-  link). It is synced, closed and then renamed over the target, and it is
+  link) under a short name, so a long family name still fits. It is synced, closed and then renamed over the target, and it is
   removed if any step fails.
 
 The Import picker scans this folder as well, under the label "Exported", so
-an export can be imported back. The picker skips only the reserved pool
-families (`sims_vm::caf::is_reserved_pool_family`), not every id from 4000
-up. A notice tells the player the path, or the
-reason the export failed.
+an export can be imported back. The picker skips the reserved pool families
+(`sims_vm::caf::is_reserved_pool_family`) and ids past `i16::MAX`, which the
+importer refuses. It no longer skips every id from 4000 up. A notice tells
+the player the path, or the reason the export failed.
 
 ## Non-modal, anchored and large dialogs
 
@@ -73,13 +75,19 @@ Layout and input rules:
   - a press outside it goes on to the game;
   - a press on it goes to the dialog before an open pie menu, a held Buy
     object or a Build tool (`Game::dialog_takes`), and its release stays
-    with the dialog (`Hud::take_non_modal_press`);
+    with the dialog (`Hud::take_non_modal_press`), even when it is released
+    outside the window;
+  - a capture whose release never came is dropped when the next press
+    starts (`Hud::cancel_non_modal_press`);
+  - it is drawn over the pie menu's labels, matching the order in which
+    presses are routed;
   - keys never answer it;
   - the pie menu and camera strip stay open.
 - **Anchored.** The dialog sits flush in the window's top right corner.
   This is the legacy placement and is **unverified** against the original.
-  An anchored dialog taller than the window keeps to the bottom instead, as
-  a centered one does, so its buttons stay on screen.
+  A modal dialog taller than the window keeps to the window's bottom,
+  anchored or not, so its buttons stay on screen. A non-modal one keeps to
+  the top, so its dismiss box stays on screen.
   Any other dialog is centered, modal or not. The legacy bottom-left
   placement of other non-modal dialogs came from the host and was never
   measured, so it is not ported.

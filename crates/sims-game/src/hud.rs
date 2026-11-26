@@ -1927,6 +1927,16 @@ impl Hud {
         std::mem::take(&mut self.non_modal_press)
     }
 
+    /// Drops a non-modal dialog's capture left by a press whose release
+    /// never came, and the button it held. A modal dialog's held button is
+    /// left as it is.
+    pub fn cancel_non_modal_press(&mut self) {
+        if std::mem::take(&mut self.non_modal_press) {
+            self.dialog_state.pressed_button = None;
+            self.dialog_state.dragging_entry = None;
+        }
+    }
+
     /// Updates the native `[control_panel + 0x1ec]` idle-blink flag
     /// (`0x109(1/0)` at `0x4f688e`, or cleared by manual Live-mode speed
     /// clicks at `0x53a5e3..0x53a6e1`).
@@ -2559,6 +2569,13 @@ impl Hud {
             self.menu = None;
             self.close_camera_strip();
         }
+        // A modal dialog closes any pie menu (above), so only a non-modal
+        // one is ever drawn with a menu open: it goes over the menu's
+        // labels, as presses on it go to it first (`Game::dialog_takes`).
+        if let Some(menu) = &mut self.menu {
+            menu.layout(&self.art, view.size);
+            menu.draw_labels(&mut frame, &self.art, self.controls.pointer);
+        }
         if let (Some(message), Some(layout)) = (self.active_message(), &self.dialog) {
             let alpha = if clock_us == 0 {
                 255
@@ -2574,10 +2591,6 @@ impl Hud {
                 &self.dialog_state,
                 alpha,
             );
-        }
-        if let Some(menu) = &mut self.menu {
-            menu.layout(&self.art, view.size);
-            menu.draw_labels(&mut frame, &self.art, self.controls.pointer);
         }
         self.band = status.and_then(|status| self.status(&mut frame, status));
         if self.cheat_console.is_open() {

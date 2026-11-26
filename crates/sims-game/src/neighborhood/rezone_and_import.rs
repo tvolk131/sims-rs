@@ -337,7 +337,9 @@ impl NeighborhoodShell {
                     continue;
                 };
                 // Skip system NPC/stray households (`Strays_4000.FAM`).
-                if sims_vm::caf::is_reserved_pool_family(parsed.export_info.family_id) {
+                // Ids past i16::MAX are refused by the importer itself.
+                let id = parsed.export_info.family_id;
+                if sims_vm::caf::is_reserved_pool_family(id) || id > i16::MAX as u16 {
                     continue;
                 }
                 let member_count = parsed
@@ -792,13 +794,10 @@ fn write_replacing(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let shown = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
-    let stem = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("export");
     let (partial, mut file) = loop {
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let partial = path.with_file_name(format!(".{stem}.{}.{n}.partial", std::process::id()));
+        // Short, whatever the final name's length.
+        let partial = path.with_file_name(format!(".export.{}.{n}.partial", std::process::id()));
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -841,7 +840,24 @@ pub(super) fn export_file_name(name: &str, family_id: u16) -> String {
     } else {
         cleaned
     };
-    format!("{stem}_{family_id}.FAM")
+    // Windows takes a name whose part before the first dot is a device
+    // (`NUL.backup`) as that device: such a name gets a leading `_`.
+    let device = stem
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
+    let reserved = matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((device.starts_with("COM") || device.starts_with("LPT"))
+            && device.len() == 4
+            && device.as_bytes()[3].is_ascii_digit()
+            && device.as_bytes()[3] != b'0');
+    if reserved {
+        format!("_{stem}_{family_id}.FAM")
+    } else {
+        format!("{stem}_{family_id}.FAM")
+    }
 }
 
 #[cfg(test)]
@@ -865,6 +881,12 @@ mod export_name_tests {
             .collect();
         names.sort();
         assert_eq!(names, ["Newbie_7.FAM"], "no partial file is left");
+        // A name as long as a file name can be still writes: the temporary
+        // file's name is short.
+        let long = dir.join(export_file_name(&"a".repeat(248), 7));
+        write_replacing(&long, b"long").unwrap();
+        assert_eq!(std::fs::read(&long).unwrap(), b"long");
+        std::fs::remove_file(&long).unwrap();
         // A folder that is not there: an error, and nothing made.
         let missing = dir.join("gone").join("x.FAM");
         assert!(write_replacing(&missing, b"x").is_err());
@@ -880,5 +902,15 @@ mod export_name_tests {
         assert_eq!(export_file_name("", 4), "Family_4.FAM");
         assert_eq!(export_file_name("..", 4), "Family_4.FAM");
         assert_eq!(export_file_name("x\u{0}y", 5), "x_y_5.FAM");
+        // Device names, alone or before a dot, in any case.
+        assert_eq!(export_file_name("NUL.backup", 7), "_NUL.backup_7.FAM");
+        assert_eq!(export_file_name("con", 7), "_con_7.FAM");
+        assert_eq!(export_file_name("Com1", 7), "_Com1_7.FAM");
+        assert_eq!(export_file_name("lpt9.x", 7), "_lpt9.x_7.FAM");
+        assert_eq!(export_file_name("COM0", 7), "COM0_7.FAM");
+        assert_eq!(export_file_name("Console", 7), "Console_7.FAM");
+        assert_eq!(export_file_name("Nullson", 7), "Nullson_7.FAM");
+        // A long name still writes: the temporary name is short.
+        assert_eq!(export_file_name(&"a".repeat(248), 7).len(), 254);
     }
 }

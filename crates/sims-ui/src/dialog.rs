@@ -1993,14 +1993,24 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
     let width = a.size[0];
     // An anchored dialog is flush with the window's top right corner (the
     // old prototype's placement); any other is centered. One taller than
-    // the window keeps to its bottom either way, so its buttons stay on
-    // screen.
-    let rect = if presentation.anchored {
-        Rect::new(size[0] - width, 0.min(size[1] - height), width, height)
+    // the window keeps to its bottom, where a modal dialog's buttons are,
+    // or, non-modal, to its top, where its dismiss box is.
+    let x = if presentation.anchored {
+        size[0] - width
     } else {
-        let y = ((size[1] - height) / 2).min(size[1] - height);
-        Rect::new((size[0] - width) / 2, y, width, height)
+        (size[0] - width) / 2
     };
+    let y = if presentation.anchored {
+        0
+    } else {
+        (size[1] - height) / 2
+    };
+    let y = if presentation.modal {
+        y.min(size[1] - height)
+    } else {
+        y.max(0)
+    };
+    let rect = Rect::new(x, y, width, height);
     let title_x = match (title, icon) {
         (Some(title), Some(_)) => {
             top - PAD + icon_width + GAP + (a.text_width - band[0] - title) / 2
@@ -4318,6 +4328,19 @@ mod tests {
         assert_eq!(tall.rect.y + tall.rect.height, 60);
         let b = tall.buttons[0];
         assert!(b.y >= 0 && b.y + b.height <= 60, "{b:?}");
+        // Non-modal and taller than the window: kept to its top, so its
+        // dismiss box is reachable, anchored or not.
+        for anchored in [true, false] {
+            let p = Presentation {
+                anchored,
+                ..NON_MODAL
+            };
+            let tall = layout([800, 20], &presented("B B B B B B B B B B", 1, p), &art).unwrap();
+            assert!(tall.rect.height > 20, "{:?}", tall.rect);
+            assert_eq!(tall.rect.y, 0);
+            let d = tall.buttons[0];
+            assert!(d.y >= 0 && d.y + d.height <= 20, "{d:?}");
+        }
         // Not anchored: centered, modal or not.
         let centered = layout([800, 600], &presented("B", 1, NON_MODAL), &art).unwrap();
         assert_eq!(

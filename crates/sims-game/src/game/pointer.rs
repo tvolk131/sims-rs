@@ -178,6 +178,10 @@ impl Game {
     /// (0x5eb3d1 with `+0x170` clear); the entry is chosen, or the menu
     /// closed, on the matching [`Game::release`] (0x5eb433).
     pub fn press(&mut self, point: [i32; 2]) -> Outcome {
+        // A new press starts clean: a non-modal dialog's capture from a press
+        // whose release never came (focus lost, an overlay took it) is
+        // dropped before anything else sees this one.
+        self.hud.cancel_non_modal_press();
         if self.coop_lobby.is_open() {
             self.pointer = Some(point);
             let snap = self.coop_snapshot();
@@ -818,7 +822,11 @@ impl Game {
         let (released_camera, _) = self.hud.release_camera_strip(None);
         let (released_action, _) = self.hud.release_options_action(None);
         let (released_dialog, _) = self.hud.release_dialog(None);
-        self.hud.take_non_modal_press();
+        if self.hud.take_non_modal_press() {
+            // The press was the non-modal dialog's: what is under it (a pie
+            // menu, a drag) never sees its release.
+            return Outcome::redraw();
+        }
         if self.buy_dragging.take().is_some() {
             self.buy_commit_on_release = false;
             let redraw = self.hide_buy_cursor()
