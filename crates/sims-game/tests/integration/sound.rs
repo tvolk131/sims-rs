@@ -503,13 +503,37 @@ fn the_goths_sounds_play() {
     // SimsGeneratedHitSource.hot spells the rejected-tickler event
     // `vox_ticklee_rejected` while the interaction's FWAV asks for
     // `vox_tickler_rejected`.
+    //
+    // The clips' timed sounds (0x5912fd) name events the install's sound
+    // files do not hold either, and the original's play (0x57a54c) then
+    // plays nothing, as the player does:
+    // - the dog's clips (ExpansionPack5.far) ask for
+    //   `voxdog_sit_beg_start` and `voxdog_cower_breathe`, where
+    //   sep5snds.hot has only `voxdog_sit_beg{a,b,c}_lp` and
+    //   `voxdog_cower_{shudder,flinch}`;
+    // - a bare-footed Sim on the ground steps `footstep_terrain_noshoe`
+    //   (0x5916e9, the string at 0x6d1918), which no file defines.
     assert!(
         faults.iter().all(|f| {
             matches!(
                 f.as_str(),
-                "no event begin_route" | "no event end_route" | "no event vox_tickler_rejected"
+                "no event begin_route"
+                    | "no event end_route"
+                    | "no event vox_tickler_rejected"
+                    | "no event voxdog_sit_beg_start"
+                    | "no event voxdog_cower_breathe"
+                    | "no event footstep_terrain_noshoe"
             )
         }),
         "{faults:?}"
+    );
+    // The footsteps themselves play: at least one asked for is an event
+    // the sound files hold (the player found it, so no `no event`).
+    assert!(
+        played
+            .iter()
+            .any(|n| n.starts_with("footstep_")
+                && !faults.iter().any(|f| f == &format!("no event {n}"))),
+        "{played:?} {faults:?}"
     );
 }
