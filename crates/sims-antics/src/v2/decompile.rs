@@ -276,6 +276,7 @@ pub fn decompile_iff_to_v2_report(
                 if !unblamed
                     && !tree.is_some_and(|id| plan.drop_pin(id, &generated))
                     && !tree.is_some_and(|id| plan.add_frame(&model, id))
+                    && !tree.is_some_and(|id| plan.unname_lifecycle_locals(&model, id, &generated))
                     && !tree.is_some_and(|id| plan.keep_temps_raw(id, &generated))
                     && !tree.is_some_and(|id| plan.unmerge(id, &generated))
                     && !tree.is_some_and(|id| plan.drop_wave3(id, &generated))
@@ -337,6 +338,7 @@ pub fn decompile_iff_to_v2_report(
                 if !changed {
                     for &id in &unproven {
                         changed |= plan.pin_nodes(&model, id, &generated, &recompiled)
+                            || plan.unname_lifecycle_locals(&model, id, &generated)
                             || plan.keep_temps_raw(id, &generated)
                             || plan.fix_locals(id)
                             || plan.unmerge(id, &generated)
@@ -5679,6 +5681,7 @@ impl Plan {
         self.drop_pin(id, generated)
             || self.grow_locals(model, id, message)
             || self.add_frame(model, id)
+            || self.unname_lifecycle_locals(model, id, generated)
             || self.keep_temps_raw(id, generated)
             || self.unmerge(id, generated)
             || self.drop_wave3(id, generated)
@@ -5886,9 +5889,16 @@ impl Plan {
         generated.extras.contains(&id) && self.plain.insert(id)
     }
 
+    /// [`Self::unname_locals`] for a lifecycle block, tried before its other idioms. A
+    /// lifecycle block keeps its extra idioms, which it had before it named its locals, so
+    /// the names are what it gives up first.
+    fn unname_lifecycle_locals(&mut self, model: &Model, id: u16, generated: &Generated) -> bool {
+        model.tree(id).is_some_and(|t| t.lifecycle.is_some()) && self.unname_locals(id, generated)
+    }
+
     /// Leaves lifecycle block or plain tree `id`'s locals by number from now on, when the
-    /// last round named them. Tried after [`Self::drop_extras`]: names are no extra idiom,
-    /// but each pins its frame word.
+    /// last round named them. For a plain tree, tried after [`Self::drop_extras`]: names are
+    /// no extra idiom, but each pins its frame word.
     fn unname_locals(&mut self, id: u16, generated: &Generated) -> bool {
         generated.named_plain.contains(&id) && self.unnamed_locals.insert(id)
     }

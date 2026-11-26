@@ -122,7 +122,8 @@ unit test checks the list against `std/globals.antics`. After the flag-method gr
 - **Where reads stop:**
   - any write to the temp: an assignment, `flag_set` / `flag_clear`, a method call, `&` or
     `mut`;
-  - any call, since a call may change `temp[0]`;
+  - a call written `name(`, since a call may change `temp[0]`. A turbofish call
+    (`f::<T>()`) does not stop the scan; the byte gate covers it;
   - any `raw { }` block.
 - **When a statement is skipped:**
   - the name is already spelled somewhere in the file;
@@ -147,6 +148,28 @@ unit test checks the list against `std/globals.antics`. After the flag-method gr
 
   The `drop_pin` and `unname_locals` paths are exercised by the corpus counts above.
 
+## Decision 7: review round 2
+
+Codex returned HTTP 400 twice, so a fresh Claude Opus reviewer did this round.
+
+- **A lifecycle block gives up its local names first.**
+  - A lifecycle block keeps its extra idioms, which it had before it named its locals.
+  - Its fallback chains used to drop temps, merges and waves 3 and 2, and turn the block
+    plain, before taking the names away.
+  - `unname_lifecycle_locals` now runs right after `add_frame` in all three chains: build
+    errors, `.air` errors and unproven trees.
+  - Plain trees keep `unname_locals` after `drop_extras`.
+- **Left as is:**
+  - **A pin on a lifecycle block written with the default header writes the full header.**
+    That is the original's header (`lifecycle_header`), the one `add_frame` writes. If that
+    build is short of locals, the pin is dropped and the same text is not pinned again.
+  - **`pin_nodes` and `share_large` share one entry per tree.** When `pin_nodes` finds no
+    match for a text, `share_large` skips that text.
+  - **The unblamed error chains have no "drop every pin" step.** A refused pin carries its
+    tree's span.
+
+  Sweeps drop 2 pins in behavioral mode and 7 in strict mode, so these cases are rare.
+
 ## Results
 
 The base install, 1,191 objects and 26,206 trees. Before is `lift-v2-2-final-*`; after is
@@ -158,8 +181,8 @@ The base install, 1,191 objects and 26,206 trees. Before is `lift-v2-2-final-*`;
 | identical / equivalent | 870 / 4,651 | 870 / 4,651 | 884 / 4,637 | 1,113 / 4,408 |
 | raw-fallback trees | 897 | 897 | 17,702 | 16,682 |
 | zero-raw objects | 250 | 264 | 50 | 56 |
-| inline raw statements | 14,553 | 13,346 | 3,058 | 3,441 |
-| inline raw lines | 78,913 | 76,438 | 5,915 | 8,017 |
+| inline raw statements | 14,553 | 13,347 | 3,058 | 3,441 |
+| inline raw lines | 78,913 | 76,439 | 5,915 | 8,017 |
 | `node_order` / `share_tails` pins | 0 / 0 | 0 / 44 | 0 / 0 | 938 / 297 |
 | lint `frame_headroom` | 46 | 2 | 3 | 3 |
 | lint `manual_raw_has_builtin` | 214 | 268 | 3 | 3 |
