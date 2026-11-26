@@ -869,10 +869,13 @@ impl Feed {
 
 /// The sound player's event for one of the simulation's. The
 /// simulation's object ID is 16 bits, as the script named it; it is
-/// widened without its sign, so -1 is 65535 (which the original passes is
-/// **unverified**).
+/// widened with its sign, as the original's play does (0x57a60e, `movsx`),
+/// so -4 (an off-lot pet's sound) is 0xfffffffc, which the player places
+/// as the screen's centre at full volume (`sims_audio::placement::place`,
+/// an object at most 0). That a stop widens the same way is
+/// **unverified**.
 pub fn event(event: sims_vm::SoundEvent) -> SoundEvent {
-    let widen = |object: i16| u32::from(object as u16);
+    let widen = |object: i16| i32::from(object) as u32;
     match event {
         sims_vm::SoundEvent::Play { object, name } => SoundEvent::Play {
             object: widen(object),
@@ -1774,18 +1777,27 @@ mod tests {
     }
 
     #[test]
-    fn a_requests_object_is_widened_without_its_sign() {
+    fn a_requests_object_is_widened_with_its_sign() {
         let play = event(sims_vm::SoundEvent::Play {
-            object: -1,
+            object: -4,
             name: "door_open".into(),
         });
         assert!(
-            matches!(&play, SoundEvent::Play { object: 65535, name } if name == "door_open"),
+            matches!(&play, SoundEvent::Play { object: 0xffff_fffc, name } if name == "door_open"),
             "{play:?}"
         );
+        let SoundEvent::Play { object, .. } = play else {
+            unreachable!()
+        };
+        assert_eq!(object as i32, -4, "the player reads it back as -4");
         let stop = event(sims_vm::SoundEvent::Stop { object: -32768 });
         assert!(
-            matches!(stop, SoundEvent::StopObject { object: 32768 }),
+            matches!(
+                stop,
+                SoundEvent::StopObject {
+                    object: 0xffff_8000
+                }
+            ),
             "{stop:?}"
         );
         let stop = event(sims_vm::SoundEvent::Stop { object: 12 });

@@ -24,7 +24,7 @@
 //!   runtime's random function (0x636c74): none of 0x57a54c, 0x58900f,
 //!   0x5890a8, 0x432595 and 0x45e50e calls it directly or through direct
 //!   calls five deep. In a person's animator refresh at its taking itself
-//!   off the lot such an event fails (`timed_event`). "sound" also writes
+//!   off the lot such an event plays nothing (`timed_event`). "sound" also writes
 //!   a line to the game's log when its byte 0x5b is set, which is not
 //!   modeled.
 //! - "anchor" (0x5913a6): the event's bone becomes, or stops being, the
@@ -113,12 +113,13 @@ impl Interpreter<'_> {
     /// One timed event's properties (0x5912fd; the module documentation).
     ///
     /// In a person's animator refresh at its taking itself off the lot
-    /// (`refresh`; `Interpreter::refresh_at_take_off`), a sound key fails: the
-    /// refresh is made only if the house view drew the person, which is not
-    /// kept, and the sound it would play (for a selected person
-    /// "selectedsound" reaches 0x57a54c through 0x59158c and 0x59175e) is not
-    /// one the animator's tick alone plays. When the original plays nothing
-    /// there is not worked out.
+    /// (`refresh`; `Interpreter::refresh_at_take_off`), a sound key plays
+    /// nothing: the refresh is made only if the house view drew the person,
+    /// which is not kept, and a sound (for a selected person
+    /// "selectedsound" reaches 0x57a54c through 0x59158c and 0x59175e)
+    /// writes nothing the lot reads, so leaving it out keeps both branches
+    /// of the refresh alike. That the original plays it there is
+    /// **unverified**.
     ///
     /// Otherwise a sound key's pick ([`footsteps::pick`]) goes to the sound
     /// events, if they are noted ([`Interpreter::sounds`]). A pick that
@@ -147,14 +148,10 @@ impl Interpreter<'_> {
                 "lefthand" => LEFT_HAND,
                 "righthand" => RIGHT_HAND,
                 "censor" => CENSOR,
-                "sound" | "selectedsound" | "deselectedsound" | "footstep" if refresh => {
-                    return Err(Trap::Unsupported(format!(
-                        "the clip {:?} has a timed event {key:?} (0x5912fd) due in person {id}'s \
-                     animator refresh at its taking itself off the lot (0x58da12), which plays \
-                     a sound only if the house view drew the person; that is not kept",
-                        layer.clip
-                    )));
-                }
+                // The refresh is made only if the house view drew the
+                // person, which is not kept; what it would play changes
+                // nothing the lot does, so it plays nothing.
+                "sound" | "selectedsound" | "deselectedsound" | "footstep" if refresh => continue,
                 "sound" | "selectedsound" | "deselectedsound" | "footstep" => {
                     // A pick that cannot be made (a tile off the lot's
                     // arrays, where the original reads whatever memory

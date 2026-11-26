@@ -2651,19 +2651,16 @@ fn a_refresh_whose_event_writes_a_hand_fails_at_the_take_off() {
 }
 
 #[test]
-fn a_refresh_whose_event_plays_a_sound_fails_at_the_take_off() {
+fn a_refresh_whose_event_plays_a_sound_takes_itself_off_quietly() {
     // For a selected person, "selectedsound" plays (0x59158c, 0x59175e,
-    // 0x57a54c); whether the refresh's sounds play is not kept, so in the
-    // refresh any sound key fails. The tick alone plays it
+    // 0x57a54c); whether the refresh's sounds play is not kept, and a
+    // sound writes nothing the lot reads, so in the refresh any sound key
+    // plays nothing and the take-off goes on. The tick alone plays it
     // (`clip_sounds.rs`).
     for key in ["sound", "selectedsound", "deselectedsound", "footstep"] {
         let mut fx = taking_itself_off(sleep());
         playing_an_event(&mut fx, key, "x");
-        let fault = tick(&mut fx).unwrap_err().to_string();
-        assert!(
-            fault.contains("0x58da12") && fault.contains(&format!("{key:?}")),
-            "{fault}"
-        );
+        tick(&mut fx).unwrap_or_else(|f| panic!("{key}: {f}"));
         let mut alone = standing();
         playing_an_event(&mut alone, key, "x");
         // A footstep reads the floor under the Sim (no pattern there).

@@ -454,6 +454,7 @@ impl<'a> Interpreter<'a> {
             special_panels: self.special_panels,
             inline_special_panel: self.inline_special_panel,
             in_both_ways: self.in_both_ways,
+            floor_categories: self.floor_categories(),
             global_lib: self.global_lib,
             fast: self.fast,
             active_frame: None,
@@ -618,6 +619,10 @@ pub(crate) struct Machine<'a, 'w> {
         Option<&'a (dyn crate::primitives::dialog::InlinePanelSink + 'a)>,
     /// See [`Interpreter::in_both_ways`].
     pub(crate) in_both_ways: bool,
+    /// See [`Interpreter::floor_categories`]: the table the machine's
+    /// interpreter had, so a service's nested interpreter hears the same
+    /// floors.
+    pub(crate) floor_categories: Option<&'a std::collections::BTreeMap<u16, u8>>,
     /// See [`Interpreter::global_lib`].
     pub(crate) global_lib: Option<&'a Library>,
     /// See [`Interpreter::fast`].
@@ -670,7 +675,7 @@ impl<'a> Machine<'a, '_> {
             in_both_ways: self.in_both_ways,
             move_objects: false,
             architecture_prices: None,
-            floor_categories: None,
+            floor_categories: self.floor_categories,
             global_lib: self.global_lib,
             fast: self.fast,
         }

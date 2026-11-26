@@ -459,6 +459,68 @@ fn state_7_notes_why_it_stopped() {
 
 /// The routed Sim at the end of a short path, near it already (+0x288),
 /// with person word 64 set and its walk flag `walking`.
+#[test]
+fn a_share_just_below_a_whole_turn_steps_with_clip_minus_1() {
+    // From (32, 32) to (32.73491, 31.69559): the angle's share of a turn
+    // plus 1/16 is just below 0, so its part above the whole number below
+    // rounds to 1, and times 8 is sector 8 (0x58f363): clip -1. It has no
+    // name (string 0, 0x4704fa), so no displacement, and starts nothing
+    // (0x592733): the foreground playing goes on, with the stop's end
+    // mode, the animator's speed and the weight (the distance, 0.797, over
+    // a length of 0).
+    let at = |fx: &mut Fixture| {
+        let a = fx.world.animators.get_mut(&SIM).unwrap();
+        a.position = [32.0, 32.0, 2.0].map(F32::from_f32);
+        a.destination = [0x4202_f08d, 0x41fd_9091, 0x4000_0000].map(F32::from_bits);
+    };
+    let mut fx = walking_to(0, [0.0, 0.0], 2.0);
+    at(&mut fx);
+    let playing = Layer::start(
+        "test-turn-10",
+        F32::from_bits(HUNDRED),
+        4,
+        true,
+        0,
+        true,
+        500,
+    );
+    let a = fx.world.animators.get_mut(&SIM).unwrap();
+    a.foreground = Some(playing);
+    a.selection = 10;
+    let destination = a.destination;
+    tick(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    assert_eq!((a.state, a.selection), (5, -1));
+    assert_eq!(a.destination, destination, "no displacement");
+    assert_eq!(a.motion.turn_destination, destination);
+    let layer = a.foreground.as_ref().unwrap();
+    assert_eq!(layer.clip, "test-turn-10");
+    assert_eq!((layer.mode, layer.speed), (0, a.rate));
+    assert_eq!(layer.weight.to_bits(), f32::INFINITY.to_bits());
+    // With no foreground the original reads through a null pointer.
+    let mut fx = walking_to(0, [0.0, 0.0], 2.0);
+    at(&mut fx);
+    let fault = tick(&mut fx).unwrap_err().to_string();
+    assert!(fault.contains("0x58f4d3"), "{fault}");
+}
+
+#[test]
+fn a_position_that_is_not_a_number_is_left_as_it_is() {
+    // 0x58dd8f compares with -999 by `sahf; je`: unordered sets ZF, so a
+    // coordinate that is not a number counts as unset and state 3 places
+    // the animator (0x592132) and is done. The placing compares within
+    // epsilon by `jb` (0x592160), which unordered takes, so it places
+    // nothing: the coordinate stays, and no turn or step starts.
+    let mut fx = walking_to(0, [1.0, 0.0], 2.0);
+    fx.world.animators.get_mut(&SIM).unwrap().position[1] = F32::from_f32(f32::NAN);
+    tick(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    assert_eq!((a.state, a.selection), (3, -1));
+    assert!(a.position[1].to_f32().is_nan());
+    assert_eq!(a.position[0].to_f32(), 100.0);
+    assert!(a.foreground.is_none());
+}
+
 fn special_at_end(walking: bool) -> Fixture {
     let mut fx = routed();
     fx.world.routing.routes.get_mut(&SIM).unwrap().path.pop();
@@ -535,4 +597,31 @@ fn a_stop_asked_under_way_for_a_person_whose_word_64_is_set_plays_the_stop_backw
     let a = &fx.world.animators[&SIM];
     assert_eq!((a.state, a.arrival), (3, 2));
     assert_eq!(a.position, stepped);
+}
+
+#[test]
+fn a_stop_clip_no_file_defines_leaves_the_foreground_playing() {
+    // 0x58f036: the lookup of a name no animation file defines gives a
+    // null clip, so nothing starts and state 7 eases on with what plays.
+    let mut fx = special_at_end(true);
+    fx.program
+        .libraries
+        .get_mut(&GLOBAL)
+        .unwrap()
+        .strings
+        .get_mut(&150)
+        .unwrap()[0x13] = "test-defined-nowhere".into();
+    fx.world.animators.get_mut(&SIM).unwrap().foreground = Some(Layer::start(
+        "test-walk",
+        F32::from_bits(HUNDRED),
+        4,
+        true,
+        0,
+        true,
+        500,
+    ));
+    tick(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    assert_eq!((a.state, a.selection), (7, 0x13));
+    assert_eq!(a.foreground.as_ref().unwrap().clip, "test-walk");
 }

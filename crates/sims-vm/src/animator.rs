@@ -803,7 +803,15 @@ impl Interpreter<'_> {
                 }
                 1 | 2 => self.seated(world, id, a)?,
                 3 => {
-                    if a.position.iter().any(|&p| p.ext() == UNSET.ext()) {
+                    // 0x58dd8f: `sahf; je`, so a position that is not a
+                    // number counts as unset too (an unordered compare
+                    // sets ZF).
+                    if a.position.iter().any(|&p| {
+                        !matches!(
+                            p.ext().partial_cmp(&UNSET.ext()),
+                            Some(Ordering::Less | Ordering::Greater)
+                        )
+                    }) {
                         place(a, position, direction);
                         Next::Done
                     } else {
@@ -1162,8 +1170,11 @@ impl Interpreter<'_> {
     ///    (the C runtime's `floor`, 0x636ac9), times 8, floored and
     ///    truncated, picks one of eight sectors: the posture's clip is,
     ///    by sector, 15, 13, 11, 12, 14, 16, 18 or 17 (the jump table at
-    ///    0x58fad6). A sector outside 0 to 7 (an angle that is not a
-    ///    number) gives clip -1, which is not ported.
+    ///    0x58fad6). A sector outside 0 to 7 (a share just below a whole
+    ///    number, whose part above it rounds to 1) gives clip -1: it has
+    ///    no name, so no displacement, and starts nothing; the foreground
+    ///    already playing takes the stop's end mode and the rest below,
+    ///    and with none the update fails at 0x58f4d3.
     /// 2. The clip's root displacement, X, Y and Z
     ///    ([`Interpreter::root_displacement`], virtual function 0x124).
     /// 3. The direction takes the destination's (virtual function 0xd0),
@@ -1204,17 +1215,28 @@ impl Interpreter<'_> {
             .to_f32();
         let part = (share.ext() - share.ext().floor()).single();
         let sector = (part * EIGHT.ext()).single().floor().to_i32_truncate();
+        // 0x58f363: a sector past 7 (a share just below a whole number,
+        // whose fraction rounds to 1) is clip -1.
         let selection = usize::try_from(sector)
             .ok()
             .and_then(|s| SIDESTEPS.get(s))
-            .copied()
-            .ok_or_else(|| {
-                unsupported(
-                    "0x58f369",
-                    &format!("steps sideways in sector {sector}, with clip -1"),
-                )
-            })?;
-        let [x, y, _] = self.root_displacement(world, id, a, selection)?;
+            .copied();
+        let [x, y, _] = match selection {
+            Some(selection) => self.root_displacement(world, id, a, selection)?,
+            None => {
+                // 0x588efb's lookup (virtual function 0xf4) reads the
+                // appearance if stale; clip -1 has no name (0x59db62,
+                // string 0 at 0x4704fa), so no clip, and no displacement.
+                read_appearance_if_stale(
+                    self.catalog,
+                    world,
+                    self.program,
+                    id,
+                    &mut a.profile_stale,
+                )?;
+                [F32::ZERO; 3]
+            }
+        };
         let [x, y] = [x.ext(), y.ext()];
         a.position[2] = a.destination[2];
         set_datum(world, id, DIRECTION, direction_word(a.position[2]))?;
@@ -1241,7 +1263,21 @@ impl Interpreter<'_> {
         if !at_least(weight, least) {
             weight = least;
         }
-        self.start_clip(world, id, a, selection, now, STOP)?;
+        match selection {
+            Some(selection) => self.start_clip(world, id, a, selection, now, STOP)?,
+            // 0x5926d7 with clip -1: unless the foreground already plays
+            // it, the clip number becomes -1 and the null clip starts
+            // nothing (0x592733), so the foreground already playing goes
+            // on, its end mode now the stop's.
+            None => {
+                if a.foreground.is_none() || a.selection != -1 {
+                    a.selection = -1;
+                    if let Some(layer) = a.foreground.as_mut() {
+                        layer.mode = STOP;
+                    }
+                }
+            }
+        }
         let rate = a.rate;
         let layer = a.foreground.as_mut().ok_or_else(|| {
             unsupported(
@@ -1380,8 +1416,9 @@ impl Interpreter<'_> {
     /// reads the person's appearance again if the animator says so) and,
     /// if it has a name, starts in the foreground slot backward (virtual
     /// function 0x100 with 1: speed -1 from phase 1, end mode 0;
-    /// [`start_foreground`]). Without a name nothing starts and the slot
-    /// keeps what it holds.
+    /// [`start_foreground`]). Without a name, or with one no animation file
+    /// defines (a null clip, 0x58f036), nothing starts and the slot keeps
+    /// what it holds.
     ///
     /// Either way the state's code runs again (0x58f089).
     ///
@@ -1396,7 +1433,8 @@ impl Interpreter<'_> {
     /// follows the walk's step (`walking` is then passed as true).
     ///
     /// Fails for what is not ported: a person of kind above 1 stopping at
-    /// the end of its path (see above), and a clip name no file holds.
+    /// the end of its path (see above), and a clip name whose lookup is
+    /// ambiguous ([`Interpreter::clip_if_defined`]).
     fn stop_special(
         &self,
         world: &mut World,
@@ -1422,8 +1460,11 @@ impl Interpreter<'_> {
         a.motion.progress = ONE;
         a.selection = STOP_WALK as i32;
         read_appearance_if_stale(self.catalog, world, self.program, id, &mut a.profile_stale)?;
-        if let Some(name) = self.posture_clip(world, id, STOP_WALK)? {
-            let clip = self.clip(&name)?;
+        // 0x58f036: no clip (no name, or a name no file defines) starts
+        // nothing, and the foreground already playing goes on.
+        if let Some(name) = self.posture_clip(world, id, STOP_WALK)?
+            && let Some(clip) = self.clip_if_defined(&name)?
+        {
             start_foreground(a, &name, clip, true, now);
         }
         Ok(Next::Again)
@@ -2570,6 +2611,26 @@ impl Interpreter<'_> {
             .animations
             .clip(name)
             .map_err(|e| unsupported("0x59dc32", &format!("finds no clip {name:?}: {e}")))
+    }
+
+    /// [`Self::clip`], with `None` for a name no animation file defines,
+    /// in any case: the original's lookup (0x59dc32) then gives a null
+    /// clip. Any other failure (names differing only in case, differing
+    /// definitions, missing samples) still fails, as which clip the
+    /// original would find there is not known.
+    fn clip_if_defined(&self, name: &str) -> Result<Option<&sims_content::Clip>, Trap> {
+        match self.program.animations.clip(name) {
+            Ok(clip) => Ok(Some(clip)),
+            Err(sims_content::Error::Unsupported(message))
+                if message == format!("no animation file defines the clip {name:?}") =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(unsupported(
+                "0x59dc32",
+                &format!("finds no clip {name:?}: {e}"),
+            )),
+        }
     }
 
     /// The start of a route (0x589c85), from Go To Routing Slot: the

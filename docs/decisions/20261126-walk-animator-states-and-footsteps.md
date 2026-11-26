@@ -7,7 +7,8 @@
   `clip_events.rs`, `sounds.rs`, `interpreter.rs` (`floor_categories`), `lifecycle.rs`
   (`LotPrices` floor categories), `placement.rs` (read-only `container`); tests
   `tests/interpreter/walk_states.rs`, `tests/interpreter/clip_sounds.rs`, `animate.rs`,
-  `tests/integration/boot.rs`. No change to `sims-sim`, `sims-audio` or `sims-game`.
+  `tests/integration/boot.rs`; `sims-game/src/sound.rs` (the emitter's sign). No change to
+  `sims-sim` or `sims-audio`.
 - **Track:** Track B (walk animator states, footstep and clip sounds)
 
 All addresses below are from the original executable, read from the memory image
@@ -19,8 +20,10 @@ The state jump table at 0x58faa2 has 13 entries. States 5, 7, 8 and 12 are now p
 state above 12 (an unsigned compare, so negative states too) goes to the tick's tail
 (0x58dd73), as before.
 
-- **State 3, stand (0x58ddbf to 0x58e043).** This now decides between a turn, a snap and a
-  sidestep. The direction is wrapped first. Then:
+- **State 3, stand (0x58ddbf to 0x58e043).** A coordinate equal to -999 places the animator
+  (0x58dd8f, `sahf; je`). An unordered compare sets ZF, so a NaN coordinate counts as unset
+  too; the placing (0x592160, `jb`) then leaves it, and the tick ends. Otherwise state 3 now
+  decides between a turn, a snap and a sidestep. The direction is wrapped first. Then:
   - Distance: `sqrt(dy² + dx²)` at single precision. It is 0 when both offsets are within
     epsilon.
   - Turn: `d` is wrapped into [-4, 4). A NaN `d` traps at 0x58e039.
@@ -42,8 +45,14 @@ state above 12 (an unsigned compare, so negative states too) goes to the tick's 
     - `distance / |root|` below 1;
     - otherwise 1;
     - and at least 0.5.
-  - **Errors:** a ROOT motion that is not the clip's first traps at 0x596b60. A sector out
-    of range traps at 0x58f369.
+  - **Sector 8.** A share just below a whole number has a fraction that rounds to 1, so
+    sector 8, which is clip -1 (0x58f363). Clip -1 has no name (string 0 is null at
+    0x4704fa), so there is no displacement and nothing starts (0x592733). The foreground
+    already playing goes on, with the stop's end mode, the speed and the weight. With no
+    foreground the update traps at 0x58f4d3, where the original reads through a null pointer.
+  - **Errors:** a ROOT motion that is not the clip's first traps at 0x596b60. The original
+    reads that motion's own frame count (+0x14, 0x588f51), and `sims_content::Clip` keeps
+    only the first motion's.
 - **State 5, sidestep under way (0x58e084).**
   - It eases the position as a turn does.
   - At phase 1 it stands at the turn's end, with no priority raise.
@@ -59,7 +68,9 @@ state above 12 (an unsigned compare, so negative states too) goes to the tick's 
 - **The special stop (0x58ef8e).** It is entered from the end of the path (0x58e83b), the
   timed stop (`slow_down`), and a stop asked for under way (0x58ef2f).
   - Not walking: the person stands at once, arrival by +0x288.
-  - Walking: state 7, with the stop clip (selection 0x13) reversed.
+  - Walking: state 7, with the stop clip (selection 0x13) reversed. A name no animation file
+    defines is a null clip (0x58f036): nothing starts and the foreground goes on. A lookup that
+    is ambiguous (names differing only in case) still traps.
   - **The walking flag:** the original tests +0x290, which is not kept. Adding a hashed
     field would move every pin. Entries (a) and (b) use `walking` and trap at 0x58ef8e for
     a kind above 1, the one case where the two can differ. At entry (c), +0x290 is always 1
@@ -115,11 +126,17 @@ noted.
      is set.
   6. **Direction:** the event's layer speed must agree with the step's sign. A speed of at
      least 0 needs a step of 1 or 2. A speed below 0, or NaN, needs -1 or -2.
-- In a person's animator refresh at its take-off (0x58da12), a sound key still fails, as
-  before.
+- In a person's animator refresh at its take-off (0x58da12), a sound key plays nothing. The
+  refresh is made only if the house view drew the person, which is not kept, and a sound
+  writes nothing the lot reads, so both branches of the refresh stay alike. Whether the
+  original plays it there is unverified.
 
-Playback needs nothing new. The game already forwards `Update::sounds` to its sound thread,
-and `sims_audio::Player::play` resolves any event name against the loaded modules.
+Playback already worked: the game forwards `Update::sounds` to its sound thread, and
+`sims_audio::Player::play` resolves any event name against the loaded modules. One fix was
+needed: `sims_game::sound::event` now widens the 16-bit object with its sign, as the
+original's play does (0x57a60e, `movsx`). So -4 reaches the player as -4, which places it at
+the screen's centre at full volume, instead of as 65532, an unknown object that would keep
+the previous placement.
 
 ## Decision 3: floor categories, the base game's file only
 
@@ -134,8 +151,10 @@ comes from the first byte of the label of the pattern's `SPR2` (0x49fd95): 'C' 3
 - A footstep on a plug-in pattern has no category here and plays nothing. Silence is the
   honest answer; a guessed sound would not be.
 - Every interpreter a booted `Lot` makes carries the table (`floor_categories`, or through
-  `architecture_prices`), so a refresh outside the tick (selecting a Sim) hears the same
-  floors. `Interpreter::floor_categories` also overrides the table for tests.
+  `architecture_prices`, as co-op's do), so a refresh outside the tick (selecting a Sim)
+  hears the same floors. A `Machine` passes its table on to the nested interpreters its
+  services make (the Global 3 selection among them). `Interpreter::floor_categories` also
+  overrides the table for tests.
 
 ## Decision 4: sounds never touch the simulation
 
@@ -156,9 +175,10 @@ comes from the first byte of the label of the pattern's `SPR2` (0x49fd95): 'C' 3
 
 ## Evidence
 
-- **`tests/interpreter/walk_states.rs` (15 tests):** the snap; the sidestep with root motion
-  (destination, weight, priority, end); all 8 sectors and the boundary; the weight cases; a
-  ROOT not first (0x596b60); a far turn; the pet bounds (kinds 2 and 3) against kinds 0 and
+- **`tests/interpreter/walk_states.rs` (18 tests):** the snap; the sidestep with root motion
+  (destination, weight, priority, end); all 8 sectors and the boundary; sector 8 (clip -1,
+  with and without a foreground); the weight cases; a ROOT not first (0x596b60); a NaN
+  coordinate in state 3; a stop clip no file defines; a far turn; the pet bounds (kinds 2 and 3) against kinds 0 and
   1; states 8, 12, 13, -1 and 100; the backward stop with its reason mapping; the
   special-stop entries (a), (b) and (c).
 - **`tests/interpreter/clip_sounds.rs` (9 tests):**
@@ -179,6 +199,14 @@ comes from the first byte of the label of the pattern's `SPR2` (0x49fd95): 'C' 3
   NEWBIE_*, OLD_TOWN_69*, IMPORTED_69*, and the tick fuzzer.
 
 ## Follow-ups
+
+- **Co-op sounds:** every co-op command (pick, mode, the host's selection) runs on its own
+  sound buffer and drops it, as before this track. A selection's footsteps there are not
+  heard. The co-op step needs an output for them.
+- **Travel and household moves:** arrival, home reconciliation and eviction run interpreters
+  with no sound sink and no floor table, so a refresh there plays nothing.
+- **sims-content, per-motion frame counts:** these would lift the 0x596b60 trap for a ROOT
+  motion that is not a clip's first.
 
 - **sims-content:** keep each floor pattern's category (and colour, +0x2c) in
   `SurfaceCatalog`, so plug-in floors' footsteps play.
