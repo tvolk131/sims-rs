@@ -265,21 +265,22 @@ pub struct People {
 /// global stream (`0x46f457`), which the simulation also draws from. The
 /// presentation must never change the world, so the mosaic draws from a
 /// copy of the world's global stream instead: taken again after every
-/// tick (or whenever the stream or the tick count otherwise changes), and
+/// tick (or whenever the stream, the tick count or the restore generation
+/// changes, so a restored save draws as it did when saved), and
 /// advanced only by the mosaic in between. So the first frame after a
 /// tick draws as the original's first censored frame after it does, and
 /// frames while paused keep drawing on. The original's draws would also
 /// move the simulation's later draws; this copy's do not.
 #[derive(Debug, Default, Clone, Copy)]
 struct CensorRandom {
-    /// The world's tick count and stream state the copy was taken from,
-    /// and the copy.
-    copy: Option<((u32, u32), sims_core::rng::GameRng)>,
+    /// The restore generation, the world's tick count and stream state the
+    /// copy was taken from, and the copy.
+    copy: Option<((u64, u32, u32), sims_core::rng::GameRng)>,
 }
 
 impl CensorRandom {
-    fn follow(&mut self, world: &World) -> &mut sims_core::rng::GameRng {
-        let at = (world.ticks, world.global_rng.state());
+    fn follow(&mut self, world: &World, generation: u64) -> &mut sims_core::rng::GameRng {
+        let at = (generation, world.ticks, world.global_rng.state());
         let (seen, copy) = self.copy.get_or_insert((at, world.global_rng));
         if *seen != at {
             *seen = at;
@@ -454,8 +455,9 @@ impl People {
     /// Draws the censor mosaic over the people the last draw drew whose
     /// censor word is set (`sims_render::draw_censor`), into `canvas`,
     /// which holds the lot `lot` and those people drawn with `camera`;
-    /// `lot_depth` is the lot's depth from before the people. Pushes the
-    /// rectangles it changed onto `rects`.
+    /// `lot_depth` is the lot's depth from before the people, with what
+    /// their held objects wrote; `restore_generation` is the game's
+    /// ([`CensorRandom`]). Pushes the rectangles it changed onto `rects`.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_censor(
         &mut self,
@@ -464,6 +466,7 @@ impl People {
         camera: &Camera,
         viewport: (u32, u32),
         lot_depth: &[u16],
+        restore_generation: u64,
         canvas: &mut Canvas,
         rects: &mut Vec<sims_render::canvas::Rect>,
     ) {
@@ -471,7 +474,7 @@ impl People {
         if censored.is_empty() {
             return;
         }
-        let random = self.censor_random.follow(world);
+        let random = self.censor_random.follow(world, restore_generation);
         sims_render::draw_censor(
             lot,
             camera,

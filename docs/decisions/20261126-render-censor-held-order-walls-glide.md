@@ -39,10 +39,12 @@ people and the objects that hold someone, as `0x4b3510` does (`0x4b017b`,
   when its depth is greater (farther) than `Depth::stand` of that anchor at
   the row.
 - **Which depth.** The test reads the lot's depth from before the people,
-  not the canvas's. The original draws a person's mesh through Direct3D.
-  We assume (unverified) that this does not write the software depth
-  buffer `0x4ac301` reads. If it did, a person's front would hide their own
-  mosaic, which the original does not show. As in the original, the row asked about is the clipped top plus
+  plus the depth the Sims' held objects wrote, not the canvas's. The
+  original draws a person's mesh through Direct3D, and held objects as
+  sprites. We assume (unverified) that the mesh does not write the software
+  depth buffer `0x4ac301` reads. If it did, a person's front would hide
+  their own mosaic, which the original does not show. A plate held in
+  front of a censored Sim keeps its pixels out of the mosaic. As in the original, the row asked about is the clipped top plus
   the row within the block, for every block row (`0x4ac4c8`, `0x4ac649`).
 - **Blocks.** Blocks are 2, 4 or 8 pixels by zoom. Pixels are read in the
   original's 5-6-5 unpacking: channels zero-filled, not widened. Each
@@ -59,8 +61,9 @@ which the simulation also uses. The presentation must never change the
 world. So `sims_game::people::People` keeps a copy of
 `World::global_rng`:
 
-- The copy is taken again after every tick (whenever `World::ticks` or the
-  stream's state changes).
+- The copy is taken again after every tick, whenever `World::ticks`, the
+  stream's state or the game's restore generation changes. A restored save
+  draws as it did when saved.
 - Between ticks, only the mosaic advances the copy, so a paused frame
   still varies.
 - The first censored frame after a tick draws as the original's would.
@@ -83,6 +86,9 @@ calls `sims_render::draw_held_by`:
 - The walk stops at people.
 - What an earlier person's draw drew is left out. Slot lists that
   disagree could otherwise draw an object twice.
+- `holds_person` also takes in each person's own slot tree. When a
+  holder's link words reach the person but its slot list does not, the
+  lot pass would otherwise draw the person's plate as well.
 - The person's items keep slot order ([Object order](#object-order)).
 
 Then `draw_held_except` draws what holds a person (a bench), minus what
@@ -143,8 +149,12 @@ Boundaries:
   then by ID, as before.
 - **Slot contents.** Each object is followed by what its slots hold, slot
   by slot, at every depth, as the holder's walk draws them (`0x437c56`).
-- **Holder outside the pass.** What such a holder holds (a person's) stays
-  together in slot order, at its first object's place.
+- **Holder outside the pass.** A holder not in the pass (hidden, or a
+  person) keeps its place in the walk: under its own holder at its slot,
+  or, held by nothing in the pass, as a root at its first object's key.
+  What it holds stays together in slot order.
+- **Loops.** Holders that hold each other, which no root reaches, are
+  broken at their lowest-keyed object, which joins the roots.
 
 The presenter's own order was tried and is **not** used. It sorts by each
 object's view tile key `(x + y, x - y)` with the original's sort (legacy
@@ -199,8 +209,8 @@ Unit tests:
 - **Walls:** corner classification, run order at rotations 0 and 2, every
   segment exactly once at each rotation, leftovers last.
 - **Ground:** the rule.
-- **Objects:** holders before what they hold, and a holder outside the
-  list keeps slot order.
+- **Objects:** holders before what they hold, a holder outside the list
+  (or hidden) keeps slot order, and loops join the roots.
 - **`held_by`:** on the bench, person and drink tree.
 - **Glide:** the glide's samples and its equal steps.
 - **Zoom:** house 99's zoom floor.
