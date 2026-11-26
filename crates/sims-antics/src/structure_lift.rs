@@ -2000,13 +2000,30 @@ fn lift_structured(
         node_order,
         emitted_nodes: 0,
         max_emitted_nodes: 245, // Stay safely under MAX_BHAV_NODES (251)
+        over_budget: false,
+        joins: false,
+        join_regions: Vec::new(),
     };
 
+    let header_len = emitter.out.len();
     if emitter
         .emit_region(0, None, None, &mut BTreeSet::new(), 1, false)
         .is_err()
     {
-        return StructuredLiftOutcome::Unstructured;
+        // A body that copies its shared tails past the budget is emitted again with each
+        // shared tail written once, after a `while true { }` the branches `break` out of.
+        if !emitter.over_budget {
+            return StructuredLiftOutcome::Unstructured;
+        }
+        emitter.out.truncate(header_len);
+        emitter.emitted_nodes = 0;
+        emitter.joins = true;
+        if emitter
+            .emit_region(0, None, None, &mut BTreeSet::new(), 1, false)
+            .is_err()
+        {
+            return StructuredLiftOutcome::Unstructured;
+        }
     }
 
     emitter.out.push_str("}\n");
@@ -2263,6 +2280,13 @@ struct StructEmitter<'a> {
     node_order: bool,
     emitted_nodes: usize,
     max_emitted_nodes: usize,
+    /// Whether the last pass stopped at `max_emitted_nodes`.
+    over_budget: bool,
+    /// Whether an `if`/`else` whose branches meet again before a `return` is wrapped in a
+    /// `while true { }` that `break`s to the node they share ([`Self::shared_join`]).
+    joins: bool,
+    /// The nodes of each `while true { }` join being emitted, innermost last.
+    join_regions: Vec<BTreeSet<usize>>,
 }
 
 impl StructEmitter<'_> {
@@ -2339,6 +2363,70 @@ impl StructEmitter<'_> {
             .into_iter()
             .max_by(|(v1, c1), (v2, c2)| c1.cmp(c2).then_with(|| v2.cmp(v1)))
             .map(|(v, _)| v as u8)
+    }
+
+    /// The node to join the two branches of `cur` at, and the nodes before it, when both
+    /// branches reach it and every other way out of them is a `return`.
+    ///
+    /// Of the nodes both branches reach, the one with the most nodes after it (outside the
+    /// branches) wins, the lowest on a tie. A branch that reaches `stop_at`, an active node,
+    /// `cur` again or the enclosing loop's header or exit other than through the join has no
+    /// join: inside the `while true { }`, `break` and `continue` would name the wrong loop.
+    fn shared_join(
+        &self,
+        cur: u8,
+        on_true: u8,
+        on_false: u8,
+        stop_at: Option<u8>,
+        loop_ctx: Option<LoopCtx>,
+        active: &BTreeSet<u8>,
+    ) -> Option<(u8, BTreeSet<usize>)> {
+        let barrier = |v: usize| {
+            let v = v as u8;
+            v == cur
+                || Some(v) == stop_at
+                || active.contains(&v)
+                || loop_ctx.is_some_and(|c| c.header == v || c.exit == Some(v))
+        };
+        // The nodes reached from `start`, not past `avoid`, and whether a barrier was met.
+        let reach = |start: u8, avoid: Option<usize>| {
+            let mut seen = BTreeSet::new();
+            let mut hit = false;
+            let mut work = Vec::new();
+            if !matches!(start, TARGET_ERROR..=TARGET_FALSE) {
+                work.push(usize::from(start));
+            }
+            while let Some(v) = work.pop() {
+                if Some(v) == avoid {
+                    continue;
+                }
+                if barrier(v) {
+                    hit = true;
+                    continue;
+                }
+                if seen.insert(v) {
+                    work.extend(self.succs[v].iter().copied());
+                }
+            }
+            (seen, hit)
+        };
+        let (a, _) = reach(on_true, None);
+        let (b, _) = reach(on_false, None);
+        let mut best: Option<(usize, usize, BTreeSet<usize>)> = None;
+        for &join in a.intersection(&b) {
+            let (ra, hit_a) = reach(on_true, Some(join));
+            let (rb, hit_b) = reach(on_false, Some(join));
+            if hit_a || hit_b {
+                continue;
+            }
+            let mut region: BTreeSet<usize> = ra.union(&rb).copied().collect();
+            region.insert(usize::from(cur));
+            let tail = reach(join as u8, None).0.difference(&region).count();
+            if best.as_ref().is_none_or(|(t, _, _)| tail > *t) {
+                best = Some((tail, join, region));
+            }
+        }
+        best.map(|(_, join, region)| (join as u8, region))
     }
 
     fn emit_region(
@@ -2418,6 +2506,7 @@ impl StructEmitter<'_> {
                         if !defer_to_loop {
                             self.emitted_nodes += 1;
                             if self.emitted_nodes > self.max_emitted_nodes {
+                                self.over_budget = true;
                                 return Err(());
                             }
                             self.indent(depth);
@@ -2475,6 +2564,7 @@ impl StructEmitter<'_> {
 
             self.emitted_nodes += 1;
             if self.emitted_nodes > self.max_emitted_nodes {
+                self.over_budget = true;
                 return Err(());
             }
 
@@ -2535,6 +2625,11 @@ impl StructEmitter<'_> {
                             Some(m) != stop_at
                                 && !active.contains(&m)
                                 && loop_ctx.is_none_or(|c| m != c.header && c.exit != Some(m))
+                                // Inside a join, a merge past the join is reached by `break`.
+                                && self
+                                    .join_regions
+                                    .last()
+                                    .is_none_or(|r| r.contains(&usize::from(m)))
                         });
                     let branch_stop = merge.or(stop_at);
 
@@ -2571,6 +2666,42 @@ impl StructEmitter<'_> {
                             cur = *on_true;
                             continue;
                         }
+                    }
+
+                    // Both branches reach a node again before they return: write that node and
+                    // what follows it once, after a `while true { }` they `break` out of.
+                    if self.joins
+                        && merge.is_none()
+                        && !true_is_skip
+                        && !false_is_skip
+                        && !(is_entering && loop_ctx.is_some_and(|c| c.header == cur))
+                        && let Some((join, region)) =
+                            self.shared_join(cur, *on_true, *on_false, stop_at, loop_ctx, active)
+                    {
+                        // The pass inside counts `cur` again.
+                        self.emitted_nodes -= 1;
+                        self.indent(depth);
+                        self.out.push_str("while true {\n");
+                        self.join_regions.push(region);
+                        active.insert(cur);
+                        let res = self.emit_region(
+                            cur,
+                            None,
+                            Some(LoopCtx {
+                                header: cur,
+                                exit: Some(join),
+                            }),
+                            active,
+                            depth + 1,
+                            true,
+                        );
+                        active.remove(&cur);
+                        self.join_regions.pop();
+                        res?;
+                        self.indent(depth);
+                        self.out.push_str("}\n");
+                        cur = join;
+                        continue;
                     }
 
                     active.insert(cur);

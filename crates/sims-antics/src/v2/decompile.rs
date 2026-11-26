@@ -732,6 +732,10 @@ const POLISH_DISCARD_BUILDS: usize = 8;
 /// write by name with the same bytes.
 const POLISH_CELL_BUILDS: usize = 8;
 
+/// The most builds [`Model::polish`] may take to find the `raw { }` blocks it can write as
+/// v2 builtins with the same bytes ([`raw_builtin_spellings`]).
+const POLISH_RAW_BUILDS: usize = 24;
+
 /// How many diagnostics of each rule, line and message a text lints with.
 type LintCounts = BTreeMap<(&'static str, usize, String), usize>;
 
@@ -1271,6 +1275,169 @@ fn matching_braces(tokens: &[crate::v2::lexer::Token]) -> Option<BTreeMap<usize,
         }
     }
     open.is_empty().then_some(out)
+}
+
+/// Every `raw { }` block whose statements v2 all spells as builtins (what lint
+/// `manual_raw_has_builtin` asks for), as those statements, one rewrite per block:
+/// - `scope(27, N) := v` and `temp[K] := scope(27, N)`, for `N` and `K` in `0..=7` and `v`
+///   a number or `temp[K]`: the stack object's sprite flag `temp[N]`, as
+///   `stack_obj.sprite_flags[temp[N]]`;
+/// - `remove_object(T)` / `remove_object(T, flags: F)` with `T` the frame's object (`0`,
+///   `me`, `self`) or the stack object (`1`, `stack_obj`), as `me.remove(..)` or
+///   `stack_obj.remove(..)`, with `no_yield: true` / `skip_resets: true` for flags 1 and 2
+///   (`flags: F` for any other bit);
+/// - `clear_motive_changes()` with an optional `pad(I: 0xNN, ..)`, as
+///   `clear_motive_changes(padI: 0xNN, ..)`.
+///
+/// The lifter writes these itself only in trees that keep the wave 2 and 3 idioms; the
+/// caller keeps a rewrite only if the file builds the same bytes.
+fn raw_builtin_spellings(text: &str) -> Vec<Rewrite> {
+    use crate::v2::lexer::{TokenKind as K, tokenize};
+    let Ok(tokens) = tokenize(text) else {
+        return Vec::new();
+    };
+    let offsets = TokenOffsets::new(text);
+    let mut out = Vec::new();
+    for t in &tokens {
+        let K::RawBlock(body) = &t.kind else {
+            continue;
+        };
+        let Some(start) = offsets.of(t) else {
+            continue;
+        };
+        let Some(brace) = text[start..].find('{').map(|b| start + b) else {
+            continue;
+        };
+        let end = brace + 1 + body.len() + 1;
+        if text.get(brace + 1..end - 1) != Some(body.as_str())
+            || text.get(end - 1..end) != Some("}")
+            || !text[start..brace].trim_end().ends_with("raw")
+        {
+            continue;
+        }
+        let Some(stmts) = raw_builtin_body(body) else {
+            continue;
+        };
+        let line_start = text[..start].rfind('\n').map_or(0, |n| n + 1);
+        let indent = &text[line_start..start];
+        if !indent.chars().all(|c| c == ' ') {
+            continue;
+        }
+        out.push(Rewrite {
+            range: start..end,
+            text: stmts.join(&format!("\n{indent}")),
+        });
+    }
+    out
+}
+
+/// The v2 statements of a `raw { }` body that holds only what [`raw_builtin_spellings`]
+/// spells, or `None`.
+fn raw_builtin_body(body: &str) -> Option<Vec<String>> {
+    if body.contains(['#', '"', '{', '}', '@']) || body.contains("//") || body.contains("->") {
+        return None;
+    }
+    let number = |v: &str| {
+        let v = v.trim();
+        let digits = v.strip_prefix('-').unwrap_or(v);
+        let ok = match digits.strip_prefix("0x") {
+            Some(hex) => !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()),
+            None => !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()),
+        };
+        ok.then(|| v.to_owned())
+    };
+    let small = |v: &str| v.trim().parse::<u8>().ok().filter(|n| *n <= 7);
+    let temp = |v: &str| {
+        let i = v
+            .trim()
+            .strip_prefix("temp")?
+            .trim_start()
+            .strip_prefix('[')?;
+        small(i.strip_suffix(']')?)
+    };
+    let sprite = |v: &str| {
+        let inner = v
+            .trim()
+            .strip_prefix("scope")?
+            .trim_start()
+            .strip_prefix('(')?;
+        let (scope, n) = inner.strip_suffix(')')?.split_once(',')?;
+        (scope.trim() == "27").then_some(())?;
+        small(n)
+    };
+    let mut out = Vec::new();
+    for stmt in body.split(';') {
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        let spelled = if let Some((dst, src)) = stmt.split_once(":=") {
+            if let Some(n) = sprite(dst) {
+                let value = match temp(src) {
+                    Some(k) => format!("temp[{k}]"),
+                    None => number(src)?,
+                };
+                format!("stack_obj.sprite_flags[temp[{n}]] = {value};")
+            } else {
+                let k = temp(dst)?;
+                let n = sprite(src)?;
+                format!("temp[{k}] = stack_obj.sprite_flags[temp[{n}]];")
+            }
+        } else if let Some(rest) = stmt.strip_prefix("remove_object") {
+            let inner = rest.trim().strip_prefix('(')?.strip_suffix(')')?;
+            let mut args = inner.split(',').map(str::trim);
+            let target = match args.next()? {
+                "0" | "me" | "self" => "me",
+                "1" | "stack_obj" => "stack_obj",
+                _ => return None,
+            };
+            let mut flags = 0u8;
+            for a in args {
+                let (k, v) = a.split_once(':')?;
+                match (k.trim(), v.trim()) {
+                    ("flags", v) => flags |= v.parse::<u8>().ok()?,
+                    ("no_yield", "true") => flags |= 1,
+                    ("skip_resets", "true") => flags |= 2,
+                    ("no_yield" | "skip_resets", "false") => {}
+                    _ => return None,
+                }
+            }
+            // The method form, as lint `prefer_method_syntax` asks; the two known flag bits
+            // by name.
+            let mut opts = Vec::new();
+            if flags & !3 != 0 {
+                opts.push(format!("flags: {flags}"));
+            } else {
+                if flags & 1 != 0 {
+                    opts.push("no_yield: true".to_owned());
+                }
+                if flags & 2 != 0 {
+                    opts.push("skip_resets: true".to_owned());
+                }
+            }
+            format!("{target}.remove({});", opts.join(", "))
+        } else if let Some(rest) = stmt.strip_prefix("clear_motive_changes") {
+            let rest = rest.trim().strip_prefix("()")?.trim();
+            let mut pads = Vec::new();
+            if !rest.is_empty() {
+                let bytes = rest
+                    .strip_prefix("pad")?
+                    .trim_start()
+                    .strip_prefix('(')?
+                    .strip_suffix(')')?;
+                for b in bytes.split(',') {
+                    let (i, v) = b.split_once(':')?;
+                    let i = i.trim().parse::<u8>().ok()?;
+                    pads.push(format!("pad{i}: {}", number(v)?));
+                }
+            }
+            format!("clear_motive_changes({});", pads.join(", "))
+        } else {
+            return None;
+        };
+        out.push(spelled);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// The `std::globals` trees declared `#[ret(temp = 0)] .. -> Option<T>`, by name, and the
@@ -3063,6 +3230,14 @@ impl Model {
             let ok = |g: &[Vec<Rewrite>]| same(&apply_groups(&base, g));
             let kept = keep_joint(&groups, &ok, POLISH_CELL_BUILDS);
             text = apply_groups(&text, &kept);
+        }
+        // `raw { }` blocks of builtins only, as the builtins.
+        let raws = raw_builtin_spellings(&text);
+        if !raws.is_empty() {
+            let base = text.clone();
+            let ok = |r: &[Rewrite]| same(&apply_rewrites(&base, r));
+            let kept = keep_joint(&raws, &ok, POLISH_RAW_BUILDS);
+            text = apply_rewrites(&text, &kept);
         }
         // `if let Some(v) = globals::f()` and `let Some(v) = globals::f() else { .. };`, one
         // statement at a time.

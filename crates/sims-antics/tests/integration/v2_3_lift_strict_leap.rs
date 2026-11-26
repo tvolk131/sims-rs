@@ -285,11 +285,11 @@ fn lifecycle_blocks_name_their_locals() {
 }
 
 #[test]
-fn a_body_past_the_node_limit_stays_labeled() {
-    // Six arms, each ending in the same 45-store tail: a structured body copies the tail
-    // into each arm, past what a tree may hold. The structurer stops at 245 nodes, so the
-    // tree is written as its labeled nodes, as before. Structuring it anyway and building it
-    // with `share_tails` was measured and not adopted (see the ADR).
+fn a_body_past_the_node_limit_joins_its_tails() {
+    // Six arms, each ending in the same 45-store tail: a structured body that copies the
+    // tail into each arm goes past what a tree may hold. The structurer writes the arms in a
+    // loop they `break` out of, and the tail once after it, so the tree lifts in both modes
+    // with no pin.
     let tail: String = (0..45).map(|_| "self.n += 1; ").collect();
     let arms: String = (1..=6)
         .map(|k| format!("if x == {k} {{ self.m = {k}; {tail} return true; }} "))
@@ -303,8 +303,12 @@ fn a_body_past_the_node_limit_stays_labeled() {
     let source = object(0x7E00_01A8, ", share_tails", &body);
     for behavioral in [false, true] {
         let (lifted, trees) = lift(&source, behavioral);
-        assert_eq!(tree(&trees, 4300).style, TreeStyle::RawLabeled, "{lifted}");
-        lacks(&lifted, &["share_tails"]);
+        assert_eq!(tree(&trees, 4300).style, TreeStyle::Idiomatic, "{lifted}");
+        assert_eq!(tree(&trees, 4300).raw_statements, 0, "{lifted}");
+        assert_eq!(lifted.matches("self.attr_0 += 1;").count(), 45, "{lifted}");
+        assert_eq!(lifted.matches("break;").count(), 6, "{lifted}");
+        has(&lifted, &["loop {"]);
+        lacks(&lifted, &["share_tails", "node_order"]);
     }
 }
 
