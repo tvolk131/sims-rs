@@ -79,7 +79,7 @@ fn typed_constants_bring_their_imports_and_method_forms_replace_target_arguments
             &lifted,
             &[
                 "use std::engine::RefreshMode;\nuse std::flags::ObjectFlags;\n\nobject",
-                "self.flags flag_set ObjectFlags::InUse;",
+                "self.flags.set(ObjectFlags::InUse);",
                 "stack_obj.play_sound(fable_chime);",
                 "stack_obj.refresh(RefreshMode::RecountRoom);",
             ],
@@ -211,19 +211,23 @@ fn parameter_slots_of_reach_make_new_character_and_drop_onto_lift() {
         make_new_character(skin: skin, age: age, sex: sex, species: 1);
     }
 }"#;
-    for lifted in lift_both(source) {
+    for (lifted, p) in lift_both(source)
+        .iter()
+        .zip([["param[0]", "param[1]"], ["p0", "p1"]])
+    {
+        // Behavioral mode names the arguments the tree only reads.
         has(
-            &lifted,
+            lifted,
             &[
-                "drop_onto(src: 0, dst: param[1]);",
-                "drop_onto(src: param[0], dst: 3);",
-                "reach(mode: 1, moves: true, slot: param[1]);",
+                &format!("drop_onto(src: 0, dst: {});", p[1]),
+                &format!("drop_onto(src: {}, dst: 3);", p[0]),
+                &format!("reach(mode: 1, moves: true, slot: {});", p[1]),
                 "reach(mode: 0, moves: false);",
                 "make_new_character(skin: slot_",
                 ", species: 1)",
             ],
         );
-        lacks(&lifted, &["raw {"]);
+        lacks(lifted, &["raw {"]);
     }
 }
 
@@ -300,15 +304,15 @@ fn slot_parameter_0_lifts_inside_an_animation_handler() {
         }
     }
 }"#;
-    for lifted in lift_both(source) {
+    for (lifted, p) in lift_both(source).iter().zip(["param[0]", "p0"]) {
         has(
-            &lifted,
+            lifted,
             &[
-                "reach(mode: 1, moves: true, slot: param[0]);",
-                "drop_onto(src: param[0], dst: 3);",
+                &format!("reach(mode: 1, moves: true, slot: {p});"),
+                &format!("drop_onto(src: {p}, dst: 3);"),
             ],
         );
-        lacks(&lifted, &["raw {"]);
+        lacks(lifted, &["raw {"]);
     }
 }
 
