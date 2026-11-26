@@ -203,7 +203,7 @@ Invariants, both modes:
 - the 5 style rules stay at 0;
 - `collapsible_if_chain` stays at 2 and `stale_lint_allow` at 1 in behavioral mode.
 
-Sweep time is 112 s behavioral (was 122 s) and 136 s strict (was 119 s).
+Sweeps take 104 to 136 s per mode across runs, against 119 to 122 s before. They vary with machine load, and the change adds no measurable time.
 
 ## Consequences
 
