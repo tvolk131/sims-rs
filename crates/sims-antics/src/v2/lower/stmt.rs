@@ -35,74 +35,17 @@ impl<'a> TreeLowerer<'a> {
             V2Stmt::Let {
                 span,
                 name,
+                ty: None,
+                init,
+                slot: None,
+            } if name == "_" => self.lower_discard_let(*span, init),
+            V2Stmt::Let {
+                span,
+                name,
                 ty,
                 init,
                 slot,
-            } => {
-                let air_name = self.local_air_name(name, *slot, *span)?;
-                let inferred_ty = if let V2Expr::Match {
-                    span: mspan,
-                    scrutinee,
-                    arms,
-                } = init
-                {
-                    // The arms write the binding directly (`let x;` emits no node).
-                    self.line(format!("let {air_name};"));
-                    self.lower_match_expr(*mspan, scrutinee, arms, Some(&air_name), true)?
-                        .1
-                } else if let V2Expr::If {
-                    span: ispan,
-                    cond,
-                    then_value,
-                    else_value,
-                } = init
-                {
-                    // The branches write the binding directly.
-                    self.line(format!("let {air_name};"));
-                    self.lower_if_expr(*ispan, cond, then_value, else_value, Some(&air_name), true)?
-                        .1
-                } else if let Some(ty) = self.try_lower_inline_into(init, &air_name)? {
-                    ty
-                } else if is_compound_arith_or_neg(init) {
-                    self.lower_arith_into_dest(init, &air_name, true)?
-                } else if let Some((val_air, inferred)) = self.try_lower_callable_value_raw(init)? {
-                    self.emit_let(&air_name, &val_air);
-                    inferred
-                } else {
-                    let (val_air, inferred) = self.lower_value_expr(init)?;
-                    self.emit_let(&air_name, &val_air);
-                    inferred
-                };
-                let final_ty = if let Some(ann) = ty {
-                    let expected = self.env.resolve_value_type(
-                        ann,
-                        &self.owner_module,
-                        self.in_object_scope,
-                        *span,
-                    )?;
-                    if !types_compatible_for_assign(&expected, &inferred_ty) {
-                        return Err(Error::at(
-                            *span,
-                            format!(
-                                "cannot initialize '{}' variable '{name}' from {} expression",
-                                self.env.display_value_type(&expected),
-                                self.env.display_value_type(&inferred_ty)
-                            ),
-                        ));
-                    }
-                    expected
-                } else {
-                    inferred_ty
-                };
-                self.bind_var(
-                    name.clone(),
-                    Binding::Local {
-                        air_name,
-                        ty: final_ty,
-                    },
-                );
-                Ok(())
-            }
+            } => self.lower_let(*span, name, ty.as_ref(), init, *slot),
             V2Stmt::LetSome {
                 span,
                 name,
@@ -1051,10 +994,16 @@ impl<'a> TreeLowerer<'a> {
                     }
                 }
             }
-            V2Stmt::ReturnError { span, from_try } => {
+            V2Stmt::ReturnError {
+                span,
+                from_try,
+                panic,
+            } => {
                 // A written `return error;` with `error` bound as a local/param/i16 or bool param
-                // keeps its pre-v2-interop meaning (returns that value). `cond?;` always errors.
+                // keeps its pre-v2-interop meaning (returns that value). `cond?;` and `panic!()`
+                // always error.
                 if !*from_try
+                    && !*panic
                     && (self.lookup_var("error").is_some()
                         || self.env.i16_params.contains_key("error")
                         || self.env.bool_params.contains_key("error"))
@@ -1065,9 +1014,10 @@ impl<'a> TreeLowerer<'a> {
                     });
                 }
                 if self.in_defer() {
+                    let what = if *panic { "panic!()" } else { "return error;" };
                     return Err(Error::at(
                         *span,
-                        "'return error;' cannot exit out of a 'defer' block",
+                        format!("'{what}' cannot exit out of a 'defer' block"),
                     ));
                 }
                 // Exits the whole BHAV (even from an inlined helper), so every active cleanup runs.
@@ -1357,6 +1307,227 @@ impl<'a> TreeLowerer<'a> {
     /// [`Self::emit_continue_step`]), which nothing else emits outside raw code, so every
     /// `temp[N]` write left in the body text is the body's. Raw code, which could spell either,
     /// is rejected.
+    /// `let name[: ty] = init;`
+    fn lower_let(
+        &mut self,
+        span: Span,
+        name: &str,
+        ty: Option<&V2Type>,
+        init: &V2Expr,
+        slot: Option<u8>,
+    ) -> Result<()> {
+        let air_name = self.local_air_name(name, slot, span)?;
+        let inferred_ty = if let V2Expr::Match {
+            span: mspan,
+            scrutinee,
+            arms,
+        } = init
+        {
+            // The arms write the binding directly (`let x;` emits no node).
+            self.line(format!("let {air_name};"));
+            self.lower_match_expr(*mspan, scrutinee, arms, Some(&air_name), true)?
+                .1
+        } else if let V2Expr::If {
+            span: ispan,
+            cond,
+            then_value,
+            else_value,
+        } = init
+        {
+            // The branches write the binding directly.
+            self.line(format!("let {air_name};"));
+            self.lower_if_expr(*ispan, cond, then_value, else_value, Some(&air_name), true)?
+                .1
+        } else if let Some(ty) = self.try_lower_inline_into(init, &air_name)? {
+            ty
+        } else if is_compound_arith_or_neg(init) {
+            self.lower_arith_into_dest(init, &air_name, true)?
+        } else if let Some((val_air, inferred)) = self.try_lower_callable_value_raw(init)? {
+            self.emit_let(&air_name, &val_air);
+            inferred
+        } else {
+            let (val_air, inferred) = self.lower_value_expr(init)?;
+            self.emit_let(&air_name, &val_air);
+            inferred
+        };
+        let final_ty = if let Some(ann) = ty {
+            let expected =
+                self.env
+                    .resolve_value_type(ann, &self.owner_module, self.in_object_scope, span)?;
+            if !types_compatible_for_assign(&expected, &inferred_ty) {
+                return Err(Error::at(
+                    span,
+                    format!(
+                        "cannot initialize '{}' variable '{name}' from {} expression",
+                        self.env.display_value_type(&expected),
+                        self.env.display_value_type(&inferred_ty)
+                    ),
+                ));
+            }
+            expected
+        } else {
+            inferred_ty
+        };
+        // `let _ = ..` keeps its hidden local unbound.
+        if name != "_" {
+            self.bind_var(
+                name.to_owned(),
+                Binding::Local {
+                    air_name,
+                    ty: final_ty,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// `let _ = expr;`: evaluates `expr` and binds nothing.
+    /// - `expr?` lowers exactly as the statement `expr?;` (the payload is not tested).
+    /// - A call lowers as `expr;` would dispatch it:
+    ///   - an inline helper returning bool or `Result` lowers exactly as `if expr {}` (no
+    ///     return local); any other helper lowers as the statement `expr;`. The choice comes
+    ///     from the declared return type, so nested helpers are lowered once;
+    ///   - a `#[bhav]` tree, an `extern mod` function or `run_functional` lowers exactly as
+    ///     `if expr {}` (the same nodes as its statement, which refuses an unused `Result`),
+    ///     else as `expr;`;
+    ///   - a builtin lowers exactly as its statement `expr;`, which can differ from its
+    ///     condition (the legacy `create_object` restores the stack object), else as `if expr {}`.
+    /// - Any other bool expression lowers exactly as `if expr {}`.
+    /// - A literal is checked, then dropped: it declares nothing.
+    ///
+    /// Anything left (a value call, any other value) is an unused `let y = expr;` of a hidden,
+    /// unbound local: the optimizer drops exactly what it would drop for one, so a dropped
+    /// node cannot change a read, a trap or the scratch pointer.
+    fn lower_discard_let(&mut self, span: Span, init: &V2Expr) -> Result<()> {
+        // Through `lower_stmt`, so either form is specialized as the written one would be.
+        let as_stmt = V2Stmt::Expr {
+            span,
+            expr: init.clone(),
+        };
+        let as_if = V2Stmt::If {
+            span,
+            cond: init.clone(),
+            then_body: Vec::new(),
+            else_body: Vec::new(),
+        };
+        let (callee_span, callee) = match init {
+            V2Expr::Try { .. } => return self.lower_stmt(&as_stmt),
+            V2Expr::Call { span, callee, .. } => (*span, Some(callee.as_ref())),
+            V2Expr::MethodCall { method, .. } if method == "run_functional" => (span, None),
+            V2Expr::MethodCall { .. } => return self.lower_builtin_discard(span, init),
+            // A literal has nothing to evaluate (an unused `let y = 1;` leaves no node either).
+            V2Expr::Int(..) | V2Expr::Bool(..) | V2Expr::Str(..) => {
+                return self.trial_lower(false, |t| t.lower_hidden_discard(span, init));
+            }
+            _ => {
+                if self.trial_lower(true, |t| t.lower_stmt(&as_if)).is_ok() {
+                    return Ok(());
+                }
+                return self.lower_hidden_discard(span, init);
+            }
+        };
+        if let Some(callee) = callee {
+            if let Some((module, decl, local)) = self.stmt_dispatch_helper(callee, callee_span)? {
+                return if self.helper_returns_condition(&module, &decl, local) {
+                    self.lower_stmt(&as_if)
+                } else {
+                    self.lower_stmt(&as_stmt)
+                };
+            }
+            if self.resolve_callable(callee, callee_span)?.is_none() {
+                return self.lower_builtin_discard(span, init);
+            }
+        }
+        let Err(if_err) = self.trial_lower(true, |t| t.lower_stmt(&as_if)) else {
+            return Ok(());
+        };
+        let Err(stmt_err) = self.trial_lower(true, |t| t.lower_stmt(&as_stmt)) else {
+            return Ok(());
+        };
+        // A value call (`Result<i16>`) discards into a local. The statement's error is the one
+        // to report, unless it only refuses an unused `Result` (which `if` takes): then the
+        // `if`'s error is the call's own.
+        self.trial_lower(true, |t| t.lower_hidden_discard(span, init))
+            .map_err(|_| {
+                if stmt_err.message.starts_with("unused Result from ") {
+                    if_err
+                } else {
+                    stmt_err
+                }
+            })
+    }
+
+    /// `let _ = builtin(..);`: its statement, else its condition (a predicate with no
+    /// statement form), else a hidden local; errors are the statement's.
+    fn lower_builtin_discard(&mut self, span: Span, init: &V2Expr) -> Result<()> {
+        let as_stmt = V2Stmt::Expr {
+            span,
+            expr: init.clone(),
+        };
+        let Err(stmt_err) = self.trial_lower(true, |t| t.lower_stmt(&as_stmt)) else {
+            return Ok(());
+        };
+        let as_if = V2Stmt::If {
+            span,
+            cond: init.clone(),
+            then_body: Vec::new(),
+            else_body: Vec::new(),
+        };
+        if self.trial_lower(true, |t| t.lower_stmt(&as_if)).is_ok() {
+            return Ok(());
+        }
+        self.trial_lower(true, |t| t.lower_hidden_discard(span, init))
+            .map_err(|_| stmt_err)
+    }
+
+    /// The inline helper the statement `callee(..);` runs, following `lower_expr_stmt`'s order:
+    /// `create_object` unless a user callable has that name, then `#[bhav]` trees and `extern
+    /// mod` functions, then the statement builtins, then helpers.
+    fn stmt_dispatch_helper(
+        &self,
+        callee: &V2Expr,
+        span: Span,
+    ) -> Result<Option<(String, FnDecl, bool)>> {
+        let V2Expr::Ident(_, name) = callee else {
+            return Ok(None);
+        };
+        if STMT_BUILTINS_BEFORE_HELPERS.contains(&name.as_str())
+            || self.resolve_callable(callee, span)?.is_some()
+        {
+            return Ok(None);
+        }
+        Ok(self
+            .env
+            .lookup_fn(&self.owner_module, name, self.in_object_scope))
+    }
+
+    /// The fallback of `let _ = expr;`: a `let` of a local nothing can name.
+    fn lower_hidden_discard(&mut self, span: Span, init: &V2Expr) -> Result<()> {
+        self.note_decl_named(span, "_");
+        self.lower_let(span, "_", None, init, None)
+    }
+
+    /// Runs `f` on a copy of the lowerer; keeps the copy (its emission and state) when `f`
+    /// succeeds and `commit`, else leaves `self` and the object's shared tables untouched.
+    fn trial_lower<T>(
+        &mut self,
+        commit: bool,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        // The whole emission is copied, so offsets the copy records stay valid.
+        let mut trial = self.clone();
+        let strings = self.env.dialog_strings.borrow().clone();
+        let inherit = self.env.inherit_calls.borrow().clone();
+        let out = f(&mut trial);
+        if commit && out.is_ok() {
+            *self = trial;
+        } else {
+            *self.env.dialog_strings.borrow_mut() = strings;
+            *self.env.inherit_calls.borrow_mut() = inherit;
+        }
+        out
+    }
+
     fn check_temp_counter_untouched(
         &self,
         span: Span,
@@ -1758,6 +1929,7 @@ impl<'a> TreeLowerer<'a> {
                     then_body: vec![V2Stmt::ReturnError {
                         span: *span,
                         from_try: true,
+                        panic: false,
                     }],
                     else_body: Vec::new(),
                 };
@@ -2193,3 +2365,21 @@ fn peel_as_i16(mut expr: &V2Expr) -> (&V2Expr, Option<Span>) {
     }
     (expr, at)
 }
+
+/// The builtins `lower_expr_stmt` dispatches before user helpers: a statement `name(..);`
+/// runs the builtin even when a helper has the name. Keep in step with its match.
+const STMT_BUILTINS_BEFORE_HELPERS: &[&str] = &[
+    "sleep",
+    "idle",
+    "play_sound",
+    "stop_all_sounds",
+    "debit_funds",
+    "credit_funds",
+    "destroy_self",
+    "set_graphic",
+    "route_to",
+    "snap",
+    "set_motive_change",
+    "clear_motive_changes",
+    "dialog",
+];

@@ -692,6 +692,8 @@ pub enum V2Stmt {
         /// Synthesized by `cond?;`: always the error exit, even when a binding named `error`
         /// is in scope (a written `return error;` then returns that binding instead).
         from_try: bool,
+        /// Written `panic!()`: also always the error exit, like `from_try`.
+        panic: bool,
     },
     Expr {
         span: Span,
