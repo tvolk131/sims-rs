@@ -242,8 +242,11 @@ fn no_pin_is_offered_where_it_cannot_be_written_or_tried() {
                 "{BODY}\n        raw {{\n            remove_object(0, flags: 3); // kept\n        }}"
             ),
         ),
-        // A lifecycle tree has no `#[bhav(..)]`.
-        obj("", &format!("    main {{\n{BODY}\n        {raw}\n    }}")),
+        // A lifecycle tree takes the pin since v2.6 (`v2_6_lint.rs`), once.
+        obj(
+            "",
+            &format!("    #[frame(keep_layout)] main {{\n{BODY}\n        {raw}\n    }}"),
+        ),
     ] {
         iff(&source);
         let d = one(&source, "manual_raw_has_builtin");
