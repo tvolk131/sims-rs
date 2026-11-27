@@ -99,9 +99,10 @@ pub extern mod globals {
 
     // The Sim's body and clothes.
     #[id(295)] fn flip_sim_around() -> Result;
-    // Its false exit (no container, or the way up fails) is one no caller treats as an error;
-    // it stays `-> Result` so existing declarations of it still merge.
-    #[id(382)] fn ensure_standing() -> Result;
+    // True when the Sim is on its feet: already, or after it leaves the object it is in or on
+    // (its container's get-up tree, or a walk out). False when it has no container or the way
+    // up fails, an answer callers branch on.
+    #[id(382)] fn get_up() -> bool;
     // Always true.
     #[id(406)] fn drop_held_object() -> bool;
     #[id(340)] fn change_to_everyday_clothes() -> Result;

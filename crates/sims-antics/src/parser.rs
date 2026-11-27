@@ -464,6 +464,19 @@ impl Parser {
                     "node_order" => {
                         header.node_order = Some(self.parse_u16_list("node_order entry")?);
                     }
+                    "keep_layout" => {
+                        header.keep_layout = match &self.peek().kind {
+                            TokenKind::Ident(v) if v == "true" => true,
+                            TokenKind::Ident(v) if v == "false" => false,
+                            _ => {
+                                return Err(Error::at(
+                                    self.peek().span,
+                                    "expected 'true' or 'false' after 'keep_layout:'",
+                                ));
+                            }
+                        };
+                        self.bump();
+                    }
                     "dead_false" => {
                         if header.dead_false_error {
                             return Err(Error::at(kspan, "duplicate header field 'dead_false'"));

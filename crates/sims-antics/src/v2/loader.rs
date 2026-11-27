@@ -512,7 +512,17 @@ fn extern_fn_text(f: &ExternFnDecl) -> String {
             format!(" -> Result<{}> (temp {temp})", ty.display_name())
         }
     };
-    format!("#[id({})] fn {}({}){ret}", f.id, f.name, params.join(", "))
+    let frame = match f.frame {
+        Some(crate::v2::ast::ExternFrame::Args(n)) => format!(" #[frame(args = {n})]"),
+        Some(crate::v2::ast::ExternFrame::Unknown) => " #[frame(args = unknown)]".to_owned(),
+        None => String::new(),
+    };
+    format!(
+        "#[id({})]{frame} fn {}({}){ret}",
+        f.id,
+        f.name,
+        params.join(", ")
+    )
 }
 
 /// Whether two extern fns call their tree the same way: parameter types and slots, and the
@@ -617,9 +627,12 @@ pub(crate) fn merge_extern_mods(
         }
         if let Some(b) = base.fns.iter().find(|b| b.name == f.name) {
             // One name keeps one meaning: its declarations must agree exactly, so the merge does
-            // not depend on which side comes first.
+            // not depend on which side comes first. The frame width is compared as declared or
+            // implied (`#[frame(args = 0)]` on an argless fn is the same width), and `unknown`
+            // agrees only with `unknown`.
             let same = b.id == f.id
                 && b.ret == f.ret
+                && b.frame_args() == f.frame_args()
                 && same_extern_abi(b, f)
                 && b.params
                     .iter()

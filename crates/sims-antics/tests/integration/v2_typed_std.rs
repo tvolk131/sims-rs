@@ -390,7 +390,7 @@ fn std_globals_call_the_documented_trees() {
         "globals.antics",
         &sim_tree(
             "use std::globals::*;",
-            "if !globals::ensure_standing() { return false; } \
+            "if !globals::get_up() { return false; } \
              globals::change_to_swimwear(1)?; \
              if globals::find_companion() { self.n = temp[0]; } \
              globals::rouse_stack_room(0, 1)?; \
@@ -586,12 +586,12 @@ fn casts_and_raw_conversions_stay_sound() {
             "temp[0] flag_set my.id;",
         ],
     );
-    // 382 keeps its `-> Result` signature, so a local declaration of it still merges.
+    // 382 answers `-> bool`: a local declaration of it with that ABI merges.
     expand(
         "merge_382.antics",
         &sim_tree(
-            "use std::globals::*;\nextern mod globals { #[id(382)] fn get_up() -> Result; }",
-            "globals::get_up()?;",
+            "use std::globals::*;\nextern mod globals { #[id(382)] fn get_up() -> bool; }",
+            "if !globals::get_up() { return false; }",
         ),
     );
 }

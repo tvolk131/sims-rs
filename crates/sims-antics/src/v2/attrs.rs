@@ -261,6 +261,9 @@ impl ItemAttrs {
                 AttrValue::Ident(name) if name == "share_tails" => {
                     Some((&mut frame.share_tails, "share_tails"))
                 }
+                AttrValue::Ident(name) if name == "keep_layout" => {
+                    Some((&mut frame.keep_layout, "keep_layout"))
+                }
                 _ => None,
             };
             if let Some((slot, name)) = flag {
@@ -274,7 +277,9 @@ impl ItemAttrs {
             }
             return Err(Error::at(
                 arg.span,
-                format!("expected 'key = value', 'empty' or 'share_tails' in '#[{attr}(..)]'"),
+                format!(
+                    "expected 'key = value', 'empty', 'share_tails' or 'keep_layout' in '#[{attr}(..)]'"
+                ),
             ));
         };
         let int = |what: &str| -> Result<i64> {
@@ -291,7 +296,7 @@ impl ItemAttrs {
             u16::try_from(int(what)?)
                 .map_err(|_| Error::at(arg.span, format!("'{what}' is out of u16 range")))
         };
-        if matches!(key, "empty" | "share_tails") {
+        if matches!(key, "empty" | "share_tails" | "keep_layout") {
             return Err(Error::at(
                 arg.span,
                 format!("'{key}' takes no value: write '#[{attr}(.., {key})]'"),
@@ -348,7 +353,7 @@ impl ItemAttrs {
                 return Err(Error::at(
                     arg.span,
                     format!(
-                        "unknown '#[{attr}(..)]' field '{other}' (expected {more}args, locals, format, revision, kind, node_order, dead_false, empty, or share_tails)"
+                        "unknown '#[{attr}(..)]' field '{other}' (expected {more}args, locals, format, revision, kind, node_order, dead_false, empty, share_tails, or keep_layout)"
                     ),
                 ));
             }

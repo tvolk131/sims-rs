@@ -617,6 +617,20 @@ pub(crate) fn count_frame_locals(body: &str) -> usize {
     first_named + names.len()
 }
 
+/// The frame words `.air` allocates for the finished (slot-placed) tree `body` under a header
+/// whose `min_locals` floor is `min_locals`, by `.air`'s own scan: the named locals after every
+/// explicit local and the floor, and the `idle` scratch word after them when the tree uses
+/// both `idle` and `param[0]`. `None` when `.air` cannot parse the body, or raw `op` bytes may
+/// name locals no scan reads.
+pub(crate) fn frame_words(body: &str, min_locals: usize) -> Option<usize> {
+    let usage = body_local_usage(body)?;
+    if usage.has_raw_ops {
+        return None;
+    }
+    let first = usage.explicit.last().map_or(0, |w| w + 1).max(min_locals);
+    Some(first + usage.lets.len() + usize::from(usage.uses_idle_scratch))
+}
+
 /// Whether `body` may read global 34, whose value depends on the scratch pointer every
 /// Expression sets (`sims-vm` `primitives/expression.rs`): a `global[34]` operand or one whose
 /// index is not a known number, a `scope(6, ..)` or `scope(<not a known number>, ..)` cell, or

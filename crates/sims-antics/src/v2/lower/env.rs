@@ -295,9 +295,10 @@ impl<'a> ObjectEnv<'a> {
     }
 
     /// Whether tree `id`'s frame holds at most four arguments, by every declaration of it the
-    /// object can see from anywhere: a sibling tree's frame, an `extern` fn's positional
-    /// parameters in any module or in the object (an `extern` is trusted to declare its whole
-    /// frame), or, for a global tree, `std::globals` whether or not anything imports it (its
+    /// object can see from anywhere: a sibling tree's frame, an `extern` fn's
+    /// `#[frame(args = N)]` or else its positional parameters, in any module or in the object
+    /// (an `extern` is trusted to declare its whole frame; `#[frame(args = unknown)]` proves
+    /// nothing), or, for a global tree, `std::globals` whether or not anything imports it (its
     /// frames are checked against the original's). The question ignores scope, since one tree
     /// has one frame: an inlined helper sees its module's declarations, but the object's own
     /// may disagree. `false` when none names it or two disagree.
@@ -315,12 +316,6 @@ impl<'a> ObjectEnv<'a> {
             }
         } else {
             None
-        };
-        let positional = |f: &crate::v2::ast::ExternFnDecl| {
-            f.params
-                .iter()
-                .filter(|p| p.slot == AbiParamSlot::Positional)
-                .count()
         };
         let mut frames = self
             .trees
@@ -342,7 +337,7 @@ impl<'a> ObjectEnv<'a> {
                 (Some(_), Some(_)) => library_declares |= decl.fns.iter().any(|f| f.id == id),
                 (None, _) => {}
             }
-            frames.extend(declares.map(|f| Some(positional(f))));
+            frames.extend(declares.map(crate::v2::ast::ExternFnDecl::frame_args));
         }
         if link.is_some() && !library_declares {
             return false;
@@ -352,7 +347,7 @@ impl<'a> ObjectEnv<'a> {
                 std_global_fns()
                     .iter()
                     .filter(|f| f.id == id)
-                    .map(|f| Some(positional(f))),
+                    .map(crate::v2::ast::ExternFnDecl::frame_args),
             );
         }
         !frames.is_empty() && frames.iter().all(|n| n.is_some_and(|n| n <= 4))
