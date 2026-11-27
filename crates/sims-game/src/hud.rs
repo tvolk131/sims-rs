@@ -29,6 +29,7 @@ use sims_ui::command::{
     BuildItemId, Command, Mode, OptionsAction, Panel as UiPanel, VolumeChannel, Walls as UiWalls,
 };
 use sims_ui::dialog::{self, DialogFadeState, DialogState, Labels, Message};
+use sims_ui::dialog_timer::{self, AutoAnswer};
 use sims_ui::frame::{Frame, Rect};
 use sims_ui::house;
 use sims_ui::household::{Acquaintances, Careers, Faces, Fame, Snapshot};
@@ -177,6 +178,14 @@ pub struct Hud {
     /// The press held now landed on a non-modal dialog
     /// ([`Hud::take_non_modal_press`]): its release is the dialog's too.
     non_modal_press: bool,
+    /// The simulation dialog's 40 s auto-answer timer (`0x436c89`), and
+    /// the answer it gives when it runs out.
+    auto_answer: AutoAnswer,
+    auto_answer_status: Option<u8>,
+    /// Each non-modal dialog still shown, read at the end of the update
+    /// that showed it, while its caller's frame (and so its `$Local`
+    /// text) was still there: one queued behind another keeps its text.
+    non_modal_read: Vec<((u16, [u8; 8]), Message)>,
     dialog: Option<dialog::Layout>,
     /// Active Sound volume slider being dragged (`0x5f6245..0x5f6336`).
     dragging_slider: Option<VolumeChannel>,
@@ -676,6 +685,9 @@ impl Hud {
             ui_dialog: None,
             dialog_state: DialogState::default(),
             non_modal_press: false,
+            auto_answer: AutoAnswer::default(),
+            auto_answer_status: None,
+            non_modal_read: Vec::new(),
             dialog: None,
             dragging_slider: None,
             pressed_options_action: None,
@@ -750,6 +762,8 @@ impl Hud {
     pub fn forget(&mut self) {
         self.menu = None;
         self.message = None;
+        self.disarm_auto_answer();
+        self.non_modal_read.clear();
         self.ui_dialog = None;
         self.dialog_state = DialogState::default();
         self.dialog = None;
@@ -1770,6 +1784,9 @@ impl Hud {
         // Re-hit-testing on mouse-up would misread a stationary click after
         // mouse-down shifted the field's scroll offset.
         let released_entry = self.dialog_state.release_entry();
+        // 0x524a13: the button coming up starts the timer a press on the
+        // dialog stopped again, with the whole 40 s.
+        self.auto_answer.release(self.last_clock_us);
         let Some(pressed) = self.dialog_state.pressed_button.take() else {
             return (released_entry, None);
         };
@@ -2028,6 +2045,7 @@ impl Hud {
     /// text state (`0x523825..0x523887`).
     pub fn clear_vm_dialog(&mut self) {
         self.message = None;
+        self.disarm_auto_answer();
         if self.ui_dialog.is_none() {
             self.dialog = None;
             self.dialog_state = DialogState::default();
@@ -2038,17 +2056,57 @@ impl Hud {
     /// Reads the dialog `world` waits on, if it changed. The lot's world,
     /// or, while the lot waits for the player, the world as the tick left
     /// it when it showed the dialog.
+    ///
+    /// A modal dialog comes first. Otherwise it is the first non-modal
+    /// dialog still shown whose text was read ([`Hud::read_non_modal_shown`])
+    /// or can be read now, so one whose caller's frame is gone does not
+    /// hide the others.
     pub fn read_dialog(&mut self, world: &World, assets: &Assets) {
-        let Some(pending) = dialog::pending(world) else {
+        // What was read of a dialog no longer shown is dropped.
+        self.non_modal_read.retain(|(key, _)| {
+            world.dialogs.records.iter().any(|r| {
+                r.status <= 1 && r.operands[7] & 0x80 != 0 && (r.caller, r.operands) == *key
+            })
+        });
+        let waiting = || world.dialogs.records.iter().filter(|r| r.status <= 1);
+        let modal = waiting().find(|r| r.operands[7] & 0x80 == 0);
+        let candidates: Vec<&sims_sim::Dialog> = match modal {
+            Some(record) => vec![record],
+            None => waiting().collect(),
+        };
+        if candidates.is_empty() {
+            self.disarm_auto_answer();
             if self.message.take().is_some() && self.ui_dialog.is_none() {
                 self.dialog_fade = DialogFadeState::hidden();
             }
             return;
-        };
-        let key = (pending.caller, pending.operands);
-        if self.message.as_ref().is_some_and(|(_, k)| *k == key) {
-            return;
         }
+        for pending in candidates {
+            let key = (pending.caller, pending.operands);
+            if self.message.as_ref().is_some_and(|(_, k)| *k == key) {
+                return;
+            }
+            let read = match self.non_modal_read.iter().find(|(k, _)| *k == key) {
+                Some((_, m)) => Some(m.clone()),
+                None => self.read_message(world, assets, pending),
+            };
+            if let Some(m) = read {
+                self.show_message(m, key);
+                return;
+            }
+        }
+        self.disarm_auto_answer();
+        self.message = None;
+    }
+
+    /// Reads `record`'s dialog from `world`, or None when it cannot be
+    /// read (its caller has no frame, its strings are missing).
+    fn read_message(
+        &mut self,
+        world: &World,
+        assets: &Assets,
+        record: &sims_sim::Dialog,
+    ) -> Option<Message> {
         let mut ctx = dialog::DialogContext {
             faces: Some(&self.faces),
             thumbnails: Some(&mut self.thumbnails),
@@ -2060,25 +2118,125 @@ impl Hud {
             known: Some(&self.known),
             members: &self.members,
         };
-        let read = Message::read_with_context(
+        Message::read_with_context(
             world,
             assets.index(),
             assets.catalog(),
             &self.labels,
-            pending,
+            record,
             &mut ctx,
         )
         .ok()
-        .flatten();
-        if let Some(m) = read {
-            if self.ui_dialog.is_none() {
-                self.dialog_state = DialogState::for_message(&m);
-                self.start_dialog_fade();
-            }
-            self.message = Some((m, key));
-        } else {
-            self.message = None;
+        .flatten()
+    }
+
+    /// Shows `m`, the dialog of `key` (its caller and operands), as a new
+    /// widget: fresh input state and, at `0x436c89`, its timer.
+    fn show_message(&mut self, m: Message, key: (u16, [u8; 8])) {
+        if self.ui_dialog.is_none() {
+            self.dialog_state = DialogState::for_message(&m);
+            self.start_dialog_fade();
         }
+        self.auto_answer_status = dialog_timer::auto_answer_status(&key.1, m.presentation.anchored);
+        match self.auto_answer_status {
+            Some(_) => self.auto_answer.arm(self.last_clock_us),
+            None => self.auto_answer.disarm(),
+        }
+        self.message = Some((m, key));
+    }
+
+    /// After an update that showed the non-modal dialogs of `callers`
+    /// (`sims_vm::Update::non_modal_shown`), reads each one from `world`
+    /// as that update left it, as the original makes the widget then
+    /// (`0x436da0`), and then the dialog to show ([`Hud::read_dialog`]).
+    ///
+    /// A caller shows its choice again each tick it runs, closing the old
+    /// widget and making a new one (`0x451552` → `0x437058`). The new one's
+    /// timer starts over. When its text differs from the one shown (the
+    /// same instruction with other `$Local` values), it replaces it with
+    /// fresh input state, so a press held on the old text answers nothing.
+    pub fn read_non_modal_shown(&mut self, world: &World, assets: &Assets, callers: &[u16]) {
+        for record in &world.dialogs.records {
+            if record.status != 1
+                || record.operands[7] & 0x80 == 0
+                || !callers.contains(&record.caller)
+            {
+                continue;
+            }
+            let key = (record.caller, record.operands);
+            let Some(m) = self.read_message(world, assets, record) else {
+                continue;
+            };
+            if self
+                .message
+                .as_ref()
+                .is_some_and(|(shown, k)| *k == key && *shown != m)
+            {
+                self.show_message(m.clone(), key);
+            }
+            match self.non_modal_read.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, kept)) => *kept = m,
+                None => self.non_modal_read.push((key, m)),
+            }
+        }
+        self.read_dialog(world, assets);
+        for &caller in callers {
+            self.restart_auto_answer(caller);
+        }
+    }
+
+    fn disarm_auto_answer(&mut self) {
+        self.auto_answer.disarm();
+        self.auto_answer_status = None;
+    }
+
+    /// The simulation showed `caller`'s dialog again (a non-modal choice,
+    /// which its caller makes again each tick it runs: `0x451552` →
+    /// `0x437058`): the new widget's timer starts over with the whole 40 s.
+    pub fn restart_auto_answer(&mut self, caller: u16) {
+        if self.auto_answer_status.is_some()
+            && self
+                .message
+                .as_ref()
+                .is_some_and(|(message, _)| message.caller == caller)
+        {
+            self.auto_answer.arm(self.last_clock_us);
+        }
+    }
+
+    /// Whether the simulation dialog shown has its 40 s timer running.
+    pub fn auto_answer_running(&self) -> bool {
+        self.auto_answer.running()
+    }
+
+    /// How long until the simulation dialog's timer runs out at
+    /// `clock_us`, or None while it does not run: when the host must wake
+    /// to press its button, drawn or not.
+    pub fn auto_answer_remaining_us(&self, clock_us: u64) -> Option<u64> {
+        if self.ui_dialog.is_some() || self.message.is_none() || self.auto_answer_status.is_none() {
+            return None;
+        }
+        self.auto_answer.remaining_us(clock_us)
+    }
+
+    /// The simulation dialog shown, as its caller and the Dialog
+    /// instruction's operands, if one is read.
+    pub fn vm_dialog_key(&self) -> Option<(u16, [u8; 8])> {
+        self.message.as_ref().map(|(_, key)| *key)
+    }
+
+    /// The answer the simulation dialog's timer gives if it has run out
+    /// at `clock_us` (`0x5248a8` presses the stored button): its caller,
+    /// the answer's status and whether the dialog is modal. Taken once.
+    /// A shell dialog in front holds it.
+    pub fn take_auto_answer(&mut self, clock_us: u64) -> Option<(u16, u8, bool)> {
+        if self.ui_dialog.is_some() {
+            return None;
+        }
+        let (message, _) = self.message.as_ref()?;
+        let status = self.auto_answer_status?;
+        let answer = (message.caller, status, message.presentation.modal);
+        self.auto_answer.take_due(clock_us).then_some(answer)
     }
 
     /// What the panel shows of `world`: the household with what the next
@@ -3186,6 +3344,11 @@ impl Hud {
             .filter(|l| !non_modal || l.rect.contains(point[0], point[1]))
         {
             self.non_modal_press = non_modal;
+            // 0x5249f9: a mouse button going down on the simulation
+            // dialog stops its timer until the release.
+            if self.ui_dialog.is_none() && layout.rect.contains(point[0], point[1]) {
+                self.auto_answer.press();
+            }
             if let Some(message) = self.active_message().cloned()
                 && self
                     .dialog_state

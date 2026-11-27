@@ -37,12 +37,12 @@ pub use error::{
 };
 pub use manifest::{FileManifest, FileManifestEntry, ManifestDiff};
 pub use protocol::{
-    ALPN, BuyBuildEdit, CameraRotation, Command, CommandSeq, DEFAULT_SNAPSHOT_CHUNK_BYTES,
-    DialogAnswer, DialogId, Epoch, LeaveReason, MAX_WIRE_FRAME_BYTES, ManifestDigest,
-    PROTOCOL_VERSION, PeerRosterEntry, PlayerId, PlayerMode, PlayerRole, RejectReason,
-    ResyncReason, SessionConfig, SimSpeed, SnapshotId, StampedCommand, StateFingerprint, Tick,
-    TickBatch, WireMessage, decode_framed, decode_payload, encode_framed, encode_payload,
-    protocol_mismatch_message,
+    ALPN, BUILD_ID, BuildId, BuyBuildEdit, CameraRotation, Command, CommandSeq,
+    DEFAULT_SNAPSHOT_CHUNK_BYTES, DialogAnswer, DialogId, Epoch, LeaveReason, MAX_WIRE_FRAME_BYTES,
+    ManifestDigest, PROTOCOL_VERSION, PeerRosterEntry, PlayerId, PlayerMode, PlayerRole,
+    RejectReason, ResyncReason, SessionConfig, SimSpeed, SnapshotId, StampedCommand,
+    StateFingerprint, Tick, TickBatch, WireMessage, build_mismatch_message, decode_framed,
+    decode_payload, encode_framed, encode_payload, protocol_mismatch_message,
 };
 pub use session::{
     ActivePauseReasons, AppliedBatch, AppliedCommand, BlockingDialog, CommandIgnoreReason,

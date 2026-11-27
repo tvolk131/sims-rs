@@ -3049,6 +3049,134 @@ fn play_mode_non_modal_choice_dialog_advances_caller_on_next_tick() {
     assert!(fx.world.dialogs.records.is_empty());
 }
 
+/// Play mode with `SpecialPanels::present_non_modal` set and no co-op, as
+/// `Lot::present_non_modal_dialogs` steps it.
+fn presenting_update(fx: &mut Fixture, play: &mut Play) -> Update {
+    let tuning = tuning();
+    let panels = RefCell::new(SpecialPanels {
+        present_non_modal: true,
+        ..SpecialPanels::default()
+    });
+    let mut interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.special_panels = Some(&panels);
+    interpreter
+        .lot_update_with(&mut fx.world, &tuning, &mut answers(&[]), Some(play))
+        .expect("play mode carries on")
+}
+
+/// `0x436da0` with byte `0x69` clear: a non-modal choice dialog stays
+/// shown while the game goes on. Its caller's next `Dialog` closes it and
+/// makes it again (`0x437058`), so it is shown afresh every tick, until
+/// the player's answer (`0x4370be`) reaches the caller.
+#[test]
+fn a_presented_non_modal_choice_waits_for_the_player_and_is_shown_again_each_tick() {
+    let non_modal_two_buttons = [0, 0, 0, 0, 0, 1, 0, 0x80];
+    let mut fx = lot(tree(vec![
+        ins(36, 1, 2, non_modal_two_buttons),
+        assign(scope::MY_DATA, 0, scope::LITERAL, 1, 3),
+        assign(scope::MY_DATA, 0, scope::LITERAL, 2, 3),
+        ins(0, 3, 3, [0; 8]),
+    ]));
+    let mut play = Play::default();
+    for tick in 0..3 {
+        let u = presenting_update(&mut fx, &mut play);
+        assert!(u.errors.is_empty(), "tick {tick}: {:?}", u.errors);
+        assert!(u.answered.is_empty(), "nothing answers it");
+        assert_eq!(u.non_modal_shown, vec![LAMP], "tick {tick}");
+        assert_eq!(
+            fx.world.dialogs.records,
+            vec![Dialog {
+                caller: LAMP,
+                operands: non_modal_two_buttons,
+                status: 1,
+            }],
+            "tick {tick}: one shown record, made again"
+        );
+        assert_eq!(fx.lamp().stack[0].node, 0, "the lamp still waits");
+        assert_eq!(fx.lamp().data[0], 0);
+    }
+    // The player presses the second button between updates
+    // (`Lot::answer_non_modal`): the lamp takes the false branch.
+    fx.world.dialogs.records[0].status = 3;
+    let u = presenting_update(&mut fx, &mut play);
+    assert!(u.non_modal_shown.is_empty());
+    assert_eq!(fx.lamp().data[0], 2);
+    assert!(fx.world.dialogs.records.is_empty());
+}
+
+/// Without the setting, play mode answers a non-modal dialog at once, and
+/// strict mode stops at one, as before; co-op keeps answering it at once
+/// with the setting on.
+#[test]
+fn without_presenting_a_non_modal_dialog_is_handled_as_before() {
+    let non_modal_choice = [0, 0, 0, 0, 0, 0, 0, 0x80];
+    let program = || {
+        tree(vec![
+            ins(36, 1, ERROR, non_modal_choice),
+            ins(0, 1, ERROR, [0; 8]),
+        ])
+    };
+    // Strict, with the setting on: still unsupported.
+    let mut fx = lot(program());
+    let panels = RefCell::new(SpecialPanels {
+        present_non_modal: true,
+        ..SpecialPanels::default()
+    });
+    assert!(matches!(
+        update_with_panels(&mut fx, &panels, &mut answers(&[])),
+        Err(TickError::Unsupported(_))
+    ));
+    // Play, setting off: answered at once with the first button.
+    let mut fx = lot(program());
+    let u = play_update(&mut fx, &mut Play::default());
+    assert!(u.non_modal_shown.is_empty());
+    assert_eq!(u.errors.len(), 1);
+    assert_eq!(fx.world.dialogs.records[0].status, 2);
+    // Play with co-op attached, setting on: answered at once too.
+    let mut fx = lot(program());
+    let tuning = tuning();
+    let coop = RefCell::new(sims_vm::CoopVmContext::new(sims_net::SessionState::new(
+        "Host",
+        None,
+        sims_net::SessionConfig::default(),
+    )));
+    let mut interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.special_panels = Some(&panels);
+    interpreter.coop = Some(&coop);
+    let u = interpreter
+        .lot_update_with(
+            &mut fx.world,
+            &tuning,
+            &mut answers(&[]),
+            Some(&mut Play::default()),
+        )
+        .unwrap();
+    assert!(u.non_modal_shown.is_empty());
+    assert_eq!(fx.world.dialogs.records[0].status, 2);
+}
+
+/// An informing non-modal dialog does not hold its caller: the record
+/// stays shown until the player closes it (`0x4370be` sets it done).
+#[test]
+fn a_presented_informing_non_modal_dialog_stays_until_closed() {
+    let informs = [0, 0, 0, 0, 0, 0, 0, 0x81];
+    let mut fx = lot(tree(vec![
+        ins(36, 1, ERROR, informs),
+        assign(scope::MY_DATA, 0, scope::LITERAL, 5, 2),
+        ins(0, 2, 2, [0; 8]),
+    ]));
+    let mut play = Play::default();
+    let u = presenting_update(&mut fx, &mut play);
+    assert_eq!(u.non_modal_shown, vec![LAMP]);
+    assert_eq!(fx.lamp().data[0], 5, "the caller went on");
+    let u = presenting_update(&mut fx, &mut play);
+    assert!(u.non_modal_shown.is_empty(), "not shown again");
+    assert_eq!(fx.world.dialogs.records[0].status, 1);
+    fx.world.dialogs.records[0].status = 5;
+    presenting_update(&mut fx, &mut play);
+    assert!(fx.world.dialogs.records.is_empty());
+}
+
 #[test]
 fn play_mode_cleans_orphaned_dialogs_from_held_children_and_removal_callbacks() {
     use sims_formats::execution::ObjectFunction;

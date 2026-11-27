@@ -449,6 +449,13 @@ pub struct Update {
     /// masks were built at reads it. Filled by [`crate::boot::Lot`]'s
     /// steps only ([`Interpreter::masks_rebuilt`]).
     pub masks_rebuilt: u8,
+    /// In play mode with [`crate::boot::Lot::present_non_modal_dialogs`]
+    /// on, the callers whose dialog that does not stop the game was shown
+    /// during the update (`0x436da0` with byte `0x69` clear), in order. A
+    /// caller's next `Dialog` closes such a record and makes it again, so
+    /// a choice is shown afresh every tick its caller runs, and the
+    /// interface's 40 s timer (`0x436c89`) starts over each time.
+    pub non_modal_shown: Vec<u16>,
 }
 
 /// A frame of the house view that failed in play mode and was skipped
@@ -1393,6 +1400,21 @@ impl Interpreter<'_> {
                 return Err(TickError::Unsupported(msg));
             };
             if !dialog::modal(&record.operands) {
+                // `0x436da0`: a dialog that does not stop the game keeps its
+                // widget (byte `0x69` clear) with the record shown, and the
+                // game goes on. The player answers it between updates
+                // (`Lot::answer_non_modal`, `0x4370be`), or its caller's
+                // next `Dialog` closes it (`0x437058`). Co-op still answers
+                // it at once, below: no command carries such an answer.
+                if play.is_some()
+                    && self.coop.is_none()
+                    && self
+                        .special_panels
+                        .is_some_and(|panels| panels.borrow().present_non_modal)
+                {
+                    update.non_modal_shown.push(record.caller);
+                    continue;
+                }
                 let caller = record.caller;
                 let msg = format!(
                     "object {caller} shows a dialog that does not stop the game; answering one \

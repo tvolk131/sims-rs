@@ -44,6 +44,7 @@ mod cancel;
 mod clip_events;
 pub mod coop;
 mod daily;
+pub mod dialog_non_modal;
 mod error;
 mod factory;
 mod fault;
@@ -106,6 +107,7 @@ pub use coop::{
     build_prices_from_install, cancel_uid_to_wire, menu_entry_to_pick_command,
     player_mode_to_panel_mode,
 };
+pub use dialog_non_modal::{NonModalAnswerError, NonModalDialog};
 pub use error::Error;
 pub use factory::{MAX_CREATION_DEPTH, TURN_BUDGET};
 pub use fault::{Fault, Location, Trap};

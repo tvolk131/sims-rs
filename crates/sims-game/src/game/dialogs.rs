@@ -31,6 +31,22 @@ impl Game {
             || self.active_special_panel.is_some()
     }
 
+    /// Whether the simulation dialog shown has its 40 s auto-answer timer
+    /// running (`0x436c89`; stopped by a press on the dialog until its
+    /// release).
+    pub fn auto_answer_running(&self) -> bool {
+        self.hud.auto_answer_running()
+    }
+
+    /// Whether something in front of the simulation dialog holds its
+    /// 40 s timer until it closes: a shell modal, a special panel, or the
+    /// co-op lobby.
+    pub(super) fn auto_answer_held(&self) -> bool {
+        self.ui_modal_in_front()
+            || self.lot.asking_special_panel().is_some()
+            || self.coop_lobby.is_open()
+    }
+
     /// Whether a press at `point` belongs to a dialog: any press while a
     /// modal one is open ([`Game::has_dialog`]), or one on a non-modal
     /// dialog, which takes it before a pie menu, a held object or a tool

@@ -41,6 +41,7 @@ pub mod command;
 pub mod coop;
 pub mod currency;
 pub mod dialog;
+pub mod dialog_timer;
 pub mod family_bin;
 pub mod font;
 pub mod frame;

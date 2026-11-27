@@ -330,10 +330,15 @@ impl Labels {
     }
 }
 
-/// The first dialog record that waits for the player: made and not yet
-/// answered.
+/// The dialog record that waits for the player: made and not yet
+/// answered. A modal one comes first, since the lot waits on it, even
+/// behind a non-modal one still shown (operand 7 bit 7 set) that the game
+/// goes on around; otherwise the first waiting record.
 pub fn pending(world: &World) -> Option<&Dialog> {
-    world.dialogs.records.iter().find(|r| r.status <= 1)
+    let waiting = || world.dialogs.records.iter().filter(|r| r.status <= 1);
+    waiting()
+        .find(|r| r.operands[7] & 0x80 == 0)
+        .or_else(|| waiting().next())
 }
 
 /// Cached neighborhood family metadata (`FAMI` / `FAMs`) used by `$Family`
@@ -4217,6 +4222,22 @@ mod tests {
         world.event_owner = 0;
         let p = Presentation::capture(&asked(0), &world);
         assert!(!p.anchored && !p.hide_title);
+    }
+
+    #[test]
+    fn the_pending_dialog_is_the_modal_one_the_lot_waits_on() {
+        let record = |caller, flags, status| sims_sim::Dialog {
+            caller,
+            operands: [0, 0, 0, 0, 0, 0, 0, flags],
+            status,
+        };
+        let mut world = World::empty();
+        world.dialogs.records = vec![record(10, 0x81, 1), record(11, 0x00, 1)];
+        assert_eq!(pending(&world).map(|r| r.caller), Some(11));
+        world.dialogs.records = vec![record(10, 0x81, 1), record(11, 0x00, 5)];
+        assert_eq!(pending(&world).map(|r| r.caller), Some(10));
+        world.dialogs.records = vec![record(12, 0x80, 2)];
+        assert_eq!(pending(&world), None);
     }
 
     #[test]

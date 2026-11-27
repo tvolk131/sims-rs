@@ -315,6 +315,14 @@ pub struct SpecialPanels {
     /// (`0x451628..0x451634`). While `true`, kind 13 yields without arming
     /// `magic_lot = -1` when `magic_lot == 0`.
     pub magic_picker_blocked: bool,
+    /// The interface's handling of a dialog that does not stop the game:
+    /// left shown for the player to answer while the lot runs in play mode,
+    /// as the original does, instead of answered at once
+    /// ([`crate::boot::Lot::present_non_modal_dialogs`]). A setting of the
+    /// lot's host, not registry state: no save holds it (a restore clears
+    /// it), and strict mode and co-op ignore it.
+    #[serde(skip)]
+    pub present_non_modal: bool,
 }
 
 /// Typed special panel request surfaced by `Dialog` kinds `5..=15` (`0x451552`

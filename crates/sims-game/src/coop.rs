@@ -1228,6 +1228,10 @@ impl CoopController {
                                 let msg = sims_net::protocol_mismatch_message(expected, actual);
                                 (ConnectionState::Error(msg.clone()), msg)
                             }
+                            RejectReason::BuildMismatch { expected, actual } => {
+                                let msg = sims_net::build_mismatch_message(expected, actual);
+                                (ConnectionState::Error(msg.clone()), msg)
+                            }
                             RejectReason::SessionFull { max_players } => {
                                 let msg = format!("Session is full ({max_players} players max)");
                                 (ConnectionState::Error(msg.clone()), msg)

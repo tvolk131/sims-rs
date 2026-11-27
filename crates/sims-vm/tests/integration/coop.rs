@@ -340,7 +340,9 @@ fn coop_two_players_goth_house_lockstep_convergence_and_throwaway_pie_menu() {
                 .world()
                 .objects
                 .get(&id)
-                .is_some_and(|o| o.person.is_none())
+                // An object parked off the lot is never drawn, and the
+                // executor refuses a pick on one.
+                .is_some_and(|o| o.person.is_none() && o.position[..2] != PARKED)
         })
         .take(25)
         .collect();
@@ -1061,4 +1063,127 @@ fn coop_camera_rotation_affects_look_towards_and_gsc_12_per_player() {
     interp.run_tree(&mut world, 20, 4096, 20, &[], 100).unwrap();
     assert_eq!(world.objects[&10].temps[0], -53);
     assert_eq!(world.objects[&20].temps[0], -73);
+}
+
+/// Where a factory or a removal parks an object off the lot.
+const PARKED: [i32; 2] = [-16, -16];
+
+/// #458: a pie-menu entry on an object parked off the lot at [-16, -16],
+/// picked and run, faults (a Scold whose stack object is 0), which halts a
+/// strict lot. No player can click such an object, but a peer's `Pick`
+/// arrives over the wire: the co-op executor refuses it before listing its
+/// menu, the same on every peer, and the lot goes on.
+#[test]
+fn coop_refuses_a_peer_pick_on_an_object_parked_off_the_lot() {
+    let Some((root, house)) = goth_house() else {
+        return;
+    };
+
+    // Reproduce the fault the single-player way: list a parked object's
+    // menu, pick an entry, and step strictly until the lot halts.
+    let mut plain = Lot::load(&root, &house, &[], Frames::default()).unwrap();
+    let boot = plain.save().unwrap();
+    let people: Vec<u16> = plain
+        .world()
+        .people
+        .iter()
+        .copied()
+        .filter(|id| plain.world().objects[id].position[..2] != PARKED)
+        .collect();
+    let parked: Vec<u16> = plain
+        .world()
+        .objects
+        .values()
+        .filter(|o| o.position[..2] == PARKED)
+        .map(|o| o.id)
+        .collect();
+    assert!(!parked.is_empty(), "the Goth lot parks helpers off the lot");
+    let mut fault = None;
+    'search: for &sim in &people {
+        for &target in &parked {
+            plain.restore(boot.clone()).unwrap();
+            let Ok(menu) = plain.pie_menu(sim, target) else {
+                continue;
+            };
+            for entry in menu.entries {
+                plain.restore(boot.clone()).unwrap();
+                // Listing changes the lot as the original's does: list again
+                // on the restored lot before the pick, as a player would.
+                if plain.pie_menu(sim, target).is_err()
+                    || !matches!(plain.pick(sim, entry.action.clone()), Ok(Some(_)))
+                {
+                    continue;
+                }
+                for _ in 0..60 {
+                    match plain.step() {
+                        Ok(_) => {}
+                        Err(error) => {
+                            // Other parked menus fault in other ways (a
+                            // dialog waiting for an answer, a Find Location
+                            // For with no object): look for #458's.
+                            let error = format!("{error:?}");
+                            if error.contains("native error 0x34") {
+                                fault = Some((sim, target, entry, error));
+                                break 'search;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let (sim, target, entry, error) =
+        fault.expect("some parked object's menu entry faults when picked (#458)");
+    eprintln!("#458 fault: Sim {sim} on parked object {target}: {error}");
+    assert!(
+        matches!(plain.step(), Err(sims_vm::boot::StepError::Halted)),
+        "the fault halts a strict lot"
+    );
+
+    // The same pick, sent to a strict co-op lot, is refused cleanly.
+    let mut lot = Lot::load(&root, &house, &[], Frames::default()).unwrap();
+    let mut session = SessionState::new("Host", None, SessionConfig::default());
+    lot.sync_initial_coop_session(&mut session);
+    lot.attach_coop_context(CoopVmContext::new(session))
+        .unwrap();
+    let before = lot.world().hash();
+    let host = lot.coop().unwrap().session.host_id;
+    let batch = |lot: &Lot, commands: Vec<sims_net::Command>| {
+        let session = &lot.coop().unwrap().session;
+        let tick = session.current_tick.next();
+        sims_net::TickBatch {
+            epoch: session.epoch,
+            tick,
+            commands: commands
+                .into_iter()
+                .enumerate()
+                .map(|(sequence, command)| sims_net::StampedCommand {
+                    tick,
+                    sequence: sequence as u32,
+                    issuer: host,
+                    command,
+                })
+                .collect(),
+            pacing_hint_ms: 0,
+            host_fingerprint: None,
+        }
+    };
+    let pick = menu_entry_to_pick_command(&entry);
+    let report = lot
+        .apply_coop_tick_batch(&batch(&lot, vec![pick]))
+        .expect("the tick runs");
+    assert_eq!(report.command_results.len(), 1);
+    match &report.command_results[0].1 {
+        CoopCommandStatus::Refused(why) => {
+            assert!(why.contains("parked off the lot"), "{why}");
+            assert!(why.contains(&target.to_string()), "{why}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_ne!(lot.world().hash(), before, "the tick still ran");
+    for _ in 0..60 {
+        lot.apply_coop_tick_batch(&batch(&lot, Vec::new()))
+            .expect("the lot goes on after the refusal");
+    }
 }
