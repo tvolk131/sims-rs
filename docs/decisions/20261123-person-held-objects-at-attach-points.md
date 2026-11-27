@@ -98,14 +98,10 @@ walks), so this is a visual check, not a pixel match.
 
 ## Unverified and not ported
 
-- Slot 1 (the `HEAD` record, `+0x48`). The tail of `0x58dc72`
-  (`0x58f8ff`..`0x58fa91`) puts an object there at its bone's position,
-  but only an object that has its own animator, and ticks that animator.
-  The standard plumb bob is held there; `sims_people::bob` already draws it
-  from the same record (`0x58db05`..`0x58db19`). We have not ported the
-  tail for any other animated object. We have not checked what the
-  original does with a slot 1 object that has no animator (the person's
-  draw skips slot 1). We keep drawing such an object at its own position.
+- Slot 1 (the `HEAD` record, `+0x48`): settled in
+  `20261126-slot-one-animated-objects-and-pets.md`. Any object whose type
+  has its own 3D graphic (OBJD word 102 bit 0) is drawn there by mode.
+  Nothing else in slot 1 or past slot 4 is drawn.
 - Draw order. The original draws a person's held objects before the Sim
   (slot 0 at `0x459e45`, the Sim at `0x45a131`). We draw them in the held
   pass after all people. Both are depth-tested, but the order still
@@ -121,9 +117,8 @@ walks), so this is a visual check, not a pixel match.
   Sim is right at the edge.
 - The other callers of `draw_held` (`sims-people`'s lot tests,
   `perf_part4`) still pass no points.
-- Pets: their skeletons have no `R_HAND`. If a pet's body strings name it,
-  its point 0 is unbound and what it holds in slots 0 and 4 is not drawn,
-  which is what the binding above implies. We did not check this against a
-  capture.
+- Pets: settled in `20261126-slot-one-animated-objects-and-pets.md`.
+  Their skeletons do have `R_HAND`, so all their points bind. The guess
+  here that they have none was wrong.
 - Body strings we cannot read give a person no points (what it holds stays
   where it was), not unbound ones, so a loader failure does not hide it.

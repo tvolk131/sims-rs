@@ -277,12 +277,12 @@ impl<'a> Player<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use sims_core::F32;
 
     /// A person record with nothing in it.
-    fn blank_person() -> Person {
+    pub(crate) fn blank_person() -> Person {
         let idle = sims_formats::saved_objects::Interaction {
             join: 0,
             uid: 0,

@@ -72,9 +72,10 @@
 //! [`Target`]. How the original gives a person's mesh its depth is
 //! **unverified**.
 //!
-//! **The plumb bob** ([`crate::bob`]) is drawn over the person who holds
-//! it in their head slot, right after them, by the original's own light
-//! and colour; [`People::set_clock`] spins it.
+//! **The plumb bob** ([`crate::bob`]), or any object whose type has its
+//! own 3D graphic, is drawn over the person who holds it in their head
+//! slot, right after them, by the original's own light and colour in the
+//! mode its suit picks; [`People::set_clock`] spins it.
 //!
 //! **Light** is the original's standard light ([`STANDARD_LIGHT`]) at the
 //! person's level ([`level`]), lit as [`Lighting::standard`] says. The
@@ -1032,22 +1033,29 @@ fn rotate(rotation: u8, [x, y]: [f32; 2], size: f32) -> [f32; 2] {
     }
 }
 
-/// What makes a person's body: their type, the appearances and
-/// accessories their record names, and the data words their suit's
+/// What makes a person's body: their type, the rows the simulation wrote
+/// over its body strings ([`crate::house::written_rows`]), the appearances
+/// and accessories their record names, and the data words their suit's
 /// clothes are chosen by ([`crate::suit`]). When any of it changes, the
 /// body is loaded again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Key {
     guid: u32,
+    written: BTreeMap<usize, String>,
     appearance: [String; 10],
     accessories: Vec<(String, String)>,
     suit: [i16; 5],
 }
 
 impl Key {
-    fn of(guid: u32, person: &sims_formats::saved_objects::Person) -> Self {
+    fn of(
+        guid: u32,
+        written: BTreeMap<usize, String>,
+        person: &sims_formats::saved_objects::Person,
+    ) -> Self {
         Self {
             guid,
+            written,
             appearance: person.appearance.clone(),
             accessories: person
                 .accessories
@@ -1059,8 +1067,13 @@ impl Key {
         }
     }
 
-    fn matches(&self, guid: u32, person: &sims_formats::saved_objects::Person) -> bool {
-        if self.guid != guid {
+    fn matches(
+        &self,
+        guid: u32,
+        written: &BTreeMap<usize, String>,
+        person: &sims_formats::saved_objects::Person,
+    ) -> bool {
+        if self.guid != guid || &self.written != written {
             return false;
         }
         let suit =
@@ -1305,8 +1318,9 @@ pub struct People {
     /// The names a suit's templates are matched against, gathered the
     /// first time a person wears a suit.
     wardrobe: Option<Wardrobe>,
-    /// The plumb bob, once a person holds one: loaded the first time.
-    bob: Option<Result<Bob, String>>,
+    /// The bobs' suits, each loaded the first time a person holds an
+    /// object that wears it.
+    bobs: BTreeMap<String, Result<Bob, String>>,
     /// The game's clock in milliseconds, which spins the plumb bob.
     clock: u32,
     /// Reusable per-frame scratch buffers for posing, lighting, and rasterization.
@@ -1339,7 +1353,7 @@ impl People {
             clips: BTreeMap::new(),
             people: BTreeMap::new(),
             wardrobe: None,
-            bob: None,
+            bobs: BTreeMap::new(),
             clock: 0,
             scratch: PeopleScratch::default(),
             drawn_attach: BTreeMap::new(),
@@ -1366,6 +1380,19 @@ impl People {
             .collect()
     }
 
+    /// Whether the object `id` is drawn as a bob when a person holds it in
+    /// their head slot: its type has its own 3D graphic ([`bob::ANIMATED`])
+    /// whose suit picks a [`bob::Mode`]. The 3D pick, the damage
+    /// rectangles and the spin redraw should take every such object, not
+    /// only the standard bob.
+    pub fn is_bob(&self, world: &World, id: u16) -> bool {
+        world
+            .objects
+            .get(&id)
+            .and_then(|o| self.cast.animated_suit(world.characters.definition(o.guid)))
+            .is_some_and(|suit| bob::Mode::of_suit(&suit).is_some())
+    }
+
     /// The people the last draw drew whose censor word (person data word
     /// 30) is set, in ID order, with the screen bounds of their censor
     /// boxes, for `sims_render::draw_censor`.
@@ -1387,23 +1414,24 @@ impl People {
             let Some(person) = &object.person else {
                 continue;
             };
+            let written = crate::house::written_rows(world, object.guid);
             if self
                 .people
                 .get(&id)
-                .is_some_and(|l| l.key.matches(object.guid, person))
+                .is_some_and(|l| l.key.matches(object.guid, &written, person))
             {
                 continue;
             }
-            let key = Key::of(object.guid, person);
+            let key = Key::of(object.guid, written, person);
             let body = self
                 .cast
-                .residents([(id, object.guid, person)])
+                .residents_in(world, [(id, object.guid, person)])
                 .and_then(|found| {
                     let resident = found
                         .into_iter()
                         .next()
                         .ok_or_else(|| format!("person {id} is not a person type"))?;
-                    let outfit = match self.dress(object.guid, person) {
+                    let outfit = match self.dress(world, object.guid, person) {
                         Ok(Some(outfit)) => outfit,
                         Ok(None) => resident.outfit,
                         Err(e) => {
@@ -1432,16 +1460,22 @@ impl People {
         problems
     }
 
-    /// What `person` (of the type `guid`) wears for their suit, or None
-    /// for suit 0, whose clothes are the record's (or, for a record that
-    /// names no body, the type's default outfit).
-    fn dress(&mut self, guid: u32, person: &Person) -> Result<Option<Outfit>, String> {
+    /// What `person` (of the type `guid`, read with the rows `world`
+    /// wrote, [`Cast::rows_of`]) wears for their suit, or None for suit 0,
+    /// whose clothes are the record's (or, for a record that names no
+    /// body, the type's default outfit).
+    fn dress(
+        &mut self,
+        world: &World,
+        guid: u32,
+        person: &Person,
+    ) -> Result<Option<Outfit>, String> {
         if person.data.get(SUIT).copied().unwrap_or(0) == 0 {
             return Ok(None);
         }
         let assets = &self.assets;
         let wardrobe = self.wardrobe.get_or_insert_with(|| Wardrobe::of(assets));
-        let rows = self.cast.body_strings(guid)?;
+        let rows = self.cast.rows_of(world, guid)?;
         let clothes = dress(
             &Clothes::of(person, &rows),
             &person.data,
@@ -1753,11 +1787,6 @@ impl People {
         let view = View::new(camera);
         let light = view.light();
         let eye = view.eye(viewport);
-        // The plumb bob is loaded the first time the lot has one.
-        let mut bob = self.bob.take();
-        if bob.is_none() && world.objects.values().any(|o| o.guid == bob::STANDARD) {
-            bob = Some(Bob::load(&self.assets));
-        }
         let spin = bob::spin(self.clock);
         let bob_light = bob::light(camera.rotation);
         let mut problems = self.refresh_poses(world, camera.level, true);
@@ -1769,6 +1798,7 @@ impl People {
             cast,
             censor_boxes: boxes,
             drawn_censor,
+            bobs,
             ..
         } = self;
         drawn_attach.clear();
@@ -1810,7 +1840,7 @@ impl People {
             if let Some(rows) = world
                 .objects
                 .get(&person_id)
-                .and_then(|o| cast.body_strings(o.guid).ok())
+                .and_then(|o| cast.rows_of(world, o.guid).ok())
             {
                 let points = attach::attach(&body.skeleton, &cached.bones, &rows);
                 // What they hold goes first (`0x459e45`..`0x45a027`).
@@ -1873,13 +1903,24 @@ impl People {
                     );
                 }
             }
-            // The plumb bob over their head, if they hold it. Its pixels
-            // name the bob itself, so the pointer on it finds the bob, not
-            // the person: the original's bob draw makes the bob the
-            // graphic under the pointer when it changes the depth there
-            // (0x586455), and the house view then lists the bob's pie
-            // (0x48ca2c → 0x48c834).
-            let Some(bob_id) = bob::held_by(world, person_id) else {
+            // The plumb bob over their head, if they hold it: any object
+            // in the head slot whose type has its own 3D graphic, in the
+            // mode its suit picks (0x58f8ff). Its pixels name the bob
+            // itself, so the pointer on it finds the bob, not the person:
+            // the original's bob draw makes the bob the graphic under the
+            // pointer when it changes the depth there (0x586455), and the
+            // house view then lists the bob's pie (0x48ca2c → 0x48c834).
+            let Some(bob_id) = bob::in_head_slot(world, person_id) else {
+                continue;
+            };
+            let Some(suit) = world
+                .objects
+                .get(&bob_id)
+                .and_then(|o| cast.animated_suit(world.characters.definition(o.guid)))
+            else {
+                continue;
+            };
+            let Some(mode) = bob::Mode::of_suit(&suit) else {
                 continue;
             };
             let Some(head) =
@@ -1887,16 +1928,18 @@ impl People {
             else {
                 continue;
             };
-            let loaded_bob = match &bob {
-                Some(Ok(loaded)) => loaded,
-                Some(Err(e)) => {
+            let loaded_bob = match bobs
+                .entry(suit)
+                .or_insert_with_key(|suit| Bob::load_suit(assets, suit))
+            {
+                Ok(loaded) => &*loaded,
+                Err(e) => {
                     problems.push(format!(
                         "person {}'s plumb bob is not drawn: {e}",
                         person_id
                     ));
                     continue;
                 }
-                None => continue,
             };
             // The mood, cut to an integer as the original's `_ftol` does.
             let mood = world
@@ -1904,7 +1947,7 @@ impl People {
                 .get(&person_id)
                 .and_then(|o| o.person.as_ref())
                 .map_or(0, |p| p.motives[sims_sim::motives::MOOD] as i32);
-            let colour = bob::colour(mood);
+            let colour = bob::colour_in(mode, mood);
             target.set_id(Some(bob_id));
             let bones = [bob::root(*head, cached.root, spin)];
             for part in &loaded_bob.parts {
@@ -1929,7 +1972,6 @@ impl People {
         }
         target.set_id(None);
         drawn_censor.sort_by_key(|c| c.id);
-        self.bob = bob;
         Drawn {
             people: drawn_count,
             problems,
