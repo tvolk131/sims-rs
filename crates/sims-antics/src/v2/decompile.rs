@@ -825,6 +825,10 @@ const POLISH_CELL_BUILDS: usize = 8;
 /// v2 builtins with the same bytes ([`raw_builtin_spellings`]).
 const POLISH_RAW_BUILDS: usize = 24;
 
+/// The most builds [`Model::polish`] may take to find the `raw { }` blocks refused alone that
+/// it can write as builtins with `keep_layout` added to their tree's header.
+const POLISH_LAYOUT_BUILDS: usize = 8;
+
 /// The lifter's self-loop note, as an `allow` and as a plain comment.
 const LOOP_ALLOW: &str = "// antics-lint: allow(unbounded_loop_without_yield): the original's";
 const LOOP_NOTE: &str = "// The original's";
@@ -859,10 +863,6 @@ fn loop_allows(text: String) -> String {
     }
     if changed { lines.join("\n") } else { text }
 }
-
-/// The untagged block [`Model::semi_global_module`] declares the linked library's trees in
-/// when their frames may be wider than four argument words.
-const SEMI_GLOBALS_WIDE: &str = "semi_globals_wide";
 
 /// The most `match` passes [`Model::polish`] takes: one per level of chains nested in
 /// another chain's arms.
@@ -1650,6 +1650,76 @@ fn raw_builtin_spellings(text: &str) -> Vec<(Rewrite, usize)> {
             text: stmts.join(&format!("\n{indent}")),
         };
         out.push((rewrite, stmts.len()));
+    }
+    out
+}
+
+/// `rewrites` without the second and later copies of an edit (the `keep_layout` pin two
+/// blocks of one tree both bring).
+fn unique_rewrites(rewrites: Vec<(Rewrite, usize)>) -> Vec<(Rewrite, usize)> {
+    let mut out: Vec<(Rewrite, usize)> = Vec::new();
+    for (w, n) in rewrites {
+        if !out
+            .iter()
+            .any(|(o, _)| o.range == w.range && o.text == w.text)
+        {
+            out.push((w, n));
+        }
+    }
+    out
+}
+
+/// The edit adding `keep_layout` to the `#[bhav(..)]` header of the tree that byte `pos` of
+/// `text` is in (the last header line before it), or `None` when that tree has no such
+/// one-line header or keeps its layout already.
+fn keep_layout_pin(text: &str, pos: usize) -> Option<Rewrite> {
+    let mut end = pos;
+    loop {
+        let start = text[..end].rfind('\n').map_or(0, |n| n + 1);
+        let line = &text[start..end];
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("#[id(") {
+            return None;
+        }
+        if trimmed.starts_with("#[bhav(") {
+            let body = line.trim_end();
+            if unquoted(body).contains("keep_layout") || !body.ends_with(")]") {
+                return None;
+            }
+            let at = start + body.len() - 2;
+            return Some(Rewrite {
+                range: at..at,
+                text: ", keep_layout".to_owned(),
+            });
+        }
+        if start == 0 {
+            return None;
+        }
+        end = start - 1;
+    }
+}
+
+/// `line` without its string literals (a `label = ".."` may hold any text), each replaced
+/// by `""`.
+fn unquoted(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == '"' {
+            while let Some(q) = chars.next() {
+                match q {
+                    '\\' => {
+                        chars.next();
+                    }
+                    '"' => {
+                        out.push('"');
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
     out
 }
@@ -3755,7 +3825,28 @@ impl Model {
                 r.iter().map(|(w, _)| w.clone()).collect()
             };
             let ok = |r: &[(Rewrite, usize)]| same(&apply_rewrites(&base, &rewrites(r)));
-            let kept = keep_joint(&raws, &ok, POLISH_RAW_BUILDS);
+            let mut kept = keep_joint(&raws, &ok, POLISH_RAW_BUILDS);
+            // A block refused alone may be the last that keeps its tree's layout (a raw block
+            // keeps the backend pass off the tree): it goes with `keep_layout` added to the
+            // tree's `#[bhav(..)]`, which keeps the layout as the block did.
+            let pinned: Vec<Vec<(Rewrite, usize)>> = raws
+                .iter()
+                .filter(|(w, _)| !kept.iter().any(|(k, _)| k.range == w.range))
+                .filter_map(|(w, n)| {
+                    let pin = keep_layout_pin(&base, w.range.start)?;
+                    Some(vec![(w.clone(), *n), (pin, 0)])
+                })
+                .collect();
+            if !pinned.is_empty() {
+                let with = |g: &[Vec<(Rewrite, usize)>]| {
+                    let mut all = kept.clone();
+                    all.extend(g.iter().flatten().cloned());
+                    ok(&unique_rewrites(all))
+                };
+                let more = keep_joint(&pinned, &with, POLISH_LAYOUT_BUILDS);
+                kept =
+                    unique_rewrites(kept.into_iter().chain(more.into_iter().flatten()).collect());
+            }
             for (w, n) in &kept {
                 if let Some(id) = tree_id_before(&text, w.range.start) {
                     *raw_spelled.entry(id).or_default() += n;
@@ -6895,19 +6986,26 @@ impl Model {
         }
     }
 
-    /// The module semi-global tree `id` is declared in. A block of the linked library
-    /// (`extern "Name" mod`) is trusted to declare a tree's whole frame, so it proves a
-    /// call to it narrow (four argument words or fewer); a tree whose frame the lift does
-    /// not know to be that narrow (no literal call of it, and no catalog arity of 4 or
-    /// fewer) goes in an untagged block, `SEMI_GLOBALS_WIDE`, which proves nothing.
-    fn semi_global_module(&self, id: u16) -> &'static str {
+    /// The `#[frame(args = ..)]` width semi-global tree `id`'s declaration in the linked
+    /// library's block (`extern "Name" mod`) carries. The block is trusted to declare a
+    /// tree's whole frame, so a declaration without one proves a call narrow (four argument
+    /// words or fewer). A tree the lift does not know to be that narrow (no literal call of
+    /// it, and no catalog arity of 4 or fewer) declares its catalog arity, or `unknown`,
+    /// which proves nothing. An unlinked object's block is untagged and proves nothing either.
+    fn semi_global_width(&self, id: u16) -> Option<String> {
         let narrow = self.literal_calls.contains_key(&id)
             || self.library_arities.get(&id).is_some_and(|&n| n <= 4);
         if narrow || self.semi_global_link().is_none() {
-            "semi_globals"
-        } else {
-            SEMI_GLOBALS_WIDE
+            return None;
         }
+        // `args = N` takes a byte; a wider catalog arity (no install gives one) proves
+        // nothing more than `unknown`.
+        Some(
+            self.library_arities
+                .get(&id)
+                .and_then(|&n| u8::try_from(n).ok())
+                .map_or_else(|| "unknown".to_owned(), |n| n.to_string()),
+        )
     }
 
     fn generate(&self, plan: &Plan) -> Generated {
@@ -6945,11 +7043,8 @@ impl Model {
 
         let mut lib_globals: Vec<u16> = Vec::new();
         let mut lib_semis: Vec<u16> = Vec::new();
-        let mut wide_semis: Vec<u16> = Vec::new();
         for &id in self.extern_calls.keys() {
-            if id >= 8192 && self.semi_global_module(id) == SEMI_GLOBALS_WIDE {
-                wide_semis.push(id);
-            } else if id >= 8192 {
+            if id >= 8192 {
                 lib_semis.push(id);
             } else if id >= 256 && !self.std_globals.contains(&id) {
                 lib_globals.push(id);
@@ -6965,7 +7060,6 @@ impl Model {
         for (module, ids, lib) in [
             (self.globals_module(), &lib_globals, None),
             ("semi_globals", &lib_semis, link),
-            (SEMI_GLOBALS_WIDE, &wide_semis, None),
         ] {
             if ids.is_empty() {
                 continue;
@@ -6989,8 +7083,12 @@ impl Model {
                         _ => (String::new(), String::new()),
                     };
                 let ident = &self.extern_calls[id];
+                let frame = match self.semi_global_width(*id).filter(|_| *id >= 8192) {
+                    Some(width) => format!("#[frame(args = {width})] "),
+                    None => String::new(),
+                };
                 out.line(format!(
-                    "#[id({id})] fn {ident}({params}) -> bool;{comment}"
+                    "#[id({id})] {frame}fn {ident}({params}) -> bool;{comment}"
                 ));
             }
             out.indent -= 1;
@@ -9116,7 +9214,7 @@ impl Translator<'_> {
         } else {
             let ident = self.model.extern_calls.get(&id)?;
             let module = if id >= 8192 {
-                self.model.semi_global_module(id)
+                "semi_globals"
             } else if self.model.std_globals.contains(&id) {
                 "globals"
             } else {

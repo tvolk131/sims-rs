@@ -124,12 +124,14 @@ object \"V2.4 Lift Finale Link\" {
 }
 
 #[test]
-fn semi_global_trees_of_unknown_width_stay_out_of_the_library_block() {
+fn semi_global_trees_of_unknown_width_declare_it_in_the_library_block() {
     // A library block is trusted to declare a tree's whole frame, so a call to one of its
     // trees with four or fewer words is taken as narrow. A tree the lift only sees called
-    // through the temps (no literal arguments) is declared with no parameters: in the
-    // library block only when its catalog arity is 4 or fewer (8204), and otherwise in an
-    // untagged block (8202, six arguments; 8203, not in the catalog).
+    // through the temps (no literal arguments) is declared with no parameters, and with its
+    // width when it is not known to be narrow: `#[frame(args = 6)]` for 8202 (six catalog
+    // arguments), `#[frame(args = unknown)]` for 8203 (not in the catalog). 8204 (catalog
+    // arity 2) needs none. (v2.4 put 8202 and 8203 in an untagged `semi_globals_wide`
+    // block; #503's extern frame widths let them join the library block.)
     let source = "extern \"Finale Probe Lib\" mod probe {
     #[id(8202)] fn wide() -> Result;
     #[id(8203)] fn unknown() -> Result;
@@ -157,13 +159,14 @@ object \"V2.4 Lift Finale Wide\" {
             lifted[at..at + lifted[at..].find("\n}").expect("block end")].to_owned()
         };
         let library = block("extern \"Finale Probe Lib\" mod semi_globals {");
-        let wide = block("extern mod semi_globals_wide {");
-        assert!(library.contains("#[id(8204)]"), "{lifted}");
-        for id in ["#[id(8202)]", "#[id(8203)]"] {
-            assert!(wide.contains(id), "{lifted}");
-            assert!(!library.contains(id), "{lifted}");
+        for decl in [
+            "#[id(8202)] #[frame(args = 6)] fn ",
+            "#[id(8203)] #[frame(args = unknown)] fn ",
+            "#[id(8204)] fn ",
+        ] {
+            assert!(library.contains(decl), "{decl}\n{lifted}");
         }
-        assert!(lifted.contains("semi_globals_wide::"), "{lifted}");
+        assert!(!lifted.contains("semi_globals_wide"), "{lifted}");
         let t = report.trees.iter().find(|t| t.id == 4200).expect("tree");
         assert!(
             matches!(t.check, TreeCheck::Identical | TreeCheck::Equivalent),

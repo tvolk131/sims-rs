@@ -40,6 +40,7 @@ mod v2_4_compiler_upgrades;
 mod v2_4_dead_false;
 mod v2_4_lift_finale;
 mod v2_5_compiler;
+mod v2_5_lift_finale;
 mod v2_5_lift_locals;
 mod v2_5_lint;
 mod v2_compiler;
