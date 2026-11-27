@@ -11,7 +11,7 @@ publish = false
 [dependencies]
 sims-core.workspace = true
 sims-formats.workspace = true
-symphonia-bundle-mp3 = { version = "0.5.5", default-features = false, features = ["mp3"] }
+symphonia-bundle-mp3 = { version = "0.6.1", default-features = false, features = ["mp3"] }
 symphonia-core = "0.5.5"
 # Live playback, for the `play` example only; off by default so tests and
 # CI need no audio device or system audio library.
