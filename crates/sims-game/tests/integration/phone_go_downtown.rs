@@ -272,13 +272,35 @@ fn the_phones_go_downtown_leaves_the_lot_once_through_the_shell() {
         "the lot pick departs once"
     );
     // Routine 17 wrote one token for each value it saves, and the trip
-    // carries exactly those (GUIDs and counts) to the destination.
+    // carries exactly those (GUIDs and counts) to the destination, where
+    // the arrival takes the clock (GUIDs 7 and 8) out and sets the clock
+    // to it (0x4f1ae9 → 0x46d86f).
     let written = written.expect("the trip was asked for");
     assert!(!written.is_empty(), "routine 17 saved the caller's state");
+    // The arrival takes the hour token, then the minute token, and stops
+    // at the first one missing (a clock token of 0 is never written).
+    let count_of = |guid| written.iter().find(|&&(g, _)| g == guid).map(|&(_, c)| c);
+    let (hour, minute) = (count_of(7), count_of(8));
+    let arrived: Vec<(u32, u16)> = written
+        .iter()
+        .copied()
+        .filter(|&(guid, _)| {
+            !(hour.is_some() && guid == 7 || hour.is_some() && minute.is_some() && guid == 8)
+        })
+        .collect();
     assert_eq!(
         tokens_of(game, leader_guid),
-        written,
-        "the saved state traveled as routine 17 wrote it"
+        arrived,
+        "the saved state traveled as routine 17 wrote it, less the clock"
+    );
+    let (Some(hour), Some(minute)) = (hour, minute) else {
+        panic!("the capture asks at a clock with both tokens: {written:?}");
+    };
+    let globals = &game.lot().world().globals;
+    assert_eq!(
+        (globals[0], globals[5]),
+        (hour as i16, minute as i16),
+        "the arrival sets the clock from the tokens"
     );
     // The Downtown lot plays on.
     assert_eq!(game.run(10), 10);

@@ -177,6 +177,32 @@ pub fn take_token(items: &mut Vec<Item>, place: i16, amount: i16) {
     }
 }
 
+/// The arrival clock as a native arrival reads it back from member 0's
+/// inventory (0x4f1ae9: Downtown at 0x4f1d1b, Studio Town at 0x4f1ea6, the
+/// solo path at 0x4f210a and the family path at 0x4f22b5, each followed
+/// by 0x46d86f). The first kind-2 token of GUID 7 (0x41f69c, from the
+/// start) gives the hour and is erased (0x41f56b with -1); then the first
+/// of GUID 8 gives the minute and is erased. A place of -1 (none found)
+/// stops there with no clock, the hour token already erased when only the
+/// minute is missing. Any other place is read as [`read_token`] reads it
+/// (the caller's own values give a count of 1, 0x4f1d29..0x4f1d2f) and
+/// erased as [`take_token`] erases it.
+pub fn take_arrival_clock(items: &mut Vec<Item>) -> Option<(i16, i16)> {
+    let mut clock = [0i16; 2];
+    for (slot, guid) in clock
+        .iter_mut()
+        .zip([ARRIVAL_HOUR_GUID, ARRIVAL_MINUTE_GUID])
+    {
+        let place = token_place(items, SAVED_STATE_KIND, guid);
+        if place == -1 {
+            return None;
+        }
+        *slot = read_token(items, place).count as i16;
+        take_token(items, place, -1);
+    }
+    Some((clock[0], clock[1]))
+}
+
 /// The arrival clock 0x45a785 works out: with `absolute` (a residential lot
 /// leaving for houses 40 to 49) the hour and minute are the time itself.
 /// Otherwise they are added to the clock as words: 60 minutes or more carry
@@ -528,6 +554,36 @@ mod tests {
         let mut many = vec![item(0, 0, 1); 0x8000];
         many.push(item(2, 7, 1));
         assert_eq!(token_place(&many, 2, 7), (0x8000u16) as i16);
+    }
+
+    /// 0x4f1ae9's clock read: both tokens give the clock and are erased;
+    /// a missing minute erases the hour and gives none; a missing hour
+    /// touches nothing. Other tokens stay.
+    #[test]
+    fn take_arrival_clock_reads_and_erases_both_tokens_or_stops() {
+        let token = |kind: i32, guid: u32, count: u16| Item { kind, guid, count };
+        let mut items = vec![
+            token(SAVED_STATE_KIND, 0, 50),
+            token(SAVED_STATE_KIND, ARRIVAL_HOUR_GUID, 13),
+            token(1, ARRIVAL_MINUTE_GUID, 2),
+            token(SAVED_STATE_KIND, ARRIVAL_MINUTE_GUID, 7),
+        ];
+        assert_eq!(take_arrival_clock(&mut items), Some((13, 7)));
+        assert_eq!(
+            items,
+            [
+                token(SAVED_STATE_KIND, 0, 50),
+                token(1, ARRIVAL_MINUTE_GUID, 2)
+            ]
+        );
+
+        let mut items = vec![token(SAVED_STATE_KIND, ARRIVAL_HOUR_GUID, 9)];
+        assert_eq!(take_arrival_clock(&mut items), None);
+        assert_eq!(items, []);
+
+        let mut items = vec![token(SAVED_STATE_KIND, ARRIVAL_MINUTE_GUID, 30)];
+        assert_eq!(take_arrival_clock(&mut items), None);
+        assert_eq!(items, [token(SAVED_STATE_KIND, ARRIVAL_MINUTE_GUID, 30)]);
     }
 
     #[test]

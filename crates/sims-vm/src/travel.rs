@@ -3699,15 +3699,25 @@ fn return_from_request_in(
 /// session is the one [`return_from_request`] and
 /// [`return_from_destination`] take.
 ///
-/// Every traveler must be on the lot and go along: a party that leaves
-/// one behind (a whole family's member Go Somewhere Else, which asks in
-/// mode 0, does not take) or takes someone else (a mode 1 request that
-/// saved a household member visiting the lot) is refused
-/// ([`TravelError::InvalidParty`]), as is a date anywhere but Downtown
-/// (whose middle ped marker alone brings the companion in with routine
-/// 19) or with the leader as its own companion, and a house that is the trip's home, its current destination
-/// or no destination. A refused request stays; it is cleared once the trip
-/// succeeds.
+/// The party may leave travelers behind: a whole family's member Go
+/// Somewhere Else asks in mode 0 and takes that member alone, and a mode 1
+/// request takes the household's travelers, not a date's companion. Those
+/// who stay are flushed into the neighborhood with the lot, as 0x4fc59c's
+/// save (0x428843) leaves them, and leave the trip; their inventories are
+/// left as they are. Back home they are household members who did not
+/// travel: the home lot keeps them where it froze them and attaches them
+/// from their records again. A family arrival on the next lot makes every
+/// member of the family (0x4f2253..0x4f235c), so a member left on an
+/// earlier lot is made there from its record and rejoins the trip.
+///
+/// Every traveler who goes must be on the lot. A party that takes someone
+/// who is not a traveler (a mode 1 request that saved a household member
+/// visiting the lot), or is led by someone outside the household, is
+/// refused ([`TravelError::InvalidParty`]), as is a date anywhere but
+/// Downtown (whose middle ped marker alone brings the companion in with
+/// routine 19) or with the leader as its own companion, and a house that
+/// is the trip's home, its current destination or no destination. A
+/// refused request stays; it is cleared once the trip succeeds.
 pub fn travel_on_from_request(
     install_root: &Path,
     store: &NeighborhoodStore,
@@ -4074,12 +4084,22 @@ fn return_home(
     //     departure did not save keeps its own.
     //     A trip on to another destination keeps the ones routine 17 wrote
     //     again for the next arrival marker.
+    //     A traveler a hop leaves on the lot keeps what its inventory
+    //     holds: nothing reads or erases it as the next lot loads.
     let rewritten: &[i16] = match leg {
         Leg::OnTo(trip, _) => &trip.saved,
         Leg::Home(_) => &[],
     };
+    let stays = |neighbor: i16| {
+        onward.as_ref().is_some_and(|(_, going)| {
+            auth_session
+                .travelers
+                .iter()
+                .any(|t| t.neighbor_id == neighbor && !going.contains(&t.guid))
+        })
+    };
     for &neighbor in &persisted.departure_tokens {
-        if !rewritten.contains(&neighbor) {
+        if !rewritten.contains(&neighbor) && !stays(neighbor) {
             clear_saved_state_tokens(&mut dest_saved.world, neighbor);
         }
     }
@@ -4242,8 +4262,9 @@ fn return_home(
         tuning.friendship_threshold,
     )?;
 
-    if let (Some(request), Leg::OnTo(trip, _)) = (&onward, leg) {
+    if let (Some((request, going)), Leg::OnTo(trip, _)) = (&onward, leg) {
         if let Some(missing) = (0..auth_session.travelers.len())
+            .filter(|&idx| going.contains(&auth_session.travelers[idx].guid))
             .find(|idx| !resolved_by_index.contains_key(idx))
             .map(|idx| auth_session.travelers[idx].guid)
         {
@@ -4252,6 +4273,27 @@ fn return_home(
                 auth_session.destination_house
             )));
         }
+        // The travelers who stay are left with the lot: the merge above
+        // put them into the neighborhood (0x428843 saves it before the
+        // next lot loads, 0x4fc59c), and they leave the trip. Back home
+        // they are the household members who did not travel, attached
+        // from their records again.
+        returning_states.retain(|state| going.contains(&state.guid));
+        // Their saved state stays theirs: the next leg's cleanup (an abort,
+        // or a trip home no request rewrote) erases only the tokens of
+        // those who went, even when routine 17 saved a stayer too (a
+        // second request the shell never took).
+        let saved: Vec<i16> = trip
+            .saved
+            .iter()
+            .copied()
+            .filter(|&neighbor| {
+                !auth_session
+                    .travelers
+                    .iter()
+                    .any(|t| t.neighbor_id == neighbor && !going.contains(&t.guid))
+            })
+            .collect();
         return travel_on(
             base,
             store,
@@ -4262,7 +4304,7 @@ fn return_home(
             ),
             destination_lot,
             request,
-            &trip.saved,
+            &saved,
             returning_states,
             updated_stored,
             funds_at_return,
@@ -4409,7 +4451,7 @@ fn onward_request(
     session: &TravelSession,
     trip: &sims_sim::TripRequest,
     departure: &TripDeparture,
-) -> Result<TravelRequest, TravelError> {
+) -> Result<(TravelRequest, BTreeSet<u32>), TravelError> {
     let house = i64::from(trip.house);
     if house == i64::from(session.home_house) {
         return Err(TravelError::SessionMismatch(format!(
@@ -4457,19 +4499,34 @@ fn onward_request(
             }
             BTreeSet::from([*leader_guid, *companion_guid])
         }
-        // A whole family is every member on the lot (0x45a3ef): the
-        // travelers, when they are all the household's.
+        // A whole family is every member of the caller's family, as the
+        // lot has it now, with a person on the lot (0x45a3ef; a missing
+        // family takes the leader alone, 0x45a4fc). A traveler that is not
+        // (a date's companion, one that left the family, one whose person
+        // is gone) stays.
         TravelParty::WholeFamily { leader_guid } => {
-            if let Some(other) = session.travelers.iter().find(|t| !t.is_household_member) {
-                return Err(TravelError::InvalidParty(format!(
-                    "Sim 0x{:08X} travels with the family but is not in it, so a whole \
-                     family's trip on leaves it behind",
-                    other.guid
-                )));
-            }
-            let mut all = travelers.clone();
-            all.insert(*leader_guid);
-            all
+            let mut members: BTreeSet<u32> = world
+                .families
+                .iter()
+                .find(|f| f.id == i32::from(trip.family))
+                .map(|family| {
+                    family
+                        .members
+                        .iter()
+                        .copied()
+                        .filter(|&guid| {
+                            world.people.iter().any(|id| {
+                                world
+                                    .objects
+                                    .get(id)
+                                    .is_some_and(|o| o.guid == guid && o.person.is_some())
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            members.insert(*leader_guid);
+            members
         }
         TravelParty::HouseholdGroup { .. } => {
             return Err(TravelError::InvalidParty(
@@ -4477,13 +4534,25 @@ fn onward_request(
             ));
         }
     };
-    if party != travelers {
+    // Whoever does not go stays on the lot (a member Go Somewhere Else
+    // takes alone, mode 0); someone who is not a traveler cannot go.
+    if !party.is_subset(&travelers) {
         return Err(TravelError::InvalidParty(format!(
-            "the trip on takes {party:08X?}, but the trip's travelers are {travelers:08X?}; a \
-             traveler left behind is not carried out"
+            "the trip on takes {party:08X?}, but the trip's travelers are {travelers:08X?}; \
+             someone who is not a traveler cannot go along"
         )));
     }
-    Ok(request)
+    let leader = request.party.leader_guid();
+    if !session
+        .travelers
+        .iter()
+        .any(|t| t.guid == leader && t.is_household_member)
+    {
+        return Err(TravelError::InvalidParty(format!(
+            "Sim 0x{leader:08X} leads the trip on but is not a member of the household"
+        )));
+    }
+    Ok((request, party))
 }
 
 /// The rest of [`travel_on_from_request`], once the destination lot is
@@ -5584,17 +5653,50 @@ fn boot_destination_lot(
         }
     }
 
-    // Make the travelers. On a family arrival 0x4f1ae9 makes them in the
-    // order of the family's members (0x4f2253..0x4f235c).
-    let mut ordered: Vec<&LiveTravelerSnapshot> = snapshots.iter().collect();
-    if arrival == ArrivalFamily::Family {
-        ordered.sort_by_key(|snap| {
-            household
+    // Make the travelers. On a family arrival 0x4f1ae9 makes every member
+    // of the family, in the order of its members (0x4f2253..0x4f235c),
+    // whether or not it traveled: a member that did not (one a hop left
+    // on another lot) is made by the person factory from its record, as
+    // the original makes every member, and joins the trip. A traveler
+    // that is not a member comes last.
+    // The family's members as the load has them: a deleted character, or
+    // an entry with no record, is not one (the neighborhood load drops
+    // it), so member 0 is the first that is.
+    let roster: Vec<u32> = household
+        .iter()
+        .copied()
+        .filter(|&guid| {
+            !stored.deleted_characters.contains(&guid) && world.neighbors.first_of(guid).is_some()
+        })
+        .collect();
+    let ordered: Vec<Arriving<'_>> = if arrival == ArrivalFamily::Family {
+        let mut ordered: Vec<Arriving<'_>> = roster
+            .iter()
+            .map(
+                |&guid| match snapshots.iter().find(|snap| snap.guid == guid) {
+                    Some(snap) => Arriving::Traveler(snap),
+                    None => Arriving::Member(guid),
+                },
+            )
+            .collect();
+        ordered.extend(
+            snapshots
                 .iter()
-                .position(|&guid| guid == snap.guid)
-                .unwrap_or(usize::MAX)
-        });
-    }
+                .filter(|snap| !roster.contains(&snap.guid))
+                .map(Arriving::Traveler),
+        );
+        ordered
+    } else {
+        snapshots.iter().map(Arriving::Traveler).collect()
+    };
+    // The member whose inventory holds the arrival clock: member 0 of the
+    // family the arrival holds (0x4e97dc(0)), the traveler on a solo
+    // arrival. A trip with no native arrival reads none.
+    let clock_holder = match arrival {
+        ArrivalFamily::Solo => Some(leader_guid),
+        ArrivalFamily::Family => roster.first().copied(),
+        ArrivalFamily::Group => None,
+    };
     let (traveler_records, leader_id, counted) = {
         let interpreter = Interpreter {
             view_rotation,
@@ -5638,7 +5740,11 @@ fn boot_destination_lot(
         // arrival meets no marker.
         let tokens_restored = arrival != ArrivalFamily::Group;
 
-        for snap in ordered {
+        for arriving in ordered {
+            let (guid, snap) = match arriving {
+                Arriving::Traveler(snap) => (snap.guid, Some(snap)),
+                Arriving::Member(guid) => (guid, None),
+            };
             // A date's companion is not made here when the leader holds its
             // kind-1 token: the middle ped marker's Generic Sims Call 19
             // makes it from that token (EP3 PedMarkers tree 0x100e, node 11),
@@ -5646,7 +5752,8 @@ fn boot_destination_lot(
             // departure wrote no token (any the leader holds was its own),
             // so its companion is made here, with the date links, as that
             // build did.
-            if is_date
+            if let Some(snap) = snap
+                && is_date
                 && companion_from_token
                 && snap.guid != leader_guid
                 && leader_neighbor.is_some_and(|nid| {
@@ -5671,7 +5778,7 @@ fn boot_destination_lot(
                     world
                         .objects
                         .get(&id)
-                        .is_some_and(|o| o.guid == snap.guid && o.person.is_some())
+                        .is_some_and(|o| o.guid == guid && o.person.is_some())
                 })
                 .collect();
             let (person_id, reused) = if let Some(primary) = matching.first().copied() {
@@ -5693,26 +5800,41 @@ fn boot_destination_lot(
                 }
                 let _ = crate::placement::unlink_off_lot(&mut world, primary);
                 (primary, true)
-            } else {
-                let id = interpreter
-                    .create_person(&mut world, snap.guid)
-                    .map_err(|e| {
-                        TravelError::Lot(format!(
-                            "creating traveler 0x{:08X} on house {dest_house}: {e}",
-                            snap.guid
-                        ))
-                    })?;
+            } else if snap.is_some() {
+                let id = interpreter.create_person(&mut world, guid).map_err(|e| {
+                    TravelError::Lot(format!(
+                        "creating traveler 0x{guid:08X} on house {dest_house}: {e}"
+                    ))
+                })?;
                 (id, false)
+            } else {
+                // A member that did not travel is made as 0x4e9719 makes
+                // it: one the installed packs cannot make (a pet without
+                // the pet pack) is left out, not a fault.
+                match interpreter.try_create_person(&mut world, guid) {
+                    Ok(Some(id)) => (id, false),
+                    Ok(None) => continue,
+                    Err(e) => {
+                        return Err(TravelError::Lot(format!(
+                            "creating family member 0x{guid:08X} on house {dest_house}: {e}"
+                        )));
+                    }
+                }
             };
             // The traveler carries its fame, so a famous Sim that is not
             // selected gets its star when it is placed (0x447a57 ->
             // 0x447a82), here or by the middle ped marker. Its date link is
-            // written after selection.
-            let saved_fame = snap
-                .person_data
-                .get(PERSON_FAME_LEVEL)
-                .copied()
-                .unwrap_or(0);
+            // written after selection. A member made from its record keeps
+            // the fame the record gave it.
+            let saved_fame = match snap {
+                Some(snap) => snap.person_data.get(PERSON_FAME_LEVEL).copied(),
+                None => world
+                    .objects
+                    .get(&person_id)
+                    .and_then(|o| o.person.as_ref())
+                    .and_then(|p| p.data.get(PERSON_FAME_LEVEL).copied()),
+            }
+            .unwrap_or(0);
             if let Some(person) = world
                 .objects
                 .get_mut(&person_id)
@@ -5755,27 +5877,58 @@ fn boot_destination_lot(
             }
 
             // Overlay live motives, skills, career/fame, accessories, outfits, and visitor word.
-            let keep_motives = tokens_restored && departure_tokens.contains(&snap.neighbor_id);
-            apply_traveler_live_state(
-                &mut world,
-                person_id,
-                snap,
-                residential,
-                saved_fame,
-                None,
-                keep_motives,
-            );
-            if snap.guid == leader_guid {
+            // A member made from its record has what the factory gave it.
+            let neighbor_id = person_neighbor(&world, person_id);
+            let record = match snap {
+                Some(snap) => {
+                    let keep_motives =
+                        tokens_restored && departure_tokens.contains(&snap.neighbor_id);
+                    apply_traveler_live_state(
+                        &mut world,
+                        person_id,
+                        snap,
+                        residential,
+                        saved_fame,
+                        None,
+                        keep_motives,
+                    );
+                    TravelerRecord {
+                        guid,
+                        neighbor_id: snap.neighbor_id,
+                        is_household_member: snap.is_household_member,
+                        home_object_id: snap.home_object_id,
+                        destination_object_id: person_id,
+                        had_hotel_key_before_trip: snap.had_hotel_key_before_trip,
+                    }
+                }
+                None => TravelerRecord {
+                    guid,
+                    neighbor_id,
+                    is_household_member: true,
+                    home_object_id: None,
+                    destination_object_id: person_id,
+                    // Check-in gave it no key, so any it holds when the
+                    // trip ends is its own and stays.
+                    had_hotel_key_before_trip: true,
+                },
+            };
+            if guid == leader_guid {
                 leader_obj_id = Some(person_id);
             }
-            records.push(TravelerRecord {
-                guid: snap.guid,
-                neighbor_id: snap.neighbor_id,
-                is_household_member: snap.is_household_member,
-                home_object_id: snap.home_object_id,
-                destination_object_id: person_id,
-                had_hotel_key_before_trip: snap.had_hotel_key_before_trip,
-            });
+            records.push(record);
+
+            // Once member 0 is made, the arrival reads the clock the
+            // departure's routine 17 left in its inventory, found by the
+            // person's neighbor ID (+0x5ca) or added empty (0x42a8a1), and
+            // sets the clock to it (0x46d86f).
+            if clock_holder == Some(guid) {
+                arrive_at_clock(&mut world, neighbor_id);
+            }
+        }
+        // A solo arrival on house 99 then sets the clock to noon whatever
+        // the tokens said (0x4f21a1..0x4f21b2).
+        if arrival == ArrivalFamily::Solo && dest_house == 99 {
+            crate::lifecycle::set_clock(&mut world, 12, 0);
         }
 
         let _ = interpreter
@@ -5875,6 +6028,47 @@ fn boot_destination_lot(
         move_objects: false,
     };
     Ok((lot, traveler_records))
+}
+
+/// One person a destination's arrival makes: a traveler, with the state it
+/// left with, or a member of the arriving family that did not travel,
+/// which the person factory makes from its record (0x4f2265..0x4f2277).
+#[derive(Clone, Copy)]
+enum Arriving<'a> {
+    Traveler(&'a LiveTravelerSnapshot),
+    Member(u32),
+}
+
+/// A person's neighbor ID (person data word 31, +0x5ca), or 0.
+fn person_neighbor(world: &World, person: u16) -> i16 {
+    world
+        .objects
+        .get(&person)
+        .and_then(|o| o.person.as_ref())
+        .and_then(|p| p.data.get(PERSON_NEIGHBOR).copied())
+        .unwrap_or(0)
+}
+
+/// The arrival clock on a native arrival (0x4f1ae9): member 0's inventory,
+/// found by `neighbor` or added empty (0x42a8a1), gives up its kind-2
+/// tokens 7 and 8 ([`trip::take_arrival_clock`]), and the clock becomes
+/// them (0x46d86f, [`crate::lifecycle::set_clock`]). Without both tokens
+/// the clock stays as the lot was saved.
+fn arrive_at_clock(world: &mut World, neighbor: i16) {
+    let inventories = &mut world.neighbors.inventories;
+    let slot = match inventories.iter().position(|i| i.neighbor == neighbor) {
+        Some(slot) => slot,
+        None => {
+            inventories.push(Inventory {
+                neighbor,
+                items: Vec::new(),
+            });
+            inventories.len() - 1
+        }
+    };
+    if let Some((hour, minute)) = trip::take_arrival_clock(&mut inventories[slot].items) {
+        crate::lifecycle::set_clock(world, hour, minute);
+    }
 }
 
 /// Restores the frozen home lot snapshot from REDB, reconciles neighborhood
@@ -9154,11 +9348,13 @@ mod tests {
     ///    and 14 cut toward zero (GUIDs 0 to 6; a motive cut to 0 gets no
     ///    token), and member 0's inventory gets the arrival clock (GUIDs 7
     ///    and 8, 0x45a785), in the world and in the stored neighborhood.
-    /// 2. The middle ped marker's routine 21 (0x45098a) restores them as it
-    ///    places each traveler. A motive with no token keeps the value the
-    ///    traveler was made with. The clock tokens name nothing for routine
-    ///    21 (0x450a53), so they stay.
-    /// 3. The return brings the motives the travelers have on the
+    /// 2. The arrival (0x4f1ae9, family path 0x4f22b5) takes member 0's
+    ///    clock tokens out as soon as it is made and sets the clock to them
+    ///    (0x46d86f); the stored neighborhood keeps them.
+    /// 3. The middle ped marker's routine 21 (0x45098a) restores the rest
+    ///    as it places each traveler. A motive with no token keeps the
+    ///    value the traveler was made with.
+    /// 4. The return brings the motives the travelers have on the
     ///    destination home and takes every kind-2 token back out, the clock
     ///    included.
     #[test]
@@ -9242,11 +9438,26 @@ mod tests {
             .map(|&guid| lot.world.neighbors.first_of(guid).unwrap().id)
             .collect();
         let stored = store.load_neighborhood("UserData").unwrap().unwrap();
+        assert_eq!(
+            (
+                lot.world.globals[GLOBAL_HOURS],
+                lot.world.globals[GLOBAL_MINUTES]
+            ),
+            clock,
+            "the arrival sets the clock from member 0's tokens"
+        );
         for (k, &nid) in nids.iter().enumerate() {
+            let arrived: Vec<(u32, u16)> = expected[k]
+                .iter()
+                .copied()
+                .filter(|&(guid, _)| {
+                    guid != trip::ARRIVAL_HOUR_GUID && guid != trip::ARRIVAL_MINUTE_GUID
+                })
+                .collect();
             assert_eq!(
                 saved_state_tokens(&lot.world, nid),
-                expected[k],
-                "member {k}'s departure tokens"
+                arrived,
+                "member {k}'s departure tokens, less the clock the arrival took"
             );
             assert_eq!(
                 stored_tokens(&stored, nid, trip::SAVED_STATE_KIND),
@@ -9293,17 +9504,9 @@ mod tests {
                     ),
                 }
             }
-            let left = if k == 0 {
-                vec![
-                    (trip::ARRIVAL_HOUR_GUID, clock.0 as u16),
-                    (trip::ARRIVAL_MINUTE_GUID, clock.1 as u16),
-                ]
-            } else {
-                Vec::new()
-            };
             assert_eq!(
                 saved_state_tokens(&lot.world, nids[k]),
-                left,
+                [],
                 "member {k}'s tokens after routine 21"
             );
         }
@@ -9689,6 +9892,279 @@ mod tests {
             inspect_active_trip(&store, "UserData", first.home_house).unwrap(),
             None
         );
+    }
+
+    /// The Goth family on Magic Town lot 93, every member placed by the
+    /// marker: the store, the lot, the session and the members' GUIDs.
+    fn goth_family_on_lot_93(
+        root: &Path,
+        label: &str,
+    ) -> (NeighborhoodStore, impl Drop, Lot, TravelSession, Vec<u32>) {
+        let (store, guard) = live_store(root, label);
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let members = nh.family_in(5).unwrap().1.members.clone();
+        assert_eq!(members.len(), 3);
+        let mut home =
+            crate::lifecycle::enter_lot(root, &store, "UserData", 5, &[3], Frames::default())
+                .unwrap();
+        let request = TravelRequest::magic_town(
+            93,
+            TravelParty::WholeFamily {
+                leader_guid: members[0],
+            },
+            TravelTransport::MagicHole,
+        );
+        let departed =
+            depart_to_destination(root, &store, "UserData", &mut home, &request).unwrap();
+        let mut lot = departed.destination_lot;
+        let placed = |world: &World| {
+            members.iter().all(|&guid| {
+                let id = person_with_guid(world, guid).unwrap();
+                world.objects[&id].position[0] >= 0
+            })
+        };
+        for _ in 0..40 {
+            if placed(&lot.world) {
+                break;
+            }
+            lot.step_play().unwrap();
+        }
+        assert!(placed(&lot.world), "the marker placed the family");
+        (store, guard, lot, departed.session, members)
+    }
+
+    /// Go Somewhere Else for one member of a whole family asks in mode 0
+    /// and takes that member alone. The others stay with the lot: their
+    /// state goes into the neighborhood as the lot is left (0x4fc59c saves
+    /// it, 0x428843), their inventories are left as they are, and they
+    /// leave the trip. The traveler arrives alone (family 0), and the
+    /// arrival sets the clock from its tokens (0x4f1ae9 → 0x46d86f). Back
+    /// home the members who stayed are where the home lot froze them,
+    /// attached from their records again.
+    #[test]
+    fn a_member_goes_on_alone_and_the_family_stays() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard, mut lot, first, members) =
+            goth_family_on_lot_93(&root, "travel-on-alone");
+        let frozen = Saved::decode(
+            &decode_travel_envelope(
+                store
+                    .load_lot_snapshot("UserData", first.home_house)
+                    .unwrap()
+                    .unwrap()
+                    .saved_lot
+                    .as_deref()
+                    .unwrap(),
+            )
+            .unwrap()
+            .frozen_home_bytes,
+        )
+        .unwrap();
+        let frozen_place = |guid: u32| {
+            let id = person_with_guid(&frozen.world, guid).unwrap();
+            frozen.world.objects[&id].position
+        };
+        let stayer = members[1];
+        let stayer_id = person_with_guid(&lot.world, stayer).unwrap();
+        let stayer_nid = lot.world.neighbors.first_of(stayer).unwrap().id;
+        // A persistent word (a skill, 0x423827's table) the stayer gained
+        // on the lot, and a saved-state token nothing has read yet.
+        lot.world
+            .objects
+            .get_mut(&stayer_id)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[2] = 777;
+        set_neighbor_token_count(&mut lot.world, stayer_nid, trip::SAVED_STATE_KIND, 9, 4);
+
+        let leader = person_with_guid(&lot.world, members[0]).unwrap();
+        let leader_nid = lot.world.neighbors.first_of(members[0]).unwrap().id;
+        let clock = trip::arrival_clock(
+            lot.world.globals[GLOBAL_HOURS],
+            lot.world.globals[GLOBAL_MINUTES],
+            0,
+            30,
+            false,
+        );
+        ask_for_trip(&mut lot, leader, 21, 0, 30, 0);
+        assert_eq!(lot.world.trip_request.as_ref().unwrap().saved, [leader_nid]);
+        let on = travel_on_from_request(
+            &root,
+            &store,
+            &first,
+            &mut lot,
+            &TripDeparture {
+                answers: vec![3],
+                ..TripDeparture::default()
+            },
+        )
+        .unwrap();
+        let second = on.session.clone();
+        let mut downtown = on.destination_lot;
+        assert_eq!(second.destination_house, 21);
+        assert_eq!(
+            second.travelers.iter().map(|t| t.guid).collect::<Vec<_>>(),
+            [members[0]]
+        );
+        assert_eq!(downtown.load.family, 0, "the traveler arrives alone");
+        for &guid in &members[1..] {
+            assert!(person_with_guid(&downtown.world, guid).is_none());
+        }
+        assert_eq!(
+            (
+                downtown.world.globals[GLOBAL_HOURS],
+                downtown.world.globals[GLOBAL_MINUTES]
+            ),
+            clock,
+            "the arrival sets the clock from the traveler's tokens"
+        );
+        assert_eq!(
+            tokens_of(&downtown.world, leader_nid, trip::SAVED_STATE_KIND)
+                .iter()
+                .filter(|&&(guid, _)| guid == trip::ARRIVAL_HOUR_GUID
+                    || guid == trip::ARRIVAL_MINUTE_GUID)
+                .count(),
+            0,
+            "the arrival took the clock tokens"
+        );
+        assert_eq!(
+            downtown.world.neighbors.first_of(stayer).unwrap().data[2],
+            777
+        );
+        assert_eq!(
+            tokens_of(&downtown.world, stayer_nid, trip::SAVED_STATE_KIND),
+            [(9, 4)],
+            "the stayer's inventory is left as it was"
+        );
+        let stored = store.load_neighborhood("UserData").unwrap().unwrap();
+        assert_eq!(stored.families[&first.home_family].secondary_house(), 21);
+
+        let traveler = person_with_guid(&downtown.world, members[0]).unwrap();
+        ask_for_trip(&mut downtown, traveler, -1, 0, 30, 0);
+        let returned = return_from_request(
+            &root,
+            &store,
+            &second,
+            &mut downtown,
+            &[3],
+            Frames::default(),
+        )
+        .unwrap();
+        let world = &returned.home_lot.world;
+        assert_eq!(
+            returned
+                .report
+                .returning_travelers
+                .iter()
+                .map(|&(guid, _)| guid)
+                .collect::<Vec<_>>(),
+            [members[0]]
+        );
+        for &guid in &members[1..] {
+            let id = person_with_guid(world, guid).expect("the member who stayed is home");
+            assert_eq!(world.objects[&id].position, frozen_place(guid));
+        }
+        let id = person_with_guid(world, stayer).unwrap();
+        assert_eq!(
+            world.objects[&id].person.as_ref().unwrap().data[2],
+            777,
+            "attached from the record the hop wrote"
+        );
+        let stored = store.load_neighborhood("UserData").unwrap().unwrap();
+        assert_eq!(stored.families[&first.home_family].secondary_house(), 0);
+    }
+
+    /// A family arrival makes every member of the family (0x4f2253 ..
+    /// 0x4f235c), not only those who traveled: after one member went on
+    /// alone, that member's whole-family trip on (mode 1) brings the
+    /// members who stayed on the earlier lot back from their records, and
+    /// they join the trip, so the trip home brings all of them.
+    #[test]
+    fn a_family_arrival_makes_the_members_left_on_another_lot() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let (store, _guard, mut lot, first, members) =
+            goth_family_on_lot_93(&root, "travel-on-family-again");
+        let leader = person_with_guid(&lot.world, members[0]).unwrap();
+        ask_for_trip(&mut lot, leader, 21, 0, 30, 0);
+        let on = travel_on_from_request(
+            &root,
+            &store,
+            &first,
+            &mut lot,
+            &TripDeparture {
+                answers: vec![3],
+                ..TripDeparture::default()
+            },
+        )
+        .unwrap();
+        let second = on.session.clone();
+        let mut downtown = on.destination_lot;
+        assert_eq!(second.travelers.len(), 1);
+
+        let traveler = person_with_guid(&downtown.world, members[0]).unwrap();
+        ask_for_trip(&mut downtown, traveler, 93, 0, 30, 1);
+        let on = travel_on_from_request(
+            &root,
+            &store,
+            &second,
+            &mut downtown,
+            &TripDeparture {
+                transport: Some(TravelTransport::MagicHole),
+                answers: vec![3],
+                ..TripDeparture::default()
+            },
+        )
+        .unwrap();
+        let third = on.session.clone();
+        let magic = on.destination_lot;
+        assert_eq!(magic.load.family, first.home_family);
+        assert_eq!(
+            third.travelers.iter().map(|t| t.guid).collect::<Vec<_>>(),
+            members,
+            "every member, in the family's order"
+        );
+        for traveler in &third.travelers {
+            assert!(traveler.is_household_member);
+            assert_eq!(
+                person_with_guid(&magic.world, traveler.guid),
+                Some(traveler.destination_object_id)
+            );
+        }
+        // The arrival markers bring every member in, those made from
+        // their records too.
+        let mut magic = magic;
+        let on_lot = |lot: &Lot| {
+            third.travelers.iter().all(|t| {
+                let position = lot.world.objects[&t.destination_object_id].position;
+                crate::placement::on_lot([position[0], position[1]])
+            })
+        };
+        for _ in 0..600 {
+            if on_lot(&magic) {
+                break;
+            }
+            magic.step_play().unwrap();
+        }
+        assert!(on_lot(&magic), "every member reached the lot");
+        let returned =
+            return_from_destination(&root, &store, &third, &mut magic, &[3], Frames::default())
+                .unwrap();
+        let mut home: Vec<u32> = returned
+            .report
+            .returning_travelers
+            .iter()
+            .map(|&(guid, _)| guid)
+            .collect();
+        home.sort_unstable();
+        let mut expected = members.clone();
+        expected.sort_unstable();
+        assert_eq!(home, expected);
     }
 
     /// A companion the caller's kind-3 token names who did not travel is

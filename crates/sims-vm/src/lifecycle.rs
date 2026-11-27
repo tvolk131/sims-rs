@@ -789,6 +789,29 @@ fn time_of_day(hours: i16) -> i16 {
     }
 }
 
+/// Sets the clock (0x46d86f): global 0 becomes `hour` and global 5
+/// `minute`; global 6, the second, is left alone. Signal 0xdb goes to the
+/// game's subscribers. Then the time of day is worked out again from the
+/// hour (0x46d525); when it changed, global 4 takes it, the lighting is
+/// told (0x4c4648) and signal 0xdd goes out. Here the rooms are marked to
+/// be counted again ([`World::mark_all_rooms`]), as the light recount
+/// does; the signals' handlers are presentation.
+pub(crate) fn set_clock(world: &mut World, hour: i16, minute: i16) {
+    if let Some(slot) = world.globals.get_mut(HOURS) {
+        *slot = hour;
+    }
+    if let Some(slot) = world.globals.get_mut(MINUTES) {
+        *slot = minute;
+    }
+    let tod = time_of_day(hour);
+    if world.globals.get(TIME_OF_DAY).copied() != Some(tod) {
+        if let Some(slot) = world.globals.get_mut(TIME_OF_DAY) {
+            *slot = tod;
+        }
+        world.mark_all_rooms();
+    }
+}
+
 /// Resets budget history (`0x46d97a`) and days played (`global 28`).
 fn reset_budget_history(world: &mut World) {
     world.budget.days = vec![Some([0; 8]); 6];
@@ -818,19 +841,7 @@ fn apply_move_in_reset(
     tuning: NeighborhoodTuning,
 ) -> Result<(), LifecycleError> {
     // 0x46d86f: set clock to (new_family_start_hour, 0), update time_of_day.
-    if let Some(slot) = world.globals.get_mut(HOURS) {
-        *slot = tuning.new_family_start_hour;
-    }
-    if let Some(slot) = world.globals.get_mut(MINUTES) {
-        *slot = 0;
-    }
-    let tod = time_of_day(tuning.new_family_start_hour);
-    if world.globals.get(TIME_OF_DAY).copied() != Some(tod) {
-        if let Some(slot) = world.globals.get_mut(TIME_OF_DAY) {
-            *slot = tod;
-        }
-        world.mark_all_rooms();
-    }
+    set_clock(world, tuning.new_family_start_hour, 0);
     // 0x46d97a: reset budget history + days played.
     reset_budget_history(world);
     // 0x46d83a: unpause.

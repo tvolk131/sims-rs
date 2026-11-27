@@ -6,9 +6,10 @@
 //! DowntownLotPicker special panel) and runs Generic Sims Call 17 with
 //! (house, 0, 30, mode 0). Routine 17 (0x45a22d) writes Mortimer's saved
 //! state and the arrival clock into his neighbor inventory and asks for the
-//! trip. `travel::depart_from_request` carries the trip out, and Downtown's
-//! middle ped marker places him and restores the saved state with routine
-//! 21, which leaves the clock tokens for the plugin's routine 23.
+//! trip. `travel::depart_from_request` carries the trip out. The arrival
+//! (0x4f1ae9, Downtown at 0x4f1d1b) takes the clock tokens out of his
+//! inventory and sets the clock to them (0x46d86f), and Downtown's middle
+//! ped marker places him and restores the saved state with routine 21.
 //!
 //! Needs an install (`SIMS_INSTALL`); skipped otherwise.
 
@@ -183,11 +184,23 @@ fn calling_a_cab_on_the_phone_goes_downtown_with_the_saved_state() {
     }
     let written: Vec<(u32, i16)> = tokens.iter().map(|t| (t.guid, t.count as i16)).collect();
     assert_eq!(written, expected);
-    let clock_tokens: Vec<Item> = tokens
+    // A clock token of 0 is never written. The arrival takes the hour
+    // token, then the minute token, and stops at the first one missing
+    // (an hour taken stays taken); only with both does it set the clock.
+    let (has_hour, has_minute) = (hours != 0, minutes != 0);
+    let arrived: Vec<Item> = tokens
         .iter()
-        .filter(|t| t.guid == ARRIVAL_HOUR_GUID || t.guid == ARRIVAL_MINUTE_GUID)
+        .filter(|t| {
+            !(has_hour && t.guid == ARRIVAL_HOUR_GUID
+                || has_hour && has_minute && t.guid == ARRIVAL_MINUTE_GUID)
+        })
         .cloned()
         .collect();
+    let clock = (has_hour && has_minute).then_some((hours, minutes));
+    assert!(
+        clock.is_some(),
+        "the capture asks at a clock with both tokens"
+    );
 
     // The shell leaves the house between ticks.
     let departed =
@@ -206,9 +219,16 @@ fn calling_a_cab_on_the_phone_goes_downtown_with_the_saved_state() {
     let mut downtown = departed.destination_lot;
     assert_eq!(
         saved_state(&downtown, mortimer_guid),
-        tokens,
-        "the tokens travel with Mortimer"
+        arrived,
+        "the tokens travel with Mortimer, less the clock the arrival took"
     );
+    if let Some(clock) = clock {
+        assert_eq!(
+            (downtown.world().globals[0], downtown.world().globals[5]),
+            clock,
+            "the arrival sets the clock from the tokens"
+        );
+    }
 
     // The marker places Mortimer and restores his saved state (routine
     // 21): on that tick his motives are the tokens' counts.
@@ -218,8 +238,8 @@ fn calling_a_cab_on_the_phone_goes_downtown_with_the_saved_state() {
         let update = downtown.step_play().unwrap();
         assert!(update.errors.is_empty(), "errors: {:?}", update.errors);
         let now = saved_state(&downtown, mortimer_guid);
-        if now.len() < tokens.len() {
-            assert_eq!(now, clock_tokens, "routine 21 leaves only the clock");
+        if now.len() < arrived.len() {
+            assert_eq!(now, [], "routine 21 leaves nothing");
             let motives = &downtown.world().objects[&traveler]
                 .person
                 .as_ref()
