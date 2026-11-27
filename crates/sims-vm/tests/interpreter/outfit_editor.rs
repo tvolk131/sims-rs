@@ -202,12 +202,98 @@ fn generic_call_24_dresses_a_pet_from_its_species_list() {
         assert_eq!(row(&fx, idx), Some("NONE"), "row {idx}");
     }
     assert_eq!(fx.sim().temps[..2], [0, 0]);
-    // A pet's clothing categories are refused before anything changes.
-    let mut fx2 = Fixture::new();
-    fx2.program = fx.program.clone();
-    let text = trap(generic_24(&mut fx2, SIM, 1, 0)).to_string();
-    assert!(text.contains("category 1 for a pet"), "{text}");
-    assert!(fx2.world.made_outfits.is_empty());
+}
+
+const PET_FORMAL_0: &str = "f100adog_x,BODY=f100adoglgt_one";
+const PET_FORMAL_1: &str = "f100adog_x,BODY=f100adoglgt_two";
+
+/// The Sim as an adult dog of light skin (as the install's pets are),
+/// with a wardrobe holding clothing for a sexless adult (`f100a…`,
+/// `s100a…`) and a man's formal suit.
+fn dressed_dog() -> Fixture {
+    let mut fx = Fixture::new();
+    for suit in ["b100dog_x", "f100adog_x", "s100adog_x", "f100mafit_x"] {
+        fx.program.people.eager_suits.insert(suit.into());
+    }
+    fx.program.people.textures = [
+        "b100dog_one",
+        "f100adoglgt_one",
+        "f100adoglgt_two",
+        "f100adogdrk_one",
+        "s100adoglgt_one",
+        "f100mafitlgt_one",
+    ]
+    .map(String::from)
+    .to_vec();
+    fx.program.people.profiles.insert(
+        SIM_GUID,
+        sims_content::Profile {
+            body: Some("b100dog_x,BODY=b100dog_one".into()),
+            gender: Some("dogmale".into()),
+            age: Some("27".into()),
+            skin: Some("lgt".into()),
+            suit_rows: BTreeMap::from([(30, PET_FORMAL_1.into())]),
+            ..Default::default()
+        },
+    );
+    fx
+}
+
+#[test]
+fn generic_call_31_counts_a_pets_clothing_without_a_sex_step() {
+    // The clothing fill (0x4098f1 and kin) adds the sex step for gender
+    // codes 0 and 1 only, so a pet's list is the letter, any three, the
+    // age letter and any three, with textures of those eight characters
+    // and its skin tone: two formal, one swimwear, no pajamas. The man's
+    // suit has `m` where the age letter goes.
+    let mut fx = dressed_dog();
+    for (category, count) in [(0, 1), (1, 2), (2, 1), (3, 0), (4, 0), (5, -1)] {
+        assert_eq!(on_sim(&mut fx, 31, category, 9), Ok(true));
+        assert_eq!(
+            fx.lamp().temps[..2],
+            [category, count],
+            "category {category}"
+        );
+    }
+    assert!(row(&fx, 30).is_none(), "the commit with 0 writes nothing");
+}
+
+#[test]
+fn generic_call_30_answers_a_pets_clothing_worn_and_commits_none() {
+    // The current accessor finds the second formal outfit; the commit's
+    // pet branch (0x40a5d5) then writes NONE into rows 2 and 30 to 34, so
+    // asked again it is in no place.
+    let mut fx = dressed_dog();
+    assert_eq!(on_sim(&mut fx, 30, 1, 9), Ok(true));
+    assert_eq!(fx.lamp().temps[..2], [1, 1]);
+    for idx in [2, 30, 31, 32, 33, 34] {
+        assert_eq!(row(&fx, idx), Some("NONE"), "row {idx}");
+    }
+    assert_eq!(on_sim(&mut fx, 30, 1, 9), Ok(true));
+    assert_eq!(fx.lamp().temps[..2], [1, -1]);
+}
+
+#[test]
+fn generic_calls_24_and_29_dress_a_pet_in_clothing_the_commit_takes_off() {
+    // The set accessor writes the entry and keeps the place worn (1); the
+    // commit's pet branch then writes NONE over the row.
+    for routine in [24, 29] {
+        let mut fx = dressed_dog();
+        let result = if routine == 24 {
+            generic_24(&mut fx, SIM, 1, 0)
+        } else {
+            on_sim(&mut fx, 29, 1, 0)
+        };
+        assert_eq!(result, Ok(true), "routine {routine}");
+        let temps = if routine == 24 {
+            fx.sim().temps[..2].to_vec()
+        } else {
+            fx.lamp().temps[..2].to_vec()
+        };
+        assert_eq!(temps, [1, 1], "routine {routine}");
+        assert_eq!(row(&fx, 30), Some("NONE"), "routine {routine}");
+        assert_ne!(row(&fx, 30), Some(PET_FORMAL_0));
+    }
 }
 
 #[test]
@@ -322,4 +408,32 @@ fn generic_call_31_counts_a_null_body_list_as_none() {
         trap(on_sim(&mut fx, 30, 0, 9)),
         sims_vm::Trap::Unsupported(_)
     ));
+}
+
+#[test]
+fn generic_call_31_counts_clothing_for_an_unknown_gender() {
+    // The clothing lists are not null for an unknown gender code: the fill
+    // (0x4098f1) leaves out the sex step, as for a pet. Routines 24, 29
+    // and 30 still commit through the null body list (0x40d0a4).
+    let mut fx = dressed_dog();
+    fx.program
+        .people
+        .profiles
+        .get_mut(&SIM_GUID)
+        .unwrap()
+        .gender = Some("robot".into());
+    assert_eq!(on_sim(&mut fx, 31, 1, 9), Ok(true));
+    assert_eq!(fx.lamp().temps[..2], [1, 2]);
+    assert_eq!(on_sim(&mut fx, 31, 0, 9), Ok(true));
+    assert_eq!(fx.lamp().temps[..2], [0, 0]);
+    for routine in [29, 30] {
+        assert!(
+            matches!(
+                trap(on_sim(&mut fx, routine, 1, 0)),
+                sims_vm::Trap::Unsupported(_)
+            ),
+            "routine {routine}"
+        );
+    }
+    assert!(fx.world.made_outfits.is_empty());
 }

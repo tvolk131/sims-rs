@@ -51,6 +51,29 @@ type Rows = BTreeMap<usize, String>;
 /// flags, label and data.
 type Resource = (u16, u16, u16, Vec<u8>, Vec<u8>);
 
+/// Drops from a saved lot's `made_outfits` the rows of each person the
+/// lot's load purges (`purged`, a deleted visitor's person) and of each
+/// character deleted since the lot was saved: listed in
+/// `deleted_characters`, or deleted after `lot_epoch` (a GUID a later
+/// character may reuse). The rows were that character's strings, which
+/// went with its file (the original keeps them in the definition,
+/// 0x587bbd), so no later person of the GUID reads them.
+pub(crate) fn drop_deleted_rows(
+    made_outfits: &mut BTreeMap<u32, Rows>,
+    purged: &BTreeSet<u32>,
+    deleted_characters: &BTreeSet<u32>,
+    deleted_at_epoch: &BTreeMap<u32, u64>,
+    lot_epoch: u64,
+) {
+    made_outfits.retain(|guid, _| {
+        !purged.contains(guid)
+            && !deleted_characters.contains(guid)
+            && !deleted_at_epoch
+                .get(guid)
+                .is_some_and(|&deleted| lot_epoch < deleted)
+    });
+}
+
 /// The character files to replace, and the people whose rows they now
 /// hold.
 #[derive(Debug, Default, PartialEq, Eq)]

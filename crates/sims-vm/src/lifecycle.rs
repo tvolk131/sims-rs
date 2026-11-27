@@ -2812,6 +2812,19 @@ fn boot_from_saved_lot(
                 })
             })
             .collect();
+        // Their outfit rows, and those of any character deleted since the
+        // lot was saved, go too.
+        let purged: BTreeSet<u32> = orphaned_people
+            .iter()
+            .filter_map(|id| world.objects.get(id).map(|o| o.guid))
+            .collect();
+        outfit_rows::drop_deleted_rows(
+            &mut world.made_outfits,
+            &purged,
+            &stored.deleted_characters,
+            &stored.deleted_at_epoch,
+            lot_epoch,
+        );
         let mut people_to_reset = BTreeSet::new();
         let mut objects_to_reset = BTreeSet::new();
         for person_id in orphaned_people {
@@ -5649,7 +5662,26 @@ mod tests {
         house7.world.objects.insert(stale_visitor_id, visitor);
         house7.world.order.push(stale_visitor_id);
         house7.world.people.push(stale_visitor_id);
+        // An outfit the visitor was dressed in there (routine 29). A type
+        // made on a lot keeps its rows with the lot.
+        let stale_row = "f100mafit_x,BODY=f100mafitlgt_stale".to_owned();
+        house7
+            .world
+            .made_outfits
+            .entry(guid)
+            .or_default()
+            .insert(30, stale_row.clone());
         save_and_leave_lot(&root, &store, "UserData", &mut house7).unwrap();
+        let saved7 = store.load_lot_snapshot("UserData", 7).unwrap().unwrap();
+        let saved7 = Saved::decode(saved7.saved_lot.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            saved7
+                .world
+                .made_outfits
+                .get(&guid)
+                .and_then(|r| r.get(&30)),
+            Some(&stale_row)
+        );
 
         // 3. Bulldoze House 5: deletes `0x61520029` (advancing `deletion_epoch`).
         let dozed = bulldoze(&root, &store, "UserData", 5).unwrap();
@@ -5698,6 +5730,10 @@ mod tests {
         assert!(
             house7_after.world.objects.values().all(|o| o.guid != guid),
             "reused GUID must not revive the deleted visitor on older saved House 7"
+        );
+        assert!(
+            !house7_after.world.made_outfits.contains_key(&guid),
+            "the deleted visitor's outfit rows go with it, not to the replacement"
         );
         house7_after.step().unwrap();
         // And House 4 (saved at the newer epoch) still opens cleanly!

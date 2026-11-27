@@ -142,6 +142,15 @@ impl Wearer {
 ///   with those nine characters and the skin tone (0x409663, 0x4098f1).
 ///   The filter is the one `outfits::commit_character_clothing` builds
 ///   its lists by.
+/// - Any other wearer's clothing (a pet, or an unknown gender) is built
+///   the same way without the sex step: the fill (0x4098f1 and its kin)
+///   adds `m`/`u` for gender 0 and `f`/`u` for gender 1 only
+///   (0x409941..0x409966), so the suit is the letter, any three, the age
+///   letter and any three, and each texture starts with those eight
+///   characters and the skin tone (0x4727f1's matched length). Native
+///   keeps the lists in a lot-session cache keyed by skin tone and
+///   `child * 2 + (gender != 0)` (0x6e4890), which a pet shares with a
+///   light-skinned adult woman; the port builds each wearer's own list.
 /// - A head is `c`, any three, the sex or `u` and the age letter, but
 ///   not a suit whose second character is `t` (0x40a364, 0x40a453).
 /// - A pet body is `b`, any three and `dog` (genders 2 and 3, list
@@ -159,9 +168,15 @@ fn entries(
         List::Body if (4..=5).contains(&wearer.gender) => (b'b', 7, "BODY", Some(b"cat")),
         List::Head if wearer.human() => (b'c', 6, "HEAD-HEAD", None),
         List::Clothing(letter) if wearer.human() => (letter, 9, "BODY", None),
+        List::Clothing(letter) => (letter, 8, "BODY", None),
         _ => return None,
     };
-    let sex = if wearer.gender == 1 { b'f' } else { b'm' };
+    // 0x409941: a sex step for gender 0 or 1 only.
+    let sex = match wearer.gender {
+        0 => Some(b'm'),
+        1 => Some(b'f'),
+        _ => None,
+    };
     let age = if wearer.child { b'c' } else { b'a' };
     let scan = outfits::suit_scan_order(program, world);
     let textures = outfits::texture_list(program);
@@ -173,11 +188,14 @@ fn entries(
         }
         let fits = match species {
             Some(kind) => bytes[4..7].eq_ignore_ascii_case(kind),
-            None => {
-                (bytes[4].eq_ignore_ascii_case(&sex) || bytes[4].eq_ignore_ascii_case(&b'u'))
-                    && bytes[5].eq_ignore_ascii_case(&age)
-                    && !(list == List::Head && bytes[1].eq_ignore_ascii_case(&b't'))
-            }
+            None => match sex {
+                Some(sex) => {
+                    (bytes[4].eq_ignore_ascii_case(&sex) || bytes[4].eq_ignore_ascii_case(&b'u'))
+                        && bytes[5].eq_ignore_ascii_case(&age)
+                        && !(list == List::Head && bytes[1].eq_ignore_ascii_case(&b't'))
+                }
+                None => bytes[4].eq_ignore_ascii_case(&age),
+            },
         };
         if !fits {
             continue;
@@ -352,14 +370,6 @@ impl Machine<'_, '_> {
             )));
         }
         let picked = category(number).filter(|_| number <= 4);
-        if wearer.pet()
-            && let Some((List::Clothing(_), _)) = picked
-        {
-            return Err(Trap::Unsupported(format!(
-                "Generic Sims Call 30 category {number} for a pet: its list (0x408d8e and kin) \
-                 is not ported"
-            )));
-        }
         // 0x4505ad: the editor's load.
         outfits::init_clothing_rows(self.program, self.world, guid, profile);
         // 0x4505b2: the current accessor, before the commit, or -1.
@@ -385,15 +395,6 @@ impl Machine<'_, '_> {
         let (profile, wearer) = self.wearer(guid);
         let profile = profile.as_ref();
         let picked = category(number).filter(|_| number <= 4);
-        if !wearer.human()
-            && let Some((List::Clothing(_), _)) = picked
-        {
-            return Err(Trap::Unsupported(format!(
-                "Generic Sims Call 31 category {number} for a person of gender code {}: its \
-                 list (0x408d8e and kin) is not ported",
-                wearer.gender
-            )));
-        }
         // 0x45047d: the editor's load.
         outfits::init_clothing_rows(self.program, self.world, guid, profile);
         // 0x450482: the count accessor (0 for a null list), or -1. The
@@ -463,14 +464,6 @@ impl Machine<'_, '_> {
         } else {
             None
         };
-        if wearer.pet()
-            && let Some((List::Clothing(_), _)) = picked
-        {
-            return Err(Trap::Unsupported(format!(
-                "Generic Sims Call {routine} category {number} for a pet: its list (0x408d8e and \
-                 kin) is not ported"
-            )));
-        }
         // 0x44ffcb (24), 0x450242 (29): the editor's load.
         outfits::init_clothing_rows(self.program, self.world, guid, profile);
         let mut kept = None;
