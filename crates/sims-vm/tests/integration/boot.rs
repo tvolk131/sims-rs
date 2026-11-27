@@ -1932,13 +1932,19 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
         }
         assert_eq!(streams(&lot), (lot_rng, 270_289_136, crt), "after {at}");
     }
-    // From 36718 the lot stream moves one update before or after the
-    // recording's at a few updates: 36718, 36929, 37058, 37126, and 37215
-    // from the fitted frame schedule's drift against the recording's frames,
-    // and after 40317 by one update on the raccoon's draws — inferred from
-    // the binary's unmodeled Special Effect PIP paint (0x4b3489 → 0x58da12)
-    // refreshing the raccoon's animator (`goth-day-20261115` watched no
-    // frames) — before matching again at the next update. The C runtime
+    // From 36718 this schedule's lot stream moves exactly one update
+    // before the original's at 36718, 36929, 37058, 37126 and 37215 (the
+    // value there is the original's at the next update), and matches again
+    // at the next update. Those five are this schedule's
+    // doing: the original drew frames at phase 25 from 28315 to 39595, not
+    // 14, and under the frames it drew the lot stream matches at every
+    // update of the day
+    // (`the_goth_day_under_the_frames_the_original_drew_keeps_its_streams`).
+    // `goth-day-20261115` itself draws the raccoon's 41445 and 41893 one
+    // update early against the frame-watched recording, which this run
+    // matches there: the two runs of the original differ, for a reason
+    // not established (see
+    // `docs/decisions/20261127-goth-late-day-rng-parity.md`). The C runtime
     // stream matches the recording's at every update of the day.
     //
     // At tick 39610 the raccoon (object 10) runs Special Effect with flag
@@ -1970,13 +1976,12 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
     lot.step().unwrap();
     tick += 1;
     assert_eq!((lot.world().speed(), lot.world().return_speed()), (760, -1));
-    // At tick 41446 (one update after the recording's 41445 — inferred to
-    // follow an unmodeled Special Effect PIP paint refreshing the raccoon's
-    // animator via 0x4b3489 → 0x58da12 around update 40317; the recording
-    // watched no frames), the raccoon (object 10) runs Wander (tree 419
-    // node 8: Find Location For mode 5) and places its wander target
-    // (object 37, GUID 0x000007C4) at [648, 312, 1] (tile (40, 19)),
-    // matching `goth-day-20261115`'s update 41445.
+    // At tick 41446 the raccoon (object 10) runs Wander (tree 419 node 8:
+    // Find Location For mode 5) and places its wander target (object 37,
+    // GUID 0x000007C4) at [648, 312, 1] (tile (40, 19)), as the
+    // frame-watched recording `goth-day-frame-20261121` does at 41446
+    // (`goth-day-20261115` does it at 41445; the two runs of the original
+    // differ there).
     while tick < 41_446 {
         lot.step().unwrap();
         tick += 1;
@@ -1993,6 +1998,153 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
         (5_524_294, 270_289_136, 2_700_240_999),
         "after 43200"
     );
+}
+
+/// The frames the original drew on the Goth day, as the frame-watched
+/// recording `goth-day-frame-20261121` caught them (the draw guard set at
+/// 0x4d1b60 between updates): `(first, last)` is a frame after `first`
+/// and after every 30th update from it through `last`. The phase moves
+/// with the original's wall clock.
+const GOTH_DAY_FRAMES: [(u32, u32); 60] = [
+    (0, 0),
+    (1, 1),
+    (2, 2),
+    (3, 873),
+    (901, 901),
+    (902, 902),
+    (903, 903),
+    (923, 2723),
+    (2747, 3437),
+    (3458, 3488),
+    (3494, 7304),
+    (7321, 7321),
+    (7322, 7322),
+    (7340, 10700),
+    (10712, 10712),
+    (10713, 10713),
+    (10728, 12978),
+    (12986, 15296),
+    (15298, 15298),
+    (15299, 15329),
+    (15341, 15341),
+    (15358, 15598),
+    (15611, 16451),
+    (16474, 16564),
+    (16567, 17917),
+    (17929, 17929),
+    (17930, 17990),
+    (18007, 19177),
+    (19194, 20004),
+    (20032, 20032),
+    (20033, 20093),
+    (20102, 20102),
+    (20103, 20103),
+    (20129, 21149),
+    (21153, 21243),
+    (21246, 22356),
+    (22374, 22374),
+    (22375, 23065),
+    (23089, 23149),
+    (23151, 24711),
+    (24719, 24719),
+    (24720, 26100),
+    (26103, 26103),
+    (26104, 26104),
+    (26127, 27927),
+    (27948, 28218),
+    (28219, 28309),
+    (28315, 39595),
+    (39609, 39609),
+    (39610, 39610),
+    (39611, 39611),
+    (39640, 40480),
+    (40495, 40495),
+    (40496, 40496),
+    (40507, 40537),
+    (40539, 40749),
+    (40766, 43646),
+    (43655, 43655),
+    (43656, 43656),
+    (43676, 44186),
+];
+
+/// The SHA-256 of the frame-watched recording's lot and C runtime stream
+/// states after each of its 44,200 updates, each as two little-endian
+/// `u32`s in that order.
+const GOTH_DAY_STREAMS: &str = "a637715181a34a398fd598eeac89ecf9cfa3f3137426d6f67f52bb4971dbdf78";
+
+/// The Goth house under the frames the original drew
+/// ([`GOTH_DAY_FRAMES`]): the lot and C runtime streams match the
+/// original's after every update of the recorded 44,200, the late day
+/// included (`docs/decisions/20261127-goth-late-day-rng-parity.md`). A
+/// frame counts the rooms and clears queue flag 0x80, so the lot stream
+/// depends on which updates a frame follows: under the fitted schedule
+/// above it moves at five updates from 36718.
+#[test]
+fn the_goth_day_under_the_frames_the_original_drew_keeps_its_streams() {
+    use sha2::Digest;
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let after = GOTH_DAY_FRAMES
+        .iter()
+        .flat_map(|&(first, last)| (first..=last).step_by(30))
+        .collect();
+    let frames = Frames {
+        after,
+        every: vec![],
+    };
+    let mut lot = Lot::load_viewed(&root, &house, &[3, 3], frames, Some(GOTH_VIEW_CENTRE)).unwrap();
+    // The recording's lot and C runtime streams after some of its updates,
+    // to say where a difference starts: every 4000th, the five the fitted
+    // schedule moves, the out-of-update animator refresh at 40330 and the
+    // raccoon's draws `goth-day-20261115` makes an update early.
+    let named: BTreeMap<u32, (u32, u32)> = BTreeMap::from([
+        (4000, (3_155_726_356, 2_930_731_800)),
+        (8000, (338_639_505, 3_332_047_783)),
+        (12000, (1_719_165_496, 2_767_048_999)),
+        (16000, (3_136_581_033, 1_658_190_486)),
+        (20000, (3_423_205_860, 750_951_283)),
+        (24000, (721_853_175, 1_381_078_483)),
+        (28000, (2_516_832_155, 3_190_147_790)),
+        (32000, (3_196_126_627, 181_336_453)),
+        (36000, (3_381_790_592, 881_272_253)),
+        (36717, (2_118_795_333, 3_741_955_181)),
+        (36718, (2_118_795_333, 3_741_955_181)),
+        (36929, (213_478_759, 3_741_955_181)),
+        (37058, (494_340_820, 3_741_955_181)),
+        (37126, (3_914_581_231, 3_741_955_181)),
+        (37215, (2_261_443_906, 3_741_955_181)),
+        (40000, (1_247_714_781, 2_700_240_999)),
+        (40330, (889_985_465, 2_700_240_999)),
+        (40331, (1_448_996_191, 2_700_240_999)),
+        (41445, (1_218_798_765, 2_700_240_999)),
+        (41446, (576_479_792, 2_700_240_999)),
+        (41893, (173_888_586, 2_700_240_999)),
+        (43200, (5_524_294, 2_700_240_999)),
+        (44000, (3_107_368_753, 1_813_896_902)),
+        (44200, (1_033_384_786, 1_813_896_902)),
+    ]);
+    let mut streams = sha2::Sha256::new();
+    for update in 1..=44_200 {
+        lot.step().unwrap();
+        let world = lot.world();
+        let (lot_rng, crt) = (world.lot_rng.state(), world.crt_rng.state());
+        if let Some(&theirs) = named.get(&update) {
+            assert_eq!((lot_rng, crt), theirs, "after {update}");
+        }
+        streams.update(lot_rng.to_le_bytes());
+        streams.update(crt.to_le_bytes());
+    }
+    let ours: String = streams
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(ours, GOTH_DAY_STREAMS);
 }
 
 // The Newbies' pins follow Remove Object Instance saving a removed
