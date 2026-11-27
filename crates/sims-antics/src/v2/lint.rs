@@ -375,8 +375,8 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             consts: file_consts(ast),
             raw_bodies: directives.raw_bodies.clone(),
             raw_ends: directives.raw_ends.clone(),
-            bhav_pins: bhav_pins(tokens),
-            bhav_pin: None,
+            pin_sites: pin_sites(tokens),
+            layout_pin: None,
             layout_trials: Vec::new(),
             line_starts: directives.line_starts.clone(),
             sims: Vec::new(),
@@ -466,8 +466,9 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             });
         }
         if let Some(original) = compiled.as_deref() {
-            layout_pins(input, original, &layout_trials, &mut diags);
-            let (stand, untried) = verified(input, original, pending, &diags);
+            let mut untried = layout_pins(input, original, &layout_trials, &mut diags);
+            let (stand, later) = verified(input, original, pending, &diags);
+            untried.extend(later);
             diags.extend(stand);
             let seen: Vec<LintDiagnostic> = diags.iter().chain(&untried).cloned().collect();
             diags.extend(stale_allows(&directives, &seen, &input.name));
@@ -1806,11 +1807,12 @@ struct FileLinter<'a> {
     raw_bodies: BTreeMap<(usize, usize), usize>,
     /// Where each `raw { }` block ends ([`Directives::raw_ends`]).
     raw_ends: BTreeMap<(usize, usize), usize>,
-    /// Per `#[bhav] fn` (its `fn` keyword), where `keep_layout` goes in its `#[bhav(..)]`
-    /// ([`bhav_pins`]).
-    bhav_pins: BTreeMap<(usize, usize), (Span, usize, &'static str)>,
-    /// The `keep_layout` edit of the `#[bhav] fn` being linted, when it has no pin yet.
-    bhav_pin: Option<Fix>,
+    /// Per `#[bhav] fn` (its `fn` keyword) and lifecycle tree (its keyword), where
+    /// `keep_layout` goes in its header ([`pin_sites`]).
+    pin_sites: BTreeMap<(usize, usize), PinSite>,
+    /// The `keep_layout` edit of the tree being linted (a `#[bhav] fn` or a lifecycle tree),
+    /// when it has no pin yet, and the help's advice for it.
+    layout_pin: Option<(Fix, String)>,
     /// The `manual_raw_has_builtin` findings whose native form is built with and without
     /// `keep_layout` ([`layout_pins`]).
     layout_trials: Vec<LayoutTrial>,
@@ -2870,7 +2872,7 @@ impl FileLinter<'_> {
                 ObjectMember::Fn(f) => self.lint_fn(f),
                 ObjectMember::Tree(t) => {
                     self.missing_sim_frame_args(t);
-                    self.bhav_pin = self.keep_layout_fix(t);
+                    self.layout_pin = self.keep_layout_fix(t.span, t.frame.as_ref());
                     self.enter_tree(t.pinned_id, &t.label, &t.body);
                     let sim = t.sim_binding.is_some();
                     self.enter_context(
@@ -2886,7 +2888,7 @@ impl FileLinter<'_> {
                     );
                     self.lint_body(&t.body, BodyCx { sim });
                     self.leave_context();
-                    self.bhav_pin = None;
+                    self.layout_pin = None;
                 }
                 ObjectMember::Init(b) | ObjectMember::Main(b) => {
                     let label = if matches!(m, ObjectMember::Init(_)) {
@@ -2894,16 +2896,31 @@ impl FileLinter<'_> {
                     } else {
                         "Main"
                     };
+                    // A `main` that a later `main` of the object replaces is not built: a
+                    // rewrite of it builds the same bytes whatever it says.
+                    let replaced = matches!(m, ObjectMember::Main(_))
+                        && members
+                            .iter()
+                            .rev()
+                            .find(|x| matches!(x, ObjectMember::Main(_)))
+                            .is_some_and(|last| !std::ptr::eq(last, m));
+                    let unbuilt = self.unbuilt;
+                    self.unbuilt |= replaced;
+                    self.layout_pin = self.lifecycle_pin(members, m);
                     self.enter_tree(None, label, &b.body);
                     self.enter_context(std::iter::empty(), false, true);
                     self.lint_body(&b.body, BodyCx { sim: false });
                     self.leave_context();
+                    self.layout_pin = None;
+                    self.unbuilt = unbuilt;
                 }
                 ObjectMember::Load(b) | ObjectMember::Reset(b) | ObjectMember::Cleanup(b) => {
+                    self.layout_pin = self.lifecycle_pin(members, m);
                     self.enter_tree(None, "", &b.body);
                     self.enter_context(std::iter::empty(), false, true);
                     self.lint_body(&b.body, BodyCx { sim: false });
                     self.leave_context();
+                    self.layout_pin = None;
                 }
                 ObjectMember::Functional(f) => {
                     self.lint_guard(f.guard.as_ref(), &f.params);
@@ -4839,6 +4856,8 @@ impl FileLinter<'_> {
         let mut spellings = Vec::new();
         // The exact statements, while every line has one.
         let mut exact: Option<Vec<String>> = Some(Vec::new());
+        // Whether a line names a frame word `local[N]` ([`Self::raw_local_form`]).
+        let mut local = false;
         for l in &lines {
             let word: String = l
                 .chars()
@@ -4863,11 +4882,15 @@ impl FileLinter<'_> {
                     ((*v2).to_owned(), None)
                 }
                 Some(_) => return,
-                None => match self.raw_native_form(&word, l) {
+                None => match self
+                    .raw_native_form(&word, l)
+                    .or_else(|| self.raw_local_form(l))
+                {
                     Some(form) => form,
                     None => return,
                 },
             };
+            local |= raw_indexes(l, "local");
             match (&mut exact, stmt) {
                 (Some(list), Some(stmt)) => list.push(stmt),
                 _ => exact = None,
@@ -4876,41 +4899,179 @@ impl FileLinter<'_> {
                 spellings.push(v2);
             }
         }
+        let message = "this `raw` block only holds primitives v2 spells natively".to_owned();
+        let help = format!("use {}", spellings.join(", "));
+        if local {
+            // A block naming `local[N]` stands only on a build: every line needs its exact
+            // statement, and the native form must build the same bytes (alone, or with the
+            // tree's `keep_layout`, since such a block keeps the tree's layout).
+            if let Some(stmts) = exact {
+                let severity =
+                    rule(MANUAL_RAW_HAS_BUILTIN).map_or(Severity::Warning, |r| r.severity);
+                let finding = LintDiagnostic {
+                    rule: MANUAL_RAW_HAS_BUILTIN,
+                    severity,
+                    file: self.file.to_owned(),
+                    line: span.line,
+                    column: span.column,
+                    message,
+                    // Every statement, in order: the block is rewritten whole.
+                    help: Some(format!(
+                        "write the block as `{}`; v2 reads and writes `local[N]` natively",
+                        stmts.join(" ")
+                    )),
+                    suggestion: None,
+                    note: None,
+                };
+                self.layout_trial(span, &stmts, Some(finding));
+            }
+            return;
+        }
         self.emit(
             MANUAL_RAW_HAS_BUILTIN,
             span,
-            "this `raw` block only holds primitives v2 spells natively".to_owned(),
-            Some(format!("use {}", spellings.join(", "))),
+            message,
+            Some(help),
             None,
             None,
         );
         if let Some(stmts) = exact {
-            self.layout_trial(span, &stmts);
+            self.layout_trial(span, &stmts, None);
         }
     }
 
-    /// The edit adding `keep_layout` to `t`'s `#[bhav(..)]`, when `t` has no pin yet.
-    fn keep_layout_fix(&self, t: &crate::v2::ast::TreeMemberDecl) -> Option<Fix> {
-        if t.frame.as_ref().is_some_and(|f| f.keep_layout) {
+    /// The v2 statement of one raw `.air` line `l` naming a frame word `local[N]` (N 0..=255),
+    /// or `None`: `DST OP SRC` (single spaces apart, as the `.air` printer writes it), where
+    /// - DST is `local[N]`, `temp[0..7]`, a `param[N]` below the tree's compiled argument
+    ///   count, or `stack_obj`; SRC is one of those or a literal (−32768..=32767);
+    /// - OP is `:=` (v2 `=`), a compound assignment (`+=`, `-=`, `*=`, `/=`, `%=`, `&=`,
+    ///   `|=`, `^=`) or `flag_set` / `flag_clear`, each spelled alike in v2.
+    ///
+    /// (`.air` has no `dec_gt` / `inc_lt` statement: they are comparisons, and an `if` /
+    /// `while` test or an edge keeps its block raw.) Each spelling is only a candidate: the
+    /// finding stands when the native form builds the same bytes ([`LayoutTrial`]). Nothing is
+    /// spelled when the body rebinds a name the line uses (`temp`, `param`, `stack_obj`).
+    fn raw_local_form(&self, l: &str) -> Option<(String, Option<String>)> {
+        if !raw_indexes(l, "local") {
             return None;
         }
-        let &(at, past, text) = self.bhav_pins.get(&(t.span.line, t.span.column))?;
-        let start = self.offset(at)? + past;
-        Some(Fix {
-            start,
-            end: start,
-            text: text.to_owned(),
-        })
+        let free = |name: &str| {
+            !self.bound.contains(name)
+                && !self.sim_bindings.contains(name)
+                && !self.const_names.contains(name)
+        };
+        let index = |cell: &str, base: &str| -> Option<i64> {
+            let inner = cell
+                .strip_prefix(base)?
+                .strip_prefix('[')?
+                .strip_suffix(']')?;
+            air_literal(inner)
+        };
+        let args_count = self
+            .tree
+            .as_ref()
+            .and_then(|t| t.frame.as_ref())
+            .and_then(|f| f.args);
+        let cell = |c: &str| {
+            index(c, "local").is_some_and(|n| (0..=255).contains(&n))
+                || (free("temp") && index(c, "temp").is_some_and(|n| (0..=7).contains(&n)))
+                || (free("param")
+                    && index(c, "param").is_some_and(|n| {
+                        args_count.is_some_and(|args| usize::try_from(n).is_ok_and(|n| n < args))
+                    }))
+                || (c == "stack_obj" && free("stack_obj"))
+        };
+        let mut parts = l.split(' ');
+        let (Some(dst), Some(op), Some(src), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        let src_ok = cell(src) || air_literal(src).is_some_and(|n| (-32768..=32767).contains(&n));
+        if !(cell(dst) && src_ok) {
+            return None;
+        }
+        let stmt = match op {
+            ":=" => format!("{dst} = {src};"),
+            "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "flag_set" | "flag_clear" => {
+                format!("{dst} {op} {src};")
+            }
+            _ => return None,
+        };
+        Some((format!("`{}`", &stmt[..stmt.len() - 1]), Some(stmt)))
+    }
+
+    /// The `keep_layout` edit for lifecycle block `m` of an object whose members are
+    /// `members`. The blocks of one kind build one tree, under one header: the pin goes in
+    /// the one of them with a header attribute (a `dead_nodes` footer alone is no header),
+    /// else before the first of them; the advice names the header's line, since that block
+    /// need not be the one holding the anchor. A template's header is not seen here: the
+    /// pinned trial then does not build, and no advice is given.
+    fn lifecycle_pin(&self, members: &[ObjectMember], m: &ObjectMember) -> Option<(Fix, String)> {
+        fn block(x: &ObjectMember) -> Option<&crate::v2::ast::LifecycleBlock> {
+            match x {
+                ObjectMember::Init(b)
+                | ObjectMember::Main(b)
+                | ObjectMember::Load(b)
+                | ObjectMember::Reset(b)
+                | ObjectMember::Cleanup(b) => Some(b),
+                _ => None,
+            }
+        }
+        let kind = std::mem::discriminant(m);
+        let blocks: Vec<_> = members
+            .iter()
+            .filter(|x| std::mem::discriminant(*x) == kind)
+            .filter_map(block)
+            .collect();
+        let head = blocks
+            .iter()
+            .find(|b| b.frame.as_ref().is_some_and(|f| !f.footer_only))
+            .or_else(|| blocks.first())
+            .copied()?;
+        let (fix, advice) = self.keep_layout_fix(head.span, head.frame.as_ref())?;
+        let line = self.line_starts.partition_point(|&s| s <= fix.start);
+        Some((fix, format!("{advice} on line {line}")))
+    }
+
+    /// The edit adding `keep_layout` to the header of the tree whose keyword (`fn`, or a
+    /// lifecycle keyword) is at `span`, when the tree (header `frame`) has no pin yet, and the
+    /// help's advice for it ([`pin_sites`]).
+    fn keep_layout_fix(
+        &self,
+        span: Span,
+        frame: Option<&crate::v2::ast::TreeFrame>,
+    ) -> Option<(Fix, String)> {
+        if frame.is_some_and(|f| f.keep_layout) {
+            return None;
+        }
+        let site = self.pin_sites.get(&(span.line, span.column))?;
+        let start = self.offset(site.at)? + site.past;
+        Some((
+            Fix {
+                start,
+                end: start,
+                text: site.text.to_owned(),
+            },
+            site.advice.to_owned(),
+        ))
     }
 
     /// Queues the `keep_layout` trial of the `manual_raw_has_builtin` finding at `span`
-    /// ([`LayoutTrial`]): the raw block becomes `stmts`, and the pin goes in the `#[bhav(..)]`
-    /// of the `#[bhav] fn` being linted. Not for a tree that already has the pin (the block
-    /// keeps nothing more), a block holding a comment (the rewrite would drop it), a template
-    /// no object of the file builds, or a body other than a `#[bhav] fn`'s.
-    fn layout_trial(&mut self, span: Span, stmts: &[String]) {
-        let Some(pin) = self.bhav_pin.clone() else {
-            return;
+    /// ([`LayoutTrial`]): the raw block becomes `stmts`, and the pin goes in the header of the
+    /// `#[bhav] fn` or lifecycle tree being linted. Not for a tree that already has the pin
+    /// (the block keeps nothing more), a block holding a comment (the rewrite would drop it),
+    /// a template no object of the file builds, or the body of a functional, an interaction or
+    /// an inline fn (their trees take no header).
+    ///
+    /// With `finding` (a block naming `local[N]`), the trial is the finding's own byte check:
+    /// it stands when the native form builds the same bytes, alone or with the pin (then
+    /// saying so); it is tried in any body, with no pin where the tree takes none.
+    fn layout_trial(&mut self, span: Span, stmts: &[String], finding: Option<LintDiagnostic>) {
+        let (pin, advice) = match self.layout_pin.clone() {
+            Some((pin, advice)) => (Some(pin), advice),
+            None if finding.is_some() => (None, String::new()),
+            None => return,
         };
         if self.unbuilt {
             return;
@@ -4937,6 +5098,8 @@ impl FileLinter<'_> {
                 text: stmts.join(&format!("\n{indent}")),
             },
             pin,
+            advice,
+            finding,
         });
     }
 
@@ -5094,20 +5257,42 @@ impl FileLinter<'_> {
                 let mode_ok = MODES.contains(mode)
                     || air_literal(mode).is_some_and(|n| (0..=12).contains(&n) && n != 9);
                 let mut dest = false;
+                // Into a frame word `local[N]` (since #512): the statement is the line itself,
+                // and the finding stands only on a build ([`Self::raw_local_form`]).
+                let mut local_dest = false;
                 let ok = mode_ok
                     && opts.iter().all(|o| match o.split_once(':') {
                         Some((k, v)) => match k.trim() {
                             "guid" => in_range(v.trim(), 0, 0xFFFF_FFFF),
                             "dest" | "into" if !dest => {
                                 dest = true;
-                                temp(v.trim()) || param(v.trim())
+                                local_dest = index(v.trim(), "local")
+                                    .is_some_and(|n| (0..=255).contains(&n));
+                                temp(v.trim()) || param(v.trim()) || local_dest
                             }
                             _ => false,
                         },
                         // A positional GUID.
                         None => in_range(o, 0, 0xFFFF_FFFF),
                     });
-                (ok && dest).then(|| ("set_to_next(.., dest: ..)".to_owned(), None))
+                (ok && dest).then(|| {
+                    if local_dest {
+                        // `.air` reads `into:` as `dest:`, the only key v2 takes.
+                        let args: Vec<String> = args
+                            .iter()
+                            .map(|a| match a.split_once(':') {
+                                Some((k, v)) if k.trim() == "into" => {
+                                    format!("dest: {}", v.trim())
+                                }
+                                _ => (*a).to_owned(),
+                            })
+                            .collect();
+                        let call = format!("set_to_next({})", args.join(", "));
+                        (format!("`{call}`"), Some(format!("{call};")))
+                    } else {
+                        ("set_to_next(.., dest: ..)".to_owned(), None)
+                    }
+                })
             }
             "play_sound" | "clear_motive_changes" if free_call(word) => {
                 // `name(args)`, then an optional `pad(i: 0xNN, ..)`.
@@ -5835,15 +6020,17 @@ fn same_bytes<'a>(
 }
 
 /// For a pack file, the label it is built under (its file name) and its pack's resolver
-/// config, as `check` reads them (`read_v2_checked_file`'s path checks included); `None` for
-/// a file built on its own. The file's text is never taken from here: the lint builds
-/// `input.source`, the text it read once.
+/// config, as `check` reads them, with the same path checks (`check_v2_file`); `None` for a
+/// file built on its own. The file is never read here: the lint builds `input.source`, the
+/// text it read once, so a file that changes (or stops decoding) on disk mid-lint keeps its
+/// byte-checked findings.
 fn pack_config(input: &LintInput) -> Option<Result<(String, crate::v2::PackResolverConfig)>> {
     let (Some(path), Some(pack)) = (&input.path, &input.pack_dir) else {
         return None;
     };
     Some(
-        crate::v2::loader::read_v2_checked_file(path, Some(pack)).map(|(_, config)| {
+        crate::v2::loader::check_v2_file(path, Some(pack)).map(|checked| {
+            let config = checked.config;
             let label = path
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -5855,19 +6042,24 @@ fn pack_config(input: &LintInput) -> Option<Result<(String, crate::v2::PackResol
 }
 
 /// A `manual_raw_has_builtin` finding whose raw block every line of which has an exact v2
-/// statement, in a `#[bhav] fn` without `keep_layout`. A raw block that keeps the tree's
-/// layout (`raw_block_is_layout_free` is false for it) keeps the backend pass off the whole
-/// tree, and its native form does not: that form may then build other bytes (or not build,
-/// when the tree's `node_order` counts the kept nodes). `#[bhav(keep_layout)]` keeps the pass
-/// off as such a block does when it ends the body (#503).
+/// statement, in a `#[bhav] fn` or lifecycle tree without `keep_layout`. A raw block that
+/// keeps the tree's layout (`raw_block_is_layout_free` is false for it) keeps the backend pass
+/// off the whole tree, and its native form does not: that form may then build other bytes
+/// (or not build, when the tree's `node_order` counts the kept nodes). `keep_layout` in the
+/// tree's header keeps the pass off as such a block does when it ends the body (#503).
 #[derive(Debug, Clone)]
 struct LayoutTrial {
     /// The finding's position.
     at: Span,
     /// The raw block, rewritten to its exact statements.
     native: Fix,
-    /// `keep_layout` added to the tree's `#[bhav(..)]`.
-    pin: Fix,
+    /// `keep_layout` added to the tree's header, when the tree takes one and has none yet.
+    pin: Option<Fix>,
+    /// Where the help says the pin goes ([`PinSite::advice`]).
+    advice: String,
+    /// For a block naming `local[N]`, the finding: it is reported only when the trial builds
+    /// the same bytes ([`FileLinter::raw_local_form`]).
+    finding: Option<LintDiagnostic>,
 }
 
 /// The most `keep_layout` trials one file may take (each takes up to two builds).
@@ -5876,18 +6068,29 @@ const LAYOUT_BUDGET: usize = 8;
 /// `manual_raw_has_builtin` with `keep_layout`: for each trial (in source order, within
 /// [`LAYOUT_BUDGET`]), the native form is built alone, and when it does not build the same
 /// bytes, with the pin. When only the pinned form builds the same bytes, the finding's help
-/// says so. Each block is tried on its own, as the finding stands on its own.
+/// says so. Each block is tried on its own, as the finding stands on its own. A trial's own
+/// finding (a block naming `local[N]`) is added when either form builds the same bytes.
+///
+/// The trial findings left untried (past the budget, or when the file's pack config does
+/// not read): an `allow` of them is not stale.
 fn layout_pins(
     input: &LintInput,
     original: &[crate::compile::CompiledObject],
     trials: &[LayoutTrial],
-    diags: &mut [LintDiagnostic],
-) {
+    diags: &mut Vec<LintDiagnostic>,
+) -> Vec<LintDiagnostic> {
+    let untried = |from: usize| -> Vec<LintDiagnostic> {
+        trials
+            .iter()
+            .skip(from)
+            .filter_map(|t| t.finding.clone())
+            .collect()
+    };
     if trials.is_empty() {
-        return;
+        return Vec::new();
     }
     let Some(builds_same) = same_bytes(input, original) else {
-        return;
+        return untried(0);
     };
     let builds = |fixes: Vec<Fix>| {
         let p = Pending {
@@ -5912,7 +6115,29 @@ fn layout_pins(
         apply_fixes(&input.source, std::iter::once(&p)).is_some_and(|s| builds_same(&s))
     };
     for t in trials.iter().take(LAYOUT_BUDGET) {
-        if builds(vec![t.native.clone()]) || !builds(vec![t.native.clone(), t.pin.clone()]) {
+        let pinned = if builds(vec![t.native.clone()]) {
+            false
+        } else if let Some(pin) = &t.pin
+            && builds(vec![t.native.clone(), pin.clone()])
+        {
+            true
+        } else {
+            continue;
+        };
+        let advice = format!(
+            ", and {}: this block keeps the tree's layout, and the native form builds the same \
+             bytes only with the pin",
+            t.advice
+        );
+        if let Some(finding) = &t.finding {
+            let mut d = finding.clone();
+            if pinned && let Some(help) = &mut d.help {
+                help.push_str(&advice);
+            }
+            diags.push(d);
+            continue;
+        }
+        if !pinned {
             continue;
         }
         let Some(d) = diags.iter_mut().find(|d| {
@@ -5921,22 +6146,47 @@ fn layout_pins(
             continue;
         };
         if let Some(help) = &mut d.help {
-            help.push_str(
-                ", and add `keep_layout` to the tree's `#[bhav(..)]`: this block keeps the \
-                 tree's layout, and the native form builds the same bytes only with the pin",
-            );
+            help.push_str(&advice);
         }
     }
+    untried(LAYOUT_BUDGET)
 }
 
-/// Per `#[bhav] fn` (keyed by its `fn` keyword's position), where `keep_layout` goes in its
-/// `#[bhav(..)]`: the token to insert at, the bytes past that token's start, and the text.
-/// `#[bhav]` takes `(keep_layout)` after its name; `#[bhav(..)]` takes `, keep_layout` before
-/// its `)` (`keep_layout` after a `(` or a trailing comma). Other attributes and `pub` may
-/// stand between the attribute and `fn`.
-fn bhav_pins(
-    tokens: &[crate::v2::lexer::Token],
-) -> BTreeMap<(usize, usize), (Span, usize, &'static str)> {
+/// The help's advice for a pin in a tree's `#[bhav(..)]`.
+const BHAV_PIN_ADVICE: &str = "add `keep_layout` to the tree's `#[bhav(..)]`";
+/// The help's advice for a pin in a lifecycle tree's `#[frame(..)]`.
+const FRAME_PIN_ADVICE: &str = "add `keep_layout` to the tree's `#[frame(..)]`";
+/// The help's advice for a lifecycle tree with no header attribute.
+const NEW_FRAME_PIN_ADVICE: &str = "add `#[frame(keep_layout)]` to the tree";
+
+/// The keywords of an object's lifecycle trees, which take a header as `#[frame(..)]` or
+/// `#[bhav(..)]`.
+const LIFECYCLE_KEYWORDS: [&str; 5] = ["init", "main", "load", "reset", "cleanup"];
+
+/// Where `keep_layout` goes in one tree's header ([`pin_sites`]).
+#[derive(Debug, Clone, Copy)]
+struct PinSite {
+    /// The token the pin is inserted at.
+    at: Span,
+    /// The bytes past that token's start.
+    past: usize,
+    /// The inserted text.
+    text: &'static str,
+    /// What the help tells the user to add.
+    advice: &'static str,
+}
+
+/// Per tree keyword (keyed by its position), where `keep_layout` goes in the tree's header:
+/// - a `#[bhav] fn` (its `fn` keyword): in its `#[bhav(..)]`;
+/// - a lifecycle tree (`init`, `main`, `load`, `reset`, `cleanup`): in its `#[bhav(..)]`,
+///   else its `#[frame(..)]`, else a new `#[frame(keep_layout)]` before the keyword.
+///
+/// `#[bhav]` / `#[frame]` take `(keep_layout)` after their name; `#[bhav(..)]` /
+/// `#[frame(..)]` take `, keep_layout` before their `)` (`keep_layout` after a `(` or a
+/// trailing comma). Other attributes (and `pub`, before `fn`) may stand between the attribute
+/// and the keyword. The lint looks a tree up by its keyword's position, so an entry for a
+/// token that is not a tree's keyword is never used.
+fn pin_sites(tokens: &[crate::v2::lexer::Token]) -> BTreeMap<(usize, usize), PinSite> {
     let kind = |i: usize| tokens.get(i).map(|t| &t.kind);
     let is_ident = |i: usize, name: &str| matches!(kind(i), Some(TokenKind::Ident(n)) if n == name);
     // One past the `]` closing the attribute that opens at `i` (`#[`), or `None`.
@@ -5956,40 +6206,66 @@ fn bhav_pins(
         }
         None
     };
-    let mut out = BTreeMap::new();
-    for i in 0..tokens.len() {
-        if !(matches!(kind(i), Some(TokenKind::HashBracket)) && is_ident(i + 1, "bhav")) {
-            continue;
+    // The pin inside the attribute `#[name]` / `#[name(..)]` opening at `i` and ending
+    // before `end`, or `None` for another shape.
+    let inside = |i: usize, end: usize, name: &str| match kind(i + 2) {
+        Some(TokenKind::RBracket) => Some((tokens[i + 1].span, name.len(), "(keep_layout)")),
+        // `#[name(..)]`: the `)` just before the closing `]`.
+        Some(TokenKind::LParen) if matches!(kind(end - 2), Some(TokenKind::RParen)) => {
+            let text = if matches!(kind(end - 3), Some(TokenKind::LParen | TokenKind::Comma)) {
+                "keep_layout"
+            } else {
+                ", keep_layout"
+            };
+            Some((tokens[end - 2].span, 0, text))
         }
-        let Some(mut next) = attr_end(i) else {
-            break;
-        };
-        let pin = match kind(i + 2) {
-            Some(TokenKind::RBracket) => (tokens[i + 1].span, "bhav".len(), "(keep_layout)"),
-            // `#[bhav(..)]`: the `)` just before the closing `]`.
-            Some(TokenKind::LParen) if matches!(kind(next - 2), Some(TokenKind::RParen)) => {
-                let text = if matches!(kind(next - 3), Some(TokenKind::LParen | TokenKind::Comma)) {
-                    "keep_layout"
-                } else {
-                    ", keep_layout"
-                };
-                (tokens[next - 2].span, 0, text)
-            }
-            _ => continue,
-        };
+        _ => None,
+    };
+    let site = |(at, past, text): (Span, usize, &'static str), advice: &'static str| PinSite {
+        at,
+        past,
+        text,
+        advice,
+    };
+    let mut out = BTreeMap::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        // A run of attributes (none when `i` is not a `#[`), then the item's keyword.
+        let (mut bhav, mut frame) = (None, None);
+        let mut next = i;
         while matches!(kind(next), Some(TokenKind::HashBracket)) {
             let Some(end) = attr_end(next) else {
-                break;
+                return out;
             };
+            if is_ident(next + 1, "bhav") {
+                bhav = Some(inside(next, end, "bhav"));
+            } else if is_ident(next + 1, "frame") {
+                frame = Some(inside(next, end, "frame"));
+            }
             next = end;
         }
-        if is_ident(next, "pub") {
+        let at = |n: usize| (tokens[n].span.line, tokens[n].span.column);
+        if is_ident(next, "pub") && is_ident(next + 1, "fn") {
             next += 1;
         }
         if is_ident(next, "fn") {
-            let at = tokens[next].span;
-            out.insert((at.line, at.column), pin);
+            if let Some(Some(pin)) = bhav {
+                out.insert(at(next), site(pin, BHAV_PIN_ADVICE));
+            }
+        } else if LIFECYCLE_KEYWORDS.iter().any(|k| is_ident(next, k)) {
+            let pin = match (bhav, frame) {
+                (Some(pin), _) => pin.map(|p| site(p, BHAV_PIN_ADVICE)),
+                (None, Some(pin)) => pin.map(|p| site(p, FRAME_PIN_ADVICE)),
+                (None, None) => Some(site(
+                    (tokens[next].span, 0, "#[frame(keep_layout)] "),
+                    NEW_FRAME_PIN_ADVICE,
+                )),
+            };
+            if let Some(pin) = pin {
+                out.insert(at(next), pin);
+            }
         }
+        i = next + 1;
     }
     out
 }
