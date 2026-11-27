@@ -163,6 +163,7 @@ pub(super) fn lower_standalone_tree(
         ctx.begin_body(explicit);
     }
     ctx.frame_locals = d.frame.as_ref().and_then(|f| f.locals);
+    ctx.pinned_layout = d.frame.as_ref().is_some_and(|f| f.keep_layout);
     ctx.frame_format = d.frame.as_ref().and_then(|f| f.format);
     ctx.fixed_entry = d.frame.as_ref().and_then(|f| f.kind).is_some();
     ctx.frame_args = d.frame.as_ref().and_then(|f| f.args).map_or_else(
@@ -310,6 +311,9 @@ pub(super) fn write_framed_tree(
     }
     if frame.dead_false_error {
         header.push("dead_false: error".to_owned());
+    }
+    if frame.keep_layout {
+        header.push("keep_layout: true".to_owned());
     }
     if let Some(order) = &frame.node_order {
         let order: Vec<String> = order.iter().map(u16::to_string).collect();

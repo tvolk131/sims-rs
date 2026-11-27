@@ -307,9 +307,9 @@ struct CallableSig {
     context: CallContext,
     params: Vec<ResolvedAbiParam>,
     ret: ResolvedReturnAbi,
-    /// Argument words the callee's frame reads: `#[frame(args = )]` for a standalone tree, else
-    /// the positional parameter count (an `extern` is trusted to declare its whole frame).
-    /// `None` when unknown.
+    /// Argument words the callee's frame reads: `#[frame(args = )]` for a standalone tree or an
+    /// `extern` fn, else the positional parameter count (an `extern` is trusted to declare its
+    /// whole frame). `None` when unknown (`#[frame(args = unknown)]`).
     frame_args: Option<usize>,
 }
 
@@ -945,6 +945,8 @@ struct TreeLowerer<'a> {
     /// following instruction's bytes), or a literal-argument call whose callee frame may read
     /// more than the four words in the call's own operands.
     keep_layout: bool,
+    /// `#[bhav(keep_layout)]`: `finish` sets `keep_layout`.
+    pinned_layout: bool,
     /// Trees this tree calls with inline arguments whose frame holds at most four arguments
     /// (the `.air` header's `narrow_callees`, which `share_tails`, `node_order` and
     /// `dead_false` need).
@@ -953,6 +955,10 @@ struct TreeLowerer<'a> {
     /// `let Some(v) = f() else { .. };`), which the backend may read in place
     /// ([`mir::alias_option_temps`]).
     option_aliases: BTreeSet<String>,
+    /// Every option binding's copy outside a `#[temp]` loop of a tree not entered at a numbered
+    /// node, whether or not copy staging is on: a fixed frame (`locals = N`) the copies do not
+    /// fit reads them in place instead, when the copies' reads allow it (`finish`).
+    fit_aliases: BTreeSet<String>,
     /// The first emitted inline-argument call to a callee with a wider frame, which reads the
     /// nodes after the call: `share_tails` and `node_order` refuse it.
     wide_call: Option<(Span, String)>,

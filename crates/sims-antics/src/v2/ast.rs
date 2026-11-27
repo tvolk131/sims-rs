@@ -86,6 +86,37 @@ pub struct ExternFnDecl {
     pub name: String,
     pub params: Vec<AbiParam>,
     pub ret: ReturnAbi,
+    /// `#[frame(args = N)]` / `#[frame(args = unknown)]`: the callee's frame width, when the
+    /// parameters do not give it (a tree called through the temps declares no positional
+    /// parameters). `None`: the positional parameters are the whole frame.
+    pub frame: Option<ExternFrame>,
+}
+
+/// What an extern fn's `#[frame(..)]` says about its callee's frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternFrame {
+    /// `#[frame(args = N)]`: the frame holds `N` argument words.
+    Args(u8),
+    /// `#[frame(args = unknown)]`: the width is not known, so no inline call to the tree is
+    /// taken as narrow.
+    Unknown,
+}
+
+impl ExternFnDecl {
+    /// The callee's frame width as this declaration gives it: `#[frame(args = N)]`, else its
+    /// positional parameter count; `None` for `#[frame(args = unknown)]`.
+    pub fn frame_args(&self) -> Option<usize> {
+        match self.frame {
+            Some(ExternFrame::Args(n)) => Some(usize::from(n)),
+            Some(ExternFrame::Unknown) => None,
+            None => Some(
+                self.params
+                    .iter()
+                    .filter(|p| p.slot == AbiParamSlot::Positional)
+                    .count(),
+            ),
+        }
+    }
 }
 
 /// External global (`256..=4095`) / semi-global (`8192..`) BHAV bindings (`[pub] extern mod name { ... }`).
@@ -155,8 +186,8 @@ pub struct TreeMemberDecl {
     pub ret: ReturnAbi,
     pub body: Vec<V2Stmt>,
     /// Header pins from `#[bhav(..)]` / `#[frame(..)]`, all optional: `args`, `locals`, `format`,
-    /// `revision`, `kind`, `empty`, `node_order`, `share_tails`, `dead_false` (see
-    /// [`TreeFrame`]).
+    /// `revision`, `kind`, `empty`, `node_order`, `share_tails`, `dead_false`, `keep_layout`
+    /// (see [`TreeFrame`]).
     pub frame: Option<TreeFrame>,
 }
 
@@ -183,6 +214,10 @@ pub struct TreeFrame {
     /// `false: error` in place of `false: next`, as the original compiler writes it (`.air`
     /// `dead_false: error`).
     pub dead_false_error: bool,
+    /// `#[bhav(keep_layout)]`: the backend pass leaves the tree's nodes and frame words as
+    /// lowered, as it does for a tree whose body ends in a `raw` block that keeps its layout
+    /// (`.air` `keep_layout: true`).
+    pub keep_layout: bool,
 }
 
 /// Zero-cost integer enum declaration (`[pub] enum Name { VariantA, VariantB = 2 }`).

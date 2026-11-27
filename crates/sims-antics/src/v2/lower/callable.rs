@@ -53,7 +53,14 @@ impl<'a> TreeLowerer<'a> {
                         is_local,
                         f.span,
                     )
-                    .map(Some)
+                    .map(|sig| {
+                        // `#[frame(args = ..)]` gives the callee's frame where the positional
+                        // parameters do not.
+                        Some(CallableSig {
+                            frame_args: f.frame_args(),
+                            ..sig
+                        })
+                    })
             }
             _ => Ok(None),
         }
@@ -308,32 +315,37 @@ impl<'a> TreeLowerer<'a> {
             Some(l) => {
                 // A callee frame wider than the call's four operand words reads the rest from
                 // the instructions after the call, so the tree's layout must stay as lowered.
+                // So must a call not proven narrow: a narrow declaration is listed only when no
+                // other declaration of the id disagrees. Discarded code emits no call, so it
+                // keeps nothing.
                 match sig.frame_args {
-                    Some(n) if n <= 4 => {
-                        // Listed only when no other declaration of the id disagrees.
-                        if self.env.frame_is_narrow(sig.id) {
-                            self.narrow_callees.insert(sig.id);
-                        } else if self.checking_discarded == 0 && self.wide_call.is_none() {
-                            let why = if sig.id >= 8192 && !self.env.library_declares(sig.id) {
-                                "a semi-global tree, whose library (and frame) depends on the \
-                                 object that runs the call (its 'semi_global: \"Name\";' \
-                                 link), and no 'extern \"Name\" mod' of that library declares \
-                                 it"
-                            } else {
-                                "whose tree id another declaration gives a wider frame"
-                            };
-                            self.wide_call = Some((span, format!("to {}, {why}", sig.display)));
-                        }
+                    Some(n) if n <= 4 && self.env.frame_is_narrow(sig.id) => {
+                        self.narrow_callees.insert(sig.id);
                     }
+                    _ if self.checking_discarded > 0 => {}
                     frame => {
                         self.keep_layout = true;
-                        if self.checking_discarded == 0 && self.wide_call.is_none() {
-                            let words =
-                                frame.map_or("an unknown number of".to_owned(), |n| n.to_string());
-                            self.wide_call = Some((
-                                span,
-                                format!("to {}, whose frame holds {words} arguments", sig.display),
-                            ));
+                        if self.wide_call.is_none() {
+                            let why = match frame {
+                                Some(n) if n <= 4 => {
+                                    if sig.id >= 8192 && !self.env.library_declares(sig.id) {
+                                        "a semi-global tree, whose library (and frame) depends \
+                                         on the object that runs the call (its 'semi_global: \
+                                         \"Name\";' link), and no 'extern \"Name\" mod' of that \
+                                         library declares it"
+                                            .to_owned()
+                                    } else {
+                                        "whose tree id another declaration gives a wider frame"
+                                            .to_owned()
+                                    }
+                                }
+                                frame => format!(
+                                    "whose frame holds {} arguments",
+                                    frame.map_or("an unknown number of".to_owned(), |n| n
+                                        .to_string())
+                                ),
+                            };
+                            self.wide_call = Some((span, format!("to {}, {why}", sig.display)));
                         }
                     }
                 }
@@ -371,6 +383,11 @@ impl<'a> TreeLowerer<'a> {
         // A discarded check's trial lowering leaves no code, and its names may come again.
         if self.checking_discarded == 0 && !self.copy_staging() {
             self.option_aliases.insert(air_name.to_owned());
+        }
+        // Dropping a copy would move a numbered entry node, and in a `#[temp]` loop it follows
+        // the loop's staging; neither is a fixed frame's to settle.
+        if self.checking_discarded == 0 && self.temp_loops == 0 && !self.fixed_entry {
+            self.fit_aliases.insert(air_name.to_owned());
         }
     }
 

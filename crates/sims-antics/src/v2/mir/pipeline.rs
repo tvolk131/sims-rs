@@ -6,6 +6,7 @@
 use super::*;
 
 /// What the backend needs to know about a lowered tree besides its body text.
+#[derive(Clone)]
 pub(crate) struct FrameFacts<'a> {
     /// The tree keeps main's rules: some tree of its object may read global 34
     /// (`ObjectEnv::reads_global_34`), or it pins a `push_interaction` slot, which must pin

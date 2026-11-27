@@ -56,8 +56,10 @@ impl<'a> TreeLowerer<'a> {
             inline_call_sites: Vec::new(),
             dup_decl: None,
             keep_layout: false,
+            pinned_layout: false,
             narrow_callees: BTreeSet::new(),
             option_aliases: BTreeSet::new(),
+            fit_aliases: BTreeSet::new(),
             wide_call: None,
             staged_in_place: false,
             temp_loops: 0,
@@ -88,6 +90,9 @@ impl<'a> TreeLowerer<'a> {
     }
 
     pub(super) fn finish(mut self) -> Result<String> {
+        // `#[bhav(keep_layout)]` keeps the backend pass off as a `raw` block that ends the body
+        // and keeps its layout would: lowering itself is unchanged.
+        self.keep_layout |= self.pinned_layout;
         let formats_text = self.raw_formats_text || mir::body_formats_text(self.em.text());
         if formats_text {
             self.env.saw_text_tree.set(true);
@@ -217,7 +222,36 @@ impl<'a> TreeLowerer<'a> {
             // the named locals after it.
             out = replace_outside_strings(&out, PIN_SLOT, "0");
         }
-        let finished = mir::finish_body(out, &facts);
+        let mut finished = mir::finish_body(out.clone(), &facts);
+        // A fixed frame (`locals = N`) too small for the option copies would fail to build:
+        // where the copies' reads allow it (`mir::alias_option_temps`), every binding reads its
+        // temp in place instead, past the object-wide guards `copy_staging` follows (another
+        // tree's frame-word text, or a kept layout elsewhere in the object), since the form
+        // that copies every binding does not build, so no bytes or frame residue can differ. Only when the copies overflow the frame (as `.air` counts its words)
+        // and the result fits it, so a source that builds keeps its bytes. Not when this
+        // tree's own text may name a frame word (a copy may fill the word it shows), with a
+        // kept layout, a wide inline call (it reads the nodes after it), or main's rules (the
+        // copy is an Expression, whose scratch-pointer write global 34 reads).
+        let words = |body: &str| mir::frame_words(body, facts.min_locals);
+        if let Some(n) = self.frame_locals
+            && !self.fit_aliases.is_empty()
+            && !self.keep_layout
+            && self.wide_call.is_none()
+            && !facts.main_rules
+            && !mir::reads_a_word(&facts.text_reads)
+            && words(&finished).is_some_and(|w| w > usize::from(n))
+        {
+            let fit = std::cell::Cell::new(false);
+            let fit_facts = mir::FrameFacts {
+                option_aliases: &self.fit_aliases,
+                aliased: &fit,
+                ..facts.clone()
+            };
+            let alt = mir::finish_body(out, &fit_facts);
+            if fit.get() && words(&alt).is_some_and(|w| w <= usize::from(n)) {
+                finished = alt;
+            }
+        }
         // An option binding read in place dropped its copy, which changes nodes and frame
         // words as a staging in place does (the pass reports whether it read any in place).
         let aliased = aliased.get();
@@ -250,6 +284,7 @@ impl<'a> TreeLowerer<'a> {
     /// the frame, as on a standalone `#[bhav] fn`.
     pub(super) fn set_lifecycle_frame(&mut self, frame: &TreeFrame) {
         self.frame_locals = frame.locals;
+        self.pinned_layout = frame.keep_layout;
         self.frame_format = frame.format;
         self.frame_args = frame.args.map_or(0, usize::from);
         self.fixed_entry = frame.kind.is_some();

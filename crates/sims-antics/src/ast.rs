@@ -74,6 +74,10 @@ pub struct TreeHeader {
     /// arguments: a callee with a wider frame reads the rest from the nodes after the call,
     /// which a rewrite moves or changes.
     pub narrow_callees: Vec<u16>,
+    /// `keep_layout: true`: the v2 tree it was expanded from asked its backend pass to leave the
+    /// nodes and frame words as lowered (`#[bhav(keep_layout)]`). The `.air` compiler never
+    /// rewrites a tree's nodes past its other header fields, so here it only records the pin.
+    pub keep_layout: bool,
 }
 
 impl Default for TreeHeader {
@@ -91,6 +95,7 @@ impl Default for TreeHeader {
             node_order: None,
             dead_false_error: false,
             narrow_callees: Vec::new(),
+            keep_layout: false,
         }
     }
 }

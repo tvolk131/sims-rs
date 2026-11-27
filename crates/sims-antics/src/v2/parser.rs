@@ -7,12 +7,12 @@ use crate::parser::motive_by_name;
 use crate::v2::ast::{
     AbiParam, AbiParamSlot, AdvertiseDecl, BconTableDecl, BitflagVariant, BitflagsDecl, CallArg,
     ConstDecl, ConstIntExpr, EnumDecl, EnumVariant, ExternBconDecl, ExternBconEntry, ExternFnDecl,
-    ExternModDecl, FLAG_LIST_METHODS, FnDecl, FnParam, ForEachIter, FunctionalDecl, GuardBody,
-    GuardDecl, GuidValue, InteractionDecl, LifecycleBlock, MatchArm, MatchExprArm, MatchPattern,
-    MetaField, MetaFieldKind, ObjectDecl, ObjectMember, ParamAssignDecl, ParamDecl, ParamType,
-    ParamValue, ReturnAbi, SlotDecl, SoundDecl, SpriteDecl, StateDecl, StateInitValue, StateType,
-    StringsDecl, TemplateDecl, TileDecl, TreeMemberDecl, UseDecl, UseItem, V2AssignOp, V2BinOp,
-    V2Expr, V2File, V2Item, V2Stmt, V2Type, V2UnaryOp, VariantDecl,
+    ExternFrame, ExternModDecl, FLAG_LIST_METHODS, FnDecl, FnParam, ForEachIter, FunctionalDecl,
+    GuardBody, GuardDecl, GuidValue, InteractionDecl, LifecycleBlock, MatchArm, MatchExprArm,
+    MatchPattern, MetaField, MetaFieldKind, ObjectDecl, ObjectMember, ParamAssignDecl, ParamDecl,
+    ParamType, ParamValue, ReturnAbi, SlotDecl, SoundDecl, SpriteDecl, StateDecl, StateInitValue,
+    StateType, StringsDecl, TemplateDecl, TileDecl, TreeMemberDecl, UseDecl, UseItem, V2AssignOp,
+    V2BinOp, V2Expr, V2File, V2Item, V2Stmt, V2Type, V2UnaryOp, VariantDecl,
 };
 use crate::v2::attrs::{Attr, AttrArg, AttrValue, ItemAttrs};
 use crate::v2::lexer::{Token, TokenKind, tokenize};
@@ -530,6 +530,25 @@ impl Parser {
         }
     }
 
+    /// The `as alias` after an imported item, if any. The name it binds may not be `self`,
+    /// which always names the running object.
+    fn parse_use_alias(&mut self, item: &str, item_span: Span) -> Result<Option<String>> {
+        let (alias, span) = if self.eat_ident("as") {
+            let (alias, span) = self.expect_ident("import alias")?;
+            (Some(alias), span)
+        } else {
+            (None, item_span)
+        };
+        if alias.as_deref().unwrap_or(item) == "self" {
+            return Err(Error::at(
+                span,
+                "'self' always names the running object and cannot be imported as a name; \
+                 choose another alias",
+            ));
+        }
+        Ok(alias)
+    }
+
     fn parse_use(&mut self, span: Span) -> Result<UseDecl> {
         let mut segs = Vec::new();
         let (first, _) = self.expect_ident("module path segment")?;
@@ -550,11 +569,7 @@ impl Parser {
             if self.eat(&TokenKind::LBrace) {
                 while !self.eat(&TokenKind::RBrace) {
                     let (name, ispan) = self.expect_ident("imported item name")?;
-                    let alias = if self.eat_ident("as") {
-                        Some(self.expect_ident("import alias")?.0)
-                    } else {
-                        None
-                    };
+                    let alias = self.parse_use_alias(&name, ispan)?;
                     items.push(UseItem {
                         span: ispan,
                         name,
@@ -571,11 +586,7 @@ impl Parser {
             if self.peek().kind == TokenKind::ColonColon {
                 segs.push(seg);
             } else {
-                let alias = if self.eat_ident("as") {
-                    Some(self.expect_ident("import alias")?.0)
-                } else {
-                    None
-                };
+                let alias = self.parse_use_alias(&seg, seg_span)?;
                 items.push(UseItem {
                     span: seg_span,
                     name: seg,
@@ -1058,8 +1069,13 @@ impl Parser {
         let mut fns: Vec<ExternFnDecl> = Vec::new();
         while !self.eat(&TokenKind::RBrace) {
             let fspan = self.span();
-            let attrs = self.parse_item_attrs()?;
-            attrs.only(&["id", "ret"], "an extern fn")?;
+            let (frame_attrs, attrs): (Vec<Attr>, Vec<Attr>) = self
+                .parse_attrs()?
+                .into_iter()
+                .partition(|a| a.name == "frame");
+            let attrs = ItemAttrs::collect(attrs)?;
+            attrs.only(&["id", "ret", "frame"], "an extern fn")?;
+            let frame = extern_frame(frame_attrs)?;
             if let Some((ispan, v)) = attrs.id
                 && !(256..=4095).contains(&v)
                 && v < 8192
@@ -1105,12 +1121,27 @@ impl Parser {
             let (_, params) = self.parse_abi_params(&what, false)?;
             let ret = self.parse_return_abi(&what, attrs.ret_temp)?;
             self.expect(&TokenKind::Semicolon, "';' after extern fn signature")?;
+            if let Some((fspan, ExternFrame::Args(n))) = frame {
+                let positional = params
+                    .iter()
+                    .filter(|p| p.slot == AbiParamSlot::Positional)
+                    .count();
+                if positional > usize::from(n) {
+                    return Err(Error::at(
+                        fspan,
+                        format!(
+                            "{what} declares {positional} positional parameters, more than its '#[frame(args = {n})]'"
+                        ),
+                    ));
+                }
+            }
             fns.push(ExternFnDecl {
                 span: fspan,
                 id,
                 name: fname,
                 params,
                 ret,
+                frame: frame.map(|(_, f)| f),
             });
         }
         Ok(ExternModDecl {
@@ -4735,4 +4766,37 @@ fn reject_world_binding(name: &str, span: Span) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// An extern fn's `#[frame(args = N)]` or `#[frame(args = unknown)]`: its callee's frame width
+/// when the parameters do not give it, as for a tree called through the temps. Other header
+/// fields describe a tree's own body, which an extern fn does not have.
+fn extern_frame(attrs: Vec<Attr>) -> Result<Option<(Span, ExternFrame)>> {
+    const SPELLING: &str = "an extern fn takes '#[frame(args = N)]' or '#[frame(args = unknown)]'";
+    let mut out = None;
+    for attr in attrs {
+        let frame = match attr.args.as_deref() {
+            Some(
+                [
+                    AttrArg {
+                        key: Some(key),
+                        value,
+                        ..
+                    },
+                ],
+            ) if key == "args" => match value {
+                AttrValue::Ident(v) if v == "unknown" => ExternFrame::Unknown,
+                AttrValue::Int(n) => ExternFrame::Args(
+                    u8::try_from(*n)
+                        .map_err(|_| Error::at(attr.span, "'args' must fit in a byte (0..=255)"))?,
+                ),
+                _ => return Err(Error::at(attr.span, SPELLING)),
+            },
+            _ => return Err(Error::at(attr.span, SPELLING)),
+        };
+        if out.replace((attr.span, frame)).is_some() {
+            return Err(Error::at(attr.span, "duplicate #[frame]"));
+        }
+    }
+    Ok(out)
 }
