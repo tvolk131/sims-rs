@@ -458,21 +458,21 @@ fn an_enum_or_bitflags_of_the_table_name_wins_the_path() {
 
 #[test]
 fn a_called_path_does_not_count() {
-    // `globals::init_object()` calls a global tree; it reads no entry of a table whose
+    // `globals::set_up_object()` calls a global tree; it reads no entry of a table whose
     // snake-case name is `globals`.
     let source = format!(
         "use std::globals::*;\n{}",
         bcon_obj(
             "",
-            "    bcon 4098 \"Globals\" { init_object = 1, spare = 2 }\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.level = Tuning::low + Tuning::high + Globals::spare;\n        globals::init_object()?;\n    }",
+            "    bcon 4098 \"Globals\" { set_up_object = 1, spare = 2 }\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.level = Tuning::low + Tuning::high + Globals::spare;\n        globals::set_up_object()?;\n    }",
         )
     );
     assert_eq!(
         unused_bcon(&source),
-        ["BCON entry `init_object` of table 4098 is never read"]
+        ["BCON entry `set_up_object` of table 4098 is never read"]
     );
     // Read by path, it counts.
-    let read = source.replace("Globals::spare", "globals::init_object + Globals::spare");
+    let read = source.replace("Globals::spare", "globals::set_up_object + Globals::spare");
     assert!(unused_bcon(&read).is_empty(), "{:#?}", lint(&read));
     iff(&read);
 }
@@ -499,12 +499,12 @@ fn a_grouped_callee_is_a_call_too() {
         "use std::globals::*;\n{}",
         bcon_obj(
             "",
-            "    bcon 4098 \"Globals\" { init_object = 1, spare = 2 }\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.level = Tuning::low + Tuning::high + Globals::spare;\n        (globals::init_object)()?;\n    }",
+            "    bcon 4098 \"Globals\" { set_up_object = 1, spare = 2 }\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.level = Tuning::low + Tuning::high + Globals::spare;\n        (globals::set_up_object)()?;\n    }",
         )
     );
     assert_eq!(
         unused_bcon(&source),
-        ["BCON entry `init_object` of table 4098 is never read"]
+        ["BCON entry `set_up_object` of table 4098 is never read"]
     );
     // A grouped read is still a read.
     let read = bcon_probe("        self.level = (Tuning::low) + Tuning::high;");
@@ -605,12 +605,12 @@ fn a_nested_grouped_callee_is_a_call_too() {
         "use std::globals::*;\n{}",
         bcon_obj(
             "",
-            "    bcon 4098 \"Globals\" { init_object = 1, spare = 2 }\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.level = Tuning::low + Tuning::high + Globals::spare;\n        ((globals::init_object))()?;\n    }",
+            "    bcon 4098 \"Globals\" { set_up_object = 1, spare = 2 }\n    #[bhav(label = \"Probe\")] fn probe() {\n        self.level = Tuning::low + Tuning::high + Globals::spare;\n        ((globals::set_up_object))()?;\n    }",
         )
     );
     assert_eq!(
         unused_bcon(&source),
-        ["BCON entry `init_object` of table 4098 is never read"]
+        ["BCON entry `set_up_object` of table 4098 is never read"]
     );
 }
 

@@ -44,6 +44,7 @@ mod v2_5_lift_finale;
 mod v2_5_lift_locals;
 mod v2_5_lint;
 mod v2_6_compiler;
+mod v2_6_lift_finale;
 mod v2_6_lint;
 mod v2_compiler;
 mod v2_fmt_and_decompile;
