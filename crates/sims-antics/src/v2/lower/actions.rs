@@ -901,7 +901,7 @@ impl<'a> TreeLowerer<'a> {
     /// The cell `set_to_next(.., dest: x)` steps: Set To Next reads the cursor there and
     /// writes the next one back into it (`sims-vm` `primitives/set_to_next.rs`, operand bit 7
     /// with the destination scope and index), so it is both read and written. That is
-    /// `stack_obj`, an `i16` or untyped `ObjectId` local, `param[N]`, or `temp[N]`. A typed
+    /// `stack_obj`, an `i16` or untyped `ObjectId` local, `local[N]`, `param[N]`, or `temp[N]`. A typed
     /// handle is refused: the next object need not be of its type.
     fn set_to_next_dest(&mut self, dest: &V2Expr) -> Result<String> {
         let refuse = |what: String| Error::at(dest.span(), what);
@@ -929,7 +929,7 @@ impl<'a> TreeLowerer<'a> {
             },
             V2Expr::Index { base, .. }
                 if matches!(base.as_ref(), V2Expr::Ident(_, b)
-                    if matches!(b.as_str(), "param" | "temp") && self.lookup_var(b).is_none()) =>
+                    if matches!(b.as_str(), "param" | "temp" | "local") && self.lookup_var(b).is_none()) =>
             {
                 match self.resolve_lvalue(dest)? {
                     // The VM bounds-checks the destination before it steps (`sims-vm`

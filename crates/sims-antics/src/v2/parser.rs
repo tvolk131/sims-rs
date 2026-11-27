@@ -3,6 +3,7 @@
 use crate::art::FurnitureShape;
 use crate::audio::SoundPreset;
 use crate::error::{Error, Result, Span};
+use crate::node_order::DeadNode;
 use crate::parser::motive_by_name;
 use crate::v2::ast::{
     AbiParam, AbiParamSlot, AdvertiseDecl, BconTableDecl, BitflagVariant, BitflagsDecl, CallArg,
@@ -11,8 +12,8 @@ use crate::v2::ast::{
     GuardBody, GuardDecl, GuidValue, InteractionDecl, LifecycleBlock, MatchArm, MatchExprArm,
     MatchPattern, MetaField, MetaFieldKind, ObjectDecl, ObjectMember, ParamAssignDecl, ParamDecl,
     ParamType, ParamValue, ReturnAbi, SlotDecl, SoundDecl, SpriteDecl, StateDecl, StateInitValue,
-    StateType, StringsDecl, TemplateDecl, TileDecl, TreeMemberDecl, UseDecl, UseItem, V2AssignOp,
-    V2BinOp, V2Expr, V2File, V2Item, V2Stmt, V2Type, V2UnaryOp, VariantDecl,
+    StateType, StringsDecl, TemplateDecl, TileDecl, TreeFrame, TreeMemberDecl, UseDecl, UseItem,
+    V2AssignOp, V2BinOp, V2Expr, V2File, V2Item, V2Stmt, V2Type, V2UnaryOp, VariantDecl,
 };
 use crate::v2::attrs::{Attr, AttrArg, AttrValue, ItemAttrs};
 use crate::v2::lexer::{Token, TokenKind, tokenize};
@@ -75,6 +76,8 @@ fn parse_v2_source(source: &str, std_module: bool) -> Result<V2File> {
         tails: Vec::new(),
         arm_tails: Vec::new(),
         std_module,
+        dead_nodes_depth: None,
+        dead_nodes: None,
     };
     parser.parse_file()
 }
@@ -95,6 +98,11 @@ struct Parser {
     arm_tails: Vec<Span>,
     /// Parsing a built-in `std` module (`parse_v2_std_file`).
     std_module: bool,
+    /// The nesting depth of the tree body being parsed, where a trailing `dead_nodes { .. }`
+    /// block may end it ([`Parser::parse_tree_body`]); `None` outside one.
+    dead_nodes_depth: Option<usize>,
+    /// The entries of the `dead_nodes` block that ended the tree body, and its span.
+    dead_nodes: Option<(Span, Vec<DeadNode>)>,
 }
 
 impl Parser {
@@ -1255,7 +1263,9 @@ impl Parser {
         }
         let (sim_binding, params) = self.parse_abi_params(&what, true)?;
         let ret = self.parse_return_abi(&what, attrs.ret_temp)?;
-        let body = self.parse_fn_body(ret != ReturnAbi::Void)?;
+        let (body, frame) = self.parse_tree_body(attrs.frame.clone(), |p| {
+            p.parse_fn_body(ret != ReturnAbi::Void)
+        })?;
         Ok(TreeMemberDecl {
             span,
             pinned_id: attrs.id.map(|(_, id)| id),
@@ -1266,7 +1276,7 @@ impl Parser {
             params,
             ret,
             body,
-            frame: attrs.frame.clone(),
+            frame,
         })
     }
 
@@ -1422,7 +1432,7 @@ impl Parser {
                     members.push(ObjectMember::Bitflags(self.parse_bitflags(kw_span, false)?));
                 }
                 "init" => {
-                    let body = self.parse_block()?;
+                    let (body, frame) = self.parse_tree_body(frame, Self::parse_block)?;
                     members.push(ObjectMember::Init(LifecycleBlock {
                         span: kw_span,
                         pinned_id,
@@ -1431,7 +1441,7 @@ impl Parser {
                     }));
                 }
                 "main" => {
-                    let body = self.parse_block()?;
+                    let (body, frame) = self.parse_tree_body(frame, Self::parse_block)?;
                     members.push(ObjectMember::Main(LifecycleBlock {
                         span: kw_span,
                         pinned_id,
@@ -1440,7 +1450,7 @@ impl Parser {
                     }));
                 }
                 "load" => {
-                    let body = self.parse_block()?;
+                    let (body, frame) = self.parse_tree_body(frame, Self::parse_block)?;
                     members.push(ObjectMember::Load(LifecycleBlock {
                         span: kw_span,
                         pinned_id,
@@ -1449,7 +1459,7 @@ impl Parser {
                     }));
                 }
                 "reset" => {
-                    let body = self.parse_block()?;
+                    let (body, frame) = self.parse_tree_body(frame, Self::parse_block)?;
                     members.push(ObjectMember::Reset(LifecycleBlock {
                         span: kw_span,
                         pinned_id,
@@ -1458,7 +1468,7 @@ impl Parser {
                     }));
                 }
                 "cleanup" => {
-                    let body = self.parse_block()?;
+                    let (body, frame) = self.parse_tree_body(frame, Self::parse_block)?;
                     members.push(ObjectMember::Cleanup(LifecycleBlock {
                         span: kw_span,
                         pinned_id,
@@ -2791,6 +2801,121 @@ impl Parser {
         })
     }
 
+    /// A tree's body (a `#[bhav] fn`'s or a lifecycle block's), parsed by `parse`, which may end
+    /// in a `dead_nodes { .. }` block: its nodes go into the tree's `frame` (made if the tree
+    /// has none).
+    fn parse_tree_body(
+        &mut self,
+        mut frame: Option<TreeFrame>,
+        parse: impl FnOnce(&mut Self) -> Result<Vec<V2Stmt>>,
+    ) -> Result<(Vec<V2Stmt>, Option<TreeFrame>)> {
+        let saved = self.dead_nodes_depth.replace(self.depth + 1);
+        let body = parse(self);
+        self.dead_nodes_depth = saved;
+        let body = body?;
+        if let Some((span, dead)) = self.dead_nodes.take() {
+            frame
+                .get_or_insert(TreeFrame {
+                    span,
+                    footer_only: true,
+                    ..TreeFrame::default()
+                })
+                .dead_nodes = dead;
+        }
+        Ok((body, frame))
+    }
+
+    /// `dead_nodes { N: op 0xXXXX(8 bytes) -> true: T, false: F; .. }`, at the end of a tree
+    /// body, its closing `}` included: the original's nodes no branch reaches, kept as bytes
+    /// ([`DeadNode`]). A branch is `true`, `false`, `error` or any byte.
+    fn parse_dead_nodes(&mut self) -> Result<(Span, Vec<DeadNode>)> {
+        let span = self.bump().span; // 'dead_nodes'
+        self.expect(&TokenKind::LBrace, "'{'")?;
+        let mut dead = Vec::new();
+        while !self.eat(&TokenKind::RBrace) {
+            let at = self.expect_byte("dead node number")?;
+            self.expect(&TokenKind::Colon, "':'")?;
+            let (op, ospan) = self.expect_ident("'op'")?;
+            if op != "op" {
+                return Err(Error::at(ospan, "expected 'op' after a dead node's number"));
+            }
+            let opcode = self.expect_u16("opcode")?;
+            self.expect(&TokenKind::LParen, "'('")?;
+            let mut operands = [0u8; 8];
+            for (i, slot) in operands.iter_mut().enumerate() {
+                *slot = self.expect_byte("operand byte")?;
+                if i < 7 {
+                    self.eat(&TokenKind::Comma);
+                }
+            }
+            self.eat(&TokenKind::Comma);
+            self.expect(&TokenKind::RParen, "')' after 8 operand bytes")?;
+            self.expect(&TokenKind::Arrow, "'->'")?;
+            let on_true = self.dead_node_branch("true")?;
+            self.expect(&TokenKind::Comma, "','")?;
+            let on_false = self.dead_node_branch("false")?;
+            self.expect(&TokenKind::Semicolon, "';' after a dead node")?;
+            dead.push(DeadNode {
+                at,
+                opcode,
+                operands,
+                on_true,
+                on_false,
+            });
+        }
+        if dead.is_empty() {
+            return Err(Error::at(
+                span,
+                "empty 'dead_nodes { }' block: list a node, or drop the block",
+            ));
+        }
+        Ok((span, dead))
+    }
+
+    /// At a `dead_nodes { .. }` footer at the top level of the tree body being parsed.
+    fn at_dead_nodes_footer(&self) -> bool {
+        self.dead_nodes_depth == Some(self.depth)
+            && self.is_ident("dead_nodes")
+            && self.peek_at(1).kind == TokenKind::LBrace
+    }
+
+    /// `true: T` / `false: F` of a dead node: `true`, `false`, `error` or any byte.
+    fn dead_node_branch(&mut self, word: &str) -> Result<u8> {
+        let (kw, span) = self.expect_ident(&format!("'{word}'"))?;
+        if kw != word {
+            return Err(Error::at(span, format!("expected '{word}:' branch")));
+        }
+        self.expect(&TokenKind::Colon, "':'")?;
+        match &self.peek().kind {
+            TokenKind::Ident(s) if s == "error" => {
+                self.bump();
+                Ok(crate::lower::TARGET_ERROR)
+            }
+            TokenKind::Ident(s) if s == "true" => {
+                self.bump();
+                Ok(crate::lower::TARGET_TRUE)
+            }
+            TokenKind::Ident(s) if s == "false" => {
+                self.bump();
+                Ok(crate::lower::TARGET_FALSE)
+            }
+            _ => self.expect_byte("dead node branch (a byte, 'true', 'false' or 'error')"),
+        }
+    }
+
+    /// An integer 0..=255.
+    fn expect_byte(&mut self, desc: &str) -> Result<u8> {
+        let tok = self.bump();
+        match tok.kind {
+            TokenKind::Int(v) => u8::try_from(v)
+                .map_err(|_| Error::at(tok.span, format!("{desc} {v} is not a byte (0..=255)"))),
+            other => Err(Error::at(
+                tok.span,
+                format!("expected {desc}, found {other:?}"),
+            )),
+        }
+    }
+
     fn parse_block(&mut self) -> Result<Vec<V2Stmt>> {
         let span = self.expect(&TokenKind::LBrace, "'{'")?;
         self.enter_nesting(span)?;
@@ -2802,6 +2927,28 @@ impl Parser {
             }
             if self.peek().kind == TokenKind::Eof {
                 break Err(Error::at(span, "unterminated '{ ... }' block"));
+            }
+            if self.is_ident("dead_nodes") && self.peek_at(1).kind == TokenKind::LBrace {
+                let dspan = self.span();
+                if self.dead_nodes_depth != Some(self.depth) {
+                    break Err(Error::at(
+                        dspan,
+                        "a 'dead_nodes { .. }' block goes only at the end of a tree's body (a \
+                         '#[bhav] fn' or a lifecycle block), not in a nested block or a helper fn",
+                    ));
+                }
+                match self.parse_dead_nodes() {
+                    Ok(dead) => self.dead_nodes = Some(dead),
+                    Err(e) => break Err(e),
+                }
+                if !self.eat(&TokenKind::RBrace) {
+                    break Err(Error::at(
+                        self.span(),
+                        "a 'dead_nodes { .. }' block must end its tree's body: nothing may \
+                         follow it",
+                    ));
+                }
+                break Ok(());
             }
             if self.at_const_binding() {
                 binds = true;
@@ -3024,8 +3171,9 @@ impl Parser {
             return self.parse_attr_stmt(span);
         }
         if let Some(stmt) = self.parse_panic_macro()? {
-            // `panic!();`, or `{ .. panic!() }` as a block's last statement (Rust's tail form).
-            if self.peek().kind != TokenKind::RBrace {
+            // `panic!();`, or `{ .. panic!() }` as a block's last statement (Rust's tail form),
+            // which a tree's `dead_nodes { .. }` footer may follow.
+            if self.peek().kind != TokenKind::RBrace && !self.at_dead_nodes_footer() {
                 self.expect(&TokenKind::Semicolon, "';'")?;
             }
             return Ok(stmt);
@@ -3102,9 +3250,10 @@ impl Parser {
                 value,
             });
         }
-        if self.peek().kind == TokenKind::RBrace {
+        if self.peek().kind == TokenKind::RBrace || self.at_dead_nodes_footer() {
             // A tail expression if it ends a value-returning function body (else an error at
-            // the end of the file).
+            // the end of the file). A tree body's `dead_nodes { .. }` footer is no statement,
+            // so a tail may stand before it.
             self.tails.push(span);
         } else {
             self.expect(&TokenKind::Semicolon, "';'")?;

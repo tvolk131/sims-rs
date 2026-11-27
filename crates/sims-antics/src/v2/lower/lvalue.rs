@@ -428,11 +428,12 @@ impl<'a> TreeLowerer<'a> {
                                 ty: global_word_type(idx),
                             });
                         }
+                        // `local[N]`: a numbered frame word, written in place. Like a read
+                        // (`read_frame_local_slot`), it keeps the tree's layout, so the
+                        // optimizer never moves a named local onto it.
                         "local" if self.lookup_var("local").is_none() => {
-                            return Err(Error::at(
-                                *span,
-                                "'local[N]' is read-only (a raw block writes a numbered local slot; name the local with 'let' instead)",
-                            ));
+                            let (air, ty) = self.read_frame_local_slot(*span, index)?;
+                            return Ok(LValue::Direct { air, ty });
                         }
                         // `param[n]`: the call frame's argument word, readable and assignable
                         // inside the frame (positional params, `#[frame(args = )]`, functionals).
@@ -750,9 +751,9 @@ impl<'a> TreeLowerer<'a> {
         Ok(())
     }
 
-    /// `local[N]` read: frame word N as a raw block wrote it. Like a raw block, naming a slot
-    /// pins the tree's layout (`.air` puts the named locals after every explicit slot, and the
-    /// optimizer leaves the tree alone), so it cannot share a tree with a pinned
+    /// `local[N]`, read or written: frame word N's `.air` operand. Like a raw block, naming a
+    /// word pins the tree's layout (`.air` puts the named locals after every explicit slot, and
+    /// the optimizer leaves the tree alone), so it cannot share a tree with a pinned
     /// `push_interaction` object slot.
     pub(super) fn read_frame_local_slot(
         &mut self,

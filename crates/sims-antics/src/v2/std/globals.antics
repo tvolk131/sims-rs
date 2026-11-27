@@ -27,18 +27,18 @@ pub extern mod globals {
     #[id(272)] fn standard_entry() -> Result;
     // Frees the stack object, locking it out for `delay` ticks.
     #[id(273)] fn standard_exit(delay: i16) -> Result;
-    #[id(278)] fn multi_tile_entry() -> Result;
+    #[id(278)] fn claim_all_tiles() -> Result;
     // Takes its delay as an argument (param 0), like 273, which it runs for each tile; its
     // second parameter is a word it writes before reading. Writes temp[0].
-    #[id(279)] fn multi_tile_exit(delay: i16) -> Result;
+    #[id(279)] fn release_all_tiles(delay: i16) -> Result;
     // Sets the wall-placement rules of each tile of a multi-tile object. Writes temp[0..2].
     #[id(438)] fn apply_group_wall_rules() -> Result;
 
     // Graphics and lighting.
-    #[id(256)] fn select_own_graphic(graphic: i16) -> Result;
-    #[id(260)] fn select_stack_graphic(graphic: i16) -> Result;
+    #[id(256)] fn pick_own_image(graphic: i16) -> Result;
+    #[id(260)] fn pick_stack_image(graphic: i16) -> Result;
     // Every tile of the stack object's group. Writes temp[0].
-    #[id(277)] fn select_group_graphic(graphic: i16) -> Result;
+    #[id(277)] fn pick_group_image(graphic: i16) -> Result;
     #[id(275)] fn light_stack_object(level: i16) -> Result;
 
     // Check trees.
@@ -50,14 +50,14 @@ pub extern mod globals {
     #[id(280)] fn idle_ticks(ticks: i16) -> Result;
     // Waits up to `a` ticks; `b` is 1 to start a queued action while waiting, else 0. True when
     // interrupted.
-    #[id(281)] fn wait_for_notify(a: i16, b: i16) -> bool;
+    #[id(281)] fn wait_until_interrupted(a: i16, b: i16) -> bool;
     // `Some(n)` when at least one whole `period` has passed: `n` is the number of periods.
     #[id(282)] #[ret(temp = 0)] fn take_elapsed_periods(period: i16) -> Option<i16>;
     // `unused` is never read; `busy_attr` names an attribute of the stack object.
     #[id(283)] fn wait_turn_near_stack(unused: i16, busy_attr: i16, timeout: i16) -> bool;
-    #[id(366)] fn wait_hours(hours: i16) -> Result;
+    #[id(366)] fn pass_hours(hours: i16) -> Result;
     // Writes temp[0..1].
-    #[id(370)] fn animated_idle_for(ticks: i16) -> Result;
+    #[id(370)] fn idle_with_motion(ticks: i16) -> Result;
     // Runs the global trees that entries 34 and 36 of string table 303 name. With `amount` 0 or
     // less: each once, then idles a tick. Otherwise: repeats entry 34 (waiting for a notify
     // after each run, up to 10 ticks when the run fails) until interrupted or my.person[27],
@@ -72,9 +72,9 @@ pub extern mod globals {
     // True to stop a fun object now (fun reached `fun_target`, interrupted, or a need is low).
     #[id(405)] fn should_stop_fun(fun_target: i16) -> bool;
     // True when the Sim is willing to use a skill object; false after acting out a refusal.
-    #[id(407)] fn agrees_to_skill_object(min_mood: i16) -> bool;
+    #[id(407)] fn willing_to_train(min_mood: i16) -> bool;
     // A disabled gate: always false in this build.
-    #[id(408)] fn fun_object_gate(max_fun: i16) -> bool;
+    #[id(408)] fn disabled_fun_gate(max_fun: i16) -> bool;
     // True to stop a skill object now (interrupted, mood at or below `min_mood`, or a need is low).
     #[id(415)] fn should_stop_skill(min_mood: i16) -> bool;
     // True to stop repairing now (interrupted, or a need is low).
@@ -83,7 +83,7 @@ pub extern mod globals {
     // The stack object.
     #[id(287)] fn stack_object_exists() -> bool;
     #[id(355)] fn stack_object_is_person() -> bool;
-    #[id(288)] fn in_use() -> bool;
+    #[id(288)] fn stack_object_busy() -> bool;
     // Writes temp[0] (the stack object's room).
     #[id(301)] fn stack_object_outdoors() -> bool;
     #[id(303)] fn stack_object_needs_cleaning() -> bool;
@@ -95,10 +95,10 @@ pub extern mod globals {
     #[id(349)] fn advance_repair(total: i16) -> Result;
     #[id(350)] fn stack_repaired() -> bool;
     // Writes temp[0..2].
-    #[id(297)] fn explain_broken_object() -> Result;
+    #[id(297)] fn report_needs_repair() -> Result;
 
     // The Sim's body and clothes.
-    #[id(295)] fn flip_sim_around() -> Result;
+    #[id(295)] fn face_opposite_way() -> Result;
     // True when the Sim is on its feet: already, or after it leaves the object it is in or on
     // (its container's get-up tree, or a walk out). False when it has no container or the way
     // up fails, an answer callers branch on.
@@ -113,9 +113,9 @@ pub extern mod globals {
     #[id(412)] fn change_to_sleepwear(censor: i16) -> Result;
 
     // Questions about the Sim and the lot.
-    #[id(320)] fn is_downtown_lot() -> bool;
-    #[id(321)] fn is_residential_lot() -> bool;
-    #[id(424)] fn is_vacation_lot() -> bool;
+    #[id(320)] fn on_downtown_lot() -> bool;
+    #[id(321)] fn on_residential_lot() -> bool;
+    #[id(424)] fn on_vacation_lot() -> bool;
     // True at once on a residential lot. Otherwise it charges `amount` when the Sim is global[3]
     // (doubled when its person word 77 is negative), when global[3]'s person word 77 names the
     // Sim (doubled), or when global[3] is in the Sim's family on a vacation lot: it checks that
@@ -129,13 +129,13 @@ pub extern mod globals {
     // True when the Sim is in the selected Sim's group.
     #[id(446)] fn with_selected_sim() -> bool;
     // Writes temp[0].
-    #[id(410)] fn can_join() -> bool;
+    #[id(410)] fn free_to_join() -> bool;
     #[id(319)] fn uses_robot_voice() -> bool;
 
     // Skills.
     // Shows the meter for a skill value (0..1000). False only off a home lot without expansion
     // bit 6 (`std::flags::Expansions::Pets`). Writes temp[0].
-    #[id(286)] fn show_skill_progress(skill: i16) -> bool;
+    #[id(286)] fn display_skill_level(skill: i16) -> bool;
 
     // Companions and conversations.
     #[id(332)] fn push_on_companion(interaction: i16) -> bool;
@@ -157,5 +157,5 @@ pub extern mod globals {
 
     // Leaving.
     // Never false; it may not return, and may remove the Sim.
-    #[id(368)] fn leave_lot() -> Result;
+    #[id(368)] fn depart_lot() -> Result;
 }

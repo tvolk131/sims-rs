@@ -78,6 +78,10 @@ pub struct TreeHeader {
     /// nodes and frame words as lowered (`#[bhav(keep_layout)]`). The `.air` compiler never
     /// rewrites a tree's nodes past its other header fields, so here it only records the pin.
     pub keep_layout: bool,
+    /// `dead_nodes: [N: op .. -> true: T, false: F; ..]`: nodes no branch reaches, put back as
+    /// bytes at their node numbers once the tree is built and its other header fields applied
+    /// ([`crate::node_order::DeadNode`]). The body's nodes fill the other numbers in order.
+    pub dead_nodes: Vec<crate::node_order::DeadNode>,
 }
 
 impl Default for TreeHeader {
@@ -96,6 +100,7 @@ impl Default for TreeHeader {
             dead_false_error: false,
             narrow_callees: Vec::new(),
             keep_layout: false,
+            dead_nodes: Vec::new(),
         }
     }
 }

@@ -1046,7 +1046,7 @@ struct MatchResult {
 }
 
 const SLOT_WITH_PIN: &str = "push_interaction(object: <handle>) cannot share a tree with '#[slot(N)] let': the pinned object slot is local[0], which the frame layout around '#[slot]' locals does not reserve; pass a constant parameter index or move one of them to its own tree";
-const RAW_WITH_PIN: &str = "push_interaction(object: <handle>) cannot share a tree with 'raw { ... }' or a 'local[N]' read: they may name local slots the pinned object slot could collide with; pass a constant parameter index or move the raw block to its own tree";
+const RAW_WITH_PIN: &str = "push_interaction(object: <handle>) cannot share a tree with 'raw { ... }' or 'local[N]': they may name local slots the pinned object slot could collide with; pass a constant parameter index or move the raw block to its own tree";
 
 /// Placeholder for the per-tree pinned local slot of `push_interaction(object: <handle>)`,
 /// replaced in `TreeLowerer::finish` (not an identifier character, so no name contains it).

@@ -1371,7 +1371,12 @@ impl<'a> TreeLowerer<'a> {
                 .1
         } else if let Some(ty) = self.try_lower_inline_into(init, &air_name)? {
             ty
-        } else if is_compound_arith_or_neg(init) {
+        } else if is_compound_arith_or_neg(init)
+            // A `#[slot(N)]` binding is frame word `N`, which the initializer may read
+            // (`local[N]`, or an earlier binding of the same slot). Any other binding is a
+            // fresh local nothing else names.
+            && (slot.is_none() || self.can_lower_arith_in_place(&air_name, init, true))
+        {
             self.lower_arith_into_dest(init, &air_name, true)?
         } else if let Some((val_air, inferred)) = self.try_lower_callable_value_raw(init)? {
             self.emit_let(&air_name, &val_air);

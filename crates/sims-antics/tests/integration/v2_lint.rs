@@ -2055,7 +2055,10 @@ fn an_extern_matching_std_globals_is_flagged() {
         found[0].message.contains("globals::idle_ticks"),
         "{found:#?}"
     );
-    assert!(found[1].message.contains("globals::in_use"), "{found:#?}");
+    assert!(
+        found[1].message.contains("globals::stack_object_busy"),
+        "{found:#?}"
+    );
     assert_eq!(found[0].line, 2);
 }
 

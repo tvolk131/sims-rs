@@ -979,10 +979,3 @@ impl<'a> TreeLowerer<'a> {
         Ok(())
     }
 }
-
-/// The frame word an `#[slot(N)] let` local's `.air` name (`__slot<N>_...`) fixes.
-fn slot_word(air_name: &str) -> Option<u8> {
-    let rest = air_name.strip_prefix("__slot")?;
-    let (n, _) = rest.split_once('_')?;
-    n.parse().ok()
-}
