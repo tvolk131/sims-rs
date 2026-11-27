@@ -262,13 +262,13 @@ object "Fable Wave3 Bench" {
     guid: 0x7E00_0166;
     #[bhav(id = 4300)]
     fn t() {
-        globals::init_object()?;
+        globals::set_up_object()?;
         self.weight = 1000;
     }
 }"#;
     for lifted in lift_both(source) {
-        has(&lifted, &["globals::init_object()?;"]);
-        lacks(&lifted, &["if !globals::init_object()", "raw {"]);
+        has(&lifted, &["globals::set_up_object()?;"]);
+        lacks(&lifted, &["if !globals::set_up_object()", "raw {"]);
     }
 }
 

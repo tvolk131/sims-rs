@@ -870,7 +870,7 @@ object "Pr I4" {{
 object "Pr I4 Tail" {
     guid: 0x7F40_0264;
     fn leave() -> bool {
-        globals::standard_exit(50)?;
+        globals::release_stack_object(50)?;
         false
     }
     #[bhav(id = 4100)]

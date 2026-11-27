@@ -306,11 +306,11 @@ fn std_globals_matches_a_copied_extern_block() {
     state n: i16;
     interaction \"Use\" {
         run(sim) {
-            globals::standard_entry()?;
-            if !globals::am_i_a_child() {
+            globals::claim_stack_object()?;
+            if !globals::sim_is_child() {
                 self.n = 1;
             }
-            globals::standard_exit(3)?;
+            globals::release_stack_object(3)?;
         }
     }
 }
@@ -320,9 +320,9 @@ fn std_globals_matches_a_copied_extern_block() {
         &format!("use std::globals::*;\n\n{body}"),
         &format!(
             "extern mod globals {{
-    #[id(272)] fn standard_entry() -> Result;
-    #[id(273)] fn standard_exit(delay: i16) -> Result;
-    #[id(363)] fn am_i_a_child() -> bool;
+    #[id(272)] fn claim_stack_object() -> Result;
+    #[id(273)] fn release_stack_object(delay: i16) -> Result;
+    #[id(363)] fn sim_is_child() -> bool;
 }}
 
 {body}"
@@ -668,12 +668,12 @@ fn local_extern_globals_merge_with_std() {
     state n: i16;
 {externs}    interaction \"Use\" {{
         run(sim) {{
-            globals::standard_entry()?;
+            globals::claim_stack_object()?;
             globals::robot_hum(2)?;
-            if !globals::am_i_a_child() {{
+            if !globals::sim_is_child() {{
                 self.n = 1;
             }}
-            globals::standard_exit(3)?;
+            globals::release_stack_object(3)?;
         }}
     }}
 }}
@@ -681,9 +681,9 @@ fn local_extern_globals_merge_with_std() {
         )
     };
     let copied = "extern mod globals {
-    #[id(272)] fn standard_entry() -> Result;
-    #[id(273)] fn standard_exit(delay: i16) -> Result;
-    #[id(363)] fn am_i_a_child() -> bool;
+    #[id(272)] fn claim_stack_object() -> Result;
+    #[id(273)] fn release_stack_object(delay: i16) -> Result;
+    #[id(363)] fn sim_is_child() -> bool;
     #[id(4000)] fn robot_hum(level: i16) -> Result;
 }
 
@@ -692,7 +692,7 @@ fn local_extern_globals_merge_with_std() {
     // A top-level local block and an object-member block both add to std's.
     let local = "extern mod globals {
     #[id(4000)] fn robot_hum(level: i16) -> Result;
-    #[id(272)] fn standard_entry() -> Result;
+    #[id(272)] fn claim_stack_object() -> Result;
 }
 
 ";
@@ -727,10 +727,10 @@ fn local_extern_globals_merge_with_std() {
         &format!(
             "use std::globals::*;\n\n{}",
             body(
-                "    extern mod globals {\n        #[id(4000)] fn robot_hum(level: i16) -> Result;\n        #[id(274)] fn standard_entry() -> Result;\n    }\n"
+                "    extern mod globals {\n        #[id(4000)] fn robot_hum(level: i16) -> Result;\n        #[id(274)] fn claim_stack_object() -> Result;\n    }\n"
             )
         ),
-        "extern mod 'globals' declares fn 'standard_entry' twice, differently: `#[id(274)] fn standard_entry() -> Result`",
+        "extern mod 'globals' declares fn 'claim_stack_object' twice, differently: `#[id(274)] fn claim_stack_object() -> Result`",
     );
     expect_err(
         &format!(
@@ -1057,7 +1057,7 @@ fn constant_helper_tails_keep_their_test_after_raw_code() {
 object "Tail Probe" {{
     guid: 0x7F40_0A30;
     fn leave() -> bool {{
-        globals::standard_exit(50)?;
+        globals::release_stack_object(50)?;
         {tail}
     }}
     #[bhav(id = 4100)]

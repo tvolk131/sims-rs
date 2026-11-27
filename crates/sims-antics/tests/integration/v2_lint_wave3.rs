@@ -378,7 +378,7 @@ fn every_std_global_declared_locally_is_a_duplicate() {
     let found = of(&source, "duplicate_std_global");
     assert_eq!(found.len(), 64, "{found:#?}");
     // Another ABI is another way to call the tree: no finding.
-    let source = "extern mod mine {\n    #[id(271)] fn init_object() -> bool;\n}\nobject \"Synth Probe\" {\n    guid: 0x7E00_0301;\n    price: 1;\n}\n";
+    let source = "extern mod mine {\n    #[id(271)] fn set_up_object() -> bool;\n}\nobject \"Synth Probe\" {\n    guid: 0x7E00_0301;\n    price: 1;\n}\n";
     none(source, "duplicate_std_global");
 }
 
@@ -581,13 +581,13 @@ fn a_result_call_that_only_panics() {
 fn std_globals_and_local_trees_return_result_too() {
     let source = tree(
         "use std::globals::*;\n",
-        "        if !globals::init_object() { panic!(); }",
+        "        if !globals::set_up_object() { panic!(); }",
     );
     rewrites(
         &source,
         "prefer_question_mark",
-        "if !globals::init_object() { panic!(); }",
-        "globals::init_object()?;",
+        "if !globals::set_up_object() { panic!(); }",
+        "globals::set_up_object()?;",
     );
     let source = obj(
         "",
@@ -639,8 +639,8 @@ fn no_question_mark_for_bool_calls_other_exits_comments_or_else_if() {
     );
     // A local `extern mod globals` hides `std::globals`, here with a `bool` tree.
     let source = tree(
-        "use std::globals::*;\nextern mod globals {\n    #[id(271)] fn init_object() -> bool;\n}\n",
-        "        if !globals::init_object() { panic!(); }",
+        "use std::globals::*;\nextern mod globals {\n    #[id(271)] fn set_up_object() -> bool;\n}\n",
+        "        if !globals::set_up_object() { panic!(); }",
     );
     none(&source, "prefer_question_mark");
     // Inside `raw { }`: not v2.

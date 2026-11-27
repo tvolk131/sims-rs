@@ -19,7 +19,7 @@ use crate::ast::{
 use crate::error::{Error, Result};
 use crate::ir::BhavChunk;
 use crate::lift::{format_bhav_labeled_air_with_arities, lift_bhav};
-use crate::node_order::{TreePin, match_tree_pin};
+use crate::node_order::{QuarantinedPin, TreePin, match_tree_pin_quarantined};
 use crate::structure_lift::{
     LiftOptions, StructuredLiftOutcome, lift_bhav_structured_copying_tails,
     lift_bhav_structured_in_node_order, lift_bhav_structured_with_arities,
@@ -225,7 +225,9 @@ pub fn decompile_iff_to_v2_report(
     let mut model = Model::build(iff, options)?;
     let mut plan = Plan::initial(&model);
     if !options.validate {
-        let source = format_v2_source(&model.generate(&plan).text)?;
+        // No `polish` runs here, so a GUID constant kept for its raw-block step goes.
+        let text = clear_unused_guid_consts(&model.generate(&plan).text, &model.guid_consts, &[]);
+        let source = format_v2_source(&text)?;
         let trees = model
             .trees
             .iter()
@@ -276,6 +278,7 @@ pub fn decompile_iff_to_v2_report(
                         || plan.number_all_raw_bcons(&generated));
                 if !unblamed
                     && !tree.is_some_and(|id| plan.drop_pin(id, &generated))
+                    && !tree.is_some_and(|id| plan.drop_layout(id, &generated))
                     && !tree.is_some_and(|id| plan.add_frame(&model, id))
                     && !tree.is_some_and(|id| plan.unname_lifecycle_locals(&model, id, &generated))
                     && !tree.is_some_and(|id| plan.keep_temps_raw(id, &generated))
@@ -340,6 +343,7 @@ pub fn decompile_iff_to_v2_report(
                 if !changed {
                     for &id in &unproven {
                         changed |= plan.pin_nodes(&model, id, &generated, &recompiled)
+                            || plan.keep_layout(&model, id, &generated)
                             || plan.unname_lifecycle_locals(&model, id, &generated)
                             || plan.keep_temps_raw(id, &generated)
                             || plan.fix_locals(id)
@@ -369,7 +373,15 @@ pub fn decompile_iff_to_v2_report(
                 let (text, raw_spelled) = model.polish(text, &recompiled);
                 // Polish may write what wave 3 spells (a raw sound as a call with a method
                 // form), and changes what a self-loop's `allow` covers.
+                let polished = text.clone();
                 let text = model.lint_spellings(text, &recompiled);
+                // The lint may name a flag constant only now (it skips some on the first
+                // pass), so the flag it tests may take a method now.
+                let text = if text == polished {
+                    text
+                } else {
+                    model.flag_methods(text, &recompiled)
+                };
                 let text = loop_allows(text);
                 let (text, recompiled, mut checks) =
                     model.flip_negations(text, (recompiled, checks), &mut cache);
@@ -408,20 +420,51 @@ pub fn decompile_iff_to_v2_report(
     Err(Error::new("decompiler validation did not converge"))
 }
 
-/// The most builds [`read_locals_in_place`] takes.
+/// The most builds each stage of [`read_locals_in_place`] takes.
 const LOCAL_READ_BUILDS: usize = 4;
 
-/// The converged lift `generated` (which built `recompiled`) with the statements that only
-/// read a local the tree leaves by number written as v2 code (`local[N]`) instead of raw
-/// lines. It changes no node: a tree whose nodes come out different keeps its reads raw
-/// ([`Plan::raw_local_reads`]), and `generated` is kept unless the whole object builds the
+/// The converged lift `generated` (which built `recompiled`) with the statements that read
+/// or write a local the tree leaves by number written as v2 code (`local[N]`) instead of
+/// raw lines. It changes no node: `generated` is kept unless the whole object builds the
 /// same bytes, so no verdict changes. The pins carry over to the trees' new text.
+///
+/// Two stages, each with its own [`LOCAL_READ_BUILDS`] builds:
+///
+/// 1. Reads only. A tree whose nodes come out different keeps its reads raw
+///    ([`Plan::raw_local_reads`]).
+/// 2. Writes too ([`Plan::local_writes`]), on top of the first stage's result. A blamed
+///    tree that wrote a local keeps its writes raw ([`Plan::raw_local_writes`]); its reads
+///    get another try. When this stage does not build the same bytes within its builds,
+///    the first stage's result stands, so writes never cost a tree its reads.
 fn read_locals_in_place(
     model: &Model,
     plan: &mut Plan,
     generated: Generated,
     recompiled: &RecompiledFile,
 ) -> Generated {
+    plan.local_reads = Some(&generated.pinned | &generated.layout_kept);
+    plan.local_writes = false;
+    // Stage 2 starts from stage 1's blame: a tree whose reads stayed raw keeps them raw.
+    let base = locals_in_place_stage(model, plan, recompiled).unwrap_or(generated);
+    plan.local_writes = true;
+    let writes = locals_in_place_stage(model, plan, recompiled);
+    plan.local_writes = false;
+    plan.local_reads = None;
+    // Every tree stage 1 wrote in place must still be: stage 2 only adds writes.
+    match writes {
+        Some(trial) if trial.local_reads.is_superset(&base.local_reads) => trial,
+        _ => base,
+    }
+}
+
+/// One stage of [`read_locals_in_place`]: the lift with the locals `plan` allows written in
+/// place, when the whole object builds `recompiled`'s bytes within [`LOCAL_READ_BUILDS`]
+/// builds; `None` otherwise (or when no statement is written in place).
+fn locals_in_place_stage(
+    model: &Model,
+    plan: &mut Plan,
+    recompiled: &RecompiledFile,
+) -> Option<Generated> {
     let same_nodes = |a: Option<&BhavChunk>, b: Option<&BhavChunk>| match (a, b) {
         (Some(a), Some(b)) => {
             (a.args, a.locals, a.format, a.kind) == (b.args, b.locals, b.format, b.kind)
@@ -433,17 +476,14 @@ fn read_locals_in_place(
         }
         _ => false,
     };
-    plan.local_reads = Some(generated.pinned.clone());
     for _ in 0..LOCAL_READ_BUILDS {
         let trial = model.generate(plan);
-        if trial.local_reads.is_empty() {
-            break;
+        // In stage 2, a text with no write in place is stage 1's.
+        if trial.local_reads.is_empty() || (plan.local_writes && trial.local_writes.is_empty()) {
+            return None;
         }
         let blamed: BTreeSet<u16> = match model.compile(&trial.text) {
-            Ok(built) if built.iff_bytes == recompiled.iff_bytes => {
-                plan.local_reads = None;
-                return trial;
-            }
+            Ok(built) if built.iff_bytes == recompiled.iff_bytes => return Some(trial),
             Ok(built) => trial
                 .local_reads
                 .iter()
@@ -459,19 +499,23 @@ fn read_locals_in_place(
             Err(Failure::Air { tree: Some(id), .. }) => BTreeSet::from([id]),
             Err(_) => BTreeSet::new(),
         };
-        // Only a tree that read a local in place is blamed; anything else keeps the
-        // converged text. Every blamed tree keeps its reads raw from the next build on.
+        // Only a tree that read or wrote a local in place is blamed; anything else keeps
+        // the converged text. A blamed tree that wrote one keeps its writes raw from the
+        // next build on (its reads get another try); one that only read keeps its reads raw.
         if blamed.is_empty() || !blamed.iter().all(|id| trial.local_reads.contains(id)) {
-            break;
+            return None;
         }
-        let before = plan.raw_local_reads.len();
-        plan.raw_local_reads.extend(blamed);
-        if plan.raw_local_reads.len() == before {
-            break;
+        let before = plan.raw_local_reads.len() + plan.raw_local_writes.len();
+        for id in blamed {
+            if !(trial.local_writes.contains(&id) && plan.raw_local_writes.insert(id)) {
+                plan.raw_local_reads.insert(id);
+            }
+        }
+        if plan.raw_local_reads.len() + plan.raw_local_writes.len() == before {
+            return None;
         }
     }
-    plan.local_reads = None;
-    generated
+    None
 }
 
 /// Lint `untyped_engine_field`'s suggestion: `(line, column, typed name)`, 1-based, for the
@@ -1608,12 +1652,14 @@ fn neighbor_cell(handle: &str, scope: u8, index: i16) -> String {
 /// - `temp[K] := scope(24, N)` (`N` in `0..=9`) and `temp[K] := scope(32, N)`, the stack
 ///   object's neighborhood record ([`neighbor_cell`]);
 /// - `play_sound(S [, stack_obj | true | false]) pad(I: 0xNN, ..)` with a literal sound and
-///   no pad of bytes 0, 1 or 4, as `play_sound(S, stack_obj | false, padI: 0xNN, ..)`.
+///   no pad of bytes 0, 1 or 4, as `play_sound(S, stack_obj | false, padI: 0xNN, ..)`;
+/// - a store to or from a frame word `local[N]` ([`raw_local_line`]), which the locals pass
+///   left raw in a tree it blamed as a whole.
 ///
 /// The lifter writes these itself only in trees that keep the wave 2 and 3 idioms; the
 /// caller keeps a rewrite only if the file builds the same bytes. Each rewrite comes with
 /// the raw statements it takes away.
-fn raw_builtin_spellings(text: &str) -> Vec<(Rewrite, usize)> {
+fn raw_builtin_spellings(text: &str, guids: &BTreeMap<u32, String>) -> Vec<(Rewrite, usize)> {
     use crate::v2::lexer::{TokenKind as K, tokenize};
     let Ok(tokens) = tokenize(text) else {
         return Vec::new();
@@ -1637,7 +1683,7 @@ fn raw_builtin_spellings(text: &str) -> Vec<(Rewrite, usize)> {
         {
             continue;
         }
-        let Some(stmts) = raw_builtin_body(body) else {
+        let Some(stmts) = raw_builtin_body(body, guids) else {
             continue;
         };
         let line_start = text[..start].rfind('\n').map_or(0, |n| n + 1);
@@ -1739,9 +1785,166 @@ fn tree_id_before(text: &str, pos: usize) -> Option<u16> {
     })
 }
 
+/// The v2 statement of one raw `.air` line naming a frame word `local[N]`, as lint
+/// `manual_raw_has_builtin` spells it (#515): `DST OP SRC`, single spaces apart, where DST is
+/// `local[N]` (N `0..=255`), `temp[0..=7]`, `param[N]` or `stack_obj`, SRC is one of those or
+/// a literal, and OP is `:=` (v2 `=`), a compound assignment, `flag_set` or `flag_clear`; or
+/// `set_to_next(..)` into `local[N]` ([`set_to_next_local`]). A line naming no `local[N]` is
+/// left to the other spellings. Only a candidate: the caller
+/// keeps it when the object builds the same bytes.
+fn raw_local_line(stmt: &str, guids: &BTreeMap<u32, String>) -> Option<String> {
+    let index = |cell: &str, base: &str| -> Option<u16> {
+        cell.strip_prefix(base)?
+            .strip_prefix('[')?
+            .strip_suffix(']')?
+            .parse()
+            .ok()
+    };
+    let local = |c: &str| index(c, "local").is_some_and(|n| n <= 255);
+    let cell = |c: &str| {
+        local(c)
+            || index(c, "temp").is_some_and(|n| n <= 7)
+            || index(c, "param").is_some()
+            || c == "stack_obj"
+    };
+    // A decimal or `0x` literal in `-32768..=32767`.
+    let literal = |c: &str| {
+        let (neg, digits) = c.strip_prefix('-').map_or((false, c), |d| (true, d));
+        let n = match digits.strip_prefix("0x") {
+            Some(hex) if hex.chars().all(|ch| ch.is_ascii_hexdigit()) => {
+                i64::from_str_radix(hex, 16).ok()
+            }
+            Some(_) => None,
+            None if digits.chars().all(|ch| ch.is_ascii_digit()) => digits.parse::<i64>().ok(),
+            None => None,
+        };
+        n.is_some_and(|n| (-32768..=32767).contains(&if neg { -n } else { n }))
+    };
+    if let Some(call) = stmt.strip_prefix("set_to_next") {
+        return set_to_next_local(call, local, guids);
+    }
+    let mut parts = stmt.split(' ');
+    let (Some(dst), Some(op), Some(src), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    if !(local(dst) || local(src)) || !cell(dst) || !(cell(src) || literal(src)) {
+        return None;
+    }
+    match op {
+        ":=" => Some(format!("{dst} = {src};")),
+        "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "flag_set" | "flag_clear" => {
+            Some(format!("{dst} {op} {src};"))
+        }
+        _ => None,
+    }
+}
+
+/// `set_to_next(MODE, ..)` (the text after the name) into a frame word, as lint
+/// `manual_raw_has_builtin` spells it: MODE a mode name or a literal in `0..=12` but 9 (which
+/// takes `local:`), then a `guid:` (or positional) literal GUID and one `dest:` / `into:`
+/// that `local` accepts; `.air`'s `into:` is v2's `dest:`. As the lifter writes the step
+/// itself: a mode literal by its name, and a GUID by its `guids` constant (`None` when a
+/// GUID-sized one has none, which lint `magic_guid_literal` would ask for). `None` for
+/// anything else.
+fn set_to_next_local(
+    call: &str,
+    local: impl Fn(&str) -> bool,
+    guids: &BTreeMap<u32, String>,
+) -> Option<String> {
+    const MODES: &[&str] = &[
+        "all",
+        "person",
+        "non_person",
+        "part",
+        "tile",
+        "guid",
+        "neighbor",
+        "category",
+        "neighbor_guid",
+        "on_tile",
+        "career",
+        "family",
+    ];
+    // As `set_to_next`'s words (9, `beside`, takes `local:`; 11 has no word).
+    const WORDS: &[(u8, &str)] = &[
+        (0, "all"),
+        (1, "person"),
+        (2, "non_person"),
+        (3, "part"),
+        (4, "guid"),
+        (5, "neighbor"),
+        (6, "category"),
+        (7, "neighbor_guid"),
+        (8, "on_tile"),
+        (10, "career"),
+        (12, "family"),
+    ];
+    let guid = |v: &str| -> Option<String> {
+        let g = match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => v.parse::<u32>().ok()?,
+        };
+        match guids.get(&g) {
+            Some(name) => Some(name.clone()),
+            None if g > 0xFFFF => None,
+            None => Some(v.to_owned()),
+        }
+    };
+    let inner = call.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let args: Vec<&str> = inner.split(',').map(str::trim).collect();
+    let (mode, opts) = args.split_first()?;
+    if !(MODES.contains(mode) || mode.parse::<u8>().is_ok_and(|n| n <= 12 && n != 9)) {
+        return None;
+    }
+    let word = mode
+        .parse::<u8>()
+        .ok()
+        .and_then(|n| WORDS.iter().find(|(m, _)| *m == n))
+        .map_or(*mode, |(_, w)| w);
+    let mut out = vec![word.to_owned()];
+    let mut dest = false;
+    for o in opts {
+        match o.split_once(':').map(|(k, v)| (k.trim(), v.trim())) {
+            Some(("guid", v)) => out.push(format!("guid: {}", guid(v)?)),
+            Some(("dest" | "into", v)) if !dest && local(v) => {
+                dest = true;
+                out.push(format!("dest: {v}"));
+            }
+            None => out.push(guid(o)?),
+            _ => return None,
+        }
+    }
+    dest.then(|| format!("set_to_next({});", out.join(", ")))
+}
+
+/// `text` with the declaration of each `guids` constant that no other line (nor any of
+/// `pending`, text a later step may write) names cleared to a blank line, which keeps the
+/// line numbers.
+fn clear_unused_guid_consts(
+    text: &str,
+    guids: &BTreeMap<u32, String>,
+    pending: &[String],
+) -> String {
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    for name in guids.values() {
+        let decl = format!("const {name} = ");
+        let is_decl = |l: &str| l.trim_start().starts_with(&decl);
+        let used = lines
+            .iter()
+            .any(|l| !is_decl(l) && l.contains(name.as_str()))
+            || pending.iter().any(|p| p.contains(name.as_str()));
+        if !used && let Some(l) = lines.iter_mut().find(|l| is_decl(l)) {
+            *l = "";
+        }
+    }
+    lines.join("\n")
+}
+
 /// The v2 statements of a `raw { }` body that holds only what [`raw_builtin_spellings`]
 /// spells, or `None`.
-fn raw_builtin_body(body: &str) -> Option<Vec<String>> {
+fn raw_builtin_body(body: &str, guids: &BTreeMap<u32, String>) -> Option<Vec<String>> {
     if body.contains(['#', '"', '{', '}', '@']) || body.contains("//") || body.contains("->") {
         return None;
     }
@@ -1788,7 +1991,9 @@ fn raw_builtin_body(body: &str) -> Option<Vec<String>> {
         if stmt.is_empty() {
             continue;
         }
-        let spelled = if let Some((dst, src)) = stmt.split_once(":=") {
+        let spelled = if let Some(local) = raw_local_line(stmt, guids) {
+            local
+        } else if let Some((dst, src)) = stmt.split_once(":=") {
             if let Some(n) = sprite(dst) {
                 let value = match temp(src) {
                     Some(k) => format!("temp[{k}]"),
@@ -3737,6 +3942,32 @@ impl Model {
     /// Each kind is tried together, then in halves (the frame changes per tree first); the
     /// last two never change the bytes, but are checked the same way. Also returns, per tree,
     /// the raw statements the text no longer writes raw.
+    /// `text` with its typed flag operations written as methods (`.set(..)`, `.clear(..)`,
+    /// `.contains(..)`) where the object still builds `recompiled`'s bytes; one group per
+    /// place: a place v2 types as `i16` (not `bitflags`, such as an `i16` local) refuses every
+    /// method. `world.expansions` and `wall_placement` are lenient engine `bitflags` words,
+    /// which take methods. A step of [`Self::polish`], and run again on a text the last lint
+    /// pass changed (a constant it names may be the flag a method needs).
+    fn flag_methods(&self, text: String, recompiled: &RecompiledFile) -> String {
+        let tables: BTreeSet<&str> = self.bcons.iter().map(|b| b.label.as_str()).collect();
+        let mut places: BTreeMap<String, Vec<Rewrite>> = BTreeMap::new();
+        for (place, r) in cell_spellings(&text, &tables) {
+            if let Some(place) = place {
+                places.entry(place).or_default().push(r);
+            }
+        }
+        if places.is_empty() {
+            return text;
+        }
+        let groups: Vec<Vec<Rewrite>> = places.into_values().collect();
+        let ok = |g: &[Vec<Rewrite>]| {
+            self.compile(&apply_groups(&text, g))
+                .is_ok_and(|r| r.iff_bytes == recompiled.iff_bytes)
+        };
+        let kept = keep_joint(&groups, &ok, POLISH_CELL_BUILDS);
+        apply_groups(&text, &kept)
+    }
+
     fn polish(&self, text: String, recompiled: &RecompiledFile) -> (String, BTreeMap<u16, usize>) {
         let same = |t: &str| {
             self.compile(t)
@@ -3801,24 +4032,9 @@ impl Model {
             let kept = keep_joint(&cells, &ok, POLISH_CELL_BUILDS);
             text = apply_rewrites(&text, &kept);
         }
-        // Typed flags by method, one group per place: a place v2 types as `i16` (not
-        // `bitflags`, such as an `i16` local) refuses every method. `world.expansions` and
-        // `wall_placement` are lenient engine `bitflags` words, which take methods.
-        let mut places: BTreeMap<String, Vec<Rewrite>> = BTreeMap::new();
-        for (place, r) in cell_spellings(&text, &tables) {
-            if let Some(place) = place {
-                places.entry(place).or_default().push(r);
-            }
-        }
-        if !places.is_empty() {
-            let groups: Vec<Vec<Rewrite>> = places.into_values().collect();
-            let base = text.clone();
-            let ok = |g: &[Vec<Rewrite>]| same(&apply_groups(&base, g));
-            let kept = keep_joint(&groups, &ok, POLISH_CELL_BUILDS);
-            text = apply_groups(&text, &kept);
-        }
+        text = self.flag_methods(text, recompiled);
         // `raw { }` blocks of builtins only, as the builtins.
-        let raws = raw_builtin_spellings(&text);
+        let raws = raw_builtin_spellings(&text, &self.guid_consts);
         if !raws.is_empty() {
             let base = text.clone();
             let rewrites = |r: &[(Rewrite, usize)]| -> Vec<Rewrite> {
@@ -3854,6 +4070,8 @@ impl Model {
             }
             text = apply_rewrites(&text, &rewrites(&kept));
         }
+        // The GUID constants kept for a spelling the step refused.
+        text = clear_unused_guid_consts(&text, &self.guid_consts, &[]);
         // `if let Some(v) = globals::f()` and `let Some(v) = globals::f() else { .. };`, one
         // statement at a time.
         let if_lets = if_let_spellings(&text);
@@ -6294,20 +6512,33 @@ struct Plan {
     /// the idiom that needed the words goes raw instead.
     fixed_locals: BTreeSet<u16>,
     /// Tree ID -> the text of the tree (written without a pin) that a node pin was worked
-    /// out for, and the pin: `None` once it was tried and none is kept (see
+    /// out for, whether that round wrote it with `keep_layout` (which changes the nodes the
+    /// pin is predicted from), and the pin: `None` once it was tried and none is kept (see
     /// [`Plan::pin_nodes`]). A pin applies only while the tree is written as that text.
-    pins: BTreeMap<u16, (String, Option<TreePin>)>,
+    pins: BTreeMap<u16, (String, bool, Option<QuarantinedPin>)>,
+    /// Tree ID -> the text of the tree (written without the pin) that `keep_layout` was
+    /// tried for, and whether it is still kept (see [`Plan::keep_layout`]): it
+    /// applies only while the tree is written as that text.
+    layouts: BTreeMap<u16, (String, bool)>,
+    /// The trees and levels `keep_layout` was tried at.
+    layout_tried: BTreeSet<(u16, Level)>,
     /// Lifecycle blocks and trees without the extra idioms that leave their locals by number,
     /// after a round that named them was not proven or did not compile.
     unnamed_locals: BTreeSet<u16>,
     /// Set once the lift has converged, for [`read_locals_in_place`], to the trees the
     /// converged round pinned: unnamed locals are read `local[N]` (see
-    /// [`Translator::local_read`]), and those trees keep their pins although their text
+    /// [`Translator::local_word`]), and those trees keep their pins although their text
     /// changes.
     local_reads: Option<BTreeSet<u16>>,
     /// Trees whose reads of unnamed locals stay in `raw { }` blocks, since writing them
     /// `local[N]` changed their nodes ([`read_locals_in_place`]).
     raw_local_reads: BTreeSet<u16>,
+    /// Trees whose writes of unnamed locals stay raw, since writing them `local[N]` changed
+    /// their nodes or did not build; their reads may still be `local[N]`.
+    raw_local_writes: BTreeSet<u16>,
+    /// Whether [`read_locals_in_place`] writes unnamed locals as `local[N]` too, after its
+    /// reads-only stage.
+    local_writes: bool,
 }
 
 /// `compiled` with the nodes that run alike merged (`share_tails`), or `None` when nothing
@@ -6406,9 +6637,13 @@ impl Plan {
             pre_wave3: BTreeSet::new(),
             fixed_locals: BTreeSet::new(),
             pins: BTreeMap::new(),
+            layouts: BTreeMap::new(),
+            layout_tried: BTreeSet::new(),
             unnamed_locals: BTreeSet::new(),
             local_reads: None,
             raw_local_reads: BTreeSet::new(),
+            raw_local_writes: BTreeSet::new(),
+            local_writes: false,
         }
     }
 
@@ -6477,6 +6712,7 @@ impl Plan {
         message: &str,
     ) -> bool {
         self.drop_pin(id, generated)
+            || self.drop_layout(id, generated)
             || self.grow_locals(model, id, message)
             || self.add_frame(model, id)
             || self.unname_lifecycle_locals(model, id, generated)
@@ -6493,11 +6729,12 @@ impl Plan {
             || self.lower_tree(model, id)
     }
 
-    /// Pins tree `id`'s nodes ([`match_tree_pin`]: `dead_false = error`, `share_tails`, a
-    /// `node_order`) when the round wrote it without a pin, it is not proven, and a pin
-    /// should make it compile to the original's nodes exactly. The pin is a prediction from
-    /// the bytes: a pinned tree that is still not proven loses its pin. Each text is tried
-    /// once.
+    /// Pins tree `id`'s nodes ([`match_tree_pin_quarantined`]: `dead_false = error`,
+    /// `share_tails`, a `node_order`, and the original's unreachable nodes as a
+    /// `dead_nodes { }` footer) when the round wrote it without a pin, it is not proven, and
+    /// a pin should make it compile to the original's nodes exactly. The pin is a prediction
+    /// from the bytes: a pinned tree that is still not proven loses its pin. Each text is
+    /// tried once.
     /// - The node numbers are what strict mode compares, so a structured tree that runs the
     ///   original's nodes in another order is proven with its order pinned.
     /// - An indexed tree (kind 4) enters at the node its first argument names: none may move.
@@ -6518,18 +6755,21 @@ impl Plan {
         ) else {
             return false;
         };
+        // A text is tried again once it is written with `keep_layout`: the build it predicts
+        // from no longer merges what the layout keeps (Sol review round 1).
+        let layout = generated.layout_kept.contains(&id);
         if self
             .pins
             .get(&id)
-            .is_some_and(|(written, _)| written == text)
+            .is_some_and(|(written, with, _)| written == text && *with == layout)
         {
             return false;
         }
         let pin = (t.original.kind != 4)
-            .then(|| match_tree_pin(&b.instructions, &t.original.instructions))
+            .then(|| match_tree_pin_quarantined(&b.instructions, &t.original.instructions))
             .flatten();
         let found = pin.is_some();
-        self.pins.insert(id, (text.clone(), pin));
+        self.pins.insert(id, (text.clone(), layout, pin));
         found
     }
 
@@ -6541,7 +6781,47 @@ impl Plan {
             return false;
         }
         match self.pins.get_mut(&id) {
-            Some((_, pin)) => pin.take().is_some(),
+            Some((_, _, pin)) => pin.take().is_some(),
+            None => false,
+        }
+    }
+
+    /// Writes tree `id` with `#[bhav(.., keep_layout)]` (#503) for a round, once per tree and
+    /// level, when it is not proven: the backend pass may be all that keeps an idiomatic text
+    /// from building the original's nodes (two identical `if` arms it merges, say). Tried
+    /// before any idiom is dropped, and only for a tree at an idiomatic level written with a
+    /// `#[bhav(..)]` header. A tree not proven with it loses it again, and the steps after
+    /// this one go on in the same round.
+    fn keep_layout(&mut self, model: &Model, id: u16, generated: &Generated) -> bool {
+        if generated.layout_kept.contains(&id) {
+            if let Some((_, kept)) = self.layouts.get_mut(&id) {
+                *kept = false;
+            }
+            return false;
+        }
+        let (Some(t), Some(text)) = (model.tree(id), generated.tree_texts.get(&id)) else {
+            return false;
+        };
+        let level = self.level(t);
+        // A lifecycle block written whole as a `#[bhav(..)]` tree (standalone, or framed with
+        // its header) takes it too (Sol review round 2).
+        let bhav_header =
+            t.lifecycle.is_none() || self.standalone.contains(&id) || self.framed.contains(&id);
+        if !level.idiomatic() || !bhav_header || !self.layout_tried.insert((id, level)) {
+            return false;
+        }
+        self.layouts.insert(id, (text.clone(), true));
+        true
+    }
+
+    /// Drops tree `id`'s `keep_layout` when the round wrote it with one (the build refused
+    /// it, or the tree is not proven with it).
+    fn drop_layout(&mut self, id: u16, generated: &Generated) -> bool {
+        if !generated.layout_kept.contains(&id) {
+            return false;
+        }
+        match self.layouts.get_mut(&id) {
+            Some((_, kept)) => std::mem::replace(kept, false),
             None => false,
         }
     }
@@ -6563,24 +6843,28 @@ impl Plan {
             else {
                 continue;
             };
+            let layout = generated.layout_kept.contains(&t.id);
             if t.original.kind == 4
                 || b.instructions.len() <= crate::v2::lint::FRAME_NODE_WARN
                 || t.original.instructions.len() > crate::v2::lint::FRAME_NODE_WARN
                 || self
                     .pins
                     .get(&t.id)
-                    .is_some_and(|(written, _)| written == text)
+                    .is_some_and(|(written, with, _)| written == text && *with == layout)
             {
                 continue;
             }
-            let pin = shared_tails(&b.instructions).map(|shared| TreePin {
-                dead_false_error: false,
-                share_tails: true,
-                order: crate::node_order::match_node_order(&shared, &t.original.instructions)
-                    .filter(|order| !is_identity(order)),
+            let pin = shared_tails(&b.instructions).map(|shared| QuarantinedPin {
+                dead_nodes: Vec::new(),
+                pin: Some(TreePin {
+                    dead_false_error: false,
+                    share_tails: true,
+                    order: crate::node_order::match_node_order(&shared, &t.original.instructions)
+                        .filter(|order| !is_identity(order)),
+                }),
             });
             changed |= pin.is_some();
-            self.pins.insert(t.id, (text.clone(), pin));
+            self.pins.insert(t.id, (text.clone(), layout, pin));
         }
         changed
     }
@@ -6934,6 +7218,8 @@ struct Generated {
     named_other_locals: BTreeSet<u16>,
     /// Trees that read an unnamed local as `local[N]` (see [`read_locals_in_place`]).
     local_reads: BTreeSet<u16>,
+    /// Trees that wrote an unnamed local as `local[N]` (a subset of `local_reads`).
+    local_writes: BTreeSet<u16>,
     /// Trees with merged `if` arms (see [`Translator::merge_arms`]).
     merged: BTreeSet<u16>,
     /// Trees that named a temps call to a tree with arguments (see [`Plan::keep_temps_raw`]).
@@ -6948,6 +7234,8 @@ struct Generated {
     tree_texts: BTreeMap<u16, String>,
     /// Trees written with a pin.
     pinned: BTreeSet<u16>,
+    /// Trees written with `keep_layout` ([`Plan::layouts`]).
+    layout_kept: BTreeSet<u16>,
     /// Lifecycle blocks and trees without the extra idioms that named their locals.
     named_plain: BTreeSet<u16>,
     /// 0-based lines holding the `variant` members.
@@ -7019,6 +7307,7 @@ impl Model {
         let mut extras = BTreeSet::new();
         let mut named_other_locals = BTreeSet::new();
         let mut local_reads = BTreeSet::new();
+        let mut local_writes = BTreeSet::new();
         let mut merged = BTreeSet::new();
         let mut temps_named = BTreeSet::new();
         let mut wave2_trees = BTreeSet::new();
@@ -7026,6 +7315,7 @@ impl Model {
         let mut raw_bcons_named = BTreeSet::new();
         let mut tree_texts = BTreeMap::new();
         let mut pinned = BTreeSet::new();
+        let mut layout_kept = BTreeSet::new();
         let mut named_plain = BTreeSet::new();
         out.line("// Decompiled by `sims-antics lift --v2`.");
         if self.behavioral {
@@ -7353,6 +7643,7 @@ impl Model {
                         wave2_used: std::cell::Cell::new(false),
                         wave3_used: std::cell::Cell::new(false),
                         local_read: std::cell::Cell::new(false),
+                        local_write: std::cell::Cell::new(false),
                         stack_moves: sim && assigns_stack_obj(body),
                     };
                     if named_locals > 0 && (plain_names || tr.extra()) {
@@ -7390,6 +7681,9 @@ impl Model {
                     if tr.local_read.get() {
                         local_reads.insert(t.id);
                     }
+                    if tr.local_write.get() {
+                        local_writes.insert(t.id);
+                    }
                 }
                 _ => {
                     let mut lines = if level == Level::Raw {
@@ -7419,7 +7713,7 @@ impl Model {
             out.indent -= 1;
             out.line("}");
             let text = out.lines[start..].join("\n");
-            if let Some((written, Some(pin))) = plan.pins.get(&t.id)
+            if let Some((written, _, Some(pin))) = plan.pins.get(&t.id)
                 && (*written == text
                     || plan.local_reads.as_ref().is_some_and(|p| p.contains(&t.id)))
             {
@@ -7431,8 +7725,36 @@ impl Model {
                     line.trim_start().to_owned()
                 };
                 let header = header.strip_suffix(")]").unwrap_or(&header);
-                *line = format!("{}{header}{})]", &line[..indent], pin.bhav_fields());
+                *line = format!(
+                    "{}{header}{})]",
+                    &line[..indent],
+                    pin.pin.as_ref().map_or(String::new(), TreePin::bhav_fields)
+                );
+                if !pin.dead_nodes.is_empty() {
+                    let close = out.lines.pop().expect("close");
+                    let ci = close.len() - close.trim_start().len();
+                    let block = crate::node_order::dead_nodes_block(
+                        &pin.dead_nodes,
+                        &format!("{}    ", &close[..ci]),
+                    );
+                    for l in block.lines() {
+                        out.lines.push(l.to_owned());
+                    }
+                    out.lines.push(close);
+                }
                 pinned.insert(t.id);
+            }
+            if let Some((written, true)) = plan.layouts.get(&t.id)
+                && (*written == text
+                    || plan.local_reads.as_ref().is_some_and(|p| p.contains(&t.id)))
+            {
+                let line = &mut out.lines[header_line];
+                if line.trim_start().starts_with("#[bhav(")
+                    && let Some(head) = line.strip_suffix(")]")
+                {
+                    *line = format!("{head}, keep_layout)]");
+                    layout_kept.insert(t.id);
+                }
             }
             tree_texts.insert(t.id, text);
             tree_ranges.push((t.id, start, out.lines.len() - 1));
@@ -7466,20 +7788,16 @@ impl Model {
         out.indent = 0;
         out.line("}");
         // A GUID constant only `raw` text needed (its trees went `raw`) is left out; the
-        // blank line keeps the line numbers the statement ranges use.
-        for name in self.guid_consts.values() {
-            let decl = format!("const {name} = ");
-            let is_decl = |l: &str| l.trim_start().starts_with(&decl);
-            let used = out
-                .lines
-                .iter()
-                .any(|l| !is_decl(l) && l.contains(name.as_str()));
-            if !used && let Some(l) = out.lines.iter_mut().find(|l| is_decl(l)) {
-                l.clear();
-            }
-        }
+        // blank line keeps the line numbers the statement ranges use. One that a raw line
+        // `polish` may spell natively would name ([`raw_local_line`]) stays until then.
+        let spelled: Vec<String> = out
+            .lines
+            .iter()
+            .filter_map(|l| raw_local_line(l.trim().strip_suffix(';')?, &self.guid_consts))
+            .collect();
         let mut text = out.lines.join("\n");
         text.push('\n');
+        let text = clear_unused_guid_consts(&text, &self.guid_consts, &spelled);
         Generated {
             text,
             stmt_ranges,
@@ -7488,6 +7806,7 @@ impl Model {
             extras,
             named_other_locals,
             local_reads,
+            local_writes,
             merged,
             temps_named,
             wave2: wave2_trees,
@@ -7495,6 +7814,7 @@ impl Model {
             raw_bcons_named,
             tree_texts,
             pinned,
+            layout_kept,
             named_plain,
             variant_lines,
             strings_lines,
@@ -7762,8 +8082,11 @@ struct Translator<'a> {
     wave2_used: std::cell::Cell<bool>,
     /// Whether a wave 3 spelling was written (see [`Translator::wave3`]).
     wave3_used: std::cell::Cell<bool>,
-    /// Whether an unnamed local was read as `local[N]` (see [`Translator::local_read`]).
+    /// Whether an unnamed local was read or written as `local[N]` (see
+    /// [`Translator::local_word`]).
     local_read: std::cell::Cell<bool>,
+    /// Whether an unnamed local was written as `local[N]`.
+    local_write: std::cell::Cell<bool>,
     /// A Sim tree that assigns `stack_obj`: the stack object's cells are written
     /// `stack_obj.attr[i]` / `stack_obj.slot[i]` (the same operands), since `self` would
     /// name another object after the assignment (lint `stack_obj_clobber_after_self`).
@@ -8839,6 +9162,14 @@ impl Translator<'_> {
         let OperandRef::Direct(o) = operand else {
             return None;
         };
+        // In an inherit tree `self` is refused: `me` is whatever runs the tree.
+        if self.inherit {
+            return match (o.scope, o.index) {
+                (10, 0) => Some("stack_obj".to_owned()),
+                (3, 11) => Some("me.id".to_owned()),
+                _ => None,
+            };
+        }
         match (o.scope, o.index, self.sim) {
             (10, 0, _) => Some("stack_obj".to_owned()),
             (3, 11, true) => Some("sim".to_owned()),
@@ -9345,6 +9676,10 @@ impl Translator<'_> {
         match p {
             PrimitiveCall::TestObjectType { guid, object } => {
                 let obj = self.rvalue(object)?;
+                // `local[N]` is a plain word, never a handle.
+                if obj.starts_with("local[") {
+                    return None;
+                }
                 let receiver = if self.sim && obj == "stack_obj" && !self.stack_moves {
                     "self".to_owned()
                 } else if let Some(base) = obj.strip_suffix(".data[11]").filter(|b| {
@@ -9970,24 +10305,33 @@ impl Translator<'_> {
                 let handle = self.neighbor_handle()?;
                 Some(neighbor_cell(handle, o.scope, o.index))
             }
-            25 => self.lvalue(r).or_else(|| self.local_read(o.index)),
+            25 => self
+                .place(r, false)
+                .or_else(|| self.local_word(o.index, false)),
             _ => self.lvalue(r),
         }
     }
 
-    /// `local[N]`, v2's read of frame word `N`, for a local the tree leaves by number: a
-    /// statement that only reads it is then v2 code instead of a `raw { }` line. The read
-    /// keeps the tree's layout as a raw block does, and it is never written: v2's `local[N]`
-    /// is read-only. Only once the lift has converged ([`read_locals_in_place`]), and not
-    /// for a tree in [`Plan::raw_local_reads`].
-    fn local_read(&self, index: i16) -> Option<String> {
+    /// `local[N]`, v2's frame word `N`, for a local the tree leaves by number: a statement
+    /// that reads or (`write`) writes it is then v2 code instead of a `raw { }` line. Either
+    /// keeps the tree's layout as a raw block does. Only once the lift has converged
+    /// ([`read_locals_in_place`]), and not for a tree in [`Plan::raw_local_reads`]. A write
+    /// only in that pass's second stage ([`Plan::local_writes`]), and not for a tree in
+    /// [`Plan::raw_local_writes`].
+    fn local_word(&self, index: i16, write: bool) -> Option<String> {
+        // A word past the declared frame stays raw: v2 sizes the frame to cover `local[N]`.
         if self.plan.local_reads.is_none()
-            || !(0..=255).contains(&index)
+            || !u16::try_from(index).is_ok_and(|i| i < self.tree.original.locals)
             || self.plan.raw_local_reads.contains(&self.tree.id)
+            || (write
+                && (!self.plan.local_writes || self.plan.raw_local_writes.contains(&self.tree.id)))
         {
             return None;
         }
         self.local_read.set(true);
+        if write {
+            self.local_write.set(true);
+        }
         Some(format!("local[{index}]"))
     }
 
@@ -10061,6 +10405,11 @@ impl Translator<'_> {
     }
 
     fn lvalue(&self, r: &OperandRef) -> Option<String> {
+        self.place(r, true)
+    }
+
+    /// [`Self::lvalue`], for a cell the statement writes (`write`) or only reads.
+    fn place(&self, r: &OperandRef, write: bool) -> Option<String> {
         let OperandRef::Direct(o) = r else {
             return None;
         };
@@ -10165,7 +10514,9 @@ impl Translator<'_> {
                         (i <= 255 && self.extra()).then(|| format!("stack_obj.person[{i}]"))
                     })?
             }
-            (25, _) => self.local_name(i as u16)?,
+            (25, _) => self
+                .local_name(i as u16)
+                .or_else(|| self.local_word(i, write))?,
             // The check tree's advertisement: its motive deltas (12), personality (28) and
             // minimums (29).
             (12 | 28 | 29, _) if i < 16 && self.wave3() => {
@@ -10248,7 +10599,7 @@ mod tests {
     #[test]
     fn raw_builtin_blocks_are_spelled_as_builtins() {
         let text = "fn t() {\n    raw {\n        scope(27, 1) := temp[0];\n        temp[2] := scope(27, 1);\n    }\n    raw { remove_object(0, flags: 3) }\n    raw { remove_object(stack_obj, no_yield: true) }\n    raw { remove_object(1, flags: 4) }\n    raw { clear_motive_changes() pad(2: 0x05) }\n}\n";
-        let raws = raw_builtin_spellings(text);
+        let raws = raw_builtin_spellings(text, &BTreeMap::new());
         assert_eq!(raws.iter().map(|(_, n)| n).sum::<usize>(), 6);
         let rewrites: Vec<Rewrite> = raws.into_iter().map(|(w, _)| w).collect();
         let rewritten = apply_rewrites(text, &rewrites);
@@ -10261,7 +10612,7 @@ mod tests {
     #[test]
     fn raw_blocks_with_other_statements_stay_raw() {
         for body in [
-            "scope(27, 1) := 1; local[0] := 2",
+            "scope(27, 1) := 1; local[0] := my.attr[0]",
             "scope(27, 9) := 1",
             "scope(26, 1) := 1",
             "remove_object(2)",
@@ -10269,7 +10620,7 @@ mod tests {
             "if x { remove_object(me) }",
             "@n0: remove_object(me) -> true: @n1",
         ] {
-            assert_eq!(raw_builtin_body(body), None, "{body}");
+            assert_eq!(raw_builtin_body(body, &BTreeMap::new()), None, "{body}");
         }
     }
 
@@ -10306,7 +10657,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                raw_builtin_body(body),
+                raw_builtin_body(body, &BTreeMap::new()),
                 Some(vec![spelled.to_owned()]),
                 "{body}"
             );
@@ -10322,7 +10673,7 @@ mod tests {
             "play_sound(5, 2) pad(3: 0x01);",
             "play_sound(x) pad(3: 0x01);",
         ] {
-            assert_eq!(raw_builtin_body(body), None, "{body}");
+            assert_eq!(raw_builtin_body(body, &BTreeMap::new()), None, "{body}");
         }
     }
 
@@ -10747,8 +11098,8 @@ object "Fable Lamp" {
     guid: 0x7E00_0130;
     #[bhav(id = 4300, label = "Use", locals = 0)]
     fn use_it() {
-        globals::standard_entry()?;
-        if globals::am_i_a_child() {
+        globals::claim_stack_object()?;
+        if globals::sim_is_child() {
             temp[0] = 1;
         }
         if more_globals::other() {
@@ -10763,8 +11114,8 @@ object "Fable Lamp" {
                 "use std::globals::*;",
                 "extern mod globals {",
                 "#[id(300)] fn global_300() -> bool;",
-                "globals::standard_entry()",
-                "globals::am_i_a_child()",
+                "globals::claim_stack_object()",
+                "globals::sim_is_child()",
                 "globals::global_300()",
             ],
         );
@@ -10787,7 +11138,7 @@ object "Fable Lamp" {
     guid: 0x7E00_013A;
     #[bhav(id = 4300, label = "Use", locals = 0)]
     fn use_it() {
-        globals::standard_entry()?;
+        globals::claim_stack_object()?;
         if more_globals::exit_now() {
             temp[0] = 1;
         }
@@ -10800,7 +11151,7 @@ object "Fable Lamp" {
                 "use std::globals::*;",
                 "extern mod more_globals {",
                 "#[id(273)]",
-                "globals::standard_entry()",
+                "globals::claim_stack_object()",
             ],
         );
         assert!(!lifted.contains("extern mod globals"), "{lifted}");
@@ -11135,13 +11486,58 @@ object "Fable Lamp" {
     /// The lint pass on its own: both `?` shapes are rewritten, and the file builds to the
     /// same bytes with the rewrite.
     #[test]
+    fn raw_local_lines_are_spelled_as_the_lint_spells_them() {
+        let guids = BTreeMap::from([(0x7E00_01EA, "GUID_7E0001EA".to_owned())]);
+        for (line, v2) in [
+            ("local[2] := 10", Some("local[2] = 10;")),
+            ("temp[0] := local[0]", Some("temp[0] = local[0];")),
+            ("local[1] += param[0]", Some("local[1] += param[0];")),
+            ("stack_obj := local[255]", Some("stack_obj = local[255];")),
+            ("local[0] := -0x8000", Some("local[0] = -0x8000;")),
+            ("local[0] flag_set 3", Some("local[0] flag_set 3;")),
+            // As the lifter writes the step: the mode by name, the GUID by its constant.
+            (
+                "set_to_next(4, guid: 0x7e0001ea, dest: local[8])",
+                Some("set_to_next(guid, guid: GUID_7E0001EA, dest: local[8]);"),
+            ),
+            (
+                "set_to_next(guid, 2113929706, into: local[1])",
+                Some("set_to_next(guid, GUID_7E0001EA, dest: local[1]);"),
+            ),
+            (
+                "set_to_next(11, guid: 0x7fff, dest: local[1])",
+                Some("set_to_next(11, guid: 0x7fff, dest: local[1]);"),
+            ),
+            // A GUID-sized literal with no constant would draw `magic_guid_literal`.
+            ("set_to_next(4, guid: 0x7e0001eb, dest: local[8])", None),
+            ("set_to_next(person, dest: temp[0])", None),
+            ("set_to_next(9, dest: local[0])", None),
+            ("set_to_next(person, dest: local[0], dest: local[1])", None),
+            ("set_to_next(person, local: local[0])", None),
+            ("set_to_next(person)", None),
+            // No `local[N]`: left to the other spellings.
+            ("temp[0] := 1", None),
+            // A word past 255, a temp past 7, a literal past an i16, another op or shape.
+            ("local[256] := 1", None),
+            ("temp[8] := local[0]", None),
+            ("local[0] := 32768", None),
+            ("local[0] := 0x", None),
+            ("local[0] <<= 1", None),
+            ("local[0]  := 1", None),
+            ("local[0] := my.attr[0]", None),
+        ] {
+            assert_eq!(raw_local_line(line, &guids).as_deref(), v2, "{line}");
+        }
+    }
+
+    #[test]
     fn lint_spellings_rewrite_both_question_mark_shapes_to_the_same_bytes() {
-        let text = "use std::globals::*;\n\nobject \"Fable Wave3 Query\" {\n    guid: 0x7E00_016B;\n    #[bhav(id = 4300)]\n    fn t() {\n        if !globals::init_object() {\n            panic!();\n        }\n        if globals::init_object() {\n        } else {\n            panic!();\n        }\n        return true;\n    }\n}\n";
+        let text = "use std::globals::*;\n\nobject \"Fable Wave3 Query\" {\n    guid: 0x7E00_016B;\n    #[bhav(id = 4300)]\n    fn t() {\n        if !globals::set_up_object() {\n            panic!();\n        }\n        if globals::set_up_object() {\n        } else {\n            panic!();\n        }\n        return true;\n    }\n}\n";
         let fixes = lint_spellings(text);
         assert_eq!(fixes.len(), 2, "{text}");
         let rewritten = apply_lint_spellings(text, &fixes);
         assert_eq!(
-            rewritten.matches("globals::init_object()?;").count(),
+            rewritten.matches("globals::set_up_object()?;").count(),
             2,
             "{rewritten}"
         );
@@ -11340,7 +11736,10 @@ object "Fable Lamp" {
     #[test]
     fn a_tree_that_proves_only_in_the_other_branch_order_keeps_it() {
         // The true branch visits n4, n2, n3: written first, it keeps the primitive at n3;
-        // node order would put it at n4.
+        // node order would put it at n4. Since v2.6 the compiler's unreachable fall-through
+        // node after the raw block no longer stops a pin, so the tree is pinned (its
+        // `node_order`, the node as `dead_nodes`) before the other order is tried. Either way
+        // it is structured, with the true branch's nodes in their order.
         let lifted = lift_source(
             r#"object "Fable Clock" {
     guid: 0x7E00_0137;
@@ -11363,9 +11762,10 @@ object "Fable Lamp" {
         );
         has(
             &lifted,
-            &["if self.data[3] == 1 {\n            temp[0] = 1;"],
+            &["temp[0] = 1;\n            temp[1] = 2;\n            play_sound(2);"],
         );
         assert!(!lifted.contains("@n"), "{lifted}");
+        assert!(!lifted.contains("raw {"), "{lifted}");
     }
 
     /// n3 (a yield) is reached from n1 and n2. The structured lift writes it once after the
@@ -11526,14 +11926,14 @@ object "Fable Lamp" {
 
     #[test]
     fn std_global_table_reads_the_std_source() {
-        let entry = std_global(272).expect("standard_entry");
+        let entry = std_global(272).expect("claim_stack_object");
         assert_eq!(
             (entry.name, entry.params, entry.result),
-            ("standard_entry", 0, true)
+            ("claim_stack_object", 0, true)
         );
-        let exit = std_global(273).expect("standard_exit");
+        let exit = std_global(273).expect("release_stack_object");
         assert_eq!((exit.params, exit.result), (1, true));
-        let child = std_global(363).expect("am_i_a_child");
+        let child = std_global(363).expect("sim_is_child");
         assert_eq!((child.params, child.result), (0, false));
         assert!(std_global(4096).is_none());
     }

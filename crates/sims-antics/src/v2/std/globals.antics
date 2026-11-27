@@ -1,6 +1,6 @@
 // Built-in `std::globals`: clean-room signatures of commonly used global BHAV trees.
 //
-// `use std::globals::*;` brings `globals` into scope, so an object calls `globals::standard_entry()?;`
+// `use std::globals::*;` brings `globals` into scope, so an object calls `globals::claim_stack_object()?;`
 // instead of copying its own `extern mod globals { .. }` block. The names are our own descriptions of
 // what each tree does; only the tree ids are engine facts.
 //
@@ -22,11 +22,11 @@
 
 pub extern mod globals {
     // Object set-up and tear-down.
-    #[id(271)] fn init_object() -> Result;
+    #[id(271)] fn set_up_object() -> Result;
     // Marks the stack object busy.
-    #[id(272)] fn standard_entry() -> Result;
+    #[id(272)] fn claim_stack_object() -> Result;
     // Frees the stack object, locking it out for `delay` ticks.
-    #[id(273)] fn standard_exit(delay: i16) -> Result;
+    #[id(273)] fn release_stack_object(delay: i16) -> Result;
     #[id(278)] fn claim_all_tiles() -> Result;
     // Takes its delay as an argument (param 0), like 273, which it runs for each tile; its
     // second parameter is a word it writes before reading. Writes temp[0].
@@ -123,7 +123,7 @@ pub extern mod globals {
     // my.person[1] and playing sound 300). False when the budget cannot cover it; true without
     // a charge for anyone else. May set `stack_obj` to global[3].
     #[id(334)] fn charge_off_home_lot(amount: i16, check_only: i16) -> bool;
-    #[id(363)] fn am_i_a_child() -> bool;
+    #[id(363)] fn sim_is_child() -> bool;
     #[id(467)] fn sim_is_dog() -> bool;
     #[id(468)] fn sim_is_cat() -> bool;
     // True when the Sim is in the selected Sim's group.

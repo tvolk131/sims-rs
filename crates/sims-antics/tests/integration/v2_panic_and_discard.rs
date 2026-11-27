@@ -247,7 +247,7 @@ mod discard_let {
             "fallible()",
             "b(sim)",
             "g::try_light(3)",
-            "globals::init_object()",
+            "globals::set_up_object()",
             "stack_obj.run_functional(4)",
             "self.n == 6",
             "!ok()",

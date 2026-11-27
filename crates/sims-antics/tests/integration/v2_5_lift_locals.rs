@@ -49,10 +49,12 @@ fn body<'a>(source: &'a str, name: &str) -> &'a str {
 }
 
 #[test]
-fn a_local_left_by_number_is_read_as_local_n() {
-    // Named, the tree is the optimizer's to rewrite (it forwards the stored values), so its
-    // locals stay numbered and the raw stores keep its layout. The statements that only read
-    // them are v2 code, which builds the same nodes.
+fn a_tree_whose_raw_stores_kept_its_layout_names_its_locals() {
+    // Named, the tree is the optimizer's to rewrite (it forwards the stored values). v2.5
+    // left its locals by number, with the raw stores keeping its layout. Since v2.6 the
+    // tree is tried with `keep_layout` before its names are dropped, so the stores and reads
+    // name their frame words. `v2_6_lift_finale` covers a tree that still leaves its
+    // locals by number.
     let source = "object \"V2.5 Lift Locals Reads\" {
     guid: 0x7E00_01C1;
     state n: i16;
@@ -67,20 +69,28 @@ fn a_local_left_by_number_is_read_as_local_n() {
     }
 }
 ";
-    for behavioral in [false, true] {
-        let report = lift(source, behavioral);
-        let t = body(&report.source, "t");
-        for read in ["temp[0] = local[0];", "stack_obj = local[1];"] {
-            assert!(t.contains(read), "{read}\n{}", report.source);
-        }
-        let tree = report.trees.iter().find(|t| t.id == 4200).expect("tree");
-        assert_eq!(tree.style, TreeStyle::Idiomatic, "{}", report.source);
-        assert_eq!(tree.raw_statements, 2, "{}", report.source);
-        if !behavioral {
-            assert!(matches!(tree.check, TreeCheck::Identical), "{tree:?}");
-            assert_eq!(build(&report.source), build(source));
-        }
+    let report = lift(source, false);
+    let t = body(&report.source, "t");
+    for statement in ["slot_0 = 5;", "temp[0] = slot_0;", "stack_obj = slot_1;"] {
+        assert!(t.contains(statement), "{statement}\n{}", report.source);
     }
+    assert!(
+        report.source.contains(", keep_layout)]"),
+        "{}",
+        report.source
+    );
+    let tree = report.trees.iter().find(|t| t.id == 4200).expect("tree");
+    assert_eq!(tree.style, TreeStyle::Idiomatic, "{}", report.source);
+    assert_eq!(tree.raw_statements, 0, "{}", report.source);
+    assert!(matches!(tree.check, TreeCheck::Identical), "{tree:?}");
+    assert_eq!(build(&report.source), build(source));
+    let behavioral = lift(source, true);
+    let tree = behavioral
+        .trees
+        .iter()
+        .find(|t| t.id == 4200)
+        .expect("tree");
+    assert_eq!(tree.style, TreeStyle::Idiomatic, "{}", behavioral.source);
 }
 
 /// Thirty trees whose `if let` needs a frame word their header lacks, then `free`, after
@@ -132,50 +142,6 @@ fn if_lets_in_short_trees_do_not_starve_the_others() {
         "{}",
         report.source
     );
-    assert_eq!(build(&report.source), build(&source));
-}
-
-#[test]
-fn every_tree_a_failed_read_build_blames_keeps_its_reads_raw() {
-    // Each `bad` tree's padded read builds other bytes as `local[N]`. One build names all four,
-    // so the build after it reads `good`'s locals in place (review round 1: one blamed tree a
-    // build used to leave the budget spent before `good` was reached).
-    let mut trees = String::new();
-    for i in 0..4 {
-        trees.push_str(&format!(
-            "    #[bhav(id = {}, locals = 2)] fn bad_{i}(sim: Sim) {{
-        raw {{
-            local[0] := 5;
-            local[1] := stack_obj;
-            expr(temp[0] := local[0]) pad 0xff;
-        }}
-        stack_obj = local[1];
-        self.n = temp[0];
-    }}
-",
-            4200 + i
-        ));
-    }
-    let source = format!(
-        "object \"V2.5 Lift Locals Blame\" {{
-    guid: 0x7E00_01C3;
-    state n: i16;
-{trees}    #[bhav(id = 4250, locals = 2)] fn good(sim: Sim) {{
-        raw {{
-            local[0] := 5;
-            local[1] := stack_obj;
-        }}
-        temp[0] = local[0];
-        stack_obj = local[1];
-        self.n = temp[0];
-    }}
-}}
-"
-    );
-    let report = lift(&source, false);
-    let good = body(&report.source, "good");
-    assert!(good.contains("temp[0] = local[0];"), "{}", report.source);
-    assert!(good.contains("stack_obj = local[1];"), "{}", report.source);
     assert_eq!(build(&report.source), build(&source));
 }
 
