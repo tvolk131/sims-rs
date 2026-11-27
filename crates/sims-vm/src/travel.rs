@@ -68,7 +68,7 @@ use crate::boot::{Finished, Frames, LoadReport, Lot, NeighborhoodOrigin, opening
 use crate::daily::value as object_value;
 use crate::factory::word;
 use crate::interpreter::{Interpreter, Stream};
-use crate::lifecycle::{LotPrices, VmInstallCache, architecture_value_and_built};
+use crate::lifecycle::{LotPrices, VmInstallCache, architecture_value_and_built, outfit_rows};
 use crate::people;
 use crate::placement::{Place, Rules};
 use crate::play::Play;
@@ -2424,9 +2424,29 @@ fn depart(
         &staged_stored.zoning,
     );
 
+    // The home lot's outfit rows go into the character files with the
+    // envelope, and out of the frozen home lot and the travelers'
+    // snapshots; the destination boots from the files as written.
+    let outfits = outfit_rows::outfit_writes(
+        &dest_snapshot.character_files,
+        frozen_home.made_outfits(),
+        &outfit_rows::Loaded {
+            program: &home_lot.program,
+            world: &frozen_home.world,
+        },
+    );
+    for snap in &mut snapshots {
+        snap.made_outfits = outfits.carried(snap.guid, snap.made_outfits.take());
+    }
+    outfits.strip(&mut frozen_home);
+
     // Boot destination lot in memory BEFORE committing REDB, so any destination
     // boot/injection failure rolls back cleanly with zero REDB/home mutations.
-    let runtime = StoreRuntime::load(base, staged_stored.clone(), &dest_snapshot.character_files)?;
+    let runtime = StoreRuntime::load(
+        base,
+        staged_stored.clone(),
+        &outfits.staged(&dest_snapshot.character_files),
+    )?;
     let (mut dest_lot, traveler_records) = boot_destination_lot(
         runtime,
         store.store_id(),
@@ -2492,14 +2512,16 @@ fn depart(
         arrival: Some(arrival),
         departure_tokens,
     })?;
-    let (committed_instance, committed_revision) = match store.save_lot_and_neighborhood_checked(
-        neighborhood_id,
-        home_house,
-        Some((origin.instance_id, origin.revision)),
-        &envelope_bytes,
-        &staged_stored,
-        &[],
-    )? {
+    let (committed_instance, committed_revision) = match store
+        .save_lot_neighborhood_and_characters_checked(
+            neighborhood_id,
+            home_house,
+            Some((origin.instance_id, origin.revision)),
+            &envelope_bytes,
+            &staged_stored,
+            &[],
+            &outfits.files,
+        )? {
         Ok(version) => version,
         Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
             return Err(TravelError::NeighborhoodMismatch {
@@ -2928,19 +2950,30 @@ fn abort_active_trip_in(
         .save()
         .map_err(|e| TravelError::Lot(format!("encoding reconciled home lot: {e}")))?;
     home_saved_after.deletion_epoch = updated_stored.deletion_epoch;
+    let outfits = outfit_rows::outfit_writes(
+        &home_snapshot.character_files,
+        home_saved_after.made_outfits(),
+        &outfit_rows::Loaded {
+            program: &resumed_home.program,
+            world: &home_saved_after.world,
+        },
+    );
+    outfits.strip(&mut home_saved_after);
     let home_lot_bytes = home_saved_after.encode();
 
-    let (final_instance, final_revision) = match store.save_lot_and_neighborhood_checked(
-        neighborhood_id,
-        home_house,
-        Some((
-            home_snapshot.neighborhood.instance_id,
-            home_snapshot.neighborhood.revision,
-        )),
-        &home_lot_bytes,
-        &updated_stored,
-        &[],
-    )? {
+    let (final_instance, final_revision) = match store
+        .save_lot_neighborhood_and_characters_checked(
+            neighborhood_id,
+            home_house,
+            Some((
+                home_snapshot.neighborhood.instance_id,
+                home_snapshot.neighborhood.revision,
+            )),
+            &home_lot_bytes,
+            &updated_stored,
+            &[],
+            &outfits.files,
+        )? {
         Ok(version) => version,
         Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
             return Err(TravelError::NeighborhoodMismatch {
@@ -4316,8 +4349,22 @@ fn return_home(
     //    REDB, leaving any Build/Buy community-lot snapshot in REDB untouched
     //    (matching `Sims.exe` 1.91: live away-from-home visits never overwrite
     //    the destination lot with transient visit NPCs/mess).
-    let home_runtime =
-        StoreRuntime::load(base, updated_stored.clone(), &home_snapshot.character_files)?;
+    // The outfit rows of everyone on the lot the trip leaves go into the
+    // character files first, the travelers carrying none of their own, and
+    // the home lot boots from the files as written.
+    let away = outfit_rows::outfit_writes(
+        &home_snapshot.character_files,
+        dest_saved.made_outfits(),
+        &outfit_rows::Loaded {
+            program: &destination_lot.program,
+            world: &dest_saved.world,
+        },
+    );
+    for state in &mut returning_states {
+        state.made_outfits = away.carried(state.guid, state.made_outfits.take());
+    }
+    let home_files = away.staged(&home_snapshot.character_files);
+    let home_runtime = StoreRuntime::load(base, updated_stored.clone(), &home_files)?;
     let (mut resumed_home, returning_travelers) = reconcile_frozen_home_lot(
         home_runtime,
         store.store_id(),
@@ -4346,28 +4393,49 @@ fn return_home(
         }
     }
 
+    // The visited lot's rows are newer than any the home lot saved before
+    // the trip: those people read their files.
+    resumed_home
+        .world
+        .made_outfits
+        .retain(|guid, _| !away.persisted.contains(guid));
+
     // Snapshot reconciled home lot so REDB holds the post-return home state too.
     let mut home_saved_after = resumed_home
         .save()
         .map_err(|e| TravelError::Lot(format!("encoding reconciled home lot: {e}")))?;
     home_saved_after.deletion_epoch = updated_stored.deletion_epoch;
+    // Then the home lot's own (rows saved before the trip), for the people
+    // the visited lot wrote none for.
+    let home = outfit_rows::outfit_writes(
+        &home_files,
+        home_saved_after.made_outfits(),
+        &outfit_rows::Loaded {
+            program: &resumed_home.program,
+            world: &home_saved_after.world,
+        },
+    );
+    home.strip(&mut home_saved_after);
+    let outfits = away.then(home);
     let home_lot_bytes = home_saved_after.encode();
 
     // 6. Commit the reconciled home lot + updated neighborhood in a SINGLE
     //    atomic checked REDB transaction fenced on the latest home snapshot
     //    revision (so unrelated writes before return succeed, while any
     //    concurrent write racing with this return fails cleanly via CAS).
-    let (final_instance, final_revision) = match store.save_lot_and_neighborhood_checked(
-        &auth_session.neighborhood_id,
-        auth_session.home_house,
-        Some((
-            home_snapshot.neighborhood.instance_id,
-            home_snapshot.neighborhood.revision,
-        )),
-        &home_lot_bytes,
-        &updated_stored,
-        &[],
-    )? {
+    let (final_instance, final_revision) = match store
+        .save_lot_neighborhood_and_characters_checked(
+            &auth_session.neighborhood_id,
+            auth_session.home_house,
+            Some((
+                home_snapshot.neighborhood.instance_id,
+                home_snapshot.neighborhood.revision,
+            )),
+            &home_lot_bytes,
+            &updated_stored,
+            &[],
+            &outfits.files,
+        )? {
         Ok(version) => version,
         Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
             return Err(TravelError::NeighborhoodMismatch {
@@ -4555,6 +4623,30 @@ fn onward_request(
     Ok((request, party))
 }
 
+/// The frozen home lot `bytes` without rows for the people whose files
+/// `outfits` writes. An envelope from before the rows went into the files
+/// can hold some, for a person the trip leaves behind, whom no snapshot
+/// clears at the return; the files' rows are newer.
+fn without_persisted_rows(
+    bytes: &[u8],
+    outfits: &outfit_rows::OutfitWrites,
+) -> Result<Vec<u8>, TravelError> {
+    if outfits.persisted.is_empty() {
+        return Ok(bytes.to_vec());
+    }
+    let mut home = Saved::decode(bytes)
+        .map_err(|e| TravelError::Lot(format!("decoding the frozen home lot: {e}")))?;
+    if !home
+        .made_outfits()
+        .keys()
+        .any(|guid| outfits.persisted.contains(guid))
+    {
+        return Ok(bytes.to_vec());
+    }
+    home.retain_made_outfits(|guid, _| !outfits.persisted.contains(&guid));
+    Ok(home.encode())
+}
+
 /// The rest of [`travel_on_from_request`], once the destination lot is
 /// left: `stored` is the neighborhood with that lot's visit merged in,
 /// `states` the travelers as they left it, and `saved` the neighbor ids
@@ -4672,7 +4764,25 @@ fn travel_on(
         house,
         session.home_family,
     );
-    let runtime = StoreRuntime::load(base, stored.clone(), &dest_snapshot.character_files)?;
+    // The outfit rows of everyone on the lot the trip leaves go into the
+    // character files, the travelers carrying none of their own, and the
+    // next lot boots from the files as written.
+    let outfits = outfit_rows::outfit_writes(
+        &dest_snapshot.character_files,
+        &destination_lot.world.made_outfits,
+        &outfit_rows::Loaded {
+            program: &destination_lot.program,
+            world: &destination_lot.world,
+        },
+    );
+    for state in &mut states {
+        state.made_outfits = outfits.carried(state.guid, state.made_outfits.take());
+    }
+    let runtime = StoreRuntime::load(
+        base,
+        stored.clone(),
+        &outfits.staged(&dest_snapshot.character_files),
+    )?;
     let (mut dest_lot, travelers) = boot_destination_lot(
         runtime,
         store.store_id(),
@@ -4723,19 +4833,21 @@ fn travel_on(
         session: onward.clone(),
         baseline: DepartureBaseline::from_stored(&stored, fence.1 + 1, session.home_family),
         departure_snapshots: states,
-        frozen_home_bytes: persisted.frozen_home_bytes.clone(),
+        frozen_home_bytes: without_persisted_rows(&persisted.frozen_home_bytes, &outfits)?,
         version: TRAVEL_ENVELOPE_VERSION,
         arrival: Some(arrival),
         departure_tokens: saved.to_vec(),
     })?;
-    let (committed_instance, committed_revision) = match store.save_lot_and_neighborhood_checked(
-        neighborhood_id,
-        session.home_house,
-        Some(fence),
-        &envelope_bytes,
-        &stored,
-        &[],
-    )? {
+    let (committed_instance, committed_revision) = match store
+        .save_lot_neighborhood_and_characters_checked(
+            neighborhood_id,
+            session.home_house,
+            Some(fence),
+            &envelope_bytes,
+            &stored,
+            &[],
+            &outfits.files,
+        )? {
         Ok(version) => version,
         Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
             return Err(TravelError::NeighborhoodMismatch {
@@ -5624,6 +5736,16 @@ fn boot_destination_lot(
     }
     if let Some(slot) = world.globals.get_mut(GLOBAL_MODE) {
         *slot = 0;
+    }
+
+    // Each traveler's outfit rows go in before anyone is made, so a person
+    // the arrival makes later (a date's companion, from its token) is made
+    // with them too. An empty set clears rows the saved lot held: that
+    // person reads its character file.
+    for snap in snapshots {
+        if let Some(rows) = &snap.made_outfits {
+            world.made_outfits.insert(snap.guid, rows.clone());
+        }
     }
 
     // Issue Vacation hotel keys on check-in before spawning/ticking so
@@ -8366,10 +8488,16 @@ mod tests {
                 .last_dressed,
             [2, 1, 0, 0]
         );
+        // The home lot boots from the character file the return wrote, so
+        // Mortimer reads the row from it.
+        let profile =
+            crate::people::profile(&home.program.people, &home.world, mortimer_guid).unwrap();
         assert_eq!(
-            home.world.made_outfits[&mortimer_guid][&1],
-            "b300mafitlgt_formal"
+            crate::outfits::read_character_row(&home.world, mortimer_guid, Some(&profile), 1)
+                .as_deref(),
+            Some("b300mafitlgt_formal")
         );
+        assert_eq!(profile.body.as_deref(), Some("b300mafitlgt_formal"));
         assert_eq!(
             neighbor_token_count(
                 &home.world,
@@ -8397,6 +8525,16 @@ mod tests {
         let stored_after = store.load_neighborhood("UserData").unwrap().unwrap();
         assert_eq!(stored_after.families[&5].secondary_house(), 0);
         assert_eq!(stored_after.families[&5].budget, spent_funds);
+        // The row the trip wrote went into Mortimer's character file with
+        // the return, and the saved home lot keeps none of its own.
+        let files = store.load_character_files("UserData").unwrap();
+        assert_eq!(
+            crate::lifecycle::outfit_rows::stored_row(&files, mortimer_guid, 1).as_deref(),
+            Some("b300mafitlgt_formal")
+        );
+        let saved_home = store.load_lot_snapshot("UserData", 5).unwrap().unwrap();
+        let saved_home = Saved::decode(saved_home.saved_lot.as_deref().unwrap()).unwrap();
+        assert!(!saved_home.made_outfits().contains_key(&mortimer_guid));
         assert!(stored_after.families[&5].friends >= 1);
 
         // Switching away from famous Mortimer (`fame=25`) via `select_sim`

@@ -99,6 +99,10 @@
 //!   becomes entry temp 1 of that category's wardrobe list, through the
 //!   outfit editor, and temp 1 becomes the index it wore. See
 //!   [`outfit_editor`].
+//! - 29 (0x4501bd), 30 (0x450528) and 31 (0x4503f2): the outfit editor
+//!   on the stack object, categories 0 to 4. 29 is routine 24 for it; 30
+//!   puts the index the person wears in temp 1, and 31 the length of the
+//!   category's list. See [`outfit_editor`].
 
 mod outfit_editor;
 
@@ -211,6 +215,18 @@ impl Machine<'_, '_> {
             }
             24 => {
                 self.change_outfit()?;
+                Ok(true)
+            }
+            29 => {
+                self.change_stack_outfit()?;
+                Ok(true)
+            }
+            30 => {
+                self.current_outfit()?;
+                Ok(true)
+            }
+            31 => {
+                self.outfit_count()?;
                 Ok(true)
             }
             25 => {

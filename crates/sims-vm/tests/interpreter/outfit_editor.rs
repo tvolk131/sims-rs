@@ -1,5 +1,6 @@
-//! Generic Sims Call routine 24 (0x44ff6e), the outfit editor, against a
-//! synthetic wardrobe: made-up suit and texture names only.
+//! Generic Sims Call routines 24 (0x44ff6e), 29 (0x4501bd), 30
+//! (0x450528) and 31 (0x4503f2), the outfit editor, against a synthetic
+//! wardrobe: made-up suit and texture names only.
 
 use crate::support::*;
 use std::collections::BTreeMap;
@@ -71,6 +72,19 @@ fn generic_24(
     category: i16,
     index: i16,
 ) -> Result<bool, sims_vm::Fault> {
+    generic(fx, 24, me, 0, category, index)
+}
+
+/// Runs `routine` as `me`, with `stack` as the stack object and `me`'s
+/// temps 0 and 1 at `category` and `index`.
+fn generic(
+    fx: &mut Fixture,
+    routine: u8,
+    me: u16,
+    stack: i16,
+    category: i16,
+    index: i16,
+) -> Result<bool, sims_vm::Fault> {
     let file = if me == SIM { SIM_FILE } else { LAMP_FILE };
     let object = fx.world.objects.get_mut(&me).unwrap();
     (object.temps[0], object.temps[1]) = (category, index);
@@ -81,10 +95,20 @@ fn generic_24(
             1,
             RETURN_TRUE,
             RETURN_FALSE,
-            [24, 0, 0, 0, 0, 0, 0, 0],
+            [routine, 0, 0, 0, 0, 0, 0, 0],
         )]),
     );
-    fx.run_with(me, 4096, 0, &[], 10)
+    fx.run_with(me, 4096, stack, &[], 10)
+}
+
+/// Runs `routine` as the lamp on the Sim.
+fn on_sim(
+    fx: &mut Fixture,
+    routine: u8,
+    category: i16,
+    index: i16,
+) -> Result<bool, sims_vm::Fault> {
+    generic(fx, routine, LAMP, SIM as i16, category, index)
 }
 
 fn row(fx: &Fixture, idx: usize) -> Option<&str> {
@@ -184,4 +208,118 @@ fn generic_call_24_dresses_a_pet_from_its_species_list() {
     let text = trap(generic_24(&mut fx2, SIM, 1, 0)).to_string();
     assert!(text.contains("category 1 for a pet"), "{text}");
     assert!(fx2.world.made_outfits.is_empty());
+}
+
+#[test]
+fn generic_call_29_dresses_the_stack_object_from_the_running_objects_temps() {
+    // The lamp's temps pick body 1 for the Sim; the lamp's temp 1 becomes
+    // the body the Sim wore (0x4503e3).
+    let mut fx = dressed_sim();
+    assert_eq!(on_sim(&mut fx, 29, 0, 1), Ok(true));
+    assert_eq!(row(&fx, 1), Some(BODY_1));
+    assert_eq!(fx.lamp().temps[..2], [0, 0]);
+    assert_eq!(fx.sim().temps[..2], [0, 0]);
+    assert_eq!(on_sim(&mut fx, 29, 1, 0), Ok(true));
+    assert_eq!(row(&fx, 30), Some(FORMAL_0));
+    assert_eq!(fx.lamp().temps[..2], [1, 1]);
+}
+
+#[test]
+fn generic_call_29_knows_no_high_fashion() {
+    // Its switch stops at category 4: 5 writes nothing, as 6 does, and
+    // temp 1 is left as it was.
+    let mut fx = dressed_sim();
+    fx.program.people.textures.push("h100mafitlgt_two".into());
+    assert_eq!(on_sim(&mut fx, 29, 5, 1), Ok(true));
+    assert_eq!(row(&fx, 34), None);
+    assert_eq!(fx.lamp().temps[..2], [5, 1]);
+    // Routine 24 writes it.
+    assert_eq!(generic_24(&mut fx, SIM, 5, 1), Ok(true));
+    assert_eq!(row(&fx, 34), Some("h100mafit_x,BODY=h100mafitlgt_two"));
+    assert_eq!(fx.sim().temps[..2], [5, 0]);
+}
+
+#[test]
+fn generic_calls_29_to_31_need_a_person_on_the_stack() {
+    // The stack object is cast (0x635abe): no object, an object not on
+    // the lot, or one that is not a person throws native error 0x1c.
+    for routine in [29, 30, 31] {
+        for stack in [0, -1, 77, LAMP as i16] {
+            let mut fx = dressed_sim();
+            let result = generic(&mut fx, routine, LAMP, stack, 0, 0);
+            assert_eq!(
+                trap(result).code(),
+                Some(0x1c),
+                "routine {routine} stack {stack}"
+            );
+            assert!(fx.world.made_outfits.is_empty());
+        }
+    }
+}
+
+#[test]
+fn generic_call_30_answers_the_place_worn_and_commits() {
+    // The current accessors (0x40d0a4, 0x40d52f): body 0, formal 1.
+    let mut fx = dressed_sim();
+    assert_eq!(on_sim(&mut fx, 30, 0, 9), Ok(true));
+    assert_eq!(fx.lamp().temps[..2], [0, 0]);
+    assert_eq!(on_sim(&mut fx, 30, 1, 9), Ok(true));
+    assert_eq!(fx.lamp().temps[..2], [1, 1]);
+    // A row in no place of its list answers -1, and so does a category
+    // past 4 (0x4505c6).
+    for category in [5, 6, -1] {
+        assert_eq!(on_sim(&mut fx, 30, category, 9), Ok(true));
+        assert_eq!(fx.lamp().temps[..2], [category, -1]);
+    }
+    // The commit with 1 runs its check (0x40a588): a body the list does
+    // not hold is answered as -1 first, then replaced by the first.
+    let mut fx = dressed_sim();
+    fx.program.people.profiles.get_mut(&SIM_GUID).unwrap().body =
+        Some("b100mafit_x,BODY=b100mafitlgt_gone".into());
+    assert_eq!(on_sim(&mut fx, 30, 0, 9), Ok(true));
+    assert_eq!(fx.lamp().temps[..2], [0, -1]);
+    assert_eq!(row(&fx, 1), Some(BODY_0));
+}
+
+#[test]
+fn generic_call_31_counts_without_committing() {
+    // The count accessors (0x40d077, 0x40d4ff and kin): two bodies, two
+    // formal outfits, one of each other category, -1 past 4.
+    let mut fx = dressed_sim();
+    for (category, count) in [(0, 2), (1, 2), (2, 1), (3, 1), (4, 1), (5, -1), (6, -1)] {
+        assert_eq!(on_sim(&mut fx, 31, category, 9), Ok(true));
+        assert_eq!(
+            fx.lamp().temps[..2],
+            [category, count],
+            "category {category}"
+        );
+    }
+    // The commit with 0 checks nothing: a body the list does not hold
+    // stays.
+    let mut fx = dressed_sim();
+    fx.program.people.profiles.get_mut(&SIM_GUID).unwrap().body =
+        Some("b100mafit_x,BODY=b100mafitlgt_gone".into());
+    assert_eq!(on_sim(&mut fx, 31, 0, 9), Ok(true));
+    assert_eq!(fx.lamp().temps[..2], [0, 2]);
+    assert_eq!(row(&fx, 1), None);
+}
+
+#[test]
+fn generic_call_31_counts_a_null_body_list_as_none() {
+    // A gender code the editor does not know leaves the body list null
+    // (0x408bf5), which the count accessor answers with 0.
+    let mut fx = dressed_sim();
+    fx.program
+        .people
+        .profiles
+        .get_mut(&SIM_GUID)
+        .unwrap()
+        .gender = Some("robot".into());
+    assert_eq!(on_sim(&mut fx, 31, 0, 9), Ok(true));
+    assert_eq!(fx.lamp().temps[..2], [0, 0]);
+    // Routine 30 would read through it.
+    assert!(matches!(
+        trap(on_sim(&mut fx, 30, 0, 9)),
+        sims_vm::Trap::Unsupported(_)
+    ));
 }

@@ -31,9 +31,7 @@ use std::path::{Path, PathBuf};
 use support::*;
 
 /// The routines the install's trees call that the port refuses.
-const RESIDUALS: &[u16] = &[
-    0, 1, 4, 5, 13, 27, 29, 30, 32, 33, 34, 36, 38, 39, 40, 41, 42,
-];
+const RESIDUALS: &[u16] = &[0, 1, 4, 5, 13, 27, 32, 33, 34, 36, 38, 39, 40, 41, 42];
 
 /// The paths in `dir`, sorted, so the scan never depends on the order the
 /// filesystem lists them in. An entry that cannot be read is an error:

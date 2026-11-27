@@ -674,6 +674,23 @@ impl Saved {
             .expect("encoding to memory cannot fail")
     }
 
+    /// The outfit rows the save carries (person GUID → row → text).
+    pub(crate) fn made_outfits(&self) -> &BTreeMap<u32, BTreeMap<usize, String>> {
+        &self.made_outfits
+    }
+
+    /// Keeps only the outfit rows `keep` is true for (person GUID and its
+    /// rows), in the save and in its world.
+    pub(crate) fn retain_made_outfits(
+        &mut self,
+        mut keep: impl FnMut(u32, &BTreeMap<usize, String>) -> bool,
+    ) {
+        self.made_outfits.retain(|&guid, rows| keep(guid, rows));
+        self.world
+            .made_outfits
+            .retain(|&guid, rows| keep(guid, rows));
+    }
+
     fn hydrate_world_aux(&mut self) {
         self.world.generated_portrait_2002 = self.generated_portrait_2002.clone();
         self.world.made_portrait_head = self.made_portrait_head.clone();

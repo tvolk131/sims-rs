@@ -28,3 +28,24 @@ fn vacant_lot_thumbnail_draws_non_key_grass_diamond() {
     assert!(thumb.pixels.iter().any(|&p| p != COLOR_KEY_565));
     assert_eq!(thumb.pixels[0], COLOR_KEY_565);
 }
+
+#[test]
+fn a_staged_save_carries_only_the_character_files_it_changed() {
+    let dir = TempStagingDir::new("saved-character-files").unwrap();
+    let staging = NeighborhoodStore::open(&dir.path().join("stage.redb")).unwrap();
+    staging
+        .save_character_file("UserData", "a.iff", b"a")
+        .unwrap();
+    staging
+        .save_character_file("UserData", "b.iff", b"b")
+        .unwrap();
+    let before = character_files(&staging, "UserData").unwrap();
+    // The save writes a's outfit rows.
+    staging
+        .save_character_file("UserData", "a.iff", b"a, edited")
+        .unwrap();
+    assert_eq!(
+        saved_character_files(&before, &staging, "UserData").unwrap(),
+        vec![("a.iff".to_owned(), b"a, edited".to_vec())]
+    );
+}
