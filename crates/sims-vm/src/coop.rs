@@ -52,6 +52,7 @@ use crate::build::{
     plan_wall_drag, plan_wallpaper_edit,
 };
 use crate::buy::{BuyPurchase, snap_to_tile_centre};
+use crate::dialog_non_modal::NonModalAnswerError;
 use crate::interpreter::{Interpreter, Stream};
 use crate::orders::MenuEntry;
 use crate::{
@@ -1058,6 +1059,7 @@ fn apply_session_command(
         }
         Command::SelectPerson { .. }
         | Command::AnswerBlockingDialog { .. }
+        | Command::AnswerNonModalDialog { .. }
         | Command::SimActionPick { .. }
         | Command::SimActionCancel { .. }
         | Command::BuyBuild(_) => {
@@ -1957,6 +1959,36 @@ impl Lot {
                     }
                 }
                 CoopCommandStatus::Applied
+            }
+            Command::AnswerNonModalDialog {
+                caller,
+                operands,
+                answer,
+            } => {
+                if let Err(status) = apply_session_command(session, stamped) {
+                    return status;
+                }
+                // Between ticks, as `0x4370be` answers a press: not while a
+                // modal dialog or special panel holds the tick.
+                if ctx.frozen_dialog.is_some() || self.has_pending_dialog() || self.answered {
+                    return CoopCommandStatus::IgnoredWhileDialogPending;
+                }
+                match self.answer_non_modal_in_coop(
+                    *caller,
+                    *operands,
+                    answer.status,
+                    answer.text.clone(),
+                ) {
+                    Ok(()) => CoopCommandStatus::Applied,
+                    // Answered first by another player, closed by its
+                    // caller, or shown again with other operands.
+                    Err(
+                        NonModalAnswerError::NotShown { .. } | NonModalAnswerError::Replaced { .. },
+                    ) => CoopCommandStatus::IgnoredBySession(
+                        CommandIgnoreReason::DialogAlreadyAnswered,
+                    ),
+                    Err(err) => CoopCommandStatus::Refused(err.to_string()),
+                }
             }
             Command::SimActionPick {
                 sim_id,
@@ -4288,6 +4320,144 @@ mod tests {
             session.players[&PlayerId(2)].selected_sim,
             Some(30),
             "intervening selection must be preserved after replay"
+        );
+    }
+
+    /// `Command::AnswerNonModalDialog`: co-op play mode shows a dialog that
+    /// does not stop the game, and every peer answers the same record, once,
+    /// between the same two ticks.
+    #[test]
+    fn a_non_modal_dialog_is_shown_in_co_op_and_answered_once_by_command() {
+        use sims_sim::Dialog;
+        let (mut program, catalog, mut world) = run_expr_world();
+        for chunk in 1..=4 {
+            program
+                .libraries
+                .get_mut(&0)
+                .unwrap()
+                .definitions
+                .insert(chunk, [0; crate::DEFINITION_WORDS]);
+        }
+        for obj in world.objects.values_mut() {
+            obj.set_flags(SCHEDULER_READY, false);
+        }
+        // A NEW non-modal Yes/No dialog (kind 1, operand 7 bit 7 set).
+        let operands = [0, 0, 0, 0, 0, 1, 0, 0x80];
+        world.dialogs.records.push(Dialog {
+            caller: 40,
+            operands,
+            status: 0,
+        });
+        let frames = || Frames::parse("none").unwrap();
+        let mut host_lot =
+            synthetic_coop_lot(program.clone(), catalog.clone(), world.clone(), frames());
+        let mut peer_lot = synthetic_coop_lot(program, catalog, world, frames());
+        let mut session = two_player_session(Some(10), Some(20));
+        let mut peer_session = session.clone();
+        for lot in [&mut host_lot, &mut peer_lot] {
+            lot.attach_coop_context(
+                CoopVmContext::new(session.clone())
+                    .with_frames(frames())
+                    .with_play_mode(true),
+            )
+            .expect("attach");
+        }
+        let epoch = session.epoch;
+        let batch = |tick: u64, commands: Vec<(u32, Command)>| TickBatch {
+            epoch,
+            tick: Tick(tick),
+            pacing_hint_ms: 0,
+            host_fingerprint: None,
+            commands: commands
+                .into_iter()
+                .enumerate()
+                .map(|(sequence, (player, command))| StampedCommand {
+                    tick: Tick(tick),
+                    sequence: sequence as u32,
+                    issuer: PlayerId(player),
+                    command,
+                })
+                .collect(),
+        };
+        let answer = |operands: [u8; 8], status: u8| Command::AnswerNonModalDialog {
+            caller: 40,
+            operands,
+            answer: sims_net::DialogAnswer {
+                status,
+                bitmap_id: None,
+                text: None,
+            },
+        };
+
+        // Tick 1 shows it and goes on: no blocking dialog opens.
+        let b1 = batch(1, Vec::new());
+        let r1_h = host_lot
+            .apply_coop_batch(&session.apply_batch(&b1).unwrap(), &mut session)
+            .unwrap();
+        let r1_p = peer_lot
+            .apply_coop_batch(&peer_session.apply_batch(&b1).unwrap(), &mut peer_session)
+            .unwrap();
+        assert!(r1_h.stepped && r1_h.opened_dialog.is_none());
+        assert_eq!(r1_h.update.as_ref().unwrap().non_modal_shown, vec![40]);
+        assert_eq!(r1_h.state_fingerprint, r1_p.state_fingerprint);
+        assert_eq!(host_lot.non_modal_dialogs().len(), 1);
+        // Outside the command, a peer cannot answer it alone.
+        assert_eq!(
+            host_lot.answer_non_modal(40, 2, None),
+            Err(NonModalAnswerError::Coop)
+        );
+
+        // Tick 2: an answer for other operands (a record since replaced) is
+        // ignored, one the dialog does not offer is refused, the peer's
+        // answer wins, and the host's later one finds it answered.
+        let stale = [0, 0, 0, 0, 7, 1, 0, 0x80];
+        let b2 = batch(
+            2,
+            vec![
+                (1, answer(stale, 2)),
+                (1, answer(operands, 4)),
+                (2, answer(operands, 3)),
+                (1, answer(operands, 2)),
+            ],
+        );
+        let r2_h = host_lot
+            .apply_coop_batch(&session.apply_batch(&b2).unwrap(), &mut session)
+            .unwrap();
+        let r2_p = peer_lot
+            .apply_coop_batch(&peer_session.apply_batch(&b2).unwrap(), &mut peer_session)
+            .unwrap();
+        let statuses: Vec<_> = r2_h
+            .command_results
+            .iter()
+            .map(|(_, s)| s.clone())
+            .collect();
+        assert_eq!(
+            statuses[0],
+            CoopCommandStatus::IgnoredBySession(CommandIgnoreReason::DialogAlreadyAnswered)
+        );
+        assert!(matches!(statuses[1], CoopCommandStatus::Refused(_)));
+        assert_eq!(statuses[2], CoopCommandStatus::Applied);
+        assert_eq!(
+            statuses[3],
+            CoopCommandStatus::IgnoredBySession(CommandIgnoreReason::DialogAlreadyAnswered)
+        );
+        assert_eq!(
+            statuses,
+            r2_p.command_results
+                .iter()
+                .map(|(_, s)| s.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(r2_h.state_fingerprint, r2_p.state_fingerprint);
+        assert!(host_lot.non_modal_dialogs().is_empty());
+        assert!(
+            host_lot
+                .world()
+                .dialogs
+                .records
+                .iter()
+                .all(|r| r.status != 1),
+            "the peer's answer took the record"
         );
     }
 

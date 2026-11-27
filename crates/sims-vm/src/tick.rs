@@ -450,7 +450,7 @@ pub struct Update {
     /// steps only ([`Interpreter::masks_rebuilt`]).
     pub masks_rebuilt: u8,
     /// In play mode with [`crate::boot::Lot::present_non_modal_dialogs`]
-    /// on, the callers whose dialog that does not stop the game was shown
+    /// on, or in co-op play mode, the callers whose dialog that does not stop the game was shown
     /// during the update (`0x436da0` with byte `0x69` clear), in order. A
     /// caller's next `Dialog` closes such a record and makes it again, so
     /// a choice is shown afresh every tick its caller runs, and the
@@ -1404,13 +1404,14 @@ impl Interpreter<'_> {
                 // widget (byte `0x69` clear) with the record shown, and the
                 // game goes on. The player answers it between updates
                 // (`Lot::answer_non_modal`, `0x4370be`), or its caller's
-                // next `Dialog` closes it (`0x437058`). Co-op still answers
-                // it at once, below: no command carries such an answer.
+                // next `Dialog` closes it (`0x437058`). Co-op always does
+                // this in play mode, as every peer must do the same; an
+                // answer comes as a command (`Command::AnswerNonModalDialog`).
                 if play.is_some()
-                    && self.coop.is_none()
-                    && self
-                        .special_panels
-                        .is_some_and(|panels| panels.borrow().present_non_modal)
+                    && (self.coop.is_some()
+                        || self
+                            .special_panels
+                            .is_some_and(|panels| panels.borrow().present_non_modal))
                 {
                     update.non_modal_shown.push(record.caller);
                     continue;

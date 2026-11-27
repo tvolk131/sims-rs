@@ -31,8 +31,9 @@ use std::fmt;
 /// and the host compares too ([`RejectReason::BuildMismatch`]).
 ///
 /// History: 2 for `Saved` format 11 and the indicator refresh queues in
-/// the fingerprint; 3 for the build identity in `Hello`.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// the fingerprint; 3 for the build identity in `Hello`; 4 for
+/// [`Command::AnswerNonModalDialog`].
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// ALPN identifier for `iroh` QUIC co-op sessions. Not tied to
 /// [`PROTOCOL_VERSION`]: see there.
@@ -607,6 +608,18 @@ pub enum Command {
     },
     /// Host-issued leadership event: deterministic host failover occurred.
     HostChanged { new_host: PlayerId, epoch: Epoch },
+    /// Answer the dialog that does not stop the game (Dialog operand 7
+    /// bit 7 set) that object `caller` shows with `operands`, between
+    /// ticks, as a press of its button or its 40 s timer does
+    /// (`0x4370be`). The first answer in host tick order wins; a later
+    /// one, or one for a record its caller has since replaced with
+    /// other operands, is ignored. `answer.text` is a kind-3 field's
+    /// text; `answer.bitmap_id` is not used.
+    AnswerNonModalDialog {
+        caller: u16,
+        operands: [u8; 8],
+        answer: DialogAnswer,
+    },
 }
 
 impl Command {

@@ -210,7 +210,7 @@ impl Game {
         }
         // The simulation dialog's 40 s timer presses its button whether or
         // not the window can draw.
-        if !self.coop.is_active_or_starting()
+        if (!self.coop.is_active_or_starting() || self.coop_runs_auto_answer())
             && !self.auto_answer_held()
             && let Some(us) = self.hud.auto_answer_remaining_us(self.clock_us)
         {
@@ -329,6 +329,16 @@ impl Game {
             self.blink_dirty = true;
         }
         if self.coop.is_active_or_starting() {
+            // In co-op only a non-modal dialog's timer runs: when it runs
+            // out it sends the answer as a command, as a press would, and
+            // the first answer in tick order wins on every peer.
+            if self.coop_runs_auto_answer()
+                && !self.auto_answer_held()
+                && let Some((caller, status, modal)) = self.hud.take_auto_answer(self.clock_us)
+            {
+                self.auto_answer(caller, status, modal);
+                self.blink_dirty = true;
+            }
             return self.advance_coop_while(clock_elapsed_us, step_elapsed_us, keep_going);
         }
         // The shown simulation dialog's 40 s timer (wall clock, paused or

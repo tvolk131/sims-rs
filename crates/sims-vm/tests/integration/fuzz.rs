@@ -410,6 +410,7 @@ fn draw_step(lot: &Lot, rng: &mut Rng) -> Step {
 /// The answers the open dialog or special panel accepts: each button an
 /// ordinary dialog offers, or the cancel or dismissal a special panel takes
 /// (a lot picked in a picker would leave the lot, which a co-op lot can't).
+/// With neither open, each button of a shown non-modal dialog.
 fn answers(lot: &Lot) -> Vec<Command> {
     let ctx = lot.coop().expect("co-op is attached");
     if let Some((id, shown)) = &ctx.active_special_panel {
@@ -428,7 +429,26 @@ fn answers(lot: &Lot) -> Vec<Command> {
         .collect();
     }
     let (Some(id), Some(asking)) = (ctx.active_dialog, lot.asking()) else {
-        return Vec::new();
+        // Each button of a dialog that does not stop the game, shown
+        // between ticks (co-op play mode shows them).
+        return lot
+            .non_modal_dialogs()
+            .into_iter()
+            .flat_map(|shown| {
+                shown
+                    .answers
+                    .iter()
+                    .map(move |&status| Command::AnswerNonModalDialog {
+                        caller: shown.caller,
+                        operands: shown.operands,
+                        answer: DialogAnswer {
+                            status,
+                            bitmap_id: None,
+                            text: None,
+                        },
+                    })
+            })
+            .collect();
     };
     asking
         .shown
@@ -698,7 +718,7 @@ fn env(name: &str, default: u64) -> u64 {
 }
 
 /// The command kinds the summary counts.
-const KINDS: [&str; 8] = [
+const KINDS: [&str; 9] = [
     "SimActionPick",
     "SimActionCancel",
     "SetSpeed",
@@ -707,6 +727,7 @@ const KINDS: [&str; 8] = [
     "SelectPerson",
     "SetCameraRotation",
     "AnswerBlockingDialog",
+    "AnswerNonModalDialog",
 ];
 
 #[test]

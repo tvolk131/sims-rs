@@ -599,7 +599,8 @@ impl SessionState {
             }
             Command::SimActionPick { .. }
             | Command::SimActionCancel { .. }
-            | Command::BuyBuild(_) => {
+            | Command::BuyBuild(_)
+            | Command::AnswerNonModalDialog { .. } => {
                 if !self.players.contains_key(&issuer) {
                     return CommandOutcome::Rejected(CommandRejectReason::UnknownIssuer);
                 }

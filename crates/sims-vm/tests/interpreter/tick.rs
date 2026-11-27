@@ -3132,7 +3132,8 @@ fn without_presenting_a_non_modal_dialog_is_handled_as_before() {
     assert!(u.non_modal_shown.is_empty());
     assert_eq!(u.errors.len(), 1);
     assert_eq!(fx.world.dialogs.records[0].status, 2);
-    // Play with co-op attached, setting on: answered at once too.
+    // Play with co-op attached and the setting off: shown, as every
+    // peer must do the same whatever its own setting.
     let mut fx = lot(program());
     let tuning = tuning();
     let coop = RefCell::new(sims_vm::CoopVmContext::new(sims_net::SessionState::new(
@@ -3140,8 +3141,9 @@ fn without_presenting_a_non_modal_dialog_is_handled_as_before() {
         None,
         sims_net::SessionConfig::default(),
     )));
+    let off = RefCell::new(SpecialPanels::default());
     let mut interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    interpreter.special_panels = Some(&panels);
+    interpreter.special_panels = Some(&off);
     interpreter.coop = Some(&coop);
     let u = interpreter
         .lot_update_with(
@@ -3151,8 +3153,8 @@ fn without_presenting_a_non_modal_dialog_is_handled_as_before() {
             Some(&mut Play::default()),
         )
         .unwrap();
-    assert!(u.non_modal_shown.is_empty());
-    assert_eq!(fx.world.dialogs.records[0].status, 2);
+    assert_eq!(u.non_modal_shown, vec![LAMP]);
+    assert_eq!(fx.world.dialogs.records[0].status, 1);
 }
 
 /// An informing non-modal dialog does not hold its caller: the record

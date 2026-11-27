@@ -1371,12 +1371,49 @@ impl Game {
     /// the status `answer` (`Lot::answer_non_modal`, `0x4370be`), between
     /// ticks: the game goes on, and the caller reads the answer on its
     /// next turn.
+    ///
+    /// In co-op it sends `Command::AnswerNonModalDialog` for the record
+    /// shown, which every peer applies between the same two ticks; the
+    /// first answer in tick order wins.
     pub fn answer_non_modal(&mut self, caller: u16, answer: u8) {
         let text = self
             .hud
             .vm_dialog_key()
             .filter(|&(shown, _)| shown == caller)
             .and_then(|_| self.hud.active_dialog_entry().map(str::to_owned));
+        if self.coop.is_active() {
+            if !self.lot.takes_non_modal_answer() {
+                // Every peer would ignore it: a modal dialog's tick has
+                // not run again yet.
+                self.note = Some("Answer the dialog in front first.".into());
+                return;
+            }
+            let Some(shown) = self
+                .lot
+                .non_modal_dialogs()
+                .into_iter()
+                .find(|d| d.caller == caller)
+            else {
+                self.note = Some(format!("Object {caller} shows no dialog to answer."));
+                return;
+            };
+            let cmd = NetCommand::AnswerNonModalDialog {
+                caller,
+                operands: shown.operands,
+                answer: sims_net::DialogAnswer {
+                    status: answer,
+                    bitmap_id: None,
+                    text,
+                },
+            };
+            if let Err(e) = self.coop.submit_command(cmd) {
+                self.note = Some(format!("The answer was not sent: {e}"));
+                // A timer that ran out into a send that failed runs again
+                // (no-op unless this caller's dialog is shown with one).
+                self.hud.restart_auto_answer(caller);
+            }
+            return;
+        }
         match self.lot.answer_non_modal(caller, answer, text) {
             Ok(()) => {
                 // The answer is the lot's state, as a tick's change is.
