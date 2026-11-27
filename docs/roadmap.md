@@ -73,6 +73,17 @@ events, and what it asks for after them) come first.
    `frame` rows) confirms the exact out-of-tick `Refresh(0)` write
    (`eip=0x58da4a`) on both `mort_clk` and `racc_clk` at update 40,330
    immediately following out-of-tick `frame` writes.
+   Batch 26, #513 (`docs/decisions/20261127-goth-late-day-rng-parity.md`,
+   no simulation change): replayed under the 1,512 frames that recording
+   shows the original drew between updates (plus the one before update
+   1), the lot and C runtime streams match at
+   **every update, 1 to 44,200**. The five late lot-stream misses
+   (36,718, 36,929, 37,058, 37,126, 37,215) came from the fitted
+   schedule's phase 14; from 28,315 to 39,595 the original drew at phase
+   25. The test `the_goth_day_under_the_frames_the_original_drew_keeps_its_streams`
+   pins a SHA-256 of both streams (`GOTH_DAY_STREAMS`). The two runs of
+   the original differ at 41,445 and 41,893; the port follows the
+   frame-watched one, and why the other differs is not established.
    See Progress.
 3. **1000 ticks on three more base-game houses**, picked for code the
    Goths do not reach (for example the Newbies and a family with
@@ -501,11 +512,26 @@ events, and what it asks for after them) come first.
   (`0x10c`), and #317 fixes Find Location For mode 5's swapped axes,
   asserting `obj 37`'s wander target `[648, 312, 1]` at fitted replay
   update 41,446 (matching the recording's update 41,445) and moving the
-  default-frames 43,200 pin to `c3b7a6b9`. Next (track 3): screen-centre
-  pick (`0x4a7b58`, `0x434891`, `0x43491c`), no-tile portrait branch
-  (`0x4e9706`, `0x4e938c`), full-state comparison past 3350 against a
-  frame-watched recording, and verifying the inferred `cTSLiveModePIP`
-  paint refresh near 40,317 as the explanation for the 1-update lag.
+  default-frames 43,200 pin to `c3b7a6b9`. Batch 26, #513: under the
+  frames the frame-watched recording shows the original drew, the lot and
+  C runtime streams match at every update from 1 to 44,200, with no
+  simulation change. The five late lot-stream misses each came exactly
+  one update early because of the fitted schedule's frame phase (14
+  where the original drew at 25, from 28,315 to 39,595); 41,445 and
+  41,893 are where the original's two runs differ, and the port follows
+  the frame-watched one. A full-state comparison at the
+  938 saved updates, with the day audit's masking, differs from 28,400
+  to 44,200 only in the global stream (taken to be the censor mosaic)
+  and at a mid-update dialog save at 40,495. Open for the early-day
+  audit (no stream effect): object 21's `data[50]` (5,268 to 18,200,
+  intermittent); global 11 at 12,986, 18,007 and 19,194; uninitialised
+  locals at 368/400 and 19,400 to 19,436; the idle-speed switch (ours
+  at 28,195, the original's between 28,200 and 28,317); and person word
+  37, which the port marks unknown. Why the original's other run
+  differs at 41,445 and 41,893 is not established; paint timing (an
+  out-of-update animator refresh at 40,330) is a hypothesis, not proven.
+  The screen-centre pick and the no-tile portrait branch were ported in
+  #330.
   `placement::on_lot` still uses a
   fixed 64-tile bound where the original tests the lot's size
   (0x422632). Also open: the
@@ -2919,7 +2945,10 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   the measured "Magic Town" exactly. The Yes/No "Help System" dialog
   (tick 2) is checked against the original's screen (#228): the layout
   matches at 800×600. After conversion to 5-6-5 color, the pixels match
-  apart from the corners. **Unverified:**
+  apart from the corners. (Batch 26, #516: the corners already match.
+  The frame ring is pinned against the Help System capture, with 0 of
+  16,656 RGB565 codes different; a 1-pixel shift gives 2,766.)
+  **Unverified:**
   dialogs with three buttons; dialogs at other screen sizes; a button
   wider than 100 pixels for a long label; the width of a leftover line (the font's
   extra, 0x60b7e2, is taken as 0); a dialog bigger than the window; the
@@ -2929,7 +2958,14 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   #226): an entry field, 64 bytes long. **Unverified:** whether anything
   replaces the starting text before the dialog shows; the byte limit
   with double-byte encodings; the field's drawing against a screenshot.
-  The caret, selection and paste are not ported.
+  The caret, selection and paste were ported in Batch 26 (#516), as
+  `cTSWinTextEdit2` does them: Shift and Ctrl caret and word moves
+  with an anchored selection, overwrite mode per field, double-click word
+  selection (`0x5f2c21`, medium confidence), and copy, cut and paste
+  through the `0x5d7cf1` / `0x5f477b` cleaners. Which clipboard keys 1.91
+  binds is the port's choice until checked on the harness. Outside macOS
+  the clipboard is the process's own buffer. #511 routes keys to a
+  non-modal kind-3 field.
 - **Done: the pie menu.** `sims_ui::pie` lays out, hit-tests and draws
   the menu and groups an object's actions into submenus, ported from the
   original's menu window and object picker. The window and label boxes
@@ -3008,10 +3044,12 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   (`0x49a315`, `0x4986c6`, `0x4999ea`), and 24-bit wrapping TGA
   un-premultiplication (`0x4deb3d`, `0x4fad5c`, `0x5dff82`). Panel match
   rates across all 8 ratchet scenes rise to **98.97%–99.88%**.
-- **Next:** a screenshot of an open pie menu; the dialog's corners,
-  which the original blends; whether frames should be cut to 16-bit
+- **Next:** a screenshot of an open pie menu; the dialog's corners
+  (closed in Batch 26: #516 found they already match, with no blend);
+  whether frames should be cut to 16-bit
   color as the original's screen is; the simulation side of text entry
-  dialogs (dialog kind 3 in `sims-vm`, not ported) and where the
+  dialogs (dialog kind 3 in `sims-vm`; the VM now takes kind-3 answers,
+  including non-modal ones, #504 and #511) and where the
   original stores the entered text; the job panel's blinking
   performance and its tooltips; the house panel's Layout
   (the routing history at lot +0x3c..+0x64); the needs panel's help
@@ -3023,7 +3061,14 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   (`0x53b2a4`, `0x4cfe18`), non-residential selected-Sim family lookup
   in `0x4cfcdb`, pause button blink, 15-bit 5-5-5 panel blend path, and
   skipping TGA un-premultiplication for Magicland mist overlays
-  (`0x1655`..`0x1657`) (#312); the other live panels.
+  (`0x1655`..`0x1657`) (#312); the other live panels. (Batch 26, #516,
+  closed the dialog's corners, the job panel's blinking performance
+  (green `0x0647` every 333 ms below zero), the 250 ms fade for Options
+  help balloons (a reopen during a fade-out turns it around silently,
+  `0x50fad3`), the job panel's skill balloons (`0x53074c`), and the mist
+  overlays' skipped un-premultiply (`[0x6c8c3c]` cleared at `0x54228f`).
+  `kHelpBtn`'s modal help window is still open: its geometry is not
+  traced.)
 - **Done: the gadget buttons' checks** (#283,
   `docs/decisions/20261120-gadget-buttons-need-selected-sim-house-residential-lot.md`).
   As the original's press handler checks (0x51bbe6 to 0x51be75), all
@@ -4381,23 +4426,205 @@ through their public interfaces only; the simulation never depends on it.
       identical `if` arms apart (the 2 alarm trees).
     - Track 7: split `read_v2_checked_file` so the lint can check a pack
       file's path without decoding it again.
+  - (Batch 26 closed:
+    - the roster merge and the hop that takes a non-traveler (#514);
+    - pet and non-human clothing, and purging a deleted visitor's rows
+      (#514);
+    - the co-op non-modal command, kind-3 typing, the sell refund, and a
+      Game-level non-modal test (#511; it runs on the open pack with
+      patched records, not on an install);
+    - all three Track 8 items (#512, #517);
+    - the Track 7 split (#512's `check_v2_file`, used by #515).
+
+    Still open: the strand when Find Location places nobody, writing
+    outfit rows at the edit, per-row precedence for legacy home rows, a
+    test with a real non-modal dialog from an install, and a non-modal
+    record whose text cannot be read.)
+- **Done (Batch 26 — `.antics` v2.6 and the parity and polish wave,
+  #511–#517):**
+  - **Co-op and dialogs (Wave 2B follow-up, #511,
+    `docs/decisions/20261127-coop-non-modal-dialogs-and-sell-refund.md`):**
+    - Co-op play presents non-modal dialogs (Dialog operand 7 bit 7).
+    - An answer goes out as `sims_net::Command::AnswerNonModalDialog {
+      caller, operands, answer }`, and `PROTOCOL_VERSION` is now 4.
+    - Every peer applies the command between the same two ticks
+      (`Lot::answer_non_modal_in_coop`):
+      - the first answer in tick order wins;
+      - an answer with stale operands, or one that comes after another,
+        is ignored;
+      - an answer the dialog does not offer is `Refused`;
+      - an answer while a modal dialog is pending gets
+        `IgnoredWhileDialogPending`.
+    - The 40 s timer runs in co-op for non-modal dialogs only (gated on
+      `Lot::takes_non_modal_answer`).
+    - A non-modal kind-3 field takes characters, Backspace, the caret
+      keys, Enter and Escape. A modal dialog, a Game-drawn modal and an
+      open pie menu get the keys first.
+    - The sell prompt's refund goes through the locale currency formatter
+      (`0x50a343` → … → `0x6007df`): 6500 reads `$6,500`
+      (`sims_ui::currency::simoleons`).
+    - Game-level end-to-end tests (`tests/integration/non_modal_dialogs.rs`)
+      run on the open pack with patched records, with no install.
+  - **Travel and outfits (#514,
+    `docs/decisions/20261127-travel-roster-non-traveler-hops-and-pet-outfits.md`):**
+    - **Visited-lot roster.** The native trip handler (`0x4fc59c` →
+      `0x428843` → `0x4286a0`) saves every family as the visited lot left
+      it. Now:
+      - the neighborhood merge takes the traveling household's members
+        from the visited lot when they differ from those at departure;
+      - membership is worked out again for the trip home and a trip on;
+      - the MagiCoins reported on return count only current members.
+    - **The home lot at the return.**
+      - Former members are removed. Their records and outfit rows stay.
+      - A Sim who joined the family during the trip but did not come home
+        is made from their record (`0x4f2253`).
+      - A trip in which everyone has left the family is refused before
+        anything is written.
+    - **A trip on can take Sims who did not travel.** `0x4fc59c` keeps no
+      list of travelers, so who arrives is read from the neighborhood.
+      - Each such Sim needs a neighbor record.
+      - The trip is refused if that Sim was deleted, including after the
+        trip's starting deletion epoch.
+    - **Pet and unknown-gender clothing lists.** The list fill
+      (`0x4098f1`) adds the sex step only for genders 0 and 1.
+      - Routines 24, 29 and 30 no longer refuse pets, and routine 31 no
+        longer refuses non-human clothing.
+      - Unknown genders stay refused in 24, 29 and 30.
+    - **Deleted visitors' rows.** `outfit_rows::drop_deleted_rows` runs at
+      all three lot-load purge sites.
+  - **UI and HUD parity (Wave parity lane C, #516,
+    `docs/decisions/20261127-ui-hud-parity-polish.md`):**
+    - Kind-3 text entry as `cTSWinTextEdit2` (see the interface track).
+    - **Balloons.**
+      - The job panel's skill labels open the fame skill balloons.
+      - Options help balloons get the same 250 ms fade as Live ones.
+      - A reopen during a fade-out turns it around silently.
+      - A close (a press, Escape in Options, F10) starts the fade-out at
+        once. An Options balloon goes without a fade when its panel leaves
+        or collapses.
+      - In co-op, Help is checked against the player's own selection.
+    - **Job performance** blinks green every 333 ms while it is below
+      zero.
+    - **Tutorial marker.** A UI Effect highlight draws UI graphic 4980 (3
+      cells at 6 fps, order 0, 1, 2, 1).
+      - It sits centred, 3 px above the control (`0x5de13f`), in place of
+        the yellow outline.
+      - It hides on a clear, on Escape, and under modal windows, shell
+        ones included (`Game::set_shell_modal`).
+    - The mist overlays keep their stored colour.
+    - The dialog corners are pinned at 0 of 16,656 codes different.
+  - **Goth late day (#513,
+    `docs/decisions/20261127-goth-late-day-rng-parity.md`):** both streams
+    match at every update, 1 to 44,200, under the frames the original
+    drew. No simulation change (see Steps, item 2).
+  - **The `.antics` v2 compiler (Track 8, #512,
+    `docs/decisions/20261127-antics-v2-6-compiler.md`):**
+    - `local[N]` is writable: `=`, compound assignments,
+      `dec_gt(&mut local[N], ..)` and `set_to_next(.., dest: local[N])`.
+      A write keeps the tree's layout, as a read does.
+    - `dead_nodes { N: op 0x.. (8 bytes) -> true: T, false: F; .. }` at
+      the end of a tree body (`dead_nodes: [..]` in `.air`) puts an
+      original's unreachable nodes back at their numbers. It is refused in
+      kind 4 trees, at node 0, and beside a wide inline call.
+    - Identical `if` arms need no new pin: `keep_layout` keeps them apart.
+    - `v2::loader::check_v2_file` checks a path and returns the pack
+      config without reading the file.
+    - Fixed a `#[slot(N)]` binding whose value reads `local[N]`: it was
+      built in place, and is now built in a temporary and stored last.
+      The bug predates v2.6.
+    - 19 `std::globals` names became clean-room descriptions, with ids
+      and signatures unchanged.
+  - **Lint (Track 7, #515,
+    `docs/decisions/20261127-antics-v2-6-lint.md`):**
+    - The linter checks a pack file's path with `check_v2_file` and builds
+      only the text it read.
+    - `manual_raw_has_builtin` spells raw `local[N]` lines natively. The
+      finding stands only if the whole-block rewrite builds the same
+      bytes, within the budget of 8 trials per file.
+    - `dead_nodes` footers lint clean.
+    - Lifecycle trees get `keep_layout` advice that names the header's
+      line.
+  - **Lift (Track 9, #517,
+    `docs/decisions/20261127-antics-v2-6-lift-finale.md`):**
+    - Pins carry the original's unreachable nodes as `dead_nodes` footers:
+      3,214 strict trees now carry one.
+    - `keep_layout` is tried before any idiom is dropped, for a tree at an
+      idiomatic level written with a `#[bhav(..)]` header (lifecycle
+      blocks included). The two strict alarm trees lift with a native
+      `if`/`else`.
+    - Stores to unnamed locals are written as `local[N]`, after the reads,
+      and kept only where the object builds the same bytes.
+    - #515's 181 strict and 67 behavioral local findings are gone.
+    - The four deferred `std::globals` renames (271, 272, 273, 363) are
+      done.
+    - Results (1,191 objects, 26,206 trees per mode). Neither mode has a
+      DIFFERENT tree, an error or timeout, or an `fmt --check`-dirty file.
+
+      | | v2.5 final | v2.6 |
+      |---|---|---|
+      | strict idiomatic | 21,244 (81.1%) | **24,461 (93.3%)** |
+      | strict raw-fallback trees | 4,961 | **1,744** |
+      | strict `dead_nodes` / `keep_layout` trees | — / 25 | 3,214 / 161 |
+      | strict native `local[N]` writes / reads | 0 / 743 | 1,377 / 968 |
+      | strict inline raw statements | 24,484 | 31,575 (3,217 whole raw trees became native) |
+      | behavioral idiomatic | 25,590 (97.6%) | 25,593 (97.7%) |
+      | behavioral inline raw statements | 11,894 | **10,397** |
+      | lint, v2.6's linter (strict / behavioral) | 48 / 8 | **1 / 1** |
+  - **Follow-ups:**
+    - Dialogs (#511):
+      - a 40 s timer for modal co-op dialogs;
+      - a prompt identity for co-op answers that arrive late;
+      - per-record kind-3 text;
+      - a fallback widget for a choice whose text cannot be read;
+      - a late joiner reading a notice whose caller has gone on;
+      - a test with a real non-modal dialog from an install.
+    - Travel and outfits (#514):
+      - the per-lot-session clothing-list cache (`0x6e4890`, which needs a
+        `World` field and co-op sync);
+      - the native cleanup of an empty family on lot load (`0x428071`), in
+        place of refusing the trip;
+      - counting the return's MagiCoin report from the merged neighborhood
+        (pre-existing).
+    - Interface (#516):
+      - `kHelpBtn`'s modal help window;
+      - the job panel's gadget balloons and the family-portrait balloon;
+      - the neighborhood lot button's marker offset;
+      - marker visibility timing;
+      - the clipboard keys and the double-click reading, to check on the
+        harness.
+    - Goth day (#513): the early-day state audit (see Progress).
+    - `.antics`:
+      - Track 9: `set_to_next(.., dest: local[N])` in trees written
+        without their extra idioms (101 strict and 81 behavioral);
+        translator spellings for the raw statements that keep pinned
+        trees raw (`my.data[11]` reads, inherit spellings); drop the
+        local-findings filter in `v2_5_lift_locals.rs`.
+      - Track 7: the advice for a raw `set_to_next(.., guid: G, dest:
+        local[N])` block should name the GUID's constant; a joint trial
+        per file for local blocks past the budget; local lines that use
+        `my.attr[N]`, `global[N]` or `stack.<field>`.
+      - Lifted files that call the four renamed `std::globals` trees by
+        their old names must be lifted again.
 - **Next (in flight, in order of player impact):**
   - **Travel follow-ups:**
     - The strand when a marker's Find Location places nobody (#464); the
       original most likely strands too.
-    - A hop whose party takes a Sim who is not a traveler (a townie met on
-      the lot) is still refused (#501).
-    - Roster changes on a destination lot (a member who leaves the family)
-      are not merged into the neighborhood, so a later family arrival
-      still makes that member (#501).
+    - The original caches clothing lists per lot session (`0x6e4890`),
+      keyed by skin tone and `child*2 + (gender != 0)`, so a pet shares a
+      slot with a light-skinned adult woman. The port builds each wearer's
+      own list, which matches only when the list is built from scratch.
+      Porting it needs a serialized `World` field and co-op sync (#514).
+    - The native cleanup of an empty family on lot load (`0x428071` →
+      `0x425efb`) is not ported; the port refuses a trip in which everyone
+      has left the family (#514).
+    - The MagiCoins reported on return are not counted from the merged
+      neighborhood, so a concurrent coin write can leave the report stale
+      (pre-existing, #514).
   - **Outfit rows (#508):**
-    - pet clothing in routines 29–31, and non-human clothing categories
-      in routine 31 (the native list's pet pattern is untraced);
     - rows are written at the next store commit, not at the edit, so a
       crash in between loses the edit;
     - at a return or a trip on, legacy home rows are dropped per person,
-      not per row (a one-time migration);
-    - a deleted visitor's rows are not purged from the lot.
+      not per row (a one-time migration).
   - **Drawing what a Sim holds (#502, #506):**
     - captures of the date and star bobs and of a pet carrying something;
     - confirming slot 1's bone (the port assumes the head);
@@ -4406,47 +4633,74 @@ through their public interfaces only; the simulation never depends on it.
     - pets with no saved animation use the adult fallback clip, and an
       animated graphic whose suit picks no mode is not drawn (none in the
       install).
-  - **Dialogs (#504):**
-    - a co-op command that carries a non-modal answer (co-op still
-      answers them at once and runs no timer);
-    - typing into a non-modal kind-3 field;
-    - the sell prompt's refund formatting (`0x50a343`, untraced);
-    - a test with a real non-modal dialog from an install;
-    - a non-modal record whose text cannot be read (its caller has no
-      frame) shows nothing and stays until its caller's next `Dialog`.
+  - **Dialogs (#511):**
+    - a modal (blocking) co-op dialog runs no 40 s timer;
+    - a co-op answer is matched by caller and operands, so a late answer
+      can answer an identical prompt asked again in between (the same on
+      every peer); telling them apart needs a prompt identity in the co-op
+      snapshot;
+    - a test with a real non-modal dialog from an install (#511's
+      Game-level tests use patched open-pack records);
+    - kind-3 answers share one text global (`last_dialog_text`); keeping
+      the text per record needs a field on the world's dialog record;
+    - a choice whose text cannot be read (broken content) draws nothing
+      and sets no timer; a fallback widget from the record's buttons is
+      left for later;
+    - a peer that joins after an informing notice's caller has gone on
+      draws nothing for it.
+  - **Interface (#516):**
+    - `kHelpBtn` (`0x53aaad` → `0x50e8d3`): the modal help window (topics
+      from `STR#` 166, background 3008, pauses the view); its geometry is
+      not traced;
+    - the job panel's gadget balloons (career, salary, performance,
+      friends; `0x530af1`), whose string indices are not resolved, and the
+      family-portrait balloon;
+    - the neighborhood lot button's marker offset (`0x54f192`, +50 px); no
+      lot button takes a UI Effect yet;
+    - the port checks a marked control's visibility when it draws, the
+      original when the highlight arrives;
+    - to check on the harness: which clipboard keys 1.91 binds, and the
+      double-click reading of slot `0xa8` (`0x5f2c21`).
+  - **Goth day early-day audit (#513):** the state differences that move
+    no stream (see Progress).
   - **The `.antics` v2 toolchain:**
-    - v2.5 is done (#503, #505, #507, #509): strict lift at 81.1%
-      idiomatic, lint at 1 strict (`frame_headroom`) and 1 behavioral
-      (`collapsible_if_chain`) finding, 0 DIFFERENT.
-    - The strict gap (Track 8, #505's census of 4,961 trees):
-      - a way to keep an original's unreachable nodes, for example a pin
-        that lists them (3,836 trees; 1,920 differ only by them);
-      - a partial-sharing mode, since the original shares only some tails
-        (1,128 trees);
-      - a per-node dead-false marker for the 105 mixed trees, not needed
-        yet.
-    - A writable `local[N]` that keeps the layout (Track 8): the 3,722
-      strict and 2,762 behavioral raw local writes, and the reads that
-      share their blocks, wait on it.
-    - A spelling that keeps identical `if` arms apart, for the 2 strict
-      alarm trees whose native `if` merges them (#505).
+    - v2.6 is done (#512, #515, #517): strict lift at 93.3% idiomatic
+      (1,744 raw-fallback trees), behavioral at 97.7%, lint at 1 strict
+      (`frame_headroom`) and 1 behavioral (`collapsible_if_chain`)
+      finding, 0 DIFFERENT.
+    - The strict gap: the 1,744 remaining raw-fallback trees fail on raw
+      statements the translator cannot spell or on pins the proof refuses
+      (#517). From #505's census, still open: a partial-sharing mode,
+      since the original shares only some tails (1,128 trees then; not
+      re-counted since v2.6), and a per-node dead-false marker for the
+      105 mixed trees, not needed yet.
+    - Track 9 (#517): `set_to_next(.., dest: local[N])` in trees written
+      without their extra idioms (101 strict and 81 behavioral still raw);
+      translator spellings for pinned trees whose other statements stay
+      raw (`my.data[11]` reads, inherit spellings), where most remaining
+      raw local writes are; then drop the local-findings filter in
+      `v2_5_lift_locals.rs`.
     - Option bindings still keep their copies under a kept layout and
       beside frame-word (`$Local:N`) text; in #503's probe, raw blocks
       kept the layout in 46 behavioral and 58 strict trees.
-    - Track 8 (#503): raw `local[N]` blocks that keep the layout only
-      because of an explicit local, and a `keep_layout` that also covers
+    - Track 8 (#503): a tree that names `local[N]` keeps its whole layout
+      (raw, or native since #512), and a `keep_layout` that also covers
       lowering (inline branches).
     - Semi-global calls: the 27 files that call semi-globals with no
       `GLOB` chunk.
     - `std::bcon` is deferred until the BCON slots have checkable
       clean-room names (#453).
-    - `std::globals`: clean-room names for the names that sit close to the
-      original labels (#503).
-    - Lint (#507): split `read_v2_checked_file` so a pack file's path is
-      checked and its config loaded without decoding it again; exact
-      rewrites for `set_to_next`, `reach` and `find_best_object` as a
-      test; `#[frame(keep_layout)]` advice for lifecycle trees; a joint
-      trial if a tree ever has more than one anchor.
+    - `std::globals`: #512's 19 clean-room renames and the 4 it deferred
+      (#517) are done. Lifted files that call the four renamed in #517 by
+      their old names must be lifted again.
+    - Lint (#507, #515, #517): the advice for a raw
+      `set_to_next(.., guid: G, dest: local[N])` block spells the GUID
+      literal, which then draws `magic_guid_literal`; it could name the
+      constant. Also a joint trial per file for local blocks past the
+      budget of 8; local lines that use `my.attr[N]`, `global[N]` or
+      `stack.<field>`; exact rewrites for `set_to_next`, `reach` and
+      `find_best_object` as a test; and a joint trial if a tree ever has
+      more than one anchor.
   - **Legacy mining backlog:** see
     `docs/legacy-mining-audit.md#porting-backlog`.
     - Ported in Batch 25: the dialogs' 40-second auto-answer timer (legacy
