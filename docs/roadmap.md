@@ -3712,7 +3712,8 @@ through their public interfaces only; the simulation never depends on it.
       exactly once. Lots 90–92 never snapped back.
     - Routine 17's kind-2, 7 and 8 tokens (saved motives, the arrival
       clock) have round-tripped since #426 and #430. A test now covers
-      departure, arrival and return.
+      departure, arrival and return. (Batch 25, #501: the arrival now
+      takes the clock tokens before routine 21.)
     - The lot shift (0x444991) is reached only from the `offset_world`
       developer cheat, which the port does not have. 0x467436 empties
       planner rectangles the port never keeps. Neither needs a port.
@@ -3926,13 +3927,17 @@ through their public interfaces only; the simulation never depends on it.
       non-modal `Lot::asking` as non-blocking); the native 40-second
       auto-answer timer; the anchored placement is unverified against a
       capture; the Buy popup price should use `sims_ui::currency`; the HUD
-      zoom-out button should use `Zoom::zoom_out_on(lot.house)`.
+      zoom-out button should use `Zoom::zoom_out_on(lot.house)`. (Batch
+      25, #504, closed the non-modal presentation in single play, the 40 s
+      timer and the Buy popup's currency. The anchored placement and the
+      zoom-out button are still open.)
     - Walking and sound: sims-content should keep each floor pattern's
       category (footsteps on plug-in floors) and each motion's frame count
       (removing the `0x596b60` trap); co-op commands drop their sound
       buffers; travel, arrival and eviction run without a sound sink; the
       `+0x290` walking flag needs a pin rebaseline.
-    - Rendering: slot-1 animated objects and the pet's own draw; the
+    - Rendering: slot-1 animated objects and the pet's own draw (closed
+      in Batch 25, #502 and #506, not yet compared with a capture); the
       ground rule's global enable byte `0x6c724a`; the presenter's tile
       key for the 6 pixels; the original leaves out objects on the lot's
       outermost tiles; walls are turned once from rotation 0, not through
@@ -4083,9 +4088,12 @@ through their public interfaces only; the simulation never depends on it.
     - Track 8: the in-place option alias misses trees of the kept shape
       depending on root and header (`me` without a fixed header,
       `stack_obj`, `if let` on `me`): 62 behavioral `prefer_if_let`
-      proposals wait on it.
+      proposals wait on it. (Batch 25: #503 found nearly all of them in
+      fixed-frame trees, and added an in-place retry for bindings whose
+      copies would overflow the frame.)
     - Track 8: an import alias can still be named `self`
       (`use .. as self;`), a gap in #495's "self is never bound".
+      (Closed in Batch 25, #503.)
     - Rendering, standalone: the lit lamp's floor pools need the pool
       maps worked out without `lightMap.dat` (`0x4bb5bc`, `0x4a38b6`),
       and its light on Sims needs the mesh renderer in open-pack mode
@@ -4102,6 +4110,7 @@ through their public interfaces only; the simulation never depends on it.
     - Track 7: `collapsible_if_chain` 2 → 4 in behavioral mode, on trees
       #496 made idiomatic.
     - `#382 -> bool` in `std::globals`, joint Track 8 and Track 9.
+      (Closed in Batch 25: #503's `get_up() -> bool`.)
 - **Done (Batch 24 — `.antics` v2.4 finale: dead false targets and the
   strict lift leap, #498, #499 and Track 7's v2.4 Step 3):**
   - **The `.antics` v2 compiler (Track 8, #498,
@@ -4204,73 +4213,244 @@ through their public interfaces only; the simulation never depends on it.
     - Not needed yet: a per-node dead-false marker for the 196 mixed
       trees. The one behavioral `collapsible_if_chain` whose `match`
       fails the byte gate stays.
+  - (Batch 25 closed the keep-layout attribute (#503, #509), the 6
+    behavioral `prefer_if_let` sites (#505), the fixed-frame retry for
+    option bindings whose copies would overflow (#503), refusing `use .. as self;` (#503) and the 15
+    `semi_globals_wide` widths (#503, #509). #505 counted 105 mixed
+    dead-false trees, not 196.)
+- **Done (Batch 25 — Wave 1 travel, Wave 2 playability and co-op, and
+  `.antics` v2.5, #501–#509):**
+  - **Travel (Wave 1, `sims-vm`, #501,
+    `docs/decisions/20261126-arrival-clock-family-members-partial-hops.md`):**
+    - A native arrival (`0x4f1ae9`) reads the clock itself. It takes
+      member 0's first kind-2 hour and minute tokens from routine 17 and
+      erases them in that order. When both are there, the clock is set
+      (`0x46d86f`, ported once as `lifecycle::set_clock`, which the
+      move-in reset now uses too). A group arrival reads nothing. A solo
+      arrival on lot 99 then sets 12:00 whatever the tokens said.
+      Destination lots start at routine 17's arrival time, not their saved
+      clock. The clock tokens are gone before routine 21 runs; the tests
+      that said they stayed pinned the port, not a capture.
+    - A family arrival makes every member of the family in FAMI order
+      (`0x4f2253`), not just the travelers. A member that did not travel
+      is made from its record and joins the trip.
+    - A hop (`0x4fc59c`) can leave travelers behind. Mode 0 takes the
+      caller (and a traveling date's companion); mode 1 takes the
+      caller's family members on the lot. The members who stay leave the
+      session with their records flushed, are home where the home lot
+      froze them, and a later family arrival makes them again.
+    - Dropped from Next as already settled: #464 (Batch 18) fixed the
+      household-group snap-back on lots 93–99, found that lots 90–92
+      never snapped back, and found that the lot shift (`0x444991`) and
+      `0x467436` need no port. A date's companion is made by the arrival
+      marker's routine 19 (#411, #443), not by the departure.
+  - **The outfit editor (Wave 1, #508,
+    `docs/decisions/20261127-outfit-editor-29-30-31-outfit-rows-in-character-files.md`):**
+    - Generic Sims Call routines 29 (`0x4501bd`), 30 (`0x450528`) and 31
+      (`0x4503f2`) run the outfit editor on the stack object (a person,
+      or native error 0x1c). Routine 30 commits with 1 (`0x45060c`): it
+      runs the clothing check and writes the table if it changed. The old
+      note that it commits with 0 was wrong. Routine 31 commits with 0,
+      which restores the table the load left.
+    - Edited outfit rows go into the person's character file, in the same
+      checked REDB commit as the lot and neighborhood, at every commit
+      that saves a lot: lot save, departure, abort, return and trip on,
+      and saves through a staging store. Only rows that differ from what
+      the lot loaded are written. Travelers whose files now hold their
+      rows carry an empty set, and the visited lot's rows win at a
+      return. So every other lot reads the edit from the file, as in the
+      original (#430's follow-up closed). A person with no eligible store
+      character file (types the install defines, files in FAR archives, a
+      GUID two files define, a shared table) keeps its rows in the lot.
+  - **Drawing what a Sim holds (Wave 2, Track A, #502 and #506,
+    `docs/decisions/20261126-slot-one-animated-objects-and-pets.md`):**
+    - Slot-1 animated objects: a type with VitaboyFlags bit 0 (OBJD word
+      102) has its own graphic. The native animator tick places it at the
+      bone slot 1 names; the port assumes the head bone. The suit picks the mode byte for byte (`0x5856d4`): the
+      standard bob, the date bob and the star bob. The colour
+      (`0x58603b`) swaps green and blue for the date bob and is yellow for
+      the star bob.
+    - The person draw takes only slots 0, 2, 3 and 4 (`0x459dc0`) and the
+      slot walk skips people (`0x437c56`), so `sims_render` no longer
+      draws what a person holds in slot 1 or past slot 4.
+    - Pets and made characters go through the person path: skeleton files
+      named with an underscore load, the empty-slot word (`0x6c0fd4`)
+      names no part, and a character made on a lot reads as its template
+      with its written rows over it (`Cast::rows_of`). Every pet attach
+      point binds. Pets were not drawn at all before.
+    - `sims-game` (#506): the 3D pick, the damage rectangles and the spin
+      redraw ask `People::is_bob`, so they reach the date and star bobs
+      too. The pet turntable loads bodies with `Body::load`.
+    - Not compared with a capture: no recording shows the date or star bob,
+      or a pet holding something.
+  - **Dialogs, the Buy catalog and co-op (Wave 2B, Track C, #504,
+    `docs/decisions/20261126-non-modal-dialogs-catalog-text-coop-build-id.md`):**
+    - Play mode presents non-modal dialogs (`0x436da0`): the record stays
+      shown, the player answers between updates (`0x4370be`,
+      `Lot::answer_non_modal`), and a choice is shown again each tick its
+      caller runs. Strict mode and co-op are unchanged.
+    - The native 40 s auto-answer timer (`0x436c89`) presses the last
+      button. Kinds 3 and 4 and dialogs anchored at the top right have
+      none. A press on the dialog holds it and the release restarts it. A
+      special panel, a shell modal or the co-op lobby in front holds it,
+      and co-op runs no timer.
+    - The Buy popup price uses `sims_ui::currency`.
+    - CATS/CTSS settled: catalog text is read from the object's own file
+      only (`0x457d3b`, `0x470256`); the semi-global serves only the TTAB
+      lookup. The port already did this, and a test now pins it.
+    - Co-op `Hello` carries a `BuildId`: the first 16 bytes of a SHA-256
+      over the manifests and sources of the crates that decide a tick, the
+      workspace `Cargo.toml` and `Cargo.lock`. A host refuses a different
+      one with `RejectReason::BuildMismatch`; `PROTOCOL_VERSION` is 3. A peer's pick on a Sim or object parked off
+      the lot at [-16, -16] is refused on every peer (#458's open point).
+  - **The `.antics` v2 compiler (Track 8, #503,
+    `docs/decisions/20261126-antics-v2-5-compiler.md`):**
+    - `#[bhav(keep_layout)]` (`#[frame(keep_layout)]` on a lifecycle
+      tree, `keep_layout: true` in `.air`) keeps the backend pass off a
+      tree, as a raw layout anchor ending the body does. Opt-in.
+    - Extern fns declare a callee's frame width with
+      `#[frame(args = N | unknown)]`. A wide or unknown declaration vetoes
+      a narrow one, and any literal call not proven narrow now keeps the
+      layout (a gap that predated this step, with no file affected).
+    - Option bindings are read in place where a fixed `locals = N` frame
+      cannot hold their copies. This changes only sources the `.air`
+      compiler would refuse.
+    - `use .. as self;` is refused. Global 382 is
+      `get_up() -> bool`.
+  - **Lift (Track 9, #505 and #509,
+    `docs/decisions/20261126-antics-v2-5-lift-locals-and-census.md`,
+    `docs/decisions/20261127-antics-v2-5-lift-finale.md`):**
+    - #505: after the lift converges, reads of an unnamed local are
+      written as native `local[N]`, kept only where the object builds the
+      same bytes (−578 strict and −430 behavioral raw statements). `if let`
+      candidates in short trees are searched last, so the 6 behavioral
+      `prefer_if_let` sites became `let .. else` (6 → 0). The 2 strict
+      alarm trees stay raw: a native `if` merges their identical arms.
+    - #505's strict-gap census of the 4,961 strict raw-fallback trees:
+      **3,836** have a node in the original that no branch reaches, which
+      v2 never emits and `match_tree_pin` cannot pin. 1,933 are the same
+      graph and operands renumbered (1,920 of them differ only by those
+      unreachable nodes), and 1,128 need partial `share_tails` (1,124 with
+      unreachable nodes). Mixed dead-false trees: 105.
+    - #509: `keep_layout` replaces all 25 strict and 2 behavioral layout
+      anchors (`manual_raw_has_builtin` → 0 in both modes). The 15
+      `semi_globals_wide` trees moved into `extern "Lib" mod semi_globals`
+      with `#[frame(args = unknown)]` (10 blocks → 0).
+    - Results (1,191 objects, 26,206 trees; 0 DIFFERENT, 0 errors or
+      timeouts, 0 `fmt --check` dirty files in both modes):
+
+      | | v2.4 final | v2.5 final |
+      |---|---|---|
+      | strict idiomatic | 21,244 (81.1%) | 21,244 (81.1%) |
+      | strict inline raw statements | 25,087 | 24,484 |
+      | strict `if let` / `let .. else` | 5 / 12 | 8 / 45 |
+      | strict lint | 26 | **1** (`frame_headroom`) |
+      | behavioral idiomatic | 25,590 (97.6%) | 25,590 (97.6%) |
+      | behavioral inline raw statements | 12,326 | 11,894 |
+      | behavioral `if let` / `let .. else` | 12 / 23 | 15 / 88 |
+      | behavioral lint | 9 | **1** (`collapsible_if_chain`) |
+  - **Lint (Track 7, #507,
+    `docs/decisions/20261126-antics-v2-5-lint.md`):**
+    - `duplicate_std_global` compares frame widths: a local
+      `#[frame(args = 6 | unknown)]` declaration of a `std::globals` id is
+      no longer a duplicate, since dropping it would change the bytes.
+    - `manual_raw_has_builtin` gives byte-checked `keep_layout` advice
+      when only the pinned native form builds the same bytes: 25/25 strict
+      and 2/2 behavioral anchors.
+    - A pack file's baseline is built from the text the linter read. The
+      path checks still read and decode the file again.
+    - `prefer_if_let` in fixed frames is verified: 68 behavioral and 36
+      strict findings on the v2.4 corpora, all byte-identical when applied.
+  - **Follow-ups:**
+    - Travel: the strand when a marker's Find Location places nobody
+      (#464); a hop whose party takes a Sim who is not a traveler; merging
+      roster changes on a destination lot (a member who leaves the family)
+      into the neighborhood.
+    - Outfit rows: pet clothing in routines 29–31 and non-human clothing
+      categories in routine 31; writing at the edit, so a crash before the
+      next commit keeps it; per-row precedence for legacy home rows at a
+      return or trip on; purging a deleted visitor's rows.
+    - Dialogs: a co-op command for non-modal answers (co-op still answers
+      them at once, with no timer); typing into a non-modal kind-3 field;
+      the sell prompt's refund formatting; a test with a real non-modal
+      dialog from an install; a non-modal record whose caller has no
+      frame shows nothing.
+    - Track 8: a writable `local[N]` that keeps the layout (3,722 strict
+      and 2,762 behavioral raw writes); a way to keep an original's
+      unreachable nodes (3,836 strict trees); a spelling that keeps
+      identical `if` arms apart (the 2 alarm trees).
+    - Track 7: split `read_v2_checked_file` so the lint can check a pack
+      file's path without decoding it again.
 - **Next (in flight, in order of player impact):**
   - **Travel follow-ups:**
-    - A hop that leaves travelers behind (Go Somewhere Else for one
-      member of a family, mode 0) needs session support for the members
-      who stay (#443).
-    - Arrivals not made from the token alone:
-      - routine 17's kind-2, 7 and 8 tokens (saved motives, the arrival
-        clock) are neither written nor read;
-      - a date's companion is still made by the departure;
-      - a family arrival makes only the members who traveled (#414).
-    - `HouseholdGroup` and Magic Town 90–92 trips can still snap back
-      (#414).
-    - The outfit-editor routines 29, 30 and 31, and saving edited outfit
-      rows to the neighborhood (#430).
-    - The lot shift (0x444991) should forget routes, and 0x467436 at
-      go-live is not modeled (#443).
-  - **Drawing what a Sim holds:** slot-1 animated objects, and pets
-    (#442; the held draw order is done, #486).
-  - **Dialogs:** sims-vm answers non-modal dialogs at once, so #484's
-    presentation and input routing wait on it; the 40-second auto-answer
-    timer (#484).
-  - **Buy catalog:**
-    - The Buy popup price is still formatted `${}`, not with
-      `sims_ui::currency` (#484).
-    - Untraced: whether the CATS/CTSS lookup also searches the
-      semi-global (#441).
-  - **Co-op:**
-    - a build identity in `Hello`, so that mixed builds are rejected even
-      when the protocol is unchanged;
-    - whether the co-op executor should refuse a peer's pick on an
-      object parked off the lot (#458).
+    - The strand when a marker's Find Location places nobody (#464); the
+      original most likely strands too.
+    - A hop whose party takes a Sim who is not a traveler (a townie met on
+      the lot) is still refused (#501).
+    - Roster changes on a destination lot (a member who leaves the family)
+      are not merged into the neighborhood, so a later family arrival
+      still makes that member (#501).
+  - **Outfit rows (#508):**
+    - pet clothing in routines 29–31, and non-human clothing categories
+      in routine 31 (the native list's pet pattern is untraced);
+    - rows are written at the next store commit, not at the edit, so a
+      crash in between loses the edit;
+    - at a return or a trip on, legacy home rows are dropped per person,
+      not per row (a one-time migration);
+    - a deleted visitor's rows are not purged from the lot.
+  - **Drawing what a Sim holds (#502, #506):**
+    - captures of the date and star bobs and of a pet carrying something;
+    - confirming slot 1's bone (the port assumes the head);
+    - the damage rectangles compared with the pixels directly, and a test
+      that opens the pet picker's panel;
+    - pets with no saved animation use the adult fallback clip, and an
+      animated graphic whose suit picks no mode is not drawn (none in the
+      install).
+  - **Dialogs (#504):**
+    - a co-op command that carries a non-modal answer (co-op still
+      answers them at once and runs no timer);
+    - typing into a non-modal kind-3 field;
+    - the sell prompt's refund formatting (`0x50a343`, untraced);
+    - a test with a real non-modal dialog from an install;
+    - a non-modal record whose text cannot be read (its caller has no
+      frame) shows nothing and stays until its caller's next `Dialog`.
   - **The `.antics` v2 toolchain:**
-    - Strict lift at 81.1% idiomatic (#499, with #498's
-      `dead_false = error`). Of what is left, the 25 strict
-      `manual_raw_has_builtin` layout anchors need a keep-layout
-      attribute (Track 8); a per-node dead-false marker for the 196
-      mixed trees is not needed yet.
-    - Shared tails: the lift writes `share_tails` (#493) and its own
-      joins (#496). A partial-sharing mode is open, since the original
-      shares only some tails.
-    - Semi-global calls: v2 has the `GLOB` link and `extern "Lib" mod`
-      (#495), and the lift writes them (#499). Open: a way to declare a
-      semi-global tree's frame width (the 15 `semi_globals_wide` trees),
-      and the 27 files that call semi-globals with no `GLOB` chunk.
-    - Option bindings read in place (#495) miss some trees of the plain
-      shape (`me` without a fixed header, `stack_obj`); 62 behavioral
-      `prefer_if_let` proposals wait on it (Batch 23). A `let .. else`
-      with no frame word where the value is read later is open too; the
-      6 behavioral findings left are already free, for the lift to take
-      (Batch 24).
-    - Raw-block `if` tails: a raw `if` whose arms may end alike now
-      keeps its layout (#489). The 2 strict alarm trees #473 left
-      non-idiomatic need a re-lift to confirm.
-    - Readable locals: about 9,000 one-statement raw blocks are
-      local-slot moves. This changes strict output, so it needs its own
-      PR (#460).
+    - v2.5 is done (#503, #505, #507, #509): strict lift at 81.1%
+      idiomatic, lint at 1 strict (`frame_headroom`) and 1 behavioral
+      (`collapsible_if_chain`) finding, 0 DIFFERENT.
+    - The strict gap (Track 8, #505's census of 4,961 trees):
+      - a way to keep an original's unreachable nodes, for example a pin
+        that lists them (3,836 trees; 1,920 differ only by them);
+      - a partial-sharing mode, since the original shares only some tails
+        (1,128 trees);
+      - a per-node dead-false marker for the 105 mixed trees, not needed
+        yet.
+    - A writable `local[N]` that keeps the layout (Track 8): the 3,722
+      strict and 2,762 behavioral raw local writes, and the reads that
+      share their blocks, wait on it.
+    - A spelling that keeps identical `if` arms apart, for the 2 strict
+      alarm trees whose native `if` merges them (#505).
+    - Option bindings still keep their copies under a kept layout and
+      beside frame-word (`$Local:N`) text; in #503's probe, raw blocks
+      kept the layout in 46 behavioral and 58 strict trees.
+    - Track 8 (#503): raw `local[N]` blocks that keep the layout only
+      because of an explicit local, and a `keep_layout` that also covers
+      lowering (inline branches).
+    - Semi-global calls: the 27 files that call semi-globals with no
+      `GLOB` chunk.
     - `std::bcon` is deferred until the BCON slots have checkable
       clean-room names (#453).
-    - `std::globals` (#468):
-      - tree 382 moves to `-> bool`, with the names that sit close to
-        the original labels renamed;
-      - a typed `bool + value` ABI for 282 and 333, with `#[temp(N)]`
-        parameters.
+    - `std::globals`: clean-room names for the names that sit close to the
+      original labels (#503).
+    - Lint (#507): split `read_v2_checked_file` so a pack file's path is
+      checked and its config loaded without decoding it again; exact
+      rewrites for `set_to_next`, `reach` and `find_best_object` as a
+      test; `#[frame(keep_layout)]` advice for lifecycle trees; a joint
+      trial if a tree ever has more than one anchor.
   - **Legacy mining backlog:** see
     `docs/legacy-mining-audit.md#porting-backlog`.
-    - Parity-relevant items still open: the dialogs' 40-second
-      auto-answer timer (legacy `widget_setting`).
+    - Ported in Batch 25: the dialogs' 40-second auto-answer timer (legacy
+      `widget_setting`, #504).
     - Ported in Batch 21: walk animator states 5/7/8/12 and footstep and
       clip sounds (#485); the wall draw order, the camera glide and the
       censor mosaic (#486); non-modal and anchored dialogs and the
