@@ -518,12 +518,14 @@ fn tier3_local_slot_reads_pin_the_layout() {
     assert!(air.contains("stack.attr[0] := local[2];"), "{air}");
     // Layout is kept: `x` stays a named local.
     assert!(air.contains("let __v_x_0 = 4;"), "{air}");
+    // Since v2.6 `local[N]` is writable in place, and a write keeps the layout as a read does.
+    let air = expand(
+        "local_write.antics",
+        &sim_tree("local[2] = 1; let x = 4; self.n += x;"),
+    );
+    assert!(air.contains("local[2] := 1;"), "{air}");
+    assert!(air.contains("let __v_x_0 = 4;"), "{air}");
     for (name, body, needle) in [
-        (
-            "local_write.antics",
-            "local[2] = 1;",
-            "'local[N]' is read-only",
-        ),
         ("local_range.antics", "self.n = local[300];", "local slot"),
         (
             "local_pin.antics",

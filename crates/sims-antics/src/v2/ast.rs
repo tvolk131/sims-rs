@@ -218,6 +218,13 @@ pub struct TreeFrame {
     /// lowered, as it does for a tree whose body ends in a `raw` block that keeps its layout
     /// (`.air` `keep_layout: true`).
     pub keep_layout: bool,
+    /// A trailing `dead_nodes { N: op .. -> true: T, false: F; .. }` block ending the tree's
+    /// body: nodes no branch reaches, put back as bytes at their node numbers once the tree is
+    /// built (`.air` `dead_nodes: [..]`, [`crate::node_order::DeadNode`]).
+    pub dead_nodes: Vec<crate::node_order::DeadNode>,
+    /// No `#[frame]`/`#[bhav]` attribute was written: the frame exists only to carry the
+    /// `dead_nodes` footer.
+    pub footer_only: bool,
 }
 
 /// Zero-cost integer enum declaration (`[pub] enum Name { VariantA, VariantB = 2 }`).

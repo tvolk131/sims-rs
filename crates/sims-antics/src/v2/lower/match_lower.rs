@@ -164,10 +164,16 @@ impl<'a> TreeLowerer<'a> {
                 );
                 // A nested chain whose every branch leaves (only in a `let` initializer, where
                 // branches may diverge) gives no value: the enclosing chain's other arms do.
-                let ty = if is_bool_shape {
+                // The destination may be a `#[slot(N)]` binding the arm reads as `local[N]`: a
+                // short-circuit chain or an arithmetic chain built in place would overwrite it
+                // before that read.
+                // (Any other destination is a fresh local nothing else names.)
+                let reads_dest = slot_word(&dest).is_some()
+                    && self.expr_may_read_or_clobber_air(expr, &canonical_air_cell(&dest));
+                let ty = if is_bool_shape && !reads_dest {
                     self.emit_bool_into_local(expr, &dest)?;
                     ValueType::Bool
-                } else if is_compound_arith_or_neg(expr) {
+                } else if is_compound_arith_or_neg(expr) && !reads_dest {
                     self.lower_arith_into_dest(expr, &dest, false)?
                 } else if let V2Expr::Match {
                     span,

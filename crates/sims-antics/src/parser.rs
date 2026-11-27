@@ -424,6 +424,7 @@ impl Parser {
             format!("Tree_{id}")
         };
         let mut header = TreeHeader::default();
+        let mut seen_dead_nodes = false;
         if self.eat(&TokenKind::LParen) {
             while !self.eat(&TokenKind::RParen) {
                 let (key, kspan) = self.expect_ident("tree header field")?;
@@ -493,6 +494,19 @@ impl Parser {
                     }
                     "narrow_callees" => {
                         header.narrow_callees = self.parse_u16_list("narrow_callees entry")?;
+                    }
+                    "dead_nodes" => {
+                        if std::mem::replace(&mut seen_dead_nodes, true) {
+                            return Err(Error::at(kspan, "duplicate header field 'dead_nodes'"));
+                        }
+                        self.expect(&TokenKind::LBracket, "'['")?;
+                        while !self.eat(&TokenKind::RBracket) {
+                            header.dead_nodes.push(self.parse_dead_node()?);
+                            if !self.eat(&TokenKind::Semicolon) {
+                                self.expect(&TokenKind::RBracket, "']'")?;
+                                break;
+                            }
+                        }
                     }
                     "id" => {
                         let explicit = self.expect_u16("BHAV id")?;
@@ -796,6 +810,52 @@ impl Parser {
         self.eat(&TokenKind::Comma);
         self.expect(&TokenKind::RParen, "')'")?;
         Ok((span, opcode, operands))
+    }
+
+    /// One `dead_nodes` entry, without its `;`: `N: op 0xXXXX(8 bytes) -> true: T, false: F`.
+    /// A branch is `true`, `false`, `error` or any byte: nothing runs the node, so its bytes are
+    /// kept as they are ([`crate::node_order::DeadNode`]).
+    fn parse_dead_node(&mut self) -> Result<crate::node_order::DeadNode> {
+        let at = self.expect_u8("dead node number")?;
+        self.expect(&TokenKind::Colon, "':'")?;
+        let (_, opcode, operands) = self.parse_raw_op_head()?;
+        self.expect(&TokenKind::Arrow, "'->'")?;
+        let branch = |parser: &mut Self, word: &str| -> Result<u8> {
+            let (kw, span) = parser.expect_ident(&format!("'{word}'"))?;
+            if kw != word {
+                return Err(Error::at(span, format!("expected '{word}:' branch")));
+            }
+            parser.expect(&TokenKind::Colon, "':'")?;
+            let tok = parser.bump();
+            match tok.kind {
+                TokenKind::Ident(s) if s == "error" => Ok(crate::lower::TARGET_ERROR),
+                TokenKind::Ident(s) if s == "true" => Ok(crate::lower::TARGET_TRUE),
+                TokenKind::Ident(s) if s == "false" => Ok(crate::lower::TARGET_FALSE),
+                TokenKind::Int(v) => u8::try_from(v).map_err(|_| {
+                    Error::at(
+                        tok.span,
+                        format!("dead node branch {v} is not a byte (0..=255)"),
+                    )
+                }),
+                other => Err(Error::at(
+                    tok.span,
+                    format!(
+                        "expected a dead node branch (a byte, 'true', 'false' or 'error'), found \
+                         {other:?}"
+                    ),
+                )),
+            }
+        };
+        let on_true = branch(self, "true")?;
+        self.expect(&TokenKind::Comma, "','")?;
+        let on_false = branch(self, "false")?;
+        Ok(crate::node_order::DeadNode {
+            at,
+            opcode,
+            operands,
+            on_true,
+            on_false,
+        })
     }
 
     fn parse_raw_op(&mut self) -> Result<Stmt> {

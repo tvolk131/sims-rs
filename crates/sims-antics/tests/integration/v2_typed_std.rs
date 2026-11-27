@@ -395,7 +395,7 @@ fn std_globals_call_the_documented_trees() {
              if globals::find_companion() { self.n = temp[0]; } \
              globals::rouse_stack_room(0, 1)?; \
              if globals::wants_fun(50) { self.n = 1; } \
-             globals::wait_hours(2)?;",
+             globals::pass_hours(2)?;",
         ),
     );
     expect_lines(
@@ -493,12 +493,12 @@ fn engine_words_compare_and_convert_like_i16() {
         &sim_tree("", &format!("temp[0] = 1{casts};")),
         "nesting depth exceeds maximum",
     );
-    // `show_skill_progress` keeps its parameter name for named calls.
+    // `display_skill_level` keeps its parameter name for named calls.
     let air = expand(
         "skill_named.antics",
         &sim_tree(
             "use std::globals::*;",
-            "if !globals::show_skill_progress(skill: 250) { panic!(); }",
+            "if !globals::display_skill_level(skill: 250) { panic!(); }",
         ),
     );
     expect_lines("skill_named", &air, &["call 286(250)"]);

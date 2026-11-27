@@ -10,10 +10,15 @@
 //! for a decompiler that pins a lifted tree's node numbers to the original's. [`match_tree_pin`]
 //! finds the whole pin, `dead_false = error` included
 //! (`docs/decisions/20261126-antics-v2-4-dead-false-error.md`).
+//!
+//! An original's nodes that no branch reaches can be kept as bytes at their node numbers
+//! ([`DeadNode`], `dead_nodes`): [`split_dead_nodes`] takes them out, and
+//! [`match_tree_pin_quarantined`] pins the rest
+//! (`docs/decisions/20261127-antics-v2-6-compiler.md`).
 
 use sims_formats::behavior::Instruction;
 
-use crate::lower::{MAX_BHAV_NODES, TARGET_ERROR};
+use crate::lower::{MAX_BHAV_NODES, TARGET_ERROR, TARGET_FALSE, TARGET_TRUE};
 use crate::verify::is_always_true_instruction;
 
 /// A branch of a node before the tree is numbered: another node, or a return
@@ -436,6 +441,234 @@ fn match_bases(
         }
     }
     None
+}
+
+/// A node of an original tree that no branch reaches from node 0, kept as bytes at its node
+/// number (`dead_nodes { .. }` in v2, the `.air` header's `dead_nodes: [..]`). Nothing runs it,
+/// so its branch bytes are kept as they are: they may name any node, a reserved byte or none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeadNode {
+    /// Its node number in the finished tree.
+    pub at: u8,
+    pub opcode: u16,
+    pub operands: [u8; 8],
+    pub on_true: u8,
+    pub on_false: u8,
+}
+
+impl DeadNode {
+    /// The node as one `dead_nodes` entry, the same in v2 and `.air`:
+    /// `5: op 0x0002(0x01, ..) -> true: 6, false: error;`. A branch byte prints as
+    /// `error` / `true` / `false` for the three returns, else as its number.
+    #[must_use]
+    pub fn entry_text(&self) -> String {
+        let target = |b: u8| match b {
+            TARGET_ERROR => "error".to_owned(),
+            TARGET_TRUE => "true".to_owned(),
+            TARGET_FALSE => "false".to_owned(),
+            n => n.to_string(),
+        };
+        let operands: Vec<String> = self.operands.iter().map(|b| format!("{b:#04x}")).collect();
+        format!(
+            "{}: op {:#06x}({}) -> true: {}, false: {};",
+            self.at,
+            self.opcode,
+            operands.join(", "),
+            target(self.on_true),
+            target(self.on_false)
+        )
+    }
+}
+
+/// The v2 `dead_nodes { .. }` block for `dead`, one entry a line, indented by `indent` (the
+/// block's own indent; its entries are 4 deeper), ending in a newline. Empty for no nodes.
+#[must_use]
+pub fn dead_nodes_block(dead: &[DeadNode], indent: &str) -> String {
+    if dead.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("{indent}dead_nodes {{\n");
+    for d in dead {
+        out.push_str(&format!("{indent}    {}\n", d.entry_text()));
+    }
+    out.push_str(&format!("{indent}}}\n"));
+    out
+}
+
+/// Splits `original` into the nodes that node 0 reaches, renumbered in their order, and the
+/// rest ([`DeadNode`]s at their node numbers). [`insert_dead_nodes`] puts the tree back
+/// together: given the reached nodes as they come back, it rebuilds `original` exactly.
+///
+/// `None` when a reached node branches to a node the tree does not have or to a reserved byte
+/// (the tree is no tree to rebuild), or the tree is longer than a branch byte can number.
+/// A tree that every node of is reached comes back whole, with no dead nodes.
+#[must_use]
+pub fn split_dead_nodes(original: &[Instruction]) -> Option<(Vec<Instruction>, Vec<DeadNode>)> {
+    let count = original.len();
+    if count > MAX_BHAV_NODES {
+        return None;
+    }
+    if count == 0 {
+        return Some((Vec::new(), Vec::new()));
+    }
+    let mut reached = vec![false; count];
+    let mut pending = vec![0usize];
+    reached[0] = true;
+    while let Some(i) = pending.pop() {
+        for b in [original[i].on_true, original[i].on_false] {
+            match edge_of(b, count)? {
+                Edge::Node(n) if !reached[n] => {
+                    reached[n] = true;
+                    pending.push(n);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut number = vec![0u8; count];
+    let mut next = 0u8;
+    for (i, &r) in reached.iter().enumerate() {
+        if r {
+            number[i] = next;
+            next += 1;
+        }
+    }
+    let renumber = |b: u8| {
+        if b >= TARGET_ERROR {
+            b
+        } else {
+            number[usize::from(b)]
+        }
+    };
+    let mut live = Vec::with_capacity(usize::from(next));
+    let mut dead = Vec::new();
+    for (i, ins) in original.iter().enumerate() {
+        if reached[i] {
+            live.push(Instruction {
+                opcode: ins.opcode,
+                on_true: renumber(ins.on_true),
+                on_false: renumber(ins.on_false),
+                operands: ins.operands,
+            });
+        } else {
+            dead.push(DeadNode {
+                at: u8::try_from(i).expect("fits MAX_BHAV_NODES"),
+                opcode: ins.opcode,
+                operands: ins.operands,
+                on_true: ins.on_true,
+                on_false: ins.on_false,
+            });
+        }
+    }
+    Some((live, dead))
+}
+
+/// Checks `dead` as the dead nodes of a tree whose live (reached) part has `live` nodes: each
+/// at its own node number below `live + dead.len()` (at most [`MAX_BHAV_NODES`]), and none at
+/// node 0, where the tree is entered. The error says what is wrong.
+pub(crate) fn check_dead_nodes(dead: &[DeadNode], live: usize) -> Result<(), String> {
+    let total = live + dead.len();
+    if total > MAX_BHAV_NODES {
+        return Err(format!(
+            "the tree has {live} node(s) and {} dead node(s); a tree holds at most {MAX_BHAV_NODES}",
+            dead.len()
+        ));
+    }
+    let mut seen = vec![false; total];
+    for d in dead {
+        let at = usize::from(d.at);
+        if at == 0 {
+            return Err(
+                "dead node 0: a tree runs from node 0, so its entry cannot be a dead node"
+                    .to_owned(),
+            );
+        }
+        if at >= total {
+            return Err(format!(
+                "dead node {at} is past the tree's last node: it has {total} (0..={})",
+                total - 1
+            ));
+        }
+        if std::mem::replace(&mut seen[at], true) {
+            return Err(format!("dead node {at} is listed twice"));
+        }
+    }
+    Ok(())
+}
+
+/// The tree `live` (its nodes in order, checked with [`check_dead_nodes`]) with `dead` put at
+/// their node numbers: the live nodes fill the other numbers in order, and each live branch
+/// follows its node. A dead node keeps its bytes, so no live branch can reach it.
+pub(crate) fn insert_dead_nodes(live: &[WideNode], dead: &[DeadNode]) -> Vec<Instruction> {
+    let total = live.len() + dead.len();
+    let mut slots: Vec<Option<&DeadNode>> = vec![None; total];
+    for d in dead {
+        slots[usize::from(d.at)] = Some(d);
+    }
+    let number: Vec<usize> = (0..total).filter(|&i| slots[i].is_none()).collect();
+    let byte = |e: Edge| match e {
+        Edge::Node(n) => number[n] as u8,
+        Edge::Exit(b) => b,
+    };
+    let mut live = live.iter();
+    slots
+        .iter()
+        .map(|slot| match slot {
+            Some(d) => Instruction {
+                opcode: d.opcode,
+                on_true: d.on_true,
+                on_false: d.on_false,
+                operands: d.operands,
+            },
+            None => {
+                let n = live.next().expect("one live node per free number");
+                Instruction {
+                    opcode: n.opcode,
+                    on_true: byte(n.on_true),
+                    on_false: byte(n.on_false),
+                    operands: n.operands,
+                }
+            }
+        })
+        .collect()
+}
+
+/// A pin for a tree whose original keeps nodes no branch reaches: the header fields
+/// ([`TreePin`]) for its reached nodes, and the [`DeadNode`]s that go back in after them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantinedPin {
+    /// The `#[bhav(..)]` fields; `None` when the reached nodes already match as compiled.
+    pub pin: Option<TreePin>,
+    /// The original's unreached nodes, for a trailing `dead_nodes { .. }` block
+    /// ([`dead_nodes_block`]); empty when every node is reached.
+    pub dead_nodes: Vec<DeadNode>,
+}
+
+/// [`match_tree_pin`] for an original that may keep nodes no branch reaches: its reached
+/// nodes ([`split_dead_nodes`]) are matched as `match_tree_pin` matches a whole tree, and
+/// the rest come back as dead nodes. `compiled` is the tree built with none of the pin's
+/// fields and no dead nodes. `None` when nothing needs pinning (the nodes match and none is
+/// dead) or no pin makes them match. The pin is a prediction from the bytes, like
+/// `match_tree_pin`'s: a caller builds the tree with it and keeps it only when the nodes come
+/// out identical.
+#[must_use]
+pub fn match_tree_pin_quarantined(
+    compiled: &[Instruction],
+    original: &[Instruction],
+) -> Option<QuarantinedPin> {
+    let (live, dead_nodes) = split_dead_nodes(original)?;
+    if dead_nodes.is_empty() {
+        return match_tree_pin(compiled, original).map(|pin| QuarantinedPin {
+            pin: Some(pin),
+            dead_nodes,
+        });
+    }
+    let pin = if same_nodes(compiled, &live) {
+        None
+    } else {
+        Some(match_tree_pin(compiled, &live)?)
+    };
+    Some(QuarantinedPin { pin, dead_nodes })
 }
 
 #[cfg(test)]

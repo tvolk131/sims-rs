@@ -5,8 +5,11 @@ use super::*;
 
 /// Normalizes `.air` operand spellings to their canonical SimAntics VM storage cell so alias
 /// analysis treats `self.prep_score` (`stack.prep_score`) and `self.data[31]` (`stack.data[31]`)
-/// as the exact same cell.
+/// as the exact same cell. An `#[slot(N)] let` local is frame word `N`, so it is `local[N]`.
 pub(super) fn canonical_air_cell(air: &str) -> String {
+    if let Some(n) = slot_word(air) {
+        return format!("local[{n}]");
+    }
     if let Some((prefix, rest)) = air.split_once('.')
         && matches!(prefix, "my" | "stack")
     {
@@ -36,6 +39,13 @@ pub(super) fn canonical_air_cell(air: &str) -> String {
         }
     }
     air.to_owned()
+}
+
+/// The frame word an `#[slot(N)] let` local's `.air` name (`__slot<N>_...`) fixes.
+pub(super) fn slot_word(air_name: &str) -> Option<u8> {
+    let rest = air_name.strip_prefix("__slot")?;
+    let (n, _) = rest.split_once('_')?;
+    n.parse().ok()
 }
 
 pub(super) fn is_arith_or_bit_binop(op: V2BinOp) -> bool {

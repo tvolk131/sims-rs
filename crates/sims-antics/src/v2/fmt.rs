@@ -602,6 +602,9 @@ struct Analysis {
     enclosing: Vec<Option<usize>>,
     /// A forced blank line before the member starting at this token.
     forced_blank: Vec<bool>,
+    /// The token is directly inside a `dead_nodes { .. }` block, whose entries
+    /// (`5: op 0x0002(..) -> true: 6, false: error;`) each stay on one line.
+    dead_entry: Vec<bool>,
 }
 
 fn analyze(toks: &[Tok]) -> Analysis {
@@ -840,7 +843,20 @@ fn analyze(toks: &[Tok]) -> Analysis {
         unary[i] = !operand_end;
     }
 
+    let mut dead_entry = vec![false; n];
+    for o in 1..n {
+        if is_punct(o, "{")
+            && toks[o - 1].class == Class::Ident
+            && text(o - 1) == "dead_nodes"
+            && let Some(c) = partner[o]
+        {
+            for k in o + 1..c {
+                dead_entry[k] = enclosing[k] == Some(o);
+            }
+        }
+    }
     let mut a = Analysis {
+        dead_entry,
         partner,
         frame,
         generic_open,
@@ -1113,6 +1129,13 @@ impl<'a> Printer<'a> {
                 None | Some(Frame::Block) => Sep::Newline,
                 _ => Sep::Space,
             };
+        }
+        // `dead_nodes` entries: `op 0x0002(..)`, and both branches on the entry's line.
+        if self.a.dead_entry[p] && p_punct && pt == "," {
+            return Sep::Space;
+        }
+        if self.a.dead_entry[i] && n_punct && nt == "(" && self.toks[p].class == Class::Number {
+            return Sep::None;
         }
         if p_punct && pt == "," {
             return match self.inner_frame(p) {

@@ -281,12 +281,48 @@ pub fn resolve_v2_source(
 /// Maximum transitive module import nesting depth.
 const MAX_IMPORT_DEPTH: usize = 32;
 
+/// A `.antics` or `.air` file whose path [`check_v2_file`] has checked, with the resolver
+/// config of its pack. [`Self::read`] reads its text.
+#[derive(Debug, Clone)]
+pub struct CheckedV2File {
+    /// The resolver config the file builds under: its pack's, or the one inferred for it.
+    pub config: PackResolverConfig,
+    canonical: PathBuf,
+    read_root: PathBuf,
+}
+
+impl CheckedV2File {
+    /// The file's canonical path.
+    #[must_use]
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical
+    }
+
+    /// Reads the file's text, refusing a file that is no longer a regular file inside the root
+    /// it was checked against.
+    pub fn read(&self) -> Result<String> {
+        read_regular_file_checked(&self.canonical, &self.read_root)
+    }
+}
+
 /// Reads one `.antics` or `.air` file from disk after verifying symlink-free components
-/// and (when `pack_dir` is `Some`) containment within the pack root.
+/// and (when `pack_dir` is `Some`) containment within the pack root: [`check_v2_file`], then
+/// [`CheckedV2File::read`].
 pub fn read_v2_checked_file(
     file_path: &Path,
     pack_dir: Option<&Path>,
 ) -> Result<(String, PackResolverConfig)> {
+    let checked = check_v2_file(file_path, pack_dir)?;
+    let source = checked.read()?;
+    Ok((source, checked.config))
+}
+
+/// The checks [`read_v2_checked_file`] makes before it reads a file, without reading it: the
+/// file's resolver config (its pack's when `pack_dir` is `Some`, else inferred), a regular
+/// file that is no symlink, no symlinked component on its path, and (with `pack_dir`) a path
+/// inside the pack root. A caller that already holds the file's text (a linter given it once)
+/// gets the config the build would use from here.
+pub fn check_v2_file(file_path: &Path, pack_dir: Option<&Path>) -> Result<CheckedV2File> {
     let config = match pack_dir {
         Some(dir) => PackResolverConfig::from_pack_dir(dir)?,
         None => PackResolverConfig::infer_for_file(file_path)?,
@@ -338,13 +374,17 @@ pub fn read_v2_checked_file(
             verify_no_symlink_components(root_canon, rel)?;
         }
     }
-    let root_for_read = config
+    let read_root = config
         .pack_root
         .as_deref()
         .filter(|r| canon_file.starts_with(r))
-        .unwrap_or_else(|| canon_file.parent().unwrap_or(Path::new("/")));
-    let source = read_regular_file_checked(&canon_file, root_for_read)?;
-    Ok((source, config))
+        .unwrap_or_else(|| canon_file.parent().unwrap_or(Path::new("/")))
+        .to_path_buf();
+    Ok(CheckedV2File {
+        config,
+        canonical: canon_file,
+        read_root,
+    })
 }
 
 /// Loads and resolves one `.antics` v2 file from disk (symlink-free regular file check,

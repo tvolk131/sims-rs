@@ -2,6 +2,7 @@
 //! layout, slot spans).
 
 use super::*;
+use crate::node_order::DeadNode;
 
 /// Lowers and emits one standalone `#[bhav] fn` member as a real (non-inlined) BHAV.
 pub(super) fn emit_standalone_tree(
@@ -319,12 +320,22 @@ pub(super) fn write_framed_tree(
         let order: Vec<String> = order.iter().map(u16::to_string).collect();
         header.push(format!("node_order: [{}]", order.join(", ")));
     }
-    if frame.share_tails || frame.node_order.is_some() || frame.dead_false_error {
+    if !frame.dead_nodes.is_empty() {
+        let entries: Vec<String> = frame.dead_nodes.iter().map(DeadNode::entry_text).collect();
+        header.push(format!("dead_nodes: [{}]", entries.join(" ")));
+    }
+    if frame.share_tails
+        || frame.node_order.is_some()
+        || frame.dead_false_error
+        || !frame.dead_nodes.is_empty()
+    {
         if let Some((span, callee)) = &ctx.wide_call {
             let (option, effect) = if frame.share_tails {
                 ("share_tails", "moves nodes")
             } else if frame.node_order.is_some() {
                 ("node_order", "moves nodes")
+            } else if !frame.dead_nodes.is_empty() {
+                ("dead_nodes", "moves nodes")
             } else {
                 ("dead_false", "rewrites false branches")
             };

@@ -7,7 +7,10 @@ use crate::ast::{
 };
 use crate::error::{Error, Result, Span};
 use crate::ir::{BconChunk, BhavChunk, StringEntry, StringFormat, StringTableChunk};
-use crate::node_order::{Edge, WideNode, apply_node_order, check_node_order, narrow, share_tails};
+use crate::node_order::{
+    Edge, WideNode, apply_node_order, check_dead_nodes, check_node_order, insert_dead_nodes,
+    narrow, share_tails,
+};
 use crate::verify::{apply_operand_pad, is_always_true_instruction};
 use sims_formats::behavior::Instruction;
 use std::collections::{BTreeMap, BTreeSet};
@@ -2138,7 +2141,8 @@ fn check_sibling_frames(calls: &[SiblingCall], behaviors: &BTreeMap<u16, BhavChu
                 format!(
                     "tree '{}': node {} calls tree {} with inline arguments, and its frame holds \
                      {args} arguments: it reads those past the fourth from the nodes after the \
-                     call, which 'share_tails' and 'node_order' move and 'dead_false' rewrites",
+                     call, which 'share_tails', 'node_order' and 'dead_nodes' move and \
+                     'dead_false' rewrites",
                     call.tree, call.node, call.callee
                 ),
             ));
@@ -2185,8 +2189,9 @@ fn check_inline_calls(
                 format!(
                     "tree '{}': node {i} calls tree {} with inline arguments; a callee whose \
                      frame holds more than four arguments reads the rest from the nodes after the \
-                     call, which 'share_tails' and 'node_order' move and 'dead_false' rewrites. \
-                     List {} in 'narrow_callees' when its frame holds at most four",
+                     call, which 'share_tails', 'node_order' and 'dead_nodes' move and \
+                     'dead_false' rewrites. List {} in 'narrow_callees' when its frame holds at \
+                     most four",
                     tree.label, node.opcode, node.opcode
                 ),
             ));
@@ -2195,8 +2200,9 @@ fn check_inline_calls(
     Ok(())
 }
 
-/// The instructions of a tree whose header asks for `share_tails` or a `node_order`
-/// ([`crate::node_order`]): the assembled nodes, merged, then renumbered.
+/// The instructions of a tree whose header asks for `share_tails`, a `node_order` or
+/// `dead_nodes` ([`crate::node_order`]): the assembled nodes, merged, renumbered, then the dead
+/// nodes put back at their numbers.
 fn rewrite_nodes(tree: &TreeDecl, builder: &TreeBuilder<'_>) -> Result<Vec<Instruction>> {
     let count = builder.nodes.len();
     let mut nodes = Vec::with_capacity(count);
@@ -2259,7 +2265,23 @@ fn rewrite_nodes(tree: &TreeDecl, builder: &TreeBuilder<'_>) -> Result<Vec<Instr
         }
         nodes = apply_node_order(&nodes, order);
     }
-    Ok(narrow(&nodes))
+    let dead = &tree.header.dead_nodes;
+    if dead.is_empty() {
+        return Ok(narrow(&nodes));
+    }
+    if indexed {
+        return Err(Error::at(
+            tree.span,
+            format!(
+                "tree '{}' is an indexed tree (kind 4), which enters at the node its first \
+                 argument names: it can have no dead nodes, which would renumber the others",
+                tree.label
+            ),
+        ));
+    }
+    check_dead_nodes(dead, nodes.len())
+        .map_err(|message| Error::at(tree.span, format!("tree '{}': {message}", tree.label)))?;
+    Ok(insert_dead_nodes(&nodes, dead))
 }
 
 fn lower_tree(
@@ -2349,7 +2371,9 @@ fn lower_tree(
         None
     };
 
-    let rewrites = tree.header.share_tails || tree.header.node_order.is_some();
+    let rewrites = tree.header.share_tails
+        || tree.header.node_order.is_some()
+        || !tree.header.dead_nodes.is_empty();
     let checks_calls = rewrites || tree.header.dead_false_error;
     let mut builder = TreeBuilder::new(
         symbols,

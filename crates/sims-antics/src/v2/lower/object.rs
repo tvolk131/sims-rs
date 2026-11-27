@@ -120,8 +120,10 @@ fn lower_object_with(
     let mut cleanup_pinned_id: Option<u16> = None;
     // `#[frame(...)]` per lifecycle tree ("Init", "Main", "Load", "Reset", "Cleanup").
     let mut lifecycle_frames: BTreeMap<&'static str, TreeFrame> = BTreeMap::new();
+    // A block's `dead_nodes { .. }` footer rides in its frame, but it is no `#[frame]`: one block
+    // of a composed tree may carry the attribute and another the footer.
     let mut note_lifecycle_frame = |label: &'static str, frame: Option<TreeFrame>| -> Result<()> {
-        let Some(f) = frame else {
+        let Some(mut f) = frame else {
             return Ok(());
         };
         if f.empty {
@@ -130,12 +132,35 @@ fn lower_object_with(
                 "'empty' is only allowed on a standalone '#[bhav] fn' (a lifecycle tree always has nodes)",
             ));
         }
+        let dead = std::mem::take(&mut f.dead_nodes);
         let span = f.span;
-        if lifecycle_frames.insert(label, f).is_some() {
-            return Err(Error::at(
-                span,
-                format!("'#[frame]' on more than one block of the '{label}' tree"),
-            ));
+        let cur = lifecycle_frames.entry(label).or_insert_with(|| TreeFrame {
+            span,
+            footer_only: true,
+            ..TreeFrame::default()
+        });
+        // An explicit `#[frame]`, even an empty `#[frame()]`, may be written on one block only.
+        if !f.footer_only {
+            if !cur.footer_only {
+                return Err(Error::at(
+                    span,
+                    format!("'#[frame]' on more than one block of the '{label}' tree"),
+                ));
+            }
+            let kept = std::mem::take(&mut cur.dead_nodes);
+            *cur = TreeFrame {
+                dead_nodes: kept,
+                ..f
+            };
+        }
+        if !dead.is_empty() {
+            if !cur.dead_nodes.is_empty() {
+                return Err(Error::at(
+                    span,
+                    format!("'dead_nodes' ends more than one block of the '{label}' tree"),
+                ));
+            }
+            cur.dead_nodes = dead;
         }
         Ok(())
     };
