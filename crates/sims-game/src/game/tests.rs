@@ -712,7 +712,7 @@ fn screen_centre_pick_uses_active_viewport_and_native_origin_column() {
 }
 
 #[test]
-fn ui_effect_highlights_outline_buttons_portraits_and_first_relationship_control() {
+fn the_tutorial_marker_finds_buttons_portraits_and_the_first_relationship_control() {
     let relation = |guid: u32, id: i16| sims_ui::household::Relation {
         guid,
         id,
@@ -760,29 +760,29 @@ fn ui_effect_highlights_outline_buttons_portraits_and_first_relationship_control
         },
     ];
 
-    // Empty highlight sets leave the canvas untouched.
-    let mut canvas = Canvas::new(64, 20, [0, 0, 0]);
-    draw_ui_effect_highlights(
-        &items,
-        &BTreeSet::new(),
-        &BTreeSet::new(),
-        false,
-        &mut canvas,
+    let rect = sims_ui::frame::Rect::new;
+    assert_eq!(
+        marker_target_rect(&items, MarkerTarget::Button(sims_ui::hud::id::LIVE as i16)),
+        Some(rect(2, 2, 10, 10))
     );
-    assert!(canvas.color.iter().all(|&px| px == 0));
-
-    // Active highlights draw the outline on the matching button, portrait,
-    // and only the first relationship control (matching 0x4769ca).
-    let buttons = BTreeSet::from([sims_ui::hud::id::LIVE as i16]);
-    let portraits = BTreeSet::from([0x1111_2222u32]);
-    draw_ui_effect_highlights(&items, &buttons, &portraits, true, &mut canvas);
-    let pixel = |c: &Canvas, x: usize, y: usize| c.pixel_rgb(x, y);
-    assert_eq!(pixel(&canvas, 2, 2), UI_EFFECT_HIGHLIGHT_RGB);
-    assert_eq!(pixel(&canvas, 16, 2), UI_EFFECT_HIGHLIGHT_RGB);
-    assert_eq!(pixel(&canvas, 30, 2), UI_EFFECT_HIGHLIGHT_RGB);
-    assert_eq!(pixel(&canvas, 44, 2), [0, 0, 0]);
-    // Interior pixels stay untouched.
-    assert_eq!(pixel(&canvas, 6, 6), [0, 0, 0]);
+    assert_eq!(
+        marker_target_rect(&items, MarkerTarget::Portrait(0x1111_2222)),
+        Some(rect(16, 2, 10, 10))
+    );
+    // `0x4769ca` takes the first relationship control, whoever it shows.
+    assert_eq!(
+        marker_target_rect(&items, MarkerTarget::Relationship),
+        Some(rect(30, 2, 10, 10))
+    );
+    // A control not laid out shows no marker.
+    assert_eq!(
+        marker_target_rect(&items, MarkerTarget::Portrait(0x3333_4444)),
+        None
+    );
+    assert_eq!(
+        marker_target_rect(&items, MarkerTarget::Button(sims_ui::hud::id::PAUSE as i16)),
+        None
+    );
 }
 
 #[test]
@@ -850,4 +850,118 @@ fn phone_book_eligibility_is_family_kind_and_caller_only() {
         ),
         "a relationship row without values"
     );
+}
+
+/// `0x5de13f`, `0x5dab61` and `0x4d14b2`: one marker, moved by each
+/// highlight, hidden by any clear, by a modal dialog (shown again after,
+/// from its first cell) and by Escape.
+#[test]
+fn the_tutorial_marker_follows_highlights_and_hides_for_clears_modals_and_escape() {
+    use sims_ui::tutorial::{FRAME_US, cell_at};
+    let pack = crate::open_pack::discover_open_pack_dir().expect("the workspace's open-pack/");
+    let mut game = Game::open_open_pack(&pack, &[], true, Frames::default()).expect("open pack");
+    game.resize([800, 600]);
+    assert_eq!(game.run(1), 1);
+    game.advance_while(1_000_000, 0, |_| true);
+    let zoom_in = MarkerTarget::Button(sims_ui::hud::id::ZOOM_IN as i16);
+    let button = |id: MarkerTarget, highlight: bool| match id {
+        MarkerTarget::Button(id) => UiEffectEvent::Button { id, highlight },
+        MarkerTarget::Portrait(guid) => UiEffectEvent::Portrait { guid, highlight },
+        MarkerTarget::Relationship => UiEffectEvent::Relationship { guid: 1, highlight },
+    };
+    let shown_us = |game: &Game| game.tutorial_marker.map(|m| m.shown_us);
+
+    // Without its bitmap nothing shows, so nothing waits on its animation
+    // and Escape is not taken.
+    game.keep_ui_effects(vec![button(zoom_in, true)]);
+    game.render();
+    assert_eq!(game.marker_cell_drawn, None);
+    assert_eq!(game.marker_elapsed_us(), None);
+    assert!(!game.hide_tutorial_marker());
+    let mut cells = Vec::new();
+    for cell in 0..3u8 {
+        for _ in 0..50 * 50 {
+            cells.extend_from_slice(&[cell, 1, 2, 255]);
+        }
+    }
+    let mut rgba = Vec::new();
+    for y in 0..50 {
+        for cell in 0..3 {
+            let row = (cell * 50 * 50 + y * 50) * 4;
+            rgba.extend_from_slice(&cells[row..row + 50 * 4]);
+        }
+    }
+    game.hud.art_mut().insert(
+        sims_ui::tutorial::MARKER,
+        sims_formats::bitmap::Image {
+            width: 150,
+            height: 50,
+            rgba,
+        },
+    );
+
+    game.keep_ui_effects(vec![button(zoom_in, true)]);
+    assert_eq!(game.tutorial_marker(), Some(zoom_in));
+    let start = game.clock_us;
+    assert_eq!(shown_us(&game), Some(start));
+    game.render();
+    assert_eq!(game.marker_cell_drawn, Some(0));
+    let zoom_rect = marker_target_rect(game.hud.items(), zoom_in).expect("Zoom In laid out");
+    let [mx, my] = sims_ui::tutorial::origin(zoom_rect, [50, 50]);
+    assert_eq!(
+        game.canvas.pixel_rgb(mx as usize, my as usize),
+        [0, 1, 2],
+        "cell 0 over Zoom In"
+    );
+    // It wakes the window for its next cell, and that cell asks for a frame.
+    assert!(
+        game.next_wake_us(false, u64::MAX)
+            .is_some_and(|us| us <= FRAME_US)
+    );
+    game.advance_while(FRAME_US, 0, |_| true);
+    assert!(game.blink_due());
+    game.render();
+    assert_eq!(game.marker_cell_drawn, Some(cell_at(FRAME_US)));
+
+    // The same highlight again goes on animating; another control moves it
+    // and starts it over.
+    game.keep_ui_effects(vec![button(zoom_in, true)]);
+    assert_eq!(shown_us(&game), Some(start));
+    let portrait = MarkerTarget::Portrait(0x1234_5678);
+    game.keep_ui_effects(vec![button(portrait, true)]);
+    assert_eq!(game.tutorial_marker(), Some(portrait));
+    assert_eq!(shown_us(&game), Some(game.clock_us));
+    // A clear hides it whatever it was over (`0x5de1d1`).
+    game.keep_ui_effects(vec![button(zoom_in, false)]);
+    assert_eq!(game.tutorial_marker(), None);
+
+    // A modal dialog hides it while it is up; after, it starts over.
+    game.keep_ui_effects(vec![button(zoom_in, true)]);
+    game.show_notice("Notice", "Over the marker");
+    game.render();
+    assert_eq!(game.tutorial_marker(), None, "hidden by the modal dialog");
+    assert_eq!(game.marker_cell_drawn, None);
+    game.advance_while(2 * FRAME_US, 0, |_| true);
+    game.dialog_confirm_key(crate::hud::DialogKey::Enter);
+    game.render();
+    assert_eq!(game.tutorial_marker(), Some(zoom_in));
+    assert_eq!(shown_us(&game), Some(game.clock_us));
+    assert_eq!(game.marker_cell_drawn, Some(0));
+
+    // Escape hides it.
+    assert!(game.hide_tutorial_marker());
+    assert!(!game.hide_tutorial_marker());
+    assert_eq!(game.tutorial_marker(), None);
+    game.render();
+    assert_eq!(game.marker_cell_drawn, None);
+
+    // Moved to a control not drawn yet, the old one is still on screen until
+    // the next frame, so Escape takes it rather than going on to quit.
+    game.keep_ui_effects(vec![button(zoom_in, true)]);
+    game.render();
+    assert_eq!(game.marker_cell_drawn, Some(0));
+    game.keep_ui_effects(vec![button(portrait, true)]);
+    assert!(game.hide_tutorial_marker());
+    game.render();
+    assert_eq!(game.marker_cell_drawn, None);
 }

@@ -60,6 +60,7 @@ pub mod saves;
 pub mod shop;
 pub mod thumbnail;
 pub mod travel;
+pub mod tutorial;
 
 /// Why art could not be loaded.
 #[derive(Debug)]

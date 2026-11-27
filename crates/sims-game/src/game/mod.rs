@@ -389,6 +389,16 @@ pub struct Game {
     highlighted_buttons: BTreeSet<i16>,
     highlighted_portraits: BTreeSet<u32>,
     highlighted_relationships: BTreeSet<u32>,
+    /// The tutorial highlight marker, while one is shown ([`sims_ui::tutorial`]).
+    tutorial_marker: Option<TutorialMarker>,
+    /// The marker cell last drawn, so a cell change asks for a frame.
+    marker_cell_drawn: Option<u32>,
+    /// A shell window (Save Manager, Photo Album, travel dialog) is drawn
+    /// over this game, which hides the marker as a modal dialog does.
+    shell_modal: bool,
+    /// The dialog clipboard kept inside this game, or `None` to use the
+    /// system's ([`Game::use_local_clipboard`]).
+    local_clipboard: Option<String>,
     /// A short message about the last press, until the next one.
     note: Option<String>,
     /// Where the pointer is on the canvas, while it is over the window.
@@ -1559,86 +1569,50 @@ impl Errors {
     }
 }
 
-/// Highlight colour drawn around HUD controls targeted by UI Effect (opcode 34,
-/// `0x476485` / `0x47690d` / `0x4769c3` → `0x5de13f`).
-const UI_EFFECT_HIGHLIGHT_RGB: [u8; 3] = [255, 224, 64];
-
-/// Outlines any laid-out HUD items currently highlighted by UI Effect
-/// (opcode 34, `0x44acff`). Returns immediately when no highlight is active so
-/// ordinary frames and ratchet captures are untouched.
-fn draw_ui_effect_highlights(
-    items: &[sims_ui::hud::Item],
-    highlighted_buttons: &BTreeSet<i16>,
-    highlighted_portraits: &BTreeSet<u32>,
-    highlight_relationship: bool,
-    canvas: &mut Canvas,
-) {
-    if highlighted_buttons.is_empty() && highlighted_portraits.is_empty() && !highlight_relationship
-    {
-        return;
-    }
-    let mut relationship_drawn = false;
-    for item in items {
-        let matched = match &item.kind {
-            sims_ui::hud::Kind::Button { id, .. }
-            | sims_ui::hud::Kind::Toggle { id, .. }
-            | sims_ui::hud::Kind::Cell { id, .. } => {
-                i16::try_from(*id).is_ok_and(|k| highlighted_buttons.contains(&k))
-            }
-            sims_ui::hud::Kind::Pause { .. } => i16::try_from(sims_ui::hud::id::PAUSE)
-                .is_ok_and(|k| highlighted_buttons.contains(&k)),
-            sims_ui::hud::Kind::Portrait { guid, .. } => highlighted_portraits.contains(guid),
-            sims_ui::hud::Kind::Relation { .. }
-                if highlight_relationship && !relationship_drawn =>
-            {
-                relationship_drawn = true;
-                true
-            }
-            _ => false,
-        };
-        if matched {
-            draw_highlight_rect(canvas, item.rect, UI_EFFECT_HIGHLIGHT_RGB);
-        }
-    }
+/// The control the tutorial marker is over: the target of a UI Effect
+/// highlight (opcode 34, `0x476485` / `0x47690d` / `0x4769c3`), each of
+/// which calls the control's slot `+0x160` (`0x5de13f`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerTarget {
+    /// A panel control by its ID.
+    Button(i16),
+    /// A family portrait by its person's GUID.
+    Portrait(u32),
+    /// The first relationship control, whoever it shows (`0x4769ca`).
+    Relationship,
 }
 
-/// Draws a 2-pixel rectangular outline around `rect` clipped to `canvas`.
-fn draw_highlight_rect(canvas: &mut Canvas, rect: sims_ui::frame::Rect, rgb: [u8; 3]) {
-    if rect.width <= 0 || rect.height <= 0 || canvas.width == 0 || canvas.height == 0 {
-        return;
-    }
-    let cw = canvas.width as i32;
-    let ch = canvas.height as i32;
-    let x0 = rect.x;
-    let y0 = rect.y;
-    let x1 = rect.x.saturating_add(rect.width).saturating_sub(1);
-    let y1 = rect.y.saturating_add(rect.height).saturating_sub(1);
-    let packed = sims_render::pack_rgb(rgb);
-    let mut put = |x: i32, y: i32| {
-        if x >= 0 && x < cw && y >= 0 && y < ch {
-            let idx = y as usize * canvas.width + x as usize;
-            if let Some(px) = canvas.color.get_mut(idx) {
-                *px = packed;
+/// The one tutorial highlight marker (`cTSWinTutorialHighlight`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TutorialMarker {
+    target: MarkerTarget,
+    /// The presentation clock when its animation last started.
+    shown_us: u64,
+    /// Hidden by a modal dialog (`0x5dab61`), to be shown again after it.
+    hidden_by_modal: bool,
+}
+
+/// Where the laid-out control `target` is, if it is laid out.
+fn marker_target_rect(
+    items: &[sims_ui::hud::Item],
+    target: MarkerTarget,
+) -> Option<sims_ui::frame::Rect> {
+    use sims_ui::hud::Kind;
+    items
+        .iter()
+        .find(|item| match (&item.kind, target) {
+            (
+                Kind::Button { id, .. } | Kind::Toggle { id, .. } | Kind::Cell { id, .. },
+                MarkerTarget::Button(k),
+            ) => i16::try_from(*id).is_ok_and(|id| id == k),
+            (Kind::Pause { .. }, MarkerTarget::Button(k)) => {
+                i16::try_from(sims_ui::hud::id::PAUSE).is_ok_and(|id| id == k)
             }
-        }
-    };
-    for inset in 0..2 {
-        let lx = x0.saturating_add(inset);
-        let rx = x1.saturating_sub(inset);
-        let ty = y0.saturating_add(inset);
-        let by = y1.saturating_sub(inset);
-        if lx > rx || ty > by {
-            break;
-        }
-        for x in lx.max(0)..=rx.min(cw - 1) {
-            put(x, ty);
-            put(x, by);
-        }
-        for y in ty.max(0)..=by.min(ch - 1) {
-            put(lx, y);
-            put(rx, y);
-        }
-    }
+            (Kind::Portrait { guid, .. }, MarkerTarget::Portrait(g)) => *guid == g,
+            (Kind::Relation { .. }, MarkerTarget::Relationship) => true,
+            _ => false,
+        })
+        .map(|item| item.rect)
 }
 
 /// Adds `items` to the requests the host has yet to take, keeping at

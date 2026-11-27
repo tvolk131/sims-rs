@@ -3,6 +3,37 @@
 use super::*;
 
 impl Game {
+    /// Draws the tutorial marker over its control. A modal dialog hides it
+    /// while it is up (`0x5dab61..0x5dab8e`); shown again after, it starts
+    /// its animation over. A control not laid out, or a missing bitmap,
+    /// shows no marker, and then nothing waits on its animation.
+    fn draw_tutorial_marker(&mut self) {
+        let modal = self.hud.has_dialog()
+            || self.ui_modal_in_front()
+            || self.coop_lobby.is_open()
+            || self.shell_modal;
+        let Some(marker) = &mut self.tutorial_marker else {
+            self.marker_cell_drawn = None;
+            return;
+        };
+        if modal {
+            marker.hidden_by_modal = true;
+            self.marker_cell_drawn = None;
+            return;
+        }
+        if marker.hidden_by_modal {
+            marker.hidden_by_modal = false;
+            marker.shown_us = self.clock_us;
+        }
+        let elapsed = self.clock_us.saturating_sub(marker.shown_us);
+        let target = marker.target;
+        let drawn = marker_target_rect(self.hud.items(), target).is_some_and(|rect| {
+            self.hud
+                .draw_tutorial_marker(&mut self.canvas, rect, elapsed)
+        });
+        self.marker_cell_drawn = drawn.then(|| sims_ui::tutorial::cell_at(elapsed));
+    }
+
     /// Draws the frame: the lot, its people, then the panel. When the
     /// frame shows a new object under the pointer (the object moved, or
     /// the view did), its pie menu is listed, as when the pointer moves
@@ -320,12 +351,9 @@ impl Game {
             self.draw_coop_remote_indicators(viewport);
             self.draw_coop_buy_preview(viewport);
         }
-        let selected_override = if self.coop.is_active() {
-            let local_sel = self.local_selected_sim();
-            (local_sel != self.lot.world().selected()).then_some(local_sel)
-        } else {
-            None
-        };
+        // In co-op the panel, and the Help it answers, are this player's
+        // Sim's even when the lot's selection matches it now.
+        let selected_override = self.coop.is_active().then(|| self.local_selected_sim());
         self.log_debug_note_if_new();
         self.hud.set_clock_us(self.clock_us);
         self.sync_special_panel();
@@ -433,13 +461,7 @@ impl Game {
             &mut self.canvas,
         );
         self.ui_animating_prev = self.hud.is_ui_animating(self.clock_us);
-        draw_ui_effect_highlights(
-            self.hud.items(),
-            &self.highlighted_buttons,
-            &self.highlighted_portraits,
-            !self.highlighted_relationships.is_empty(),
-            &mut self.canvas,
-        );
+        self.draw_tutorial_marker();
         self.draw_build_cost_label();
         self.draw_shop_dialog();
         self.draw_book_dialog();
@@ -478,9 +500,7 @@ impl Game {
             && !self.book_dialog.is_open()
             && !self.phonebook_dialog.is_open()
             && self.destination_picker.is_none()
-            && self.highlighted_buttons.is_empty()
-            && self.highlighted_portraits.is_empty()
-            && self.highlighted_relationships.is_empty()
+            && self.tutorial_marker.is_none()
             && sell.is_none();
         let cur_steady_key = if steady_eligible {
             let world = self.lot.world();

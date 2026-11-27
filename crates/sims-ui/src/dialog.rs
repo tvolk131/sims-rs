@@ -2344,6 +2344,11 @@ pub struct DialogState {
     /// Bitmask of disabled buttons (bit `i` disables button `i`, drawing
     /// `WinBtn.bmp` cell 3 with dim text `[0x40, 0x5d, 0x5f]`).
     pub disabled_buttons: u8,
+    /// Per field (`active_field` 0 and 1), whether typing overwrites the
+    /// character at the caret instead of inserting before it. Each
+    /// `cTSWinTextEdit2` keeps its own flag (`[esi + 0x13c] == 1`, toggled
+    /// by Insert at `0x5f29d8`; [`DialogState::toggle_overwrite`]).
+    overwrite: [bool; 2],
 }
 
 impl Default for DialogState {
@@ -2360,6 +2365,7 @@ impl Default for DialogState {
             active_field: 0,
             pressed_button: None,
             disabled_buttons: 0,
+            overwrite: [false; 2],
         }
     }
 }
@@ -2571,10 +2577,22 @@ impl DialogState {
             self.reset_blink();
             return true;
         }
+        let pos = self.caret.map_or(len, |c| c.min(len));
+        // Overwrite mode (`0x5f347b`) replaces the character at the caret,
+        // so it works at the length limit too; at the end of the text it
+        // inserts like insert mode.
+        if self.overwrite() && pos < len {
+            let b0 = char_byte_index(text, pos);
+            let b1 = char_byte_index(text, pos + 1);
+            text.replace_range(b0..b1, ch.encode_utf8(&mut [0; 4]));
+            self.caret = Some(pos + 1);
+            self.caret_line = None;
+            self.reset_blink();
+            return true;
+        }
         if len >= limit {
             return false;
         }
-        let pos = self.caret.map_or(len, |c| c.min(len));
         let byte_idx = char_byte_index(text, pos);
         text.insert(byte_idx, ch);
         self.caret = Some(pos + 1);
@@ -2649,60 +2667,235 @@ impl DialogState {
         true
     }
 
-    /// Moves the caret one character left, clearing any active selection.
-    pub fn move_left(&mut self, message: &Message) -> bool {
-        let Some((text, _)) = self.active_text(message) else {
-            return false;
-        };
+    /// Puts the caret at `target` (`0..=len`) as `0x5f2ec7` does. Without
+    /// `extend` any selection is dropped. With it the selection runs from
+    /// its anchor (the end the caret is not on, or the caret when nothing
+    /// is selected) to `target`. Returns whether anything changed.
+    fn place_caret(
+        &mut self,
+        len: usize,
+        target: usize,
+        line: Option<usize>,
+        extend: bool,
+    ) -> bool {
         self.dragging_entry = None;
-        let len = text.chars().count();
-        if let Some((start, _)) = self.selection_in(len) {
-            self.selection = None;
-            self.caret = Some(start);
-            self.caret_line = None;
-            self.reset_blink();
-            return true;
-        }
-        let pos = self.caret_in(text);
-        let next = pos.saturating_sub(1);
-        self.caret = Some(next);
-        self.caret_line = None;
+        let caret = self.caret.map_or(len, |c| c.min(len));
+        let target = target.min(len);
+        let selection = if extend {
+            let anchor = match self.selection_in(len) {
+                Some((start, end)) if caret == start => end,
+                Some((start, _)) => start,
+                None => caret,
+            };
+            (anchor != target).then_some((anchor.min(target), anchor.max(target)))
+        } else {
+            None
+        };
+        let changed = self.caret != Some(target)
+            || self.caret_line != line
+            || self.selection_in(len) != selection;
+        self.caret = Some(target);
+        self.caret_line = line;
+        self.selection = selection;
         self.reset_blink();
-        next != pos
+        changed
     }
 
-    /// Moves the caret one character right, clearing any active selection.
-    pub fn move_right(&mut self, message: &Message) -> bool {
+    /// Moves the caret one character left (`0x5f2ec7(-1, shift, 1)` from
+    /// the key handler `0x5f29d8`): with `extend` (Shift) the selection
+    /// grows or shrinks; without, it is dropped and the caret steps from
+    /// where it is, not from the selection's edge.
+    pub fn move_left(&mut self, message: &Message, extend: bool) -> bool {
         let Some((text, _)) = self.active_text(message) else {
+            return false;
+        };
+        let len = text.chars().count();
+        let pos = self.caret_in(text);
+        self.place_caret(len, pos.saturating_sub(1), None, extend)
+    }
+
+    /// Moves the caret one character right (`0x5f2ec7(1, shift, 1)`), as
+    /// [`DialogState::move_left`] does.
+    pub fn move_right(&mut self, message: &Message, extend: bool) -> bool {
+        let Some((text, _)) = self.active_text(message) else {
+            return false;
+        };
+        let len = text.chars().count();
+        let pos = self.caret_in(text);
+        self.place_caret(len, pos + 1, None, extend)
+    }
+
+    /// Moves the caret one word left (`dir < 0`) or right as Ctrl+Left and
+    /// Ctrl+Right do (`0x5f3188`). Spaces and line breaks separate words.
+    /// Right goes past the word and the separators after it, to the next
+    /// word's start; left goes back over separators, then to the start of
+    /// the word before.
+    pub fn move_word(&mut self, message: &Message, dir: i32, extend: bool) -> bool {
+        let Some((text, _)) = self.active_text(message) else {
+            return false;
+        };
+        let chars: Vec<char> = text.chars().collect();
+        let target = word_target(&chars, self.caret_in(text), dir);
+        self.place_caret(chars.len(), target, None, extend)
+    }
+
+    /// Selects the word at the caret and the separators after it, as a
+    /// double-click does (`0x5f2c21`: a word left, then a word right
+    /// extending). The word left starts one past a caret that sits on a
+    /// letter, so a click on a word's first letter selects that word and
+    /// not the one before.
+    pub fn select_word(&mut self, message: &Message) -> bool {
+        let Some((text, _)) = self.active_text(message) else {
+            return false;
+        };
+        let chars: Vec<char> = text.chars().collect();
+        let caret = self.caret_in(text).min(chars.len());
+        let from = match chars.get(caret) {
+            Some(&c) if c != ' ' && c != '\n' => caret + 1,
+            _ => caret,
+        };
+        let start = word_target(&chars, from, -1);
+        let end = word_target(&chars, start, 1);
+        let before = (self.caret, self.selection);
+        self.place_caret(chars.len(), start, None, false);
+        self.place_caret(chars.len(), end, None, true);
+        (self.caret, self.selection) != before
+    }
+
+    /// Moves the caret to the start of the whole text (Ctrl+Home,
+    /// `0x5f29d8`), extending the selection with `extend`.
+    pub fn text_home(&mut self, message: &Message, extend: bool) -> bool {
+        let Some((text, _)) = self.active_text(message) else {
+            return false;
+        };
+        let line = self.is_multiline(message).then_some(0);
+        self.place_caret(text.chars().count(), 0, line, extend)
+    }
+
+    /// Moves the caret to the end of the whole text (Ctrl+End), extending
+    /// the selection with `extend`.
+    pub fn text_end(&mut self, message: &Message, extend: bool) -> bool {
+        let Some((text, _)) = self.active_text(message) else {
+            return false;
+        };
+        let len = text.chars().count();
+        self.place_caret(len, len, None, extend)
+    }
+
+    /// Selects the whole active field, as `cTSWinTextEdit2::SetText` does
+    /// when text is set (`0x5f462f..0x5f4685`).
+    pub fn select_all(&mut self, message: &Message) -> bool {
+        let Some((text, _)) = self.active_text(message) else {
+            return false;
+        };
+        let len = text.chars().count();
+        let before = (self.caret, self.selection);
+        self.caret = Some(len);
+        self.caret_line = None;
+        self.selection = (len > 0).then_some((0, len));
+        self.reset_blink();
+        (self.caret, self.selection) != before
+    }
+
+    /// Whether the active field overwrites (Insert mode off).
+    pub fn overwrite(&self) -> bool {
+        self.overwrite[usize::from(self.active_field.min(1))]
+    }
+
+    /// Toggles the active field's overwrite mode (Insert, `0x5f29d8`:
+    /// `[esi + 0x13c]` 0 ↔ 1).
+    pub fn toggle_overwrite(&mut self) -> bool {
+        if !self.focused {
+            return false;
+        }
+        let field = &mut self.overwrite[usize::from(self.active_field.min(1))];
+        *field = !*field;
+        self.reset_blink();
+        true
+    }
+
+    /// The selected text of the active field, as Copy (`0x5f4699`) takes it.
+    pub fn selected_text(&self, message: &Message) -> Option<String> {
+        let (text, _) = self.active_text(message)?;
+        let (start, end) = self.selection_in(text.chars().count())?;
+        Some(text.chars().skip(start).take(end - start).collect())
+    }
+
+    /// Cuts the selection (`0x5f4724`: Copy, then delete): returns the text
+    /// taken out, or `None` when nothing is selected.
+    pub fn cut(&mut self, message: &mut Message) -> Option<String> {
+        if !self.focused {
+            return None;
+        }
+        let taken = self.selected_text(message)?;
+        self.delete(message);
+        Some(taken)
+    }
+
+    /// Pastes `clipboard` at the caret as `0x5f473f` does: the text is first
+    /// cleaned as the original cleans what it reads from the system
+    /// clipboard ([`clipboard_text`]), a single-line field then drops the
+    /// control characters left ([`single_line_text`]), the selection is
+    /// replaced, and what does not fit in the field's limit is cut off
+    /// (`0x5f32bc`). Returns whether anything was inserted (the original
+    /// plays its error sound when not).
+    pub fn paste(&mut self, message: &mut Message, clipboard: &str) -> bool {
+        if !self.focused {
+            return false;
+        }
+        let single_line = !self.is_multiline(message);
+        let Some((text, limit)) = self.active_text_mut(message) else {
             return false;
         };
         self.dragging_entry = None;
         let len = text.chars().count();
-        if let Some((_, end)) = self.selection_in(len) {
-            self.selection = None;
-            self.caret = Some(end);
-            self.caret_line = None;
-            self.reset_blink();
-            return true;
+        let (start, end) = self.selection_in(len).unwrap_or_else(|| {
+            let pos = self.caret.map_or(len, |c| c.min(len));
+            (pos, pos)
+        });
+        let room = limit.saturating_sub(len - (end - start));
+        // Cleaned lazily, so only as much of the clipboard as fits is read.
+        let cleaned = clipboard_chars(clipboard.chars());
+        let inserted: String = if single_line {
+            single_line_chars(cleaned).take(room).collect()
+        } else {
+            cleaned.take(room).collect()
+        };
+        if inserted.is_empty() {
+            return false;
         }
-        let pos = self.caret_in(text);
-        let next = (pos + 1).min(len);
-        self.caret = Some(next);
+        let b0 = char_byte_index(text, start);
+        let b1 = char_byte_index(text, end);
+        text.replace_range(b0..b1, &inserted);
+        self.selection = None;
+        self.caret = Some(start + inserted.chars().count());
         self.caret_line = None;
         self.reset_blink();
-        next != pos
+        true
     }
 
     /// Moves the caret one visual row up in a multiline field (`0x5f29f2..0x5f2a90`),
     /// preserving the caret's horizontal offset and clearing any selection.
-    pub fn move_up(&mut self, message: &Message, layout: Option<&Layout>, art: &Art) -> bool {
-        self.move_vertical(message, layout, art, -1)
+    pub fn move_up(
+        &mut self,
+        message: &Message,
+        layout: Option<&Layout>,
+        art: &Art,
+        extend: bool,
+    ) -> bool {
+        self.move_vertical(message, layout, art, -1, extend)
     }
 
     /// Moves the caret one visual row down in a multiline field (`0x5f2a90..0x5f2b40`),
     /// preserving the caret's horizontal offset and clearing any selection.
-    pub fn move_down(&mut self, message: &Message, layout: Option<&Layout>, art: &Art) -> bool {
-        self.move_vertical(message, layout, art, 1)
+    pub fn move_down(
+        &mut self,
+        message: &Message,
+        layout: Option<&Layout>,
+        art: &Art,
+        extend: bool,
+    ) -> bool {
+        self.move_vertical(message, layout, art, 1, extend)
     }
 
     fn move_vertical(
@@ -2711,6 +2904,7 @@ impl DialogState {
         layout: Option<&Layout>,
         art: &Art,
         delta: isize,
+        extend: bool,
     ) -> bool {
         if !self.is_multiline(message) {
             return false;
@@ -2727,23 +2921,15 @@ impl DialogState {
         } else {
             (row + 1).min(lines.len().saturating_sub(1))
         };
-        let had_selection = self.selection.take().is_some();
         if target_row == row {
-            self.caret_line = Some(row);
-            self.reset_blink();
-            return had_selection;
+            return self.place_caret(text.chars().count(), cur, Some(row), extend);
         }
         // `0x5f37f4..0x5f38cd`: carry the character column from the current
         // visual row to the destination row and clamp to its length.
         let (r0, _) = lines[row];
         let (t0, t1) = lines[target_row];
         let target_pos = (t0 + cur.saturating_sub(r0)).min(t1);
-        let changed =
-            self.caret != Some(target_pos) || self.caret_line != Some(target_row) || had_selection;
-        self.caret = Some(target_pos);
-        self.caret_line = Some(target_row);
-        self.reset_blink();
-        changed
+        self.place_caret(text.chars().count(), target_pos, Some(target_row), extend)
     }
 
     /// Moves the caret to the start of the active line (`0x5f2c13`: start of
@@ -2754,35 +2940,25 @@ impl DialogState {
         message: &Message,
         layout: Option<&Layout>,
         art: Option<&Art>,
+        extend: bool,
     ) -> bool {
         let Some((text, _)) = self.active_text(message) else {
             return false;
         };
-        self.dragging_entry = None;
-        let had_selection = self.selection.take().is_some();
+        let len = text.chars().count();
         if self.is_multiline(message) {
             let lines = self.multiline_lines(text, layout, art);
             let cur = self.caret_in(text);
             let row = multiline_caret_line(&lines, cur, self.caret_line);
-            let target = lines[row].0;
-            let changed =
-                self.caret != Some(target) || self.caret_line != Some(row) || had_selection;
-            self.caret = Some(target);
-            self.caret_line = Some(row);
-            self.reset_blink();
-            return changed;
+            return self.place_caret(len, lines[row].0, Some(row), extend);
         }
-        let changed = self.caret != Some(0) || had_selection;
-        self.caret = Some(0);
-        self.caret_line = None;
-        self.reset_blink();
-        changed
+        self.place_caret(len, 0, None, extend)
     }
 
     /// Moves the caret to the start of the active entry field (or current line
     /// when multiline), always clearing any active selection (`0x5f2c13`).
     pub fn home(&mut self, message: &Message) -> bool {
-        self.home_in_layout(message, None, None)
+        self.home_in_layout(message, None, None, false)
     }
 
     /// Moves the caret to the end of the active line (`0x5f2c13`: end of
@@ -2793,36 +2969,25 @@ impl DialogState {
         message: &Message,
         layout: Option<&Layout>,
         art: Option<&Art>,
+        extend: bool,
     ) -> bool {
         let Some((text, _)) = self.active_text(message) else {
             return false;
         };
-        self.dragging_entry = None;
-        let had_selection = self.selection.take().is_some();
+        let len = text.chars().count();
         if self.is_multiline(message) {
             let lines = self.multiline_lines(text, layout, art);
             let cur = self.caret_in(text);
             let row = multiline_caret_line(&lines, cur, self.caret_line);
-            let target = lines[row].1;
-            let changed =
-                self.caret != Some(target) || self.caret_line != Some(row) || had_selection;
-            self.caret = Some(target);
-            self.caret_line = Some(row);
-            self.reset_blink();
-            return changed;
+            return self.place_caret(len, lines[row].1, Some(row), extend);
         }
-        let len = text.chars().count();
-        let changed = self.caret != Some(len) || had_selection;
-        self.caret = Some(len);
-        self.caret_line = None;
-        self.reset_blink();
-        changed
+        self.place_caret(len, len, None, extend)
     }
 
     /// Moves the caret to the end of the active entry field (or current line
     /// when multiline), always clearing any active selection (`0x5f2c13`).
     pub fn end(&mut self, message: &Message) -> bool {
-        self.end_in_layout(message, None, None)
+        self.end_in_layout(message, None, None, false)
     }
 
     /// Hit-tests `point` against `field` (`0` = primary entry, `1` = multiline
@@ -2916,6 +3081,7 @@ impl DialogState {
         message: &Message,
         art: &Art,
         point: [i32; 2],
+        extend: bool,
     ) -> bool {
         let target = if let (Some(field), Some(text)) = (layout.entry, message.entry.as_deref())
             && field.contains(point[0], point[1])
@@ -2935,14 +3101,27 @@ impl DialogState {
         let switched = self.active_field != field_idx;
         let (pos, line_idx) =
             self.hit_test_entry_pos(field_idx, field, text, message, art, point, switched);
-        self.active_field = field_idx;
         self.focused = true;
-        self.selection = None;
-        self.caret = Some(pos);
-        self.caret_line = line_idx;
-        self.dragging_entry = Some(pos);
+        // A Shift press in the field already focused extends the selection
+        // to the press (`0x5f2522`: `0x5f2ec7(pos - caret, shift, 0)`), and
+        // a drag from it keeps that anchor.
+        let anchor = if extend && !switched {
+            self.place_caret(text.chars().count(), pos, line_idx, true);
+            match self.selection {
+                Some((start, end)) if start == pos => end,
+                Some((start, _)) => start,
+                None => pos,
+            }
+        } else {
+            self.active_field = field_idx;
+            self.selection = None;
+            self.caret = Some(pos);
+            self.caret_line = line_idx;
+            self.reset_blink();
+            pos
+        };
+        self.dragging_entry = Some(anchor);
         self.drag_origin = Some(point);
-        self.reset_blink();
         true
     }
 
@@ -3002,6 +3181,107 @@ fn char_byte_index(text: &str, char_pos: usize) -> usize {
     text.char_indices()
         .nth(char_pos)
         .map_or(text.len(), |(idx, _)| idx)
+}
+
+/// Where a word move from `caret` ends in `chars` (`0x5f3188`): `dir < 0`
+/// for left, `dir > 0` for right. The original walks bytes of its
+/// NUL-ended buffer; here a position at `chars.len()` reads as that NUL.
+fn word_target(chars: &[char], caret: usize, dir: i32) -> usize {
+    let len = chars.len() as isize;
+    let at = |i: isize| -> char {
+        if (0..len).contains(&i) {
+            chars[i as usize]
+        } else {
+            '\0'
+        }
+    };
+    let separator = |c: char| c == ' ' || c == '\n';
+    let mut pos = caret.min(chars.len()) as isize;
+    if dir == 0 {
+        return pos as usize;
+    }
+    if dir < 0 {
+        // `0x5f31a5..0x5f31df`: step back over separators just before the
+        // caret, then off one under it.
+        while pos > 1 && separator(at(pos - 1)) {
+            pos -= 1;
+        }
+        let c = at(pos);
+        if (pos > 0 && c == ' ') || c == '\n' {
+            pos -= 1;
+        }
+    }
+    // `0x5f31f8..0x5f327b`: walk in `dir` over a word; a separator turns
+    // the walk forward, and the first letter after one ends it.
+    let step = if dir > 0 { 1 } else { -1 };
+    let mut words = 0;
+    let mut after_separator = false;
+    while words < dir.unsigned_abs() as usize {
+        if pos < 0 || pos > len {
+            break;
+        }
+        if separator(at(pos)) {
+            after_separator = true;
+            pos += 1;
+        } else if after_separator {
+            words += 1;
+        } else {
+            pos += step;
+        }
+    }
+    pos.clamp(0, len) as usize
+}
+
+/// Cleans text read from the system clipboard as `0x5d7cf1` does on
+/// activation: carriage returns go, a tab becomes four spaces, and other
+/// control characters but the line feed go. After it removes a character
+/// the original does not look at the one that moved into its place, so of
+/// two control characters in a row the second stays (and a tab's spaces
+/// are stepped over).
+pub fn clipboard_text(text: &str) -> String {
+    clipboard_chars(text.chars()).collect()
+}
+
+/// [`clipboard_text`] over a character stream, in one pass.
+fn clipboard_chars(mut chars: impl Iterator<Item = char>) -> impl Iterator<Item = char> {
+    let mut spaces = 0;
+    std::iter::from_fn(move || {
+        if spaces > 0 {
+            spaces -= 1;
+            return Some(' ');
+        }
+        let c = chars.next()?;
+        if c == '\t' {
+            // The tab's four spaces are stepped over as spaces.
+            spaces = 3;
+            Some(' ')
+        } else if c == '\r' || ((c as u32) < 0x20 && c != '\n') {
+            // Removed; the character that moves into its place is kept
+            // unchecked.
+            chars.next()
+        } else {
+            Some(c)
+        }
+    })
+}
+
+/// Drops the control characters a single-line field's Paste drops
+/// (`0x5f477b..0x5f47ad`), with the same step past each removal as
+/// [`clipboard_text`].
+pub fn single_line_text(text: &str) -> String {
+    single_line_chars(text.chars()).collect()
+}
+
+/// [`single_line_text`] over a character stream, in one pass.
+fn single_line_chars(mut chars: impl Iterator<Item = char>) -> impl Iterator<Item = char> {
+    std::iter::from_fn(move || {
+        let c = chars.next()?;
+        if (c as u32) < 0x20 {
+            chars.next()
+        } else {
+            Some(c)
+        }
+    })
 }
 
 /// Draws a 3×3 tiled 9-slice bitmap (`PopupInfoTiles.bmp` 3008, `GenDlg.bmp`
@@ -4131,12 +4411,166 @@ mod tests {
         assert_eq!(frame.pixel(at[0] + 44, at[1] + 29), Some([200, 100, 50]));
     }
 
+    fn field(text: &str) -> (Message, DialogState) {
+        let m = Message::prompt("Name", "Enter name:", text, vec!["OK".into()]);
+        let mut state = DialogState::for_message(&m);
+        state.selection = None;
+        (m, state)
+    }
+
+    #[test]
+    fn shift_moves_grow_and_shrink_the_selection_from_its_anchor() {
+        // `0x5f2ec7`: the end of the selection at the caret moves; the
+        // other end stays, and the selection flips when the caret crosses it.
+        let (m, mut state) = field("abcdef");
+        state.caret = Some(2);
+        assert!(state.move_right(&m, true));
+        assert!(state.move_right(&m, true));
+        assert_eq!((state.caret, state.selection), (Some(4), Some((2, 4))));
+        assert!(state.move_left(&m, true));
+        assert_eq!(state.selection, Some((2, 3)));
+        for _ in 0..3 {
+            state.move_left(&m, true);
+        }
+        assert_eq!((state.caret, state.selection), (Some(0), Some((0, 2))));
+        // Shift+End from there runs to the end from the same anchor.
+        assert!(state.end_in_layout(&m, None, None, true));
+        assert_eq!((state.caret, state.selection), (Some(6), Some((2, 6))));
+        // Without Shift the selection goes and the caret steps from where
+        // it is, not from the selection's edge.
+        assert!(state.move_left(&m, false));
+        assert_eq!((state.caret, state.selection), (Some(5), None));
+        // Back onto the anchor selects nothing.
+        state.caret = Some(3);
+        state.move_right(&m, true);
+        state.move_left(&m, true);
+        assert_eq!((state.caret, state.selection), (Some(3), None));
+    }
+
+    #[test]
+    fn word_moves_stop_where_the_original_stops() {
+        // `0x5f3188`: right ends at the next word's start, left at the
+        // start of the word before (spaces and line feeds separate).
+        let chars: Vec<char> = "ab  cd".chars().collect();
+        assert_eq!(word_target(&chars, 0, 1), 4);
+        assert_eq!(word_target(&chars, 4, 1), 6);
+        assert_eq!(word_target(&chars, 6, 1), 6);
+        assert_eq!(word_target(&chars, 6, -1), 4);
+        assert_eq!(word_target(&chars, 4, -1), 0);
+        assert_eq!(word_target(&chars, 3, -1), 0);
+        assert_eq!(word_target(&chars, 0, -1), 0);
+        let lines: Vec<char> = "ab\ncd ef".chars().collect();
+        assert_eq!(word_target(&lines, 0, 1), 3);
+        assert_eq!(word_target(&lines, 5, -1), 3);
+
+        // A double-click (`0x5f2c21`) takes the word and the spaces after it.
+        let (m, mut state) = field("ab cd  ef");
+        state.caret = Some(4);
+        assert!(state.select_word(&m));
+        assert_eq!((state.caret, state.selection), (Some(7), Some((3, 7))));
+        assert_eq!(state.selected_text(&m).as_deref(), Some("cd  "));
+        // On a word's first letter it takes that word, not the one before;
+        // on its last, the same word; at the very end, the last word.
+        for (caret, word) in [(3, "cd  "), (0, "ab "), (4, "cd  "), (9, "ef")] {
+            let (m, mut state) = field("ab cd  ef");
+            state.caret = Some(caret);
+            state.select_word(&m);
+            assert_eq!(state.selected_text(&m).as_deref(), Some(word), "{caret}");
+        }
+    }
+
+    #[test]
+    fn a_huge_paste_reads_only_what_fits() {
+        let clipboard = "\t".repeat(2_000_000);
+        let (mut m, mut state) = field("");
+        assert!(state.paste(&mut m, &clipboard));
+        assert_eq!(m.entry.as_deref(), Some(" ".repeat(ENTRY_MOST).as_str()));
+        // The one-pass cleaners give what the original's in-place loops give.
+        assert_eq!(clipboard_text("\r\t\t\u{1}"), "\t    ");
+        assert_eq!(single_line_text("\u{1}\u{2}\u{3}x\n"), "\u{2}x");
+    }
+
+    #[test]
+    fn each_save_card_field_keeps_its_own_overwrite_mode() {
+        let mut m = Message::save_card("Name", "Desc", None, vec!["OK".into()], None);
+        let mut state = DialogState::for_message(&m);
+        assert!(state.switch_field(&m));
+        assert!(state.toggle_overwrite());
+        assert!(state.overwrite());
+        assert!(state.switch_field(&m));
+        assert!(!state.overwrite(), "Lot Name inserts still");
+        state.selection = None;
+        state.caret = Some(0);
+        assert!(state.insert(&mut m, 'X'));
+        assert_eq!(m.entry.as_deref(), Some("XName"));
+    }
+
+    #[test]
+    fn a_paste_is_cleaned_and_cut_to_the_fields_limit() {
+        // `0x5d7cf1`: CR goes, a tab is four spaces, other control
+        // characters go but the line feed, and the character after a
+        // removed one is not looked at.
+        assert_eq!(clipboard_text("a\tb\r\nc"), "a    b\nc");
+        assert_eq!(clipboard_text("a\u{1}\u{2}b"), "a\u{2}b");
+        // `0x5f477b`: a single-line field drops the control characters left.
+        assert_eq!(single_line_text("a\nb"), "ab");
+
+        let (mut m, mut state) = field("Abc");
+        state.caret = Some(1);
+        assert!(state.paste(&mut m, "x\ty\r\nz"));
+        assert_eq!(m.entry.as_deref(), Some("Ax    yzbc"));
+        assert_eq!(state.caret, Some(8));
+
+        // It replaces the selection, and what passes the 64 characters
+        // (`0x5f32bc`) is cut off.
+        let (mut m, mut state) = field("Abc");
+        assert!(state.select_all(&m));
+        assert!(state.paste(&mut m, &"z".repeat(70)));
+        assert_eq!(m.entry.as_deref().map(str::len), Some(ENTRY_MOST));
+        assert_eq!(state.caret, Some(ENTRY_MOST));
+        assert!(!state.paste(&mut m, "more"), "a full field takes nothing");
+        assert!(!state.paste(&mut m, "\u{1}"));
+
+        // Cut takes the selection out.
+        let (mut m, mut state) = field("Hello world");
+        state.caret = Some(5);
+        state.move_word(&m, -1, true);
+        assert_eq!(state.cut(&mut m).as_deref(), Some("Hello"));
+        assert_eq!(m.entry.as_deref(), Some(" world"));
+        assert_eq!(state.cut(&mut m), None);
+    }
+
+    #[test]
+    fn overwrite_replaces_the_character_at_the_caret_even_at_the_limit() {
+        let (mut m, mut state) = field("abc");
+        assert!(state.toggle_overwrite());
+        state.caret = Some(1);
+        assert!(state.insert(&mut m, 'X'));
+        assert_eq!((m.entry.as_deref(), state.caret), (Some("aXc"), Some(2)));
+        // At the end it inserts.
+        state.caret = Some(3);
+        assert!(state.insert(&mut m, 'd'));
+        assert_eq!(m.entry.as_deref(), Some("aXcd"));
+        // A full field still takes an overwrite.
+        let full = "q".repeat(ENTRY_MOST);
+        let (mut m, mut state) = field(&full);
+        state.toggle_overwrite();
+        state.caret = Some(0);
+        assert!(state.insert(&mut m, 'Z'));
+        assert!(m.entry.as_deref().unwrap().starts_with('Z'));
+        state.toggle_overwrite();
+        assert!(
+            !state.insert(&mut m, 'Z'),
+            "inserting into a full field fails"
+        );
+    }
+
     #[test]
     fn dialog_state_edits_caret_blinks_and_handles_disabled_buttons() {
         let mut m = Message::prompt("Name", "Enter name:", "Abc", vec!["OK".into(), "No".into()]);
         let mut state = DialogState::default();
         assert_eq!(state.caret_in(m.entry.as_deref().unwrap()), 3);
-        assert!(state.move_left(&m));
+        assert!(state.move_left(&m, false));
         assert!(state.insert(&mut m, 'X'));
         assert_eq!(m.entry.as_deref(), Some("AbXc"));
         assert!(state.backspace(&mut m));
@@ -4746,6 +5180,41 @@ mod tests {
         let mut left = Frame::new(800, 600, [0, 0, 0]);
         draw_with_state(&mut left, &art, &msg, &laid, None, &state);
         assert_eq!(left.pixel(btn.x + 1, btn.y + 1), Some([10, 0, 0]));
+    }
+
+    /// `0x524603` -> `0x5df45d`: an opaque sheet's corners land unblended,
+    /// pixel for pixel, at the rect's four corners.
+    #[test]
+    fn the_nine_slice_copies_its_corners_exactly() {
+        let mut rgba = Vec::new();
+        for y in 0..9u8 {
+            for x in 0..9u8 {
+                rgba.extend_from_slice(&[x * 20, y * 20, 7, 255]);
+            }
+        }
+        let sheet = Image {
+            width: 9,
+            height: 9,
+            rgba,
+        };
+        let rect = Rect::new(5, 4, 20, 14);
+        let mut frame = Frame::new(32, 24, [255, 255, 255]);
+        draw_nine_slice(&mut frame, &sheet, rect);
+        for (sx, sy, x, y) in [
+            (0, 0, 5, 4),
+            (2, 2, 7, 6),
+            (8, 0, 24, 4),
+            (6, 2, 22, 6),
+            (0, 8, 5, 17),
+            (8, 8, 24, 17),
+            (6, 6, 22, 15),
+        ] {
+            let p = sheet.pixel(sx, sy).unwrap();
+            assert_eq!(frame.pixel(x, y), Some([p[0], p[1], p[2]]), "({sx},{sy})");
+        }
+        // Nothing outside the rect.
+        assert_eq!(frame.pixel(4, 4), Some([255, 255, 255]));
+        assert_eq!(frame.pixel(25, 17), Some([255, 255, 255]));
     }
 
     #[test]

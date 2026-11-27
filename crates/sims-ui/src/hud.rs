@@ -248,6 +248,21 @@ pub const RESOURCES: [i32; 57] = [
 /// pause blinking (state 2) and ultra-speed idle blinking (state 3).
 pub const PAUSE_BLINK_US: u64 = 500_000;
 
+/// The job panel performance blink's half period: `0x530530..0x5306c6`
+/// starts it with `0x5306df(333)`, and the timer `0x52c659` re-arms with
+/// the same period each time it flips the color.
+pub const PERFORMANCE_BLINK_US: u64 = 333_000;
+
+/// The performance text's color on the lit half of its blink: `[0x6f2ab0]`,
+/// RGB (0, 202, 57) packed to 16 bits at `0x4ff43a`.
+pub const PERFORMANCE_LIT: [u8; 3] = rgb565(0x0647);
+
+/// Whether the job panel item `kind` blinks its performance: an adult's
+/// panel with a job (`0x4ea722`) and performance below 0 (`0x4ea88c`).
+pub fn performance_blinks(kind: &Kind) -> bool {
+    matches!(kind, Kind::Work { work, performance, .. } if work.level.is_some() && *performance < 0)
+}
+
 /// Active 500 ms blink state of the clock controls (`[esi + 0x1e4]`,
 /// `0x53b4b1..0x53b7e7`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -334,6 +349,11 @@ pub struct Controls {
     /// currently highlights `id::ULTRA` (toggled every [`PAUSE_BLINK_US`];
     /// starts `false` on entry at `0x53b6e0..0x53b705`).
     pub ultra_lit: bool,
+    /// Whether the job panel's performance is on the green half of its
+    /// blink (`[gadget + 0x1a4]`, flipped every [`PERFORMANCE_BLINK_US`] by
+    /// `0x52c659` while the Sim has a job and performance is below 0,
+    /// `0x5306df`; off when that stops, `0x53070d`).
+    pub performance_lit: bool,
     /// Whether the Interests (`[esi + 0x170]`) and Gifts (`[esi + 0x174]`)
     /// gadget buttons are enabled (`byte [btn + 0x168]`, `0x51c5a6..0x51c9e5`).
     /// Enabled for human household Sims, disabled for pets and non-household
@@ -404,6 +424,7 @@ impl Default for Controls {
             speed: Some(Speed::Normal),
             pause_lit: false,
             ultra_lit: false,
+            performance_lit: false,
             interests_gifts_enabled: true,
             camera: CameraState::default(),
             pointer: None,
@@ -1099,6 +1120,7 @@ pub fn layout_with_options_lot(
                 Some(i.rect)
             }
             (Help::ReportCard, Kind::ReportCard { .. }) => Some(i.rect),
+            (Help::JobSkill(_), Kind::Skills { .. }) => Some(i.rect),
             (Help::FameSkill(_) | Help::FameLevel(_) | Help::FameFriends, Kind::Fame { .. }) => {
                 Some(i.rect)
             }
@@ -1145,6 +1167,9 @@ pub fn help_matches_snapshot(help: Help, snapshot: &Snapshot, panel: Option<Pane
         }
         Help::FameSkill(_) | Help::FameLevel(_) | Help::FameFriends => {
             panel == Some(Panel::Job) && resident.job_panel(snapshot.superstar) == JobPanel::Fame
+        }
+        Help::JobSkill(_) => {
+            panel == Some(Panel::Job) && resident.job_panel(snapshot.superstar) == JobPanel::Adult
         }
     }
 }
@@ -1535,6 +1560,16 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
                     },
                     command: None,
                 });
+                // The six skill labels open their help balloons (`0x53074c`
+                // code 1), as the Superstar panel's do.
+                let [lx, ly, lw, lh] = JOB_SKILL_BUTTON;
+                for n in 0..6i32 {
+                    items.push(Item {
+                        rect: Rect::new(panel.x + lx, panel.y + ly + SKILL_PITCH * n, lw, lh),
+                        kind: Kind::Area,
+                        command: Some(Command::Help(Help::JobSkill(n as u8))),
+                    });
+                }
             }
         }
     }
@@ -1729,6 +1764,9 @@ const SKILL_NAMES: [&str; 6] = [
 /// (measured; what sizes the boxes is not found).
 const SKILL_FONT: u8 = 7;
 const SKILL_LABEL: [i32; 4] = [93, 5, 62, 16];
+/// The skill labels as buttons, where `0x6f4420` puts them: 62 by 16 from
+/// (93, 6), 15 apart.
+const JOB_SKILL_BUTTON: [i32; 4] = [93, 6, 62, 16];
 /// The first skill bar, from the subpanel; the others are 15 below each
 /// other (0x6f4300).
 const SKILL_BAR: [i32; 2] = [157, 7];
@@ -2196,10 +2234,11 @@ fn work_icon(art: &Art, id: i32, rows: u32, row: u32) -> Option<(&Image, Rect)> 
 /// - "Need" and the family friends the next level needs, where the
 ///   family has fewer, with the icon after it, 2 down (0x531050).
 ///
-/// Text is in the labels' color. **Not drawn:** the performance's blink
-/// below 0 (0x5306df, every 333 ms), and the tooltips. Which lines of a
-/// title that wraps past its box show is **unverified**: here the lines
-/// that fit.
+/// Text is in the labels' color, but the performance's is
+/// [`PERFORMANCE_LIT`] on the lit half of its blink (`lit`, while
+/// [`performance_blinks`]; `0x52c659` swaps the gadget's text color, not
+/// its icon). **Not drawn:** the tooltips. Which lines of a title that
+/// wraps past its box show is **unverified**: here the lines that fit.
 fn draw_work(
     frame: &mut Frame,
     art: &Art,
@@ -2207,7 +2246,9 @@ fn draw_work(
     work: &Work,
     performance: i16,
     family_friends: i32,
+    lit: bool,
 ) {
+    let lit = lit && work.level.is_some() && performance < 0;
     let [Some(career), Some(salary), Some(rating), Some(friends)] =
         WORK_FONTS.map(|size| art.font(size))
     else {
@@ -2266,7 +2307,12 @@ fn draw_work(
             frame.draw(image, source, [x, y.saturating_add(down)]);
             text_x = x.saturating_add(source.width + 3);
         }
-        font.draw(frame, &text, [text_x, y], LABEL);
+        let rgb = if lit && id == id::PERFORMANCE {
+            PERFORMANCE_LIT
+        } else {
+            LABEL
+        };
+        font.draw(frame, &text, [text_x, y], rgb);
         y = y.saturating_add(font.line_height);
     }
 
@@ -3260,7 +3306,15 @@ pub fn draw_with_thumbnails(
                 work,
                 performance,
                 family_friends,
-            } => draw_work(frame, art, r, work, *performance, *family_friends),
+            } => draw_work(
+                frame,
+                art,
+                r,
+                work,
+                *performance,
+                *family_friends,
+                controls.performance_lit,
+            ),
             Kind::Relation { relation, lit } => draw_relation(frame, art, faces, r, relation, *lit),
             Kind::Interest {
                 icon_id,
@@ -5040,6 +5094,7 @@ mod tests {
                 work,
                 0,
                 family_friends,
+                false,
             );
             frame
         };
@@ -5908,6 +5963,85 @@ mod tests {
             assert!(!in_subpanel(&items, [right, panel.y]), "{size:?}");
             assert!(!in_subpanel(&items, [panel.x, bottom]), "{size:?}");
         }
+    }
+
+    #[test]
+    fn the_performance_blinks_only_for_a_job_below_zero() {
+        let kind = |level: bool, performance: i16| Kind::Work {
+            work: Work {
+                icon: 1,
+                level: level.then(|| crate::household::WorkLevel {
+                    title: "M".into(),
+                    salary: 1,
+                }),
+                friends: 0,
+            },
+            performance,
+            family_friends: 0,
+        };
+        assert!(performance_blinks(&kind(true, -1)));
+        assert!(!performance_blinks(&kind(true, 0)));
+        assert!(!performance_blinks(&kind(false, -50)));
+        assert!(!performance_blinks(&Kind::Area));
+        // `[0x6f2ab0]` is RGB (0, 202, 57) in 16 bits.
+        assert_eq!(PERFORMANCE_LIT, [0, 203, 57]);
+    }
+
+    #[test]
+    fn an_adults_job_skill_labels_open_the_skill_balloons() {
+        let mut s = snapshot();
+        s.residents[0].school_age = false;
+        s.residents[0].child = false;
+        let mut controls = Controls {
+            expanded: true,
+            panel: Some(Panel::Job),
+            ..Controls::default()
+        };
+        let mut texts = Texts::default();
+        let skill_popups: Vec<String> = (0..12).map(|n| format!("K{n}")).collect();
+        texts.set_live(&[], &[], &[], &[], &skill_popups);
+        let items = layout([800, 600], &s, &controls);
+        let panel = items
+            .iter()
+            .find(|i| matches!(i.kind, Kind::Work { .. }))
+            .expect("the adult job panel")
+            .rect;
+        // `0x6f4420`: the labels are 62 by 16 from (93, 6), 15 apart.
+        assert_eq!(
+            press(&items, [panel.x + 93, panel.y + 6 + 30]),
+            Some(Command::Help(Help::JobSkill(2)))
+        );
+        assert_eq!(
+            press(&items, [panel.x + 154, panel.y + 6 + 75 + 15]),
+            Some(Command::Help(Help::JobSkill(5)))
+        );
+        assert_eq!(press(&items, [panel.x + 92, panel.y + 6]), None);
+        assert_eq!(press(&items, [panel.x + 93, panel.y + 5]), None);
+        // The text and pictures are the Superstar skill's.
+        assert_eq!(texts.get(Help::JobSkill(2)), texts.get(Help::FameSkill(2)));
+        assert_eq!(texts.get(Help::JobSkill(2)).unwrap().title, "K4");
+        // Another label replaces the balloon; the same one closes it.
+        controls.apply(&Command::Help(Help::JobSkill(2)));
+        assert_eq!(controls.help, Some(Help::JobSkill(2)));
+        controls.apply(&Command::Help(Help::JobSkill(4)));
+        assert_eq!(controls.help, Some(Help::JobSkill(4)));
+        let items = layout([800, 600], &s, &controls);
+        assert!(items.iter().any(|i| matches!(
+            i.kind,
+            Kind::Help { help: Help::JobSkill(4), owner } if owner == panel
+        )));
+        assert!(help_matches_snapshot(
+            Help::JobSkill(4),
+            &s,
+            Some(Panel::Job)
+        ));
+        assert!(!help_matches_snapshot(
+            Help::JobSkill(4),
+            &s,
+            Some(Panel::Needs)
+        ));
+        controls.apply(&Command::Help(Help::JobSkill(4)));
+        assert_eq!(controls.help, None);
     }
 
     #[test]

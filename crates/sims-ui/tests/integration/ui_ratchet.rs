@@ -281,6 +281,88 @@ fn caf_family_and_sim_screens_match_191_oracles() {
     );
 }
 
+const DEFAULT_HELP_DIALOG_ORACLE: &str =
+    "/Users/tommyvolk/Desktop/sims-rs/cache/goth-help-dialog-shot-20261115";
+
+/// The modal dialog's border, corners included, is the 9-slice
+/// `0x524603` draws (`0x5df45d`): every pixel of the 12-pixel ring of the
+/// Help System dialog matches the 1.91 capture, compared as RGB565 (the
+/// capture widens 5-6-5 by `v * 255 / 31`, [`Frame::quantized`] by
+/// repeating the high bits, so only the codes compare). Corner pixels of
+/// the sheet carry no alpha, and the original blends nothing there.
+#[test]
+fn the_dialog_frame_ring_matches_the_191_help_dialog() {
+    let Some(install) = install() else {
+        return;
+    };
+    let Some(dir) = oracle_dir("SIMS_HELP_DIALOG_ORACLE", DEFAULT_HELP_DIALOG_ORACLE) else {
+        eprintln!("skipping: no Help System dialog capture");
+        return;
+    };
+    let (width, _, want) = load_png(&dir, "help-system-dialog-800x600.png");
+    let ui = UiGraphics::open(&install).expect("open UIGraphics");
+    let art = Art::load(&ui, US_ENGLISH, &[sims_ui::dialog::BACKGROUND]).expect("load 3008");
+    let sheet = art.image(sims_ui::dialog::BACKGROUND).expect("3008");
+    assert!(
+        sheet.rgba.chunks(4).all(|p| p[3] == 255),
+        "3008 has no partly transparent pixels"
+    );
+    let rect = sims_ui::frame::Rect::new(156, 185, 488, 230);
+    let mut frame = Frame::new(800, 600, [0, 0, 0]);
+    sims_ui::dialog::draw_nine_slice(&mut frame, sheet, rect);
+    let ring = 12;
+    let mut checked = 0;
+    let mut mismatches = Vec::new();
+    for dy in 0..rect.height {
+        for dx in 0..rect.width {
+            let inner =
+                (ring..rect.width - ring).contains(&dx) && (ring..rect.height - ring).contains(&dy);
+            if inner {
+                continue;
+            }
+            let (x, y) = (rect.x + dx, rect.y + dy);
+            let got = frame.pixel(x, y).expect("in frame");
+            let at = y as usize * width + x as usize;
+            checked += 1;
+            if pack_565(got) != pack_565(want[at]) {
+                mismatches.push((dx, dy, got, want[at]));
+            }
+        }
+    }
+    assert!(checked > 16_000, "{checked}");
+    assert!(
+        mismatches.is_empty(),
+        "{} of {checked} ring pixels differ, first {:?}",
+        mismatches.len(),
+        &mismatches[..mismatches.len().min(8)]
+    );
+}
+
+/// The tutorial marker's bitmap is three 50×50 cells side by side, keyed
+/// on magenta (`[0x6f2ab4]` = `0xf81f`), so the cells have holes; the
+/// Zoom In button puts it at (15, 469).
+#[test]
+fn the_tutorial_marker_bitmap_is_three_keyed_50_pixel_cells() {
+    let Some(install) = install() else {
+        return;
+    };
+    let ui = UiGraphics::open(&install).expect("open UIGraphics");
+    let art = Art::load(&ui, US_ENGLISH, &[sims_ui::tutorial::MARKER]).expect("load 4980");
+    let image = art.image(sims_ui::tutorial::MARKER).expect("4980");
+    assert_eq!((image.width, image.height), (150, 50));
+    let keyed = image.rgba.chunks(4).filter(|p| p[3] == 0).count();
+    assert!(keyed > 0 && keyed < 150 * 50, "{keyed}");
+    let zoom_in = sims_ui::frame::Rect::new(26, 522, 27, 27);
+    assert_eq!(sims_ui::tutorial::origin(zoom_in, [50, 50]), [15, 469]);
+    let mut frame = Frame::new(800, 600, [1, 2, 3]);
+    sims_ui::tutorial::draw(&mut frame, &art, zoom_in, 0);
+    let drawn = (469..519)
+        .flat_map(|y| (15..65).map(move |x| (x, y)))
+        .filter(|&(x, y)| frame.pixel(x, y) != Some([1, 2, 3]))
+        .count();
+    assert!(drawn > 0 && drawn < 50 * 50, "{drawn}");
+}
+
 #[test]
 fn camera_panel_loads_all_191_assets_strings_and_renders_native_strip() {
     let Some(install) = install() else {

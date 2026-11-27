@@ -283,7 +283,7 @@ fn a_non_modal_text_field_takes_the_keys_after_a_modal_dialog() {
     // field, as on a modal one.
     assert!(drawn(&mut game).is_some_and(|(caller, _)| caller == phone));
     assert!(game.has_non_modal_dialog_entry());
-    assert!(game.dialog_end());
+    assert!(game.dialog_end(false, false));
     for _ in start.chars() {
         assert!(game.dialog_backspace());
     }
@@ -298,6 +298,47 @@ fn a_non_modal_text_field_takes_the_keys_after_a_modal_dialog() {
     assert_eq!(game.dialog_entry(), Some("Abe"), "a reshow keeps the text");
     let _ = game.dialog_confirm_key(DialogKey::Escape);
     assert_eq!(status(&game, phone), SHOWN);
+    assert_eq!(game.dialog_entry(), Some("Abe"));
+
+    // Shift+Left twice selects "be" (`0x5f2ec7`); a paste replaces it, its
+    // tab widened to four spaces (`0x5d7cf1`); Ctrl+Shift+Left selects the
+    // word before the caret (`0x5f3188`) and a cut takes it out.
+    // The game keeps its own clipboard, so the test leaves the system's
+    // alone.
+    game.use_local_clipboard();
+    assert!(!game.dialog_paste(None), "nothing on the clipboard yet");
+    assert!(game.dialog_move_left(false, true));
+    assert!(game.dialog_move_left(false, true));
+    assert!(game.dialog_paste(Some("x\ty")));
+    assert_eq!(game.dialog_entry(), Some("Ax    y"));
+    assert!(game.dialog_move_left(true, true));
+    assert!(game.dialog_cut().is_some_and(|t| t == "y"));
+    assert_eq!(game.dialog_entry(), Some("Ax    "));
+    // What was cut pastes back.
+    assert!(game.dialog_paste(None));
+    assert_eq!(game.dialog_entry(), Some("Ax    y"));
+    assert!(game.dialog_move_left(true, true));
+    assert!(game.dialog_cut().is_some_and(|t| t == "y"));
+    // Insert switches to overwriting: Home, then two characters replace
+    // the first two.
+    assert!(game.dialog_toggle_overwrite());
+    assert!(game.dialog_home(false, false));
+    assert!(game.type_dialog_char('A'));
+    assert!(game.type_dialog_char('b'));
+    assert!(game.dialog_toggle_overwrite());
+    assert!(game.dialog_end(false, true));
+    assert!(game.dialog_backspace());
+    assert!(game.type_dialog_char('e'));
+    assert_eq!(game.dialog_entry(), Some("Abe"));
+
+    // A double click selects the word only when its press went to the
+    // field (`0x5f2c21`), not when another window took it.
+    let entry = game.dialog().and_then(|l| l.entry).expect("the field");
+    let point = [entry.x + 2, entry.y + entry.height / 2];
+    assert!(!game.dialog_double_click(point), "no press in the field");
+    game.press(point);
+    assert!(game.dialog_double_click(point));
+    game.release(point);
     assert_eq!(game.dialog_entry(), Some("Abe"));
 
     // Enter answers with the first button and the text typed, which the

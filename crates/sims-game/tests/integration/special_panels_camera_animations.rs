@@ -11,7 +11,9 @@ use sims_game::{Frames, Game, Options};
 use sims_net::{ManifestDigest, MemoryMesh, SessionConfig, Transport};
 use sims_ui::balloon::FADE_DURATION_MS as BALLOON_FADE_MS;
 use sims_ui::camera::{CameraButton, SnapshotQuality, SnapshotSize};
-use sims_ui::command::{Camera as UiCamera, Command, Mode, Panel as UiPanel};
+use sims_ui::command::{
+    Camera as UiCamera, Command, Mode, OptionsHelp, OptionsTab, Panel as UiPanel,
+};
 use sims_ui::queue::SLIDE_DURATION_MS;
 use sims_vm::{SpecialPanelRequest, SpecialPanelResponse};
 use std::path::PathBuf;
@@ -796,6 +798,187 @@ fn temporal_ui_animations_advance_when_clock_positive_and_snap_at_clock_zero() {
         !game.ui_animating(),
         "help balloon fade-out settles cleanly"
     );
+
+    // 0x50fad3..0x50fb2f: a balloon reopened while it still fades out turns
+    // the ramp around without a second UI_whoosh.
+    let whooshes = |game: &mut Game| {
+        game.take_sounds()
+            .iter()
+            .filter(|s| matches!(s, sims_vm::SoundEvent::Play { name, .. } if name == "UI_whoosh"))
+            .count()
+    };
+    let _ = game.take_sounds();
+    game.press(help_pt);
+    game.release(help_pt);
+    game.render();
+    game.advance_while(u64::from(BALLOON_FADE_MS + 50) * 1_000, 0, |_| true);
+    game.render();
+    game.press(help_pt);
+    game.release(help_pt);
+    game.render();
+    assert_eq!(whooshes(&mut game), 2, "an open and a close each whoosh");
+    game.advance_while(100_000, 0, |_| true);
+    game.render();
+    assert!(game.ui_animating(), "100 ms into the fade-out");
+    game.press(help_pt);
+    game.release(help_pt);
+    assert_eq!(whooshes(&mut game), 0, "a reopen mid-fade is silent");
+    game.render();
+    assert!(game.ui_animating(), "the ramp turns around");
+    game.advance_while(u64::from(BALLOON_FADE_MS + 50) * 1_000, 0, |_| true);
+    game.render();
+    game.press(help_pt);
+    game.release(help_pt);
+    game.render();
+    game.advance_while(u64::from(BALLOON_FADE_MS + 50) * 1_000, 0, |_| true);
+    game.render();
+    assert_eq!(whooshes(&mut game), 1, "a close after the fade-in whooshes");
+    assert!(!game.ui_animating());
+    // A close and a reopen with no frame drawn between: the close whooshes
+    // and starts the fade-out at once, so the reopen is silent.
+    game.press(help_pt);
+    game.release(help_pt);
+    game.render();
+    game.advance_while(u64::from(BALLOON_FADE_MS + 50) * 1_000, 0, |_| true);
+    game.render();
+    let _ = game.take_sounds();
+    game.press(help_pt);
+    game.release(help_pt);
+    game.advance_while(50_000, 0, |_| true);
+    game.press(help_pt);
+    game.release(help_pt);
+    assert_eq!(whooshes(&mut game), 1, "only the close whooshes");
+    game.render();
+    assert!(game.ui_animating(), "the fade turns around");
+    game.advance_while(u64::from(BALLOON_FADE_MS + 50) * 1_000, 0, |_| true);
+    game.render();
+    game.press(help_pt);
+    game.release(help_pt);
+    game.render();
+    game.advance_while(u64::from(BALLOON_FADE_MS + 50) * 1_000, 0, |_| true);
+    game.render();
+    assert!(!game.ui_animating());
+
+    // An Options help balloon (`cWinBalloon` too) fades in and out the same way.
+    let point_of = |game: &Game, target: &Command| {
+        let r = game
+            .panel()
+            .iter()
+            .find(|i| i.command.as_ref() == Some(target))
+            .unwrap_or_else(|| panic!("expected item for {target:?}"))
+            .rect;
+        [r.x + r.width / 2, r.y + r.height / 2]
+    };
+    let options_btn = point_of(&game, &Command::SetMode(Mode::Options));
+    game.press(options_btn);
+    game.release(options_btn);
+    game.render();
+    let play_tab = point_of(&game, &Command::OpenOptionsTab(OptionsTab::Play));
+    game.press(play_tab);
+    game.release(play_tab);
+    game.render();
+    let free_will = point_of(&game, &Command::OptionsHelp(OptionsHelp::FreeWill));
+    game.press(free_will);
+    game.release(free_will);
+    game.render();
+    assert!(
+        game.ui_animating(),
+        "an Options balloon fades in at clock_us > 0"
+    );
+    game.advance_while(u64::from(BALLOON_FADE_MS + 50) * 1_000, 0, |_| true);
+    game.render();
+    assert!(!game.ui_animating());
+    game.press(free_will);
+    game.release(free_will);
+    game.render();
+    assert!(game.ui_animating(), "and fades out");
+    game.advance_while(u64::from(BALLOON_FADE_MS + 50) * 1_000, 0, |_| true);
+    game.render();
+    assert!(!game.ui_animating());
+    // Escape closing the tab fades its balloon out, with one whoosh.
+    game.press(free_will);
+    game.release(free_will);
+    game.render();
+    game.advance_while(u64::from(BALLOON_FADE_MS + 50) * 1_000, 0, |_| true);
+    game.render();
+    let _ = game.take_sounds();
+    assert!(game.escape_options());
+    assert_eq!(whooshes(&mut game), 1, "Escape whooshes the balloon away");
+    game.render();
+    assert!(game.ui_animating(), "and it fades out");
+    game.advance_while(u64::from(BALLOON_FADE_MS + 50) * 1_000, 0, |_| true);
+    game.render();
+    assert!(!game.ui_animating());
+    game.press(play_tab);
+    game.release(play_tab);
+    game.render();
+    // Its fade starts at the Escape, so the balloon opened again before a
+    // frame turns the ramp around without a second whoosh.
+    game.press(free_will);
+    game.release(free_will);
+    game.render();
+    game.advance_while(u64::from(BALLOON_FADE_MS + 50) * 1_000, 0, |_| true);
+    game.render();
+    let _ = game.take_sounds();
+    assert!(game.escape_options());
+    game.press(play_tab);
+    game.release(play_tab);
+    game.press(free_will);
+    game.release(free_will);
+    assert_eq!(
+        whooshes(&mut game),
+        1,
+        "one whoosh for the close and reopen"
+    );
+    game.render();
+    // Collapsing the panel (F10) takes its Options balloon with it.
+    game.press(free_will);
+    game.release(free_will);
+    game.render();
+    game.advance_while(u64::from(BALLOON_FADE_MS + 50) * 1_000, 0, |_| true);
+    game.render();
+    assert!(game.toggle_panel());
+    game.render();
+    game.advance_while(10_000, 0, |_| true);
+    game.render();
+    assert!(
+        !game.ui_animating(),
+        "no Options balloon fades over the collapsed panel"
+    );
+    assert!(game.toggle_panel());
+    game.render();
+    let free_will = point_of(&game, &Command::OptionsHelp(OptionsHelp::FreeWill));
+    // An Options balloon open when the panel goes is not carried into
+    // Live: no fade there, and a Live balloon opened then whooshes.
+    game.press(free_will);
+    game.release(free_will);
+    game.render();
+    game.advance_while(u64::from(BALLOON_FADE_MS + 50) * 1_000, 0, |_| true);
+    game.render();
+    let live_btn = point_of(&game, &Command::SetMode(Mode::Live));
+    game.press(live_btn);
+    game.release(live_btn);
+    game.render();
+    game.advance_while(10_000, 0, |_| true);
+    game.render();
+    assert!(!game.ui_animating(), "no Options balloon fades over Live");
+    let _ = game.take_sounds();
+    game.press(help_pt);
+    game.release(help_pt);
+    assert_eq!(
+        whooshes(&mut game),
+        1,
+        "a Live balloon opens with its whoosh"
+    );
+    game.render();
+    assert!(game.ui_animating());
+    game.advance_while(u64::from(BALLOON_FADE_MS + 50) * 1_000, 0, |_| true);
+    game.render();
+    game.press(help_pt);
+    game.release(help_pt);
+    game.render();
+    game.advance_while(u64::from(BALLOON_FADE_MS + 50) * 1_000, 0, |_| true);
+    game.render();
 
     // QueueSlideState: 500 ms action-queue icon slide-in from pie-menu click origin,
     // and mid-slide icons ignore clicks (`Queue::at_clickable`).

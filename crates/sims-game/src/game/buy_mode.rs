@@ -325,6 +325,7 @@ impl Game {
     /// which keeps the Buy tool armed for repeat purchases after placing any
     /// affordable item (`0x48680f`) and toggles Build Mode Room-Box / Room-Fill.
     pub fn set_shift(&mut self, held: bool) {
+        self.hud.set_shift(held);
         if self.shift_held == held {
             return;
         }
