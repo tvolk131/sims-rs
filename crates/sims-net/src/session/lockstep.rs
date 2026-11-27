@@ -18,9 +18,9 @@
 
 use crate::error::{SessionError, SnapshotError, TransportError};
 use crate::protocol::{
-    CameraRotation, Command, CommandSeq, DEFAULT_SNAPSHOT_CHUNK_BYTES, Epoch, LeaveReason,
-    MAX_WIRE_FRAME_BYTES, ManifestDigest, PROTOCOL_VERSION, PeerRosterEntry, PlayerId, PlayerRole,
-    RejectReason, ResyncReason, SessionConfig, SimSpeed, SnapshotId, StampedCommand,
+    BUILD_ID, BuildId, CameraRotation, Command, CommandSeq, DEFAULT_SNAPSHOT_CHUNK_BYTES, Epoch,
+    LeaveReason, MAX_WIRE_FRAME_BYTES, ManifestDigest, PROTOCOL_VERSION, PeerRosterEntry, PlayerId,
+    PlayerRole, RejectReason, ResyncReason, SessionConfig, SimSpeed, SnapshotId, StampedCommand,
     StateFingerprint, Tick, TickBatch, WireMessage, encode_payload,
 };
 use crate::session::state::{AppliedBatch, PerPlayerState, SessionState};
@@ -212,6 +212,10 @@ pub struct LockstepNode {
     local_endpoint_hint: Option<String>,
     local_player_id: Option<PlayerId>,
     manifest: ManifestDigest,
+    /// The build identity this node sends in its `Hello` and, as host,
+    /// requires of every joiner's ([`BUILD_ID`] unless a test sets another
+    /// with [`LockstepNode::set_build_id`]).
+    build: BuildId,
     session: SessionState,
 
     // Shared lockstep buffering and fingerprint history.
@@ -278,6 +282,7 @@ impl LockstepNode {
             local_endpoint_hint: host_endpoint_hint,
             local_player_id: Some(PlayerId::INITIAL_HOST),
             manifest,
+            build: BUILD_ID,
             session,
             pending_batches: BTreeMap::new(),
             retained_batches: BTreeMap::new(),
@@ -328,6 +333,7 @@ impl LockstepNode {
             local_endpoint_hint,
             local_player_id: None,
             manifest,
+            build: BUILD_ID,
             session,
             pending_batches: BTreeMap::new(),
             retained_batches: BTreeMap::new(),
@@ -402,6 +408,19 @@ impl LockstepNode {
             || self.resync_requested
     }
 
+    /// The build identity this node sends and requires ([`BUILD_ID`] by
+    /// default).
+    pub const fn build_id(&self) -> BuildId {
+        self.build
+    }
+
+    /// Replaces this node's build identity, for a test of two builds.
+    /// Set it before [`LockstepNode::send_hello`]; the host compares each
+    /// `Hello` with its value when the `Hello` arrives.
+    pub fn set_build_id(&mut self, build: BuildId) {
+        self.build = build;
+    }
+
     /// Current adaptive pacing period in milliseconds.
     pub const fn pacing_hint_ms(&self) -> u32 {
         self.smoothed_pacing_ms
@@ -432,6 +451,7 @@ impl LockstepNode {
                 player_name: self.local_name.clone(),
                 manifest: self.manifest,
                 endpoint_hint: self.local_endpoint_hint.clone(),
+                build: self.build,
             },
         )?;
         self.hello_sent = true;
@@ -1119,6 +1139,7 @@ impl LockstepNode {
                 player_name,
                 manifest,
                 endpoint_hint,
+                build,
             } => self.on_hello(
                 transport,
                 from,
@@ -1126,6 +1147,7 @@ impl LockstepNode {
                 player_name,
                 manifest,
                 endpoint_hint,
+                build,
             ),
             WireMessage::Welcome {
                 epoch,
@@ -1209,6 +1231,7 @@ impl LockstepNode {
         }
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn on_hello<T: Transport>(
         &mut self,
         transport: &mut T,
@@ -1217,6 +1240,7 @@ impl LockstepNode {
         player_name: String,
         manifest: ManifestDigest,
         endpoint_hint: Option<String>,
+        build: BuildId,
     ) {
         if self.role != PlayerRole::Host {
             let _ = transport.send(
@@ -1236,6 +1260,18 @@ impl LockstepNode {
                     reason: RejectReason::ProtocolVersionMismatch {
                         expected: PROTOCOL_VERSION,
                         actual: protocol_version,
+                    },
+                },
+            );
+            return;
+        }
+        if build != self.build {
+            let _ = transport.send(
+                &from,
+                WireMessage::Reject {
+                    reason: RejectReason::BuildMismatch {
+                        expected: self.build,
+                        actual: build,
                     },
                 },
             );

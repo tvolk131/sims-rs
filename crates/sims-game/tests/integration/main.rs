@@ -6,6 +6,7 @@
 
 mod cheats_cache_and_open_pack;
 mod common;
+mod dialog_timer;
 mod downtown_arrival;
 mod goth;
 mod magic_town_arrival;

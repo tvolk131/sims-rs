@@ -452,6 +452,71 @@ fn buy_entries_list_what_the_builder_keeps() {
     );
 }
 
+/// The catalog text is read from the object's own file only, never from
+/// its semi-global, as the original reads it (traced in
+/// `docs/decisions/20261126-non-modal-dialogs-catalog-text-coop-build-id.md`):
+/// `0x457d3b` passes the definition's own file (`[def+0]`) to `0x4061e3`,
+/// which reads CATS through that file's vtable +0x38 (`0x406222`), and the
+/// CTSS fallback (`0x470256` → `0x470ca7`) does the same (`0x470cfc`). The
+/// semi-global (`[def+0xc]`) is read only by the TTAB lookup (`0x457cb0`,
+/// through `0x416920` and `0x416924`). So a semi-global's CATS or CTSS of
+/// the same number names nothing, and the definition falls back to its
+/// label.
+#[test]
+fn catalog_text_is_never_read_from_the_semi_global() {
+    let tree = Tree::new("buy-semi-text");
+    let semi = write(&[
+        chunk(b"TTAB", 51, "", &one_entry_ttab()),
+        chunk(b"CATS", 99, "", b"Semi words\0Semi name\0"),
+        chunk(
+            b"CTSS",
+            99,
+            "",
+            &localized(&[(1, b"Semi name"), (1, b"Semi words")]),
+        ),
+    ])
+    .unwrap();
+    tree.file("GameData/Behavior.iff", b"").file(
+        "GameData/Global/Global.far",
+        &far(&[
+            ("Global.iff", &write(&[]).unwrap()),
+            ("ThingGlobals.iff", &semi),
+        ]),
+    );
+    let object = write(&[
+        // No graphics; TTAB 51 and string table 99 only in the semi-global.
+        chunk(
+            b"OBJD",
+            131,
+            "helper",
+            &objd(4, &[(TABLE, 51), (STRINGS, 99)]),
+        ),
+        chunk(b"GLOB", 1, "", b"\x0cThingGlobals"),
+    ])
+    .unwrap();
+    tree.file(
+        "GameData/Objects/Objects.far",
+        &far(&[("Thing.iff", &object)]),
+    );
+    let index = Index::build(&Install::detect(&tree.0).unwrap()).unwrap();
+    let catalog = Catalog::build(&index).unwrap();
+    assert!(catalog.diagnostics.is_empty(), "{:?}", catalog.diagnostics);
+    let buy = catalog.buy_entries(&index, 1).unwrap();
+    assert!(buy.diagnostics.is_empty(), "{:?}", buy.diagnostics);
+    let listed: Vec<_> = buy
+        .entries
+        .iter()
+        .map(|e| {
+            (
+                catalog.objects[e.object].guid,
+                String::from_utf8(e.text.name.clone()).unwrap(),
+                String::from_utf8(e.text.description.clone()).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(listed, [(4, "*helper".into(), String::new())]);
+}
+
 /// Needs the game: set `SIMS_INSTALL` to the install folder. Prints
 /// counts only.
 #[test]

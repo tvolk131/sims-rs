@@ -91,6 +91,10 @@ const GLOBAL_MACHINE_LEVEL: usize = 33;
 /// Object data word 1: facing (`0..=7`).
 const DATA_FACING: usize = 1;
 
+/// Where an object off the lot is parked (`x`, `y`): the factory's and the
+/// removal's tile (`crate::factory`, `crate::removal`).
+const PARKED: [i32; 2] = [-16, -16];
+
 /// SimAntics opcode 10 (`Tutorial` / `own_events`) and opcode 34 (`UI Effect`),
 /// used exclusively by the single-player Tutorial and Help System controllers.
 const OPCODE_TUTORIAL: u16 = 10;
@@ -2136,6 +2140,11 @@ impl Lot {
             return CoopCommandStatus::Refused(err.to_string());
         }
 
+        // 0. Refuse a pick that names an object parked off the lot.
+        if let Some(status) = self.refuse_parked_pick(sim_id, target_id, joining, args) {
+            return status;
+        }
+
         // 1. Validate availability against a throwaway issuer-specific
         //    `pie_menu` probe (CoW World clone, zero side effects on shared
         //    state) so stale, unavailable, or forged picks and join offers are
@@ -2226,6 +2235,41 @@ impl Lot {
             Ok(None) => CoopCommandStatus::QueuedInteraction { uid: None },
             Err(fault) => CoopCommandStatus::Refused(fault.to_string()),
         }
+    }
+
+    /// Refuses a [`Command::SimActionPick`] whose Sim, target or (for a join)
+    /// origin Sim is an object parked off the lot at [`PARKED`]: a factory's
+    /// or a removal's helper, or a person who is not on the lot. The lot
+    /// never draws such an object, so no player can click it, and some of
+    /// their menus fault when run that way (#458: a Scold whose stack object
+    /// is 0, native error 0x34), which halts a strict co-op lot for every
+    /// peer. The command came over the wire, so it is refused before its
+    /// menu is even listed, the same on every peer.
+    fn refuse_parked_pick(
+        &self,
+        sim_id: u16,
+        target_id: u16,
+        joining: bool,
+        args: [i16; 4],
+    ) -> Option<CoopCommandStatus> {
+        let origin = joining
+            .then(|| u16::try_from(args[2]).ok())
+            .flatten()
+            .map(|id| ("join origin Sim", id));
+        [("Sim", sim_id), ("target", target_id)]
+            .into_iter()
+            .chain(origin)
+            .find(|&(_, id)| {
+                self.world
+                    .objects
+                    .get(&id)
+                    .is_some_and(|object| object.position[..2] == PARKED)
+            })
+            .map(|(role, id)| {
+                CoopCommandStatus::Refused(format!(
+                    "{role} {id} is parked off the lot at [-16, -16], where no player can pick it"
+                ))
+            })
     }
 
     fn cancel_with_coop(

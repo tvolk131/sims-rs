@@ -1288,6 +1288,26 @@ impl Game {
     /// lot, and the tick that showed it runs again at once.
     pub fn answer(&mut self, caller: u16, button: u8) {
         let Some(asking) = self.lot.asking() else {
+            // A dialog that does not stop the game (its dismiss box answers
+            // with the first button).
+            if let Some(shown) = self
+                .lot
+                .non_modal_dialogs()
+                .into_iter()
+                .find(|d| d.caller == caller)
+            {
+                if !self.hud_shows(caller, shown.operands) {
+                    self.note = Some(format!(
+                        "Object {caller}'s dialog changed before the answer."
+                    ));
+                    return;
+                }
+                match shown.answers.get(usize::from(button)) {
+                    Some(&status) => self.answer_non_modal(caller, status),
+                    None => self.note = Some(format!("The dialog has no button {button}.")),
+                }
+                return;
+            }
             self.note = Some("No dialog waits for an answer.".into());
             return;
         };
@@ -1343,6 +1363,62 @@ impl Game {
         // The tick that showed the dialog runs again now, with the answer,
         // so nothing is listed or ordered on the lot as it was before it.
         self.run(1);
+    }
+
+    /// Answers the dialog that does not stop the game `caller` shows with
+    /// the status `answer` (`Lot::answer_non_modal`, `0x4370be`), between
+    /// ticks: the game goes on, and the caller reads the answer on its
+    /// next turn.
+    pub fn answer_non_modal(&mut self, caller: u16, answer: u8) {
+        let text = self
+            .hud
+            .vm_dialog_key()
+            .filter(|&(shown, _)| shown == caller)
+            .and_then(|_| self.hud.active_dialog_entry().map(str::to_owned));
+        match self.lot.answer_non_modal(caller, answer, text) {
+            Ok(()) => {
+                // The answer is the lot's state, as a tick's change is.
+                self.dirty = true;
+                self.hud.clear_vm_dialog();
+            }
+            Err(e) => self.note = Some(format!("The answer was not taken: {e}")),
+        }
+    }
+
+    /// Whether the dialog the window shows for `caller`, if it shows one
+    /// of `caller`'s, is the record with `operands`: a press or a timer
+    /// read off an older one of `caller`'s, replaced before the next
+    /// draw, answers nothing.
+    fn hud_shows(&self, caller: u16, operands: [u8; 8]) -> bool {
+        self.hud
+            .vm_dialog_key()
+            .is_none_or(|(shown, ops)| shown != caller || ops == operands)
+    }
+
+    /// What the shown simulation dialog's 40 s timer does when it runs
+    /// out (`0x5248a8`): presses the button answering `status`, as a
+    /// press of it would, modal dialog or not.
+    pub(super) fn auto_answer(&mut self, caller: u16, status: u8, modal: bool) {
+        if !modal {
+            let current = self
+                .lot
+                .non_modal_dialogs()
+                .into_iter()
+                .find(|d| d.caller == caller);
+            if current.is_some_and(|d| self.hud_shows(caller, d.operands)) {
+                self.answer_non_modal(caller, status);
+            }
+            return;
+        }
+        let button = self
+            .lot
+            .asking()
+            .filter(|asking| asking.shown.object == caller)
+            .and_then(|asking| asking.shown.answers.iter().position(|&a| a == status))
+            .and_then(|button| u8::try_from(button).ok());
+        if let Some(button) = button {
+            self.answer(caller, button);
+        }
     }
 
     /// A press on the portrait of the Sim `sim` (0x4cf9c4). On another

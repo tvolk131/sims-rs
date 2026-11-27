@@ -665,6 +665,11 @@ impl Catalog {
                 });
                 continue;
             }
+            // The definition's own file only, never its semi-global:
+            // 0x457d3b passes `[def+0]` to 0x4061e3, which reads CATS
+            // through that file (vtable +0x38 at 0x406222), as the CTSS
+            // fallback does (0x470256 -> 0x470ca7, 0x470cfc). Only the TTAB
+            // lookup (0x457cb0) reads the semi-global (`[def+0xc]`).
             let cats = iff.get(b"CATS", definition.strings).map(|c| iff.data(c));
             let ctss = iff
                 .get(b"CTSS", definition.strings)

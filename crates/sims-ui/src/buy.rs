@@ -494,6 +494,12 @@ impl SellLabels {
     }
 }
 
+/// The Buy popup's first line: the object's name, then its price as the
+/// interface writes money ([`crate::currency::simoleons`]: `$1,250`).
+pub fn card_header(name: &str, price: i32) -> String {
+    format!("{name}    {}", crate::currency::simoleons(i64::from(price)))
+}
+
 /// Information about a picked-up existing lot object needed to build the Buy
 /// Mode sell prompt (`0x487d7a` → `0x4cf90b` → `0x50a343`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1531,7 +1537,7 @@ pub fn draw(
         }
         let text_x = card.rect.x + 178;
         if let Some(font) = art.font(12) {
-            let header = format!("{}    ${}", card.name, card.price);
+            let header = card_header(&card.name, card.price);
             font.draw(frame, &header, [text_x, card.rect.y + 12], [235, 240, 255]);
         }
         if let Some(font) = art.font(10) {
@@ -1828,6 +1834,13 @@ mod tests {
                 0x04, // + Logic
             ),
         ])
+    }
+
+    #[test]
+    fn the_popup_writes_its_price_as_money() {
+        assert_eq!(card_header("Item", 80), "Item    $80");
+        assert_eq!(card_header("Item B", 6_500), "Item B    $6,500");
+        assert_eq!(card_header("Item C", 1_234_567), "Item C    $1,234,567");
     }
 
     #[test]

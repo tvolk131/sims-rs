@@ -208,6 +208,14 @@ impl Game {
         if ticks_active {
             consider(self.pace.remaining_us(self.lot.world().speed()));
         }
+        // The simulation dialog's 40 s timer presses its button whether or
+        // not the window can draw.
+        if !self.coop.is_active_or_starting()
+            && !self.auto_answer_held()
+            && let Some(us) = self.hud.auto_answer_remaining_us(self.clock_us)
+        {
+            consider(us.max(1));
+        }
         if can_draw {
             if let Some(picker) = &self.destination_picker {
                 if let Some(us) = picker.next_wake_us(self.clock_us, anim_interval_us) {
@@ -334,6 +342,21 @@ impl Game {
         if self.coop.is_active_or_starting() {
             return self.advance_coop_while(clock_elapsed_us, step_elapsed_us, keep_going);
         }
+        // The shown simulation dialog's 40 s timer (wall clock, paused or
+        // not) presses its last button when it runs out (`0x5248a8`).
+        // A special panel or shell modal in front holds it until it closes.
+        if !self.auto_answer_held()
+            && let Some((caller, status, modal)) = self.hud.take_auto_answer(self.clock_us)
+        {
+            self.auto_answer(caller, status, modal);
+            self.blink_dirty = true;
+            if modal {
+                // The answered tick ran again at once; the time spent
+                // waiting is owed nothing, as after a press.
+                self.pace.restart();
+                return (0, false);
+            }
+        }
         if self.hud.controls.mode != Mode::Live
             || self.hud.has_ui_dialog()
             || self.lot.asking().is_some()
@@ -441,6 +464,10 @@ impl Game {
             }
             self.drop_trip_declined_in_coop();
             let speed_before = (self.lot.world().speed(), self.lot.world().return_speed());
+            // A dialog that does not stop the game is left for the player
+            // in play mode, as the original does. Set before every step: no
+            // save holds it, so a restore or a trip turns it off.
+            self.lot.present_non_modal_dialogs(self.play);
             let step = if self.play {
                 self.lot.step_play()
             } else {
@@ -449,6 +476,16 @@ impl Game {
             match step {
                 Ok(update) => {
                     ran += 1;
+                    if !update.non_modal_shown.is_empty() {
+                        // Read now, as the original makes the widget at the
+                        // end of the update (0x436da0): an informing
+                        // caller goes on, and its text is that tick's.
+                        self.hud.read_non_modal_shown(
+                            self.lot.world(),
+                            &self.assets,
+                            &update.non_modal_shown,
+                        );
+                    }
                     let at = self.lot.ticks();
                     for line in in_order(at, &update.errors, &update.frame_errors) {
                         self.errors.push(at, line);
@@ -476,6 +513,11 @@ impl Game {
                 Err(StepError::Asking { .. }) => {
                     self.pace.restart();
                     self.sync_special_panel();
+                    // The widget, and so its 40 s timer (0x436c89), is
+                    // made now, not at the next frame drawn.
+                    if let Some(asking) = self.lot.asking() {
+                        self.hud.read_dialog(&asking.world, &self.assets);
+                    }
                     break;
                 }
                 Err(error) => {

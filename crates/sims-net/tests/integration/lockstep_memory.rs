@@ -16,13 +16,13 @@
 use serde::{Deserialize, Serialize};
 use sims_net::manifest::sha256_bytes;
 use sims_net::{
-    AppliedBatch, BuyBuildEdit, CameraRotation, Command, CommandIgnoreReason, CommandOutcome,
-    CommandRejectReason, DialogAnswer, DialogId, Epoch, FileManifest, FileManifestEntry,
-    HostStepResult, LinkConfig, LockstepNode, ManifestDigest, MemoryMesh, MemoryNodeTransport,
-    NodeEvent, PeerAddress, PlayerId, PlayerMode, PlayerRole, RejectReason, ResyncReason,
-    SessionConfig, SimSpeed, SnapshotChunk, SnapshotCompression, SnapshotEnvelope, SnapshotError,
-    SnapshotId, SnapshotReceiver, SnapshotSender, Tick, Transport, WireMessage, decode_framed,
-    encode_framed,
+    AppliedBatch, BUILD_ID, BuildId, BuyBuildEdit, CameraRotation, Command, CommandIgnoreReason,
+    CommandOutcome, CommandRejectReason, DialogAnswer, DialogId, Epoch, FileManifest,
+    FileManifestEntry, HostStepResult, LinkConfig, LockstepNode, ManifestDigest, MemoryMesh,
+    MemoryNodeTransport, NodeEvent, PeerAddress, PlayerId, PlayerMode, PlayerRole, RejectReason,
+    ResyncReason, SessionConfig, SimSpeed, SnapshotChunk, SnapshotCompression, SnapshotEnvelope,
+    SnapshotError, SnapshotId, SnapshotReceiver, SnapshotSender, Tick, Transport, WireMessage,
+    decode_framed, encode_framed,
 };
 
 /// Minimal deterministic toy lot state to stand in for `sims_sim::World`
@@ -1269,6 +1269,7 @@ fn transport_identity_binding_config_validation_and_trailing_byte_rejection() {
                 player_name: "Attacker".to_string(),
                 manifest,
                 endpoint_hint: Some("mem:peer".to_string()),
+                build: BUILD_ID,
             },
         )
         .unwrap();
@@ -1707,15 +1708,57 @@ fn round2_host_without_hint_delay_cap_split_brain_and_peer_ack_backpressure() {
     let _ = p2_addr;
 }
 
-/// A joiner from a build before protocol 2 (`Saved` format 11 and the
-/// indicator refresh queues in the co-op fingerprint) says protocol 1. The
-/// host turns it away before the snapshot, with a message that names both
-/// versions.
+/// A joiner from a build before protocol 3 sends a `Hello` of the old
+/// shape (no build identity), which does not decode as a whole. The host
+/// still reads its version, turns it away before the snapshot, and names
+/// both versions.
 #[test]
-fn a_hello_from_protocol_1_is_rejected_with_a_clear_message() {
-    assert_eq!(sims_net::PROTOCOL_VERSION, 2);
+fn a_hello_of_an_older_shape_is_rejected_with_a_clear_message() {
+    assert_eq!(sims_net::PROTOCOL_VERSION, 3);
+    let manifest = sample_manifest(b"protocol-v3");
+    /// `WireMessage::Hello` as protocol 2 wrote it.
+    #[derive(Serialize)]
+    enum Protocol2 {
+        Hello {
+            protocol_version: u32,
+            player_name: String,
+            manifest: ManifestDigest,
+            endpoint_hint: Option<String>,
+        },
+    }
+    let old = postcard::to_allocvec(&Protocol2::Hello {
+        protocol_version: 2,
+        player_name: "Old build".to_string(),
+        manifest,
+        endpoint_hint: Some("mem:old".to_string()),
+    })
+    .unwrap();
+    let hello = sims_net::decode_payload(&old).expect("an old Hello reads as its version");
+    assert_eq!(
+        hello,
+        WireMessage::Hello {
+            protocol_version: 2,
+            player_name: String::new(),
+            manifest: ManifestDigest::default(),
+            endpoint_hint: None,
+            build: BuildId::default(),
+        }
+    );
+    // A Hello of this version with bytes over, or anything else that does
+    // not decode, is still refused.
+    let mut current = sims_net::encode_payload(&WireMessage::Hello {
+        protocol_version: 3,
+        player_name: "New".to_string(),
+        manifest,
+        endpoint_hint: None,
+        build: BUILD_ID,
+    })
+    .unwrap();
+    current.push(0);
+    assert!(sims_net::decode_payload(&current).is_err());
+    assert!(sims_net::decode_payload(&[2, 3]).is_err());
+
     let mesh = MemoryMesh::new(407);
-    let manifest = sample_manifest(b"protocol-v2");
     let host_addr = PeerAddress::new("mem:host");
     let mut host_t = mesh.add_node("mem:host");
     let mut old_t = mesh.add_node("mem:old");
@@ -1726,17 +1769,7 @@ fn a_hello_from_protocol_1_is_rejected_with_a_clear_message() {
         manifest,
         SessionConfig::default(),
     );
-    old_t
-        .send(
-            &host_addr,
-            WireMessage::Hello {
-                protocol_version: 1,
-                player_name: "Old build".to_string(),
-                manifest,
-                endpoint_hint: Some("mem:old".to_string()),
-            },
-        )
-        .unwrap();
+    old_t.send(&host_addr, hello).unwrap();
     mesh.step();
     host.poll(&mut host_t);
     mesh.step();
@@ -1753,16 +1786,79 @@ fn a_hello_from_protocol_1_is_rejected_with_a_clear_message() {
         replies,
         [WireMessage::Reject {
             reason: RejectReason::ProtocolVersionMismatch {
-                expected: 2,
-                actual: 1
+                expected: 3,
+                actual: 2
             }
         }],
         "the host sends the reject and nothing else"
     );
     assert_eq!(host.session().players.len(), 1, "nobody joined");
     assert_eq!(
-        sims_net::protocol_mismatch_message(2, 1),
-        "Join rejected: the host runs a different sims-rs build (co-op protocol v2, \
-         this build v1). Both players need the same version."
+        sims_net::protocol_mismatch_message(3, 2),
+        "Join rejected: the host runs a different sims-rs build (co-op protocol v3, \
+         this build v2). Both players need the same version."
+    );
+}
+
+/// Two builds that speak the same protocol but run different simulation
+/// code (a forgotten [`sims_net::PROTOCOL_VERSION`] bump) are told apart by
+/// their build identities: the host turns the joiner away before the
+/// snapshot, and the joiner's player is told both builds.
+#[test]
+fn a_hello_from_another_build_is_rejected_with_a_clear_message() {
+    let mesh = MemoryMesh::new(408);
+    let manifest = sample_manifest(b"build-id");
+    let host_addr = PeerAddress::new("mem:host");
+    let mut host_t = mesh.add_node("mem:host");
+    let mut host = LockstepNode::new_host("Host", None, manifest, SessionConfig::default());
+    assert_eq!(host.build_id(), BUILD_ID);
+    let other = BuildId([0xab; 16]);
+    assert_ne!(other, BUILD_ID);
+
+    let mut peer_t = mesh.add_node("mem:other");
+    peer_t.connect(&host_addr).unwrap();
+    let mut peer = LockstepNode::new_peer("Other", None, manifest, host_addr);
+    peer.set_build_id(other);
+    for _ in 0..4 {
+        peer.poll(&mut peer_t);
+        host.poll(&mut host_t);
+        mesh.step();
+    }
+    let reason = RejectReason::BuildMismatch {
+        expected: BUILD_ID,
+        actual: other,
+    };
+    assert!(
+        peer.drain_events()
+            .contains(&NodeEvent::JoinRejected(reason.clone())),
+        "the joiner hears why"
+    );
+    assert_eq!(host.session().players.len(), 1, "nobody joined");
+    assert_eq!(peer.local_player_id(), None);
+    assert_eq!(
+        sims_net::build_mismatch_message(BUILD_ID, other),
+        format!(
+            "Join rejected: the host runs a different sims-rs build (build {BUILD_ID}, this \
+             build abababababab). Both players need the same build of the game."
+        )
+    );
+    // The same builds join.
+    let mut same_t = mesh.add_node("mem:same");
+    same_t.connect(&PeerAddress::new("mem:host")).unwrap();
+    let mut same = LockstepNode::new_peer("Same", None, manifest, PeerAddress::new("mem:host"));
+    for _ in 0..4 {
+        same.poll(&mut same_t);
+        host.poll(&mut host_t);
+        mesh.step();
+    }
+    assert!(
+        !same
+            .drain_events()
+            .iter()
+            .any(|e| matches!(e, NodeEvent::JoinRejected(_)))
+    );
+    assert!(
+        same.local_player_id().is_some(),
+        "the same build is welcomed"
     );
 }

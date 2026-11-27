@@ -23,15 +23,42 @@ use std::fmt;
 /// The host rejects a `Hello` with another version before it sends anything
 /// else ([`RejectReason::ProtocolVersionMismatch`]), so the joiner sees why.
 /// [`ALPN`] stays the same across bumps for that reason: a different ALPN
-/// would fail the QUIC handshake without a message.
+/// would fail the QUIC handshake without a message. A `Hello` of another
+/// shape still reaches that check: [`decode_payload`] reads its version
+/// alone when the whole message does not decode.
+///
+/// A forgotten bump is caught by [`BUILD_ID`], which every `Hello` carries
+/// and the host compares too ([`RejectReason::BuildMismatch`]).
 ///
 /// History: 2 for `Saved` format 11 and the indicator refresh queues in
-/// the fingerprint.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// the fingerprint; 3 for the build identity in `Hello`.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// ALPN identifier for `iroh` QUIC co-op sessions. Not tied to
 /// [`PROTOCOL_VERSION`]: see there.
 pub const ALPN: &[u8] = b"sims-rs/coop/1";
+
+/// A build's identity: the first 16 bytes of a SHA-256 over the sources of
+/// the crates that decide a tick's result (`build.rs` names them). Two
+/// builds with the same identity run the same simulation code, so the host
+/// refuses a `Hello` whose identity differs from its own even when
+/// [`PROTOCOL_VERSION`] is the same ([`RejectReason::BuildMismatch`]).
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct BuildId(pub [u8; 16]);
+
+include!(concat!(env!("OUT_DIR"), "/build_id.rs"));
+
+impl fmt::Display for BuildId {
+    /// The first 6 bytes in hex, enough to tell builds apart in a message.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in &self.0[..6] {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
 
 /// Maximum length of a single length-prefixed wire message (4 MiB).
 pub const MAX_WIRE_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -659,6 +686,11 @@ pub enum RejectReason {
     InvalidEndpointHint,
     /// Peer received an invalid session configuration from host.
     InvalidConfig,
+    /// The peer's [`BuildId`] differs from the host's, though both speak
+    /// the same [`PROTOCOL_VERSION`]: their simulation code differs, so a
+    /// shared lot would drift. Last, so that a build without it still reads
+    /// every reason before it.
+    BuildMismatch { expected: BuildId, actual: BuildId },
 }
 
 /// What a joiner tells its player when the host's [`PROTOCOL_VERSION`]
@@ -668,6 +700,16 @@ pub fn protocol_mismatch_message(host: u32, local: u32) -> String {
     format!(
         "Join rejected: the host runs a different sims-rs build (co-op protocol \
          v{host}, this build v{local}). Both players need the same version."
+    )
+}
+
+/// What a joiner tells its player when the host's [`BuildId`] differs from
+/// its own ([`RejectReason::BuildMismatch`]).
+#[must_use]
+pub fn build_mismatch_message(host: BuildId, local: BuildId) -> String {
+    format!(
+        "Join rejected: the host runs a different sims-rs build (build {host}, this \
+         build {local}). Both players need the same build of the game."
     )
 }
 
@@ -686,12 +728,16 @@ pub enum ResyncReason {
 /// Top-level wire message sent over [`crate::transport::Transport`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WireMessage {
-    /// Peer -> Host join handshake carrying protocol version and file manifest.
+    /// Peer -> Host join handshake carrying protocol version, file manifest
+    /// and build identity. `protocol_version` stays the first field in
+    /// every version: [`decode_payload`] reads it alone from a `Hello` of
+    /// another shape.
     Hello {
         protocol_version: u32,
         player_name: String,
         manifest: ManifestDigest,
         endpoint_hint: Option<String>,
+        build: BuildId,
     },
     /// Host -> Peer join acceptance.
     Welcome {
@@ -773,6 +819,14 @@ pub fn encode_payload(msg: &WireMessage) -> Result<Vec<u8>, ProtocolError> {
 
 /// Decodes a [`WireMessage`] from raw `postcard` bytes, enforcing
 /// [`MAX_WIRE_FRAME_BYTES`] and rejecting trailing bytes.
+///
+/// One message of another version is read in part rather than refused: a
+/// `Hello` whose whole message does not decode, or leaves bytes over, but
+/// whose first field is a [`PROTOCOL_VERSION`] other than this build's.
+/// It comes back as a `Hello` carrying that version and nothing else (an
+/// empty name, a zero manifest and build, no hint), which the host refuses
+/// for its version before it reads any other field, so the joiner of
+/// another version is told why rather than left waiting.
 pub fn decode_payload(bytes: &[u8]) -> Result<WireMessage, ProtocolError> {
     if bytes.len() > MAX_WIRE_FRAME_BYTES {
         return Err(ProtocolError::FrameTooLarge {
@@ -780,15 +834,36 @@ pub fn decode_payload(bytes: &[u8]) -> Result<WireMessage, ProtocolError> {
             max: MAX_WIRE_FRAME_BYTES,
         });
     }
-    let (msg, rest) =
-        postcard::take_from_bytes(bytes).map_err(|e| ProtocolError::Decode(e.to_string()))?;
-    if !rest.is_empty() {
-        return Err(ProtocolError::Decode(format!(
+    let error = match postcard::take_from_bytes(bytes) {
+        Ok((msg, [])) => return Ok(msg),
+        Ok((_, rest)) => ProtocolError::Decode(format!(
             "unexpected {} trailing bytes in wire payload",
             rest.len()
-        )));
+        )),
+        Err(e) => ProtocolError::Decode(e.to_string()),
+    };
+    match other_version_hello(bytes) {
+        Some(protocol_version) => Ok(WireMessage::Hello {
+            protocol_version,
+            player_name: String::new(),
+            manifest: ManifestDigest::default(),
+            endpoint_hint: None,
+            build: BuildId::default(),
+        }),
+        None => Err(error),
     }
-    Ok(msg)
+}
+
+/// The version a `Hello` of another version's shape gives as its first
+/// field, if `bytes` start as one does (variant 0, then the version) with
+/// a version other than [`PROTOCOL_VERSION`].
+fn other_version_hello(bytes: &[u8]) -> Option<u32> {
+    #[derive(Deserialize)]
+    enum Prefix {
+        Hello { protocol_version: u32 },
+    }
+    let (Prefix::Hello { protocol_version }, _) = postcard::take_from_bytes(bytes).ok()?;
+    (protocol_version != PROTOCOL_VERSION).then_some(protocol_version)
 }
 
 /// Encodes a [`WireMessage`] with a 4-byte big-endian length prefix.
