@@ -18,8 +18,9 @@
 //!
 //! The departure also leaves each traveler's saved state in its inventory
 //! as kind-2 tokens, as the Go Downtown plugin's Generic Sims Call 17 does
-//! (0x45a22d), with the arrival clock in tokens 7 and 8. The marker's
-//! routine 21 restores the motives from them and leaves the clock tokens.
+//! (0x45a22d), with the arrival clock in tokens 7 and 8. The arrival takes
+//! the clock tokens out and sets the clock to them (0x4f1ae9 → 0x46d86f),
+//! and the marker's routine 21 restores the motives from the rest.
 //!
 //! Needs an install (`SIMS_INSTALL`); skipped otherwise.
 
@@ -189,15 +190,15 @@ fn the_middle_ped_marker_finishes_a_downtown_arrival() {
         1,
         "the marker's arrival pass stopped before node 24"
     );
-    // Routine 21 restored the saved state and erased its tokens; the clock
-    // tokens name nothing for it and stay.
+    // The arrival took the clock tokens, and routine 21 restored the saved
+    // state and erased the rest.
     let world = game.lot().world();
     let traveler = &world.objects[&arrived.traveler];
     let guids: Vec<u32> = saved_state_tokens(game, traveler.guid)
         .iter()
         .map(|&(guid, _)| guid)
         .collect();
-    assert_eq!(guids, [7, 8], "only the clock tokens are left");
+    assert_eq!(guids, [], "no saved-state token is left");
 }
 
 /// The kind-2 tokens in `guid`'s neighbor inventory, as (GUID, count).
