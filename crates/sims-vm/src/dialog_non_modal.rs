@@ -15,8 +15,12 @@
 //! ([`Lot::step_play`]). Off (the default), play mode answers such a
 //! dialog at once as before, and strict mode ([`Lot::step`]) still stops
 //! at one: answering one while the game runs is not something a recorded
-//! run of the original can be compared against. Co-op answers it at once
-//! either way: no command carries such an answer yet.
+//! run of the original can be compared against.
+//!
+//! Co-op in play mode always shows them, whatever the setting, since every
+//! peer must do the same: a player answers one with
+//! `sims_net::Command::AnswerNonModalDialog`, which every peer applies
+//! between the same two ticks ([`Lot::answer_non_modal_in_coop`]).
 
 use crate::boot::{Lot, OrderError};
 use crate::primitives::dialog::{self, DONE, SHOWN};
@@ -47,8 +51,12 @@ pub enum NonModalAnswerError {
     /// `caller` shows no dialog that does not stop the game.
     NotShown { caller: u16 },
     /// Co-op is attached: an answer changed on one peer alone would part
-    /// the peers' worlds, and no command carries one.
+    /// the peers' worlds. A co-op answer goes through
+    /// `sims_net::Command::AnswerNonModalDialog`.
     Coop,
+    /// `caller` shows such a dialog, but with other operands than the
+    /// answer was for: it showed another since.
+    Replaced { caller: u16 },
     /// The dialog does not offer that answer.
     NotOffered { answer: u8, offered: &'static [u8] },
 }
@@ -68,7 +76,11 @@ impl std::fmt::Display for NonModalAnswerError {
             }
             Self::Coop => write!(
                 f,
-                "a dialog that lets the game go on is not answered in co-op"
+                "a dialog that lets the game go on is answered in co-op by a command"
+            ),
+            Self::Replaced { caller } => write!(
+                f,
+                "object {caller} shows another dialog than the one answered"
             ),
         }
     }
@@ -83,7 +95,8 @@ impl Lot {
     /// default. A setting of the lot's host
     /// ([`crate::SpecialPanels::present_non_modal`]): no save holds it, so
     /// a restore or a trip turns it off, and a host sets it again before
-    /// it steps. Strict mode and co-op are unchanged by it.
+    /// it steps. Strict mode is unchanged by it, and co-op in play mode
+    /// shows them either way.
     pub fn present_non_modal_dialogs(&mut self, on: bool) {
         self.special_panels.present_non_modal = on;
     }
@@ -91,6 +104,19 @@ impl Lot {
     /// Whether [`Lot::present_non_modal_dialogs`] is on.
     pub fn presents_non_modal_dialogs(&self) -> bool {
         self.special_panels.present_non_modal
+    }
+
+    /// Whether an answer to a dialog that does not stop the game is taken
+    /// now: the lot is loaded and running, and no modal dialog or special
+    /// panel holds the tick, nor, in co-op, a tick a modal dialog froze
+    /// that has not run again (paused once answered). A co-op answer sent
+    /// while this is false is ignored on every peer.
+    pub fn takes_non_modal_answer(&self) -> bool {
+        self.ready().is_ok()
+            && self
+                .coop
+                .as_ref()
+                .is_none_or(|ctx| ctx.frozen_dialog.is_none())
     }
 
     /// The dialogs that do not stop the game shown now and waiting for
@@ -120,7 +146,30 @@ impl Lot {
         if self.coop.is_some() {
             return Err(NonModalAnswerError::Coop);
         }
-        if answer_record(&mut self.world.dialogs.records, caller, answer)? {
+        if answer_record(&mut self.world.dialogs.records, caller, None, answer)? {
+            self.last_dialog_text = text.unwrap_or_default();
+        }
+        Ok(())
+    }
+
+    /// [`Lot::answer_non_modal`] for co-op: answers `caller`'s shown
+    /// record if it still has `operands` (the record the player saw), as
+    /// `sims_net::Command::AnswerNonModalDialog` asks. The co-op executor
+    /// calls it between ticks, in the batch's order, so every peer
+    /// answers the same record or none.
+    pub(crate) fn answer_non_modal_in_coop(
+        &mut self,
+        caller: u16,
+        operands: [u8; 8],
+        answer: u8,
+        text: Option<String>,
+    ) -> Result<(), NonModalAnswerError> {
+        if answer_record(
+            &mut self.world.dialogs.records,
+            caller,
+            Some(operands),
+            answer,
+        )? {
             self.last_dialog_text = text.unwrap_or_default();
         }
         Ok(())
@@ -144,16 +193,21 @@ fn shown(records: &[Dialog]) -> Vec<NonModalDialog> {
 }
 
 /// Answers `caller`'s shown record in `records` with `answer`
-/// ([`Lot::answer_non_modal`]). Returns whether it asks for text (kind 3).
+/// ([`Lot::answer_non_modal`]), if it has `operands` when they are given.
+/// Returns whether it asks for text (kind 3).
 fn answer_record(
     records: &mut [Dialog],
     caller: u16,
+    operands: Option<[u8; 8]>,
     answer: u8,
 ) -> Result<bool, NonModalAnswerError> {
     let found = shown(records)
         .into_iter()
         .find(|d| d.caller == caller)
         .ok_or(NonModalAnswerError::NotShown { caller })?;
+    if operands.is_some_and(|operands| operands != found.operands) {
+        return Err(NonModalAnswerError::Replaced { caller });
+    }
     if !found.answers.contains(&answer) {
         return Err(NonModalAnswerError::NotOffered {
             answer,
@@ -210,29 +264,43 @@ mod tests {
             record(12, 3, 0x80, SHOWN),
             record(13, 1, 0x00, SHOWN),
         ];
-        assert_eq!(answer_record(&mut records, 10, 4), Ok(false));
+        assert_eq!(answer_record(&mut records, 10, None, 4), Ok(false));
         assert_eq!(records[0].status, 4);
         // Answered, it is no longer shown.
         assert_eq!(
-            answer_record(&mut records, 10, 2),
+            answer_record(&mut records, 10, None, 2),
             Err(NonModalAnswerError::NotShown { caller: 10 })
         );
-        assert_eq!(answer_record(&mut records, 11, 2), Ok(false));
+        assert_eq!(answer_record(&mut records, 11, None, 2), Ok(false));
         assert_eq!(records[1].status, DONE);
         assert_eq!(
-            answer_record(&mut records, 12, 3),
+            answer_record(&mut records, 12, None, 3),
             Err(NonModalAnswerError::NotOffered {
                 answer: 3,
                 offered: &[2]
             })
         );
         assert_eq!(records[2].status, SHOWN);
-        assert_eq!(answer_record(&mut records, 12, 2), Ok(true));
+        assert_eq!(answer_record(&mut records, 12, None, 2), Ok(true));
         // A modal record is the modal path's (`Lot::answer`).
         assert_eq!(
-            answer_record(&mut records, 13, 2),
+            answer_record(&mut records, 13, None, 2),
             Err(NonModalAnswerError::NotShown { caller: 13 })
         );
         assert_eq!(records[3].status, SHOWN);
+    }
+
+    #[test]
+    fn a_co_op_answer_takes_only_the_record_it_was_for() {
+        let mut records = [record(10, 1, 0x80, SHOWN)];
+        let other = [0, 0, 0, 0, 9, 1, 0, 0x80];
+        assert_eq!(
+            answer_record(&mut records, 10, Some(other), 2),
+            Err(NonModalAnswerError::Replaced { caller: 10 })
+        );
+        assert_eq!(records[0].status, SHOWN);
+        let same = records[0].operands;
+        assert_eq!(answer_record(&mut records, 10, Some(same), 3), Ok(false));
+        assert_eq!(records[0].status, 3);
     }
 }

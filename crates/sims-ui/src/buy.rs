@@ -467,8 +467,13 @@ impl SellLabels {
     }
 
     /// Formats the sell/dispose/cannot-delete prompt lines for `info`
-    /// (`0x50a343`, substituting `%` with the object name and `$` with
-    /// `$<refund>` — rendered as `§` by the Sims UI font).
+    /// (`0x50a343` → `0x50cb3d`), substituting `%` (`0x6cc78c`) with the
+    /// object name and `$` (`0x6c10a0`) with the refund as the interface
+    /// writes money: `0x50cec3..0x50ced4` asks the app (`[0x6fe90c]`,
+    /// vtable +4, its locale at +0x188) to format it through vtable +0x7c,
+    /// a thunk (`0x5fdc5c`) to the locale's currency formatter
+    /// (`0x6007df`, [`crate::currency::simoleons`]): `$1,250`. The Sims UI
+    /// font draws `$` as the Simoleon glyph.
     pub fn format(&self, info: &SellInfo) -> Vec<String> {
         let template = if !info.can_delete {
             &self.cannot_delete
@@ -477,7 +482,7 @@ impl SellLabels {
         } else {
             &self.dispose
         };
-        let price = format!("${}", info.refund);
+        let price = crate::currency::simoleons(i64::from(info.refund));
         let mut rendered = String::with_capacity(template.len() + info.name.len() + price.len());
         for ch in template.chars() {
             match ch {
@@ -1834,6 +1839,37 @@ mod tests {
                 0x04, // + Logic
             ),
         ])
+    }
+
+    #[test]
+    fn the_sell_prompt_writes_its_refund_as_money() {
+        // `0x50ced4`: the locale's currency formatter, as the Buy popup's
+        // price and the panels write money.
+        let labels = SellLabels {
+            dispose: "gone: %".into(),
+            sell: "sell % for $.\r\nok".into(),
+            cannot_delete: "keep %".into(),
+        };
+        let info = |refund, can_delete| SellInfo {
+            guid: 0,
+            name: "Item".into(),
+            refund,
+            can_delete,
+        };
+        assert_eq!(
+            labels.format(&info(6500, true)),
+            ["sell Item for $6,500.", "ok"]
+        );
+        assert_eq!(
+            labels.format(&info(250, true)),
+            ["sell Item for $250.", "ok"]
+        );
+        assert_eq!(
+            labels.format(&info(1_234_567, true))[0],
+            "sell Item for $1,234,567."
+        );
+        assert_eq!(labels.format(&info(0, true)), ["gone: Item"]);
+        assert_eq!(labels.format(&info(6500, false)), ["keep Item"]);
     }
 
     #[test]

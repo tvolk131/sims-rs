@@ -1714,8 +1714,8 @@ fn round2_host_without_hint_delay_cap_split_brain_and_peer_ack_backpressure() {
 /// both versions.
 #[test]
 fn a_hello_of_an_older_shape_is_rejected_with_a_clear_message() {
-    assert_eq!(sims_net::PROTOCOL_VERSION, 3);
-    let manifest = sample_manifest(b"protocol-v3");
+    assert_eq!(sims_net::PROTOCOL_VERSION, 4);
+    let manifest = sample_manifest(b"protocol-v4");
     /// `WireMessage::Hello` as protocol 2 wrote it.
     #[derive(Serialize)]
     enum Protocol2 {
@@ -1746,8 +1746,19 @@ fn a_hello_of_an_older_shape_is_rejected_with_a_clear_message() {
     );
     // A Hello of this version with bytes over, or anything else that does
     // not decode, is still refused.
-    let mut current = sims_net::encode_payload(&WireMessage::Hello {
+    // Protocol 3's Hello has this one's shape (4 only added a command), so
+    // it reads whole and the version check refuses it.
+    let v3 = WireMessage::Hello {
         protocol_version: 3,
+        player_name: "Older".to_string(),
+        manifest,
+        endpoint_hint: None,
+        build: BUILD_ID,
+    };
+    let bytes = sims_net::encode_payload(&v3).unwrap();
+    assert_eq!(sims_net::decode_payload(&bytes).unwrap(), v3);
+    let mut current = sims_net::encode_payload(&WireMessage::Hello {
+        protocol_version: sims_net::PROTOCOL_VERSION,
         player_name: "New".to_string(),
         manifest,
         endpoint_hint: None,
@@ -1786,7 +1797,7 @@ fn a_hello_of_an_older_shape_is_rejected_with_a_clear_message() {
         replies,
         [WireMessage::Reject {
             reason: RejectReason::ProtocolVersionMismatch {
-                expected: 3,
+                expected: 4,
                 actual: 2
             }
         }],
@@ -1794,8 +1805,8 @@ fn a_hello_of_an_older_shape_is_rejected_with_a_clear_message() {
     );
     assert_eq!(host.session().players.len(), 1, "nobody joined");
     assert_eq!(
-        sims_net::protocol_mismatch_message(3, 2),
-        "Join rejected: the host runs a different sims-rs build (co-op protocol v3, \
+        sims_net::protocol_mismatch_message(4, 2),
+        "Join rejected: the host runs a different sims-rs build (co-op protocol v4, \
          this build v2). Both players need the same version."
     );
 }

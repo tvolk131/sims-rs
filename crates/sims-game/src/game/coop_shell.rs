@@ -324,8 +324,18 @@ impl Game {
             manifest,
             options,
         )?;
+        self.apply_coop_prime_report();
         self.refresh_world();
         Ok(())
+    }
+
+    /// Applies the side effects of the prime tick a starting host ran
+    /// ([`crate::coop::CoopController::take_prime_report`]), as for any
+    /// batch: a non-modal dialog it showed is read from that tick.
+    fn apply_coop_prime_report(&mut self) {
+        if let Some(report) = self.coop.take_prime_report() {
+            self.apply_coop_batch_side_effects(&report);
+        }
     }
 
     /// Synchronously starts joining a host at `host_addr` over `transport`
@@ -373,6 +383,8 @@ impl Game {
         let out = self
             .coop
             .poll_and_handle(&mut self.lot, &install, self.play, frames);
+        // An `iroh` host that finished starting ran its prime tick here.
+        self.apply_coop_prime_report();
         if out.snapshot_restored {
             self.sync_after_coop_snapshot_restore();
         }
@@ -655,6 +667,22 @@ impl Game {
         &mut self,
         report: &sims_vm::coop::CoopBatchReport,
     ) {
+        // A non-modal answer applied closes its widget on every peer, as
+        // `0x4370be` destroys it: the text read for it goes, so the
+        // caller's next identical prompt starts fresh.
+        let mut answered_non_modal = false;
+        for (stamped, status) in &report.command_results {
+            if let (
+                NetCommand::AnswerNonModalDialog {
+                    caller, operands, ..
+                },
+                sims_vm::coop::CoopCommandStatus::Applied,
+            ) = (&stamped.command, status)
+            {
+                self.hud.close_non_modal((*caller, *operands));
+                answered_non_modal = true;
+            }
+        }
         if let Some(update) = &report.update {
             let at = self.lot.ticks();
             for line in in_order(at, &update.errors, &update.frame_errors) {
@@ -663,6 +691,20 @@ impl Game {
             self.view.masks_rebuilt(update.masks_rebuilt);
             self.keep_sounds(update.sounds.clone());
             self.keep_ui_effects(update.ui_effects.clone());
+            if !update.non_modal_shown.is_empty() {
+                // As outside co-op: read each shown record from the tick
+                // that showed it, and start its timer over.
+                self.hud.read_non_modal_shown(
+                    self.lot.world(),
+                    &self.assets,
+                    &update.non_modal_shown,
+                );
+            }
+        }
+        if answered_non_modal && self.lot.asking().is_none() {
+            // The next dialog shown takes its place (and its timer) now,
+            // not at the next frame drawn.
+            self.hud.read_dialog(self.lot.world(), &self.assets);
         }
         if report.opened_dialog.is_some() {
             self.hud.clear_vm_dialog();

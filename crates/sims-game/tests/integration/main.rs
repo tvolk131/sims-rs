@@ -13,6 +13,7 @@ mod goth;
 mod magic_town_arrival;
 mod native_hotkeys;
 mod neighborhood_shell;
+mod non_modal_dialogs;
 mod options_and_dialogs;
 mod perf_part4;
 mod phone_go_downtown;

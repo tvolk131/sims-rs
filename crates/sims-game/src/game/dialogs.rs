@@ -38,6 +38,18 @@ impl Game {
         self.hud.auto_answer_running()
     }
 
+    /// Whether the shown simulation dialog's 40 s timer runs in co-op:
+    /// only a non-modal one's, whose answer goes out as
+    /// `Command::AnswerNonModalDialog`. A blocking dialog in co-op waits
+    /// for a player's answer, as before. It waits while the lot takes no
+    /// such answer (a modal dialog's tick not yet run again), so it does
+    /// not run out into a command every peer ignores.
+    pub(super) fn coop_runs_auto_answer(&self) -> bool {
+        self.coop.is_active()
+            && self.hud.has_non_modal_dialog()
+            && self.lot.takes_non_modal_answer()
+    }
+
     /// Whether something in front of the simulation dialog holds its
     /// 40 s timer until it closes: a shell modal, a special panel, or the
     /// co-op lobby.
@@ -238,6 +250,18 @@ impl Game {
     /// The status note currently displayed across the top of the frame, if any.
     pub fn note(&self) -> Option<&str> {
         self.note.as_deref()
+    }
+
+    /// Whether the dialog shown is a non-modal simulation dialog asking
+    /// for text (kind 3), with no modal dialog and no pie menu in front of
+    /// it: its field takes the keys typed ([`Game::type_dialog_char`],
+    /// [`Game::dialog_backspace`], [`Game::dialog_submit`]). An open pie
+    /// menu keeps them (Escape closes it).
+    pub fn has_non_modal_dialog_entry(&self) -> bool {
+        !self.has_dialog()
+            && !self.ui_modal_in_front()
+            && self.hud.menu.is_none()
+            && self.hud.has_non_modal_dialog_entry()
     }
 
     /// Whether the active modal dialog has an editable `cTSWinTextEdit2` field.

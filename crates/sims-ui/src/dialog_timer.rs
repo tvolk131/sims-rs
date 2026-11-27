@@ -63,6 +63,14 @@ impl AutoAnswer {
         self.held = false;
     }
 
+    /// Starts the timer again with the whole 40 s at `now_us`, as for a
+    /// dialog shown again, unless a press holds it: its release does.
+    pub fn restart(&mut self, now_us: u64) {
+        if !self.held {
+            self.arm(now_us);
+        }
+    }
+
     /// No timer: no dialog, or one that sets none.
     pub fn disarm(&mut self) {
         *self = Self::default();
@@ -155,5 +163,21 @@ mod tests {
         timer.arm(30_000_000);
         assert!(!timer.take_due(AUTO_ANSWER_US));
         assert!(timer.take_due(30_000_000 + AUTO_ANSWER_US));
+    }
+
+    #[test]
+    fn a_reshow_restarts_the_timer_but_not_through_a_held_press() {
+        let mut timer = AutoAnswer::default();
+        timer.restart(0);
+        assert_eq!(timer.remaining_us(10), Some(AUTO_ANSWER_US - 10));
+        timer.press();
+        // Shown again while held: still held, never due.
+        timer.restart(1_000);
+        assert!(!timer.running());
+        assert!(!timer.take_due(u64::MAX));
+        // The release starts the whole 40 s.
+        timer.release(2_000);
+        assert!(!timer.take_due(2_000 + AUTO_ANSWER_US - 1));
+        assert!(timer.take_due(2_000 + AUTO_ANSWER_US));
     }
 }

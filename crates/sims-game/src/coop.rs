@@ -662,6 +662,10 @@ struct ActiveCoop {
     known_names: BTreeMap<PlayerId, String>,
     /// Snapshot awaiting guest lot re-staging to `(host_house, host_family)`.
     pending_restage: Option<PendingHostLotRestage>,
+    /// The report of the host's prime tick, for the `Game` to take
+    /// ([`CoopController::take_prime_report`]): what it showed (a non-modal
+    /// dialog's text, read from that tick) and its sounds.
+    prime_report: Option<Box<CoopBatchReport>>,
 }
 
 impl ActiveCoop {
@@ -705,6 +709,15 @@ impl CoopController {
     pub fn new() -> Self {
         Self {
             phase: CoopPhase::Idle,
+        }
+    }
+
+    /// The report of the prime tick the host ran as it started, once: the
+    /// `Game` applies its side effects as for any batch.
+    pub fn take_prime_report(&mut self) -> Option<CoopBatchReport> {
+        match &mut self.phase {
+            CoopPhase::Active(active) => active.prime_report.take().map(|r| *r),
+            _ => None,
         }
     }
 
@@ -987,6 +1000,7 @@ impl CoopController {
             snapshot_restore_count: 0,
             known_names: BTreeMap::new(),
             pending_restage: None,
+            prime_report: None,
         };
         active.refresh_known_names();
         if options.prime_tick_on_start && active.node.session().current_tick == Tick::ZERO {
@@ -1003,6 +1017,7 @@ impl CoopController {
                     0,
                     Some(report.world_hash),
                 );
+                active.prime_report = Some(Box::new(report));
             }
         }
         self.phase = CoopPhase::Active(Box::new(active));
@@ -1041,6 +1056,7 @@ impl CoopController {
             snapshot_restore_count: 0,
             known_names: BTreeMap::new(),
             pending_restage: None,
+            prime_report: None,
         };
         active.refresh_known_names();
         self.phase = CoopPhase::Active(Box::new(active));

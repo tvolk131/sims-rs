@@ -1817,9 +1817,11 @@ impl Hud {
     /// - `Char(ch)` activates localized Yes (button 0) or No (button 1) on
     ///   non-entry confirmations whose buttons match `STR# 142[3]` / `STR# 142[4]`.
     pub fn confirm_key(&mut self, key: DialogKey) -> Option<Command> {
-        // A non-modal dialog is answered only through its dismiss box: keys
-        // go on to whatever else has them.
-        if !self.has_dialog() {
+        // A non-modal dialog is answered only through its dismiss box,
+        // unless it asks for text (kind 3): its field has the keys, and
+        // Enter answers it as on a modal one. Other keys go on to whatever
+        // else has them.
+        if !self.has_dialog() && !self.has_non_modal_dialog_entry() {
             return None;
         }
         let message = self.active_message()?;
@@ -1921,6 +1923,14 @@ impl Hud {
                 .message
                 .as_ref()
                 .is_some_and(|(message, _)| !message.presentation.modal)
+    }
+
+    /// Whether the dialog shown is a non-modal simulation dialog that asks
+    /// for text (kind 3): its field takes the keys typed, as a modal
+    /// one's does. A modal dialog the lot waits on is shown before it
+    /// ([`Hud::read_dialog`]), so it has the keys first.
+    pub fn has_non_modal_dialog_entry(&self) -> bool {
+        self.has_non_modal_dialog() && self.active_dialog_entry().is_some()
     }
 
     /// The rect of the non-modal dialog drawn last, if one is shown.
@@ -2053,6 +2063,17 @@ impl Hud {
         }
     }
 
+    /// The non-modal dialog of `key` (its caller and operands) was answered
+    /// (in co-op, when the command ran): its widget and the text read for
+    /// it go, as `0x4370be` destroys it, so the caller's next identical
+    /// prompt is a new widget with fresh input state.
+    pub fn close_non_modal(&mut self, key: (u16, [u8; 8])) {
+        self.non_modal_read.retain(|(k, _)| *k != key);
+        if self.message.as_ref().is_some_and(|(_, k)| *k == key) {
+            self.clear_vm_dialog();
+        }
+    }
+
     /// Reads the dialog `world` waits on, if it changed. The lot's world,
     /// or, while the lot waits for the player, the world as the tick left
     /// it when it showed the dialog.
@@ -2170,7 +2191,7 @@ impl Hud {
             if self
                 .message
                 .as_ref()
-                .is_some_and(|(shown, k)| *k == key && *shown != m)
+                .is_some_and(|(shown, k)| *k == key && !same_dialog(shown, &m))
             {
                 self.show_message(m.clone(), key);
             }
@@ -2200,7 +2221,9 @@ impl Hud {
                 .as_ref()
                 .is_some_and(|(message, _)| message.caller == caller)
         {
-            self.auto_answer.arm(self.last_clock_us);
+            // A press held on the widget kept holds the timer: its release
+            // starts the whole 40 s (`0x524a13`).
+            self.auto_answer.restart(self.last_clock_us);
         }
     }
 
@@ -3907,6 +3930,16 @@ fn load_neighborhood_families(
         out.insert(i32::from(id), dialog::FamilyInfo { name, assets });
     }
     out
+}
+
+/// Whether `fresh`, a dialog read again, says what `shown` says: the
+/// same text, buttons and look. What the player typed into `shown`'s
+/// fields is theirs, not the dialog's, so it is not compared.
+fn same_dialog(shown: &Message, fresh: &Message) -> bool {
+    let mut typed = shown.clone();
+    typed.entry.clone_from(&fresh.entry);
+    typed.secondary_entry.clone_from(&fresh.secondary_entry);
+    typed == *fresh
 }
 
 #[cfg(test)]

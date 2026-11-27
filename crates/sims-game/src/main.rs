@@ -2772,7 +2772,14 @@ impl ApplicationHandler for App {
                     self.changed(changed, true);
                     return;
                 }
-                if self.session.has_dialog() {
+                // A non-modal dialog asking for text (kind 3) takes the
+                // keys too, as a modal one's field does.
+                if self.session.has_dialog()
+                    || self
+                        .session
+                        .game()
+                        .is_some_and(Game::has_non_modal_dialog_entry)
+                {
                     let has_entry = self.session.game().is_some_and(Game::has_dialog_entry);
                     if has_entry {
                         let mut changed = false;
