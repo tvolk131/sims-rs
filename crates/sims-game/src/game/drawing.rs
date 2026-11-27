@@ -227,8 +227,9 @@ impl Game {
                 },
             );
         }
+        let bobs = self.people.bobs(world);
         for (&id, obj) in &world.objects {
-            if (obj.person.is_some() || obj.guid == sims_people::bob::STANDARD)
+            if (obj.person.is_some() || bobs.contains(&id))
                 && let Some(rect) = self.canvas.drawn(id)
             {
                 self.people_rects.push(rect);

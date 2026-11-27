@@ -139,7 +139,9 @@ fn people_stand_where_a_click_finds_them() {
         bob.is_none()
             || on_bob
                 .iter()
-                .all(|&p| pick::noted(world, camera, &people_ids, p) == bob),
+                .all(|&p| pick::noted(world, camera, &people_ids, p, |id| people
+                    .is_bob(world, id))
+                    == bob),
         "a click on the bob finds something else"
     );
     // A click on a pixel a person was drawn in finds that person, the
@@ -149,7 +151,9 @@ fn people_stand_where_a_click_finds_them() {
         let Some(shown) = canvas.id_at(x, y) else {
             continue;
         };
-        let id = pick::noted(world, camera, &people_ids, [x, y]);
+        let id = pick::noted(world, camera, &people_ids, [x, y], |id| {
+            people.is_bob(world, id)
+        });
         assert_eq!(id, Some(shown), "at {:?}", [x, y]);
         assert!(world.objects[&shown].person.is_some(), "object {shown}");
         found.insert(shown);
@@ -164,7 +168,11 @@ fn people_stand_where_a_click_finds_them() {
         .iter()
         .find(|p| far(p))
         .expect("a pixel far from every person");
-    assert_eq!(pick::noted(world, camera, &people_ids, far_point), None);
+    assert_eq!(
+        pick::noted(world, camera, &people_ids, far_point, |id| people
+            .is_bob(world, id)),
+        None
+    );
     // Far from everyone, a click finds an object by the sprite pick, from
     // the lot's depth alone: never a person, and mostly the object the
     // pixel shows (a rectangle nearer the viewer may hold the point too).
@@ -173,7 +181,15 @@ fn people_stand_where_a_click_finds_them() {
     for point in points.iter().filter(|p| far(p)) {
         let shown = bare.id_at(point[0], point[1]);
         assert_eq!(canvas.id_at(point[0], point[1]), shown, "{point:?}");
-        let picked = pick::at(&lot, camera, &canvas, &bare.depth, &people_ids, *point);
+        let picked = pick::at(
+            &lot,
+            camera,
+            &canvas,
+            &bare.depth,
+            &people_ids,
+            *point,
+            |id| people.is_bob(world, id),
+        );
         if shown.is_some() {
             shown_objects += 1;
             agree += usize::from(picked == shown);
@@ -197,7 +213,8 @@ fn people_stand_where_a_click_finds_them() {
     let covered = covered.ids();
     for &point in changed.iter().step_by(7) {
         assert_eq!(
-            pick::noted(world, camera, &covered, point),
+            pick::noted(world, camera, &covered, point, |id| people
+                .is_bob(world, id)),
             None,
             "{point:?}"
         );

@@ -4,6 +4,7 @@
 //! ratchet (`tests/ratchet.rs`, `harness = false`) and the UI oracle tour
 //! (`tests/ui_oracle_tour.rs`) stay binaries of their own.
 
+mod bobs_and_pets;
 mod cheats_cache_and_open_pack;
 mod common;
 mod dialog_timer;

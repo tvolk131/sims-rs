@@ -345,7 +345,7 @@ impl Game {
             let outfit = sims_people::appearance::Outfit {
                 parts: vec![(app, tex)],
             };
-            let body = load_pet_body(assets, skeleton, &outfit).ok()?;
+            let body = sims_people::Body::load(assets, skeleton, &outfit).ok()?;
             self.shop_preview_body = Some((item_id.to_owned(), body));
         }
         let (_, body) = self.shop_preview_body.as_ref()?;

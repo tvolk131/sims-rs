@@ -176,9 +176,23 @@ pets.
   1's record (`+0x20`), so `HEAD` is assumed.
 - **Suits that pick no mode.** Such a graphic would draw as an ordinary
   posed model. No object in the install has one, and we draw nothing.
-- **sims-game follow-ups** (not owned by this wave). Three checks still
-  compare against the standard bob's GUID, so the date and star bobs miss
-  them: the 3D pick (`pick.rs` `noted`), damage rectangles
-  (`game/drawing.rs`) and the spin redraw (`game/ticking.rs`). Each should
-  ask `People::is_bob`. The pet picker's `load_pet_body` can now use
-  `Body::load`.
+- **sims-game follow-ups, done 2026-11-27.** Three checks compared
+  against the standard bob's GUID, so the date and star bobs missed them:
+  the 3D pick (`pick.rs` `noted`, which now takes an `is_bob`), the damage
+  rectangles (`game/drawing.rs`) and the spin redraw (`game/ticking.rs`).
+  - Each now asks `People::is_bob` about what Sims hold in their head
+    slots (`People::bobs`, `People::has_bob`). Those are the only bobs
+    drawn, and only they are looked up, not every object.
+  - The pet picker's turntable loads pets with `Body::load`, and its own
+    loader (`load_pet_body`) is gone. The registry finds a skeleton by its
+    name in whichever file holds it. So `load_skeleton` now tries each
+    candidate file in turn. A file that cannot be read, or that holds
+    another name, no longer hides the next one.
+  - The test `bobs_and_pets` restores the Goth house with its bob made a
+    date bob, then a star bob. Each one spins with no tick (`spin_due`),
+    is redrawn, and is found by a click on its pixels (`Game::under`). The
+    test then makes the bob an object that is no bob, and that one does
+    not spin. It also checks that every pet skeleton draws on the
+    turntable.
+  - Not yet tested: the damage rectangles are not compared with the
+    pixels directly, and the pet picker's own panel is not opened.

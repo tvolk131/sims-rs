@@ -44,8 +44,9 @@ use sims_vm::boot::Lot;
 /// `canvas`, the frame last drawn of `lot` through `camera`. Its lot left
 /// `lot_depth` (a 16-bit depth per pixel, in rows of the canvas's width) before
 /// anything else was drawn, and `people` are its IDs once the people were
-/// drawn. The answer is the person or bob drawn at the pixel ([`noted`]),
-/// else the sprite pick's object.
+/// drawn, and `is_bob` tells the plumb bobs (the standard, date and star
+/// bobs, `sims_people::People::is_bob`). The answer is the person or bob
+/// drawn at the pixel ([`noted`]), else the sprite pick's object.
 pub fn at(
     lot: &Lot,
     camera: &Camera,
@@ -53,17 +54,27 @@ pub fn at(
     lot_depth: &[u16],
     people: &Ids,
     point: [i32; 2],
+    is_bob: impl Fn(u16) -> bool,
 ) -> Option<u16> {
-    noted(lot.world(), camera, people, point)
+    noted(lot.world(), camera, people, point, is_bob)
         .or_else(|| sprite(lot, camera, canvas, lot_depth, point))
 }
 
 /// The person or plumb bob drawn at `point`, by `people`, a frame's IDs
 /// once its people were drawn, if it stands on the floor `camera` shows.
-pub fn noted(world: &World, camera: &Camera, people: &Ids, [x, y]: [i32; 2]) -> Option<u16> {
+/// `is_bob` tells the plumb bobs: every type with a 3D graphic of its own
+/// whose suit picks a bob mode notes itself as it is drawn (`0x5863eb`),
+/// not only the standard bob.
+pub fn noted(
+    world: &World,
+    camera: &Camera,
+    people: &Ids,
+    [x, y]: [i32; 2],
+    is_bob: impl Fn(u16) -> bool,
+) -> Option<u16> {
     let id = people.id_at(x, y)?;
     let object = world.objects.get(&id)?;
-    let three_d = object.person.is_some() || object.guid == sims_people::bob::STANDARD;
+    let three_d = object.person.is_some() || is_bob(id);
     (three_d && object.position[2] == camera.level).then_some(id)
 }
 

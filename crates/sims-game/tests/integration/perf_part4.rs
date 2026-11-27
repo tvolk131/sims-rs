@@ -656,7 +656,10 @@ fn wave_b_picking_parity_and_steady_present_damage_completeness() {
     let mut checked_grid_pixels = 0usize;
     for y in 0..ch as i32 {
         for x in 0..cw as i32 {
-            let is_noted = sims_game::pick::noted(world, &cam, &ref_people_ids, [x, y]).is_some();
+            let is_noted = sims_game::pick::noted(world, &cam, &ref_people_ids, [x, y], |id| {
+                ref_people.is_bob(world, id)
+            })
+            .is_some();
             if is_noted || (x % 4 == 0 && y % 4 == 0) {
                 let got = game.under([x, y]);
                 let want = sims_game::pick::at(
@@ -666,6 +669,7 @@ fn wave_b_picking_parity_and_steady_present_damage_completeness() {
                     &ref_lot_depth,
                     &ref_people_ids,
                     [x, y],
+                    |id| ref_people.is_bob(world, id),
                 );
                 assert_eq!(
                     got, want,
