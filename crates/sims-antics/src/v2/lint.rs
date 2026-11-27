@@ -374,6 +374,10 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             in_block: 0,
             consts: file_consts(ast),
             raw_bodies: directives.raw_bodies.clone(),
+            raw_ends: directives.raw_ends.clone(),
+            bhav_pins: bhav_pins(tokens),
+            bhav_pin: None,
+            layout_trials: Vec::new(),
             line_starts: directives.line_starts.clone(),
             sims: Vec::new(),
             sim_bindings: BTreeSet::new(),
@@ -423,6 +427,7 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
         cx.duplicate_std_globals(ast);
         cx.frame_headroom(ast, compiled.as_deref());
         let pending = std::mem::take(&mut cx.pending);
+        let layout_trials = std::mem::take(&mut cx.layout_trials);
         let mut diags = cx.diags;
         // The two errors that cannot be allowed stand only where `check` rejects the file
         // (the lint reads lowering's rules approximately): lowering stops on the line of one
@@ -461,6 +466,7 @@ pub fn lint_v2_sources(inputs: &[LintInput]) -> Result<Vec<LintDiagnostic>> {
             });
         }
         if let Some(original) = compiled.as_deref() {
+            layout_pins(input, original, &layout_trials, &mut diags);
             let (stand, untried) = verified(input, original, pending, &diags);
             diags.extend(stand);
             let seen: Vec<LintDiagnostic> = diags.iter().chain(&untried).cloned().collect();
@@ -559,6 +565,9 @@ struct Directives {
     /// Each `raw { }` block's body: the `raw` keyword's `(line, column)` -> the byte
     /// offset of the body's first byte (after `{`) in the source.
     raw_bodies: BTreeMap<(usize, usize), usize>,
+    /// Each `raw { }` block's end: the `raw` keyword's `(line, column)` -> the byte offset
+    /// one past its closing `}`.
+    raw_ends: BTreeMap<(usize, usize), usize>,
     /// The byte offset each line starts at.
     line_starts: Vec<usize>,
 }
@@ -586,11 +595,13 @@ impl Directives {
         // `raw { }` bodies follow `.air` comment and string rules, so they are scanned
         // apart (`scan_raw`): byte offset of each body's `{` -> one past its closing `}`.
         let mut raw_bodies = BTreeMap::new();
+        let mut block_ends = BTreeMap::new();
         let raw_ends: BTreeMap<usize, usize> = raw_keywords(source, tokens)
             .into_iter()
             // Keyed by the `{`: comments between `raw` and `{` are v2 comments.
             .map(|(at, (_, open, len))| {
                 raw_bodies.insert(at, open + 1);
+                block_ends.insert(at, open + 1 + len + 1);
                 (open, open + 1 + len + 1)
             })
             .collect();
@@ -657,6 +668,7 @@ impl Directives {
         }
         let mut out = Self {
             raw_bodies,
+            raw_ends: block_ends,
             line_starts: line_starts.clone(),
             ..Self::default()
         };
@@ -1792,6 +1804,16 @@ struct FileLinter<'a> {
     consts: BTreeSet<String>,
     /// Where each `raw { }` body starts in the source ([`Directives::raw_bodies`]).
     raw_bodies: BTreeMap<(usize, usize), usize>,
+    /// Where each `raw { }` block ends ([`Directives::raw_ends`]).
+    raw_ends: BTreeMap<(usize, usize), usize>,
+    /// Per `#[bhav] fn` (its `fn` keyword), where `keep_layout` goes in its `#[bhav(..)]`
+    /// ([`bhav_pins`]).
+    bhav_pins: BTreeMap<(usize, usize), (Span, usize, &'static str)>,
+    /// The `keep_layout` edit of the `#[bhav] fn` being linted, when it has no pin yet.
+    bhav_pin: Option<Fix>,
+    /// The `manual_raw_has_builtin` findings whose native form is built with and without
+    /// `keep_layout` ([`layout_pins`]).
+    layout_trials: Vec<LayoutTrial>,
     /// The byte offset each source line starts at.
     line_starts: Vec<usize>,
     /// The names that are the running Sim in the body being linted: its Sim binding, and
@@ -2848,6 +2870,7 @@ impl FileLinter<'_> {
                 ObjectMember::Fn(f) => self.lint_fn(f),
                 ObjectMember::Tree(t) => {
                     self.missing_sim_frame_args(t);
+                    self.bhav_pin = self.keep_layout_fix(t);
                     self.enter_tree(t.pinned_id, &t.label, &t.body);
                     let sim = t.sim_binding.is_some();
                     self.enter_context(
@@ -2863,6 +2886,7 @@ impl FileLinter<'_> {
                     );
                     self.lint_body(&t.body, BodyCx { sim });
                     self.leave_context();
+                    self.bhav_pin = None;
                 }
                 ObjectMember::Init(b) | ObjectMember::Main(b) => {
                     let label = if matches!(m, ObjectMember::Init(_)) {
@@ -4813,6 +4837,8 @@ impl FileLinter<'_> {
             return;
         }
         let mut spellings = Vec::new();
+        // The exact statements, while every line has one.
+        let mut exact: Option<Vec<String>> = Some(Vec::new());
         for l in &lines {
             let word: String = l
                 .chars()
@@ -4829,19 +4855,23 @@ impl FileLinter<'_> {
             {
                 return;
             }
-            let v2 = match RAW_BUILTINS.iter().find(|(air, _)| *air == word) {
+            let (v2, stmt) = match RAW_BUILTINS.iter().find(|(air, _)| *air == word) {
                 Some((_, v2))
                     if native_operands(&word, l[word.len()..].trim())
                         && self.call_free(v2.split('(').next().unwrap_or(v2)) =>
                 {
-                    (*v2).to_owned()
+                    ((*v2).to_owned(), None)
                 }
                 Some(_) => return,
                 None => match self.raw_native_form(&word, l) {
-                    Some(v2) => v2,
+                    Some(form) => form,
                     None => return,
                 },
             };
+            match (&mut exact, stmt) {
+                (Some(list), Some(stmt)) => list.push(stmt),
+                _ => exact = None,
+            }
             if !spellings.contains(&v2) {
                 spellings.push(v2);
             }
@@ -4854,6 +4884,60 @@ impl FileLinter<'_> {
             None,
             None,
         );
+        if let Some(stmts) = exact {
+            self.layout_trial(span, &stmts);
+        }
+    }
+
+    /// The edit adding `keep_layout` to `t`'s `#[bhav(..)]`, when `t` has no pin yet.
+    fn keep_layout_fix(&self, t: &crate::v2::ast::TreeMemberDecl) -> Option<Fix> {
+        if t.frame.as_ref().is_some_and(|f| f.keep_layout) {
+            return None;
+        }
+        let &(at, past, text) = self.bhav_pins.get(&(t.span.line, t.span.column))?;
+        let start = self.offset(at)? + past;
+        Some(Fix {
+            start,
+            end: start,
+            text: text.to_owned(),
+        })
+    }
+
+    /// Queues the `keep_layout` trial of the `manual_raw_has_builtin` finding at `span`
+    /// ([`LayoutTrial`]): the raw block becomes `stmts`, and the pin goes in the `#[bhav(..)]`
+    /// of the `#[bhav] fn` being linted. Not for a tree that already has the pin (the block
+    /// keeps nothing more), a block holding a comment (the rewrite would drop it), a template
+    /// no object of the file builds, or a body other than a `#[bhav] fn`'s.
+    fn layout_trial(&mut self, span: Span, stmts: &[String]) {
+        let Some(pin) = self.bhav_pin.clone() else {
+            return;
+        };
+        if self.unbuilt {
+            return;
+        }
+        let (Some(start), Some(&end)) = (
+            self.offset(span),
+            self.raw_ends.get(&(span.line, span.column)),
+        ) else {
+            return;
+        };
+        let Some(block) = self.source.get(start..end) else {
+            return;
+        };
+        if has_comment(block) || block.contains('#') || block.contains("/*") {
+            return;
+        }
+        let line = self.lines.get(span.line - 1).copied().unwrap_or_default();
+        let indent = &line[..line.len() - line.trim_start().len()];
+        self.layout_trials.push(LayoutTrial {
+            at: span,
+            native: Fix {
+                start,
+                end,
+                text: stmts.join(&format!("\n{indent}")),
+            },
+            pin,
+        });
     }
 
     /// The v2 spelling of one raw `.air` statement `l` (leading word `word`) that PR I-3's
@@ -4888,7 +4972,11 @@ impl FileLinter<'_> {
     /// no `temp` takes, so neither is a store here. Nothing is spelled when the body rebinds
     /// the name the spelling uses (`temp`, `param`, `me`, `stack_obj`), or a user function
     /// shadows the builtin.
-    fn raw_native_form(&self, word: &str, l: &str) -> Option<String> {
+    ///
+    /// With the spelling (for the help), the exact v2 statement the line becomes, where the
+    /// form gives one (`None` for a test, or a form the help spells with `..`): the
+    /// `keep_layout` trial builds it ([`LayoutTrial`]).
+    fn raw_native_form(&self, word: &str, l: &str) -> Option<(String, Option<String>)> {
         let rest = l[word.len()..].trim();
         let args = || -> Option<Vec<&str>> {
             let inner = rest.strip_prefix('(')?.strip_suffix(')')?.trim();
@@ -4950,11 +5038,13 @@ impl FileLinter<'_> {
                         _ => return None,
                     }
                 }
-                Some(if flags == 0 {
+                let v2 = if flags == 0 {
                     format!("remove_object({target})")
                 } else {
                     format!("remove_object({target}, flags: {flags})")
-                })
+                };
+                let exact = format!("{v2};");
+                Some((v2, Some(exact)))
             }
             "find_best_object" if free_call("find_best_object") => {
                 let args = args()?;
@@ -4977,8 +5067,12 @@ impl FileLinter<'_> {
                 // Only where `self` is the object: in a Sim's body, v2 saves and restores the
                 // entry stack object around the search for a later `self`, which the raw
                 // block does not.
-                (ok && self.object_me)
-                    .then(|| "`find_best_object(..)` as an `if` / `while` test".to_owned())
+                (ok && self.object_me).then(|| {
+                    (
+                        "`find_best_object(..)` as an `if` / `while` test".to_owned(),
+                        None,
+                    )
+                })
             }
             "set_to_next" if free_call("set_to_next") => {
                 const MODES: &[&str] = &[
@@ -5013,7 +5107,7 @@ impl FileLinter<'_> {
                         // A positional GUID.
                         None => in_range(o, 0, 0xFFFF_FFFF),
                     });
-                (ok && dest).then(|| "set_to_next(.., dest: ..)".to_owned())
+                (ok && dest).then(|| ("set_to_next(.., dest: ..)".to_owned(), None))
             }
             "play_sound" | "clear_motive_changes" if free_call(word) => {
                 // `name(args)`, then an optional `pad(i: 0xNN, ..)`.
@@ -5067,7 +5161,7 @@ impl FileLinter<'_> {
                         23,
                         [s0, s1, 0, 0, flags, 0, 0, 0],
                         &[0u8, 1, 4][..],
-                        Some(target),
+                        Some((sound, target)),
                     )
                 };
                 // v2 refuses a pad of a byte the call spells; the encoder refuses the rest
@@ -5084,9 +5178,20 @@ impl FileLinter<'_> {
                     return None;
                 }
                 let pad = if pads.is_empty() { "" } else { "padN: 0xNN" };
+                let exact_pads = pads
+                    .iter()
+                    .map(|(i, v)| format!("pad{i}: 0x{v:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 Some(match target {
-                    None => format!("clear_motive_changes({pad})"),
-                    Some(target) => format!("play_sound(.., {target}, {pad})"),
+                    None => (
+                        format!("clear_motive_changes({pad})"),
+                        Some(format!("clear_motive_changes({exact_pads});")),
+                    ),
+                    Some((sound, target)) => (
+                        format!("play_sound(.., {target}, {pad})"),
+                        Some(format!("play_sound({sound}, {target}, {exact_pads});")),
+                    ),
                 })
             }
             "reach" if free_call("reach") => {
@@ -5121,10 +5226,14 @@ impl FileLinter<'_> {
                     },
                 };
                 if mode == 1 {
-                    param(&format!("param[{p}]"))
-                        .then(|| "reach(mode: 1, moves: .., slot: param[..])".to_owned())
+                    param(&format!("param[{p}]")).then(|| {
+                        (
+                            "reach(mode: 1, moves: .., slot: param[..])".to_owned(),
+                            None,
+                        )
+                    })
                 } else {
-                    (p == 0).then(|| "reach(mode: .., moves: ..)".to_owned())
+                    (p == 0).then(|| ("reach(mode: .., moves: ..)".to_owned(), None))
                 }
             }
             "remove_object"
@@ -5141,50 +5250,64 @@ impl FileLinter<'_> {
                     let (scope, n) = inner.split_once(',')?;
                     Some((air_literal(scope)?, air_literal(n)?))
                 };
-                // A cell #469 spells, readable and writable alike.
-                let cell = |scope: i64, n: i64| -> Option<String> {
+                // A cell #469 spells, readable and writable alike: its help spelling, and its
+                // exact text.
+                let cell = |scope: i64, n: i64| -> Option<(String, String)> {
                     let temp_n = (0..=7).contains(&n) && free("temp");
+                    let indexed =
+                        |base: &str| (format!("{base}[temp[..]]"), format!("{base}[temp[{n}]]"));
                     match scope {
                         12 if (0..16).contains(&n) && free("advert") => {
-                            Some(format!("advert.delta[{n}]"))
+                            let v2 = format!("advert.delta[{n}]");
+                            Some((v2.clone(), v2))
                         }
                         27 if temp_n && free("stack_obj") => {
-                            Some("stack_obj.sprite_flags[temp[..]]".to_owned())
+                            Some(indexed("stack_obj.sprite_flags"))
                         }
-                        30 if temp_n && free("me") && !self.me_bcon => {
-                            Some("me.person[temp[..]]".to_owned())
-                        }
-                        31 if temp_n && free("stack_obj") => {
-                            Some("stack_obj.person[temp[..]]".to_owned())
-                        }
+                        30 if temp_n && free("me") && !self.me_bcon => Some(indexed("me.person")),
+                        31 if temp_n && free("stack_obj") => Some(indexed("stack_obj.person")),
                         _ => None,
                     }
                 };
+                // A `temp[N]` / `param[N]` (checked above) or a literal, as v2 writes it.
+                let operand = |text: &str| -> Option<String> {
+                    ["temp", "param"]
+                        .into_iter()
+                        .find_map(|base| index(text, base).map(|n| format!("{base}[{n}]")))
+                        .or_else(|| air_literal(text).map(|n| n.to_string()))
+                };
                 if temp(&dst) {
                     let (scope, n) = scope_cell(&src)?;
-                    match (scope, n) {
-                        (21, 9) if free("stack_obj") => Some("stack_obj.object_type".to_owned()),
-                        (21, 11) if free("stack_obj") => Some("stack_obj.sub_index".to_owned()),
-                        (33, 0..=32767) if free_call("job_field") => {
-                            Some(format!("job_field({n})"))
-                        }
-                        (24, 0..=9) if free("stack_obj") => Some(match n {
+                    let read = match (scope, n) {
+                        (21, 9) if free("stack_obj") => "stack_obj.object_type".to_owned(),
+                        (21, 11) if free("stack_obj") => "stack_obj.sub_index".to_owned(),
+                        (33, 0..=32767) if free_call("job_field") => format!("job_field({n})"),
+                        (24, 0..=9) if free("stack_obj") => match n {
                             2 => "stack_obj.neighbor.age".to_owned(),
                             5 => "stack_obj.neighbor.friend_count".to_owned(),
                             6 => "stack_obj.neighbor.family_house".to_owned(),
                             9 => "stack_obj.neighbor.family_friend_count".to_owned(),
                             _ => format!("stack_obj.neighbor.field[{n}]"),
-                        }),
+                        },
                         (32, 0..=255) if free("stack_obj") => {
-                            Some(format!("stack_obj.neighbor.person[{n}]"))
+                            format!("stack_obj.neighbor.person[{n}]")
                         }
-                        _ => cell(scope, n),
-                    }
+                        _ => {
+                            let (v2, exact) = cell(scope, n)?;
+                            let exact = operand(&dst).map(|d| format!("{d} = {exact};"));
+                            return Some((v2, exact));
+                        }
+                    };
+                    let exact = operand(&dst).map(|d| format!("{d} = {read};"));
+                    Some((read, exact))
                 } else {
                     let (scope, n) = scope_cell(&dst)?;
-                    (temp(&src) || param(&src) || in_range(&src, -32768, 32767))
-                        .then(|| cell(scope, n))
-                        .flatten()
+                    if !(temp(&src) || param(&src) || in_range(&src, -32768, 32767)) {
+                        return None;
+                    }
+                    let (v2, exact) = cell(scope, n)?;
+                    let exact = operand(&src).map(|s| format!("{exact} = {s};"));
+                    Some((v2, exact))
                 }
             }
         }
@@ -5567,39 +5690,8 @@ fn verified(
     if pending.is_empty() {
         return (Vec::new(), Vec::new());
     }
-    // A pack file builds against its pack, under its file name, as `expand_for_lint` does.
-    let pack = match (&input.path, &input.pack_dir) {
-        (Some(path), Some(pack)) => match crate::v2::loader::read_v2_checked_file(path, Some(pack))
-        {
-            Ok((_, config)) => {
-                let label = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("<input.antics>")
-                    .to_owned();
-                Some((label, config))
-            }
-            Err(_) => return (Vec::new(), Vec::new()),
-        },
-        _ => None,
-    };
-    let builds_same = |source: &str| {
-        let lowered = match &pack {
-            Some((label, config)) => crate::v2::resolve_v2_source(label, source, config)
-                .and_then(|r| crate::v2::lower_resolved_module(&r)),
-            None => crate::v2::expand_v2_source_to_objects(
-                &input.name,
-                source,
-                &crate::v2::PackResolverConfig::default(),
-            ),
-        };
-        let Ok(objects) = lowered else {
-            return false;
-        };
-        objects.len() == original.len()
-            && objects.into_iter().zip(original).all(|(e, o)| {
-                crate::v2::compile_expanded_v2_object(e).is_ok_and(|c| c.iff_bytes == o.iff_bytes)
-            })
+    let Some(builds_same) = same_bytes(input, original) else {
+        return (Vec::new(), Vec::new());
     };
     let mut budget = TRIAL_BUDGET;
     let mut joint_budget = JOINT_BUDGET;
@@ -5709,6 +5801,197 @@ fn verified(
     untried.sort_unstable();
     let diags = |list: Vec<usize>| list.into_iter().map(|i| pending[i].diag.clone()).collect();
     (diags(kept), diags(untried))
+}
+
+/// Whether a rewritten `source` builds the bytes of `original`, as `input` is built: a pack
+/// file against its pack, under its file name, as `expand_for_lint` does. `None` when the
+/// pack does not load.
+fn same_bytes<'a>(
+    input: &'a LintInput,
+    original: &'a [crate::compile::CompiledObject],
+) -> Option<impl Fn(&str) -> bool + 'a> {
+    let pack = match pack_config(input) {
+        Some(config) => Some(config.ok()?),
+        None => None,
+    };
+    Some(move |source: &str| {
+        let lowered = match &pack {
+            Some((label, config)) => crate::v2::resolve_v2_source(label, source, config)
+                .and_then(|r| crate::v2::lower_resolved_module(&r)),
+            None => crate::v2::expand_v2_source_to_objects(
+                &input.name,
+                source,
+                &crate::v2::PackResolverConfig::default(),
+            ),
+        };
+        let Ok(objects) = lowered else {
+            return false;
+        };
+        objects.len() == original.len()
+            && objects.into_iter().zip(original).all(|(e, o)| {
+                crate::v2::compile_expanded_v2_object(e).is_ok_and(|c| c.iff_bytes == o.iff_bytes)
+            })
+    })
+}
+
+/// For a pack file, the label it is built under (its file name) and its pack's resolver
+/// config, as `check` reads them (`read_v2_checked_file`'s path checks included); `None` for
+/// a file built on its own. The file's text is never taken from here: the lint builds
+/// `input.source`, the text it read once.
+fn pack_config(input: &LintInput) -> Option<Result<(String, crate::v2::PackResolverConfig)>> {
+    let (Some(path), Some(pack)) = (&input.path, &input.pack_dir) else {
+        return None;
+    };
+    Some(
+        crate::v2::loader::read_v2_checked_file(path, Some(pack)).map(|(_, config)| {
+            let label = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("<input.antics>")
+                .to_owned();
+            (label, config)
+        }),
+    )
+}
+
+/// A `manual_raw_has_builtin` finding whose raw block every line of which has an exact v2
+/// statement, in a `#[bhav] fn` without `keep_layout`. A raw block that keeps the tree's
+/// layout (`raw_block_is_layout_free` is false for it) keeps the backend pass off the whole
+/// tree, and its native form does not: that form may then build other bytes (or not build,
+/// when the tree's `node_order` counts the kept nodes). `#[bhav(keep_layout)]` keeps the pass
+/// off as such a block does when it ends the body (#503).
+#[derive(Debug, Clone)]
+struct LayoutTrial {
+    /// The finding's position.
+    at: Span,
+    /// The raw block, rewritten to its exact statements.
+    native: Fix,
+    /// `keep_layout` added to the tree's `#[bhav(..)]`.
+    pin: Fix,
+}
+
+/// The most `keep_layout` trials one file may take (each takes up to two builds).
+const LAYOUT_BUDGET: usize = 8;
+
+/// `manual_raw_has_builtin` with `keep_layout`: for each trial (in source order, within
+/// [`LAYOUT_BUDGET`]), the native form is built alone, and when it does not build the same
+/// bytes, with the pin. When only the pinned form builds the same bytes, the finding's help
+/// says so. Each block is tried on its own, as the finding stands on its own.
+fn layout_pins(
+    input: &LintInput,
+    original: &[crate::compile::CompiledObject],
+    trials: &[LayoutTrial],
+    diags: &mut [LintDiagnostic],
+) {
+    if trials.is_empty() {
+        return;
+    }
+    let Some(builds_same) = same_bytes(input, original) else {
+        return;
+    };
+    let builds = |fixes: Vec<Fix>| {
+        let p = Pending {
+            diag: LintDiagnostic {
+                rule: MANUAL_RAW_HAS_BUILTIN,
+                severity: Severity::Warning,
+                file: String::new(),
+                line: 0,
+                column: 0,
+                message: String::new(),
+                help: None,
+                suggestion: None,
+                note: None,
+            },
+            fixes,
+            import: None,
+            stmt: None,
+            body: 0,
+            flows: false,
+            secondary: false,
+        };
+        apply_fixes(&input.source, std::iter::once(&p)).is_some_and(|s| builds_same(&s))
+    };
+    for t in trials.iter().take(LAYOUT_BUDGET) {
+        if builds(vec![t.native.clone()]) || !builds(vec![t.native.clone(), t.pin.clone()]) {
+            continue;
+        }
+        let Some(d) = diags.iter_mut().find(|d| {
+            d.rule == MANUAL_RAW_HAS_BUILTIN && (d.line, d.column) == (t.at.line, t.at.column)
+        }) else {
+            continue;
+        };
+        if let Some(help) = &mut d.help {
+            help.push_str(
+                ", and add `keep_layout` to the tree's `#[bhav(..)]`: this block keeps the \
+                 tree's layout, and the native form builds the same bytes only with the pin",
+            );
+        }
+    }
+}
+
+/// Per `#[bhav] fn` (keyed by its `fn` keyword's position), where `keep_layout` goes in its
+/// `#[bhav(..)]`: the token to insert at, the bytes past that token's start, and the text.
+/// `#[bhav]` takes `(keep_layout)` after its name; `#[bhav(..)]` takes `, keep_layout` before
+/// its `)` (`keep_layout` after a `(` or a trailing comma). Other attributes and `pub` may
+/// stand between the attribute and `fn`.
+fn bhav_pins(
+    tokens: &[crate::v2::lexer::Token],
+) -> BTreeMap<(usize, usize), (Span, usize, &'static str)> {
+    let kind = |i: usize| tokens.get(i).map(|t| &t.kind);
+    let is_ident = |i: usize, name: &str| matches!(kind(i), Some(TokenKind::Ident(n)) if n == name);
+    // One past the `]` closing the attribute that opens at `i` (`#[`), or `None`.
+    let attr_end = |i: usize| {
+        let mut depth = 0usize;
+        for j in i..tokens.len() {
+            match kind(j)? {
+                TokenKind::HashBracket | TokenKind::LBracket => depth += 1,
+                TokenKind::RBracket => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    let mut out = BTreeMap::new();
+    for i in 0..tokens.len() {
+        if !(matches!(kind(i), Some(TokenKind::HashBracket)) && is_ident(i + 1, "bhav")) {
+            continue;
+        }
+        let Some(mut next) = attr_end(i) else {
+            break;
+        };
+        let pin = match kind(i + 2) {
+            Some(TokenKind::RBracket) => (tokens[i + 1].span, "bhav".len(), "(keep_layout)"),
+            // `#[bhav(..)]`: the `)` just before the closing `]`.
+            Some(TokenKind::LParen) if matches!(kind(next - 2), Some(TokenKind::RParen)) => {
+                let text = if matches!(kind(next - 3), Some(TokenKind::LParen | TokenKind::Comma)) {
+                    "keep_layout"
+                } else {
+                    ", keep_layout"
+                };
+                (tokens[next - 2].span, 0, text)
+            }
+            _ => continue,
+        };
+        while matches!(kind(next), Some(TokenKind::HashBracket)) {
+            let Some(end) = attr_end(next) else {
+                break;
+            };
+            next = end;
+        }
+        if is_ident(next, "pub") {
+            next += 1;
+        }
+        if is_ident(next, "fn") {
+            let at = tokens[next].span;
+            out.insert((at.line, at.column), pin);
+        }
+    }
+    out
 }
 
 /// Per line, each string literal's column and how many more bytes than characters it
@@ -7725,9 +8008,13 @@ fn std_globals() -> &'static [ExternFnDecl] {
 }
 
 /// Whether two `extern` functions call the same tree the same way: one ID, the same
-/// parameter types and slots, and the same return ABI (names aside).
+/// parameter types and slots, the same return ABI and the same frame width (names aside).
+/// The width counts: a declaration whose `#[frame(args = N | unknown)]` is wider than four
+/// (or unknown) vetoes the tree's narrow frame for the whole object, so a call to it keeps
+/// the tree's layout, and dropping that declaration would change the bytes.
 fn same_abi(a: &ExternFnDecl, b: &ExternFnDecl) -> bool {
     a.id == b.id
+        && a.frame_args() == b.frame_args()
         && a.ret == b.ret
         && a.params.len() == b.params.len()
         && a.params
@@ -8371,10 +8658,14 @@ fn verified_frames(
 fn expand_for_lint(
     input: &LintInput,
 ) -> std::result::Result<Vec<crate::v2::ExpandedV2Object>, Option<Span>> {
-    let lowered = match (&input.path, &input.pack_dir) {
-        (Some(path), Some(pack)) => crate::v2::resolve_v2_file(path, Some(pack))
-            .and_then(|resolved| crate::v2::lower_resolved_module(&resolved)),
-        _ => crate::v2::expand_v2_source_to_objects(
+    let lowered = match pack_config(input) {
+        // The file as the linter read it (`input.source`), not read again: the byte checks
+        // build edits of that text, so the baseline must be built from it too.
+        Some(config) => config.and_then(|(label, config)| {
+            crate::v2::resolve_v2_source(&label, &input.source, &config)
+                .and_then(|resolved| crate::v2::lower_resolved_module(&resolved))
+        }),
+        None => crate::v2::expand_v2_source_to_objects(
             &input.name,
             &input.source,
             &crate::v2::PackResolverConfig::default(),
