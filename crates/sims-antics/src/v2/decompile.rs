@@ -359,6 +359,7 @@ pub fn decompile_iff_to_v2_report(
                 if changed || plan.share_large(&model, &generated, &recompiled) {
                     continue;
                 }
+                let generated = read_locals_in_place(&model, &mut plan, generated, &recompiled);
                 let (text, recompiled, checks) = model.type_engine_fields(
                     &generated.text,
                     (recompiled, checks, &unproven),
@@ -405,6 +406,72 @@ pub fn decompile_iff_to_v2_report(
         }
     }
     Err(Error::new("decompiler validation did not converge"))
+}
+
+/// The most builds [`read_locals_in_place`] takes.
+const LOCAL_READ_BUILDS: usize = 4;
+
+/// The converged lift `generated` (which built `recompiled`) with the statements that only
+/// read a local the tree leaves by number written as v2 code (`local[N]`) instead of raw
+/// lines. It changes no node: a tree whose nodes come out different keeps its reads raw
+/// ([`Plan::raw_local_reads`]), and `generated` is kept unless the whole object builds the
+/// same bytes, so no verdict changes. The pins carry over to the trees' new text.
+fn read_locals_in_place(
+    model: &Model,
+    plan: &mut Plan,
+    generated: Generated,
+    recompiled: &RecompiledFile,
+) -> Generated {
+    let same_nodes = |a: Option<&BhavChunk>, b: Option<&BhavChunk>| match (a, b) {
+        (Some(a), Some(b)) => {
+            (a.args, a.locals, a.format, a.kind) == (b.args, b.locals, b.format, b.kind)
+                && a.instructions.len() == b.instructions.len()
+                && a.instructions.iter().zip(&b.instructions).all(|(a, b)| {
+                    (a.opcode, a.on_true, a.on_false, a.operands)
+                        == (b.opcode, b.on_true, b.on_false, b.operands)
+                })
+        }
+        _ => false,
+    };
+    plan.local_reads = Some(generated.pinned.clone());
+    for _ in 0..LOCAL_READ_BUILDS {
+        let trial = model.generate(plan);
+        if trial.local_reads.is_empty() {
+            break;
+        }
+        let blamed: BTreeSet<u16> = match model.compile(&trial.text) {
+            Ok(built) if built.iff_bytes == recompiled.iff_bytes => {
+                plan.local_reads = None;
+                return trial;
+            }
+            Ok(built) => trial
+                .local_reads
+                .iter()
+                .copied()
+                .filter(|id| !same_nodes(built.trees.get(id), recompiled.trees.get(id)))
+                .collect(),
+            Err(Failure::V2 {
+                line: Some(line), ..
+            }) => trial
+                .tree_at_line(line.saturating_sub(1))
+                .into_iter()
+                .collect(),
+            Err(Failure::Air { tree: Some(id), .. }) => BTreeSet::from([id]),
+            Err(_) => BTreeSet::new(),
+        };
+        // Only a tree that read a local in place is blamed; anything else keeps the
+        // converged text. Every blamed tree keeps its reads raw from the next build on.
+        if blamed.is_empty() || !blamed.iter().all(|id| trial.local_reads.contains(id)) {
+            break;
+        }
+        let before = plan.raw_local_reads.len();
+        plan.raw_local_reads.extend(blamed);
+        if plan.raw_local_reads.len() == before {
+            break;
+        }
+    }
+    plan.local_reads = None;
+    generated
 }
 
 /// Lint `untyped_engine_field`'s suggestion: `(line, column, typed name)`, 1-based, for the
@@ -707,6 +774,18 @@ fn insert_imports(text: &str, imports: BTreeSet<&str>) -> String {
 /// if `ok` holds for both, and a part that does not is split in halves. At most `budget`
 /// calls of `ok`.
 fn keep_joint<T: Clone>(fixes: &[T], ok: &dyn Fn(&[T]) -> bool, budget: usize) -> Vec<T> {
+    let mut budget = budget;
+    keep_joint_onto(Vec::new(), fixes, ok, &mut budget)
+}
+
+/// [`keep_joint`] after the fixes `kept` (each trial builds them too), spending from
+/// `budget` and leaving what it does not use.
+fn keep_joint_onto<T: Clone>(
+    mut kept: Vec<T>,
+    fixes: &[T],
+    ok: &dyn Fn(&[T]) -> bool,
+    budget: &mut usize,
+) -> Vec<T> {
     fn go<T: Clone>(kept: &mut Vec<T>, part: &[T], ok: &dyn Fn(&[T]) -> bool, budget: &mut usize) {
         if part.is_empty() || *budget == 0 {
             return;
@@ -724,9 +803,7 @@ fn keep_joint<T: Clone>(fixes: &[T], ok: &dyn Fn(&[T]) -> bool, budget: usize) -
             go(kept, b, ok, budget);
         }
     }
-    let mut kept = Vec::new();
-    let mut budget = budget;
-    go(&mut kept, fixes, ok, &mut budget);
+    go(&mut kept, fixes, ok, budget);
     kept
 }
 
@@ -795,6 +872,15 @@ const MATCH_SPELLING_PASSES: usize = 3;
 /// statements it can write with the same bytes ([`if_let_spellings`]): one statement per
 /// group, and a tree's frame may refuse any of them.
 const POLISH_IF_LET_BUILDS: usize = 24;
+
+/// The fewest builds [`Model::polish`] leaves for the `if let` statements in trees that the
+/// statements together leave short of locals (each may still build alone), when the others
+/// spent more of [`POLISH_IF_LET_BUILDS`].
+const POLISH_IF_LET_SHORT_BUILDS: usize = 8;
+
+/// The most builds [`Model::short_of_locals`] takes to find the trees the `if let`
+/// statements leave short of locals.
+const POLISH_IF_LET_CENSUS_BUILDS: usize = 6;
 
 /// How many diagnostics of each rule, line and message a text lints with.
 type LintCounts = BTreeMap<(&'static str, usize, String), usize>;
@@ -1741,6 +1827,19 @@ const OPTION_CALLS: [(&str, &str); 2] = [
     ("take_elapsed_periods", "periods"),
     ("find_companion", "companion"),
 ];
+
+/// The ID of the tree whose header (`#[bhav(id = N, ..)]` or `#[id(N)]`) is the last one
+/// at or before byte `at` of lifted `text`.
+fn tree_id_at(text: &str, at: usize) -> Option<u16> {
+    text[..at.min(text.len())].lines().rev().find_map(|l| {
+        let l = l.trim_start();
+        let rest = l
+            .strip_prefix("#[bhav(id = ")
+            .or_else(|| l.strip_prefix("#[id("))?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    })
+}
 
 /// Every `if globals::f(..) {` whose callee leaves its value in `temp[0]` when it returns
 /// true ([`OPTION_CALLS`]) and whose then block reads that value, as `if let Some(v) =
@@ -3306,26 +3405,61 @@ impl Model {
     /// declares and the count it requires, from one build with the headers' counts left out
     /// (the build then gives each tree what it needs). Empty when that build fails.
     fn locals_needed(&self, text: &str) -> BTreeMap<u16, (u16, u16)> {
-        let Ok(mut expanded) =
+        self.try_locals_needed(text).unwrap_or_default()
+    }
+
+    /// [`Model::locals_needed`], or `None` when the build fails.
+    fn try_locals_needed(&self, text: &str) -> Option<BTreeMap<u16, (u16, u16)>> {
+        let mut expanded =
             expand_v2_source_to_objects("decompiled.antics", text, &PackResolverConfig::default())
-        else {
-            return BTreeMap::new();
-        };
+                .ok()?;
         if expanded.len() != 1 {
-            return BTreeMap::new();
+            return None;
         }
         let mut expanded = expanded.remove(0);
         let (air, declared) = without_locals(&expanded.air_source);
         expanded.air_source = air;
-        let Ok(compiled) = compile_expanded_v2_object(expanded) else {
-            return BTreeMap::new();
-        };
-        declared
-            .into_iter()
-            .filter_map(|(id, declared)| {
-                Some((id, (declared, compiled.behaviors.get(&id)?.locals)))
-            })
-            .collect()
+        let compiled = compile_expanded_v2_object(expanded).ok()?;
+        Some(
+            declared
+                .into_iter()
+                .filter_map(|(id, declared)| {
+                    Some((id, (declared, compiled.behaviors.get(&id)?.locals)))
+                })
+                .collect(),
+        )
+    }
+
+    /// The trees that rewrite groups `groups` of `base` leave short of locals: one build with
+    /// every group, and when one of them keeps that from building, its halves, breadth first
+    /// so the halves that build are counted before a failing one is split further (at most
+    /// `budget` builds; a part still failing then names no tree).
+    fn short_of_locals(&self, base: &str, groups: &[Vec<Rewrite>], budget: usize) -> BTreeSet<u16> {
+        let mut short = BTreeSet::new();
+        let mut parts = std::collections::VecDeque::from([groups]);
+        let mut budget = budget;
+        while budget > 0
+            && let Some(part) = parts.pop_front()
+        {
+            if part.is_empty() {
+                continue;
+            }
+            budget -= 1;
+            match self.try_locals_needed(&apply_groups(base, part)) {
+                Some(needed) => short.extend(
+                    needed
+                        .into_iter()
+                        .filter(|(_, (declared, needed))| needed > declared)
+                        .map(|(id, _)| id),
+                ),
+                None if part.len() > 1 => {
+                    let (a, b) = part.split_at(part.len() / 2);
+                    parts.extend([a, b]);
+                }
+                None => {}
+            }
+        }
+        short
     }
 
     fn compile(&self, text: &str) -> std::result::Result<RecompiledFile, Failure> {
@@ -3635,7 +3769,23 @@ impl Model {
         if !if_lets.is_empty() {
             let base = text.clone();
             let ok = |g: &[Vec<Rewrite>]| same(&apply_groups(&base, g));
-            let kept = keep_joint(&if_lets, &ok, POLISH_IF_LET_BUILDS);
+            // A binding takes a frame word, which a tree whose header fixes its locals may
+            // not have: one build of every statement at once, with the counts left out,
+            // names each such tree (parts of them when one statement keeps that from
+            // building). Its statements are tried after the others, so a file
+            // with many refusals still reaches the ones that build. They get the builds the
+            // others left (all of them when every statement is in such a tree, which is the
+            // single search over every statement), and at least `POLISH_IF_LET_SHORT_BUILDS`.
+            let short = self.short_of_locals(&base, &if_lets, POLISH_IF_LET_CENSUS_BUILDS);
+            let (later, first): (Vec<_>, Vec<_>) = if_lets.into_iter().partition(|g| {
+                g.first()
+                    .and_then(|r| tree_id_at(&base, r.range.start))
+                    .is_some_and(|id| short.contains(&id))
+            });
+            let mut budget = POLISH_IF_LET_BUILDS;
+            let kept = keep_joint_onto(Vec::new(), &first, &ok, &mut budget);
+            let mut budget = budget.max(POLISH_IF_LET_SHORT_BUILDS);
+            let kept = keep_joint_onto(kept, &later, &ok, &mut budget);
             text = apply_groups(&text, &kept);
         }
         // Behavioral mode: locals without `#[slot]`, then arguments by name. Every function's
@@ -6059,6 +6209,14 @@ struct Plan {
     /// Lifecycle blocks and trees without the extra idioms that leave their locals by number,
     /// after a round that named them was not proven or did not compile.
     unnamed_locals: BTreeSet<u16>,
+    /// Set once the lift has converged, for [`read_locals_in_place`], to the trees the
+    /// converged round pinned: unnamed locals are read `local[N]` (see
+    /// [`Translator::local_read`]), and those trees keep their pins although their text
+    /// changes.
+    local_reads: Option<BTreeSet<u16>>,
+    /// Trees whose reads of unnamed locals stay in `raw { }` blocks, since writing them
+    /// `local[N]` changed their nodes ([`read_locals_in_place`]).
+    raw_local_reads: BTreeSet<u16>,
 }
 
 /// `compiled` with the nodes that run alike merged (`share_tails`), or `None` when nothing
@@ -6158,6 +6316,8 @@ impl Plan {
             fixed_locals: BTreeSet::new(),
             pins: BTreeMap::new(),
             unnamed_locals: BTreeSet::new(),
+            local_reads: None,
+            raw_local_reads: BTreeSet::new(),
         }
     }
 
@@ -6681,6 +6841,8 @@ struct Generated {
     extras: BTreeSet<u16>,
     /// Trees that named a local no builtin addresses (see [`Plan::name_builtin_locals_only`]).
     named_other_locals: BTreeSet<u16>,
+    /// Trees that read an unnamed local as `local[N]` (see [`read_locals_in_place`]).
+    local_reads: BTreeSet<u16>,
     /// Trees with merged `if` arms (see [`Translator::merge_arms`]).
     merged: BTreeSet<u16>,
     /// Trees that named a temps call to a tree with arguments (see [`Plan::keep_temps_raw`]).
@@ -6758,6 +6920,7 @@ impl Model {
         let mut raw_counts = BTreeMap::new();
         let mut extras = BTreeSet::new();
         let mut named_other_locals = BTreeSet::new();
+        let mut local_reads = BTreeSet::new();
         let mut merged = BTreeSet::new();
         let mut temps_named = BTreeSet::new();
         let mut wave2_trees = BTreeSet::new();
@@ -7091,6 +7254,7 @@ impl Model {
                         temps_named: std::cell::Cell::new(false),
                         wave2_used: std::cell::Cell::new(false),
                         wave3_used: std::cell::Cell::new(false),
+                        local_read: std::cell::Cell::new(false),
                         stack_moves: sim && assigns_stack_obj(body),
                     };
                     if named_locals > 0 && (plain_names || tr.extra()) {
@@ -7125,6 +7289,9 @@ impl Model {
                     if tr.wave3_used.get() {
                         wave3_trees.insert(t.id);
                     }
+                    if tr.local_read.get() {
+                        local_reads.insert(t.id);
+                    }
                 }
                 _ => {
                     let mut lines = if level == Level::Raw {
@@ -7155,7 +7322,8 @@ impl Model {
             out.line("}");
             let text = out.lines[start..].join("\n");
             if let Some((written, Some(pin))) = plan.pins.get(&t.id)
-                && *written == text
+                && (*written == text
+                    || plan.local_reads.as_ref().is_some_and(|p| p.contains(&t.id)))
             {
                 let line = &mut out.lines[header_line];
                 let indent = line.len() - line.trim_start().len();
@@ -7221,6 +7389,7 @@ impl Model {
             raw_counts,
             extras,
             named_other_locals,
+            local_reads,
             merged,
             temps_named,
             wave2: wave2_trees,
@@ -7495,6 +7664,8 @@ struct Translator<'a> {
     wave2_used: std::cell::Cell<bool>,
     /// Whether a wave 3 spelling was written (see [`Translator::wave3`]).
     wave3_used: std::cell::Cell<bool>,
+    /// Whether an unnamed local was read as `local[N]` (see [`Translator::local_read`]).
+    local_read: std::cell::Cell<bool>,
     /// A Sim tree that assigns `stack_obj`: the stack object's cells are written
     /// `stack_obj.attr[i]` / `stack_obj.slot[i]` (the same operands), since `self` would
     /// name another object after the assignment (lint `stack_obj_clobber_after_self`).
@@ -9701,8 +9872,25 @@ impl Translator<'_> {
                 let handle = self.neighbor_handle()?;
                 Some(neighbor_cell(handle, o.scope, o.index))
             }
+            25 => self.lvalue(r).or_else(|| self.local_read(o.index)),
             _ => self.lvalue(r),
         }
+    }
+
+    /// `local[N]`, v2's read of frame word `N`, for a local the tree leaves by number: a
+    /// statement that only reads it is then v2 code instead of a `raw { }` line. The read
+    /// keeps the tree's layout as a raw block does, and it is never written: v2's `local[N]`
+    /// is read-only. Only once the lift has converged ([`read_locals_in_place`]), and not
+    /// for a tree in [`Plan::raw_local_reads`].
+    fn local_read(&self, index: i16) -> Option<String> {
+        if self.plan.local_reads.is_none()
+            || !(0..=255).contains(&index)
+            || self.plan.raw_local_reads.contains(&self.tree.id)
+        {
+            return None;
+        }
+        self.local_read.set(true);
+        Some(format!("local[{index}]"))
     }
 
     /// The handle that reads the stack object's definition cells in place (`x.object_type`,
