@@ -84,6 +84,33 @@ const MAX_REFRESH_MILLIHERTZ: u32 = 500_000;
 const INTERACTIVE_HOLD: Duration = Duration::from_millis(250);
 
 /// Double-click detection window (400 ms, 4 canvas pixels).
+/// A clipboard chord in a dialog's text field. The original's text field
+/// has Copy, Cut and Paste (`0x5f4699`, `0x5f4724`, `0x5f473f`) but its
+/// key handler (`0x5f29d8`) binds no key to them; these are the usual
+/// chords, Cmd on macOS and Ctrl elsewhere, plus the Insert ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryClipboard {
+    Paste,
+    Copy,
+    Cut,
+}
+
+/// Which clipboard chord `key` is with Shift and Ctrl (or Cmd) as given.
+fn entry_clipboard_key(key: &Key, shift: bool, ctrl: bool) -> Option<EntryClipboard> {
+    match key {
+        Key::Character(c) if ctrl && !shift => match c.to_ascii_lowercase().as_str() {
+            "v" => Some(EntryClipboard::Paste),
+            "c" => Some(EntryClipboard::Copy),
+            "x" => Some(EntryClipboard::Cut),
+            _ => None,
+        },
+        Key::Named(NamedKey::Insert) if shift && !ctrl => Some(EntryClipboard::Paste),
+        Key::Named(NamedKey::Insert) if ctrl && !shift => Some(EntryClipboard::Copy),
+        Key::Named(NamedKey::Delete) if shift && !ctrl => Some(EntryClipboard::Cut),
+        _ => None,
+    }
+}
+
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 const DOUBLE_CLICK_DISTANCE_SQ: i32 = 16;
 
@@ -1853,6 +1880,16 @@ impl App {
             self.dirty = true;
         }
         if self.dirty {
+            let shell_modal = matches!(
+                &self.session,
+                Session::Shell(shell)
+                    if shell.save_manager_open()
+                        || shell.album_open()
+                        || shell.travel_dialog_open()
+            );
+            if let Some(game) = self.session.game_mut() {
+                game.set_shell_modal(shell_modal);
+            }
             self.session.render();
             self.dirty = false;
             let now = Instant::now();
@@ -2785,7 +2822,39 @@ impl ApplicationHandler for App {
                         let mut changed = false;
                         let mut standalone_out = None;
                         let mut shell_out = None;
+                        let (shift, ctrl) = (self.shift_held, self.ctrl_or_cmd_held);
+                        match entry_clipboard_key(&event.logical_key, shift, ctrl) {
+                            Some(EntryClipboard::Paste) => {
+                                if !event.repeat {
+                                    changed = self
+                                        .session
+                                        .game_mut()
+                                        .is_some_and(|g| g.dialog_paste(None));
+                                }
+                                self.changed(changed, true);
+                                return;
+                            }
+                            Some(EntryClipboard::Copy) => {
+                                if let Some(game) = self.session.game_mut() {
+                                    game.dialog_copy();
+                                }
+                                return;
+                            }
+                            Some(EntryClipboard::Cut) => {
+                                changed =
+                                    self.session.game_mut().and_then(Game::dialog_cut).is_some();
+                                self.changed(changed, true);
+                                return;
+                            }
+                            None => {}
+                        }
                         match &event.logical_key {
+                            Key::Named(NamedKey::Insert) => {
+                                changed = self
+                                    .session
+                                    .game_mut()
+                                    .is_some_and(Game::dialog_toggle_overwrite);
+                            }
                             Key::Named(NamedKey::Backspace) => {
                                 changed =
                                     self.session.game_mut().is_some_and(Game::dialog_backspace);
@@ -2794,25 +2863,40 @@ impl ApplicationHandler for App {
                                 changed = self.session.game_mut().is_some_and(Game::dialog_delete);
                             }
                             Key::Named(NamedKey::ArrowLeft) => {
-                                changed =
-                                    self.session.game_mut().is_some_and(Game::dialog_move_left);
+                                changed = self
+                                    .session
+                                    .game_mut()
+                                    .is_some_and(|g| g.dialog_move_left(ctrl, shift));
                             }
                             Key::Named(NamedKey::ArrowRight) => {
-                                changed =
-                                    self.session.game_mut().is_some_and(Game::dialog_move_right);
+                                changed = self
+                                    .session
+                                    .game_mut()
+                                    .is_some_and(|g| g.dialog_move_right(ctrl, shift));
                             }
                             Key::Named(NamedKey::ArrowUp) => {
-                                changed = self.session.game_mut().is_some_and(Game::dialog_move_up);
+                                changed = self
+                                    .session
+                                    .game_mut()
+                                    .is_some_and(|g| g.dialog_move_up(shift));
                             }
                             Key::Named(NamedKey::ArrowDown) => {
-                                changed =
-                                    self.session.game_mut().is_some_and(Game::dialog_move_down);
+                                changed = self
+                                    .session
+                                    .game_mut()
+                                    .is_some_and(|g| g.dialog_move_down(shift));
                             }
                             Key::Named(NamedKey::Home) => {
-                                changed = self.session.game_mut().is_some_and(Game::dialog_home);
+                                changed = self
+                                    .session
+                                    .game_mut()
+                                    .is_some_and(|g| g.dialog_home(ctrl, shift));
                             }
                             Key::Named(NamedKey::End) => {
-                                changed = self.session.game_mut().is_some_and(Game::dialog_end);
+                                changed = self
+                                    .session
+                                    .game_mut()
+                                    .is_some_and(|g| g.dialog_end(ctrl, shift));
                             }
                             Key::Named(NamedKey::Tab) => {
                                 changed = self
@@ -2863,7 +2947,10 @@ impl ApplicationHandler for App {
                                     .is_some_and(|g| g.type_dialog_char(' '));
                             }
                             _ => {
-                                if let Some(text) = &event.text
+                                // A Ctrl or Cmd chord types nothing: winit
+                                // gives Cmd+V on macOS the text "v".
+                                if !ctrl
+                                    && let Some(text) = &event.text
                                     && let Some(game) = self.session.game_mut()
                                 {
                                     for ch in text.chars() {
@@ -2909,11 +2996,15 @@ impl ApplicationHandler for App {
                         match &mut self.session {
                             Session::Starting(_) => {}
                             Session::Standalone { game, .. } => {
+                                // 0x4d14b2: Escape on the lot view also hides
+                                // the tutorial marker.
+                                let hid = game.hide_tutorial_marker();
                                 let closed = game.close_menu() || game.close_camera_strip();
                                 let cancelled = !closed && game.cancel_buy();
                                 let escaped_options =
                                     !closed && !cancelled && game.escape_options();
                                 if !escaped_options
+                                    && !hid
                                     && escape_exits(closed, cancelled, game.buy_cursor().is_some())
                                 {
                                     self.shutdown_session();
@@ -2924,11 +3015,13 @@ impl ApplicationHandler for App {
                             }
                             Session::Shell(shell) => {
                                 if let Some(game) = shell.game_mut() {
+                                    let hid = game.hide_tutorial_marker();
                                     let closed = game.close_menu() || game.close_camera_strip();
                                     let cancelled = !closed && game.cancel_buy();
                                     let escaped_options =
                                         !closed && !cancelled && game.escape_options();
                                     if !escaped_options
+                                        && !hid
                                         && escape_exits(
                                             closed,
                                             cancelled,
@@ -3012,14 +3105,27 @@ impl ApplicationHandler for App {
                         match &mut self.session {
                             Session::Starting(_) => {}
                             Session::Standalone { game, .. } => {
-                                let out = game.press(point);
+                                let mut out = game.press(point);
+                                if is_double && game.dialog_double_click(point) {
+                                    out.redraw = true;
+                                }
                                 self.handle_standalone_outcome(event_loop, out);
                             }
                             Session::Shell(shell) => {
                                 let out = if is_double && shell.screen() == ScreenKind::FamilyBin {
                                     shell.double_click(point)
                                 } else {
-                                    shell.press(point)
+                                    let out = shell.press(point);
+                                    let word = is_double
+                                        && shell
+                                            .game_mut()
+                                            .is_some_and(|g| g.dialog_double_click(point));
+                                    if word {
+                                        self.handle_shell_outcome(event_loop, out);
+                                        self.changed(true, true);
+                                        return;
+                                    }
+                                    out
                                 };
                                 self.handle_shell_outcome(event_loop, out);
                             }

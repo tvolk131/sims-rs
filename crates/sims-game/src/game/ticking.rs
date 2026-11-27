@@ -251,6 +251,9 @@ impl Game {
             if let Some(us) = self.coop_lobby.next_blink_us(self.clock_us) {
                 consider(us);
             }
+            if let Some(elapsed) = self.marker_elapsed_us() {
+                consider(sims_ui::tutorial::next_cell_us(elapsed));
+            }
         }
         best
     }
@@ -325,6 +328,11 @@ impl Game {
         }
         if let Some(picker) = &mut self.destination_picker
             && picker.tick(self.clock_us)
+        {
+            self.blink_dirty = true;
+        }
+        if let Some(elapsed) = self.marker_elapsed_us()
+            && self.marker_cell_drawn != Some(sims_ui::tutorial::cell_at(elapsed))
         {
             self.blink_dirty = true;
         }
@@ -594,11 +602,74 @@ impl Game {
         keep(&mut self.sounds, sounds, SOUNDS_KEPT);
     }
 
+    /// `0x5de13f`: a highlight shows the one marker over `target`, a clear
+    /// hides it whatever it was over. A marker already shown over the same
+    /// control goes on with its animation.
+    fn place_tutorial_marker(&mut self, target: MarkerTarget, highlight: bool) {
+        if !highlight {
+            // What is on screen (`marker_cell_drawn`) stays until the next
+            // draw takes it off.
+            if self.tutorial_marker.take().is_some() {
+                self.blink_dirty = true;
+            }
+            return;
+        }
+        if self
+            .tutorial_marker
+            .is_some_and(|m| m.target == target && !m.hidden_by_modal)
+        {
+            return;
+        }
+        self.tutorial_marker = Some(TutorialMarker {
+            target,
+            shown_us: self.clock_us,
+            hidden_by_modal: false,
+        });
+        self.blink_dirty = true;
+    }
+
+    /// Tells the game whether a shell window (Save Manager, Photo Album,
+    /// travel dialog) is drawn over it, so the next frame hides the tutorial
+    /// marker as the original's modal loop does (`0x5dab61`), and shows it
+    /// again after.
+    pub fn set_shell_modal(&mut self, open: bool) {
+        self.shell_modal = open;
+    }
+
+    /// The control the tutorial marker is over, while it is shown.
+    pub fn tutorial_marker(&self) -> Option<MarkerTarget> {
+        self.tutorial_marker
+            .filter(|m| !m.hidden_by_modal)
+            .map(|m| m.target)
+    }
+
+    /// Hides the tutorial marker, as Escape on the lot view does
+    /// (`0x4d133b` key 27 -> `0x4d14b2`). Returns whether it was on
+    /// screen (drawn at the last frame, even if since moved to a control
+    /// not yet drawn), so an Escape that hid nothing visible goes on as
+    /// before.
+    pub fn hide_tutorial_marker(&mut self) -> bool {
+        let shown = self.tutorial_marker.take().is_some() && self.marker_cell_drawn.is_some();
+        if shown {
+            self.blink_dirty = true;
+        }
+        shown
+    }
+
+    /// Microseconds the marker on screen has been animating at the clock.
+    pub(super) fn marker_elapsed_us(&self) -> Option<u64> {
+        self.marker_cell_drawn?;
+        self.tutorial_marker
+            .filter(|m| !m.hidden_by_modal)
+            .map(|m| self.clock_us.saturating_sub(m.shown_us))
+    }
+
     /// Applies and queues a step's UI Effect highlight requests.
     pub(super) fn keep_ui_effects(&mut self, effects: Vec<UiEffectEvent>) {
         for &effect in &effects {
             match effect {
                 UiEffectEvent::Button { id, highlight } => {
+                    self.place_tutorial_marker(MarkerTarget::Button(id), highlight);
                     if highlight {
                         self.highlighted_buttons.insert(id);
                     } else {
@@ -606,6 +677,7 @@ impl Game {
                     }
                 }
                 UiEffectEvent::Portrait { guid, highlight } => {
+                    self.place_tutorial_marker(MarkerTarget::Portrait(guid), highlight);
                     if highlight {
                         self.highlighted_portraits.insert(guid);
                     } else {
@@ -616,6 +688,7 @@ impl Game {
                     // `0x4769ca` resolves the first `cWinRelationship` control
                     // without comparing neighbor identity, so a clear for any
                     // valid neighbor clears the single active highlight.
+                    self.place_tutorial_marker(MarkerTarget::Relationship, highlight);
                     self.highlighted_relationships.clear();
                     if highlight {
                         self.highlighted_relationships.insert(guid);

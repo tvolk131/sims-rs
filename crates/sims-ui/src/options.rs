@@ -1027,6 +1027,22 @@ pub fn draw_balloon(frame: &mut Frame, art: &Art, balloon: &OptionsBalloon) {
     }
 }
 
+/// Draws `balloon` at `alpha`, for its 250 ms fade (the Options help
+/// balloon opens and closes through the same `cWinBalloon` code as the
+/// live panel's, `0x516615`/`0x51679a`, `0x5165ac`/`0x516734`).
+pub fn draw_balloon_with_alpha(frame: &mut Frame, art: &Art, balloon: &OptionsBalloon, alpha: u8) {
+    if alpha == 255 {
+        draw_balloon(frame, art, balloon);
+        return;
+    }
+    crate::balloon::composite(frame, balloon.rect, alpha, |scratch, [x0, y0]| {
+        let mut shifted = balloon.clone();
+        shifted.rect.x -= x0;
+        shifted.rect.y -= y0;
+        draw_balloon(scratch, art, &shifted);
+    });
+}
+
 /// Computes the screen rectangle of a Quick Tip tooltip box above `anchor`
 /// (`0x517a6f`), matching [`draw_tooltip`] byte-for-byte.
 pub fn tooltip_rect(size: [i32; 2], art: &Art, anchor: Rect, text: &str) -> Option<Rect> {

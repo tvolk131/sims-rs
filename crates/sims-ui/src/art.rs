@@ -24,10 +24,26 @@ pub struct Art {
     pub missing: Vec<i32>,
 }
 
+/// The Magicland mist overlays (`0x1655..=0x1657`). `0x54228e` loads
+/// them with `[0x6c8c3c]` cleared (`and byte [0x6c8c3c], 0` before, `mov
+/// byte [0x6c8c3c], 1` after, at `0x54228f` and `0x5422d4`), so their
+/// partly transparent pixels keep their stored color: the only UI TGAs
+/// the loader does not un-premultiply.
+pub const MIST: std::ops::RangeInclusive<i32> = 0x1655..=0x1657;
+
+/// Readies a decoded UI bitmap `id` for drawing: keys [`KEY`] and, for
+/// every TGA but the [`MIST`] overlays, un-premultiplies its partly
+/// transparent pixels.
+fn prepare(id: i32, image: &mut Image) {
+    image.key(KEY);
+    if !MIST.contains(&id) {
+        unpremultiply_tga(image);
+    }
+}
+
 /// Un-premultiplies a UI TGA's partially transparent pixels (`0 < a < 255`)
 /// as the original's TGA loader does at `0x4deb3d..0x4deb9d` when
-/// `[0x6c8c3c] == 1` (true for every UI TGA except the Magicland mist
-/// overlays `0x1655..0x1657`): `c = trunc(c * (255.0f / a) + 0.5f) as u8`,
+/// `[0x6c8c3c] == 1` (true for every UI TGA except the [`MIST`] overlays): `c = trunc(c * (255.0f / a) + 0.5f) as u8`,
 /// in 24-bit single precision (`0x4fad5c`) taking the low 8 bits on store
 /// (`0x5dff82..0x5dff94`). Opaque and colorkeyed BMP pixels (`a == 0` or
 /// `a == 255`) are untouched.
@@ -62,8 +78,7 @@ impl Art {
         let decode_req = |&id: &i32| -> Result<(i32, Option<Image>)> {
             match ui.bitmap(id, language).map_err(Error::Content)? {
                 Some(mut image) => {
-                    image.key(KEY);
-                    unpremultiply_tga(&mut image);
+                    prepare(id, &mut image);
                     Ok((id, Some(image)))
                 }
                 None => Ok((id, None)),
@@ -72,8 +87,7 @@ impl Art {
         let decode_opt = |&id: &i32| -> (i32, Option<Image>) {
             match ui.bitmap(id, language) {
                 Ok(Some(mut image)) => {
-                    image.key(KEY);
-                    unpremultiply_tga(&mut image);
+                    prepare(id, &mut image);
                     (id, Some(image))
                 }
                 Ok(None) | Err(_) => (id, None),
@@ -178,8 +192,7 @@ impl Art {
     pub fn load_optional(&mut self, ui: &UiGraphics, language: u8, id: i32) {
         match ui.bitmap(id, language) {
             Ok(Some(mut image)) => {
-                image.key(KEY);
-                unpremultiply_tga(&mut image);
+                prepare(id, &mut image);
                 self.images.insert(id, image);
             }
             Ok(None) | Err(_) => self.missing.push(id),
@@ -1520,6 +1533,34 @@ mod tests {
                 10, 20, 30, 0, 10, 20, 30, 255, 146, 73, 127, 112, 0, 255, 85, 35,
             ]
         );
+    }
+
+    #[test]
+    fn the_mist_overlays_keep_their_stored_color() {
+        let pixels = vec![64, 32, 56, 112, 255, 0, 255, 255];
+        let loaded = |id| {
+            let mut image = Image {
+                width: 2,
+                height: 1,
+                rgba: pixels.clone(),
+            };
+            prepare(id, &mut image);
+            image.rgba
+        };
+        // Every mist overlay keeps the half-transparent pixel as stored,
+        // and is still keyed.
+        for id in MIST {
+            assert_eq!(loaded(id), vec![64, 32, 56, 112, 255, 0, 255, 0], "{id:#x}");
+        }
+        // The bitmaps loaded beside them (0x542269 ends at 0x1654, 0x5422dd
+        // starts at 0x1658) are un-premultiplied.
+        for id in [0x1654, 0x1658] {
+            assert_eq!(
+                loaded(id),
+                vec![146, 73, 127, 112, 255, 0, 255, 0],
+                "{id:#x}"
+            );
+        }
     }
 
     #[test]

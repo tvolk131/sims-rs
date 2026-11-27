@@ -59,6 +59,51 @@ pub const ERROR: &str = "UI_error";
 pub const CLICK: &str = "UI_click";
 /// A help balloon opening or closing (0x50fa95, 0x50fb7f).
 pub const WHOOSH: &str = "UI_whoosh";
+
+/// A help balloon the HUD fades: a Live one or an Options one. Both are
+/// `cWinBalloon` windows (`0x50fc30`), with the same 250 ms ramp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FadingBalloon {
+    Live(Balloon),
+    Options(options::OptionsBalloon),
+}
+
+impl FadingBalloon {
+    fn of(item: &Item) -> Option<Self> {
+        match &item.kind {
+            hud::Kind::Balloon(b) => Some(Self::Live(b.clone())),
+            hud::Kind::OptionsBalloon(b) => Some(Self::Options(b.clone())),
+            _ => None,
+        }
+    }
+
+    fn rect(&self) -> Rect {
+        match self {
+            Self::Live(b) => b.rect,
+            Self::Options(b) => b.rect,
+        }
+    }
+
+    fn is_options(&self) -> bool {
+        matches!(self, Self::Options(_))
+    }
+
+    /// Draws it moved down by `dy` at `alpha`.
+    fn draw(&self, frame: &mut Frame, art: &Art, thumbnails: &Thumbnails, dy: i32, alpha: u8) {
+        match self {
+            Self::Live(b) => {
+                let mut b = b.clone();
+                b.rect.y = b.rect.y.saturating_add(dy);
+                balloon::draw_with_alpha(frame, art, Some(thumbnails), &b, alpha);
+            }
+            Self::Options(b) => {
+                let mut b = b.clone();
+                b.rect.y = b.rect.y.saturating_add(dy);
+                options::draw_balloon_with_alpha(frame, art, &b, alpha);
+            }
+        }
+    }
+}
 /// Selling an object with nonzero refund (`0x487e18` → `0x492ad4`).
 pub const MONEYBACK: &str = "UI_moneyback";
 /// Disposing of a zero-value object (`0x487e18` → `0x492b05`).
@@ -178,6 +223,9 @@ pub struct Hud {
     /// The press held now landed on a non-modal dialog
     /// ([`Hud::take_non_modal_press`]): its release is the dialog's too.
     non_modal_press: bool,
+    /// Whether Shift is held, so a press in a dialog's text field extends
+    /// its selection (`0x5f2522`).
+    shift_held: bool,
     /// The simulation dialog's 40 s auto-answer timer (`0x436c89`), and
     /// the answer it gives when it runs out.
     auto_answer: AutoAnswer,
@@ -236,10 +284,14 @@ pub struct Hud {
     queue_slide: QueueSlideState,
     /// Pending pie-menu screen click origin for newly queued icons `(person, click_pos, clock_us)`.
     pending_queue_origin: Option<(Option<u16>, [i32; 2], u64)>,
-    /// 250 ms fade-in / fade-out animator for Live help balloons (`cWinHelpBalloon`).
+    /// 250 ms fade-in / fade-out animator for the help balloon (`cWinBalloon`,
+    /// Live and Options alike).
     balloon_fade: BalloonFadeState,
     /// Most recently laid-out help balloon retained during 250 ms fade-out.
-    last_balloon: Option<Balloon>,
+    last_balloon: Option<FadingBalloon>,
+    /// The co-op player's own selection the panel was last laid out for
+    /// (`None`: the world's), so a press checks against what is shown.
+    drawn_selection: Option<Option<u16>>,
     /// Opacity fade-in state for native modal dialogs (`cTSWinFade`).
     dialog_fade: DialogFadeState,
     /// Last presentation clock timestamp in microseconds (`0` for static/headless frames).
@@ -253,6 +305,8 @@ pub struct Hud {
     /// state 2 blinks Pause (row 0 <-> row 1) and state 3 blinks Ultra
     /// (`selected` false <-> true) during idle speed when return speed != Ultra.
     clock_blink: ClockBlink,
+    /// The job panel's performance blink (`0x5306df`, `0x52c659`).
+    performance_blink: PerformanceBlink,
     /// Native `[control_panel + 0x1ec]` idle-blink flag: set on `0x109(1)`
     /// (`0x46d7b5 -> 0x4f688e`), cleared on `0x109(0)` (`0x46d803`) or a
     /// Live-mode manual speed press (`0x53a5e3..0x53a6e1`), and preserved
@@ -356,6 +410,7 @@ impl HudStatic {
                         options::id::SAVE_CARD,
                         sims_ui::neighborhood::art_id::POPUP_TILER,
                         sims_ui::album::CAM_VIEW_ALBUM,
+                        sims_ui::tutorial::MARKER,
                     ])
                     .copied()
                     .chain(buy::resource_ids())
@@ -685,6 +740,7 @@ impl Hud {
             ui_dialog: None,
             dialog_state: DialogState::default(),
             non_modal_press: false,
+            shift_held: false,
             auto_answer: AutoAnswer::default(),
             auto_answer_status: None,
             non_modal_read: Vec::new(),
@@ -715,11 +771,13 @@ impl Hud {
             pending_queue_origin: None,
             balloon_fade: BalloonFadeState::new(),
             last_balloon: None,
+            drawn_selection: None,
             dialog_fade: DialogFadeState::hidden(),
             last_clock_us: 0,
             needs_trend: NeedsTrend::default(),
             needs_trend_shown: false,
             clock_blink: ClockBlink::default(),
+            performance_blink: PerformanceBlink::default(),
             idle_speed: false,
             buy_catalog: None,
             rating_labels: static_part.rating_labels,
@@ -790,6 +848,8 @@ impl Hud {
         self.last_balloon = None;
         self.dialog_fade = DialogFadeState::hidden();
         self.clock_blink.reset();
+        self.performance_blink = PerformanceBlink::default();
+        self.controls.performance_lit = false;
         self.idle_speed = false;
         self.controls.pause_lit = false;
         self.controls.ultra_lit = false;
@@ -1612,54 +1672,132 @@ impl Hud {
         changed
     }
 
-    /// Moves the active dialog's text-entry caret left.
-    pub fn dialog_move_left(&mut self) -> bool {
-        self.active_message()
-            .cloned()
-            .is_some_and(|m| self.dialog_state.move_left(&m))
+    /// Sets whether Shift is held, for a press in a dialog's text field.
+    pub fn set_shift(&mut self, held: bool) {
+        self.shift_held = held;
     }
 
-    /// Moves the active dialog's text-entry caret right.
-    pub fn dialog_move_right(&mut self) -> bool {
-        self.active_message()
-            .cloned()
-            .is_some_and(|m| self.dialog_state.move_right(&m))
+    /// Moves the active dialog's text-entry caret a character left, or a
+    /// word with `word` (Ctrl), extending the selection with `extend`
+    /// (Shift; `0x5f29d8`).
+    pub fn dialog_move_left(&mut self, word: bool, extend: bool) -> bool {
+        self.active_message().cloned().is_some_and(|m| {
+            if word {
+                self.dialog_state.move_word(&m, -1, extend)
+            } else {
+                self.dialog_state.move_left(&m, extend)
+            }
+        })
+    }
+
+    /// Moves the active dialog's text-entry caret a character (or word)
+    /// right, as [`Hud::dialog_move_left`] does.
+    pub fn dialog_move_right(&mut self, word: bool, extend: bool) -> bool {
+        self.active_message().cloned().is_some_and(|m| {
+            if word {
+                self.dialog_state.move_word(&m, 1, extend)
+            } else {
+                self.dialog_state.move_right(&m, extend)
+            }
+        })
     }
 
     /// Moves the active dialog's text-entry caret one visual row up (multiline
     /// fields, `0x5f29f2..0x5f2a90`).
-    pub fn dialog_move_up(&mut self) -> bool {
+    pub fn dialog_move_up(&mut self, extend: bool) -> bool {
         self.active_message().cloned().is_some_and(|m| {
             self.dialog_state
-                .move_up(&m, self.dialog.as_ref(), &self.art)
+                .move_up(&m, self.dialog.as_ref(), &self.art, extend)
         })
     }
 
     /// Moves the active dialog's text-entry caret one visual row down (multiline
     /// fields, `0x5f2a90..0x5f2b40`).
-    pub fn dialog_move_down(&mut self) -> bool {
+    pub fn dialog_move_down(&mut self, extend: bool) -> bool {
         self.active_message().cloned().is_some_and(|m| {
             self.dialog_state
-                .move_down(&m, self.dialog.as_ref(), &self.art)
+                .move_down(&m, self.dialog.as_ref(), &self.art, extend)
         })
     }
 
     /// Moves the active dialog's text-entry caret to the start of the current
-    /// line (or field, `0x5f2c13`).
-    pub fn dialog_home(&mut self) -> bool {
+    /// line (or field, `0x5f2c13`), or of the whole text with `whole` (Ctrl).
+    pub fn dialog_home(&mut self, whole: bool, extend: bool) -> bool {
         self.active_message().cloned().is_some_and(|m| {
-            self.dialog_state
-                .home_in_layout(&m, self.dialog.as_ref(), Some(&self.art))
+            if whole {
+                self.dialog_state.text_home(&m, extend)
+            } else {
+                self.dialog_state
+                    .home_in_layout(&m, self.dialog.as_ref(), Some(&self.art), extend)
+            }
         })
     }
 
     /// Moves the active dialog's text-entry caret to the end of the current
-    /// line (or field, `0x5f2c13`).
-    pub fn dialog_end(&mut self) -> bool {
+    /// line (or field, `0x5f2c13`), or of the whole text with `whole` (Ctrl).
+    pub fn dialog_end(&mut self, whole: bool, extend: bool) -> bool {
         self.active_message().cloned().is_some_and(|m| {
-            self.dialog_state
-                .end_in_layout(&m, self.dialog.as_ref(), Some(&self.art))
+            if whole {
+                self.dialog_state.text_end(&m, extend)
+            } else {
+                self.dialog_state
+                    .end_in_layout(&m, self.dialog.as_ref(), Some(&self.art), extend)
+            }
         })
+    }
+
+    /// Toggles the active dialog's text field between inserting and
+    /// overwriting (Insert, `0x5f29d8`).
+    pub fn dialog_toggle_overwrite(&mut self) -> bool {
+        self.active_message().is_some_and(|m| m.entry.is_some())
+            && self.dialog_state.toggle_overwrite()
+    }
+
+    /// Pastes `text` into the active dialog's text field (`0x5f473f`).
+    pub fn dialog_paste(&mut self, text: &str) -> bool {
+        let mut state = self.dialog_state.clone();
+        let changed = self
+            .active_message_mut()
+            .is_some_and(|m| state.paste(m, text));
+        self.dialog_state = state;
+        changed
+    }
+
+    /// The selected text of the active dialog's field (Copy, `0x5f4699`).
+    pub fn dialog_selected_text(&self) -> Option<String> {
+        self.dialog_state.selected_text(self.active_message()?)
+    }
+
+    /// Cuts the active dialog's selected text (`0x5f4724`), returning it.
+    pub fn dialog_cut(&mut self) -> Option<String> {
+        let mut state = self.dialog_state.clone();
+        let taken = self.active_message_mut().and_then(|m| state.cut(m));
+        self.dialog_state = state;
+        taken
+    }
+
+    /// Selects the word under a double-click at `point` in the active
+    /// dialog's text field (`0x5f2c21`), after the first press of it put
+    /// the caret there.
+    pub fn dialog_double_click(&mut self, point: [i32; 2]) -> bool {
+        let Some(layout) = self.dialog.as_ref() else {
+            return false;
+        };
+        let field = if self.dialog_state.active_field == 1 {
+            layout.secondary_entry
+        } else {
+            layout.entry
+        };
+        // Only when the press that made this a double click went to the
+        // field: a press another window took leaves no drag captured.
+        if self.dialog_state.dragging_entry.is_none()
+            || !field.is_some_and(|r| r.contains(point[0], point[1]))
+        {
+            return false;
+        }
+        self.active_message()
+            .cloned()
+            .is_some_and(|m| self.dialog_state.select_word(&m))
     }
 
     /// Whether a Sound volume slider drag is currently captured (`0x5f6245`).
@@ -1745,10 +1883,7 @@ impl Hud {
         self.play(CLICK);
         let open = self.controls.help.is_some() || self.controls.options.help.is_some();
         self.controls.apply(&command);
-        let now_open = self.controls.help.is_some() || self.controls.options.help.is_some();
-        if now_open != open {
-            self.play(WHOOSH);
-        }
+        self.balloon_whoosh(open);
         (true, Some(command))
     }
 
@@ -1998,6 +2133,9 @@ impl Hud {
         if let Some(us) = self.clock_blink.next_blink_us(clock_us) {
             consider(us);
         }
+        if let Some(us) = self.performance_blink.next_blink_us(clock_us) {
+            consider(us);
+        }
         if self.active_message().is_some_and(|m| m.entry.is_some())
             && let Some(us) = self.dialog_state.next_blink_us(clock_us)
         {
@@ -2047,7 +2185,12 @@ impl Hud {
         );
         self.controls.pause_lit = self.clock_blink.pause_lit();
         self.controls.ultra_lit = self.clock_blink.ultra_lit();
-        changed
+        // The job panel shown last blinks its performance while the Sim
+        // has a job and performance is below 0 (`0x530530..0x5306c6`).
+        let blinks = self.items.iter().any(|i| hud::performance_blinks(&i.kind));
+        let flipped = self.performance_blink.sync(blinks, clock_us);
+        self.controls.performance_lit = self.performance_blink.lit;
+        changed || flipped
     }
 
     /// Clears the cached VM dialog and its input state after answering so a
@@ -2476,6 +2619,7 @@ impl Hud {
         self.controls.speed = hud::speed_for(world);
         // The panel follows the selection first, so that the snapshot
         // reads what the open panel needs.
+        self.drawn_selection = selected_override;
         let household = self.household(world, residential, selected_override);
         if self.controls.follow(Selected::of(&household)) {
             self.play(WHOOSH);
@@ -2521,6 +2665,14 @@ impl Hud {
         );
         hud::fit(&mut self.items, &self.art, &self.texts);
         self.sync_options_extra_button_rects(view.size);
+        // A job panel that blinks starts its timer the frame it is first laid
+        // out, not at the next clock sync.
+        if clock_us > 0
+            && self.performance_blink.since.is_none()
+            && self.items.iter().any(|i| hud::performance_blinks(&i.kind))
+        {
+            self.performance_blink.since = Some(clock_us);
+        }
         self.queue = Queue::read(world, snapshot.selected);
         if clock_us > 0 {
             let origin = self.pending_queue_origin.and_then(|(person, pos, ts)| {
@@ -2575,10 +2727,7 @@ impl Hud {
                 return;
             }
         };
-        let current_balloon = self.items.iter().find_map(|item| match &item.kind {
-            hud::Kind::Balloon(b) => Some(b.clone()),
-            _ => None,
-        });
+        let current_balloon = self.items.iter().find_map(FadingBalloon::of);
         if clock_us == 0 {
             if let Some(b) = current_balloon {
                 self.balloon_fade = BalloonFadeState::visible();
@@ -2596,6 +2745,21 @@ impl Hud {
                 &self.controls,
             );
         } else {
+            // A balloon of the other kind does not take over this one's
+            // ramp: an Options balloon is the Options panel's child and goes
+            // with it (out of Options, or with the panel collapsed), and a
+            // new kind starts its own fade.
+            let kind_changed = self.last_balloon.as_ref().is_some_and(|last| {
+                current_balloon.as_ref().map_or(
+                    last.is_options()
+                        && (self.controls.mode != Mode::Options || !self.controls.expanded),
+                    |b| b.is_options() != last.is_options(),
+                )
+            });
+            if kind_changed {
+                self.balloon_fade = BalloonFadeState::new();
+                self.last_balloon = None;
+            }
             if let Some(b) = &current_balloon {
                 self.last_balloon = Some(b.clone());
                 if !self.balloon_fade.is_open() {
@@ -2610,7 +2774,7 @@ impl Hud {
                 let non_balloons: Vec<Item> = self
                     .items
                     .iter()
-                    .filter(|item| !matches!(item.kind, hud::Kind::Balloon(_)))
+                    .filter(|item| FadingBalloon::of(item).is_none())
                     .cloned()
                     .collect();
                 hud::draw_with_thumbnails(
@@ -2624,26 +2788,12 @@ impl Hud {
                 if let Some(balloon) = current_balloon.as_ref().or(self.last_balloon.as_ref()) {
                     if self.controls.options.graphics.interface_effects {
                         let alpha = self.balloon_fade.alpha(now_ms);
-                        balloon::draw_with_alpha(
-                            &mut frame,
-                            &self.art,
-                            Some(&self.thumbnails),
-                            balloon,
-                            alpha,
-                        );
+                        balloon.draw(&mut frame, &self.art, &self.thumbnails, 0, alpha);
                     } else {
                         let dy = self
                             .balloon_fade
-                            .slide_offset_y(now_ms, balloon.rect.height);
-                        let mut shifted = balloon.clone();
-                        shifted.rect.y = shifted.rect.y.saturating_add(dy);
-                        balloon::draw_with_alpha(
-                            &mut frame,
-                            &self.art,
-                            Some(&self.thumbnails),
-                            &shifted,
-                            255,
-                        );
+                            .slide_offset_y(now_ms, balloon.rect().height);
+                        balloon.draw(&mut frame, &self.art, &self.thumbnails, dy, 255);
                     }
                 }
             } else {
@@ -3303,15 +3453,51 @@ impl Hud {
         }
     }
 
+    /// Starts the help balloon's 250 ms fade-out (`0x50fb7f`), or drops it at
+    /// once on a static frame.
+    fn close_balloon_fade(&mut self) {
+        if self.last_clock_us > 0 {
+            self.balloon_fade.close((self.last_clock_us / 1_000) as u32);
+        } else {
+            self.balloon_fade = BalloonFadeState::new();
+            self.last_balloon = None;
+        }
+    }
+
+    /// Whether a closed help balloon of the Options kind (`options`) or the
+    /// Live kind is still fading out at the last clock.
+    fn balloon_fading_out(&self, options: bool) -> bool {
+        self.last_clock_us > 0
+            && !self.balloon_fade.is_open()
+            && self
+                .balloon_fade
+                .is_visible((self.last_clock_us / 1_000) as u32)
+            && self
+                .last_balloon
+                .as_ref()
+                .is_some_and(|b| b.is_options() == options)
+    }
+
+    /// After a command that may open or close a help balloon (`open`: one
+    /// was open before): a close starts the fade-out at once and whooshes;
+    /// an open whooshes, unless a balloon of its kind is still fading out
+    /// (0x50fad3..0x50fb2f: the ramp turns around silently).
+    pub(crate) fn balloon_whoosh(&mut self, open: bool) {
+        let live = self.controls.help.is_some();
+        let options = self.controls.options.help.is_some();
+        let now_open = live || options;
+        if open && !now_open {
+            self.close_balloon_fade();
+            self.play(WHOOSH);
+        } else if !open && now_open && !self.balloon_fading_out(options && !live) {
+            self.play(WHOOSH);
+        }
+    }
+
     /// Dismisses any open live-mode help balloon (`0x50fb7f`) and plays `UI_whoosh`.
     fn dismiss_live_help(&mut self) -> bool {
         if self.controls.help.take().is_some() {
-            if self.last_clock_us > 0 {
-                self.balloon_fade.close((self.last_clock_us / 1_000) as u32);
-            } else {
-                self.balloon_fade = BalloonFadeState::new();
-                self.last_balloon = None;
-            }
+            self.close_balloon_fade();
             self.play(WHOOSH);
             true
         } else {
@@ -3321,8 +3507,9 @@ impl Hud {
 
     /// Dismisses any open Options help balloon (`0x517995..0x5179bd` -> `0x50fb7f`)
     /// and plays `UI_whoosh`.
-    fn dismiss_options_help(&mut self) -> bool {
+    pub(crate) fn dismiss_options_help(&mut self) -> bool {
         if self.controls.options.help.take().is_some() {
+            self.close_balloon_fade();
             self.play(WHOOSH);
             true
         } else {
@@ -3330,20 +3517,40 @@ impl Hud {
         }
     }
 
+    /// The HUD's artwork, for tests that add a bitmap.
+    #[cfg(test)]
+    pub(crate) fn art_mut(&mut self) -> &mut Art {
+        &mut self.art
+    }
+
+    /// Draws the tutorial highlight marker over `target` on `canvas`,
+    /// `elapsed_us` after it was shown ([`sims_ui::tutorial`]). Returns
+    /// whether it drew (not without its bitmap).
+    pub fn draw_tutorial_marker(&self, canvas: &mut Canvas, target: Rect, elapsed_us: u64) -> bool {
+        let (width, height) = (
+            u32::try_from(canvas.width).unwrap_or(u32::MAX),
+            u32::try_from(canvas.height).unwrap_or(u32::MAX),
+        );
+        match Frame::from_packed(width, height, std::mem::take(&mut canvas.color)) {
+            Ok(mut frame) => {
+                let drawn = sims_ui::tutorial::draw(&mut frame, &self.art, target, elapsed_us);
+                canvas.color = frame.into_packed();
+                drawn
+            }
+            Err(pixels) => {
+                canvas.color = pixels;
+                false
+            }
+        }
+    }
+
     /// Dismisses any open help balloon (Live or Options, `0x50fb7f`) and plays
     /// `UI_whoosh`. Returns true if a balloon was open.
     pub fn dismiss_help(&mut self) -> bool {
         let live = self.controls.help.take().is_some();
-        if live {
-            if self.last_clock_us > 0 {
-                self.balloon_fade.close((self.last_clock_us / 1_000) as u32);
-            } else {
-                self.balloon_fade = BalloonFadeState::new();
-                self.last_balloon = None;
-            }
-        }
         let opts = self.controls.options.help.take().is_some();
         if live || opts {
+            self.close_balloon_fade();
             self.play(WHOOSH);
             true
         } else {
@@ -3373,9 +3580,13 @@ impl Hud {
                 self.auto_answer.press();
             }
             if let Some(message) = self.active_message().cloned()
-                && self
-                    .dialog_state
-                    .click_entry(&layout, &message, &self.art, point)
+                && self.dialog_state.click_entry(
+                    &layout,
+                    &message,
+                    &self.art,
+                    point,
+                    self.shift_held,
+                )
             {
                 self.dialog_state.pressed_button = None;
                 return None;
@@ -3494,7 +3705,7 @@ impl Hud {
             // (e.g. zodiac on a pet, Report Card on an adult, or Fame on a
             // regular career) does not open a balloon or play `UI_whoosh`.
             Command::Help(help) => {
-                let snapshot = self.household(world, residential, None);
+                let snapshot = self.household(world, residential, self.drawn_selection);
                 if !hud::help_matches_snapshot(help, &snapshot, self.controls.panel) {
                     return None;
                 }
@@ -3522,10 +3733,7 @@ impl Hud {
         }
         let open = self.controls.help.is_some() || self.controls.options.help.is_some();
         self.controls.apply(&command);
-        let now_open = self.controls.help.is_some() || self.controls.options.help.is_some();
-        if now_open != open {
-            self.play(WHOOSH);
-        }
+        self.balloon_whoosh(open);
         Some(command)
     }
 
@@ -3643,6 +3851,47 @@ enum ClockState {
     /// toggles Ultra selected every 500 ms whenever `speed != Some(Speed::Ultra)`
     /// (and re-arms without toggling while `speed == Some(Speed::Ultra)`).
     IdleUltra,
+}
+
+/// The job panel performance's 333 ms blink (`0x5306df`, `0x52c659`,
+/// `0x53070d`): it starts unlit, turns lit one period after it starts and
+/// flips each period after, and stops unlit as soon as it is no longer
+/// wanted. While it stays wanted its phase is kept (`0x5306df` does
+/// nothing when `[gadget + 0x1a5]` already says it runs).
+#[derive(Debug, Default)]
+struct PerformanceBlink {
+    since: Option<u64>,
+    lit: bool,
+}
+
+impl PerformanceBlink {
+    /// Advances the blink to `clock_us`, `active` while it is wanted;
+    /// returns whether the color changed.
+    fn sync(&mut self, active: bool, clock_us: u64) -> bool {
+        if !active {
+            self.since = None;
+            return std::mem::take(&mut self.lit);
+        }
+        let Some(since) = self.since else {
+            self.since = Some(clock_us);
+            return false;
+        };
+        if clock_us.saturating_sub(since) < hud::PERFORMANCE_BLINK_US {
+            return false;
+        }
+        self.lit = !self.lit;
+        self.since = Some(clock_us);
+        true
+    }
+
+    fn next_blink_us(&self, clock_us: u64) -> Option<u64> {
+        let since = self.since?;
+        Some(
+            hud::PERFORMANCE_BLINK_US
+                .saturating_sub(clock_us.saturating_sub(since))
+                .max(1_000),
+        )
+    }
 }
 
 /// Shared 500 ms clock blink timer (`0x53b4b0..0x53b7e7`, `0x53b0d3..0x53b16b`).
@@ -3948,6 +4197,30 @@ mod tests {
     use sims_ui::command::{Mode, Speed};
     use sims_ui::frame::Rect;
     use sims_ui::queue::{Icon, Picture};
+
+    #[test]
+    fn the_performance_blinks_green_every_333_ms_and_stops_unlit() {
+        let ms = |n: u64| n * 1_000;
+        let mut blink = PerformanceBlink::default();
+        assert_eq!(blink.next_blink_us(0), None);
+        assert!(!blink.sync(true, ms(10)));
+        assert_eq!(blink.next_blink_us(ms(10)), Some(ms(333)));
+        assert!(!blink.sync(true, ms(342)));
+        assert!(blink.sync(true, ms(343)), "lit one period after it starts");
+        assert!(blink.lit);
+        assert!(!blink.sync(true, ms(500)));
+        assert!(blink.sync(true, ms(676)));
+        assert!(!blink.lit);
+        assert!(blink.sync(true, ms(1009)));
+        // When it is no longer wanted it goes out at once, and starts
+        // unlit again later.
+        assert!(blink.sync(false, ms(1010)));
+        assert!(!blink.lit);
+        assert_eq!(blink.next_blink_us(ms(1010)), None);
+        assert!(!blink.sync(false, ms(2000)));
+        assert!(!blink.sync(true, ms(2000)));
+        assert!(!blink.lit);
+    }
 
     #[test]
     fn pause_blink_toggles_every_500ms_and_resets_unlit() {

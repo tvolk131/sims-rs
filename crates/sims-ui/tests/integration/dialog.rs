@@ -243,7 +243,7 @@ fn native_dialog_chrome_loads_nine_slice_and_sim_stub_art() {
     let mut wrap_state = dialog::DialogState::for_message(&wrap_card);
     // Click near the left edge of row 1 (second visual wrapped row).
     let row1_click = [desc_rect.x + 2, desc_rect.y + 3 + line_h + 2];
-    assert!(wrap_state.click_entry(&wrap_layout, &wrap_card, &art_with_card, row1_click));
+    assert!(wrap_state.click_entry(&wrap_layout, &wrap_card, &art_with_card, row1_click, false));
     assert_eq!(wrap_state.active_field, 1);
     assert_eq!(wrap_state.caret_line, Some(1));
     let row1_start = wrap_state.caret.unwrap();
@@ -289,17 +289,17 @@ fn native_dialog_chrome_loads_nine_slice_and_sim_stub_art() {
     assert!(row1_diff > 0);
 
     // End moves to end of row 1 (not end of entire multi-row text); Home returns to row1_start.
-    assert!(wrap_state.end_in_layout(&wrap_card, Some(&wrap_layout), Some(&art_with_card)));
+    assert!(wrap_state.end_in_layout(&wrap_card, Some(&wrap_layout), Some(&art_with_card), false));
     assert_eq!(wrap_state.caret_line, Some(1));
     let row1_end = wrap_state.caret.unwrap();
     assert!(row1_end > row1_start);
-    assert!(wrap_state.home_in_layout(&wrap_card, Some(&wrap_layout), Some(&art_with_card)));
+    assert!(wrap_state.home_in_layout(&wrap_card, Some(&wrap_layout), Some(&art_with_card), false));
     assert_eq!(wrap_state.caret, Some(row1_start));
     assert_eq!(wrap_state.caret_line, Some(1));
     // Up moves from row 1 to row 0, and Down returns to row 1.
-    assert!(wrap_state.move_up(&wrap_card, Some(&wrap_layout), &art_with_card));
+    assert!(wrap_state.move_up(&wrap_card, Some(&wrap_layout), &art_with_card, false));
     assert_eq!(wrap_state.caret_line, Some(0));
-    assert!(wrap_state.move_down(&wrap_card, Some(&wrap_layout), &art_with_card));
+    assert!(wrap_state.move_down(&wrap_card, Some(&wrap_layout), &art_with_card, false));
     assert_eq!(wrap_state.caret_line, Some(1));
     // Inserting at row1_start keeps the rest of the text intact.
     assert!(wrap_state.insert(&mut wrap_card, '!'));
@@ -322,7 +322,7 @@ fn native_dialog_chrome_loads_nine_slice_and_sim_stub_art() {
     col_state.selection = None;
     col_state.caret = Some(2);
     col_state.caret_line = Some(0);
-    assert!(col_state.move_down(&col_card, Some(&col_layout), &art_with_card));
+    assert!(col_state.move_down(&col_card, Some(&col_layout), &art_with_card, false));
     assert_eq!(col_state.caret_line, Some(1));
     assert_eq!(col_state.caret, Some(5 + 2));
 
@@ -346,6 +346,7 @@ fn native_dialog_chrome_loads_nine_slice_and_sim_stub_art() {
         &drag_card,
         &art_with_card,
         [drag_name.x + 2, drag_name.y + 10],
+        false,
     ));
     assert_eq!(drag_state.selection, None);
     assert!(drag_state.drag_entry(
@@ -365,6 +366,7 @@ fn native_dialog_chrome_loads_nine_slice_and_sim_stub_art() {
         &drag_card,
         &art_with_card,
         [drag_desc.x + 2, drag_desc.y + 4],
+        false,
     ));
     assert!(drag_state.drag_entry(
         &drag_layout,

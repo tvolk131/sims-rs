@@ -1160,9 +1160,7 @@ impl Game {
         if self.hud.controls.options.tab.take().is_some() {
             // `0x5175ab..0x5175bb -> 0x50fb7f`: closing a tab also dismisses
             // any open Options help balloon with `UI_whoosh` before `UI_click`.
-            if self.hud.controls.options.help.take().is_some() {
-                self.hud.play(crate::hud::WHOOSH);
-            }
+            self.hud.dismiss_options_help();
             self.hud.play(crate::hud::CLICK);
             self.hud.relayout_panel(
                 self.view.size,
@@ -1175,8 +1173,7 @@ impl Game {
             );
             let sounds = self.hud.take_sounds();
             self.keep_sounds(sounds);
-        } else if self.hud.controls.options.help.take().is_some() {
-            self.hud.play(crate::hud::WHOOSH);
+        } else if self.hud.dismiss_options_help() {
             let sounds = self.hud.take_sounds();
             self.keep_sounds(sounds);
         }

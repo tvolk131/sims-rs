@@ -87,6 +87,8 @@ impl Game {
         self.highlighted_buttons.clear();
         self.highlighted_portraits.clear();
         self.highlighted_relationships.clear();
+        self.tutorial_marker = None;
+        self.marker_cell_drawn = None;
         self.reached = None;
         self.listed = None;
         self.highlighted = None;
@@ -702,9 +704,8 @@ impl Game {
         } else if self.hud.controls.mode == Mode::Build {
             self.layout_build();
         }
-        if had_balloon {
-            self.hud.play(crate::hud::WHOOSH);
-        }
+        // `TogglePanel` drops any help balloon: it fades out and whooshes.
+        self.hud.balloon_whoosh(had_balloon);
         self.hud.play(crate::hud::CLICK);
         self.flush_hud_sounds();
         true

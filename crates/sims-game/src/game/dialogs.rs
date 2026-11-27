@@ -342,37 +342,151 @@ impl Game {
         !self.ui_modal_in_front() && self.hud.dialog_delete()
     }
 
-    /// Moves the active dialog's text-entry caret one character left.
-    pub fn dialog_move_left(&mut self) -> bool {
-        !self.ui_modal_in_front() && self.hud.dialog_move_left()
+    /// Moves the active dialog's text-entry caret one character left, or a
+    /// word with `word` (Ctrl, `0x5f3188`), extending the selection with
+    /// `extend` (Shift, `0x5f2ec7`).
+    pub fn dialog_move_left(&mut self, word: bool, extend: bool) -> bool {
+        !self.ui_modal_in_front() && self.hud.dialog_move_left(word, extend)
     }
 
-    /// Moves the active dialog's text-entry caret one character right.
-    pub fn dialog_move_right(&mut self) -> bool {
-        !self.ui_modal_in_front() && self.hud.dialog_move_right()
+    /// Moves the active dialog's text-entry caret one character (or word)
+    /// right.
+    pub fn dialog_move_right(&mut self, word: bool, extend: bool) -> bool {
+        !self.ui_modal_in_front() && self.hud.dialog_move_right(word, extend)
     }
 
     /// Moves the active dialog's text-entry caret one visual row up (multiline
     /// fields, `0x5f29f2..0x5f2a90`).
-    pub fn dialog_move_up(&mut self) -> bool {
-        !self.ui_modal_in_front() && self.hud.dialog_move_up()
+    pub fn dialog_move_up(&mut self, extend: bool) -> bool {
+        !self.ui_modal_in_front() && self.hud.dialog_move_up(extend)
     }
 
     /// Moves the active dialog's text-entry caret one visual row down (multiline
     /// fields, `0x5f2a90..0x5f2b40`).
-    pub fn dialog_move_down(&mut self) -> bool {
-        !self.ui_modal_in_front() && self.hud.dialog_move_down()
+    pub fn dialog_move_down(&mut self, extend: bool) -> bool {
+        !self.ui_modal_in_front() && self.hud.dialog_move_down(extend)
     }
 
     /// Moves the active dialog's text-entry caret to the start of the current
-    /// line (or field, `0x5f2c13`).
-    pub fn dialog_home(&mut self) -> bool {
-        !self.ui_modal_in_front() && self.hud.dialog_home()
+    /// line (or field, `0x5f2c13`), or of the whole text with `whole` (Ctrl).
+    pub fn dialog_home(&mut self, whole: bool, extend: bool) -> bool {
+        !self.ui_modal_in_front() && self.hud.dialog_home(whole, extend)
     }
 
-    /// Moves the active dialog's text-entry caret to the end of the field.
-    pub fn dialog_end(&mut self) -> bool {
-        !self.ui_modal_in_front() && self.hud.dialog_end()
+    /// Moves the active dialog's text-entry caret to the end of the line, or
+    /// of the whole text with `whole` (Ctrl).
+    pub fn dialog_end(&mut self, whole: bool, extend: bool) -> bool {
+        !self.ui_modal_in_front() && self.hud.dialog_end(whole, extend)
+    }
+
+    /// Toggles the active dialog's text field between inserting and
+    /// overwriting (Insert, `0x5f29d8`).
+    pub fn dialog_toggle_overwrite(&mut self) -> bool {
+        !self.ui_modal_in_front() && self.hud.dialog_toggle_overwrite()
+    }
+
+    /// Pastes into the active dialog's text field (`0x5f473f`): `text`, or
+    /// the system clipboard when `None`.
+    pub fn dialog_paste(&mut self, text: Option<&str>) -> bool {
+        if self.ui_modal_in_front() || !self.has_dialog_entry() {
+            return false;
+        }
+        match text {
+            Some(text) => self.hud.dialog_paste(text),
+            None => self
+                .clipboard_text()
+                .is_some_and(|t| self.hud.dialog_paste(&t)),
+        }
+    }
+
+    /// Keeps the dialog clipboard inside this game, leaving the system's
+    /// alone, as headless hosts and tests want.
+    pub fn use_local_clipboard(&mut self) {
+        self.local_clipboard.get_or_insert_with(String::new);
+    }
+
+    /// The text on the dialog clipboard: the local one, or the system's. On
+    /// macOS that is `pbpaste`'s text, and nothing when it has none (an
+    /// image, say), never older text. Elsewhere it is the process's own
+    /// buffer, so text copied in other programs is not seen.
+    fn clipboard_text(&self) -> Option<String> {
+        if let Some(local) = &self.local_clipboard {
+            return Some(local.clone()).filter(|t| !t.is_empty());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // `pbpaste` falls back to RTF or EPS when the clipboard has no
+            // plain text; the original pastes only `CF_TEXT`. Ask what the
+            // clipboard holds first, and go on if that cannot be asked.
+            if let Ok(info) = std::process::Command::new("osascript")
+                .args(["-e", "clipboard info"])
+                .output()
+                && info.status.success()
+            {
+                let info = String::from_utf8_lossy(&info.stdout);
+                if !["utf8", "string", "Unicode text", "ut16"]
+                    .iter()
+                    .any(|kind| info.contains(kind))
+                {
+                    return None;
+                }
+            }
+            let output = std::process::Command::new("pbpaste").output().ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            String::from_utf8(output.stdout)
+                .ok()
+                .filter(|t| !t.is_empty())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            crate::coop::clipboard_paste()
+        }
+    }
+
+    /// Puts `text` on the dialog clipboard, noting a failure. Returns
+    /// whether it is there.
+    fn copy_to_clipboard(&mut self, text: &str) -> bool {
+        if let Some(local) = &mut self.local_clipboard {
+            text.clone_into(local);
+            true
+        } else if let Err(e) = crate::coop::clipboard_copy(text) {
+            self.note = Some(format!("Could not copy: {e}"));
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Copies the active dialog's selected text to the system clipboard
+    /// (`0x5f4699`), returning it.
+    pub fn dialog_copy(&mut self) -> Option<String> {
+        if self.ui_modal_in_front() {
+            return None;
+        }
+        let text = self.hud.dialog_selected_text()?;
+        self.copy_to_clipboard(&text).then_some(text)
+    }
+
+    /// Cuts the active dialog's selected text to the system clipboard
+    /// (`0x5f4724`), returning it.
+    pub fn dialog_cut(&mut self) -> Option<String> {
+        if self.ui_modal_in_front() {
+            return None;
+        }
+        // Only text that reached the clipboard leaves the field.
+        let text = self.hud.dialog_selected_text()?;
+        if !self.copy_to_clipboard(&text) {
+            return None;
+        }
+        self.hud.dialog_cut()
+    }
+
+    /// Selects the word under a double-click at `point` in the active
+    /// dialog's text field (`0x5f2c21`).
+    pub fn dialog_double_click(&mut self, point: [i32; 2]) -> bool {
+        !self.ui_modal_in_front() && self.hud.dialog_double_click(point)
     }
 
     /// Submits the active modal dialog via Enter (activates button 0 if enabled).

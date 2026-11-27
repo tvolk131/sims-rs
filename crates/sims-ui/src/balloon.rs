@@ -112,7 +112,9 @@ impl BalloonFadeState {
         }
         let cur = self.progress(now_ms);
         self.open = true;
-        if cur > 0.0 && cur < 1.0 {
+        // `0x50fad3`: any fade-out still in flight reverses from where it
+        // is, even one started this very millisecond (progress 1.0).
+        if cur > 0.0 {
             let rem_ms = (((1.0 - cur) * FADE_DURATION_MS as f32) + 0.5).clamp(0.0, 250.0) as u32;
             self.start_value = cur;
             self.target_value = 1.0;
@@ -234,6 +236,12 @@ pub enum Help {
     /// The Superstar friends total starpower button (`fame.iff STR# 1[37..=38]`,
     /// `0x52d068`, `0x52d134`).
     FameFriends,
+    /// One of the 6 skill labels of an adult's job panel (`0x53074c` code 1,
+    /// `0x5307a5..0x5309aa`), index `0..6` in `SKILLS` order. Its text is
+    /// `Live.iff STR# 137` pair `index` (loaded at `0x52f77e`) and its
+    /// pictures `0x6f4290`, the same as the Superstar skill's
+    /// ([`Help::FameSkill`], `0x6f3cb8`).
+    JobSkill(u8),
 }
 
 impl Help {
@@ -247,6 +255,7 @@ impl Help {
     /// - Superstar (`0x52ce92`, `0x52d0c5`): compares clicked button pointer
     ///   (6 skill buttons, 1 fame-level button regardless of level, 1 friends
     ///   starpower button).
+    /// - Job panel skills (`0x530825..0x5309aa`): compares the clicked label.
     pub fn balloon(self) -> u8 {
         match self {
             Self::Sign(_) => 0,
@@ -258,6 +267,7 @@ impl Help {
             Self::FameSkill(index) => 24 + index.min(5),
             Self::FameLevel(_) => 30,
             Self::FameFriends => 31,
+            Self::JobSkill(index) => 32 + index.min(5),
         }
     }
 
@@ -268,7 +278,7 @@ impl Help {
             Self::Need { index, .. } => index < 8,
             Self::PetSkill { index, .. } => index < 3,
             Self::ReportCard | Self::FameFriends => true,
-            Self::FameSkill(index) => index < 6,
+            Self::FameSkill(index) | Self::JobSkill(index) => index < 6,
             Self::FameLevel(level) => level <= 10,
         }
     }
@@ -655,7 +665,9 @@ impl Texts {
             Help::PetSkill { cat: false, index } => self.dog_skills.get(usize::from(index)),
             Help::PetSkill { cat: true, index } => self.cat_skills.get(usize::from(index)),
             Help::ReportCard => self.report_card.as_ref(),
-            Help::FameSkill(index) => self.fame_skills.get(usize::from(index)),
+            Help::FameSkill(index) | Help::JobSkill(index) => {
+                self.fame_skills.get(usize::from(index))
+            }
             Help::FameLevel(level) => self.fame_levels.get(usize::from(level)),
             Help::FameFriends => self.fame_friends.as_ref(),
         }
@@ -808,20 +820,35 @@ pub fn draw_with_alpha(
         draw_with_thumbnails(frame, art, thumbnails, balloon);
         return;
     }
+    let screen_width = frame.width();
+    composite(frame, balloon.rect, alpha, |scratch, [x0, y0]| {
+        let mut shifted = balloon.clone();
+        shifted.rect.x -= x0;
+        shifted.rect.y -= y0;
+        draw_with_thumbnails_inner(scratch, art, thumbnails, &shifted, screen_width);
+    });
+}
+
+/// Composites what `draw` draws inside `rect` onto `frame` at `alpha`, as
+/// `cTSWinFade` fades a window (`0x5e8c93..0x5e8e10`). `draw` gets a
+/// scratch frame holding the part of `frame` under `rect` (clipped to it)
+/// and that part's top left, to subtract from what it places; the pixels
+/// it changes are blended back at `alpha`, the others left bit-exact.
+pub fn composite(
+    frame: &mut Frame,
+    rect: Rect,
+    alpha: u8,
+    draw: impl FnOnce(&mut Frame, [i32; 2]),
+) {
+    if alpha == 0 {
+        return;
+    }
     let fw = i32::try_from(frame.width()).unwrap_or(i32::MAX);
     let fh = i32::try_from(frame.height()).unwrap_or(i32::MAX);
-    let x0 = balloon.rect.x.clamp(0, fw);
-    let y0 = balloon.rect.y.clamp(0, fh);
-    let x1 = balloon
-        .rect
-        .x
-        .saturating_add(balloon.rect.width)
-        .clamp(x0, fw);
-    let y1 = balloon
-        .rect
-        .y
-        .saturating_add(balloon.rect.height)
-        .clamp(y0, fh);
+    let x0 = rect.x.clamp(0, fw);
+    let y0 = rect.y.clamp(0, fh);
+    let x1 = rect.x.saturating_add(rect.width).clamp(x0, fw);
+    let y1 = rect.y.saturating_add(rect.height).clamp(y0, fh);
     let w = (x1 - x0) as u32;
     let h = (y1 - y0) as u32;
     if w == 0 || h == 0 {
@@ -838,10 +865,7 @@ pub fn draw_with_alpha(
             }
         }
     }
-    let mut shifted = balloon.clone();
-    shifted.rect.x -= x0;
-    shifted.rect.y -= y0;
-    draw_with_thumbnails_inner(&mut scratch, art, thumbnails, &shifted, frame.width());
+    draw(&mut scratch, [x0, y0]);
     for sy in 0..h as i32 {
         for sx in 0..w as i32 {
             if let (Some(src), Some(bg)) = (scratch.pixel(sx, sy), frame.pixel(x0 + sx, y0 + sy))
@@ -1271,6 +1295,16 @@ mod tests {
         assert_eq!(mid.alpha(1250), 128);
         assert_eq!(mid.alpha(1375), 0);
         assert!(!mid.is_visible(1375));
+
+        // A close and reopen on the same clock (`0x50fad3`: the fade-out is
+        // still in flight) stays fully lit instead of flashing to 0.
+        let mut same = BalloonFadeState::default();
+        same.open(1000);
+        same.close(2000);
+        same.open(2000);
+        assert!(same.is_open());
+        assert_eq!(same.alpha(2000), 255);
+        assert_eq!(same.alpha(2001), 255);
     }
 
     #[test]

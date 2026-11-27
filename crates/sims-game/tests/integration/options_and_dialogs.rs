@@ -1413,8 +1413,8 @@ fn a_phone_book_preview_takes_keys_before_a_text_entry_behind_it() {
     assert!(!game.type_dialog_char('z'));
     assert!(!game.dialog_backspace());
     assert!(!game.dialog_delete());
-    assert!(!game.dialog_move_left());
-    assert!(!game.dialog_home());
+    assert!(!game.dialog_move_left(false, false));
+    assert!(!game.dialog_home(false, false));
     assert!(!game.dialog_switch_field());
     let _ = game.dialog_confirm_key(DialogKey::Char('z'));
     assert_eq!(
