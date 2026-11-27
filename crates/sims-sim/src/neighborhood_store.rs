@@ -3061,6 +3061,46 @@ impl NeighborhoodStore {
         state: &StoredNeighborhood,
         remove_character_files: &[String],
     ) -> Result<std::result::Result<(u128, u64), CheckedCommitError>> {
+        self.save_lot_neighborhood_and_characters_checked(
+            id,
+            house,
+            expected,
+            lot_bytes,
+            state,
+            remove_character_files,
+            &[],
+        )
+    }
+
+    /// [`Self::save_lot_and_neighborhood_checked`], also replacing the
+    /// character files in `character_files` (filename, bytes) in the same
+    /// transaction: the outfit rows the outfit editor wrote into a
+    /// person's body strings, which the original writes into the
+    /// character file (0x409492 → 0x587bbd). On a mismatch nothing
+    /// changes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_lot_neighborhood_and_characters_checked(
+        &self,
+        id: &str,
+        house: u32,
+        expected: Option<(u128, u64)>,
+        lot_bytes: &[u8],
+        state: &StoredNeighborhood,
+        remove_character_files: &[String],
+        character_files: &[(String, Vec<u8>)],
+    ) -> Result<std::result::Result<(u128, u64), CheckedCommitError>> {
+        let mut seen_names: BTreeSet<&str> = BTreeSet::new();
+        for (filename, _) in character_files {
+            if filename.is_empty() {
+                return Err(Error::Store("character filename must not be empty".into()));
+            }
+            if !seen_names.insert(filename) || remove_character_files.contains(filename) {
+                return Err(Error::Store(format!(
+                    "character file {filename:?} is written twice, or written and removed, in \
+                     one atomic batch"
+                )));
+            }
+        }
         let txn = self.db.begin_write().map_err(store)?;
         let committed_version;
         {
@@ -3130,10 +3170,15 @@ impl NeighborhoodStore {
             let mut lot_table = txn.open_table(NEIGHBORHOOD_LOTS).map_err(store)?;
             lot_table.insert((id, house), lot_bytes).map_err(store)?;
             nh_table.insert(id, encoded.as_slice()).map_err(store)?;
-            if !remove_character_files.is_empty() {
+            if !remove_character_files.is_empty() || !character_files.is_empty() {
                 let mut char_table = txn.open_table(NEIGHBORHOOD_CHARACTERS).map_err(store)?;
                 for rel_path in remove_character_files {
                     char_table.remove((id, rel_path.as_str())).map_err(store)?;
+                }
+                for (filename, bytes) in character_files {
+                    char_table
+                        .insert((id, filename.as_str()), bytes.as_slice())
+                        .map_err(store)?;
                 }
             }
         }

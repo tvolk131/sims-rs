@@ -41,7 +41,10 @@ pub use import_wardrobe::ImportWardrobe;
 pub use index::{Index, Member, Resource, far_members};
 pub use install::{Expansions, Install, Layout, Mount};
 pub use neighborhood::{House, Neighborhood, PENDING_IMPORT};
-pub use people::{AvatarRegistry, Bone, People, Profile, Skeleton, skeleton_name, skeleton_scales};
+pub use people::{
+    AvatarRegistry, Bone, People, Profile, Skeleton, decode_body_strings, skeleton_name,
+    skeleton_scales,
+};
 pub use pool::ArchivePool;
 pub use surfaces::{SurfaceCatalog, SurfaceFile, SurfaceKind, SurfacePlugin, Surfaces, atoi};
 pub use wardrobe::Wardrobe;

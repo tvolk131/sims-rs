@@ -964,6 +964,7 @@ fn save_staged_lot_to_store(
             real_nh.revision
         ));
     }
+    let before = character_files(staging_store, neighborhood_id)?;
     let mut report = game.save_to_neighborhood(install_root, staging_store, neighborhood_id)?;
     let lot_bytes = staging_store
         .load_saved_lot(neighborhood_id, house)
@@ -973,19 +974,49 @@ fn save_staged_lot_to_store(
         .load_neighborhood(neighborhood_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "staged neighborhood missing after save".to_owned())?;
+    let character_files = saved_character_files(&before, staging_store, neighborhood_id)?;
     let committed = real_store
-        .save_lot_and_neighborhood_checked(
+        .save_lot_neighborhood_and_characters_checked(
             neighborhood_id,
             house,
             Some((expected_instance_id, expected_revision)),
             &lot_bytes,
             &staged_nh,
             &[],
+            &character_files,
         )
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("checked neighborhood commit failed: {e:?}"))?;
     report.revision = committed.1;
     Ok((report, lot_bytes))
+}
+
+/// The character files of `staging`, to compare after a save with
+/// [`saved_character_files`].
+fn character_files(
+    staging: &NeighborhoodStore,
+    neighborhood_id: &str,
+) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    staging
+        .load_character_files(neighborhood_id)
+        .map_err(|e| e.to_string())
+}
+
+/// The character files a save through `staging` changed from `before`:
+/// the outfit rows `sims_vm::lifecycle` writes into the people's files
+/// (0x587bbd), which go to the real store with the lot whose save dropped
+/// them.
+fn saved_character_files(
+    before: &BTreeMap<String, Vec<u8>>,
+    staging: &NeighborhoodStore,
+    neighborhood_id: &str,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    Ok(staging
+        .load_character_files(neighborhood_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|(name, bytes)| before.get(name) != Some(bytes))
+        .collect())
 }
 
 /// Flushes every live person's persistent `data` words (`0x423827`, revision 9)
@@ -1119,6 +1150,7 @@ fn save_cheat_mutated_lot_to_store(
         ),
     }
     .map_err(|e| format!("staging cheat save boot failed: {e}"))?;
+    let before = character_files(&staging_store, neighborhood_id)?;
     let mut report = lifecycle::save_and_leave_lot(
         install_root,
         &staging_store,
@@ -1135,14 +1167,16 @@ fn save_cheat_mutated_lot_to_store(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "staged cheat save neighborhood missing".to_owned())?;
 
+    let character_files = saved_character_files(&before, &staging_store, neighborhood_id)?;
     let committed = store
-        .save_lot_and_neighborhood_checked(
+        .save_lot_neighborhood_and_characters_checked(
             neighborhood_id,
             house,
             Some((expected_instance_id, expected_revision)),
             &lot_bytes,
             &final_nh,
             &[],
+            &character_files,
         )
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("checked neighborhood commit failed: {e:?}"))?;

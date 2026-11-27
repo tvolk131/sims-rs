@@ -1653,6 +1653,14 @@ fn decode_body_string_table(data: &[u8], flags: u16, label: &str) -> Result<Vec<
     Ok(loaded)
 }
 
+/// The rows a person's string set loads from its body strings table
+/// (`data`, with the chunk's `flags`), as [`decode_body_string_table`]
+/// decodes them: the US-English rows, padded to 35. `label` names the
+/// table in errors.
+pub fn decode_body_strings(data: &[u8], flags: u16, label: &str) -> Result<Vec<String>> {
+    decode_body_string_table(data, flags, label)
+}
+
 /// The body strings of the person definition `chunk` of a character
 /// file, decoded as `0x587b65` → `0x46feac(0, 1)`.
 fn body_strings(index: &Index, resource: &Resource, chunk: u16) -> Result<Vec<String>> {

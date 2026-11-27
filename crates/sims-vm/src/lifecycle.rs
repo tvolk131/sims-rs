@@ -36,6 +36,8 @@
 //!     resets lot funds/budget/usage, recomputes lot values (`0x416085`), and
 //!     commits both lot and neighborhood atomically to REDB.
 
+pub(crate) mod outfit_rows;
+
 use crate::boot::save::Saved;
 use crate::boot::{Finished, Frames, LoadReport, Lot, NeighborhoodOrigin, opening_rotation};
 use crate::daily::value as object_value;
@@ -3564,15 +3566,29 @@ fn save_and_leave_lot_inner(
     );
     saved.deletion_epoch = stored.deletion_epoch;
     saved.family_flags = Some(saved.world.family_flags.clone());
+    // 4. The outfit rows the lot wrote go into the people's character
+    // files (0x587bbd), in the same transaction; the revision check covers
+    // the files, which change only with the neighborhood.
+    let outfits = outfit_rows::outfit_writes(
+        &store.load_character_files(neighborhood_id)?,
+        saved.made_outfits(),
+        &outfit_rows::Loaded {
+            program: &lot.program,
+            world: &saved.world,
+        },
+    );
+    outfits.strip(&mut saved);
     let lot_bytes = saved.encode();
-    let (committed_instance, committed_revision) = match store.save_lot_and_neighborhood_checked(
-        neighborhood_id,
-        house,
-        Some((origin.instance_id, origin.revision)),
-        &lot_bytes,
-        &stored,
-        &[],
-    )? {
+    let (committed_instance, committed_revision) = match store
+        .save_lot_neighborhood_and_characters_checked(
+            neighborhood_id,
+            house,
+            Some((origin.instance_id, origin.revision)),
+            &lot_bytes,
+            &stored,
+            &[],
+            &outfits.files,
+        )? {
         Ok(version) => version,
         Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
             return Err(LifecycleError::NeighborhoodMismatch {
@@ -3589,6 +3605,8 @@ fn save_and_leave_lot_inner(
         }
     };
     lot.world.family_flags = saved.world.family_flags;
+    // The lot stays live: what the files now hold is what it loaded.
+    outfits.rebase(&mut lot.program, &lot.world.made_outfits);
     lot.neighborhood_origin = Some(NeighborhoodOrigin {
         store_id: store.store_id(),
         neighborhood_id: neighborhood_id.to_owned(),
@@ -4519,6 +4537,76 @@ mod tests {
                 .all(|o| o.id != lead_id && o.id != non_lead_id && o.guid != lead_guid),
             "multi-tile group whose non-lead tile qualifies must be removed on bulldoze"
         );
+    }
+
+    #[test]
+    fn edited_outfit_rows_go_into_the_character_file_at_lot_save() {
+        // The outfit editor writes a person's body strings into its
+        // character file (0x409315, 0x409492(1) → 0x587bbd), so an edit
+        // outlives the lot. The port carries the rows into the store's
+        // character file when the lot is saved, and the saved lot keeps
+        // none of its own.
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let db = TempDb::new("outfit-rows");
+        let store = NeighborhoodStore::open(&db.0).unwrap();
+        store
+            .import_directory("UserData", &root.join("UserData"), 0xff)
+            .unwrap();
+        let no_frames = Frames::parse("none").unwrap();
+        let stored = store.load_neighborhood("UserData").unwrap().unwrap();
+        let guid = stored.family_in(5).unwrap().1.members[0];
+        let files = store.load_character_files("UserData").unwrap();
+        let before = outfit_rows::stored_row(&files, guid, 31).expect("a character file row");
+        let edited = format!("{before};edited");
+
+        let mut lot = enter_lot(&root, &store, "UserData", 5, &[3], no_frames.clone()).unwrap();
+        lot.world
+            .made_outfits
+            .entry(guid)
+            .or_default()
+            .insert(31, edited.clone());
+        save_and_leave_lot(&root, &store, "UserData", &mut lot).unwrap();
+
+        let files = store.load_character_files("UserData").unwrap();
+        assert_eq!(
+            outfit_rows::stored_row(&files, guid, 31),
+            Some(edited.clone())
+        );
+        let saved = store.load_lot_snapshot("UserData", 5).unwrap().unwrap();
+        let saved = Saved::decode(saved.saved_lot.as_deref().unwrap()).unwrap();
+        assert!(
+            !saved.world.made_outfits.contains_key(&guid),
+            "the saved lot keeps no rows the file holds"
+        );
+        // The lot stays live; an edit back to the first row is an edit
+        // against what the save wrote, and goes in at the next save.
+        lot.world
+            .made_outfits
+            .get_mut(&guid)
+            .unwrap()
+            .insert(31, before.clone());
+        save_and_leave_lot(&root, &store, "UserData", &mut lot).unwrap();
+        let files = store.load_character_files("UserData").unwrap();
+        assert_eq!(outfit_rows::stored_row(&files, guid, 31), Some(before));
+        lot.world
+            .made_outfits
+            .get_mut(&guid)
+            .unwrap()
+            .insert(31, edited.clone());
+        save_and_leave_lot(&root, &store, "UserData", &mut lot).unwrap();
+
+        let again = enter_lot(&root, &store, "UserData", 5, &[3], no_frames.clone()).unwrap();
+        let profile = crate::people::profile(&again.program.people, &again.world, guid).unwrap();
+        assert_eq!(
+            crate::outfits::read_character_row(&again.world, guid, Some(&profile), 31),
+            Some(edited.clone())
+        );
+        // Another lot reads the file's row too.
+        let newbie = enter_lot(&root, &store, "UserData", 7, &[3], no_frames).unwrap();
+        let profile = crate::people::profile(&newbie.program.people, &newbie.world, guid).unwrap();
+        assert_eq!(profile.suit_rows.get(&31), Some(&edited));
     }
 
     #[test]

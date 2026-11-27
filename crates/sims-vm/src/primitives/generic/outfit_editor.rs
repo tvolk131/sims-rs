@@ -39,10 +39,33 @@
 //! 6. Temp 1 becomes the kept index (0x4501db), and the routine takes the
 //!    true branch (0x450656 → 0x44f7f0).
 //!
-//! Routines 29 (0x4501bd), 30 (0x450528) and 31 (0x4503f2) share the
-//! editor with the stack object as the person: 29 is routine 24 again,
-//! 30 reads the current index and 31 the list length, both committing
-//! with 0 (no 0x40a588). They are not ported here.
+//! Routines 29 (0x4501bd), 30 (0x450528) and 31 (0x4503f2) run the
+//! same editor on the stack object. Each first finds it by its place
+//! plus one in the lot's object table (anything not there, or not a
+//! person, throws native error 0x1c at the cast 0x635abe) and loads its
+//! strings (0x409315). Temps 0 and 1 are still the running object's, and
+//! only categories 0 to 4 are known: there is no high fashion.
+//!
+//! - **29** is routine 24 for the stack object: the same write (step 3),
+//!   the commit with 1 (0x450391), and temp 1 becomes the kept index
+//!   (0x4503e3). Category 5 writes nothing.
+//! - **30** reads the category's current accessor (the place of the row
+//!   the person wears, or -1; -1 for another category) before the commit
+//!   with 1 (0x45060c), so the commit's check and file write run, and
+//!   temp 1 becomes that value (0x45064c).
+//! - **31** reads the category's count accessor (0 where the list is
+//!   null; -1 for another category) into temp 1 and commits with 0
+//!   (0x4504e7), which puts the strings back as the load left them
+//!   (0x47053e from the backup at +0xc): nothing is checked or written
+//!   but what the load wrote.
+//!
+//! All three then refresh the portrait (0x45810c, or 0x4572af for 29) and
+//! mark the control panel, which is presentation, and take the true
+//! branch.
+//!
+//! The commit with 1 and the load write the person's string table into
+//! its character file; [`crate::lifecycle::outfit_rows`] carries the rows
+//! the port keeps into the neighborhood store.
 
 use crate::Program;
 use crate::fault::Trap;
@@ -302,38 +325,153 @@ impl Machine<'_, '_> {
             return Err(Trap::native(0x1c, "object is not a person"));
         }
         let guid = me.guid;
-        let (number, index) = match me.temps[..] {
-            [number, index, ..] => (number, index),
-            _ => {
-                return Err(Trap::Invalid(format!(
-                    "object has {} temps, need at least 2",
-                    me.temps.len()
-                )));
-            }
-        };
-        let profile = crate::people::profile(&self.program.people, self.world, guid)
-            .ok()
-            .map(std::borrow::Cow::into_owned);
+        self.set_outfit(24, guid, 5)
+    }
+
+    /// Routine 29 (0x4501bd): routine 24 for the stack object, with
+    /// categories 0 to 4 only. See the module notes.
+    pub(super) fn change_stack_outfit(&mut self) -> Result<(), Trap> {
+        let guid = self.stack_person()?;
+        self.set_outfit(29, guid, 4)
+    }
+
+    /// Routine 30 (0x450528): temp 1 becomes the place of the stack
+    /// object's current entry in the list of category temp 0. See the
+    /// module notes.
+    pub(super) fn current_outfit(&mut self) -> Result<(), Trap> {
+        let guid = self.stack_person()?;
+        let (number, _) = self.editor_temps()?;
+        let (profile, wearer) = self.wearer(guid);
         let profile = profile.as_ref();
-        let wearer = Wearer::read(self.world, guid, profile);
         if !wearer.human() && !wearer.pet() {
-            // 0x40a5a1 → 0x40d0a4 reads the body list 0x408bf5 left null.
+            // 0x40d0a4 and the commit's 0x40a5a1 read the null body list.
             return Err(Trap::Unsupported(format!(
-                "Generic Sims Call 24 for a person of gender code {}: the commit reads a null \
-                 body list (0x40d0a4)",
+                "Generic Sims Call 30 for a person of gender code {}: it reads a null body \
+                 list (0x40d0a4)",
                 wearer.gender
             )));
         }
-        let picked = if index >= 0 { category(number) } else { None };
+        let picked = category(number).filter(|_| number <= 4);
         if wearer.pet()
             && let Some((List::Clothing(_), _)) = picked
         {
             return Err(Trap::Unsupported(format!(
-                "Generic Sims Call 24 category {number} for a pet: its list (0x408d8e and kin) \
+                "Generic Sims Call 30 category {number} for a pet: its list (0x408d8e and kin) \
                  is not ported"
             )));
         }
-        // 0x44ffcb: the editor's load.
+        // 0x4505ad: the editor's load.
+        outfits::init_clothing_rows(self.program, self.world, guid, profile);
+        // 0x4505b2: the current accessor, before the commit, or -1.
+        let value = match picked {
+            Some((list, row)) => {
+                let list = entries(self.program, self.world, &wearer, list).unwrap_or_default();
+                let now = outfits::read_character_row(self.world, guid, profile, row);
+                place(&list, now.as_deref()).map_or(-1, |p| p as i16)
+            }
+            None => -1,
+        };
+        // 0x45060c: 0x409492(1) → 0x40a588.
+        commit(self.program, self.world, guid, profile, &wearer);
+        self.me_mut()?.temps[1] = value;
+        Ok(())
+    }
+
+    /// Routine 31 (0x4503f2): temp 1 becomes the length of the stack
+    /// object's list of category temp 0. See the module notes.
+    pub(super) fn outfit_count(&mut self) -> Result<(), Trap> {
+        let guid = self.stack_person()?;
+        let (number, _) = self.editor_temps()?;
+        let (profile, wearer) = self.wearer(guid);
+        let profile = profile.as_ref();
+        let picked = category(number).filter(|_| number <= 4);
+        if !wearer.human()
+            && let Some((List::Clothing(_), _)) = picked
+        {
+            return Err(Trap::Unsupported(format!(
+                "Generic Sims Call 31 category {number} for a person of gender code {}: its \
+                 list (0x408d8e and kin) is not ported",
+                wearer.gender
+            )));
+        }
+        // 0x45047d: the editor's load.
+        outfits::init_clothing_rows(self.program, self.world, guid, profile);
+        // 0x450482: the count accessor (0 for a null list), or -1. The
+        // commit with 0 (0x4504e7) puts back the strings the load left,
+        // which changes nothing.
+        let value = match picked {
+            Some((list, _)) => {
+                entries(self.program, self.world, &wearer, list).map_or(0, |list| list.len() as i16)
+            }
+            None => -1,
+        };
+        self.me_mut()?.temps[1] = value;
+        Ok(())
+    }
+
+    /// The stack object as a person (0x635abe on the object the frame's
+    /// stack object word names, by its place plus one), or native error
+    /// 0x1c.
+    fn stack_person(&self) -> Result<u32, Trap> {
+        let id = self.frame()?.stack_object;
+        let object = u16::try_from(id)
+            .ok()
+            .filter(|&id| id > 0)
+            .and_then(|id| self.world.objects.get(&id));
+        match object {
+            Some(object) if object.person.is_some() => Ok(object.guid),
+            _ => Err(Trap::native(0x1c, "stack object is not a person")),
+        }
+    }
+
+    /// The running object's temps 0 and 1 (+0x3a, +0x3c).
+    fn editor_temps(&self) -> Result<(i16, i16), Trap> {
+        let me = self.me()?;
+        match me.temps[..] {
+            [number, index, ..] => Ok((number, index)),
+            _ => Err(Trap::Invalid(format!(
+                "object has {} temps, need at least 2",
+                me.temps.len()
+            ))),
+        }
+    }
+
+    fn wearer(&self, guid: u32) -> (Option<sims_content::Profile>, Wearer) {
+        let profile = crate::people::profile(&self.program.people, self.world, guid)
+            .ok()
+            .map(std::borrow::Cow::into_owned);
+        let wearer = Wearer::read(self.world, guid, profile.as_ref());
+        (profile, wearer)
+    }
+
+    /// Routines 24 and 29: write entry temp 1 of category temp 0 (0 to
+    /// `last`) into the person `guid`'s strings and commit.
+    fn set_outfit(&mut self, routine: u8, guid: u32, last: i16) -> Result<(), Trap> {
+        let (number, index) = self.editor_temps()?;
+        let (profile, wearer) = self.wearer(guid);
+        let profile = profile.as_ref();
+        if !wearer.human() && !wearer.pet() {
+            // 0x40a5a1 → 0x40d0a4 reads the body list 0x408bf5 left null.
+            return Err(Trap::Unsupported(format!(
+                "Generic Sims Call {routine} for a person of gender code {}: the commit reads a \
+                 null body list (0x40d0a4)",
+                wearer.gender
+            )));
+        }
+        let picked = if index >= 0 && number <= last {
+            category(number)
+        } else {
+            None
+        };
+        if wearer.pet()
+            && let Some((List::Clothing(_), _)) = picked
+        {
+            return Err(Trap::Unsupported(format!(
+                "Generic Sims Call {routine} category {number} for a pet: its list (0x408d8e and \
+                 kin) is not ported"
+            )));
+        }
+        // 0x44ffcb (24), 0x450242 (29): the editor's load.
         outfits::init_clothing_rows(self.program, self.world, guid, profile);
         let mut kept = None;
         if let Some((list, row)) = picked {
@@ -344,12 +482,12 @@ impl Machine<'_, '_> {
                 write_row(self.world, guid, row, entry.row.clone());
             }
         }
-        // 0x450154: 0x409492(1) → 0x40a588.
+        // 0x450154 (24), 0x450391 (29): 0x409492(1) → 0x40a588.
         commit(self.program, self.world, guid, profile, &wearer);
-        // 0x4501db: temp 1 becomes the kept index. When nothing was
-        // written the native routine stores the low word of its first
-        // argument (the interpreter frame's address) instead, which is
-        // not reproducible; temp 1 is left as it was.
+        // 0x4501db (24), 0x4503e3 (29): temp 1 becomes the kept index.
+        // When nothing was written the native routine stores the low word
+        // of its first argument (the interpreter frame's address) instead,
+        // which is not reproducible; temp 1 is left as it was.
         if let Some(kept) = kept {
             self.me_mut()?.temps[1] = kept;
         }
