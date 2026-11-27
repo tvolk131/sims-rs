@@ -376,6 +376,38 @@ impl People {
         self.note(problems);
     }
 
+    /// Whether the object `id` is drawn as a plumb bob (the standard, date
+    /// or star bob) when a person holds it in their head slot
+    /// ([`sims_people::People::is_bob`]).
+    pub fn is_bob(&self, world: &World, id: u16) -> bool {
+        self.people.is_bob(world, id)
+    }
+
+    /// The plumb bobs ([`People::is_bob`]) the Sims of `world` hold in
+    /// their head slots: the only bobs drawn, so the only ones that spin
+    /// and that the pick notes (the animator's tick moves only the
+    /// head-slot object, 0x58f8ff). Only the head-slot occupants are
+    /// looked up, not every object.
+    pub fn bobs(&self, world: &World) -> std::collections::BTreeSet<u16> {
+        self.held_in_heads(world)
+            .filter(|&id| self.is_bob(world, id))
+            .collect()
+    }
+
+    /// Whether a Sim of `world` holds a plumb bob ([`People::bobs`]).
+    pub fn has_bob(&self, world: &World) -> bool {
+        self.held_in_heads(world).any(|id| self.is_bob(world, id))
+    }
+
+    /// What each Sim of `world` holds in their head slot.
+    fn held_in_heads<'w>(&self, world: &'w World) -> impl Iterator<Item = u16> + 'w {
+        world
+            .objects
+            .iter()
+            .filter(|(_, o)| o.person.is_some())
+            .filter_map(move |(&person, _)| sims_people::bob::in_head_slot(world, person))
+    }
+
     /// Sets the clock, in milliseconds, that spins the plumb bob
     /// ([`sims_people::People::set_clock`]).
     pub fn set_clock(&mut self, milliseconds: u32) {

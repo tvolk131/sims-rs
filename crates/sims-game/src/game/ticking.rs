@@ -234,13 +234,7 @@ impl Game {
             {
                 consider(anim_interval_us.max(1_000));
             }
-            if self
-                .lot
-                .world()
-                .objects
-                .values()
-                .any(|o| o.guid == sims_people::bob::STANDARD)
-            {
+            if self.people.has_bob(self.lot.world()) {
                 let elapsed = self.clock_us.saturating_sub(self.drawn_us);
                 let rem = SPIN_FRAME_US.saturating_sub(elapsed);
                 if rem > 0 {
@@ -272,12 +266,7 @@ impl Game {
     /// plumb bob is on the lot and [`SPIN_FRAME_US`] have passed.
     pub fn spin_due(&self) -> bool {
         self.clock_us.saturating_sub(self.drawn_us) >= SPIN_FRAME_US
-            && self
-                .lot
-                .world()
-                .objects
-                .values()
-                .any(|o| o.guid == sims_people::bob::STANDARD)
+            && self.people.has_bob(self.lot.world())
     }
 
     /// Runs the ticks owed after `elapsed_us` more microseconds at the

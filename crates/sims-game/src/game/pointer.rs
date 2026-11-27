@@ -990,6 +990,7 @@ impl Game {
     /// The person or object the pointer at `point` is on in the frame
     /// last drawn, by the original's pointer pick ([`pick::at`]).
     pub fn under(&self, point: [i32; 2]) -> Option<u16> {
+        let world = self.lot.world();
         pick::at(
             &self.lot,
             &self.drawn_camera,
@@ -997,6 +998,7 @@ impl Game {
             self.lot_depth_slice(),
             &self.people_ids,
             point,
+            |id| self.people.is_bob(world, id),
         )
     }
 

@@ -2022,62 +2022,6 @@ fn viewport_for_controls(size: [i32; 2], controls: &sims_ui::hud::Controls) -> (
     (w as u32, (h - strip).max(1) as u32)
 }
 
-/// Loads a pet's body for the pet picker's turntable. Pets' skeletons are
-/// `dog_skeleton.cmx.bcf` and `kat_skeleton.cmx.bcf` (`ExpansionShared.far`
-/// `Skeletons\`), an underscore where people's `<name>-skeleton.cmx.bcf`
-/// has a hyphen, so [`sims_people::Body::load`] cannot find them; this
-/// tries the hyphen first, then the underscore, and binds the outfit the
-/// same way.
-fn load_pet_body(
-    assets: &sims_people::Assets,
-    skeleton: &str,
-    outfit: &sims_people::Outfit,
-) -> Result<sims_people::Body, String> {
-    if let Ok(body) = sims_people::Body::load(assets, skeleton, outfit) {
-        return Ok(body);
-    }
-    use sims_people::appearance::{load_appearance, load_mesh, load_texture, texture_for};
-    use sims_people::rig::bone;
-    let file = format!("{skeleton}_skeleton.cmx.bcf");
-    let catalog =
-        sims_formats::avatar::read_bcf(&assets.read(&file)?).map_err(|e| format!("{file}: {e}"))?;
-    let skeleton = catalog
-        .skeletons
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("{file} holds no skeleton"))?;
-    let mut parts = Vec::new();
-    for (name, textures) in &outfit.parts {
-        let appearance = load_appearance(assets, name)?;
-        for binding in &appearance.bindings {
-            let at = bone(&skeleton, &binding.bone)
-                .ok_or_else(|| format!("{name:?} binds the missing bone {:?}", binding.bone))?;
-            let mesh = load_mesh(assets, &binding.mesh)?;
-            let bones = mesh
-                .bones
-                .iter()
-                .map(|b| bone(&skeleton, b).ok_or_else(|| format!("missing bone {b:?}")))
-                .collect::<Result<Vec<_>, _>>()?;
-            let texture_name = texture_for(&binding.mesh, textures)
-                .or_else(|| (!mesh.texture.is_empty()).then(|| mesh.texture.clone()));
-            let texture = match &texture_name {
-                Some(t) => load_texture(assets, t)?,
-                None => sims_people::texture::Texture::solid([200, 200, 200, 255]),
-            };
-            parts.push(sims_people::Part {
-                appearance: name.clone(),
-                bone: at,
-                bones,
-                mesh,
-                texture_name,
-                texture,
-                censor: binding.censor,
-            });
-        }
-    }
-    Ok(sims_people::Body { skeleton, parts })
-}
-
 /// Whether `record` may appear in `caller`'s Phonebook (see
 /// [`Game::build_phonebook_snapshot`]).
 fn phonebook_eligible(

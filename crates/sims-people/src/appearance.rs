@@ -196,17 +196,51 @@ pub fn texture_for(mesh: &str, textures: &str) -> Option<String> {
 /// reader 0x59f087) reads every skeleton file of its folders. People's
 /// files are named with a hyphen; the pets' (in the shared expansion
 /// archive's skeletons folder) with an underscore.
+///
+/// A file that cannot be read, or holds no skeleton of that name, does
+/// not end the search: the next file is tried, as the registry finds the
+/// name in whichever file holds it.
 pub fn load_skeleton(assets: &Assets, name: &str) -> Result<Skeleton, String> {
-    let file = skeleton_files(name)
-        .into_iter()
-        .find(|f| assets.contains(f))
-        .unwrap_or_else(|| format!("{name}-skeleton.cmx.bcf"));
-    let catalog = read_bcf(&assets.read(&file)?).map_err(|e| format!("{file}: {e}"))?;
-    catalog
-        .skeletons
-        .into_iter()
-        .find(|s| s.name.eq_ignore_ascii_case(name))
-        .ok_or_else(|| format!("{file} holds no skeleton named {name:?}"))
+    let files = skeleton_files(name);
+    let mut tried: Vec<&String> = files.iter().filter(|f| assets.contains(f)).collect();
+    if tried.is_empty() {
+        // Neither is listed: the hyphened name is read as before, for
+        // its error.
+        tried.push(&files[0]);
+    }
+    named_skeleton(
+        tried.into_iter().map(|file| {
+            let read = assets
+                .read(file)
+                .and_then(|bytes| read_bcf(&bytes).map_err(|e| format!("{file}: {e}")))
+                .map(|catalog| catalog.skeletons);
+            (file.as_str(), read)
+        }),
+        name,
+    )
+}
+
+/// The first skeleton named `name` (ignoring case) in `files`, each a
+/// file name and its skeletons (or why they could not be read), in the
+/// order they are tried. When none has it, every file's reason.
+fn named_skeleton<'a>(
+    files: impl IntoIterator<Item = (&'a str, Result<Vec<Skeleton>, String>)>,
+    name: &str,
+) -> Result<Skeleton, String> {
+    let mut reasons = Vec::new();
+    for (file, skeletons) in files {
+        match skeletons {
+            Ok(skeletons) => match skeletons
+                .into_iter()
+                .find(|s| s.name.eq_ignore_ascii_case(name))
+            {
+                Some(skeleton) => return Ok(skeleton),
+                None => reasons.push(format!("{file} holds no skeleton named {name:?}")),
+            },
+            Err(e) => reasons.push(e),
+        }
+    }
+    Err(reasons.join("; "))
 }
 
 /// The files that may hold the skeleton `name`, in the order they are
@@ -431,6 +465,44 @@ mod tests {
         assert_eq!(
             skeleton_files("bones"),
             ["bones-skeleton.cmx.bcf", "bones_skeleton.cmx.bcf"]
+        );
+    }
+
+    /// A hyphened file holding another skeleton, or one that cannot be
+    /// read, does not hide the underscored file that holds the name.
+    #[test]
+    fn the_skeleton_is_found_in_whichever_file_holds_its_name() {
+        let named = |name: &str| Skeleton {
+            name: name.to_owned(),
+            bones: Vec::new(),
+        };
+        let found = named_skeleton(
+            [
+                ("a-skeleton", Ok(vec![named("other")])),
+                ("a_skeleton", Ok(vec![named("x"), named("Bones")])),
+            ],
+            "bones",
+        );
+        assert_eq!(found.map(|s| s.name).as_deref(), Ok("Bones"));
+        let found = named_skeleton(
+            [
+                ("a-skeleton", Err("unreadable".to_owned())),
+                ("a_skeleton", Ok(vec![named("bones")])),
+            ],
+            "bones",
+        );
+        assert!(found.is_ok());
+        let missing = named_skeleton(
+            [
+                ("a-skeleton", Ok(vec![named("other")])),
+                ("a_skeleton", Err("unreadable".to_owned())),
+            ],
+            "bones",
+        )
+        .unwrap_err();
+        assert!(
+            missing.contains("a-skeleton") && missing.contains("unreadable"),
+            "{missing}"
         );
     }
 
