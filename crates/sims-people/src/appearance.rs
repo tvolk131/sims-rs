@@ -37,10 +37,23 @@ pub struct Outfit {
     pub parts: Vec<(String, String)>,
 }
 
+/// The name the original writes for an empty appearance slot (the string
+/// at 0x6c0fd4): the pets' body strings name their heads so (it writes it
+/// over rows 3 and 31 to 33 at 0x40a5d8), and a slot with no suit is
+/// listed so (0x58fc68). No catalog holds an appearance of that name, so
+/// the slot binds nothing.
+pub const NO_APPEARANCE: &str = "NONE";
+
+/// Whether an outfit names a part with `name`: not empty, nor
+/// [`NO_APPEARANCE`].
+pub fn names_a_part(name: &str) -> bool {
+    !name.is_empty() && name != NO_APPEARANCE
+}
+
 impl Outfit {
     /// The appearances a saved person record names, in its order: body,
-    /// left hand, right hand, head, then the accessories. Empty names are
-    /// skipped.
+    /// left hand, right hand, head, then the accessories. Empty names and
+    /// [`NO_APPEARANCE`] are skipped.
     pub fn from_person(person: &Person) -> Self {
         let a = &person.appearance;
         let mut parts: Vec<(String, String)> = [(0, 1), (4, 5), (6, 7), (8, 9)]
@@ -53,7 +66,7 @@ impl Outfit {
                 .iter()
                 .map(|x| (x.name.clone(), x.binding.clone())),
         );
-        parts.retain(|(name, _)| !name.is_empty());
+        parts.retain(|(name, _)| names_a_part(name));
         Self { parts }
     }
 
@@ -67,14 +80,15 @@ impl Outfit {
     /// in everyday clothes with open hands
     /// (legacy/crates/sims-sim/src/pose/appearance_selection.rs). Whether
     /// the original draws a newly made person in them is **unverified**;
-    /// the simulation does not yet keep the outfit it chose.
+    /// the simulation does not yet keep the outfit it chose. Empty names
+    /// and [`NO_APPEARANCE`] are skipped.
     pub fn from_body_strings(strings: &[String]) -> Self {
         let mut parts: Vec<(String, String)> = [1, 17, 18, 2]
             .into_iter()
             .filter_map(|row| strings.get(row))
             .map(|s| body_string(s))
             .collect();
-        parts.retain(|(name, _)| !name.is_empty());
+        parts.retain(|(name, _)| names_a_part(name));
         Self { parts }
     }
 }
@@ -116,8 +130,8 @@ pub struct Body {
 }
 
 impl Body {
-    /// Loads the skeleton named `skeleton` (`<name>-skeleton.cmx.bcf`,
-    /// such as `adult`) and every part of `outfit`.
+    /// Loads the skeleton named `skeleton` ([`load_skeleton`], such as
+    /// `adult`) and every part of `outfit`.
     pub fn load(assets: &Assets, skeleton: &str, outfit: &Outfit) -> Result<Self, String> {
         let skeleton = load_skeleton(assets, skeleton)?;
         let mut parts = Vec::new();
@@ -174,15 +188,34 @@ pub fn texture_for(mesh: &str, textures: &str) -> Option<String> {
     (mesh.contains(key) && !value.is_empty()).then(|| value.to_owned())
 }
 
-/// The skeleton `<name>-skeleton.cmx.bcf` holds under the name `name`.
+/// The skeleton named `name`, from `<name>-skeleton.cmx.bcf` or, when no
+/// file has that name, `<name>_skeleton.cmx.bcf`.
+///
+/// The original keys skeletons by the name inside the file, not the
+/// file's: the avatar registry's scan at startup (0x59f844, through the
+/// reader 0x59f087) reads every skeleton file of its folders. People's
+/// files are named with a hyphen; the pets' (in the shared expansion
+/// archive's skeletons folder) with an underscore.
 pub fn load_skeleton(assets: &Assets, name: &str) -> Result<Skeleton, String> {
-    let file = format!("{name}-skeleton.cmx.bcf");
+    let file = skeleton_files(name)
+        .into_iter()
+        .find(|f| assets.contains(f))
+        .unwrap_or_else(|| format!("{name}-skeleton.cmx.bcf"));
     let catalog = read_bcf(&assets.read(&file)?).map_err(|e| format!("{file}: {e}"))?;
     catalog
         .skeletons
         .into_iter()
         .find(|s| s.name.eq_ignore_ascii_case(name))
         .ok_or_else(|| format!("{file} holds no skeleton named {name:?}"))
+}
+
+/// The files that may hold the skeleton `name`, in the order they are
+/// tried ([`load_skeleton`]).
+fn skeleton_files(name: &str) -> [String; 2] {
+    [
+        format!("{name}-skeleton.cmx.bcf"),
+        format!("{name}_skeleton.cmx.bcf"),
+    ]
 }
 
 /// The folders the original loads appearance catalogs from, in its order
@@ -379,6 +412,27 @@ pub fn load_texture(assets: &Assets, name: &str) -> Result<Texture, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pet's head row names no appearance: its outfit is the body alone.
+    #[test]
+    fn an_empty_slot_names_no_part() {
+        let mut strings = vec![String::new(); 35];
+        strings[0] = "bones".into();
+        strings[1] = "coat,BODY=coat".into();
+        strings[2] = NO_APPEARANCE.into();
+        let outfit = Outfit::from_body_strings(&strings);
+        assert_eq!(outfit.parts, [("coat".to_owned(), "BODY=coat".to_owned())]);
+    }
+
+    /// A skeleton is looked for under the hyphened name first, then the
+    /// underscored one the pets' files have.
+    #[test]
+    fn a_skeleton_file_is_hyphened_or_underscored() {
+        assert_eq!(
+            skeleton_files("bones"),
+            ["bones-skeleton.cmx.bcf", "bones_skeleton.cmx.bcf"]
+        );
+    }
 
     #[test]
     fn a_type_without_clothes_chosen_wears_its_default_rows() {

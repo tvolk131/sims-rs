@@ -54,6 +54,8 @@ pub struct Cast {
     registry: Mutex<Option<AvatarRegistry>>,
     /// Cached language-1 body strings by GUID.
     body_strings_cache: Mutex<BTreeMap<u32, Vec<String>>>,
+    /// Cached VitaboyFlags words (OBJD word 102) by GUID.
+    vitaboy_flags_cache: Mutex<BTreeMap<u32, u16>>,
     /// The careers of `work.iff`, or None when the install has a
     /// `Careers.txt`, which the original reads in their place (not
     /// ported, as in `sims_vm::program::Program::careers`).
@@ -74,6 +76,10 @@ impl fmt::Debug for Cast {
 /// The word of a person type's definition that names its body strings
 /// (0x457f60).
 const BODY_STRINGS: usize = 19 * 2;
+
+/// The byte of a type's definition that holds its VitaboyFlags word (OBJD
+/// word 102; byte +0xcc of the raw words, tested at 0x4376f6).
+const VITABOY_FLAGS: usize = 102 * 2;
 
 impl Cast {
     /// The person types of the install at `root`, with the characters of
@@ -111,6 +117,7 @@ impl Cast {
             preloaded,
             registry: Mutex::new(None),
             body_strings_cache: Mutex::new(BTreeMap::new()),
+            vitaboy_flags_cache: Mutex::new(BTreeMap::new()),
             careers,
         })
     }
@@ -226,6 +233,94 @@ impl Cast {
         Ok(out)
     }
 
+    /// The VitaboyFlags word of the object type `guid` (OBJD word 102):
+    /// bit 0 ([`crate::bob::ANIMATED`]) gives its objects a 3D graphic
+    /// (0x4376f6). A definition too short to have the word has none.
+    pub fn vitaboy_flags(&self, guid: u32) -> Result<u16, String> {
+        if let Ok(cache) = self.vitaboy_flags_cache.lock()
+            && let Some(&cached) = cache.get(&guid)
+        {
+            return Ok(cached);
+        }
+        let object = self
+            .catalog
+            .object(guid)
+            .ok_or_else(|| format!("no object type has the GUID {guid:#010x}"))?;
+        let resource = &self.index.resources[object.resource];
+        let location = resource.location(&self.index.root);
+        let iff = Iff::parse(resource.read_with(&self.pool).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("{location}: {e}"))?;
+        let definition = iff
+            .get(b"OBJD", object.chunk)
+            .ok_or_else(|| format!("{location}: the type has no definition"))?;
+        let flags = iff
+            .data(definition)
+            .get(VITABOY_FLAGS..VITABOY_FLAGS + 2)
+            .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+        if let Ok(mut cache) = self.vitaboy_flags_cache.lock() {
+            cache.insert(guid, flags);
+        }
+        Ok(flags)
+    }
+
+    /// The suit the graphic of an object of type `guid` wears, if the
+    /// type has one ([`crate::bob::animated_suit`]); None for a type
+    /// without the bit, or one we cannot read.
+    pub fn animated_suit(&self, guid: u32) -> Option<String> {
+        let flags = self.vitaboy_flags(guid).ok()?;
+        if flags & crate::bob::ANIMATED == 0 {
+            return None;
+        }
+        let rows = self.body_strings(guid).ok()?;
+        crate::bob::animated_suit(flags, &rows).map(str::to_owned)
+    }
+
+    /// The body strings of the type `guid` as the simulation has them
+    /// now: its definition's ([`sims_sim::characters::Characters::definition`],
+    /// a made type's template) with the rows the simulation wrote put over
+    /// them ([`written_rows`]).
+    pub fn rows_of(&self, world: &World, guid: u32) -> Result<Vec<String>, String> {
+        let rows = self.body_strings(world.characters.definition(guid))?;
+        Ok(with_rows(rows, &written_rows(world, guid)))
+    }
+
+    /// The people `people` names (object ID, type GUID, record) as they
+    /// are in `world`, in their order. A type is read as its definition
+    /// (a made type as its template), and the rows the simulation wrote
+    /// ([`written_rows`]) override its skeleton (row 0) and, for a record
+    /// that names no body, its default outfit. Each resident keeps the
+    /// type GUID it was given.
+    pub fn residents_in<'a>(
+        &self,
+        world: &World,
+        people: impl IntoIterator<Item = (u16, u32, &'a Person)>,
+    ) -> Result<Vec<Resident>, String> {
+        let people: Vec<_> = people.into_iter().collect();
+        let mut found = self.residents(
+            people
+                .iter()
+                .map(|&(id, guid, person)| (id, world.characters.definition(guid), person)),
+        )?;
+        for (resident, &(_, guid, person)) in found.iter_mut().zip(&people) {
+            resident.guid = guid;
+            let written = written_rows(world, guid);
+            if written.is_empty() {
+                continue;
+            }
+            let rows = with_rows(
+                self.body_strings(world.characters.definition(guid))?,
+                &written,
+            );
+            if let Some(skeleton) = rows.first().filter(|s| !s.trim().is_empty()) {
+                resident.skeleton = skeleton.clone();
+            }
+            if person.appearance[0].trim().is_empty() {
+                resident.outfit = Outfit::from_body_strings(&rows);
+            }
+        }
+        Ok(found)
+    }
+
     /// The body strings of the person type `guid`, in their order
     /// (language 1, the first a string table gives).
     pub fn body_strings(&self, guid: u32) -> Result<Vec<String>, String> {
@@ -263,6 +358,32 @@ impl Cast {
         }
         Ok(rows)
     }
+}
+
+/// The body-string rows the simulation wrote for the type `guid`, by
+/// index counting from 0, in the order sims-vm reads them
+/// (`read_character_row`): what Make New Character wrote
+/// ([`sims_sim::characters::Character::strings`]) wins over the outfit rows
+/// it and the outfit choice wrote (`World::made_outfits`). Empty for a
+/// type nothing wrote.
+pub fn written_rows(world: &World, guid: u32) -> BTreeMap<usize, String> {
+    let mut rows = world.made_outfits.get(&guid).cloned().unwrap_or_default();
+    if let Some(made) = world.characters.made.get(&guid) {
+        rows.extend(made.strings.iter().map(|(&i, s)| (i, s.clone())));
+    }
+    rows
+}
+
+/// `rows` with each of `written` (by index counting from 0) put in its
+/// place, growing them with empty rows to reach it.
+fn with_rows(mut rows: Vec<String>, written: &BTreeMap<usize, String>) -> Vec<String> {
+    for (&index, text) in written {
+        if rows.len() <= index {
+            rows.resize(index + 1, String::new());
+        }
+        rows[index] = text.clone();
+    }
+    rows
 }
 
 /// Every CARR of the install's `work.iff` (none without the file), or
@@ -306,12 +427,67 @@ pub fn residents(root: &Path, house: &Path) -> Result<Vec<Resident>, String> {
 
 /// The people a simulation snapshot holds now, in object ID order:
 /// every object with a person record, including people a script made
-/// after the load.
+/// after the load ([`Cast::residents_in`]).
 pub fn residents_of(cast: &Cast, world: &World) -> Result<Vec<Resident>, String> {
-    cast.residents(
+    cast.residents_in(
+        world,
         world
             .objects
             .iter()
             .filter_map(|(&id, o)| o.person.as_ref().map(|p| (id, o.guid, p))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A made type's rows are its template's with the rows Make New
+    /// Character wrote put over them.
+    #[test]
+    fn a_made_types_rows_are_its_templates_with_its_own_written_over() {
+        let template = vec!["bones".to_owned(), "coat".to_owned(), "head".to_owned()];
+        let written = BTreeMap::from([(1, "fur".to_owned()), (4, "far".to_owned())]);
+        assert_eq!(
+            with_rows(template.clone(), &written),
+            ["bones", "fur", "head", "", "far"]
+        );
+        assert_eq!(with_rows(template.clone(), &BTreeMap::new()), template);
+    }
+
+    /// What Make New Character wrote wins over the outfit rows written for
+    /// the same type, as sims-vm reads them; a type nothing wrote has no
+    /// written rows.
+    #[test]
+    fn a_types_written_rows_put_its_own_over_its_outfit_rows() {
+        let mut world = World::empty();
+        world.characters.made.insert(
+            7,
+            sims_sim::characters::Character {
+                template: 3,
+                file: 0,
+                strings: BTreeMap::from([(0, "small".to_owned()), (2, "own".to_owned())]),
+            },
+        );
+        world.made_outfits.insert(
+            7,
+            BTreeMap::from([(1, "coat".to_owned()), (2, "picked".to_owned())]),
+        );
+        world
+            .made_outfits
+            .insert(9, BTreeMap::from([(30, "formal".to_owned())]));
+        assert_eq!(
+            written_rows(&world, 7),
+            BTreeMap::from([
+                (0, "small".to_owned()),
+                (1, "coat".to_owned()),
+                (2, "own".to_owned()),
+            ])
+        );
+        assert_eq!(
+            written_rows(&world, 9),
+            BTreeMap::from([(30, "formal".to_owned())])
+        );
+        assert!(written_rows(&world, 3).is_empty());
+    }
 }

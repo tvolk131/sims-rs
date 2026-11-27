@@ -339,8 +339,10 @@ impl PersonAttach {
     /// slot 2 at point 3, slot 3 at point 1, slot 4 at point 0
     /// (`0x459e25`, `0x459ecf`, `0x459f7b`, `0x45a027`). Slot 1, the
     /// "HEAD" record, is not drawn there: the animator's tick moves an
-    /// animated object held in it (the tail of `0x58dc72`), which is not
-    /// ported.
+    /// animated object held in it (the tail of `0x58dc72`), which
+    /// `sims_people::bob` draws after the person, and the generic slot
+    /// walk skips people (`0x437c56`), so nothing else in it, nor in a slot
+    /// past 4, is drawn.
     pub fn for_slot(&self, slot: usize) -> Option<[f32; 3]> {
         match slot {
             0 | 4 => self.palm,
@@ -352,16 +354,47 @@ impl PersonAttach {
 
     /// What the person's draw does with its slot `slot`: draws it at a
     /// point, skips it because the point is unbound (`0x591874`), or (slot
-    /// 1 and slots past 4) does not draw it at all, which is `None`.
-    fn slot_point(&self, slot: usize) -> Option<SlotPoint> {
-        let point = match slot {
-            0 | 4 => self.palm,
-            2 => self.pelvis,
-            3 => self.head_top,
-            _ => return None,
-        };
-        Some(point.map_or(SlotPoint::Unbound, SlotPoint::At))
+    /// 1 and slots past 4) never draws it.
+    fn slot_point(&self, slot: usize) -> SlotPoint {
+        if !draws_slot(slot) {
+            return SlotPoint::Skipped;
+        }
+        self.for_slot(slot)
+            .map_or(SlotPoint::Unbound, SlotPoint::At)
     }
+}
+
+/// Whether the person's draw draws its container slot `slot` at all
+/// (`0x459dc0`..`0x45a070`: slots 0, 2, 3 and 4), whatever its points.
+fn draws_slot(slot: usize) -> bool {
+    matches!(slot, 0 | 2 | 3 | 4)
+}
+
+/// For each object a person's slot list names, that person and the slot
+/// (entry `n + 1` is scripts' slot `n`), so the held pass can place an
+/// object whose own holder word does not name the person. Where two
+/// people's lists name one object, the first of `first` that does wins,
+/// then the lowest ID.
+fn listed_in(world: &World, first: &BTreeMap<u16, PersonAttach>) -> BTreeMap<u16, (u16, usize)> {
+    let mut listed = BTreeMap::new();
+    let people = world
+        .objects
+        .iter()
+        .filter(|(_, o)| o.person.is_some())
+        .map(|(&id, o)| (!first.contains_key(&id), id, o));
+    let mut people: Vec<_> = people.collect();
+    people.sort_by_key(|&(later, id, _)| (later, id));
+    for (_, person, o) in people {
+        for (slot, entry) in o.slots.iter().skip(1).enumerate() {
+            if let Ok(id) = u16::try_from(entry.object)
+                && id != 0
+                && id != person
+            {
+                listed.entry(id).or_insert((person, slot));
+            }
+        }
+    }
+    listed
 }
 
 /// Where the person's draw puts what one of its slots holds.
@@ -372,13 +405,17 @@ enum SlotPoint {
     /// Nowhere: the slot's point is unbound, so the person's draw skips the
     /// slot (`0x459e2c`, `0x591874`) and what it holds is not drawn.
     Unbound,
+    /// Nowhere: the person's draw does not draw this slot (slot 1 and
+    /// slots past 4; `0x459dc0`..`0x45a070` draws only slots 0, 2, 3 and
+    /// 4), and the generic slot walk skips people (`0x437c56`).
+    Skipped,
 }
 
 /// Like [`draw_held_with_options`], drawing what each person in `attach`
 /// holds at that person's attach points ([`PersonAttach`]). What sits in a
-/// slot whose point is unbound is not drawn, as in the original. Objects
-/// held by a person missing from `attach`, or in slot 1, stay at their own
-/// position.
+/// slot whose point is unbound is not drawn, as in the original, nor is
+/// what sits in slot 1 or a slot past 4. Objects in the other slots of a
+/// person missing from `attach` stay at their own position.
 pub fn draw_held_with_attach(
     world: &World,
     lot: &Lot,
@@ -533,6 +570,7 @@ fn draw_set(
         held,
         Some(1),
     );
+    painter.listed = listed_in(world, attach);
     painter.person_attach = attach.clone();
     let top = camera.level.clamp(1, 2);
     for level in 1..=top {
@@ -1610,6 +1648,9 @@ struct Painter<'a> {
     object_scratch: Vec<ObjectEntry<'a>>,
     /// Where each drawn person draws what it holds ([`PersonAttach`]).
     person_attach: BTreeMap<u16, PersonAttach>,
+    /// In the held pass, the person and slot whose slot list names each
+    /// object ([`listed_in`]); empty in the other passes.
+    listed: BTreeMap<u16, (u16, usize)>,
 }
 
 impl<'a> Painter<'a> {
@@ -1647,6 +1688,7 @@ impl<'a> Painter<'a> {
             commands: Vec::with_capacity(512),
             object_scratch: Vec::new(),
             person_attach: BTreeMap::new(),
+            listed: BTreeMap::new(),
         }
     }
 
@@ -3297,7 +3339,8 @@ impl<'a> Painter<'a> {
             let assets = &mut *self.assets;
             let slot = |guid, i: usize| assets.definition_ref(guid)?.slots.get(i).copied();
             let person_attach = &self.person_attach;
-            let attach = |person: u16, i: usize| person_attach.get(&person)?.slot_point(i);
+            let attach = |person: u16, i: usize| Some(person_attach.get(&person)?.slot_point(i));
+            let listed = |id: u16| self.listed.get(&id).copied();
             // The object's base altitude comes from `0x478dfe` (`0x4b9613`),
             // and its base screen position and depth anchor from `0x4b97ea`
             // (unheld) or `0x4b9991` (held in a slot, `0x437fdd`, or an
@@ -3313,6 +3356,7 @@ impl<'a> Painter<'a> {
                     &self.world.objects,
                     slot,
                     attach,
+                    listed,
                     id,
                     [x as f32, y as f32, base_altitude],
                 ) else {
@@ -3636,21 +3680,38 @@ const BEFORE: usize = 26;
 /// (`0x437c56` skips definition type 2): the person's draw puts what its
 /// slot holds at the attach point `attach(person, slot)` gives
 /// ([`PersonAttach::for_slot`]), and the steps below it stack on that. A
-/// slot whose point is unbound is skipped with all it holds, which is
-/// `None`. With no attach point (the person has none this frame, or slot
-/// 1), or one that is not finite or more than a lot's width from `base`,
-/// an object a Sim holds gets no offset from the Sim. A holder cycle
+/// slot whose point is unbound, or a slot the person's draw does not draw
+/// (slot 1 and slots past 4, whether or not the person has points), is
+/// skipped with all it holds, which is `None`. Where the holder words stop
+/// short of a holder, `listed` (the person and slot whose slot list names
+/// the outermost object, [`listed_in`]) stands in for the person holder,
+/// as the person's draw walks its list, not the words. With no attach point (the person has none this frame), or one
+/// that is not finite or more than a lot's width from `base`, an object a
+/// Sim holds gets no offset from the Sim. A holder cycle
 /// returns `(false, base)`. Each accumulated coordinate stays within a
 /// lot's width of its start so malformed slot data cannot overflow.
 fn held(
     objects: &CowMap<u16, Object>,
     mut slot: impl FnMut(u32, usize) -> Option<[f32; 3]>,
     attach: impl Fn(u16, usize) -> Option<SlotPoint>,
+    listed: impl Fn(u16) -> Option<(u16, usize)>,
     id: u16,
     base: [f32; 3],
 ) -> Option<(bool, [f32; 3])> {
     let Some(mut cursor) = objects.get(&id) else {
         return Some((false, base));
+    };
+    // What the person's draw does with its slot `i`: skip it (slot 1,
+    // slots past 4, or an unbound point), or start at its point.
+    let person_slot = |person: u16, i: usize| -> Result<Option<[f32; 3]>, ()> {
+        if !draws_slot(i) {
+            return Err(());
+        }
+        match attach(person, i) {
+            Some(SlotPoint::At(point)) => Ok(Some(point)),
+            Some(SlotPoint::Unbound | SlotPoint::Skipped) => Err(()),
+            None => Ok(None),
+        }
     };
     // Fast path: the vast majority of objects are not contained in any slot,
     // so check the immediate container word before allocating `seen`/`steps`.
@@ -3660,12 +3721,14 @@ fn held(
         .filter(|&c| c != 0)
         .and_then(|c| objects.get(&c))
         .is_none()
+        && listed(id).is_none()
     {
         return Some((false, base));
     }
     let mut seen = BTreeSet::from([id]);
     let mut steps = Vec::new();
     let mut start = None;
+    let mut cursor_id = id;
     loop {
         let container = cursor.data.get(CONTAINER).copied().unwrap_or(0);
         let Some((holder_id, holder)) = u16::try_from(container)
@@ -3673,14 +3736,25 @@ fn held(
             .filter(|&c| c != 0)
             .and_then(|c| Some((c, objects.get(&c)?)))
         else {
+            // No holder by the words: a person's list may still name it.
+            if let Some((person, i)) = listed(cursor_id) {
+                start = person_slot(person, i).ok()?;
+            }
             break;
         };
         let in_slot = usize::try_from(cursor.data.get(CONTAINER_SLOT).copied().unwrap_or(-1)).ok();
         if holder.person.is_some() {
-            match in_slot.and_then(|i| attach(holder_id, i)) {
-                Some(SlotPoint::At(point)) => start = Some(point),
-                Some(SlotPoint::Unbound) => return None,
-                None => {}
+            // The person's draw picks its point by the entry of its slot
+            // list that names the object (entry `n + 1` is scripts' slot
+            // `n`, `0x459dc0`), not by the object's own slot word; the
+            // word only stands in when no entry names it.
+            let entry = holder
+                .slots
+                .iter()
+                .skip(1)
+                .position(|s| u16::try_from(s.object).is_ok_and(|o| o == cursor_id));
+            if let Some(i) = entry.or(in_slot) {
+                start = person_slot(holder_id, i).ok()?;
             }
             break;
         }
@@ -3701,6 +3775,7 @@ fn held(
         }
         steps.push([x, y, z]);
         cursor = holder;
+        cursor_id = holder_id;
     }
     // A point that is not finite, or further than a lot's width from the
     // object's own position (which is its holder's), is no point: the
@@ -4965,6 +5040,10 @@ mod tests {
         None
     }
 
+    fn no_list(_: u16) -> Option<(u16, usize)> {
+        None
+    }
+
     /// [`held`] for an object that is drawn.
     fn held_drawn(
         objects: &CowMap<u16, Object>,
@@ -4973,7 +5052,7 @@ mod tests {
         id: u16,
         base: [f32; 3],
     ) -> (bool, [f32; 3]) {
-        held(objects, slot, attach, id, base).expect("drawn")
+        held(objects, slot, attach, no_list, id, base).expect("drawn")
     }
 
     fn person_object(id: u16, position: [i32; 3]) -> Object {
@@ -5032,7 +5111,7 @@ mod tests {
             head_top: Some([128.0, 199.0, 12.0]),
             pelvis: Some(pelvis),
         };
-        let attach = |person: u16, i: usize| (person == 1).then(|| hands.slot_point(i)).flatten();
+        let attach = |person: u16, i: usize| (person == 1).then(|| hands.slot_point(i));
         let mut objects = CowMap::new();
         objects.insert(1, person_object(1, [128, 200, 1]));
         // The plate in the Sim's carry slot, its own position the Sim's.
@@ -5061,17 +5140,79 @@ mod tests {
             palm: Some([140.0, 190.0, 8.0]),
             ..hands
         };
-        let follow = |_: u16, i: usize| moved.slot_point(i);
+        let follow = |_: u16, i: usize| Some(moved.slot_point(i));
         assert_eq!(
             held_drawn(&objects, slot, follow, 2, base),
             (true, [140.0, 190.0, 8.0])
         );
-        // Slot 2 draws at the pelvis; slot 1 (the "HEAD" record) has no
-        // point here, so the plate keeps its own position.
+        // Slot 2 draws at the pelvis. Slot 1 (the "HEAD" record) and the
+        // slots past 4 are not drawn by the person's draw, nor by the slot
+        // walk, which skips people: the plate and the food on it are not
+        // drawn.
         objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 2;
         assert_eq!(held_drawn(&objects, slot, attach, 2, base), (true, pelvis));
+        for skipped in [1, 5, 9] {
+            objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = skipped;
+            assert_eq!(
+                held(&objects, slot, attach, no_list, 2, base),
+                None,
+                "slot {skipped}"
+            );
+            assert_eq!(
+                held(&objects, slot, attach, no_list, 3, base),
+                None,
+                "slot {skipped}"
+            );
+        }
+        // The person's slot list, not the object's slot word, picks the
+        // point: listed in entry 1 (slot 0) the plate is in the hand
+        // whatever its word says, and listed in entry 2 (slot 1) it is not
+        // drawn even with the carry slot's word.
+        let list = |objects: &mut CowMap<u16, Object>, entry: usize| {
+            use sims_formats::saved_objects::Slot;
+            let slots = &mut objects.get_mut(&1).unwrap().slots;
+            *slots = (0..6)
+                .map(|i| Slot {
+                    unknown: 0,
+                    object: if i == entry { 2 } else { 0 },
+                })
+                .collect();
+        };
+        list(&mut objects, 1);
         objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 1;
-        assert_eq!(held_drawn(&objects, slot, attach, 2, base), (false, base));
+        assert_eq!(held_drawn(&objects, slot, attach, 2, base), (true, palm));
+        list(&mut objects, 2);
+        objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 0;
+        assert_eq!(held(&objects, slot, attach, no_list, 2, base), None);
+        // A holder word that does not name the person: the list still
+        // places the plate (and the food on it) as the person's draw does,
+        // and still skips slot 1.
+        let words = |objects: &mut CowMap<u16, Object>, holder: i16| {
+            objects.get_mut(&2).unwrap().data[CONTAINER] = holder;
+        };
+        words(&mut objects, 0);
+        let in_head = |id: u16| (id == 2).then_some((1, 1));
+        assert_eq!(held(&objects, slot, attach, in_head, 2, base), None);
+        assert_eq!(held(&objects, slot, attach, in_head, 3, base), None);
+        assert_eq!(held(&objects, slot, no_attach, in_head, 2, base), None);
+        let in_hand = |id: u16| (id == 2).then_some((1, 0));
+        assert_eq!(
+            held(&objects, slot, attach, in_hand, 2, base),
+            Some((true, palm))
+        );
+        assert_eq!(
+            held(&objects, slot, attach, in_hand, 3, base),
+            Some((true, [palm[0], palm[1], palm[2] + 0.25]))
+        );
+        words(&mut objects, 1);
+        objects.get_mut(&1).unwrap().slots.clear();
+        // Slot 1 and the slots past 4 are skipped even when the person
+        // has no points this frame.
+        for skipped in [1, 5] {
+            objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = skipped;
+            assert_eq!(held(&objects, slot, no_attach, no_list, 2, base), None);
+        }
+        objects.get_mut(&1).unwrap().slots.clear();
         // Without the person's points, as before: no offset from the Sim.
         objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 0;
         assert_eq!(
@@ -5096,9 +5237,9 @@ mod tests {
             palm: None,
             ..hands
         };
-        let unbound = |_: u16, i: usize| handless.slot_point(i);
-        assert_eq!(held(&objects, slot, unbound, 2, base), None);
-        assert_eq!(held(&objects, slot, unbound, 3, base), None);
+        let unbound = |_: u16, i: usize| Some(handless.slot_point(i));
+        assert_eq!(held(&objects, slot, unbound, no_list, 2, base), None);
+        assert_eq!(held(&objects, slot, unbound, no_list, 3, base), None);
         // The person's other points still draw.
         objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 2;
         assert_eq!(held_drawn(&objects, slot, unbound, 2, base), (true, pelvis));
@@ -5118,10 +5259,15 @@ mod tests {
         assert_eq!(p.for_slot(4), Some([1.0; 3]));
         assert_eq!(p.for_slot(5), None);
         let handless = PersonAttach { palm: None, ..p };
-        assert_eq!(handless.slot_point(0), Some(SlotPoint::Unbound));
-        assert_eq!(handless.slot_point(4), Some(SlotPoint::Unbound));
-        assert_eq!(handless.slot_point(1), None, "slot 1 is not drawn here");
-        assert_eq!(handless.slot_point(3), Some(SlotPoint::At([2.0; 3])));
+        assert_eq!(handless.slot_point(0), SlotPoint::Unbound);
+        assert_eq!(handless.slot_point(4), SlotPoint::Unbound);
+        assert_eq!(
+            p.slot_point(1),
+            SlotPoint::Skipped,
+            "slot 1 is not drawn here"
+        );
+        assert_eq!(p.slot_point(5), SlotPoint::Skipped);
+        assert_eq!(handless.slot_point(3), SlotPoint::At([2.0; 3]));
     }
 
     fn object(id: u16, guid: u32, position: [i32; 3], words: &[(usize, i16)]) -> Object {

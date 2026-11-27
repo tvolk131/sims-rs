@@ -16,12 +16,18 @@
 //! (`+0x140`) is the bone named by entry 6 at the named point of entry 7;
 //! points 1 and 2 (`+0x144`) the bone of entry 4 at the point of entry 5;
 //! point 3 (`+0x148`) is `PELVIS` with no named point. A bone the skeleton
-//! lacks (an empty entry, a name in another case, or a pet's skeleton) or
-//! a point name the original does not know leaves the point unbound, and
-//! the slot draw skips an unbound point and what it holds (`0x591874`). Nearly every character file has
-//! entries 4 to 7 as `HEAD`, `Top`, `R_HAND`, `Palm`; the Side Show
-//! Assistant (`NPC_SideShowAssistTop.iff`) leaves 6 and 7 empty, so it
-//! has no point 0.
+//! lacks (an empty entry or a name in another case) or a point name the
+//! original does not know leaves the point unbound, and the slot draw
+//! skips an unbound point and what it holds (`0x591874`). Nearly every
+//! character file has entries 4 to 7 as `HEAD`, `Top`, `R_HAND`, `Palm`;
+//! one leaves 6 and 7 empty, so it has no point 0.
+//!
+//! **Pets** are people to the original (definition `+0x12 == 2`): the
+//! same draw (`0x459dc0`), the same animator and the same binding. Their
+//! types' entries 4 to 7 are the people's, and their skeletons have the
+//! bones `HEAD`, `R_HAND` (a front paw) and `PELVIS`, so all their points
+//! are bound and what a pet carries in slot 0 is drawn at its right front
+//! paw's "Palm", before the pet.
 //!
 //! A named point is a fixed matrix on the bone (`0x5a1631`): a move, then
 //! a turn. "Palm" moves (0.5, 0, 0); "Top" (0.8, 0, 0); "HeadFake"

@@ -1,5 +1,6 @@
-//! The plumb bob: the diamond over the selected person's head, coloured
-//! by their mood.
+//! The plumb bob, and the other animated objects a person holds in its
+//! head slot: the diamond over the selected person's head, coloured by
+//! their mood.
 //!
 //! **What it is.** The plumb bob is an ordinary object (`PlumbBob.iff`,
 //! "PlumbBob - Standard", GUID 0x2F726FFF) that the game puts in the
@@ -12,6 +13,17 @@
 //! itself, so [`Bob`] makes a skeleton of it. No `white.bmp` exists
 //! either, so the mesh is drawn white and the light gives it its colour.
 //!
+//! **Which objects.** An object gets a 3D graphic of its own when it is
+//! made (0x4376f6: the graphic, class 0x671d6c, made by 0x58464f, kept at
+//! the object's +0x120) if its definition's VitaboyFlags word (OBJD word
+//! 102, byte +0xcc) has bit 0 set ([`ANIMATED`]); the graphic reads its
+//! skeleton and suit from the type's body strings, entries 1 and 2
+//! (counting from 1), the suit before its comma. The tail of the person
+//! animator's tick (0x58f8ff to 0x58fa91) then poses, ticks and moves
+//! whatever such object the head slot holds, whatever its GUID. In the
+//! install only the three plumb bobs have the bit (the standard, the date
+//! and the star bob), all with the skeleton `root`.
+//!
 //! **Where it is.** Each tick the head slot's redraw gives the graphic
 //! the position of the person's `HEAD` bone (bone +0x4c to +0x54, found
 //! by name, 0x5990e0) times the person's placement (animator +0xb0),
@@ -23,11 +35,14 @@
 //! its own length (0x5861ce to 0x586246). The spin is the game's clock in
 //! milliseconds (0x6e54e0) times 0.001 × π: half a turn a second.
 //!
-//! **Its colour.** The suit's name picks a mode (0x5856db to 0x58579f):
-//! `head-arrow` 1, `head-arrow-date` 2, `head-star` 3. In mode 1, which
-//! [`colour`] ports, the mood (the person's motive 3, cut to an integer,
-//! 0x58dc29 to 0x58dc46) times 0.012, held to −1..1, gives a colour from
-//! red through pale yellow to green (0x58605d to 0x586165). That colour
+//! **Its colour.** The suit's name, compared byte for byte (0x46f83e),
+//! picks a mode ([`Mode`], 0x5856d4 to 0x5857a9): [`SUIT`] 1,
+//! [`DATE_SUIT`] 2, [`STAR_SUIT`] 3. In modes 1 and 2 the mood (the
+//! person's motive 3, cut to an integer, 0x58dc29 to 0x58dc46) times
+//! 0.012, held to −1..1, gives the colour ([`colour_in`], 0x58605d to
+//! 0x586165): in mode 1 from red through pale yellow to green, in mode 2
+//! the same with green and blue swapped, from red through pale pink to
+//! blue. Mode 3 is yellow whatever the mood (0x586053). That colour
 //! is the colour of a light of intensity 1 (0x58616a), and a quarter of
 //! it plus 0.05 is the ambient light (0x586184 to 0x5861c9); the mesh is
 //! white, so a vertex takes `ambient + colour × max(0, n · l)`.
@@ -47,10 +62,12 @@
 //! the lot's terms, not the view's, so the light falls from another side
 //! at each rotation of the view; only rotation 0 was compared.
 //!
-//! **Not ported.** Modes 2 and 3 (the date and star bobs), whose GUIDs
-//! are not drawn. Which bone the head slot names (the slot's +0x20) is
+//! **Not ported.** A suit that names none of the three modes leaves the
+//! graphic's bob flag (+0xf8) clear, and the graphic then draws as an
+//! ordinary posed model; no object in the install does that, and we do
+//! not draw one. Which bone the head slot names (the slot's +0x20) is
 //! not read; `HEAD` is assumed, and puts the bob where the screenshot
-//! has it.
+//! has it. The date and star bobs were not compared with a capture.
 
 use crate::appearance::{Part, load_appearance, load_mesh};
 use crate::assets::Assets;
@@ -64,6 +81,16 @@ pub const STANDARD: u32 = 0x2F72_6FFF;
 
 /// The suit the standard plumb bob wears (its object string 200).
 pub const SUIT: &str = "head-arrow";
+
+/// The VitaboyFlags bit (OBJD word 102, definition byte +0xcc, tested at
+/// 0x4376f6) that gives an object a 3D graphic of its own.
+pub const ANIMATED: u16 = 1;
+
+/// The suit that picks mode 2, the date bob's (the string at 0x6d05e4).
+pub const DATE_SUIT: &str = "head-arrow-date";
+
+/// The suit that picks mode 3, the star bob's (the string at 0x6d05d8).
+pub const STAR_SUIT: &str = "head-star";
 
 /// The person's container slot that holds the plumb bob: the head slot
 /// (the container entry at begin + 0x48, 0x58dae5).
@@ -86,6 +113,12 @@ impl Bob {
     /// Loads the standard plumb bob's suit, [`SUIT`], on a skeleton of
     /// the one bone `ROOT`, drawn white.
     pub fn load(assets: &Assets) -> Result<Self, String> {
+        Self::load_suit(assets, SUIT)
+    }
+
+    /// Loads the suit `suit` on a skeleton of the one bone `ROOT`, drawn
+    /// white.
+    pub fn load_suit(assets: &Assets, suit: &str) -> Result<Self, String> {
         let skeleton = Skeleton {
             name: "root".to_owned(),
             bones: vec![Bone {
@@ -98,7 +131,7 @@ impl Bob {
                 wiggle: Default::default(),
             }],
         };
-        let appearance = load_appearance(assets, SUIT)?;
+        let appearance = load_appearance(assets, suit)?;
         let mut parts = Vec::new();
         for binding in &appearance.bindings {
             let mesh = load_mesh(assets, &binding.mesh)?;
@@ -111,7 +144,7 @@ impl Bob {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             parts.push(Part {
-                appearance: SUIT.to_owned(),
+                appearance: suit.to_owned(),
                 bone: 0,
                 bones,
                 mesh,
@@ -124,12 +157,71 @@ impl Bob {
     }
 }
 
-/// The plumb bob `person` holds in their head slot: its object ID, if
-/// the slot holds an object with the standard plumb bob's GUID.
+/// The standard plumb bob `person` holds in their head slot: its object
+/// ID, if the slot holds an object with the standard plumb bob's GUID.
 pub fn held_by(world: &sims_sim::World, person: u16) -> Option<u16> {
+    let id = in_head_slot(world, person)?;
+    (world.objects.get(&id)?.guid == STANDARD).then_some(id)
+}
+
+/// The object `person` holds in their head slot, whatever it is: the
+/// one the animator's tick moves if its type is [`ANIMATED`]
+/// (0x58f8ff).
+pub fn in_head_slot(world: &sims_sim::World, person: u16) -> Option<u16> {
     let slot = world.objects.get(&person)?.slots.get(HEAD_SLOT)?;
     let id = u16::try_from(slot.object).ok().filter(|&id| id != 0)?;
-    (world.objects.get(&id)?.guid == STANDARD).then_some(id)
+    world.objects.contains_key(&id).then_some(id)
+}
+
+/// The suit an [`ANIMATED`] type's graphic wears: its body strings'
+/// second entry up to the comma (the rest binds textures), or None for a
+/// type without the bit or with no suit.
+pub fn animated_suit(vitaboy_flags: u16, body_strings: &[String]) -> Option<&str> {
+    if vitaboy_flags & ANIMATED == 0 {
+        return None;
+    }
+    let suit = body_strings.get(1)?.split(',').next()?;
+    (!suit.is_empty()).then_some(suit)
+}
+
+/// How a bob's graphic colours itself (its +0xfc), picked by its suit's
+/// name (0x5856d4 to 0x5857a9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Mode 1, [`SUIT`]: by the mood, red to pale yellow to green.
+    Arrow,
+    /// Mode 2, [`DATE_SUIT`]: by the mood, red to pale pink to blue.
+    Date,
+    /// Mode 3, [`STAR_SUIT`]: yellow.
+    Star,
+}
+
+impl Mode {
+    /// The mode the suit `suit` picks, compared byte for byte (0x46f83e),
+    /// or None when it names none and the graphic is no bob.
+    pub fn of_suit(suit: &str) -> Option<Self> {
+        Some(match suit {
+            SUIT => Self::Arrow,
+            DATE_SUIT => Self::Date,
+            STAR_SUIT => Self::Star,
+            _ => return None,
+        })
+    }
+}
+
+/// The colour of a bob's light in `mode` for a mood (motive 3 cut to an
+/// integer, 0x58603b to 0x586165): [`colour`] in mode 1, the same with
+/// green and blue swapped in mode 2, and yellow (1, 1, 0) in mode 3,
+/// which does not read the mood.
+pub fn colour_in(mode: Mode, mood: i32) -> [f32; 3] {
+    match mode {
+        Mode::Arrow => colour(mood),
+        Mode::Date => {
+            let [r, g, b] = colour(mood);
+            [r, b, g]
+        }
+        Mode::Star => [1.0, 1.0, 0.0],
+    }
 }
 
 /// The colour of the plumb bob's light for a mood (motive 3 cut to an
@@ -252,6 +344,48 @@ mod tests {
         let [r, g, b] = colour(-20);
         assert_eq!(r, 1.0);
         assert!(g > b);
+    }
+
+    #[test]
+    fn the_suit_picks_the_mode_byte_for_byte() {
+        assert_eq!(Mode::of_suit(SUIT), Some(Mode::Arrow));
+        assert_eq!(Mode::of_suit(DATE_SUIT), Some(Mode::Date));
+        assert_eq!(Mode::of_suit(STAR_SUIT), Some(Mode::Star));
+        assert_eq!(Mode::of_suit(&SUIT.to_uppercase()), None);
+        assert_eq!(Mode::of_suit(&format!("{SUIT},ROOT=white")), None);
+        assert_eq!(Mode::of_suit(""), None);
+    }
+
+    /// Mode 2 is mode 1 with green and blue swapped: red when sad, pale
+    /// pink at zero, blue when happy. Mode 3 is yellow at any mood.
+    #[test]
+    fn the_date_bob_swaps_green_and_blue_and_the_star_is_yellow() {
+        assert_eq!(colour_in(Mode::Arrow, 37), colour(37));
+        assert_eq!(colour_in(Mode::Date, 100), [0.0, 0.0, 1.0]);
+        assert_eq!(colour_in(Mode::Date, -100), [1.0, 0.0, 0.0]);
+        let [r, g, b] = colour_in(Mode::Date, 0);
+        assert_eq!([r, b], [1.0, 1.0]);
+        assert!((g - 0.6).abs() < 1e-6);
+        for mood in [-90, -20, -1, 0, 1, 20, 50, 90] {
+            let [r, g, b] = colour(mood);
+            assert_eq!(colour_in(Mode::Date, mood), [r, b, g], "mood {mood}");
+            assert_eq!(colour_in(Mode::Star, mood), [1.0, 1.0, 0.0]);
+        }
+    }
+
+    /// Only a type with VitaboyFlags bit 0 has a graphic; its suit is the
+    /// second body string up to the comma.
+    #[test]
+    fn an_animated_types_suit_is_its_second_body_string_before_the_comma() {
+        let rows = |a: &str, b: &str| vec![a.to_owned(), b.to_owned()];
+        let strings = rows("bones", "a-suit,BONE=paint");
+        assert_eq!(animated_suit(1, &strings), Some("a-suit"));
+        assert_eq!(animated_suit(0xf, &strings), Some("a-suit"));
+        assert_eq!(animated_suit(0xe, &strings), None);
+        assert_eq!(animated_suit(0, &strings), None);
+        assert_eq!(animated_suit(1, &rows("bones", "plain")), Some("plain"));
+        assert_eq!(animated_suit(1, &rows("bones", ",BONE=paint")), None);
+        assert_eq!(animated_suit(1, &strings[..1]), None);
     }
 
     #[test]

@@ -7,4 +7,5 @@ mod common;
 mod goth_family;
 mod lot;
 mod offscreen;
+mod pets;
 mod playback;

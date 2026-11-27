@@ -34,7 +34,7 @@
 //! the cache 0x45ee5f keeps by career and level, which can keep a
 //! person's old work clothes when only their age or sex changes.
 
-use crate::appearance::{Outfit, appearance_names, body_string};
+use crate::appearance::{Outfit, appearance_names, body_string, names_a_part};
 use crate::assets::Assets;
 use sims_formats::career::Level;
 use sims_formats::saved_objects::Person;
@@ -513,7 +513,7 @@ impl Clothes {
             // those it names.
             let skip = [&a[0], &a[4], &a[6]]
                 .iter()
-                .filter(|n| !n.is_empty())
+                .filter(|n| names_a_part(n))
                 .count();
             Outfit::from_person(person)
                 .parts
@@ -527,7 +527,7 @@ impl Clothes {
         }
         parts.extend(self.hands.iter().cloned());
         parts.extend(rest);
-        parts.retain(|(name, _)| !name.is_empty());
+        parts.retain(|(name, _)| names_a_part(name));
         Outfit { parts }
     }
 }
@@ -651,5 +651,31 @@ mod tests {
         // A costume keeps the record's clothes, as does a pet.
         assert_eq!(wear(40, 0), worn);
         assert_eq!(wear(1, 2), worn);
+    }
+
+    /// A hand slot the record leaves empty (`NONE`) is not counted among
+    /// the body and hands the suit replaces, so the head after it stays.
+    #[test]
+    fn an_empty_hand_slot_keeps_the_head_after_it() {
+        let mut person = crate::person::tests::blank_person();
+        person.appearance[0] = "body".into();
+        person.appearance[4] = crate::appearance::NO_APPEARANCE.into();
+        person.appearance[6] = "hand".into();
+        person.appearance[8] = "head".into();
+        let clothes = Clothes {
+            body: ("suit".into(), String::new()),
+            extra: String::new(),
+            hands: [
+                (crate::appearance::NO_APPEARANCE.into(), String::new()),
+                ("glove".into(), String::new()),
+            ],
+        };
+        let names: Vec<String> = clothes
+            .wear(&person, &rows())
+            .parts
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["suit", "glove", "head"]);
     }
 }
